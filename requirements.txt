@@ -1,0 +1,6 @@
+pydantic-ai[mcp,web,openai]
+sap-ai-sdk-gen[all]
+mcp
+httpx
+uvicorn
+python-dotenv
