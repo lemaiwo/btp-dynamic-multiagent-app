@@ -6,3 +6,5 @@ __pycache__/
 .venv/
 mta_archives/
 *.mtar
+dist/
+node_modules/

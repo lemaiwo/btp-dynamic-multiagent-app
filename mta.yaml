@@ -23,6 +23,7 @@ modules:
         - ".tokens-*.json"
         - "mta_archives/"
         - "*.mtar"
+        - "approuter/"
     parameters:
       memory: 512M
       disk-quota: 2G
@@ -37,6 +38,26 @@ modules:
       MCP_BTP_URL: "https://infrabel-app-dev-cf-ai-btp-agent-btp-mcp.cfapps.eu20-001.hana.ondemand.com"
     requires:
       - name: aicore-service
+    provides:
+      - name: pydantic-agent-api
+        properties:
+          url: ${default-url}
+
+  - name: pydantic-agent-approuter
+    type: nodejs
+    path: approuter
+    parameters:
+      memory: 128M
+      disk-quota: 256M
+      buildpack: nodejs_buildpack
+    requires:
+      - name: uaa-service
+      - name: pydantic-agent-api
+        group: destinations
+        properties:
+          name: pydantic-agent-backend
+          url: ~{url}
+          forwardAuthToken: true
 
 resources:
   - name: aicore-service
@@ -44,3 +65,10 @@ resources:
     parameters:
       service: aicore
       service-plan: extended
+
+  - name: uaa-service
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: xs-security.json
