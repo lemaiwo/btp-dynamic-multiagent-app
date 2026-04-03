@@ -8,7 +8,9 @@ import asyncio
 import copy
 import json
 import logging
+import os
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -25,6 +27,8 @@ from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 
 logger = logging.getLogger(__name__)
+
+ON_CF = "VCAP_APPLICATION" in os.environ
 
 CALLBACK_PORT = 3000
 CALLBACK_URL = f"http://localhost:{CALLBACK_PORT}/callback"
@@ -129,31 +133,128 @@ async def _callback_handler() -> tuple[str, str | None]:
 
 
 # ---------------------------------------------------------------------------
+# Client credentials auth for Cloud Foundry (no browser available)
+# ---------------------------------------------------------------------------
+class ClientCredentialsAuth(httpx.Auth):
+    """OAuth2 client_credentials flow for server-to-server auth on CF.
+
+    Discovers the OAuth server metadata, dynamically registers a client,
+    and obtains tokens via client_credentials grant — no browser needed.
+    """
+
+    def __init__(self, server_url: str, client_name: str):
+        self._server_url = server_url.rstrip("/")
+        self._client_name = client_name
+        self._access_token: str | None = None
+        self._token_expiry: float = 0
+        self._client_id: str | None = None
+        self._client_secret: str | None = None
+        self._token_endpoint: str | None = None
+        self._lock = asyncio.Lock()
+
+    async def _discover_and_register(self) -> None:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            resp = await client.get(
+                f"{self._server_url}/.well-known/oauth-authorization-server"
+            )
+            resp.raise_for_status()
+            metadata = resp.json()
+            logger.debug("OAuth metadata: %s", metadata)
+
+            # The MCP server's /oauth/token only proxies authorization_code.
+            # For client_credentials we must talk to XSUAA directly.
+            # The metadata 'issuer' points to the XSUAA base URL.
+            issuer = metadata.get("issuer", "").rstrip("/")
+            if issuer:
+                self._token_endpoint = f"{issuer}/oauth/token"
+            else:
+                self._token_endpoint = metadata["token_endpoint"]
+
+            logger.info("Using token endpoint: %s", self._token_endpoint)
+
+            resp = await client.post(
+                metadata["registration_endpoint"],
+                json={
+                    "client_name": self._client_name,
+                    "grant_types": ["client_credentials"],
+                    "response_types": [],
+                    "token_endpoint_auth_method": "client_secret_post",
+                },
+            )
+            resp.raise_for_status()
+            reg = resp.json()
+            self._client_id = reg["client_id"]
+            self._client_secret = reg["client_secret"]
+            logger.info("Registered OAuth client: %s", self._client_id)
+
+    async def _ensure_token(self) -> str:
+        async with self._lock:
+            if self._access_token and time.time() < self._token_expiry:
+                return self._access_token
+
+            if not self._token_endpoint:
+                await self._discover_and_register()
+
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    self._token_endpoint,
+                    data={
+                        "grant_type": "client_credentials",
+                        "client_id": self._client_id,
+                        "client_secret": self._client_secret,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            self._access_token = data["access_token"]
+            self._token_expiry = time.time() + data.get("expires_in", 3600) - 60
+            return self._access_token
+
+    async def async_auth_flow(self, request):
+        token = await self._ensure_token()
+        request.headers["Authorization"] = f"Bearer {token}"
+        response = yield request
+
+        if response.status_code == 401:
+            self._access_token = None
+            token = await self._ensure_token()
+            request.headers["Authorization"] = f"Bearer {token}"
+            yield request
+
+
+# ---------------------------------------------------------------------------
 # MCP server factory
 # ---------------------------------------------------------------------------
 def create_mcp_server(name: str, base_url: str) -> MCPServerStreamableHTTP:
     """Create an MCP server connection with OAuth2 authentication.
 
-    Each server gets its own token file (.tokens-{name}.json) so credentials
-    are persisted independently.
+    On Cloud Foundry: uses client_credentials grant (no browser needed).
+    Locally: uses authorization_code grant with browser redirect.
     """
-    oauth_provider = OAuthClientProvider(
-        server_url=base_url,
-        client_metadata=OAuthClientMetadata(
+    if ON_CF:
+        auth = ClientCredentialsAuth(
+            server_url=base_url,
             client_name=f"SAP BTP Agent - {name}",
-            redirect_uris=[AnyUrl(CALLBACK_URL)],
-            grant_types=["authorization_code", "refresh_token"],
-            response_types=["code"],
-        ),
-        storage=FileTokenStorage(Path(f".tokens-{name}.json")),
-        redirect_handler=_redirect_handler,
-        callback_handler=_callback_handler,
-    )
+        )
+    else:
+        auth = OAuthClientProvider(
+            server_url=base_url,
+            client_metadata=OAuthClientMetadata(
+                client_name=f"SAP BTP Agent - {name}",
+                redirect_uris=[AnyUrl(CALLBACK_URL)],
+                grant_types=["authorization_code", "refresh_token"],
+                response_types=["code"],
+            ),
+            storage=FileTokenStorage(Path(f".tokens-{name}.json")),
+            redirect_handler=_redirect_handler,
+            callback_handler=_callback_handler,
+        )
 
     return MCPServerStreamableHTTP(
         url=f"{base_url}/mcp",
         http_client=httpx.AsyncClient(
-            auth=oauth_provider,
+            auth=auth,
             follow_redirects=True,
             timeout=httpx.Timeout(30.0),
         ),

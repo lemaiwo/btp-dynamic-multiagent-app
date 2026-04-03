@@ -4,12 +4,15 @@ Connects to the Cloud Foundry MCP server to manage CF resources
 such as applications, services, spaces, and organizations.
 """
 
+import os
+
 from pydantic_ai import Agent
 
 from agents.shared import create_mcp_server, get_model
 
-MCP_BASE_URL = (
-    "https://infrabel-app-dev-cf-ai-btp-agent-cf-mcp.cfapps.eu20-001.hana.ondemand.com"
+MCP_BASE_URL = os.environ.get(
+    "MCP_CLOUDFOUNDRY_URL",
+    "https://infrabel-app-dev-cf-ai-btp-agent-cf-mcp.cfapps.eu20-001.hana.ondemand.com",
 )
 
 mcp_server = create_mcp_server("cloudfoundry", MCP_BASE_URL)

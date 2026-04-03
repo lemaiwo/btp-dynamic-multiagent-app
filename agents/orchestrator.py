@@ -13,6 +13,14 @@ from agents.shared import get_model
 logger = logging.getLogger(__name__)
 
 
+def _format_error(exc: BaseException) -> str:
+    """Unwrap ExceptionGroup/TaskGroup to surface the real cause."""
+    if isinstance(exc, BaseExceptionGroup):
+        messages = [_format_error(e) for e in exc.exceptions]
+        return "; ".join(messages)
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _create_orchestrator() -> Agent:
     """Create the orchestrator agent with delegation tools.
 
@@ -69,9 +77,9 @@ def _create_orchestrator() -> Agent:
 
             result = await cf_agent.run(query, usage=ctx.usage)
             return str(result.output)
-        except Exception as e:
+        except BaseException as e:
             logger.exception("Cloud Foundry agent failed")
-            return f"Error from Cloud Foundry agent: {e}"
+            return f"Error from Cloud Foundry agent: {_format_error(e)}"
 
     @orchestrator.tool
     async def manage_btp(ctx: RunContext, query: str) -> str:
@@ -85,9 +93,9 @@ def _create_orchestrator() -> Agent:
 
             result = await btp_agent.run(query, usage=ctx.usage)
             return str(result.output)
-        except Exception as e:
+        except BaseException as e:
             logger.exception("BTP agent failed")
-            return f"Error from BTP agent: {e}"
+            return f"Error from BTP agent: {_format_error(e)}"
 
     return orchestrator
 

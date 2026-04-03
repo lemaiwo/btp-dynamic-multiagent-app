@@ -10,6 +10,7 @@ Usage:
 """
 
 import logging
+import os
 
 from dotenv import load_dotenv
 
@@ -25,6 +26,7 @@ app = orchestrator.to_web()
 if __name__ == "__main__":
     import uvicorn
 
-    print("Starting SAP BTP Management Chat on http://127.0.0.1:7932")
+    port = int(os.environ.get("PORT", 7932))
+    print(f"Starting SAP BTP Management Chat on http://127.0.0.1:{port}")
     print("OAuth2 callback listening on http://localhost:3000/callback")
-    uvicorn.run(app, host="127.0.0.1", port=7932)
+    uvicorn.run(app, host="0.0.0.0", port=port)

@@ -1,0 +1,46 @@
+_schema-version: "3.1"
+ID: pydantic-agent
+description: Multi-agent Pydantic AI application for SAP BTP management
+version: 1.0.0
+
+parameters:
+  enable-parallel-deployments: true
+
+modules:
+  - name: pydantic-agent
+    type: python
+    path: .
+    build-parameters:
+      builder: custom
+      commands: []
+      ignore:
+        - ".venv/"
+        - ".git/"
+        - "__pycache__/"
+        - "*.pyc"
+        - ".env"
+        - ".tokens.json"
+        - ".tokens-*.json"
+        - "mta_archives/"
+        - "*.mtar"
+    parameters:
+      memory: 512M
+      disk-quota: 2G
+      buildpack: python_buildpack
+      command: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
+    properties:
+      # SAP AI Core resource group (not available in VCAP_SERVICES)
+      AICORE_RESOURCE_GROUP: "default"
+      # MCP server base URLs
+      MCP_AUDITLOG_URL: "https://infrabel-app-dev-cf-ai-btp-agent-auditlog-mcp.cfapps.eu20-001.hana.ondemand.com"
+      MCP_CLOUDFOUNDRY_URL: "https://infrabel-app-dev-cf-ai-btp-agent-cf-mcp.cfapps.eu20-001.hana.ondemand.com"
+      MCP_BTP_URL: "https://infrabel-app-dev-cf-ai-btp-agent-btp-mcp.cfapps.eu20-001.hana.ondemand.com"
+    requires:
+      - name: aicore-service
+
+resources:
+  - name: aicore-service
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: aicore
+      service-plan: extended
