@@ -111,7 +111,7 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # ---------------------------------------------------------------------------
 @router.get("", response_class=HTMLResponse, dependencies=[Depends(require_admin)])
 async def admin_ui(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse("admin.html", {"request": request})
+    return templates.TemplateResponse(request, "admin.html")
 
 
 # ---------------------------------------------------------------------------
