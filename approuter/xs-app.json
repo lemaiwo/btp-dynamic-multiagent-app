@@ -2,11 +2,27 @@
   "authenticationMethod": "route",
   "routes": [
     {
+      "source": "^/admin(/.*)?$",
+      "target": "/admin$1",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "xsuaa",
+      "csrfProtection": false,
+      "scope": "$XSAPPNAME.admin"
+    },
+    {
+      "source": "^/healthz$",
+      "target": "/healthz",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "none",
+      "csrfProtection": false
+    },
+    {
       "source": "^(.*)$",
       "target": "$1",
       "destination": "pydantic-agent-backend",
       "authenticationType": "xsuaa",
-      "csrfProtection": false
+      "csrfProtection": false,
+      "scope": "$XSAPPNAME.user"
     }
   ]
 }

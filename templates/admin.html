@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Administration — SAP BTP</title>
+    <style>
+        :root {
+            --bg: #f4f5f7;
+            --panel: #ffffff;
+            --border: #d9dce1;
+            --text: #1d2129;
+            --muted: #6b7280;
+            --primary: #0070f3;
+            --primary-hover: #0058c7;
+            --danger: #c62828;
+            --success: #2e7d32;
+            --warn: #b26a00;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 14px;
+        }
+        header {
+            background: var(--panel);
+            border-bottom: 1px solid var(--border);
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+        header .actions { display: flex; gap: 8px; }
+        main { max-width: 1100px; margin: 24px auto; padding: 0 24px; }
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .panel h2 { margin: 0 0 12px 0; font-size: 16px; }
+        .panel p.hint { color: var(--muted); margin: 0 0 12px 0; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+        th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; }
+        tr:last-child td { border-bottom: none; }
+        .row-actions { white-space: nowrap; }
+        button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+        }
+        button:hover { background: var(--primary-hover); }
+        button.secondary { background: #e5e7eb; color: var(--text); }
+        button.secondary:hover { background: #d1d5db; }
+        button.danger { background: var(--danger); }
+        button.danger:hover { background: #8e0000; }
+        button.small { padding: 4px 8px; font-size: 12px; }
+        input[type="text"], input[type="url"], textarea, select {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 13px;
+        }
+        textarea { min-height: 80px; resize: vertical; font-family: Menlo, Consolas, monospace; }
+        label { display: block; margin: 10px 0 4px 0; font-weight: 500; font-size: 13px; }
+        .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .form-grid label.full { grid-column: 1 / -1; }
+        .modal-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.4);
+            z-index: 10;
+            align-items: flex-start;
+            justify-content: center;
+            padding-top: 60px;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal {
+            background: white;
+            border-radius: 6px;
+            width: 640px;
+            max-width: 92vw;
+            max-height: 80vh;
+            overflow-y: auto;
+            padding: 24px;
+        }
+        .modal h3 { margin-top: 0; }
+        .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+        #toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: var(--text);
+            color: white;
+            padding: 12px 18px;
+            border-radius: 4px;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity .25s;
+            max-width: 360px;
+        }
+        #toast.show { opacity: 1; }
+        #toast.error { background: var(--danger); }
+        #toast.success { background: var(--success); }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .status-badge.on { background: #d6f5d6; color: var(--success); }
+        .status-badge.off { background: #f5d6d6; color: var(--danger); }
+        .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+        a.link { color: var(--primary); text-decoration: none; }
+        a.link:hover { text-decoration: underline; }
+        code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    </style>
+</head>
+<body>
+<header>
+    <h1>SAP BTP Agent Administration</h1>
+    <div class="actions">
+        <a class="link" href="/">← Back to chat</a>
+    </div>
+</header>
+
+<main>
+    <div class="panel">
+        <h2>Agents</h2>
+        <p class="hint">
+            Each agent connects to a BTP-hosted MCP server over OAuth 2.1.
+            The user's JWT is forwarded on every request. Only HTTPS URLs
+            on <code>*.hana.ondemand.com</code> are allowed.
+        </p>
+        <div class="toolbar">
+            <button onclick="openAgentModal()">+ New agent</button>
+            <button class="secondary" onclick="reloadRegistry()">Reload agents</button>
+            <button class="secondary" onclick="restartApp()">Restart app</button>
+            <button class="secondary" onclick="exportConfig()">Export config</button>
+            <button class="secondary" onclick="document.getElementById('import-file').click()">Import config</button>
+            <input type="file" id="import-file" accept=".json" style="display:none"
+                   onchange="importConfig(event)">
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Description</th>
+                    <th>MCP URL</th>
+                    <th>Status</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="agents-tbody">
+                <tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="panel">
+        <h2>Orchestrator instructions</h2>
+        <p class="hint">
+            The system prompt used by the orchestrator agent. Specialist
+            names and descriptions are appended automatically.
+        </p>
+        <textarea id="orch-instructions" rows="6"></textarea>
+        <div style="margin-top: 12px; text-align: right;">
+            <button onclick="saveOrchestrator()">Save</button>
+        </div>
+    </div>
+</main>
+
+<div id="agent-modal" class="modal-backdrop" onclick="if(event.target===this)closeAgentModal()">
+    <div class="modal">
+        <h3 id="modal-title">New agent</h3>
+        <input type="hidden" id="agent-id">
+        <div class="form-grid">
+            <label class="full">
+                Name
+                <input type="text" id="agent-name" placeholder="cloudfoundry" required>
+            </label>
+            <label class="full">
+                Description <span style="color:var(--muted);font-weight:normal">(used by the orchestrator to decide routing)</span>
+                <textarea id="agent-description" rows="2" required></textarea>
+            </label>
+            <label class="full">
+                Instructions <span style="color:var(--muted);font-weight:normal">(system prompt for this specialist)</span>
+                <textarea id="agent-instructions" rows="6" required></textarea>
+            </label>
+            <label class="full">
+                MCP server URL
+                <input type="url" id="agent-mcp-url"
+                       placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com" required>
+            </label>
+            <label class="full">
+                <input type="checkbox" id="agent-enabled" checked>
+                Enabled
+            </label>
+        </div>
+        <div class="modal-actions">
+            <button class="secondary" onclick="closeAgentModal()">Cancel</button>
+            <button onclick="saveAgent()">Save</button>
+        </div>
+    </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const api = (path, opts = {}) => fetch(`/admin/api${path}`, {
+    credentials: 'same-origin',
+    headers: {'Content-Type': 'application/json'},
+    ...opts,
+});
+
+function toast(msg, kind = '') {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.className = 'show ' + kind;
+    setTimeout(() => { t.className = ''; }, 3500);
+}
+
+async function loadAgents() {
+    const res = await api('/agents');
+    if (!res.ok) { toast('Failed to load agents', 'error'); return; }
+    const agents = await res.json();
+    const tbody = document.getElementById('agents-tbody');
+    if (agents.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No agents configured yet.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = agents.map(a => `
+        <tr>
+            <td><strong>${escapeHtml(a.name)}</strong></td>
+            <td style="max-width:280px">${escapeHtml(a.description)}</td>
+            <td style="max-width:260px;word-break:break-all"><code>${escapeHtml(a.mcp_url)}</code></td>
+            <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
+            <td class="row-actions">
+                <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
+                <button class="small danger" onclick="deleteAgentRow(${a.id}, '${escapeHtml(a.name)}')">Delete</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+async function loadOrchestrator() {
+    const res = await api('/orchestrator');
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById('orch-instructions').value = data.instructions;
+}
+
+function openAgentModal() {
+    document.getElementById('modal-title').textContent = 'New agent';
+    document.getElementById('agent-id').value = '';
+    document.getElementById('agent-name').value = '';
+    document.getElementById('agent-description').value = '';
+    document.getElementById('agent-instructions').value = '';
+    document.getElementById('agent-mcp-url').value = '';
+    document.getElementById('agent-enabled').checked = true;
+    document.getElementById('agent-modal').classList.add('open');
+}
+
+function closeAgentModal() {
+    document.getElementById('agent-modal').classList.remove('open');
+}
+
+async function editAgent(id) {
+    const res = await api(`/agents/${id}`);
+    if (!res.ok) { toast('Failed to load agent', 'error'); return; }
+    const a = await res.json();
+    document.getElementById('modal-title').textContent = `Edit agent: ${a.name}`;
+    document.getElementById('agent-id').value = a.id;
+    document.getElementById('agent-name').value = a.name;
+    document.getElementById('agent-description').value = a.description;
+    document.getElementById('agent-instructions').value = a.instructions;
+    document.getElementById('agent-mcp-url').value = a.mcp_url;
+    document.getElementById('agent-enabled').checked = a.enabled;
+    document.getElementById('agent-modal').classList.add('open');
+}
+
+async function saveAgent() {
+    const id = document.getElementById('agent-id').value;
+    const body = JSON.stringify({
+        name: document.getElementById('agent-name').value.trim(),
+        description: document.getElementById('agent-description').value.trim(),
+        instructions: document.getElementById('agent-instructions').value.trim(),
+        mcp_url: document.getElementById('agent-mcp-url').value.trim(),
+        enabled: document.getElementById('agent-enabled').checked,
+    });
+    const res = id
+        ? await api(`/agents/${id}`, {method: 'PUT', body})
+        : await api('/agents', {method: 'POST', body});
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Save failed: ' + (err.detail || JSON.stringify(err)), 'error');
+        return;
+    }
+    closeAgentModal();
+    toast('Saved. Click "Reload agents" to activate.', 'success');
+    loadAgents();
+}
+
+async function deleteAgentRow(id, name) {
+    if (!confirm(`Delete agent "${name}"?`)) return;
+    const res = await api(`/agents/${id}`, {method: 'DELETE'});
+    if (!res.ok) { toast('Delete failed', 'error'); return; }
+    toast('Deleted. Click "Reload agents" to activate.', 'success');
+    loadAgents();
+}
+
+async function saveOrchestrator() {
+    const instructions = document.getElementById('orch-instructions').value;
+    const res = await api('/orchestrator', {method: 'PUT', body: JSON.stringify({instructions})});
+    if (!res.ok) { toast('Save failed', 'error'); return; }
+    toast('Saved. Click "Reload agents" to activate.', 'success');
+}
+
+async function reloadRegistry() {
+    const res = await api('/reload', {method: 'POST'});
+    if (!res.ok) { toast('Reload failed', 'error'); return; }
+    const data = await res.json();
+    toast(`Reloaded: ${data.enabled}/${data.agents} agents active`, 'success');
+}
+
+async function restartApp() {
+    if (!confirm('Trigger a full Cloud Foundry app restart? (in-memory reload runs either way)')) return;
+    const res = await api('/restart', {method: 'POST'});
+    if (!res.ok) { toast('Restart failed', 'error'); return; }
+    const data = await res.json();
+    const cf = data.cf_restart || {};
+    const msg = cf.ok
+        ? `Reloaded + CF restart triggered (${data.enabled}/${data.agents} agents)`
+        : `In-memory reload OK (${data.enabled}/${data.agents}). CF restart: ${cf.reason || 'unknown'}`;
+    toast(msg, cf.ok ? 'success' : '');
+}
+
+async function exportConfig() {
+    const res = await api('/export');
+    if (!res.ok) { toast('Export failed', 'error'); return; }
+    const data = await res.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'agents.config.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+async function importConfig(evt) {
+    const file = evt.target.files[0];
+    if (!file) return;
+    evt.target.value = '';
+    const text = await file.text();
+    let payload;
+    try { payload = JSON.parse(text); } catch (e) { toast('Invalid JSON', 'error'); return; }
+    const replace = confirm('Replace all existing agents with the import? Click Cancel to merge (upsert only).');
+    payload.replace = replace;
+    const res = await api('/import', {method: 'POST', body: JSON.stringify(payload)});
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Import failed: ' + (err.detail || ''), 'error');
+        return;
+    }
+    const data = await res.json();
+    toast(`Imported ${data.imported} agents (removed ${data.removed}). Reload to activate.`, 'success');
+    loadAgents();
+    loadOrchestrator();
+}
+
+function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, c => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+}
+
+loadAgents();
+loadOrchestrator();
+</script>
+</body>
+</html>

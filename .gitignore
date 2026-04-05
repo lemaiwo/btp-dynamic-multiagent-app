@@ -8,3 +8,4 @@ mta_archives/
 *.mtar
 dist/
 node_modules/
+agents_registry.db
