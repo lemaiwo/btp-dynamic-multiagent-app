@@ -1,53 +1,72 @@
-# Pydantic AI Agent with SAP MCP Server
+# SAP BTP Dynamic Multi-Agent
 
-## Project Overview
-A multi-agent Pydantic AI application that manages SAP BTP through specialized agents, each connected to a dedicated MCP server via OAuth 2.1 over Streamable HTTP. An orchestrator agent delegates to three specialists: audit log, Cloud Foundry, and BTP platform management. Uses SAP AI Core's Generative AI Hub as the LLM provider and exposes a web chat interface.
+## Project overview
+Multi-agent Pydantic AI application where specialist agents are defined
+**dynamically at runtime** via an XSUAA-secured admin UI. An orchestrator
+delegates to specialist agents that connect to BTP-hosted MCP servers
+over OAuth 2.1. The user's XSUAA JWT is forwarded to each MCP server.
+SAP AI Core's Generative AI Hub is the LLM provider.
 
 ## Architecture
-- **LLM**: SAP AI Core Generative AI Hub (`sap-ai-sdk-gen` package) via OpenAI-compatible API
-- **MCP**: Streamable HTTP transport with OAuth2 flow (`mcp` SDK's `OAuthClientProvider`)
-- **UI**: Pydantic AI built-in web chat (`orchestrator.to_web()`)
-- **Framework**: Pydantic AI with `OpenAIModel` + `OpenAIProvider` wrapping SAP's `AsyncOpenAI` client
-- **Multi-Agent**: Orchestrator delegates to specialist agents via `@agent.tool` pattern
+- **LLM**: SAP AI Core Generative AI Hub (`sap-ai-sdk-gen`) via
+  OpenAI-compatible API
+- **Storage**: PostgreSQL (BTP `postgresql-db` service) via SQLAlchemy async
+- **MCP**: Streamable HTTP with JWT forwarding (`JWTForwardAuth` in
+  `agents/shared.py`) reading `agents.auth.current_jwt` per request
+- **Framework**: FastAPI app combining admin router + mounted
+  pydantic-ai chat (`DynamicChatApp` rebuilds on reload)
+- **Auth**: Approuter forwards JWT; `agents/auth.py` validates against
+  XSUAA JWKS; `require_admin` dependency enforces `$XSAPPNAME.admin` scope
 
-## Key Files
-- `app.py` — Entry point for the multi-agent web chat
-- `agents/shared.py` — Shared infrastructure: OAuth2, token storage, MCP factory, SAP AI Core model
-- `agents/auditlog.py` — Audit log specialist agent
-- `agents/cloudfoundry.py` — Cloud Foundry specialist agent
-- `agents/btp.py` — BTP platform specialist agent
-- `agents/orchestrator.py` — Orchestrator agent with delegation tools
-- `agent.py` — Legacy single-agent application (kept for reference)
-- `requirements.txt` — Python dependencies
-- `.env` — SAP AI Core credentials (not committed)
-- `.tokens-{name}.json` — Per-server OAuth2 tokens (not committed)
+## Key files
+- `app.py` — FastAPI entry; middleware binds JWT; lifespan initializes
+  DB, seeds from `agents.seed.json`, builds the initial registry
+- `agents/db.py` — SQLAlchemy models (`AgentConfig`, `OrchestratorConfig`),
+  `init_db`, CRUD helpers, VCAP/ENV postgres URL resolver
+- `agents/auth.py` — `current_jwt` contextvar, `XsuaaValidator`,
+  `require_user`/`require_admin` FastAPI dependencies
+- `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
+  on CF / browser OAuth locally), `SAPAICoreModel`
+- `agents/registry.py` — `build_orchestrator` dynamically constructs the
+  orchestrator + delegation tools + specialists from the DB; `Registry`
+  singleton with `reload()` for atomic swaps
+- `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
+  the current `Agent.to_web()` and is rebuilt on reload
+- `agents/admin.py` — FastAPI `/admin` router: CRUD, reload, restart,
+  import/export, seed-on-startup
+- `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
+- `templates/admin.html` — Admin UI (single-page, vanilla JS)
+- `agents.seed.json` — Initial config imported when DB is empty
+- `mta.yaml` — adds `postgresql-db` resource; bumps version to 2.0.0
+- `xs-security.json` — adds `admin` scope, `AgentAdmin` role, admin role
+  collection
+- `approuter/xs-app.json` — routes `/admin` requires admin scope
 
-## MCP Servers
-- **Audit Log**: `https://infrabel-app-dev-cf-ai-btp-agent-auditlog-mcp.cfapps.eu20-001.hana.ondemand.com/`
-- **Cloud Foundry**: `https://infrabel-app-dev-cf-ai-btp-agent-cf-mcp.cfapps.eu20-001.hana.ondemand.com/`
-- **BTP**: `https://infrabel-app-dev-cf-ai-btp-agent-btp-mcp.cfapps.eu20-001.hana.ondemand.com/`
+## Runtime flow
+1. Lifespan: `init_db()` → `seed_from_file_if_empty(SEED_FILE)` →
+   `registry.reload()` → `dynamic_chat_app.refresh()`
+2. Request: `JWTBindingMiddleware` extracts bearer token → sets
+   `current_jwt` contextvar → downstream code (chat → orchestrator →
+   specialist → MCP httpx client) inherits the token via contextvar
+   propagation across asyncio tasks
+3. Admin reload: `POST /admin/api/reload` → `registry.reload()` rebuilds
+   orchestrator from DB → `dynamic_chat_app.refresh()` swaps the ASGI
+   inner app → next chat request gets the new agents
 
-## Configuration
-- `CALLBACK_PORT` — Local port for OAuth2 redirect callback (default: 3000)
-- SAP AI Core model name is set in `agents/shared.py` `get_model()` (currently `gpt-4o`)
-
-## Running
+## Running locally
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # fill in AICORE_* credentials
+cp .env.example .env  # AICORE_* + (optional) DATABASE_URL
 python app.py
-# Opens web chat at http://127.0.0.1:7932
+# Chat:  http://127.0.0.1:7932/chat
+# Admin: http://127.0.0.1:7932/admin  (no XSUAA locally → open access)
 ```
 
-## SAP AI Core Auth
-Credentials are resolved automatically by `sap-ai-sdk-gen` from environment variables:
-- Option A: Individual vars (`AICORE_AUTH_URL`, `AICORE_CLIENT_ID`, `AICORE_CLIENT_SECRET`, `AICORE_BASE_URL`, `AICORE_RESOURCE_GROUP`)
-- Option B: Single JSON blob (`AICORE_SERVICE_KEY`)
+Local falls back to SQLite if no `DATABASE_URL` is set.
 
 ## Dependencies
-- `pydantic-ai[mcp,web,openai]` — Agent framework, MCP client, web UI, OpenAI model support
-- `sap-ai-sdk-gen[all]` — SAP AI Core SDK (handles LLM auth and proxy)
-- `mcp` — MCP protocol SDK (OAuth2 client provider)
-- `httpx` — Async HTTP client
-- `uvicorn` — ASGI server
-- `python-dotenv` — Environment variable loading
+- `pydantic-ai[mcp,web,openai]`, `sap-ai-sdk-gen[all]`, `mcp`, `httpx`,
+  `uvicorn`, `python-dotenv`
+- `fastapi`, `jinja2`, `python-multipart` — admin UI
+- `sqlalchemy[asyncio]`, `asyncpg` — dynamic agent storage
+- `pyjwt[crypto]` — XSUAA JWT validation

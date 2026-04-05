@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: pydantic-agent
-description: Multi-agent Pydantic AI application for SAP BTP management
-version: 1.0.0
+description: Dynamic multi-agent Pydantic AI application for SAP BTP management
+version: 2.0.0
 
 parameters:
   enable-parallel-deployments: true
@@ -21,23 +21,24 @@ modules:
         - ".env"
         - ".tokens.json"
         - ".tokens-*.json"
+        - "agents_registry.db"
         - "mta_archives/"
         - "*.mtar"
         - "approuter/"
     parameters:
-      memory: 512M
+      memory: 1G
       disk-quota: 2G
       buildpack: python_buildpack
       command: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
     properties:
-      # SAP AI Core resource group (not available in VCAP_SERVICES)
       AICORE_RESOURCE_GROUP: "default"
-      # MCP server base URLs
-      MCP_AUDITLOG_URL: "https://infrabel-app-dev-cf-ai-btp-agent-auditlog-mcp.cfapps.eu20-001.hana.ondemand.com"
-      MCP_CLOUDFOUNDRY_URL: "https://infrabel-app-dev-cf-ai-btp-agent-cf-mcp.cfapps.eu20-001.hana.ondemand.com"
-      MCP_BTP_URL: "https://infrabel-app-dev-cf-ai-btp-agent-btp-mcp.cfapps.eu20-001.hana.ondemand.com"
+      # Optional: restrict the set of MCP URLs admins can register.
+      # Comma-separated list of URL prefixes. If empty, any BTP URL is allowed.
+      MCP_URL_ALLOWLIST: ""
     requires:
       - name: aicore-service
+      - name: uaa-service
+      - name: agent-registry-db
     provides:
       - name: pydantic-agent-api
         properties:
@@ -72,3 +73,9 @@ resources:
       service: xsuaa
       service-plan: application
       path: xs-security.json
+
+  - name: agent-registry-db
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: postgresql-db
+      service-plan: trial

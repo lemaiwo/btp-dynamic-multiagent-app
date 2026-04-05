@@ -4,3 +4,9 @@ mcp
 httpx
 uvicorn
 python-dotenv
+fastapi
+jinja2
+python-multipart
+sqlalchemy[asyncio]>=2.0
+asyncpg
+pyjwt[crypto]
