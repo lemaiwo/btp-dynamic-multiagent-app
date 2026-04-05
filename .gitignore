@@ -9,3 +9,4 @@ mta_archives/
 dist/
 node_modules/
 agents_registry.db
+tests/_*.db
