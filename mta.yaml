@@ -73,9 +73,11 @@ resources:
       service: xsuaa
       service-plan: application
       path: xs-security.json
+      config:
+        xsappname: pydantic-agent-${space}
 
   - name: agent-registry-db
     type: org.cloudfoundry.managed-service
     parameters:
       service: postgresql-db
-      service-plan: trial
+      service-plan: standard
