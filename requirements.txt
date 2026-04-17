@@ -9,4 +9,5 @@ jinja2
 python-multipart
 sqlalchemy[asyncio]>=2.0
 asyncpg
+aiosqlite
 pyjwt[crypto]
