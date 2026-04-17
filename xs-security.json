@@ -28,12 +28,12 @@
   ],
   "role-collections": [
     {
-      "name": "Pydantic Agent User",
+      "name": "Agent User",
       "description": "Users who can access the AI agent chat",
       "role-template-references": ["$XSAPPNAME.AgentUser"]
     },
     {
-      "name": "Pydantic Agent Administrator",
+      "name": "Agent Administrator",
       "description": "Administrators who can configure agents dynamically",
       "role-template-references": ["$XSAPPNAME.AgentAdmin"]
     }
