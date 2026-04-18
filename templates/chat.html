@@ -2,24 +2,37 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
-    <link rel="shortcut icon" href="/static/favicon.ico" />
+    <link rel="icon" type="image/png" href="/static/sap.png" />
+    <link rel="shortcut icon" href="/static/sap.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SAP BTP Multi-Agent</title>
     <script type="module" crossorigin src="https://cdn.jsdelivr.net/npm/@pydantic/ai-chat-ui@1.0.0/dist/assets/index-Dtnbv4I1.js"></script>
     <link rel="stylesheet" crossorigin href="https://cdn.jsdelivr.net/npm/@pydantic/ai-chat-ui@1.0.0/dist/assets/index-BtNS_N-J.css">
-    <style>
-      /* Swap the pydantic logo for our own. The UI uses an <img> with the
-         pydantic logo in the top-left; we hide the original and paint a
-         background image onto its container. Adjust the selector if the
-         chat UI upgrades and the DOM changes. */
-      header img[alt*="Pydantic" i],
-      header img[src*="pydantic" i] {
-        content: url("/static/logo.svg");
-        max-height: 28px;
-        width: auto;
-      }
-    </style>
+    <script>
+      // The chat UI is a React SPA rendered after load. Rebrand by watching
+      // for the title <h1> and swapping its logo + text.
+      (function () {
+        const LOGO_URL = "/static/sap.png";
+        const APP_NAME = "SAP BTP Multi-Agent";
+        function rebrand() {
+          document.querySelectorAll("h1 > span").forEach((span) => {
+            if (span.textContent.trim() === "Pydantic AI") {
+              span.textContent = APP_NAME;
+            }
+          });
+          document.querySelectorAll("h1 > img").forEach((img) => {
+            if (img.getAttribute("src") !== LOGO_URL) {
+              img.setAttribute("src", LOGO_URL);
+            }
+          });
+        }
+        new MutationObserver(rebrand).observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+        });
+        rebrand();
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
