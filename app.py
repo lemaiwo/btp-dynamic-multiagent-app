@@ -30,6 +30,7 @@ logger = logging.getLogger("app")
 from fastapi import FastAPI  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
+from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
 from agents.auth import current_jwt  # noqa: E402
 from agents.chat_app import dynamic_chat_app  # noqa: E402
@@ -87,7 +88,15 @@ class JWTBindingMiddleware:
         # token on a request that needs it, fail fast with a clear message
         # instead of letting the chat silently lose MCP authentication.
         path = scope.get("path", "")
-        needs_jwt = ON_CF and path != "/healthz" and not path.startswith("/admin")
+        # /.well-known/agent-card.json is anonymously readable (Joule
+        # and other A2A clients fetch it before authenticating). Admin,
+        # A2A JSON-RPC and the chat UI still require a forwarded JWT.
+        is_public = (
+            path == "/healthz"
+            or path.startswith("/.well-known/")
+            or path.startswith("/static/")
+        )
+        needs_jwt = ON_CF and not is_public and not path.startswith("/admin")
         if needs_jwt and not token:
             logger.warning(
                 "Rejecting %s %s: no JWT — did you hit the approuter URL?",
@@ -132,6 +141,10 @@ async def _send_json(send, status_code: int, body: dict) -> None:
 app = FastAPI(title="SAP BTP Multi-Agent", lifespan=lifespan)
 app.add_middleware(JWTBindingMiddleware)
 app.include_router(admin_router)
+# A2A (Agent-to-Agent) protocol — exposes the orchestrator to SAP Joule
+# and other A2A-capable clients. Must be included before the catch-all
+# chat mount so /.well-known/agent-card.json and /a2a resolve here.
+app.include_router(a2a_router)
 
 
 @app.get("/healthz")
