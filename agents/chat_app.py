@@ -9,10 +9,13 @@ see the changes take effect without restarting the process.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from agents.registry import registry
 
 logger = logging.getLogger(__name__)
+
+CHAT_HTML = Path(__file__).resolve().parent.parent / "templates" / "chat.html"
 
 
 class DynamicChatApp:
@@ -23,7 +26,8 @@ class DynamicChatApp:
 
     def refresh(self) -> None:
         """Rebuild the inner web app from the current orchestrator."""
-        self._app = registry.orchestrator.to_web()
+        html_source = CHAT_HTML if CHAT_HTML.is_file() else None
+        self._app = registry.orchestrator.to_web(html_source=html_source)
 
     async def __call__(self, scope, receive, send):
         if self._app is None:

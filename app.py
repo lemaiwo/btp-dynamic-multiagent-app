@@ -27,9 +27,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
 # Import after load_dotenv so SAP AI Core & XSUAA env vars are available.
-from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.responses import RedirectResponse  # noqa: E402
-from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
 from agents.auth import current_jwt  # noqa: E402
@@ -54,22 +53,77 @@ async def lifespan(app: FastAPI):
 
 
 # ---------------------------------------------------------------------------
-# Middleware: bind JWT to contextvar for MCP forwarding
+# Middleware: bind JWT to contextvar for MCP forwarding.
+#
+# This is a pure-ASGI middleware (not Starlette's BaseHTTPMiddleware) because
+# BaseHTTPMiddleware runs the endpoint in a separate task whose context is
+# captured at call_next() time — for streaming responses (as pydantic-ai's
+# chat uses) the middleware's `finally` can reset the contextvar before the
+# body has finished streaming, making the bound JWT invisible to downstream
+# MCP calls made during streaming.
 # ---------------------------------------------------------------------------
-class JWTBindingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        auth = request.headers.get("authorization") or request.headers.get("Authorization")
-        token: str | None = None
-        if auth:
-            parts = auth.split(None, 1)
-            if len(parts) == 2 and parts[0].lower() == "bearer":
-                token = parts[1].strip()
+ON_CF = "VCAP_APPLICATION" in os.environ
 
+
+class JWTBindingMiddleware:
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        token: str | None = None
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"authorization":
+                parts = value.decode("latin-1").split(None, 1)
+                if len(parts) == 2 and parts[0].lower() == "bearer":
+                    token = parts[1].strip()
+                break
+
+        # On Cloud Foundry, any API request other than /healthz must come
+        # through the approuter (which injects the user JWT). If there is no
+        # token on a request that needs it, fail fast with a clear message
+        # instead of letting the chat silently lose MCP authentication.
+        path = scope.get("path", "")
+        needs_jwt = ON_CF and path != "/healthz" and not path.startswith("/admin")
+        if needs_jwt and not token:
+            logger.warning(
+                "Rejecting %s %s: no JWT — did you hit the approuter URL?",
+                scope.get("method"), path,
+            )
+            await _send_json(
+                send,
+                401,
+                {
+                    "detail": "Missing bearer token. This app must be accessed "
+                    "through its approuter URL so the user JWT is forwarded."
+                },
+            )
+            return
+
+        if token:
+            logger.info("JWT bound for %s %s", scope.get("method"), path)
         marker = current_jwt.set(token)
         try:
-            return await call_next(request)
+            await self.app(scope, receive, send)
         finally:
             current_jwt.reset(marker)
+
+
+async def _send_json(send, status_code: int, body: dict) -> None:
+    import json as _json
+    payload = _json.dumps(body).encode()
+    await send({
+        "type": "http.response.start",
+        "status": status_code,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": payload})
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +139,17 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-# Mount the dynamic chat UI at /chat and redirect / → /chat
-app.mount("/chat", dynamic_chat_app)
+# Serve branding assets (logo, favicon) referenced by templates/chat.html.
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+if _STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
-@app.get("/")
-async def root() -> RedirectResponse:
-    return RedirectResponse(url="/chat")
+# Mount the dynamic chat UI at /. The pydantic-ai chat UI uses absolute
+# paths for its API (e.g. /api/configure), so it must be served from the
+# root. Admin routes are registered above with prefix /admin and take
+# precedence over the chat mount.
+app.mount("/", dynamic_chat_app)
 
 
 if __name__ == "__main__":
@@ -99,6 +157,6 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 7932))
     print(f"Starting SAP BTP Management app on http://127.0.0.1:{port}")
-    print(f"  Chat:  http://127.0.0.1:{port}/chat")
+    print(f"  Chat:  http://127.0.0.1:{port}/")
     print(f"  Admin: http://127.0.0.1:{port}/admin")
     uvicorn.run(app, host="0.0.0.0", port=port)
