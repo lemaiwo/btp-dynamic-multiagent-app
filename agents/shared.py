@@ -150,6 +150,9 @@ class JWTForwardAuth(httpx.Auth):
         token = current_jwt.get()
         if token:
             request.headers["Authorization"] = f"Bearer {token}"
+            logger.debug("JWTForwardAuth: forwarding JWT to %s", request.url)
+        else:
+            logger.warning("JWTForwardAuth: no JWT bound for %s", request.url)
         yield request
 
 
@@ -163,11 +166,17 @@ def create_mcp_server(name: str, base_url: str) -> MCPServerStreamableHTTP:
     Locally: uses authorization_code grant with browser redirect.
     """
     base_url = base_url.rstrip("/")
+    # Accept URLs both with and without the `/mcp` suffix. The configured
+    # URL is normalized to include exactly one `/mcp` at the end.
+    mcp_url = base_url if base_url.endswith("/mcp") else f"{base_url}/mcp"
+    # OAuthClientProvider discovers endpoints from the server root, not /mcp.
+    oauth_base = mcp_url[: -len("/mcp")]
+
     if ON_CF:
         auth: httpx.Auth = JWTForwardAuth()
     else:
         auth = OAuthClientProvider(
-            server_url=base_url,
+            server_url=oauth_base,
             client_metadata=OAuthClientMetadata(
                 client_name=f"SAP BTP Agent - {name}",
                 redirect_uris=[AnyUrl(CALLBACK_URL)],
@@ -180,7 +189,7 @@ def create_mcp_server(name: str, base_url: str) -> MCPServerStreamableHTTP:
         )
 
     return MCPServerStreamableHTTP(
-        url=f"{base_url}/mcp",
+        url=mcp_url,
         http_client=httpx.AsyncClient(
             auth=auth,
             follow_redirects=True,
