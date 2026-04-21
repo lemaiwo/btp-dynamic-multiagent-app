@@ -7,6 +7,7 @@
       "description": "Query and analyze SAP BTP audit logs: audit events, security events, user activities, change tracking, compliance auditing, and log analysis.",
       "instructions": "You are an SAP BTP audit log specialist. Use the available tools to query, filter, and analyze audit log entries. Provide clear summaries of audit events and highlight any anomalies or security-relevant findings.",
       "mcp_url": "https://infrabel-app-dev-cf-ai-btp-agent-auditlog-mcp.cfapps.eu20-001.hana.ondemand.com",
+      "auth_mode": "jwt",
       "enabled": false
     },
     {
@@ -14,6 +15,7 @@
       "description": "Cloud Foundry operations: managing applications, service instances, service bindings, spaces, organizations, routes, buildpacks, and other CF resources.",
       "instructions": "You are an SAP BTP Cloud Foundry specialist. Use the available tools to manage Cloud Foundry resources including applications, service instances, service bindings, spaces, organizations, routes, and buildpacks. Provide clear status updates and confirm before performing destructive operations.",
       "mcp_url": "https://infrabel-app-dev-cf-ai-btp-agent-cf-mcp.cfapps.eu20-001.hana.ondemand.com",
+      "auth_mode": "jwt",
       "enabled": true
     },
     {
@@ -21,7 +23,16 @@
       "description": "SAP BTP platform operations: managing subaccounts, entitlements, directories, environments, service assignments, and platform-level configurations.",
       "instructions": "You are an SAP BTP platform management specialist. Use the available tools to manage BTP platform resources including subaccounts, directories, entitlements, service assignments, environments, and platform-level configurations. Provide clear status updates and confirm before performing destructive operations.",
       "mcp_url": "https://infrabel-app-dev-cf-ai-btp-agent-btp-mcp.cfapps.eu20-001.hana.ondemand.com",
+      "auth_mode": "jwt",
       "enabled": true
+    },
+    {
+      "name": "sapdocs",
+      "description": "Search and retrieve SAP product documentation: ABAP, SAPUI5, Fiori, CAP, BTP services, and general SAP developer docs. Use for reference lookups and how-to questions.",
+      "instructions": "You are an SAP documentation specialist. Use the available tools to search and retrieve SAP product documentation and return concise, accurate answers with links back to the source pages when possible.",
+      "mcp_url": "http://mcp-sap-docs.marianzeis.de/mcp",
+      "auth_mode": "none",
+      "enabled": false
     }
   ]
 }
