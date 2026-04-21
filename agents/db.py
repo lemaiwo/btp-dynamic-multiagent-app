@@ -14,9 +14,14 @@ import os
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, func, select
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# Supported MCP auth modes
+AUTH_MODE_JWT = "jwt"
+AUTH_MODE_NONE = "none"
+VALID_AUTH_MODES = frozenset({AUTH_MODE_JWT, AUTH_MODE_NONE})
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,9 @@ class AgentConfig(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
     mcp_url: Mapped[str] = mapped_column(Text, nullable=False)
+    auth_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=AUTH_MODE_JWT, server_default=AUTH_MODE_JWT
+    )
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -105,6 +113,7 @@ class AgentConfig(Base):
             "description": self.description,
             "instructions": self.instructions,
             "mcp_url": self.mcp_url,
+            "auth_mode": self.auth_mode,
             "enabled": bool(self.enabled),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -116,6 +125,7 @@ class AgentConfig(Base):
             "description": self.description,
             "instructions": self.instructions,
             "mcp_url": self.mcp_url,
+            "auth_mode": self.auth_mode,
             "enabled": bool(self.enabled),
         }
 
@@ -147,6 +157,9 @@ async def init_db() -> None:
     """Create tables and ensure an orchestrator config row exists."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight migration: add auth_mode to pre-existing agent_configs.
+        # SQLAlchemy's create_all does not add columns to existing tables.
+        await _ensure_auth_mode_column(conn)
 
     async with SessionLocal() as session:
         existing = await session.get(OrchestratorConfig, 1)
@@ -155,6 +168,33 @@ async def init_db() -> None:
                 OrchestratorConfig(id=1, instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
             )
             await session.commit()
+
+
+async def _ensure_auth_mode_column(conn) -> None:
+    dialect = conn.dialect.name
+    if dialect == "postgresql":
+        await conn.execute(
+            text(
+                "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS "
+                f"auth_mode VARCHAR(16) NOT NULL DEFAULT '{AUTH_MODE_JWT}'"
+            )
+        )
+        return
+    # SQLite (and other dialects): probe columns, then add if missing.
+    try:
+        result = await conn.exec_driver_sql("PRAGMA table_info(agent_configs)")
+        cols = {row[1] for row in result.fetchall()}
+    except Exception:
+        logger.debug("Could not introspect agent_configs columns", exc_info=True)
+        return
+    if "auth_mode" not in cols:
+        try:
+            await conn.exec_driver_sql(
+                "ALTER TABLE agent_configs ADD COLUMN auth_mode "
+                f"VARCHAR(16) NOT NULL DEFAULT '{AUTH_MODE_JWT}'"
+            )
+        except Exception:
+            logger.exception("Failed to add auth_mode column to agent_configs")
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +221,11 @@ async def upsert_agent(
     description: str,
     instructions: str,
     mcp_url: str,
+    auth_mode: str = AUTH_MODE_JWT,
     enabled: bool = True,
 ) -> AgentConfig:
+    if auth_mode not in VALID_AUTH_MODES:
+        raise ValueError(f"invalid auth_mode {auth_mode!r}")
     existing = await get_agent_by_name(session, name)
     if existing is None:
         row = AgentConfig(
@@ -190,6 +233,7 @@ async def upsert_agent(
             description=description,
             instructions=instructions,
             mcp_url=mcp_url,
+            auth_mode=auth_mode,
             enabled=1 if enabled else 0,
         )
         session.add(row)
@@ -197,6 +241,7 @@ async def upsert_agent(
         existing.description = description
         existing.instructions = instructions
         existing.mcp_url = mcp_url
+        existing.auth_mode = auth_mode
         existing.enabled = 1 if enabled else 0
         row = existing
     await session.commit()

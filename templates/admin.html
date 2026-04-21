@@ -143,9 +143,11 @@
     <div class="panel">
         <h2>Agents</h2>
         <p class="hint">
-            Each agent connects to a BTP-hosted MCP server over OAuth 2.1.
-            The user's JWT is forwarded on every request. Only HTTPS URLs
-            on <code>*.hana.ondemand.com</code> are allowed.
+            Each agent connects to an MCP server. Choose <code>JWT forward</code>
+            for BTP-hosted servers (HTTPS on <code>*.hana.ondemand.com</code>
+            only; the user's JWT is forwarded on every request) or
+            <code>None (public)</code> for public MCP servers that do not
+            require authentication.
         </p>
         <div class="toolbar">
             <button onclick="openAgentModal()">+ New agent</button>
@@ -162,12 +164,13 @@
                     <th>Name</th>
                     <th>Description</th>
                     <th>MCP URL</th>
+                    <th>Auth</th>
                     <th>Status</th>
                     <th></th>
                 </tr>
             </thead>
             <tbody id="agents-tbody">
-                <tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr>
+                <tr><td colspan="6" style="color:var(--muted)">Loading…</td></tr>
             </tbody>
         </table>
     </div>
@@ -208,6 +211,16 @@
                        placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com" required>
             </label>
             <label class="full">
+                Authentication
+                <select id="agent-auth-mode">
+                    <option value="jwt">JWT forward (BTP-hosted)</option>
+                    <option value="none">None (public MCP server)</option>
+                </select>
+                <span style="color:var(--muted);font-weight:normal;font-size:12px">
+                    Public mode skips all auth and bypasses the BTP host allow-list.
+                </span>
+            </label>
+            <label class="full">
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
             </label>
@@ -241,7 +254,7 @@ async function loadAgents() {
     const agents = await res.json();
     const tbody = document.getElementById('agents-tbody');
     if (agents.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No agents configured yet.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">No agents configured yet.</td></tr>';
         return;
     }
     tbody.innerHTML = agents.map(a => `
@@ -249,6 +262,7 @@ async function loadAgents() {
             <td><strong>${escapeHtml(a.name)}</strong></td>
             <td style="max-width:280px">${escapeHtml(a.description)}</td>
             <td style="max-width:260px;word-break:break-all"><code>${escapeHtml(a.mcp_url)}</code></td>
+            <td>${authLabel(a.auth_mode)}</td>
             <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
             <td class="row-actions">
                 <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
@@ -256,6 +270,11 @@ async function loadAgents() {
             </td>
         </tr>
     `).join('');
+}
+
+function authLabel(mode) {
+    if (mode === 'none') return '<span class="status-badge off">public</span>';
+    return '<span class="status-badge on">jwt</span>';
 }
 
 async function loadOrchestrator() {
@@ -272,6 +291,7 @@ function openAgentModal() {
     document.getElementById('agent-description').value = '';
     document.getElementById('agent-instructions').value = '';
     document.getElementById('agent-mcp-url').value = '';
+    document.getElementById('agent-auth-mode').value = 'jwt';
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -290,6 +310,7 @@ async function editAgent(id) {
     document.getElementById('agent-description').value = a.description;
     document.getElementById('agent-instructions').value = a.instructions;
     document.getElementById('agent-mcp-url').value = a.mcp_url;
+    document.getElementById('agent-auth-mode').value = a.auth_mode || 'jwt';
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -301,6 +322,7 @@ async function saveAgent() {
         description: document.getElementById('agent-description').value.trim(),
         instructions: document.getElementById('agent-instructions').value.trim(),
         mcp_url: document.getElementById('agent-mcp-url').value.trim(),
+        auth_mode: document.getElementById('agent-auth-mode').value,
         enabled: document.getElementById('agent-enabled').checked,
     });
     const res = id
