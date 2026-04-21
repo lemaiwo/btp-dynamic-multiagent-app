@@ -159,22 +159,29 @@ class JWTForwardAuth(httpx.Auth):
 # ---------------------------------------------------------------------------
 # MCP server factory
 # ---------------------------------------------------------------------------
-def create_mcp_server(name: str, base_url: str) -> MCPServerStreamableHTTP:
-    """Create an MCP server connection with OAuth2 authentication.
+def create_mcp_server(
+    name: str, base_url: str, auth_mode: str = "jwt"
+) -> MCPServerStreamableHTTP:
+    """Create an MCP server connection.
 
-    On Cloud Foundry: forwards the user's JWT on each request.
-    Locally: uses authorization_code grant with browser redirect.
+    auth_mode:
+      - "jwt" (default): JWT forwarding on CF; OAuth2 authorization_code
+        with browser redirect locally. Use for BTP-hosted MCP servers.
+      - "none": no authentication. Use for public MCP servers.
     """
     base_url = base_url.rstrip("/")
     # Accept URLs both with and without the `/mcp` suffix. The configured
     # URL is normalized to include exactly one `/mcp` at the end.
     mcp_url = base_url if base_url.endswith("/mcp") else f"{base_url}/mcp"
-    # OAuthClientProvider discovers endpoints from the server root, not /mcp.
-    oauth_base = mcp_url[: -len("/mcp")]
 
-    if ON_CF:
-        auth: httpx.Auth = JWTForwardAuth()
+    auth: httpx.Auth | None
+    if auth_mode == "none":
+        auth = None
+    elif ON_CF:
+        auth = JWTForwardAuth()
     else:
+        # OAuthClientProvider discovers endpoints from the server root, not /mcp.
+        oauth_base = mcp_url[: -len("/mcp")]
         auth = OAuthClientProvider(
             server_url=oauth_base,
             client_metadata=OAuthClientMetadata(
