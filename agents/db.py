@@ -98,6 +98,9 @@ class AgentConfig(Base):
     auth_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default=AUTH_MODE_JWT, server_default=AUTH_MODE_JWT
     )
+    # JSON-encoded list of additional MCP servers beyond the primary
+    # (mcp_url/auth_mode). Each entry is {"url": str, "auth_mode": str}.
+    extra_servers_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -105,6 +108,27 @@ class AgentConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+    @property
+    def mcp_servers(self) -> list[dict[str, str]]:
+        """Full list of MCP servers, primary first."""
+        out: list[dict[str, str]] = [{"url": self.mcp_url, "auth_mode": self.auth_mode}]
+        if self.extra_servers_json:
+            try:
+                extras = json.loads(self.extra_servers_json)
+            except Exception:
+                logger.warning("Malformed extra_servers_json on agent %s", self.name)
+                return out
+            if isinstance(extras, list):
+                for e in extras:
+                    if isinstance(e, dict) and "url" in e:
+                        out.append(
+                            {
+                                "url": str(e["url"]),
+                                "auth_mode": str(e.get("auth_mode") or AUTH_MODE_JWT),
+                            }
+                        )
+        return out
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +138,7 @@ class AgentConfig(Base):
             "instructions": self.instructions,
             "mcp_url": self.mcp_url,
             "auth_mode": self.auth_mode,
+            "mcp_servers": self.mcp_servers,
             "enabled": bool(self.enabled),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -124,8 +149,7 @@ class AgentConfig(Base):
             "name": self.name,
             "description": self.description,
             "instructions": self.instructions,
-            "mcp_url": self.mcp_url,
-            "auth_mode": self.auth_mode,
+            "mcp_servers": self.mcp_servers,
             "enabled": bool(self.enabled),
         }
 
@@ -157,9 +181,17 @@ async def init_db() -> None:
     """Create tables and ensure an orchestrator config row exists."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Lightweight migration: add auth_mode to pre-existing agent_configs.
-        # SQLAlchemy's create_all does not add columns to existing tables.
-        await _ensure_auth_mode_column(conn)
+        # Lightweight migrations: SQLAlchemy create_all doesn't add columns
+        # to existing tables.
+        await _ensure_column(
+            conn,
+            "agent_configs",
+            "auth_mode",
+            f"VARCHAR(16) NOT NULL DEFAULT '{AUTH_MODE_JWT}'",
+        )
+        await _ensure_column(
+            conn, "agent_configs", "extra_servers_json", "TEXT"
+        )
 
     async with SessionLocal() as session:
         existing = await session.get(OrchestratorConfig, 1)
@@ -170,31 +202,27 @@ async def init_db() -> None:
             await session.commit()
 
 
-async def _ensure_auth_mode_column(conn) -> None:
+async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> None:
+    """Idempotently add a column to a table if it doesn't already exist."""
     dialect = conn.dialect.name
     if dialect == "postgresql":
         await conn.execute(
-            text(
-                "ALTER TABLE agent_configs ADD COLUMN IF NOT EXISTS "
-                f"auth_mode VARCHAR(16) NOT NULL DEFAULT '{AUTH_MODE_JWT}'"
-            )
+            text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {ddl_type}")
         )
         return
-    # SQLite (and other dialects): probe columns, then add if missing.
     try:
-        result = await conn.exec_driver_sql("PRAGMA table_info(agent_configs)")
+        result = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
         cols = {row[1] for row in result.fetchall()}
     except Exception:
-        logger.debug("Could not introspect agent_configs columns", exc_info=True)
+        logger.debug("Could not introspect %s columns", table, exc_info=True)
         return
-    if "auth_mode" not in cols:
+    if column not in cols:
         try:
             await conn.exec_driver_sql(
-                "ALTER TABLE agent_configs ADD COLUMN auth_mode "
-                f"VARCHAR(16) NOT NULL DEFAULT '{AUTH_MODE_JWT}'"
+                f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"
             )
         except Exception:
-            logger.exception("Failed to add auth_mode column to agent_configs")
+            logger.exception("Failed to add %s column to %s", column, table)
 
 
 # ---------------------------------------------------------------------------
@@ -220,28 +248,43 @@ async def upsert_agent(
     name: str,
     description: str,
     instructions: str,
-    mcp_url: str,
-    auth_mode: str = AUTH_MODE_JWT,
+    mcp_servers: list[dict[str, str]],
     enabled: bool = True,
 ) -> AgentConfig:
-    if auth_mode not in VALID_AUTH_MODES:
-        raise ValueError(f"invalid auth_mode {auth_mode!r}")
+    if not mcp_servers:
+        raise ValueError("at least one MCP server is required")
+    normalized: list[dict[str, str]] = []
+    for s in mcp_servers:
+        url = (s.get("url") or "").strip()
+        mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
+        if not url:
+            raise ValueError("MCP server url is required")
+        if mode not in VALID_AUTH_MODES:
+            raise ValueError(f"invalid auth_mode {mode!r}")
+        normalized.append({"url": url, "auth_mode": mode})
+
+    primary = normalized[0]
+    extras = normalized[1:]
+    extras_json = json.dumps(extras) if extras else None
+
     existing = await get_agent_by_name(session, name)
     if existing is None:
         row = AgentConfig(
             name=name,
             description=description,
             instructions=instructions,
-            mcp_url=mcp_url,
-            auth_mode=auth_mode,
+            mcp_url=primary["url"],
+            auth_mode=primary["auth_mode"],
+            extra_servers_json=extras_json,
             enabled=1 if enabled else 0,
         )
         session.add(row)
     else:
         existing.description = description
         existing.instructions = instructions
-        existing.mcp_url = mcp_url
-        existing.auth_mode = auth_mode
+        existing.mcp_url = primary["url"]
+        existing.auth_mode = primary["auth_mode"]
+        existing.extra_servers_json = extras_json
         existing.enabled = 1 if enabled else 0
         row = existing
     await session.commit()

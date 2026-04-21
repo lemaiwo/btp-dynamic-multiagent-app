@@ -83,18 +83,29 @@ async def build_orchestrator() -> BuildResult:
 
     # Build each specialist and register a delegation tool on the orchestrator
     for row in enabled_rows:
-        try:
-            mcp_server = create_mcp_server(row.name, row.mcp_url, row.auth_mode)
-        except Exception:
-            logger.exception("Failed to create MCP server for %s", row.name)
+        servers = []
+        for idx, spec in enumerate(row.mcp_servers):
+            server_name = row.name if idx == 0 else f"{row.name}-{idx}"
+            try:
+                servers.append(
+                    create_mcp_server(server_name, spec["url"], spec["auth_mode"])
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to create MCP server %s for agent %s",
+                    spec.get("url"),
+                    row.name,
+                )
+        if not servers:
+            logger.warning("Agent %s has no usable MCP servers; skipping", row.name)
             continue
 
-        mcp_clients.append(mcp_server)
+        mcp_clients.extend(servers)
 
         specialist = Agent(
             get_model(),
             instructions=row.instructions,
-            toolsets=[mcp_server],
+            toolsets=servers,
         )
         specialists[row.name] = specialist
 
