@@ -143,7 +143,8 @@
     <div class="panel">
         <h2>Agents</h2>
         <p class="hint">
-            Each agent connects to an MCP server. Choose <code>JWT forward</code>
+            Each agent can connect to one or more MCP servers — all of their
+            tools are exposed to the specialist. Choose <code>JWT forward</code>
             for BTP-hosted servers (HTTPS on <code>*.hana.ondemand.com</code>
             only; the user's JWT is forwarded on every request) or
             <code>None (public)</code> for public MCP servers that do not
@@ -206,17 +207,11 @@
                 <textarea id="agent-instructions" rows="6" required></textarea>
             </label>
             <label class="full">
-                MCP server URL
-                <input type="url" id="agent-mcp-url"
-                       placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com" required>
-            </label>
-            <label class="full">
-                Authentication
-                <select id="agent-auth-mode">
-                    <option value="jwt">JWT forward (BTP-hosted)</option>
-                    <option value="none">None (public MCP server)</option>
-                </select>
-                <span style="color:var(--muted);font-weight:normal;font-size:12px">
+                MCP servers <span style="color:var(--muted);font-weight:normal">(at least one — all servers' tools are exposed to the specialist)</span>
+                <div id="agent-mcp-servers"></div>
+                <button type="button" class="secondary small" style="margin-top:6px"
+                        onclick="addMcpServerRow()">+ Add MCP server</button>
+                <span style="display:block;color:var(--muted);font-weight:normal;font-size:12px;margin-top:4px">
                     Public mode skips all auth and bypasses the BTP host allow-list.
                 </span>
             </label>
@@ -257,24 +252,76 @@ async function loadAgents() {
         tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">No agents configured yet.</td></tr>';
         return;
     }
-    tbody.innerHTML = agents.map(a => `
-        <tr>
-            <td><strong>${escapeHtml(a.name)}</strong></td>
-            <td style="max-width:280px">${escapeHtml(a.description)}</td>
-            <td style="max-width:260px;word-break:break-all"><code>${escapeHtml(a.mcp_url)}</code></td>
-            <td>${authLabel(a.auth_mode)}</td>
-            <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
-            <td class="row-actions">
-                <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
-                <button class="small danger" onclick="deleteAgentRow(${a.id}, '${escapeHtml(a.name)}')">Delete</button>
-            </td>
-        </tr>
-    `).join('');
+    tbody.innerHTML = agents.map(a => {
+        const servers = a.mcp_servers && a.mcp_servers.length
+            ? a.mcp_servers
+            : [{url: a.mcp_url, auth_mode: a.auth_mode || 'jwt'}];
+        const primary = servers[0];
+        const extraCount = servers.length - 1;
+        const urlCell = `<code>${escapeHtml(primary.url)}</code>` +
+            (extraCount > 0
+                ? ` <span class="status-badge on" title="${servers.slice(1).map(s => escapeHtml(s.url)).join('\n')}">+${extraCount} more</span>`
+                : '');
+        const modes = [...new Set(servers.map(s => s.auth_mode || 'jwt'))];
+        const authCell = modes.map(authLabel).join(' ');
+        return `
+            <tr>
+                <td><strong>${escapeHtml(a.name)}</strong></td>
+                <td style="max-width:280px">${escapeHtml(a.description)}</td>
+                <td style="max-width:260px;word-break:break-all">${urlCell}</td>
+                <td>${authCell}</td>
+                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
+                <td class="row-actions">
+                    <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
+                    <button class="small danger" onclick="deleteAgentRow(${a.id}, '${escapeHtml(a.name)}')">Delete</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
 }
 
 function authLabel(mode) {
     if (mode === 'none') return '<span class="status-badge off">public</span>';
     return '<span class="status-badge on">jwt</span>';
+}
+
+function renderMcpServers(servers) {
+    const container = document.getElementById('agent-mcp-servers');
+    container.innerHTML = '';
+    if (!servers || !servers.length) {
+        addMcpServerRow();
+        return;
+    }
+    servers.forEach(s => addMcpServerRow(s));
+}
+
+function addMcpServerRow(server) {
+    server = server || {url: '', auth_mode: 'jwt'};
+    const container = document.getElementById('agent-mcp-servers');
+    const row = document.createElement('div');
+    row.className = 'mcp-server-row';
+    row.style.cssText = 'display:grid;grid-template-columns:1fr 180px 32px;gap:6px;margin-bottom:6px;align-items:center';
+    row.innerHTML = `
+        <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
+        <select class="mcp-auth-mode">
+            <option value="jwt">JWT forward (BTP)</option>
+            <option value="none">None (public)</option>
+        </select>
+        <button type="button" class="small danger" title="Remove" onclick="this.parentNode.remove()">×</button>
+    `;
+    row.querySelector('.mcp-url').value = server.url || '';
+    row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
+    container.appendChild(row);
+}
+
+function collectMcpServers() {
+    const out = [];
+    document.querySelectorAll('#agent-mcp-servers .mcp-server-row').forEach(r => {
+        const url = r.querySelector('.mcp-url').value.trim();
+        if (!url) return;
+        out.push({url, auth_mode: r.querySelector('.mcp-auth-mode').value});
+    });
+    return out;
 }
 
 async function loadOrchestrator() {
@@ -290,8 +337,7 @@ function openAgentModal() {
     document.getElementById('agent-name').value = '';
     document.getElementById('agent-description').value = '';
     document.getElementById('agent-instructions').value = '';
-    document.getElementById('agent-mcp-url').value = '';
-    document.getElementById('agent-auth-mode').value = 'jwt';
+    renderMcpServers([]);
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -309,20 +355,26 @@ async function editAgent(id) {
     document.getElementById('agent-name').value = a.name;
     document.getElementById('agent-description').value = a.description;
     document.getElementById('agent-instructions').value = a.instructions;
-    document.getElementById('agent-mcp-url').value = a.mcp_url;
-    document.getElementById('agent-auth-mode').value = a.auth_mode || 'jwt';
+    const servers = a.mcp_servers && a.mcp_servers.length
+        ? a.mcp_servers
+        : [{url: a.mcp_url || '', auth_mode: a.auth_mode || 'jwt'}];
+    renderMcpServers(servers);
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-modal').classList.add('open');
 }
 
 async function saveAgent() {
     const id = document.getElementById('agent-id').value;
+    const servers = collectMcpServers();
+    if (!servers.length) {
+        toast('Add at least one MCP server', 'error');
+        return;
+    }
     const body = JSON.stringify({
         name: document.getElementById('agent-name').value.trim(),
         description: document.getElementById('agent-description').value.trim(),
         instructions: document.getElementById('agent-instructions').value.trim(),
-        mcp_url: document.getElementById('agent-mcp-url').value.trim(),
-        auth_mode: document.getElementById('agent-auth-mode').value,
+        mcp_servers: servers,
         enabled: document.getElementById('agent-enabled').checked,
     });
     const res = id

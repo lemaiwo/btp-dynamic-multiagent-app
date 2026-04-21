@@ -51,13 +51,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
-class AgentPayload(BaseModel):
-    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_\- ]+$")
-    description: str = Field(min_length=1, max_length=2000)
-    instructions: str = Field(min_length=1)
-    mcp_url: str = Field(min_length=1)
+class McpServerPayload(BaseModel):
+    url: str = Field(min_length=1)
     auth_mode: str = Field(default=AUTH_MODE_JWT)
-    enabled: bool = True
 
     @field_validator("auth_mode")
     @classmethod
@@ -70,18 +66,17 @@ class AgentPayload(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _validate_mcp_url(self) -> "AgentPayload":
-        v = self.mcp_url.strip().rstrip("/")
+    def _validate_url(self) -> "McpServerPayload":
+        v = self.url.strip().rstrip("/")
         public = self.auth_mode == AUTH_MODE_NONE
         # Public servers may use http; authenticated servers must use https
         # so forwarded JWTs are not exposed on the wire.
         if public:
             if not (v.startswith("http://") or v.startswith("https://")):
-                raise ValueError("mcp_url must be http:// or https://")
+                raise ValueError("url must be http:// or https://")
         else:
             if not v.startswith("https://"):
-                raise ValueError("mcp_url must use https:// (set auth_mode=none for public servers)")
-        # Validate it parses as a URL
+                raise ValueError("url must use https:// (set auth_mode=none for public servers)")
         try:
             HttpUrl(v)
         except Exception as e:
@@ -94,22 +89,63 @@ class AgentPayload(BaseModel):
                 allowed = [a.strip() for a in allowlist.split(",") if a.strip()]
                 if not any(v.startswith(a.rstrip("/")) for a in allowed):
                     raise ValueError(
-                        f"mcp_url is not in MCP_URL_ALLOWLIST ({allowlist})"
+                        f"url is not in MCP_URL_ALLOWLIST ({allowlist})"
                     )
             else:
-                # Default: only allow BTP Cloud Foundry domains
                 host = v.split("/", 3)[2]
                 if not (
                     host.endswith(".hana.ondemand.com")
                     or host.endswith(".cfapps.sap.hana.ondemand.com")
                 ):
                     raise ValueError(
-                        "mcp_url must be a BTP-hosted URL (*.hana.ondemand.com). "
+                        "url must be a BTP-hosted URL (*.hana.ondemand.com). "
                         "Set MCP_URL_ALLOWLIST to override, or set auth_mode=none "
                         "for public MCP servers."
                     )
-        self.mcp_url = v
+        self.url = v
         return self
+
+
+class AgentPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_\- ]+$")
+    description: str = Field(min_length=1, max_length=2000)
+    instructions: str = Field(min_length=1)
+    mcp_servers: list[McpServerPayload] = Field(default_factory=list)
+    enabled: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_single_url(cls, data: Any) -> Any:
+        """Accept legacy {mcp_url, auth_mode} singletons by converting to
+        a single-entry mcp_servers list.
+        """
+        if not isinstance(data, dict):
+            return data
+        if data.get("mcp_servers"):
+            return data
+        legacy_url = data.get("mcp_url")
+        if legacy_url:
+            data = dict(data)
+            data["mcp_servers"] = [
+                {
+                    "url": legacy_url,
+                    "auth_mode": data.get("auth_mode") or AUTH_MODE_JWT,
+                }
+            ]
+        return data
+
+    @model_validator(mode="after")
+    def _require_server(self) -> "AgentPayload":
+        if not self.mcp_servers:
+            raise ValueError("at least one mcp_servers entry is required")
+        # Reject duplicates within a single agent
+        urls = [s.url for s in self.mcp_servers]
+        if len(set(urls)) != len(urls):
+            raise ValueError("mcp_servers contains duplicate urls")
+        return self
+
+    def to_servers_list(self) -> list[dict[str, str]]:
+        return [{"url": s.url, "auth_mode": s.auth_mode} for s in self.mcp_servers]
 
 
 class OrchestratorPayload(BaseModel):
@@ -161,8 +197,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
             name=payload.name,
             description=payload.description,
             instructions=payload.instructions,
-            mcp_url=payload.mcp_url,
-            auth_mode=payload.auth_mode,
+            mcp_servers=payload.to_servers_list(),
             enabled=payload.enabled,
         )
         return row.to_dict()
@@ -192,11 +227,15 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 raise HTTPException(
                     status_code=409, detail=f"Agent name '{payload.name}' already exists"
                 )
+        servers = payload.to_servers_list()
+        primary = servers[0]
+        extras = servers[1:]
         row.name = payload.name
         row.description = payload.description
         row.instructions = payload.instructions
-        row.mcp_url = payload.mcp_url
-        row.auth_mode = payload.auth_mode
+        row.mcp_url = primary["url"]
+        row.auth_mode = primary["auth_mode"]
+        row.extra_servers_json = json.dumps(extras) if extras else None
         row.enabled = 1 if payload.enabled else 0
         await session.commit()
         await session.refresh(row)
@@ -301,8 +340,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 name=agent.name,
                 description=agent.description,
                 instructions=agent.instructions,
-                mcp_url=agent.mcp_url,
-                auth_mode=agent.auth_mode,
+                mcp_servers=agent.to_servers_list(),
                 enabled=agent.enabled,
             )
             imported_names.add(agent.name)
@@ -358,8 +396,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                 name=payload.name,
                 description=payload.description,
                 instructions=payload.instructions,
-                mcp_url=payload.mcp_url,
-                auth_mode=payload.auth_mode,
+                mcp_servers=payload.to_servers_list(),
                 enabled=payload.enabled,
             )
             count += 1
