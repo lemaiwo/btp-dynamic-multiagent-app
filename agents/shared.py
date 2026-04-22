@@ -160,7 +160,10 @@ class JWTForwardAuth(httpx.Auth):
 # MCP server factory
 # ---------------------------------------------------------------------------
 def create_mcp_server(
-    name: str, base_url: str, auth_mode: str = "jwt"
+    name: str,
+    base_url: str,
+    auth_mode: str = "jwt",
+    tool_prefix: str | None = None,
 ) -> MCPServerStreamableHTTP:
     """Create an MCP server connection.
 
@@ -168,6 +171,10 @@ def create_mcp_server(
       - "jwt" (default): JWT forwarding on CF; OAuth2 authorization_code
         with browser redirect locally. Use for BTP-hosted MCP servers.
       - "none": no authentication. Use for public MCP servers.
+
+    tool_prefix: when set, all tools from this server are exposed as
+    `{tool_prefix}_{tool_name}`. Use to disambiguate when a single agent
+    binds multiple MCP servers that share tool names.
     """
     base_url = base_url.rstrip("/")
     # Accept URLs both with and without the `/mcp` suffix. The configured
@@ -197,6 +204,7 @@ def create_mcp_server(
 
     return MCPServerStreamableHTTP(
         url=mcp_url,
+        tool_prefix=tool_prefix,
         http_client=httpx.AsyncClient(
             auth=auth,
             follow_redirects=True,
