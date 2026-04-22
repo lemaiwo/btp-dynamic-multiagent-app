@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from pydantic_ai import Agent, RunContext
 
@@ -35,6 +36,28 @@ def _sanitize_tool_name(name: str) -> str:
     slug = _TOOL_NAME_RE.sub("_", name.strip().lower())
     slug = re.sub(r"_+", "_", slug).strip("_")
     return f"delegate_{slug}" if slug else "delegate_agent"
+
+
+def _compute_tool_prefixes(urls: list[str]) -> list[str]:
+    """Derive one tool prefix per URL from its hostname, disambiguating
+    collisions by appending an index. Used when an agent binds multiple
+    MCP servers so their tool names don't clash."""
+    slugs = []
+    for u in urls:
+        host = (urlparse(u).hostname or "mcp").lower()
+        slug = re.sub(r"[^a-z0-9]+", "_", host).strip("_") or "mcp"
+        slugs.append(slug)
+    counts: dict[str, int] = {s: slugs.count(s) for s in set(slugs)}
+    seen: dict[str, int] = {}
+    result: list[str] = []
+    for s in slugs:
+        if counts[s] > 1:
+            n = seen.get(s, 0)
+            seen[s] = n + 1
+            result.append(f"{s}_{n}")
+        else:
+            result.append(s)
+    return result
 
 
 def _format_error(exc: BaseException) -> str:
@@ -84,11 +107,22 @@ async def build_orchestrator() -> BuildResult:
     # Build each specialist and register a delegation tool on the orchestrator
     for row in enabled_rows:
         servers = []
-        for idx, spec in enumerate(row.mcp_servers):
+        specs = row.mcp_servers
+        prefixes = (
+            _compute_tool_prefixes([s["url"] for s in specs])
+            if len(specs) > 1
+            else [None] * len(specs)
+        )
+        for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:
                 servers.append(
-                    create_mcp_server(server_name, spec["url"], spec["auth_mode"])
+                    create_mcp_server(
+                        server_name,
+                        spec["url"],
+                        spec["auth_mode"],
+                        tool_prefix=prefix,
+                    )
                 )
             except Exception:
                 logger.exception(
