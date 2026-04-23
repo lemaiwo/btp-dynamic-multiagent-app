@@ -17,6 +17,21 @@
       "csrfProtection": false
     },
     {
+      "source": "^/.well-known/(agent-card|agent).json$",
+      "target": "/.well-known/$1.json",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "none",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/a2a$",
+      "target": "/a2a",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "xsuaa",
+      "csrfProtection": false,
+      "scope": "$XSAPPNAME.a2a"
+    },
+    {
       "source": "^(.*)$",
       "target": "$1",
       "destination": "pydantic-agent-backend",
