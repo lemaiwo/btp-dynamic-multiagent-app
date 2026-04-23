@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.0.0
+version: 2.1.0
 
 parameters:
   enable-parallel-deployments: true
@@ -35,6 +35,13 @@ modules:
       # Optional: restrict the set of MCP URLs admins can register.
       # Comma-separated list of URL prefixes. If empty, any BTP URL is allowed.
       MCP_URL_ALLOWLIST: ""
+      # A2A / Joule integration — the public approuter URL of this app.
+      # Joule fetches the agent card from this URL; the card's `url`
+      # field is derived from it, so it MUST match the approuter host.
+      # Example: https://<org>-<space>-pydantic-agent-approuter.cfapps.eu20-001.hana.ondemand.com
+      A2A_PUBLIC_URL: ""
+      A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
+      A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
     requires:
       - name: aicore-service
       - name: uaa-service

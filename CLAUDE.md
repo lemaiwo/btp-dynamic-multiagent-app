@@ -34,13 +34,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/admin.py` — FastAPI `/admin` router: CRUD, reload, restart,
   import/export, seed-on-startup
+- `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
+  `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
+  `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
 - `templates/admin.html` — Admin UI (single-page, vanilla JS)
 - `agents.seed.json` — Initial config imported when DB is empty
-- `mta.yaml` — adds `postgresql-db` resource; bumps version to 2.0.0
-- `xs-security.json` — adds `admin` scope, `AgentAdmin` role, admin role
-  collection
-- `approuter/xs-app.json` — routes `/admin` requires admin scope
+- `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
+  A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …)
+- `xs-security.json` — `admin`, `user`, and `a2a` scopes with matching
+  role templates and role collections
+- `approuter/xs-app.json` — `/admin` requires admin scope, `/a2a`
+  requires `a2a` scope, `/.well-known/agent-card.json` is anonymous
+- `JOULE_A2A.md` — configuration guide for BTP + Joule Agent Hub
 
 ## Runtime flow
 1. Lifespan: `init_db()` → `seed_from_file_if_empty(SEED_FILE)` →

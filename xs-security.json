@@ -2,7 +2,14 @@
   "xsappname": "pydantic-agent",
   "tenant-mode": "dedicated",
   "oauth2-configuration": {
-    "redirect-uris": ["https://*.cfapps.eu20-001.hana.ondemand.com/**"]
+    "redirect-uris": ["https://*.cfapps.eu20-001.hana.ondemand.com/**"],
+    "credential-types": ["binding-secret", "x509"],
+    "grant-types": [
+      "authorization_code",
+      "refresh_token",
+      "client_credentials",
+      "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    ]
   },
   "scopes": [
     {
@@ -12,6 +19,11 @@
     {
       "name": "$XSAPPNAME.admin",
       "description": "Administer dynamic agent configuration"
+    },
+    {
+      "name": "$XSAPPNAME.a2a",
+      "description": "Invoke the orchestrator over the A2A protocol (Joule Agent Hub)",
+      "grant-as-authority-to-apps": ["$XSAPPNAME(application,sap-provisioning,tenant-onboarding)"]
     }
   ],
   "role-templates": [
@@ -24,6 +36,11 @@
       "name": "AgentAdmin",
       "description": "Create, edit, delete and reload agents via the admin UI",
       "scope-references": ["$XSAPPNAME.user", "$XSAPPNAME.admin"]
+    },
+    {
+      "name": "AgentA2AClient",
+      "description": "Remote A2A client (e.g. SAP Joule) allowed to invoke the orchestrator",
+      "scope-references": ["$XSAPPNAME.a2a"]
     }
   ],
   "role-collections": [
@@ -36,6 +53,11 @@
       "name": "Agent Administrator",
       "description": "Administrators who can configure agents dynamically",
       "role-template-references": ["$XSAPPNAME.AgentAdmin"]
+    },
+    {
+      "name": "Agent A2A Client",
+      "description": "Technical role collection granting A2A invocation rights (assign to the Joule Agent Hub technical user or service instance)",
+      "role-template-references": ["$XSAPPNAME.AgentA2AClient"]
     }
   ]
 }

@@ -223,3 +223,14 @@ for tighter control.
 `POST /admin/api/import` accepts an additional top-level `"replace":
 true` field to delete agents not present in the payload (otherwise
 entries are upserted).
+
+## Joule integration (A2A)
+
+The orchestrator is also exposed as an **A2A (Agent-to-Agent)** endpoint
+so it can be registered as a remote code-based agent in the **SAP Joule
+Agent Hub**. The agent card is served at
+`/.well-known/agent-card.json` and the JSON-RPC endpoint at `/a2a`.
+
+See [**JOULE_A2A.md**](./JOULE_A2A.md) for the full configuration guide
+covering BTP approuter routes, XSUAA scope/role-collection setup,
+service-key creation, and how to register the agent in Joule.
