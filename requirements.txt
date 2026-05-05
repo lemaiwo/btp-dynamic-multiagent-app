@@ -1,4 +1,4 @@
-pydantic-ai[mcp,web,openai]
+pydantic-ai[mcp,web,openai,bedrock]
 sap-ai-sdk-gen[all]
 mcp
 httpx

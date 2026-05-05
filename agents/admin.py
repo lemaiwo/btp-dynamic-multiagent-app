@@ -37,13 +37,16 @@ from agents.db import (
     VALID_AUTH_MODES,
     SessionLocal,
     delete_agent,
+    get_active_model_name,
     get_agent,
     get_orchestrator_instructions,
     list_agents,
+    set_active_model_name,
     set_orchestrator_instructions,
     upsert_agent,
 )
 from agents.registry import registry
+from agents.shared import available_models, default_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +153,19 @@ class AgentPayload(BaseModel):
 
 class OrchestratorPayload(BaseModel):
     instructions: str = Field(min_length=1)
+
+
+class ModelPayload(BaseModel):
+    model_name: str = Field(min_length=1, max_length=128)
+
+    @field_validator("model_name")
+    @classmethod
+    def _validate(cls, v: str) -> str:
+        v = v.strip()
+        allowed = available_models()
+        if allowed and v not in allowed:
+            raise ValueError(f"model_name must be one of {allowed}")
+        return v
 
 
 class ImportPayload(BaseModel):
@@ -268,6 +284,33 @@ async def api_update_orchestrator(payload: OrchestratorPayload) -> dict[str, str
     async with SessionLocal() as session:
         await set_orchestrator_instructions(session, payload.instructions)
         return {"instructions": payload.instructions}
+
+
+# ---------------------------------------------------------------------------
+# Active LLM model
+# ---------------------------------------------------------------------------
+@router.get("/api/model", dependencies=[Depends(require_admin)])
+async def api_get_model() -> dict[str, Any]:
+    async with SessionLocal() as session:
+        active = await get_active_model_name(session)
+    return {
+        "model_name": active or default_model_name(),
+        "available": available_models(),
+        "default": default_model_name(),
+    }
+
+
+@router.put("/api/model", dependencies=[Depends(require_admin)])
+async def api_update_model(payload: ModelPayload) -> dict[str, Any]:
+    async with SessionLocal() as session:
+        await set_active_model_name(session, payload.model_name)
+    build = await registry.reload()
+    dynamic_chat_app.refresh()
+    return {
+        "model_name": payload.model_name,
+        "agents": len(build.configs),
+        "enabled": len(build.specialists),
+    }
 
 
 # ---------------------------------------------------------------------------

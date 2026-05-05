@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import ssl
 from datetime import datetime
 from typing import Any
 
@@ -29,8 +30,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Connection string resolution
 # ---------------------------------------------------------------------------
+_vcap_ssl_ca: str | None = None  # populated when reading VCAP_SERVICES below
+
+
+def _build_ssl_context(ca_pem: str | None) -> ssl.SSLContext:
+    """SSL context for asyncpg.
+
+    BTP managed postgres uses a self-signed CA chain that isn't in the
+    system trust store. If the binding exposes the CA pem, load it.
+    Otherwise (or if PG_SSL_INSECURE=1) skip verification — TLS is still
+    on but the cert chain isn't validated.
+    """
+    ctx = ssl.create_default_context()
+    if ca_pem:
+        try:
+            ctx.load_verify_locations(cadata=ca_pem)
+            return ctx
+        except Exception:
+            logger.exception("Failed to load BTP postgres CA from VCAP; disabling verification")
+    if os.environ.get("PG_SSL_INSECURE", "1") == "1":
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _resolve_database_url() -> str:
     """Build an async SQLAlchemy URL from VCAP_SERVICES or env."""
+    global _vcap_ssl_ca
     vcap = os.environ.get("VCAP_SERVICES")
     if vcap:
         try:
@@ -44,6 +70,13 @@ def _resolve_database_url() -> str:
                     user = creds.get("username")
                     password = creds.get("password")
                     dbname = creds.get("dbname") or creds.get("database")
+                    # BTP exposes the server CA under one of these keys
+                    _vcap_ssl_ca = (
+                        creds.get("sslrootcert")
+                        or creds.get("sslcert")
+                        or creds.get("ca")
+                        or creds.get("cert")
+                    )
                     sslmode = "require"
                     return (
                         f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
@@ -73,7 +106,7 @@ if DATABASE_URL.startswith("postgresql+asyncpg") and "ssl=" in DATABASE_URL:
     # asyncpg expects ssl via connect_args, not URL; strip & pass through
     base, _, query = DATABASE_URL.partition("?")
     DATABASE_URL = base
-    _connect_args["ssl"] = True
+    _connect_args["ssl"] = _build_ssl_context(_vcap_ssl_ca)
 
 engine = create_async_engine(DATABASE_URL, connect_args=_connect_args, future=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
@@ -159,6 +192,7 @@ class OrchestratorConfig(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -191,6 +225,9 @@ async def init_db() -> None:
         )
         await _ensure_column(
             conn, "agent_configs", "extra_servers_json", "TEXT"
+        )
+        await _ensure_column(
+            conn, "orchestrator_config", "model_name", "VARCHAR(128)"
         )
 
     async with SessionLocal() as session:
@@ -313,4 +350,23 @@ async def set_orchestrator_instructions(session: AsyncSession, instructions: str
         session.add(row)
     else:
         row.instructions = instructions
+    await session.commit()
+
+
+async def get_active_model_name(session: AsyncSession) -> str | None:
+    row = await session.get(OrchestratorConfig, 1)
+    return row.model_name if row else None
+
+
+async def set_active_model_name(session: AsyncSession, model_name: str) -> None:
+    row = await session.get(OrchestratorConfig, 1)
+    if row is None:
+        row = OrchestratorConfig(
+            id=1,
+            instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            model_name=model_name,
+        )
+        session.add(row)
+    else:
+        row.model_name = model_name
     await session.commit()

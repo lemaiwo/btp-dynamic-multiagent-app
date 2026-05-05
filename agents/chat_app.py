@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 
 from agents.registry import registry
+from agents.shared import available_models, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,24 @@ class DynamicChatApp:
     def refresh(self) -> None:
         """Rebuild the inner web app from the current orchestrator."""
         html_source = CHAT_HTML if CHAT_HTML.is_file() else None
-        self._app = registry.orchestrator.to_web(html_source=html_source)
+        models = []
+        active_id = id(registry.orchestrator.model)
+        for name in available_models():
+            try:
+                m = get_model(name)
+            except Exception:
+                logger.warning(
+                    "Skipping model %r in chat dropdown: failed to construct", name,
+                    exc_info=True,
+                )
+                continue
+            if id(m) == active_id:
+                # to_web always includes agent.model; don't duplicate it.
+                continue
+            models.append(m)
+        self._app = registry.orchestrator.to_web(
+            html_source=html_source, models=models or None
+        )
 
     async def __call__(self, scope, receive, send):
         if self._app is None:
