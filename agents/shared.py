@@ -17,6 +17,7 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -248,24 +249,98 @@ class SAPAICoreModel(OpenAIChatModel):
             SAPAICoreModel._clean_schema(prop)
 
 
-_model: SAPAICoreModel | None = None
+DEFAULT_AVAILABLE_MODELS = (
+    "gpt-4o,gpt-4o-mini,gpt-35-turbo,"
+    "anthropic--claude-4.6-opus,anthropic--claude-4-sonnet,"
+    "anthropic--claude-3.7-sonnet"
+)
 
 
-def get_model() -> SAPAICoreModel:
-    """Return a shared SAP AI Core model instance (created once)."""
-    global _model
-    if _model is None:
+def _discover_deployed_models() -> list[str]:
+    """Query SAP AI Core for the model names that are actually deployed.
+
+    Returns an empty list if discovery fails (no credentials, network error,
+    etc.) so the caller can fall back to the static default list.
+    """
+    try:
         from gen_ai_hub.proxy import get_proxy_client
-        from gen_ai_hub.proxy.native.openai import AsyncOpenAI
 
-        proxy_client = get_proxy_client("gen-ai-hub")
-        sap_openai_client = AsyncOpenAI(proxy_client=proxy_client)
+        client = get_proxy_client("gen-ai-hub")
+        names = {d.model_name for d in client.deployments if d.model_name}
+        return sorted(names)
+    except Exception:
+        logger.warning("Could not discover deployed models from AI Core", exc_info=True)
+        return []
 
-        _model = SAPAICoreModel(
-            os.environ.get("AICORE_MODEL", "gpt-4o"),
-            provider=OpenAIProvider(openai_client=sap_openai_client),
-            profile=OpenAIModelProfile(
-                openai_supports_strict_tool_definition=False,
-            ),
-        )
-    return _model
+
+def available_models() -> list[str]:
+    """Models offered in the admin UI and chat dropdown.
+
+    Resolution order:
+      1. `AICORE_AVAILABLE_MODELS` env var (explicit override, comma-separated)
+      2. Live query of SAP AI Core for deployed models
+      3. `DEFAULT_AVAILABLE_MODELS` as a last-resort fallback
+    """
+    raw = os.environ.get("AICORE_AVAILABLE_MODELS")
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    discovered = _discover_deployed_models()
+    if discovered:
+        return discovered
+    return [m.strip() for m in DEFAULT_AVAILABLE_MODELS.split(",") if m.strip()]
+
+
+def default_model_name() -> str:
+    return os.environ.get("AICORE_MODEL", "gpt-4o")
+
+
+_models: dict[str, Any] = {}
+
+
+def _is_anthropic(name: str) -> bool:
+    return name.startswith("anthropic") or "claude" in name.lower()
+
+
+def _build_openai_model(name: str) -> SAPAICoreModel:
+    from gen_ai_hub.proxy import get_proxy_client
+    from gen_ai_hub.proxy.native.openai import AsyncOpenAI
+
+    proxy_client = get_proxy_client("gen-ai-hub")
+    sap_openai_client = AsyncOpenAI(proxy_client=proxy_client)
+
+    return SAPAICoreModel(
+        name,
+        provider=OpenAIProvider(openai_client=sap_openai_client),
+        profile=OpenAIModelProfile(
+            openai_supports_strict_tool_definition=False,
+        ),
+    )
+
+
+def _build_bedrock_model(name: str):
+    """Wrap a SAP AI Core Bedrock-hosted Claude deployment as a pydantic-ai model."""
+    from gen_ai_hub.proxy.native.amazon.clients import Session
+    from pydantic_ai.models.bedrock import BedrockConverseModel
+    from pydantic_ai.providers.bedrock import BedrockProvider
+
+    session = Session()
+    bedrock_client = session.client(model_name=name)
+    return BedrockConverseModel(
+        name, provider=BedrockProvider(bedrock_client=bedrock_client)
+    )
+
+
+def get_model(name: str | None = None):
+    """Return a Pydantic AI model instance for the given deployment name.
+
+    Names containing "claude" or starting with "anthropic" are routed to
+    SAP AI Core's Bedrock proxy; everything else uses the OpenAI-compatible
+    proxy. Instances are cached per name for the process lifetime.
+    """
+    name = (name or default_model_name()).strip()
+    cached = _models.get(name)
+    if cached is not None:
+        return cached
+    model = _build_bedrock_model(name) if _is_anthropic(name) else _build_openai_model(name)
+    _models[name] = model
+    return model

@@ -18,10 +18,11 @@ from pydantic_ai import Agent, RunContext
 from agents.db import (
     AgentConfig,
     SessionLocal,
+    get_active_model_name,
     get_orchestrator_instructions,
     list_agents,
 )
-from agents.shared import create_mcp_server, get_model
+from agents.shared import create_mcp_server, default_model_name, get_model
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +83,29 @@ async def build_orchestrator() -> BuildResult:
     async with SessionLocal() as session:
         rows = await list_agents(session)
         orch_instructions = await get_orchestrator_instructions(session)
+        active_model = await get_active_model_name(session)
         configs = [r.to_dict() for r in rows]
         enabled_rows = [r for r in rows if r.enabled]
+
+    model_name = active_model or default_model_name()
+    try:
+        model = get_model(model_name)
+    except Exception as e:
+        fallback = default_model_name()
+        logger.warning(
+            "Active model %r could not be loaded (%s); falling back to %r. "
+            "Pick a valid model in /admin to clear this.",
+            model_name, e, fallback,
+        )
+        if fallback != model_name:
+            try:
+                model = get_model(fallback)
+                model_name = fallback
+            except Exception:
+                logger.exception("Fallback model %r also failed", fallback)
+                raise
+        else:
+            raise
 
     specialists: dict[str, Agent] = {}
     mcp_clients: list = []
@@ -102,7 +124,7 @@ async def build_orchestrator() -> BuildResult:
             "help with BTP-specific tasks."
         )
 
-    orchestrator = Agent(get_model(), instructions=instructions)
+    orchestrator = Agent(model, instructions=instructions)
 
     # Build each specialist and register a delegation tool on the orchestrator
     for row in enabled_rows:
@@ -137,7 +159,7 @@ async def build_orchestrator() -> BuildResult:
         mcp_clients.extend(servers)
 
         specialist = Agent(
-            get_model(),
+            model,
             instructions=row.instructions,
             toolsets=servers,
         )

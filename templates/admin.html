@@ -177,6 +177,22 @@
     </div>
 
     <div class="panel">
+        <h2>LLM model</h2>
+        <p class="hint">
+            Active model used by the orchestrator and all specialists.
+            Changing this saves and reloads the registry immediately.
+            Names containing <code>claude</code> or starting with
+            <code>anthropic</code> are routed to SAP AI Core's Bedrock proxy;
+            everything else goes through the OpenAI-compatible proxy.
+        </p>
+        <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+            <select id="model-select" style="max-width:360px;flex:1"></select>
+            <button onclick="saveModel()">Apply</button>
+            <span id="model-current" style="color:var(--muted);font-size:12px"></span>
+        </div>
+    </div>
+
+    <div class="panel">
         <h2>Orchestrator instructions</h2>
         <p class="hint">
             The system prompt used by the orchestrator agent. Specialist
@@ -398,6 +414,35 @@ async function deleteAgentRow(id, name) {
     loadAgents();
 }
 
+async function loadModel() {
+    const res = await api('/model');
+    if (!res.ok) return;
+    const data = await res.json();
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = (data.available || []).map(m =>
+        `<option value="${escapeHtml(m)}"${m === data.model_name ? ' selected' : ''}>${escapeHtml(m)}</option>`
+    ).join('');
+    if (!data.available || !data.available.includes(data.model_name)) {
+        sel.insertAdjacentHTML('afterbegin',
+            `<option value="${escapeHtml(data.model_name)}" selected>${escapeHtml(data.model_name)} (custom)</option>`);
+    }
+    document.getElementById('model-current').textContent =
+        `Active: ${data.model_name} · default: ${data.default}`;
+}
+
+async function saveModel() {
+    const model_name = document.getElementById('model-select').value;
+    const res = await api('/model', {method: 'PUT', body: JSON.stringify({model_name})});
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Apply failed: ' + (err.detail || JSON.stringify(err)), 'error');
+        return;
+    }
+    const data = await res.json();
+    toast(`Model set to ${data.model_name} (${data.enabled}/${data.agents} agents reloaded)`, 'success');
+    loadModel();
+}
+
 async function saveOrchestrator() {
     const instructions = document.getElementById('orch-instructions').value;
     const res = await api('/orchestrator', {method: 'PUT', body: JSON.stringify({instructions})});
@@ -465,6 +510,7 @@ function escapeHtml(s) {
 
 loadAgents();
 loadOrchestrator();
+loadModel();
 </script>
 </body>
 </html>
