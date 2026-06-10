@@ -49,8 +49,8 @@ class _FakeModel:
     model_name = "fake"
 
 
-shared.get_model = lambda: _FakeModel()  # type: ignore[assignment]
-shared.create_mcp_server = lambda name, base_url: object()  # type: ignore[assignment]
+shared.get_model = lambda name=None: _FakeModel()  # type: ignore[assignment]
+shared.create_mcp_server = lambda name, base_url, *a, **k: object()  # type: ignore[assignment]
 
 import pydantic_ai  # noqa: E402
 
@@ -65,7 +65,7 @@ def _patched_init(self, model=None, **kwargs):  # type: ignore[no-untyped-def]
 pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
 
 
-def _fake_to_web(self):  # type: ignore[no-untyped-def]
+def _fake_to_web(self, *args, **kwargs):  # type: ignore[no-untyped-def]
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return

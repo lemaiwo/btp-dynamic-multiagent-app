@@ -32,9 +32,15 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
-from agents.auth import current_jwt  # noqa: E402
+from agents.auth import (  # noqa: E402
+    current_base_url,
+    current_jwt,
+    current_principal,
+    principal_from_token,
+)
 from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.db import init_db  # noqa: E402
+from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 
 SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
@@ -65,6 +71,12 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 ON_CF = "VCAP_APPLICATION" in os.environ
 
+# Optional explicit public base URL for OAuth2 redirect_uri construction.
+# Falls back to A2A_PUBLIC_URL (same approuter host) then request headers.
+_OAUTH_BASE_OVERRIDE = (
+    os.environ.get("PUBLIC_BASE_URL") or os.environ.get("A2A_PUBLIC_URL") or ""
+).rstrip("/")
+
 
 class JWTBindingMiddleware:
     def __init__(self, app) -> None:
@@ -75,13 +87,19 @@ class JWTBindingMiddleware:
             await self.app(scope, receive, send)
             return
 
-        token: str | None = None
+        wanted = (b"authorization", b"x-forwarded-proto", b"x-forwarded-host", b"host")
+        hdrs: dict[bytes, bytes] = {}
         for key, value in scope.get("headers", []):
-            if key.lower() == b"authorization":
-                parts = value.decode("latin-1").split(None, 1)
-                if len(parts) == 2 and parts[0].lower() == "bearer":
-                    token = parts[1].strip()
-                break
+            lk = key.lower()
+            if lk in wanted and lk not in hdrs:
+                hdrs[lk] = value
+
+        token: str | None = None
+        auth_header = hdrs.get(b"authorization")
+        if auth_header:
+            parts = auth_header.decode("latin-1").split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                token = parts[1].strip()
 
         # On Cloud Foundry, any API request other than /healthz must come
         # through the approuter (which injects the user JWT). If there is no
@@ -114,11 +132,34 @@ class JWTBindingMiddleware:
 
         if token:
             logger.info("JWT bound for %s %s", scope.get("method"), path)
+
+        # Public base URL (scheme://host) as seen by the approuter, used to
+        # build the OAuth2 redirect_uri. An explicit override wins so the
+        # redirect_uri exactly matches what is registered with the target.
+        base_url = _OAUTH_BASE_OVERRIDE
+        if not base_url:
+            host = hdrs.get(b"x-forwarded-host") or hdrs.get(b"host")
+            if host:
+                proto_h = hdrs.get(b"x-forwarded-proto")
+                scheme = (
+                    proto_h.decode("latin-1").split(",")[0].strip()
+                    if proto_h
+                    else scope.get("scheme", "https")
+                )
+                host_str = host.decode("latin-1").split(",")[0].strip()
+                base_url = f"{scheme}://{host_str}"
+
+        principal = principal_from_token(token)
+
         marker = current_jwt.set(token)
+        marker_principal = current_principal.set(principal)
+        marker_base = current_base_url.set(base_url)
         try:
             await self.app(scope, receive, send)
         finally:
             current_jwt.reset(marker)
+            current_principal.reset(marker_principal)
+            current_base_url.reset(marker_base)
 
 
 async def _send_json(send, status_code: int, body: dict) -> None:
@@ -145,6 +186,9 @@ app.include_router(admin_router)
 # and other A2A-capable clients. Must be included before the catch-all
 # chat mount so /.well-known/agent-card.json and /a2a resolve here.
 app.include_router(a2a_router)
+# OAuth2 per-user authorization callback (auth_mode="oauth2"). Registered
+# before the chat mount so /oauth/callback resolves here.
+app.include_router(oauth_router)
 
 
 @app.get("/healthz")

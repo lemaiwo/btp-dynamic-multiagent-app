@@ -1,6 +1,6 @@
 pydantic-ai[mcp,web,openai,bedrock]
 sap-ai-sdk-gen[all]
-mcp
+mcp>=1.26.0
 httpx
 uvicorn
 python-dotenv

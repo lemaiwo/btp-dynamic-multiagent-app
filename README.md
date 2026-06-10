@@ -180,6 +180,70 @@ registered as MCP servers. Set the `MCP_URL_ALLOWLIST` env var (in
 `mta.yaml` or `cf set-env`) to a comma-separated list of URL prefixes
 for tighter control.
 
+### MCP authentication modes
+
+Each MCP server is registered with one of three auth modes:
+
+| Mode      | When to use                                                                 | How the user authenticates                          |
+|-----------|------------------------------------------------------------------------------|-----------------------------------------------------|
+| `jwt`     | BTP servers that **trust this app's XSUAA** (same subaccount / granted scope) | This app's XSUAA JWT is forwarded on every request  |
+| `oauth2`  | Servers with their **own** authorization server (separate XSUAA / OAuth)      | Per-user OAuth2 authorization_code (sign in once)   |
+| `none`    | Public servers needing no auth                                               | No token is sent                                    |
+
+#### Per-user OAuth2 (`oauth2`)
+
+Use this when a target system (e.g. an ABAP system) is protected by its
+**own** authorization server and you don't want to couple it to this
+app's XSUAA. Each end user signs in to the target once; the resulting
+access/refresh tokens are stored **per user** in PostgreSQL and forwarded
+on every MCP call, so the user's real identity reaches the target
+(per-user authorizations, transport ownership, and audit are preserved).
+
+There are two ways to obtain the OAuth client (admin UI → new/edit agent
+→ MCP server → `OAuth2 (per-user)`):
+
+**A. Auto-discover & register (DCR) — recommended.** Tick *"Auto-discover
+& register (DCR)"* and fill in **nothing else** (scope optional). On first
+use the app reads the MCP server's OAuth metadata
+(`/.well-known/oauth-protected-resource` → authorization server →
+`/.well-known/oauth-authorization-server`) and **registers itself**
+(RFC 7591), caching the registered client for all users. The callback
+redirect URI is registered automatically — no manual step on the target.
+Works when the MCP server exposes its own OAuth (as most MCP servers,
+including ABAP ones, do).
+
+**B. Manual client.** Untick DCR and provide:
+
+- **XSUAA / UAA URL** — the target's UAA `url` (authorize/token endpoints
+  are derived as `<url>/oauth/authorize` and `<url>/oauth/token`), or set
+  the **Authorize URL** / **Token URL** explicitly.
+- **Client ID / Client secret** — from a service key of the target's XSUAA
+  instance. The secret is stored in the DB, never returned by the API or
+  included in exports (leave it blank on edit to keep the stored value).
+- **Scope** — optional.
+
+Use B when the target is fronted by **plain XSUAA**, which does not support
+Dynamic Client Registration. With B you must register this app's callback
+as a redirect URI on the target's XSUAA
+(`oauth2-configuration.redirect-uris`):
+
+```
+https://<your-approuter-host>/oauth/callback
+```
+
+Either way, **no trust relationship between the two XSUAA instances is
+needed** — the target only needs to allow the callback URL (automatically
+in mode A, manually in mode B).
+
+**Runtime:** the first time a user triggers an `oauth2` specialist, the
+chat returns an **Authorize** link. The user opens it, signs in to the
+target, is redirected back to `/oauth/callback` (which exchanges the code
+for tokens via PKCE), and then re-sends the request. Tokens refresh
+automatically; on a refresh failure the user is re-prompted.
+
+> Exports redact OAuth client secrets. Re-importing into a fresh
+> database therefore requires re-entering the secret in the admin UI.
+
 ## Project structure
 
 ```

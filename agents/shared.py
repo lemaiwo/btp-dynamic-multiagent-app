@@ -165,12 +165,17 @@ def create_mcp_server(
     base_url: str,
     auth_mode: str = "jwt",
     tool_prefix: str | None = None,
+    oauth: dict | None = None,
 ) -> MCPServerStreamableHTTP:
     """Create an MCP server connection.
 
     auth_mode:
       - "jwt" (default): JWT forwarding on CF; OAuth2 authorization_code
-        with browser redirect locally. Use for BTP-hosted MCP servers.
+        with browser redirect locally. Use for BTP-hosted MCP servers that
+        trust this app's XSUAA.
+      - "oauth2": per-user OAuth2 authorization_code against the server's own
+        authorization server (e.g. a separate XSUAA). `oauth` carries the
+        client config. Each user authorizes once; tokens are stored per user.
       - "none": no authentication. Use for public MCP servers.
 
     tool_prefix: when set, all tools from this server are exposed as
@@ -185,6 +190,12 @@ def create_mcp_server(
     auth: httpx.Auth | None
     if auth_mode == "none":
         auth = None
+    elif auth_mode == "oauth2":
+        from agents.oauth2 import PerUserOAuth2Auth
+
+        if not oauth:
+            raise ValueError(f"oauth2 server {name!r} is missing its oauth config")
+        auth = PerUserOAuth2Auth(server_key=mcp_url, spec_oauth=oauth)
     elif ON_CF:
         auth = JWTForwardAuth()
     else:

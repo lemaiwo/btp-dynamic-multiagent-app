@@ -40,16 +40,19 @@ class _FakeModel:
         return "FakeModel()"
 
 
-shared.get_model = lambda: _FakeModel()  # type: ignore[assignment]
+shared.get_model = lambda name=None: _FakeModel()  # type: ignore[assignment]
 
 
 class _FakeMCP:
-    def __init__(self, name: str, base_url: str):
+    def __init__(self, name: str, base_url: str, **kwargs):
         self.name = name
         self.base_url = base_url
+        self.kwargs = kwargs
 
 
-shared.create_mcp_server = lambda name, base_url: _FakeMCP(name, base_url)  # type: ignore[assignment]
+shared.create_mcp_server = lambda name, base_url, *a, **k: _FakeMCP(  # type: ignore[assignment]
+    name, base_url, **k
+)
 
 # Patch pydantic_ai.Agent so it accepts our fake model + fake toolsets
 # without touching a real LLM or MCP process. We keep the Agent.tool
@@ -69,7 +72,7 @@ def _patched_init(self, model=None, **kwargs):  # type: ignore[no-untyped-def]
 pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
 
 
-def _fake_to_web(self):  # type: ignore[no-untyped-def]
+def _fake_to_web(self, *args, **kwargs):  # type: ignore[no-untyped-def]
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return

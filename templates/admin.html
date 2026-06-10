@@ -66,7 +66,7 @@
         button.danger { background: var(--danger); }
         button.danger:hover { background: #8e0000; }
         button.small { padding: 4px 8px; font-size: 12px; }
-        input[type="text"], input[type="url"], textarea, select {
+        input[type="text"], input[type="url"], input[type="password"], textarea, select {
             width: 100%;
             padding: 8px 10px;
             border: 1px solid var(--border);
@@ -145,10 +145,12 @@
         <p class="hint">
             Each agent can connect to one or more MCP servers — all of their
             tools are exposed to the specialist. Choose <code>JWT forward</code>
-            for BTP-hosted servers (HTTPS on <code>*.hana.ondemand.com</code>
-            only; the user's JWT is forwarded on every request) or
-            <code>None (public)</code> for public MCP servers that do not
-            require authentication.
+            for BTP-hosted servers that trust this app's XSUAA (HTTPS on
+            <code>*.hana.ondemand.com</code>; the user's JWT is forwarded on
+            every request), <code>OAuth2 (per-user)</code> for servers with
+            their own authorization server (each user signs in once; tokens are
+            stored per user), or <code>None (public)</code> for public MCP
+            servers that need no authentication.
         </p>
         <div class="toolbar">
             <button onclick="openAgentModal()">+ New agent</button>
@@ -180,10 +182,11 @@
         <h2>LLM model</h2>
         <p class="hint">
             Active model used by the orchestrator and all specialists.
-            Changing this saves and reloads the registry immediately.
-            Names containing <code>claude</code> or starting with
-            <code>anthropic</code> are routed to SAP AI Core's Bedrock proxy;
-            everything else goes through the OpenAI-compatible proxy.
+            The list is read live from your SAP AI Core (the models you have
+            deployed in the Generative AI Hub). Changing this saves and reloads
+            the registry immediately. Names containing <code>claude</code> or
+            starting with <code>anthropic</code> are routed to the Bedrock
+            proxy; everything else uses the OpenAI-compatible proxy.
         </p>
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
             <select id="model-select" style="max-width:360px;flex:1"></select>
@@ -229,6 +232,7 @@
                         onclick="addMcpServerRow()">+ Add MCP server</button>
                 <span style="display:block;color:var(--muted);font-weight:normal;font-size:12px;margin-top:4px">
                     Public mode skips all auth and bypasses the BTP host allow-list.
+                    OAuth2 prompts each user to sign in to the target system on first use.
                 </span>
             </label>
             <label class="full">
@@ -298,6 +302,7 @@ async function loadAgents() {
 
 function authLabel(mode) {
     if (mode === 'none') return '<span class="status-badge off">public</span>';
+    if (mode === 'oauth2') return '<span class="status-badge on">oauth2</span>';
     return '<span class="status-badge on">jwt</span>';
 }
 
@@ -313,21 +318,88 @@ function renderMcpServers(servers) {
 
 function addMcpServerRow(server) {
     server = server || {url: '', auth_mode: 'jwt'};
+    const oauth = server.oauth || {};
     const container = document.getElementById('agent-mcp-servers');
     const row = document.createElement('div');
     row.className = 'mcp-server-row';
-    row.style.cssText = 'display:grid;grid-template-columns:1fr 180px 32px;gap:6px;margin-bottom:6px;align-items:center';
+    row.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px';
     row.innerHTML = `
-        <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
-        <select class="mcp-auth-mode">
-            <option value="jwt">JWT forward (BTP)</option>
-            <option value="none">None (public)</option>
-        </select>
-        <button type="button" class="small danger" title="Remove" onclick="this.parentNode.remove()">×</button>
+        <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
+            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
+            <select class="mcp-auth-mode" onchange="toggleOauthFields(this)">
+                <option value="jwt">JWT forward (BTP)</option>
+                <option value="oauth2">OAuth2 (per-user)</option>
+                <option value="none">None (public)</option>
+            </select>
+            <button type="button" class="small danger" title="Remove"
+                    onclick="this.closest('.mcp-server-row').remove()">×</button>
+        </div>
+        <div class="mcp-oauth" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+            <label style="font-weight:600">
+                <input type="checkbox" class="oauth-dcr" onchange="toggleDcr(this)">
+                Auto-discover &amp; register (DCR) — no client credentials needed
+            </label>
+            <span style="display:block;color:var(--muted);font-size:12px;margin:2px 0 8px">
+                The app reads the server's OAuth metadata and registers itself. Use this
+                when the MCP server exposes its own OAuth (recommended). Uncheck to enter
+                client credentials manually (e.g. plain XSUAA, which has no DCR).
+            </span>
+            <div class="oauth-manual">
+                <div class="form-grid">
+                    <label class="full">XSUAA / UAA URL
+                        <span style="color:var(--muted);font-weight:normal">(authorize &amp; token endpoints are derived; or set them explicitly below)</span>
+                        <input type="url" class="oauth-uaa" placeholder="https://&lt;tenant&gt;.authentication.&lt;region&gt;.hana.ondemand.com">
+                    </label>
+                    <label>Client ID
+                        <input type="text" class="oauth-client-id" placeholder="sb-...">
+                    </label>
+                    <label>Client secret
+                        <input type="password" class="oauth-client-secret" autocomplete="new-password">
+                    </label>
+                    <label class="full">Authorize URL <span style="color:var(--muted);font-weight:normal">(optional override)</span>
+                        <input type="url" class="oauth-authorize-url">
+                    </label>
+                    <label class="full">Token URL <span style="color:var(--muted);font-weight:normal">(optional override)</span>
+                        <input type="url" class="oauth-token-url">
+                    </label>
+                </div>
+            </div>
+            <div class="form-grid">
+                <label class="full">Scope <span style="color:var(--muted);font-weight:normal">(optional)</span>
+                    <input type="text" class="oauth-scope" placeholder="openid">
+                </label>
+            </div>
+            <p class="hint" style="margin:8px 0 0">
+                Redirect URI <span style="font-weight:normal">(auto-registered in DCR mode;
+                otherwise add it to the target's <code>oauth2-configuration.redirect-uris</code>)</span>:
+                <code class="oauth-redirect"></code>
+            </p>
+        </div>
     `;
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
+    row.querySelector('.oauth-dcr').checked = !!oauth.dcr;
+    row.querySelector('.oauth-uaa').value = oauth.uaa_url || '';
+    row.querySelector('.oauth-client-id').value = oauth.client_id || '';
+    row.querySelector('.oauth-scope').value = oauth.scope || '';
+    row.querySelector('.oauth-authorize-url').value = oauth.authorize_url || '';
+    row.querySelector('.oauth-token-url').value = oauth.token_url || '';
+    const secret = row.querySelector('.oauth-client-secret');
+    secret.placeholder = oauth.has_client_secret ? '•••••• (stored — leave blank to keep)' : '';
+    row.querySelector('.oauth-redirect').textContent = location.origin + '/oauth/callback';
     container.appendChild(row);
+    toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+}
+
+function toggleOauthFields(select) {
+    const row = select.closest('.mcp-server-row');
+    row.querySelector('.mcp-oauth').style.display = select.value === 'oauth2' ? 'block' : 'none';
+    toggleDcr(row.querySelector('.oauth-dcr'));
+}
+
+function toggleDcr(cb) {
+    const row = cb.closest('.mcp-server-row');
+    row.querySelector('.oauth-manual').style.display = cb.checked ? 'none' : 'block';
 }
 
 function collectMcpServers() {
@@ -335,7 +407,27 @@ function collectMcpServers() {
     document.querySelectorAll('#agent-mcp-servers .mcp-server-row').forEach(r => {
         const url = r.querySelector('.mcp-url').value.trim();
         if (!url) return;
-        out.push({url, auth_mode: r.querySelector('.mcp-auth-mode').value});
+        const mode = r.querySelector('.mcp-auth-mode').value;
+        const server = {url, auth_mode: mode};
+        if (mode === 'oauth2') {
+            const scope = r.querySelector('.oauth-scope').value.trim();
+            if (r.querySelector('.oauth-dcr').checked) {
+                server.oauth = {dcr: true};
+                if (scope) server.oauth.scope = scope;
+            } else {
+                const oauth = {
+                    client_id: r.querySelector('.oauth-client-id').value.trim(),
+                    uaa_url: r.querySelector('.oauth-uaa').value.trim(),
+                    scope: scope,
+                    authorize_url: r.querySelector('.oauth-authorize-url').value.trim(),
+                    token_url: r.querySelector('.oauth-token-url').value.trim(),
+                };
+                const secret = r.querySelector('.oauth-client-secret').value;
+                if (secret) oauth.client_secret = secret;
+                server.oauth = oauth;
+            }
+        }
+        out.push(server);
     });
     return out;
 }

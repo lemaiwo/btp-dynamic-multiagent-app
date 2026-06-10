@@ -23,10 +23,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   DB, seeds from `agents.seed.json`, builds the initial registry
 - `agents/db.py` — SQLAlchemy models (`AgentConfig`, `OrchestratorConfig`),
   `init_db`, CRUD helpers, VCAP/ENV postgres URL resolver
-- `agents/auth.py` — `current_jwt` contextvar, `XsuaaValidator`,
+- `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
+  contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin` FastAPI dependencies
 - `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
-  on CF / browser OAuth locally), `SAPAICoreModel`
+  on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`
+- `agents/oauth2.py` — per-user OAuth2 authorization_code for
+  `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
+  refreshes the user's token, raises `OAuthAuthorizationRequired`),
+  `begin_authorization`/`complete_authorization` (PKCE + state),
+  `resolve_config`/`_discover_and_register` (RFC 8414/9728/7591 discovery +
+  Dynamic Client Registration when the server `oauth` is `{dcr: true}`).
+  Tokens in `mcp_oauth_tokens`, flow state in `mcp_oauth_states`, registered
+  DCR clients in `mcp_oauth_clients`
+- `agents/oauth_routes.py` — `GET /oauth/callback` completes the flow
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps
