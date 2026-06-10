@@ -39,14 +39,23 @@ def _sanitize_tool_name(name: str) -> str:
     return f"delegate_{slug}" if slug else "delegate_agent"
 
 
+# Tool prefixes must stay short: prefixed tool names (`{prefix}_{tool}`) have
+# to fit OpenAI/Azure's 64-char function-name limit. The first DNS label,
+# truncated, gives a compact yet recognizable prefix.
+_MAX_PREFIX_LEN = 12
+
+
 def _compute_tool_prefixes(urls: list[str]) -> list[str]:
-    """Derive one tool prefix per URL from its hostname, disambiguating
-    collisions by appending an index. Used when an agent binds multiple
-    MCP servers so their tool names don't clash."""
+    """Derive one short tool prefix per URL, disambiguating collisions by
+    appending an index. Used when an agent binds multiple MCP servers so their
+    tool names don't clash. Kept short so `{prefix}_{tool}` stays within the
+    64-char function-name limit (the full hostname would blow past it)."""
     slugs = []
     for u in urls:
         host = (urlparse(u).hostname or "mcp").lower()
-        slug = re.sub(r"[^a-z0-9]+", "_", host).strip("_") or "mcp"
+        first_label = host.split(".")[0]
+        slug = re.sub(r"[^a-z0-9]+", "_", first_label).strip("_") or "mcp"
+        slug = slug[:_MAX_PREFIX_LEN].strip("_") or "mcp"
         slugs.append(slug)
     counts: dict[str, int] = {s: slugs.count(s) for s in set(slugs)}
     seen: dict[str, int] = {}
@@ -65,6 +74,39 @@ def _format_error(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
         return "; ".join(_format_error(e) for e in exc.exceptions)
     return f"{type(exc).__name__}: {exc}"
+
+
+async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | None:
+    """If the failure was 'needs OAuth2 authorization', return a chat message
+    with a sign-in link; otherwise None so normal error handling proceeds.
+
+    The link points at this app's ``/oauth/login`` endpoint (short + stable),
+    which builds the real authorize URL at click time — so the long PKCE/state
+    URL never has to survive being relayed through the orchestrator LLM.
+    """
+    from urllib.parse import quote
+
+    from agents.auth import current_base_url, current_principal
+    from agents.oauth2 import find_oauth_required
+
+    required = find_oauth_required(exc)
+    if required is None:
+        return None
+
+    user_id = current_principal.get()
+    base_url = current_base_url.get()
+    if not user_id or not base_url:
+        return (
+            f"**{agent_name}** needs you to sign in, but the sign-in link could "
+            "not be built (missing user identity or app URL). Open the app "
+            "through its approuter URL and try again."
+        )
+    link = f"{base_url.rstrip('/')}/oauth/login?agent={quote(agent_name)}"
+    return (
+        f"🔐 **{agent_name}** needs you to sign in first.\n\n"
+        f"**[Click here to sign in to {agent_name}]({link})**\n\n"
+        "After signing in, send your request again."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +166,16 @@ async def build_orchestrator() -> BuildResult:
             "help with BTP-specific tasks."
         )
 
+    # A specialist may return a sign-in link (when its MCP server needs the
+    # user to authorize). The model must pass that through untouched, or the
+    # user never sees the link.
+    instructions += (
+        "\n\nIMPORTANT — sign-in links: if a specialist's response contains a "
+        "sign-in or authorization link (a Markdown link), relay that response "
+        "to the user verbatim, including the full link. Do not summarize, "
+        "rephrase, shorten, or omit the link."
+    )
+
     orchestrator = Agent(model, instructions=instructions)
 
     # Build each specialist and register a delegation tool on the orchestrator
@@ -144,6 +196,7 @@ async def build_orchestrator() -> BuildResult:
                         spec["url"],
                         spec["auth_mode"],
                         tool_prefix=prefix,
+                        oauth=spec.get("oauth"),
                     )
                 )
             except Exception:
@@ -189,6 +242,9 @@ def _attach_delegation_tool(
             result = await specialist.run(query, usage=ctx.usage)
             return str(result.output)
         except BaseException as e:  # noqa: BLE001
+            auth_msg = await _authorization_prompt(row.name, e)
+            if auth_msg is not None:
+                return auth_msg
             logger.exception("Specialist %s failed", row.name)
             return f"Error from {row.name}: {_format_error(e)}"
 

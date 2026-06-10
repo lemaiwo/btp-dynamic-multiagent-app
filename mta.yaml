@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.1.0
+version: 2.2.0
 
 parameters:
   enable-parallel-deployments: true
@@ -40,6 +40,11 @@ modules:
       # field is derived from it, so it MUST match the approuter host.
       # Example: https://<org>-<space>-pydantic-agent-approuter.cfapps.eu20-001.hana.ondemand.com
       A2A_PUBLIC_URL: ""
+      # Public base URL used to build the OAuth2 redirect_uri for per-user
+      # (auth_mode="oauth2") MCP servers: <base>/oauth/callback. Leave empty
+      # to fall back to A2A_PUBLIC_URL, then to the approuter's forwarded
+      # host headers. Set this only if those are unavailable or incorrect.
+      PUBLIC_BASE_URL: ""
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
     requires:

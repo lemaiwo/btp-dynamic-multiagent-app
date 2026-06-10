@@ -34,6 +34,7 @@ from agents.chat_app import dynamic_chat_app
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
+    AUTH_MODE_OAUTH2,
     VALID_AUTH_MODES,
     SessionLocal,
     delete_agent,
@@ -41,6 +42,7 @@ from agents.db import (
     get_agent,
     get_orchestrator_instructions,
     list_agents,
+    prepare_servers,
     set_active_model_name,
     set_orchestrator_instructions,
     upsert_agent,
@@ -54,9 +56,49 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
+class OAuthClientPayload(BaseModel):
+    """OAuth2 client config for an ``auth_mode="oauth2"`` server.
+
+    Two shapes:
+    - ``dcr=True`` — auto-discover the authorization server and register a
+      client dynamically; no manual credentials required.
+    - manual — provide either ``uaa_url`` (XSUAA — authorize/token endpoints
+      derived) or explicit ``authorize_url`` + ``token_url``, plus
+      ``client_id`` / ``client_secret``. ``client_secret`` may be left blank
+      on edit to keep the stored value.
+    """
+
+    dcr: bool = False
+    client_id: str = Field(default="", max_length=512)
+    client_secret: str = Field(default="", max_length=2048)
+    uaa_url: str = Field(default="", max_length=512)
+    authorize_url: str = Field(default="", max_length=512)
+    token_url: str = Field(default="", max_length=512)
+    scope: str = Field(default="", max_length=512)
+    # Read-only flag echoed back by the API; ignored on input.
+    has_client_secret: bool = False
+
+    def to_config(self) -> dict[str, Any]:
+        if self.dcr:
+            out: dict[str, Any] = {"dcr": True}
+            if self.scope.strip():
+                out["scope"] = self.scope.strip()
+            return out
+        fields = {
+            "client_id": self.client_id.strip(),
+            "client_secret": self.client_secret.strip(),
+            "uaa_url": self.uaa_url.strip(),
+            "authorize_url": self.authorize_url.strip(),
+            "token_url": self.token_url.strip(),
+            "scope": self.scope.strip(),
+        }
+        return {k: v for k, v in fields.items() if v}
+
+
 class McpServerPayload(BaseModel):
     url: str = Field(min_length=1)
     auth_mode: str = Field(default=AUTH_MODE_JWT)
+    oauth: OAuthClientPayload | None = None
 
     @field_validator("auth_mode")
     @classmethod
@@ -67,6 +109,28 @@ class McpServerPayload(BaseModel):
                 f"auth_mode must be one of {sorted(VALID_AUTH_MODES)}"
             )
         return v
+
+    @model_validator(mode="after")
+    def _validate_oauth(self) -> "McpServerPayload":
+        if self.auth_mode == AUTH_MODE_OAUTH2:
+            cfg = self.oauth.to_config() if self.oauth else {}
+            if cfg.get("dcr"):
+                return self  # auto-discovery: no manual credentials needed
+            if not cfg.get("client_id"):
+                raise ValueError(
+                    "oauth2 server requires oauth.client_id (or enable oauth.dcr "
+                    "to auto-discover and register)"
+                )
+            if not (cfg.get("uaa_url") or (cfg.get("authorize_url") and cfg.get("token_url"))):
+                raise ValueError(
+                    "oauth2 server requires oauth.uaa_url or both "
+                    "oauth.authorize_url and oauth.token_url"
+                )
+            # client_secret may be blank here (preserved from storage on edit);
+            # the DB layer enforces that a secret ultimately exists.
+        elif self.oauth is not None and self.oauth.to_config():
+            raise ValueError("oauth config is only valid when auth_mode=oauth2")
+        return self
 
     @model_validator(mode="after")
     def _validate_url(self) -> "McpServerPayload":
@@ -147,8 +211,14 @@ class AgentPayload(BaseModel):
             raise ValueError("mcp_servers contains duplicate urls")
         return self
 
-    def to_servers_list(self) -> list[dict[str, str]]:
-        return [{"url": s.url, "auth_mode": s.auth_mode} for s in self.mcp_servers]
+    def to_servers_list(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for s in self.mcp_servers:
+            entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
+            if s.auth_mode == AUTH_MODE_OAUTH2 and s.oauth is not None:
+                entry["oauth"] = s.oauth.to_config()
+            out.append(entry)
+        return out
 
 
 class OrchestratorPayload(BaseModel):
@@ -208,14 +278,17 @@ async def api_list_agents() -> list[dict[str, Any]]:
 )
 async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
     async with SessionLocal() as session:
-        row = await upsert_agent(
-            session,
-            name=payload.name,
-            description=payload.description,
-            instructions=payload.instructions,
-            mcp_servers=payload.to_servers_list(),
-            enabled=payload.enabled,
-        )
+        try:
+            row = await upsert_agent(
+                session,
+                name=payload.name,
+                description=payload.description,
+                instructions=payload.instructions,
+                mcp_servers=payload.to_servers_list(),
+                enabled=payload.enabled,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
         return row.to_dict()
 
 
@@ -243,15 +316,19 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 raise HTTPException(
                     status_code=409, detail=f"Agent name '{payload.name}' already exists"
                 )
-        servers = payload.to_servers_list()
-        primary = servers[0]
-        extras = servers[1:]
+        try:
+            primary, extras, primary_oauth_json = prepare_servers(
+                payload.to_servers_list(), row
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
         row.name = payload.name
         row.description = payload.description
         row.instructions = payload.instructions
         row.mcp_url = primary["url"]
         row.auth_mode = primary["auth_mode"]
         row.extra_servers_json = json.dumps(extras) if extras else None
+        row.oauth_json = primary_oauth_json
         row.enabled = 1 if payload.enabled else 0
         await session.commit()
         await session.refresh(row)
@@ -378,14 +455,19 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
 
         imported_names = set()
         for agent in payload.agents:
-            await upsert_agent(
-                session,
-                name=agent.name,
-                description=agent.description,
-                instructions=agent.instructions,
-                mcp_servers=agent.to_servers_list(),
-                enabled=agent.enabled,
-            )
+            try:
+                await upsert_agent(
+                    session,
+                    name=agent.name,
+                    description=agent.description,
+                    instructions=agent.instructions,
+                    mcp_servers=agent.to_servers_list(),
+                    enabled=agent.enabled,
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=422, detail=f"Agent '{agent.name}': {e}"
+                ) from e
             imported_names.add(agent.name)
 
         removed = 0

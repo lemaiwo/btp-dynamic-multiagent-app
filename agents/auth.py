@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 current_jwt: ContextVar[str | None] = ContextVar("current_jwt", default=None)
 
+# Stable identifier for the calling user, used to key per-user OAuth2 tokens
+# (auth_mode="oauth2"). Derived from the validated XSUAA JWT on CF.
+current_principal: ContextVar[str | None] = ContextVar("current_principal", default=None)
+
+# Public base URL of the current request (scheme://host as seen by the
+# approuter), used to build the OAuth2 redirect_uri for the callback.
+current_base_url: ContextVar[str | None] = ContextVar("current_base_url", default=None)
+
 
 def set_current_jwt(token: str | None) -> object:
     return current_jwt.set(token)
@@ -37,6 +45,42 @@ def set_current_jwt(token: str | None) -> object:
 
 def reset_current_jwt(marker: object) -> None:
     current_jwt.reset(marker)  # type: ignore[arg-type]
+
+
+def principal_from_token(token: str | None) -> str | None:
+    """Derive a stable user id from the bound JWT.
+
+    On CF the token is validated against XSUAA first (so the principal is
+    cryptographically trustworthy); the user id is taken from ``user_uuid``,
+    falling back to ``sub`` / ``user_name@origin`` / ``email``. Without an
+    XSUAA binding (local dev) the claims are read from the unverified token,
+    or a constant ``local-dev`` principal is used when there is no token, so
+    the OAuth2 flow is still exercisable locally.
+    """
+    validator = get_validator()
+    if token:
+        try:
+            if validator is not None:
+                payload = validator.validate(token)
+            else:
+                payload = jwt.decode(token, options={"verify_signature": False})
+        except Exception:
+            logger.warning("Could not derive principal from token", exc_info=True)
+            return None
+        return _principal_claim(payload)
+    return None if validator is not None else "local-dev"
+
+
+def _principal_claim(payload: dict[str, Any]) -> str | None:
+    for key in ("user_uuid", "sub"):
+        v = payload.get(key)
+        if v:
+            return str(v)
+    user_name = payload.get("user_name") or payload.get("email")
+    if user_name:
+        origin = payload.get("origin")
+        return f"{user_name}@{origin}" if origin else str(user_name)
+    return None
 
 
 # ---------------------------------------------------------------------------
