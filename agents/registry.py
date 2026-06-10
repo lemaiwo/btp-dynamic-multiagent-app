@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -25,6 +26,16 @@ from agents.db import (
 from agents.shared import create_mcp_server, default_model_name, get_model
 
 logger = logging.getLogger(__name__)
+
+# How many times a tool may return a retryable error (pydantic-ai ModelRetry)
+# before the agent gives up. MCP tools like SAP's SAPQuery surface query/syntax
+# errors this way so the model can self-correct; the default of 1 is too low to
+# recover, so allow a few attempts. Tunable via env.
+_TOOL_RETRIES = int(os.environ.get("AGENT_TOOL_RETRIES", "3"))
+
+# Hard ceiling on a single specialist run so a stuck MCP/model call surfaces as
+# a logged error instead of an indefinitely "running" chat. Tunable via env.
+_SPECIALIST_TIMEOUT = float(os.environ.get("SPECIALIST_TIMEOUT_SECONDS", "180"))
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +187,7 @@ async def build_orchestrator() -> BuildResult:
         "rephrase, shorten, or omit the link."
     )
 
-    orchestrator = Agent(model, instructions=instructions)
+    orchestrator = Agent(model, instructions=instructions, retries=_TOOL_RETRIES)
 
     # Build each specialist and register a delegation tool on the orchestrator
     for row in enabled_rows:
@@ -215,6 +226,7 @@ async def build_orchestrator() -> BuildResult:
             model,
             instructions=row.instructions,
             toolsets=servers,
+            retries=_TOOL_RETRIES,
         )
         specialists[row.name] = specialist
 
@@ -238,12 +250,35 @@ def _attach_delegation_tool(
     )
 
     async def _delegate(ctx: RunContext, query: str) -> str:
+        logger.info("[delegate] %s START | query=%.160s", row.name, query.replace("\n", " "))
         try:
-            result = await specialist.run(query, usage=ctx.usage)
-            return str(result.output)
+            result = await asyncio.wait_for(
+                specialist.run(query, usage=ctx.usage), timeout=_SPECIALIST_TIMEOUT
+            )
+            out = "" if result.output is None else str(result.output)
+            logger.info(
+                "[delegate] %s DONE | output=%d chars | %.300s",
+                row.name, len(out), out.replace("\n", " "),
+            )
+            if not out.strip():
+                return (
+                    f"The {row.name} specialist completed but returned no text. "
+                    "Please rephrase or try again."
+                )
+            return out
+        except asyncio.TimeoutError:
+            logger.error(
+                "[delegate] %s TIMEOUT after %.0fs", row.name, _SPECIALIST_TIMEOUT
+            )
+            return (
+                f"The {row.name} specialist timed out after {int(_SPECIALIST_TIMEOUT)}s. "
+                "The underlying system may be slow or the query too large; try a "
+                "narrower request."
+            )
         except BaseException as e:  # noqa: BLE001
             auth_msg = await _authorization_prompt(row.name, e)
             if auth_msg is not None:
+                logger.info("[delegate] %s -> authorization required", row.name)
                 return auth_msg
             logger.exception("Specialist %s failed", row.name)
             return f"Error from {row.name}: {_format_error(e)}"
