@@ -329,13 +329,36 @@ def _build_openai_model(name: str) -> SAPAICoreModel:
 
 
 def _build_bedrock_model(name: str):
-    """Wrap a SAP AI Core Bedrock-hosted Claude deployment as a pydantic-ai model."""
+    """Wrap a SAP AI Core Bedrock-hosted Claude deployment as a pydantic-ai model.
+
+    Bedrock calls are synchronous (boto3) and run in a worker thread, so asyncio
+    cancellation — when a chat client disconnects or a specialist run hits its
+    timeout — cannot interrupt an in-flight call; it would keep running in the
+    background. Bound each call with explicit connect/read timeouts so a stuck
+    LLM call dies within a known window (≤ read_timeout) instead of lingering.
+
+    Retries are kept modest (``max_attempts`` is *total* attempts incl. the
+    first, so 3 = 2 retries) so transient Bedrock throttling / 5xx recover
+    instead of failing the whole turn, while the read timeout plus the 180s
+    specialist timeout still bound the worst case. All tunable via env.
+    """
+    from botocore.config import Config
     from gen_ai_hub.proxy.native.amazon.clients import Session
     from pydantic_ai.models.bedrock import BedrockConverseModel
     from pydantic_ai.providers.bedrock import BedrockProvider
 
     session = Session()
-    bedrock_client = session.client(model_name=name)
+    bedrock_client = session.client(
+        model_name=name,
+        config=Config(
+            connect_timeout=float(os.environ.get("BEDROCK_CONNECT_TIMEOUT", "10")),
+            read_timeout=float(os.environ.get("BEDROCK_READ_TIMEOUT", "120")),
+            retries={
+                "max_attempts": int(os.environ.get("BEDROCK_MAX_ATTEMPTS", "3")),
+                "mode": "standard",
+            },
+        ),
+    )
     return BedrockConverseModel(
         name, provider=BedrockProvider(bedrock_client=bedrock_client)
     )
