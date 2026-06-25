@@ -81,6 +81,41 @@ def _compute_tool_prefixes(urls: list[str]) -> list[str]:
     return result
 
 
+def _make_progress_handler(agent_name: str):
+    """Build a pydantic-ai ``event_stream_handler`` that logs each tool call a
+    specialist makes while it runs.
+
+    A specialist often takes several model+MCP iterations to answer. Those
+    iterations happen inside an opaque delegation tool, so without this they are
+    completely silent — both in the logs and to anyone watching the process.
+    Streaming the specialist's events here surfaces "agent X is calling tool Y"
+    per iteration: we log it for operators and forward it via
+    :func:`agents.progress.report_progress` so the chat endpoint can show it
+    live in the UI (see ``agents/progress.py``).
+    """
+    from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent
+
+    from agents.progress import report_progress
+
+    async def handler(_ctx, events) -> None:
+        step = 0
+        async for event in events:
+            if isinstance(event, FunctionToolCallEvent):
+                step += 1
+                logger.info(
+                    "[delegate] %s working | step %d -> %s",
+                    agent_name, step, event.part.tool_name,
+                )
+                report_progress(agent_name, f"calling {event.part.tool_name}")
+            elif isinstance(event, FunctionToolResultEvent):
+                logger.info(
+                    "[delegate] %s working | %s returned",
+                    agent_name, event.result.tool_name,
+                )
+
+    return handler
+
+
 def _format_error(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
         return "; ".join(_format_error(e) for e in exc.exceptions)
@@ -170,6 +205,31 @@ async def build_orchestrator() -> BuildResult:
     instructions = orch_instructions.strip()
     if specialist_lines:
         instructions += "\n\nAvailable specialists:\n" + "\n".join(specialist_lines)
+
+        # With exactly one specialist there is no routing decision to make —
+        # always forward. Deliberating (or trying to answer directly) just adds
+        # latency and the occasional refusal, so make delegation mandatory.
+        if len(enabled_rows) == 1:
+            only = enabled_rows[0]
+            instructions += (
+                f"\n\nThere is currently only ONE specialist available: "
+                f"**{only.name}**. Forward every request that needs a specialist "
+                f"straight to {only.name} — do not deliberate about which one to "
+                "pick and do not try to answer such requests yourself."
+            )
+
+        # Keep the user informed while specialists run. The chat UI streams the
+        # orchestrator's text immediately and shows a spinner on each delegation
+        # tool call, so a one-line heads-up before delegating is what makes it
+        # visible that an agent is working (specialist iterations themselves run
+        # inside an opaque tool call and aren't streamed individually).
+        instructions += (
+            "\n\nBefore you call a specialist, tell the user in one short line "
+            "what you're about to do (e.g. \"Checking with the "
+            f"{enabled_rows[0].name} specialist…\"). When a request needs several "
+            "specialists, narrate each step before the corresponding call so the "
+            "user can follow your progress instead of staring at a silent screen."
+        )
     else:
         instructions += (
             "\n\nNo specialists are currently configured. Inform the user "
@@ -253,7 +313,12 @@ def _attach_delegation_tool(
         logger.info("[delegate] %s START | query=%.160s", row.name, query.replace("\n", " "))
         try:
             result = await asyncio.wait_for(
-                specialist.run(query, usage=ctx.usage), timeout=_SPECIALIST_TIMEOUT
+                specialist.run(
+                    query,
+                    usage=ctx.usage,
+                    event_stream_handler=_make_progress_handler(row.name),
+                ),
+                timeout=_SPECIALIST_TIMEOUT,
             )
             out = "" if result.output is None else str(result.output)
             logger.info(
