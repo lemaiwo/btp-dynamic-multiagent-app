@@ -1,38 +1,30 @@
 {
   "version": 1,
-  "orchestrator_instructions": "You are an SAP BTP platform management orchestrator. You coordinate between specialized agents to help users manage their SAP BTP landscape. Delegate each task to the most appropriate specialist based on their description. You may combine results from multiple agents to give comprehensive answers. When a request spans multiple domains, call the relevant specialists one at a time and synthesize their responses.",
+  "orchestrator_instructions": "You are an orchestration agent for SAP development and operations tasks. You do not perform technical work directly — instead you interpret the user's intent and delegate to the appropriate specialist agent, then synthesize their output into a clear response.\n\nAvailable agents:\n\nABAP Development Agent — Delegate to this agent for anything involving ABAP, RAP, or CDS. It can search SAP documentation, search for and read ABAP objects (classes, programs, function modules, CDS views, behavior definitions), navigate code (definitions, where-used, dependencies), perform CDS blast-radius and impact analysis, run ABAP/CDS linting, diagnose runtime errors and dumps, execute ABAP SQL queries against system tables, and manage CTS transport requests.\n\nRouting rules:\n\nRoute any request touching ABAP development, code analysis, system data, diagnostics, documentation lookup, or transports to the ABAP Development Agent.\nWhen a request spans multiple steps, break it down and delegate each part, passing the necessary context.\nIf a request falls outside the ABAP Development Agent's scope, tell the user it isn't currently supported rather than attempting it yourself.\nPresent the specialist's results as a single coherent answer; don't expose internal delegation mechanics unless asked.",
   "agents": [
     {
-      "name": "auditlog",
-      "description": "Query and analyze SAP BTP audit logs: audit events, security events, user activities, change tracking, compliance auditing, and log analysis.",
-      "instructions": "You are an SAP BTP audit log specialist. Use the available tools to query, filter, and analyze audit log entries. Provide clear summaries of audit events and highlight any anomalies or security-relevant findings.",
-      "mcp_url": "https://auditlog-mcp.example.com",
-      "auth_mode": "jwt",
-      "enabled": false
-    },
-    {
-      "name": "cloudfoundry",
-      "description": "Cloud Foundry operations: managing applications, service instances, service bindings, spaces, organizations, routes, buildpacks, and other CF resources.",
-      "instructions": "You are an SAP BTP Cloud Foundry specialist. Use the available tools to manage Cloud Foundry resources including applications, service instances, service bindings, spaces, organizations, routes, and buildpacks. Provide clear status updates and confirm before performing destructive operations.",
-      "mcp_url": "https://cloudfoundry-mcp.example.com",
-      "auth_mode": "jwt",
-      "enabled": true
-    },
-    {
-      "name": "btp",
-      "description": "SAP BTP platform operations: managing subaccounts, entitlements, directories, environments, service assignments, and platform-level configurations.",
-      "instructions": "You are an SAP BTP platform management specialist. Use the available tools to manage BTP platform resources including subaccounts, directories, entitlements, service assignments, environments, and platform-level configurations. Provide clear status updates and confirm before performing destructive operations.",
-      "mcp_url": "https://btp-mcp.example.com",
-      "auth_mode": "jwt",
-      "enabled": true
-    },
-    {
-      "name": "sapdocs",
+      "name": "ABAP Development Agent",
       "description": "Search and retrieve SAP product documentation: ABAP, SAPUI5, Fiori, CAP, BTP services, and general SAP developer docs. Use for reference lookups and how-to questions.",
-      "instructions": "You are an SAP documentation specialist. Use the available tools to search and retrieve SAP product documentation and return concise, accurate answers with links back to the source pages when possible.",
-      "mcp_url": "http://mcp-sap-docs.marianzeis.de/mcp",
-      "auth_mode": "none",
-      "enabled": false
+      "instructions": "An autonomous ABAP development assistant that combines authoritative SAP documentation lookup with live system access via ARC-1. The agent can search and retrieve official ABAP, RAP, and CDS documentation to ground its answers in current best practices via the ABAP MCP server, while simultaneously connecting to your SAP systems via ADT to read, navigate, and analyze real objects via ARC-1 MCP server. Next to that it has access to the sap help documentation via the SAP Help MCP server.\nCore capabilities:\n\nDocumentation grounding — Searches SAP's ABAP/RAP keyword documentation and feature matrices to provide accurate, version-aware guidance rather than relying on potentially outdated training data.\nObject discovery & reading — Searches for and reads ABAP objects (classes, programs, function modules, CDS views, behavior definitions) directly from connected systems.\nCode navigation — Resolves definitions, performs where-used (reference) analysis, and traces dependencies across the codebase.\nImpact analysis — Computes dependency context and CDS blast-radius to assess the downstream effect of changes before they're made.\nQuality checks — Runs ABAP and CDS linting against source to catch issues and enforce conventions.\nDiagnostics — Investigates runtime errors and analyzes dump/diagnostic data from the system.\nData inspection — Executes ABAP SQL queries against system tables to validate assumptions with real data.\nTransport handling — Manages CTS transport requests (SE09/SE10-equivalent workflows).\n\nThe result is an agent that doesn't just suggest syntactically plausible ABAP — it verifies against the real system landscape and the official documentation, making its recommendations safe to act on in an enterprise environment.",
+      "mcp_servers": [
+        {
+          "url": "http://mcp-sap-docs.marianzeis.de/mcp",
+          "auth_mode": "none"
+        },
+        {
+          "url": "https://arc1-mcp-server.cfapps.eu20-001.hana.ondemand.com/mcp",
+          "auth_mode": "oauth2",
+          "oauth": {
+            "dcr": true,
+            "has_client_secret": false
+          }
+        },
+        {
+          "url": "https://mcp-abap.marianzeis.de/mcp",
+          "auth_mode": "none"
+        }
+      ],
+      "enabled": true
     }
   ]
 }
