@@ -31,6 +31,44 @@
           subtree: true,
         });
         rebrand();
+
+        // Open MCP sign-in links in a popup so the chat tab stays alive. The
+        // backend polls for the token and continues the answer automatically
+        // once the user authorizes — no need to re-send the message.
+        document.addEventListener(
+          "click",
+          function (e) {
+            if (
+              e.defaultPrevented ||
+              e.button !== 0 ||
+              e.metaKey ||
+              e.ctrlKey ||
+              e.shiftKey ||
+              e.altKey
+            )
+              return;
+            const a = e.target.closest && e.target.closest("a[href]");
+            if (!a) return;
+            // Only ever hijack OUR OWN same-origin sign-in endpoint. Chat content
+            // is model/MCP-controlled, so a substring match would let an injected
+            // link (https://evil/oauth/login, javascript:…) be window.open()'d
+            // with window.opener — open redirect / reverse tabnabbing / XSS.
+            let u;
+            try {
+              u = new URL(a.href, location.href);
+            } catch (_) {
+              return;
+            }
+            if (u.origin !== location.origin || u.pathname !== "/oauth/login")
+              return;
+            e.preventDefault();
+            const popup = window.open(u.href, "mcp_auth", "width=520,height=720");
+            // Popup blocked (e.g. enterprise policy): fall back to navigating so
+            // the user can still sign in (resume is then manual).
+            if (!popup) window.location.href = u.href;
+          },
+          true,
+        );
       })();
     </script>
   </head>

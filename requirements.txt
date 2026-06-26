@@ -1,6 +1,10 @@
-pydantic-ai[mcp,web,openai,bedrock]
-sap-ai-sdk-gen[all]
-mcp>=1.26.0
+# Pinned: these drive APIs the app imports directly (e.g.
+# pydantic_ai.mcp.MCPServerStreamableHTTP). Leaving pydantic-ai unpinned let the
+# CF buildpack install a newer version that moved that symbol, crashing startup.
+# Keep in sync with the locally verified versions.
+pydantic-ai[mcp,web,openai,bedrock]==1.72.0
+sap-ai-sdk-gen[all]==6.6.0
+mcp==1.26.0
 httpx
 uvicorn
 python-dotenv

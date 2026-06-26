@@ -93,3 +93,9 @@ resources:
     parameters:
       service: postgresql-db
       service-plan: standard
+      config:
+        # engine_version: "16"          # major version; allowed 13–17
+        memory: 2                     # GB; allowed [2, 4]. 2 = smallest (recreate-only)
+        # storage: 20                   # GB; grow-only (default/floor is 20)
+        multi_az: false               # false = no HA standby (dev). Set true for prod HA.
+        # backup_retention_period: 14   # days; allowed 7–35

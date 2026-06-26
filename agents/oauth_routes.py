@@ -24,8 +24,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["oauth"])
 
 
-def _page(title: str, body: str, *, ok: bool) -> HTMLResponse:
+def _page(title: str, body: str, *, ok: bool, auto_close: bool = False) -> HTMLResponse:
     color = "#2e7d32" if ok else "#c62828"
+    # When opened as a popup from the chat, close shortly after success — the
+    # chat detects the new token and continues on its own.
+    close_script = (
+        "<script>if(window.opener&&!window.opener.closed){"
+        "setTimeout(function(){try{window.close();}catch(e){}},1500);}</script>"
+        if auto_close
+        else ""
+    )
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -42,15 +50,18 @@ def _page(title: str, body: str, *, ok: bool) -> HTMLResponse:
       padding:9px 18px; border-radius:5px; font-weight:500; font-size:14px; }}
 </style></head>
 <body><div class="card"><h1>{title}</h1><p>{body}</p>
-<a href="/">Return to chat</a></div></body></html>"""
+<a href="/">Return to chat</a></div>{close_script}</body></html>"""
     return HTMLResponse(html, status_code=200 if ok else 400)
 
 
 @router.get("/oauth/login")
-async def oauth_login(request: Request, agent: str):
+async def oauth_login(request: Request, agent: str, server: str | None = None):
     """Start the OAuth2 authorization flow for an agent and redirect the user
     to the target's sign-in page. Linked from the chat when a specialist needs
-    authorization, so the long authorize URL never has to survive the chat."""
+    authorization, so the long authorize URL never has to survive the chat.
+
+    ``server`` pins the flow to a specific MCP server (its normalized URL) so an
+    agent with several oauth2 servers authorizes the one that needs sign-in."""
     user_id = current_principal.get()
     base_url = current_base_url.get()
     if not user_id or not base_url:
@@ -60,7 +71,9 @@ async def oauth_login(request: Request, agent: str):
             ok=False,
         )
     try:
-        url = await begin_authorization_for_agent(agent, user_id=user_id, base_url=base_url)
+        url = await begin_authorization_for_agent(
+            agent, user_id=user_id, base_url=base_url, server_key=server
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Failed to start authorization for %s", agent)
         url = None
@@ -106,6 +119,8 @@ async def oauth_callback(request: Request) -> HTMLResponse:
 
     return _page(
         "You're signed in",
-        "Authorization complete. Return to the chat and send your request again.",
+        "Authorization complete — you can close this window. The chat will "
+        "continue automatically.",
         ok=True,
+        auto_close=True,
     )
