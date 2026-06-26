@@ -1,11 +1,12 @@
-"""Browser test: live specialist progress shows up in the chat UI.
+"""Browser test: live specialist progress shows up in the chat UI as tool cards.
 
 Boots the hermetic chat server (``tests/_progress_test_server.py`` — the real
 pydantic-ai chat UI + our custom ``/api/chat``, backed by TestModel agents),
 drives the actual React chat UI with Playwright/Chromium, sends a message, and
-asserts that the per-iteration progress lines streamed by the delegated
-specialist (``› demo: calling step_one`` / ``step_two``) render in the page,
-followed by the orchestrator's final answer.
+asserts that each tool the delegated specialist calls (``step_one``/``step_two``)
+renders as a native tool card that reaches the "Completed" state, that the
+orchestrator's noisy ``delegate_*`` card is suppressed, and that the final answer
+follows.
 
 Prereqs:  pip install playwright && playwright install chromium
 Run:       python tests/test_chat_progress_ui.py [--headed]
@@ -80,16 +81,26 @@ def main() -> int:
 
             _send_message(page, "please run the demo task")
 
-            # The two per-iteration progress lines must appear...
-            for needle in ("calling step_one", "calling step_two"):
+            # Each specialist tool must render as a card naming the tool...
+            for needle in ("step_one", "step_two"):
                 try:
                     page.get_by_text(needle, exact=False).first.wait_for(
                         state="visible", timeout=20_000
                     )
-                    print(f"  PASS  progress line visible: {needle!r}")
+                    print(f"  PASS  tool card visible: {needle!r}")
                 except PWTimeout:
-                    failures.append(f"progress line not found: {needle!r}")
-                    print(f"  FAIL  progress line not found: {needle!r}")
+                    failures.append(f"tool card not found: {needle!r}")
+                    print(f"  FAIL  tool card not found: {needle!r}")
+
+            # ...and each card must reach the 'Completed' state.
+            try:
+                page.get_by_text("Completed", exact=False).first.wait_for(
+                    state="visible", timeout=20_000
+                )
+                print("  PASS  'Completed' tool state visible")
+            except PWTimeout:
+                failures.append("'Completed' tool state not found")
+                print("  FAIL  'Completed' tool state not found")
 
             # ...and the orchestrator's final answer must follow.
             try:
@@ -101,9 +112,17 @@ def main() -> int:
                 failures.append("final answer not found")
                 print("  FAIL  final answer not found")
 
-            # Ordering: progress should come before the final answer in the DOM.
             body = page.inner_text("body")
-            i_prog = body.find("calling step_one")
+
+            # The orchestrator's internal delegate_* card must be suppressed.
+            if "delegate_demo" in body:
+                failures.append("delegate_demo card leaked into the UI")
+                print("  FAIL  delegate_demo card was not suppressed")
+            else:
+                print("  PASS  delegate_* card suppressed")
+
+            # Ordering: progress should come before the final answer in the DOM.
+            i_prog = body.find("step_one")
             i_final = body.find("reported 42")
             if i_prog != -1 and i_final != -1 and i_prog < i_final:
                 print("  PASS  progress precedes final answer")

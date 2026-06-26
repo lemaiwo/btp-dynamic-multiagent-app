@@ -462,13 +462,16 @@ async def begin_authorization(
 
 
 async def begin_authorization_for_agent(
-    agent_name: str, *, user_id: str, base_url: str
+    agent_name: str, *, user_id: str, base_url: str, server_key: str | None = None
 ) -> str | None:
-    """Build a fresh authorize URL for an agent's first oauth2 server.
+    """Build a fresh authorize URL for one of an agent's oauth2 servers.
 
     Used by the ``/oauth/login`` redirect endpoint so the (long, PKCE/state)
-    authorize URL is generated at click time rather than embedded in chat.
-    Returns None if the agent has no oauth2 server.
+    authorize URL is generated at click time rather than embedded in chat. When
+    ``server_key`` is given, authorize that exact server (so an agent with
+    several oauth2 servers signs into the one that needs it, and the token lands
+    under the key the chat is polling); otherwise the first oauth2 server.
+    Returns None if no matching oauth2 server is found.
     """
     async with SessionLocal() as session:
         rows = await list_agents(session)
@@ -477,10 +480,12 @@ async def begin_authorization_for_agent(
         return None
     for srv in row.mcp_servers:
         if srv.get("auth_mode") == AUTH_MODE_OAUTH2 and isinstance(srv.get("oauth"), dict):
-            server_key = normalize_mcp_url(str(srv["url"]))
-            config = await resolve_config(server_key, srv["oauth"])
+            sk = normalize_mcp_url(str(srv["url"]))
+            if server_key and sk != server_key:
+                continue
+            config = await resolve_config(sk, srv["oauth"])
             return await begin_authorization(
-                server_key, config, user_id=user_id, base_url=base_url
+                sk, config, user_id=user_id, base_url=base_url
             )
     return None
 
@@ -517,6 +522,20 @@ async def find_oauth_config(server_key: str) -> Oauth2Config | None:
     return None
 
 
+async def has_valid_token(user_id: str, server_key: str) -> bool:
+    """True if the user currently has a non-expired access token for the server.
+
+    Used by the chat endpoint to poll for an interactive sign-in completing, so
+    it can resume the specialist automatically instead of asking the user to
+    re-send their request.
+    """
+    async with SessionLocal() as session:
+        row = await get_user_token(session, user_id, server_key)
+    if row is None:
+        return False
+    return not _is_expired(row.expires_at)
+
+
 async def complete_authorization(*, code: str, state: str, principal: str | None) -> str:
     """Exchange an authorization code for tokens and persist them.
 
@@ -528,7 +547,11 @@ async def complete_authorization(*, code: str, state: str, principal: str | None
         flow = await pop_oauth_state(session, state)
     if flow is None:
         raise ValueError("Authorization link is invalid or has expired. Please retry.")
-    if principal and flow.user_id != principal:
+    # Fail closed: bind the token only when we can confirm the caller completing
+    # the callback is the same user who started the flow. A missing principal
+    # (e.g. an invalid/forged token that failed validation) is rejected, not
+    # treated as "skip the check".
+    if not principal or flow.user_id != principal:
         raise ValueError("Authorization does not belong to the current user.")
 
     config = await find_oauth_config(flow.server_key)

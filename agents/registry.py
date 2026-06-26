@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import reprlib
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -36,6 +37,14 @@ _TOOL_RETRIES = int(os.environ.get("AGENT_TOOL_RETRIES", "3"))
 # Hard ceiling on a single specialist run so a stuck MCP/model call surfaces as
 # a logged error instead of an indefinitely "running" chat. Tunable via env.
 _SPECIALIST_TIMEOUT = float(os.environ.get("SPECIALIST_TIMEOUT_SECONDS", "180"))
+
+# When a specialist's MCP server needs the user to sign in (auth_mode="oauth2"),
+# show a sign-in link and wait this long for the user to authorize in the popup
+# before giving up — then resume automatically. Polls the token store meanwhile.
+_AUTH_WAIT_SECONDS = float(os.environ.get("MCP_AUTH_WAIT_SECONDS", "180"))
+_AUTH_POLL_SECONDS = float(os.environ.get("MCP_AUTH_POLL_SECONDS", "1.5"))
+# Cap auth→retry rounds so a server that keeps demanding auth can't loop forever.
+_MAX_AUTH_ROUNDS = int(os.environ.get("MCP_AUTH_MAX_ROUNDS", "2"))
 
 
 # ---------------------------------------------------------------------------
@@ -81,36 +90,93 @@ def _compute_tool_prefixes(urls: list[str]) -> list[str]:
     return result
 
 
+# Bounded repr for non-str tool payloads: limits string/container size so a
+# multi-MB MCP result is never fully materialized just to be truncated away.
+_PREVIEW_REPR = reprlib.Repr()
+_PREVIEW_REPR.maxstring = 600
+_PREVIEW_REPR.maxother = 600
+
+
+def _short_tool_output(result) -> str:
+    """A compact, single-blob preview of a specialist tool's return value.
+
+    Shown (collapsed) inside the tool card in the chat UI, so keep it bounded —
+    MCP tools can return large payloads we don't want to stream in full.
+    """
+    try:
+        content = getattr(result, "content", None)
+        if content is None and hasattr(result, "model_response_str"):
+            content = result.model_response_str()
+        text = content if isinstance(content, str) else _PREVIEW_REPR.repr(content)
+    except Exception:  # noqa: BLE001 — preview must never break a run
+        text = ""
+    text = text.strip()
+    return text[:600] + "…" if len(text) > 600 else text
+
+
 def _make_progress_handler(agent_name: str):
-    """Build a pydantic-ai ``event_stream_handler`` that logs each tool call a
-    specialist makes while it runs.
+    """Build a pydantic-ai ``event_stream_handler`` that surfaces each tool call
+    a specialist makes while it runs.
 
     A specialist often takes several model+MCP iterations to answer. Those
     iterations happen inside an opaque delegation tool, so without this they are
-    completely silent — both in the logs and to anyone watching the process.
-    Streaming the specialist's events here surfaces "agent X is calling tool Y"
-    per iteration: we log it for operators and forward it via
-    :func:`agents.progress.report_progress` so the chat endpoint can show it
-    live in the UI (see ``agents/progress.py``).
-    """
-    from pydantic_ai.messages import FunctionToolCallEvent, FunctionToolResultEvent
+    completely silent — both in the logs and to anyone watching the chat. We log
+    each step for operators and report it via :mod:`agents.progress` so the chat
+    endpoint can render it live as a native tool card (a pulsing "Running" badge
+    that flips to a green "Completed" / red "Error"; see ``agents/chat_app.py``).
 
-    from agents.progress import report_progress
+    Tool starts that never see a matching result (the run was cancelled mid-call
+    — e.g. a timeout) are closed in the ``finally`` block so the UI never leaves
+    a card stuck "Running".
+    """
+    from pydantic_ai.messages import (
+        FunctionToolCallEvent,
+        FunctionToolResultEvent,
+        RetryPromptPart,
+    )
+
+    from agents.progress import report_tool_end, report_tool_start
 
     async def handler(_ctx, events) -> None:
         step = 0
-        async for event in events:
-            if isinstance(event, FunctionToolCallEvent):
-                step += 1
-                logger.info(
-                    "[delegate] %s working | step %d -> %s",
-                    agent_name, step, event.part.tool_name,
-                )
-                report_progress(agent_name, f"calling {event.part.tool_name}")
-            elif isinstance(event, FunctionToolResultEvent):
-                logger.info(
-                    "[delegate] %s working | %s returned",
-                    agent_name, event.result.tool_name,
+        open_calls: dict[str, str] = {}  # tool_call_id -> tool_name still running
+        try:
+            async for event in events:
+                if isinstance(event, FunctionToolCallEvent):
+                    part = event.part
+                    step += 1
+                    open_calls[part.tool_call_id] = part.tool_name
+                    try:
+                        args = part.args_as_dict()
+                    except Exception:  # noqa: BLE001
+                        args = None
+                    logger.info(
+                        "[delegate] %s working | step %d -> %s",
+                        agent_name, step, part.tool_name,
+                    )
+                    report_tool_start(agent_name, part.tool_call_id, part.tool_name, args)
+                elif isinstance(event, FunctionToolResultEvent):
+                    result = event.result
+                    open_calls.pop(result.tool_call_id, None)
+                    failed = isinstance(result, RetryPromptPart)
+                    logger.info(
+                        "[delegate] %s working | %s %s",
+                        agent_name,
+                        getattr(result, "tool_name", "?"),
+                        "failed" if failed else "returned",
+                    )
+                    report_tool_end(
+                        agent_name,
+                        result.tool_call_id,
+                        ok=not failed,
+                        output=_short_tool_output(result),
+                    )
+        finally:
+            # The run ended (or was cancelled) with calls still in flight; close
+            # their cards so they don't hang on the pulsing "Running" state.
+            for call_id in open_calls:
+                report_tool_end(
+                    agent_name, call_id, ok=False, output="(interrupted)"
                 )
 
     return handler
@@ -122,32 +188,70 @@ def _format_error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | None:
-    """If the failure was 'needs OAuth2 authorization', return a chat message
-    with a sign-in link; otherwise None so normal error handling proceeds.
+def _build_login_link(agent_name: str, server_key: str | None = None) -> str | None:
+    """The app's short, stable ``/oauth/login`` link for an agent (it builds the
+    real authorize URL at click time). None if the app base URL is unknown.
 
-    The link points at this app's ``/oauth/login`` endpoint (short + stable),
-    which builds the real authorize URL at click time — so the long PKCE/state
-    URL never has to survive being relayed through the orchestrator LLM.
-    """
+    ``server_key`` pins the link to the specific MCP server that needs sign-in,
+    so an agent with several oauth2 servers authorizes the right one (and the
+    token lands under the key the wait loop polls)."""
     from urllib.parse import quote
 
-    from agents.auth import current_base_url, current_principal
+    from agents.auth import current_base_url
+
+    base_url = current_base_url.get()
+    if not base_url:
+        return None
+    link = f"{base_url.rstrip('/')}/oauth/login?agent={quote(agent_name)}"
+    if server_key:
+        link += f"&server={quote(server_key, safe='')}"
+    return link
+
+
+def _signin_message(agent_name: str, link: str) -> str:
+    """Chat bubble shown when a specialist needs sign-in; the run keeps going
+    and resumes by itself once the user authorizes (see ``_wait_for_token``)."""
+    return (
+        f"🔐 **{agent_name}** needs you to sign in to continue.\n\n"
+        f"[**Sign in to {agent_name}**]({link})\n\n"
+        "A sign-in window will open. I'll keep working and continue "
+        "automatically as soon as you're done — no need to message me again."
+    )
+
+
+async def _wait_for_token(user_id: str, server_key: str) -> bool:
+    """Poll the token store until the user has a valid token for ``server_key``
+    (they finished signing in) or the wait window elapses.
+
+    ``asyncio.sleep`` is a cancellation point, so a client disconnect unwinds
+    this promptly rather than holding the request open."""
+    from agents.oauth2 import has_valid_token
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AUTH_WAIT_SECONDS
+    while loop.time() < deadline:
+        if await has_valid_token(user_id, server_key):
+            return True
+        await asyncio.sleep(_AUTH_POLL_SECONDS)
+    return await has_valid_token(user_id, server_key)
+
+
+async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | None:
+    """Static fallback for when auto-continue can't run (no app URL / identity):
+    return a chat message with a sign-in link the user can use, then retry
+    manually; otherwise None so normal error handling proceeds."""
     from agents.oauth2 import find_oauth_required
 
     required = find_oauth_required(exc)
     if required is None:
         return None
-
-    user_id = current_principal.get()
-    base_url = current_base_url.get()
-    if not user_id or not base_url:
+    link = _build_login_link(agent_name, required.server_key)
+    if not link:
         return (
             f"**{agent_name}** needs you to sign in, but the sign-in link could "
             "not be built (missing user identity or app URL). Open the app "
             "through its approuter URL and try again."
         )
-    link = f"{base_url.rstrip('/')}/oauth/login?agent={quote(agent_name)}"
     return (
         f"🔐 **{agent_name}** needs you to sign in first.\n\n"
         f"**[Click here to sign in to {agent_name}]({link})**\n\n"
@@ -310,43 +414,108 @@ def _attach_delegation_tool(
     )
 
     async def _delegate(ctx: RunContext, query: str) -> str:
+        from agents.auth import current_principal
+        from agents.oauth2 import find_oauth_required
+        from agents.progress import (
+            current_progress,
+            report_delegation_end,
+            report_delegation_start,
+            report_message,
+            report_note,
+        )
+
         logger.info("[delegate] %s START | query=%.160s", row.name, query.replace("\n", " "))
+        # Phase hint for the live "working…" heartbeat while the specialist spins
+        # up (MCP connect + first model call) before any tool card appears. The
+        # paired end (in `finally`) lets the chat endpoint tell when *every*
+        # specialist is done and the orchestrator is composing the reply.
+        report_delegation_start(row.name, f"Consulting the {row.name} specialist…")
         try:
-            result = await asyncio.wait_for(
-                specialist.run(
-                    query,
-                    usage=ctx.usage,
-                    event_stream_handler=_make_progress_handler(row.name),
-                ),
-                timeout=_SPECIALIST_TIMEOUT,
-            )
-            out = "" if result.output is None else str(result.output)
-            logger.info(
-                "[delegate] %s DONE | output=%d chars | %.300s",
-                row.name, len(out), out.replace("\n", " "),
-            )
-            if not out.strip():
-                return (
-                    f"The {row.name} specialist completed but returned no text. "
-                    "Please rephrase or try again."
+            # Run the specialist; if its MCP server needs the user to sign in,
+            # show a sign-in link, wait for them to authorize in the popup, then
+            # retry automatically — so the user never has to message again.
+            for attempt in range(_MAX_AUTH_ROUNDS + 1):
+                try:
+                    result = await asyncio.wait_for(
+                        specialist.run(
+                            query,
+                            usage=ctx.usage,
+                            event_stream_handler=_make_progress_handler(row.name),
+                        ),
+                        timeout=_SPECIALIST_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[delegate] %s TIMEOUT after %.0fs", row.name, _SPECIALIST_TIMEOUT
+                    )
+                    return (
+                        f"The {row.name} specialist timed out after "
+                        f"{int(_SPECIALIST_TIMEOUT)}s. The underlying system may be "
+                        "slow or the query too large; try a narrower request."
+                    )
+                except asyncio.CancelledError:
+                    # The request was cancelled (e.g. the chat client
+                    # disconnected). Let it unwind so the run actually stops,
+                    # instead of being caught below and reported as a normal
+                    # error (which would keep it running).
+                    raise
+                except BaseException as e:  # noqa: BLE001
+                    required = find_oauth_required(e)
+                    if required is None:
+                        logger.exception("Specialist %s failed", row.name)
+                        return f"Error from {row.name}: {_format_error(e)}"
+
+                    # Sign-in needed. Auto-continue (show link, wait, retry) only
+                    # makes sense with an interactive chat sink listening; for A2A
+                    # / background runs there's no popup and no one to stream the
+                    # link to, so return the sign-in link immediately instead of
+                    # holding the request polling for a sign-in that can't happen.
+                    user_id = current_principal.get()
+                    link = _build_login_link(row.name, required.server_key)
+                    interactive = current_progress.get() is not None
+                    if not (user_id and link and interactive):
+                        return await _authorization_prompt(row.name, e) or (
+                            f"Error from {row.name}: {_format_error(e)}"
+                        )
+                    if attempt >= _MAX_AUTH_ROUNDS:
+                        return (
+                            f"**{row.name}** still needs sign-in after several "
+                            "attempts. Use the sign-in link above, then send your "
+                            "request again."
+                        )
+                    logger.info("[delegate] %s -> awaiting user authorization", row.name)
+                    report_message(row.name, _signin_message(row.name, link))
+                    report_note(row.name, "Waiting for you to sign in…")
+                    if await _wait_for_token(user_id, required.server_key):
+                        logger.info("[delegate] %s -> authorized; resuming", row.name)
+                        report_note(row.name, f"Signed in — resuming {row.name}…")
+                        continue  # retry the run, now with a token
+                    logger.info("[delegate] %s -> sign-in not detected in time", row.name)
+                    return (
+                        f"I didn't detect a completed sign-in for **{row.name}** in "
+                        "time. Use the sign-in link above, then send your request "
+                        "again."
+                    )
+
+                out = "" if result.output is None else str(result.output)
+                logger.info(
+                    "[delegate] %s DONE | output=%d chars | %.300s",
+                    row.name, len(out), out.replace("\n", " "),
                 )
-            return out
-        except asyncio.TimeoutError:
-            logger.error(
-                "[delegate] %s TIMEOUT after %.0fs", row.name, _SPECIALIST_TIMEOUT
-            )
+                if not out.strip():
+                    return (
+                        f"The {row.name} specialist completed but returned no text. "
+                        "Please rephrase or try again."
+                    )
+                return out
+
+            # Defensive: loop exhausted without an explicit return.
             return (
-                f"The {row.name} specialist timed out after {int(_SPECIALIST_TIMEOUT)}s. "
-                "The underlying system may be slow or the query too large; try a "
-                "narrower request."
+                f"**{row.name}** could not complete sign-in. Use the sign-in link "
+                "above, then send your request again."
             )
-        except BaseException as e:  # noqa: BLE001
-            auth_msg = await _authorization_prompt(row.name, e)
-            if auth_msg is not None:
-                logger.info("[delegate] %s -> authorization required", row.name)
-                return auth_msg
-            logger.exception("Specialist %s failed", row.name)
-            return f"Error from {row.name}: {_format_error(e)}"
+        finally:
+            report_delegation_end(row.name)
 
     _delegate.__name__ = tool_name
     _delegate.__doc__ = description
