@@ -361,6 +361,14 @@ class DynamicChatApp:
         hb_task = asyncio.create_task(heartbeat())
         try:
             response = adapter.streaming_response(merged())
+            # Stream live through proxies. The SAP approuter gzip-compresses
+            # text/event-stream (compressible() matches `text/*`), which BUFFERS
+            # the whole response — so progress (cards, heartbeat, the sign-in
+            # link) only appears once the run finishes. The `compression`
+            # middleware skips bodies marked `no-transform`; `X-Accel-Buffering`
+            # disables any nginx-style buffering too.
+            response.headers["Cache-Control"] = "no-cache, no-transform"
+            response.headers["X-Accel-Buffering"] = "no"
             await response(scope, receive, send)
         finally:
             current_progress.reset(token)
