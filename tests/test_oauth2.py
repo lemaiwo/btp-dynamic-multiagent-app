@@ -273,6 +273,32 @@ async def main() -> None:
     finally:
         current_principal.reset(p)
 
+    # --- has_usable_token: refresh-aware sign-in pre-check gate -----------
+    # The pre-check must NOT prompt when a credential can be used without an
+    # interactive sign-in (valid access token, OR a refresh token the run
+    # refreshes silently). Distinct keys per case: upsert_user_token keeps an
+    # existing refresh_token when passed None, so reuse would mask the change.
+    print("\n== has_usable_token (pre-check gate) ==")
+    UUSER = "usable-user"
+    K_NONE = "https://u-none.example.com/mcp"
+    K_REFRESH = "https://u-refresh.example.com/mcp"
+    K_EXPIRED = "https://u-expired.example.com/mcp"
+    K_VALID = "https://u-valid.example.com/mcp"
+    check("no token -> not usable", (await oauth2.has_usable_token(UUSER, K_NONE)) is False)
+    async with SessionLocal() as s:
+        from agents.db import upsert_user_token as _up
+
+        await _up(s, user_id=UUSER, server_key=K_REFRESH, access_token="A",
+                  refresh_token="R", expires_at=datetime.now(timezone.utc) - timedelta(seconds=10))
+        await _up(s, user_id=UUSER, server_key=K_EXPIRED, access_token="A",
+                  refresh_token=None, expires_at=datetime.now(timezone.utc) - timedelta(seconds=10))
+        await _up(s, user_id=UUSER, server_key=K_VALID, access_token="A",
+                  refresh_token=None, expires_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    check("expired+refresh -> usable (no prompt)", (await oauth2.has_usable_token(UUSER, K_REFRESH)) is True)
+    check("expired+refresh -> has_valid_token False", (await oauth2.has_valid_token(UUSER, K_REFRESH)) is False)
+    check("expired+no-refresh -> not usable", (await oauth2.has_usable_token(UUSER, K_EXPIRED)) is False)
+    check("valid access -> usable", (await oauth2.has_usable_token(UUSER, K_VALID)) is True)
+
     # --- DCR: auto-discover + register ------------------------------------
     print("\n== DCR (auto-discover + register) ==")
     reg_calls = {"n": 0}

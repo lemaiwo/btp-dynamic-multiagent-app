@@ -219,6 +219,13 @@ def _signin_message(agent_name: str, link: str) -> str:
     )
 
 
+def _signin_timeout_message(agent_name: str) -> str:
+    return (
+        f"I didn't detect a completed sign-in for **{agent_name}** in time. "
+        "Use the sign-in link above, then send your request again."
+    )
+
+
 async def _wait_for_token(user_id: str, server_key: str) -> bool:
     """Poll the token store until the user has a valid token for ``server_key``
     (they finished signing in) or the wait window elapses.
@@ -234,6 +241,36 @@ async def _wait_for_token(user_id: str, server_key: str) -> bool:
             return True
         await asyncio.sleep(_AUTH_POLL_SECONDS)
     return await has_valid_token(user_id, server_key)
+
+
+def _oauth2_server_keys(row) -> list[str]:
+    """Normalized server keys of an agent's oauth2 MCP servers (the keys tokens
+    are stored under). Empty when the row carries no server list (e.g. tests)."""
+    from agents.db import AUTH_MODE_OAUTH2
+    from agents.oauth2 import normalize_mcp_url
+
+    keys: list[str] = []
+    for spec in getattr(row, "mcp_servers", None) or []:
+        if spec.get("auth_mode") == AUTH_MODE_OAUTH2 and spec.get("url"):
+            keys.append(normalize_mcp_url(str(spec["url"])))
+    return keys
+
+
+async def _await_signin(agent_name: str, server_key: str, user_id: str) -> bool:
+    """Show the sign-in link for ``server_key`` and wait for the user to
+    authorize in the popup. Returns True once a token appears, False on timeout
+    (or if no link could be built). Shared by the pre-check and the in-run path."""
+    from agents.progress import report_message, report_note
+
+    link = _build_login_link(agent_name, server_key)
+    if not link:
+        return False
+    report_message(agent_name, _signin_message(agent_name, link))
+    report_note(agent_name, "Waiting for you to sign in…")
+    if await _wait_for_token(user_id, server_key):
+        report_note(agent_name, f"Signed in — resuming {agent_name}…")
+        return True
+    return False
 
 
 async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | None:
@@ -415,13 +452,11 @@ def _attach_delegation_tool(
 
     async def _delegate(ctx: RunContext, query: str) -> str:
         from agents.auth import current_principal
-        from agents.oauth2 import find_oauth_required
+        from agents.oauth2 import find_oauth_required, has_usable_token
         from agents.progress import (
             current_progress,
             report_delegation_end,
             report_delegation_start,
-            report_message,
-            report_note,
         )
 
         logger.info("[delegate] %s START | query=%.160s", row.name, query.replace("\n", " "))
@@ -431,9 +466,41 @@ def _attach_delegation_tool(
         # specialist is done and the orchestrator is composing the reply.
         report_delegation_start(row.name, f"Consulting the {row.name} specialist…")
         try:
-            # Run the specialist; if its MCP server needs the user to sign in,
-            # show a sign-in link, wait for them to authorize in the popup, then
-            # retry automatically — so the user never has to message again.
+            # Fast path: if we already know an oauth2 MCP server has no usable
+            # credential for this user, prompt for sign-in *immediately* instead
+            # of paying the full model-call + MCP-connect + OAuth-discovery cost
+            # just to find out. Interactive runs only (A2A/no sink falls through
+            # to the run, which raises and returns the static link).
+            user_id = current_principal.get()
+            if user_id and current_progress.get() is not None:
+                for server_key in _oauth2_server_keys(row):
+                    try:
+                        # A refreshable token still works without an interactive
+                        # sign-in (the run refreshes it silently), so only prompt
+                        # when there's no usable credential at all.
+                        if await has_usable_token(user_id, server_key):
+                            continue
+                        if not _build_login_link(row.name, server_key):
+                            break  # no app URL → let the run raise → static fallback
+                        logger.info("[delegate] %s -> sign-in needed (pre-check)", row.name)
+                        signed_in = await _await_signin(row.name, server_key, user_id)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        # Token lookup hiccup (e.g. transient DB error): don't
+                        # crash the turn — defer to the run, which has graceful
+                        # error handling and will re-prompt if auth is truly needed.
+                        logger.warning(
+                            "[delegate] %s pre-check failed; deferring to run",
+                            row.name, exc_info=True,
+                        )
+                        break
+                    if not signed_in:
+                        return _signin_timeout_message(row.name)
+
+            # Run the specialist; if its MCP server still needs the user to sign
+            # in (e.g. token expired mid-run), show a sign-in link, wait for them
+            # to authorize, then retry — so the user never has to message again.
             for attempt in range(_MAX_AUTH_ROUNDS + 1):
                 try:
                     result = await asyncio.wait_for(
@@ -471,9 +538,12 @@ def _attach_delegation_tool(
                     # link to, so return the sign-in link immediately instead of
                     # holding the request polling for a sign-in that can't happen.
                     user_id = current_principal.get()
-                    link = _build_login_link(row.name, required.server_key)
                     interactive = current_progress.get() is not None
-                    if not (user_id and link and interactive):
+                    if not (
+                        user_id
+                        and interactive
+                        and _build_login_link(row.name, required.server_key)
+                    ):
                         return await _authorization_prompt(row.name, e) or (
                             f"Error from {row.name}: {_format_error(e)}"
                         )
@@ -484,18 +554,11 @@ def _attach_delegation_tool(
                             "request again."
                         )
                     logger.info("[delegate] %s -> awaiting user authorization", row.name)
-                    report_message(row.name, _signin_message(row.name, link))
-                    report_note(row.name, "Waiting for you to sign in…")
-                    if await _wait_for_token(user_id, required.server_key):
+                    if await _await_signin(row.name, required.server_key, user_id):
                         logger.info("[delegate] %s -> authorized; resuming", row.name)
-                        report_note(row.name, f"Signed in — resuming {row.name}…")
                         continue  # retry the run, now with a token
                     logger.info("[delegate] %s -> sign-in not detected in time", row.name)
-                    return (
-                        f"I didn't detect a completed sign-in for **{row.name}** in "
-                        "time. Use the sign-in link above, then send your request "
-                        "again."
-                    )
+                    return _signin_timeout_message(row.name)
 
                 out = "" if result.output is None else str(result.output)
                 logger.info(
