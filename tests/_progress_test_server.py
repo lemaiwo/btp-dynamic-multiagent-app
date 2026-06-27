@@ -107,7 +107,9 @@ def _build_heartbeat_orchestrator():
 
 
 _OAUTH_USER = "testuser"
-_OAUTH_SERVER_KEY = "testkey"
+# A normalized (/mcp) URL so registry._oauth2_server_keys -> normalize_mcp_url
+# returns it unchanged and the pre-check polls the same key the tool/authorize use.
+_OAUTH_SERVER_KEY = "https://testmcp/mcp"
 
 
 def _build_oauth_orchestrator():
@@ -131,7 +133,15 @@ def _build_oauth_orchestrator():
     orchestrator = Agent(
         TestModel(custom_output_text="ARC-1 reports 42 open incidents.")
     )
-    row = SimpleNamespace(name="arc1", description="ARC-1 incident specialist")
+    # mcp_servers makes registry._delegate's pre-check fire (prompt for sign-in
+    # before running the specialist), matching the real AgentConfig shape.
+    row = SimpleNamespace(
+        name="arc1",
+        description="ARC-1 incident specialist",
+        mcp_servers=[
+            {"url": _OAUTH_SERVER_KEY, "auth_mode": "oauth2", "oauth": {"dcr": True}}
+        ],
+    )
     _attach_delegation_tool(orchestrator, specialist, row)
     return orchestrator, {"arc1": specialist}
 

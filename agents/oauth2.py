@@ -536,6 +536,22 @@ async def has_valid_token(user_id: str, server_key: str) -> bool:
     return not _is_expired(row.expires_at)
 
 
+async def has_usable_token(user_id: str, server_key: str) -> bool:
+    """True if the user has a credential the live connection can use WITHOUT an
+    interactive sign-in: a non-expired access token, OR a refresh token (which
+    :class:`PerUserOAuth2Auth` refreshes transparently on use).
+
+    The sign-in pre-check gates on this — NOT on :func:`has_valid_token` — so a
+    returning user with a merely-expired (but refreshable) access token isn't
+    needlessly prompted to sign in again.
+    """
+    async with SessionLocal() as session:
+        row = await get_user_token(session, user_id, server_key)
+    if row is None:
+        return False
+    return (not _is_expired(row.expires_at)) or bool(row.refresh_token)
+
+
 async def complete_authorization(*, code: str, state: str, principal: str | None) -> str:
     """Exchange an authorization code for tokens and persist them.
 
