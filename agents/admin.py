@@ -18,11 +18,13 @@ Endpoints (all require `<xsappname>.admin` XSUAA scope):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -151,19 +153,22 @@ class McpServerPayload(BaseModel):
         # Host allow-list applies to authenticated (JWT-forwarding) servers
         # only. Public servers are unrestricted by design.
         if not public:
+            parsed = urlparse(v)
+            host = (parsed.hostname or "").lower()
+            if parsed.username or parsed.password:
+                raise ValueError("url must not contain userinfo (user@host)")
             allowlist = os.environ.get("MCP_URL_ALLOWLIST", "").strip()
             if allowlist:
-                allowed = [a.strip() for a in allowlist.split(",") if a.strip()]
-                if not any(v.startswith(a.rstrip("/")) for a in allowed):
+                allowed = [a.strip().rstrip("/") for a in allowlist.split(",") if a.strip()]
+                # Match only at a path boundary: a bare prefix check would let
+                # "https://good.com" also admit "https://good.com.evil.net",
+                # and the user's JWT would then be forwarded there.
+                if not any(v == a or v.startswith(a + "/") for a in allowed):
                     raise ValueError(
                         f"url is not in MCP_URL_ALLOWLIST ({allowlist})"
                     )
             else:
-                host = v.split("/", 3)[2]
-                if not (
-                    host.endswith(".hana.ondemand.com")
-                    or host.endswith(".cfapps.sap.hana.ondemand.com")
-                ):
+                if not host.endswith(".hana.ondemand.com"):
                     raise ValueError(
                         "url must be a BTP-hosted URL (*.hana.ondemand.com). "
                         "Set MCP_URL_ALLOWLIST to override, or set auth_mode=none "
@@ -370,9 +375,12 @@ async def api_update_orchestrator(payload: OrchestratorPayload) -> dict[str, str
 async def api_get_model() -> dict[str, Any]:
     async with SessionLocal() as session:
         active = await get_active_model_name(session)
+    # available_models() may do a live AI Core query (network, sync) on a
+    # cache miss; run it off the event loop so other requests aren't stalled.
+    available = await asyncio.to_thread(available_models)
     return {
         "model_name": active or default_model_name(),
-        "available": available_models(),
+        "available": available,
         "default": default_model_name(),
     }
 
@@ -450,6 +458,19 @@ async def api_export() -> dict[str, Any]:
 @router.post("/api/import", dependencies=[Depends(require_admin)])
 async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     async with SessionLocal() as session:
+        # Validate the whole payload before writing anything, so a bad entry
+        # halfway through doesn't leave a partially applied import behind.
+        from agents.db import get_agent_by_name, prepare_servers as _prepare
+
+        for agent in payload.agents:
+            existing = await get_agent_by_name(session, agent.name)
+            try:
+                _prepare(agent.to_servers_list(), existing)
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=422, detail=f"Agent '{agent.name}': {e}"
+                ) from e
+
         if payload.orchestrator_instructions:
             await set_orchestrator_instructions(session, payload.orchestrator_instructions)
 

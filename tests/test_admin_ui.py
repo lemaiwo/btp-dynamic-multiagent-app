@@ -220,12 +220,20 @@ async def main() -> None:
 
         # Modal form fields
         for fid in ("agent-id", "agent-name", "agent-description",
-                    "agent-instructions", "agent-mcp-url", "agent-enabled"):
+                    "agent-instructions", "agent-enabled"):
             found = any(
                 e[1].get("id") == fid for e in coll.elements
                 if e[0] in ("input", "textarea", "select")
             )
             check(f"form field #{fid}", found)
+        # MCP servers are a dynamic list rendered into a container div.
+        check(
+            "form container #agent-mcp-servers",
+            any(
+                e[0] == "div" and e[1].get("id") == "agent-mcp-servers"
+                for e in coll.elements
+            ),
+        )
 
         # Import file input
         file_input = next(
@@ -343,6 +351,11 @@ async def main() -> None:
                 }
             elif method == "PUT" and test_path.endswith("/orchestrator"):
                 body = {"instructions": "UI flow orchestrator instructions."}
+            elif method == "PUT" and test_path.endswith("/model"):
+                # Any model from the fallback list (no AI Core in tests).
+                from agents.shared import available_models
+
+                body = {"model_name": available_models()[0]}
             elif method == "POST" and test_path.endswith("/import"):
                 body = {
                     "orchestrator_instructions": "Imported.",

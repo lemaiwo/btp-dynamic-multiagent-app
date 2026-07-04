@@ -6,7 +6,7 @@
       "target": "/admin$1",
       "destination": "pydantic-agent-backend",
       "authenticationType": "xsuaa",
-      "csrfProtection": false,
+      "csrfProtection": true,
       "scope": "$XSAPPNAME.admin"
     },
     {
@@ -17,7 +17,7 @@
       "csrfProtection": false
     },
     {
-      "source": "^/.well-known/(agent-card|agent).json$",
+      "source": "^/\\.well-known/(agent-card|agent)\\.json$",
       "target": "/.well-known/$1.json",
       "destination": "pydantic-agent-backend",
       "authenticationType": "none",

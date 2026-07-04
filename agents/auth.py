@@ -47,15 +47,21 @@ def reset_current_jwt(marker: object) -> None:
     current_jwt.reset(marker)  # type: ignore[arg-type]
 
 
-def principal_from_token(token: str | None) -> str | None:
-    """Derive a stable user id from the bound JWT.
+def validate_token_principal(token: str | None) -> tuple[bool, str | None]:
+    """Validate the bound JWT and derive a stable user id from it.
 
-    On CF the token is validated against XSUAA first (so the principal is
-    cryptographically trustworthy); the user id is taken from ``user_uuid``,
-    falling back to ``sub`` / ``user_name@origin`` / ``email``. Without an
-    XSUAA binding (local dev) the claims are read from the unverified token,
-    or a constant ``local-dev`` principal is used when there is no token, so
-    the OAuth2 flow is still exercisable locally.
+    Returns ``(valid, principal)``. On CF the token is validated against
+    XSUAA first (so the principal is cryptographically trustworthy); the user
+    id is taken from ``user_uuid``, falling back to ``sub`` /
+    ``user_name@origin`` / ``email``. Without an XSUAA binding (local dev)
+    the claims are read from the unverified token, or a constant
+    ``local-dev`` principal is used when there is no token, so the OAuth2
+    flow is still exercisable locally.
+
+    ``valid`` is False only when a token was presented but failed validation
+    (bad signature, wrong audience, expired) — the middleware rejects those
+    outright instead of letting an unauthenticated request through with the
+    forged token still attached.
     """
     validator = get_validator()
     if token:
@@ -66,9 +72,14 @@ def principal_from_token(token: str | None) -> str | None:
                 payload = jwt.decode(token, options={"verify_signature": False})
         except Exception:
             logger.warning("Could not derive principal from token", exc_info=True)
-            return None
-        return _principal_claim(payload)
-    return None if validator is not None else "local-dev"
+            return False, None
+        return True, _principal_claim(payload)
+    return True, (None if validator is not None else "local-dev")
+
+
+def principal_from_token(token: str | None) -> str | None:
+    """Backwards-compatible wrapper: the principal, or None."""
+    return validate_token_principal(token)[1]
 
 
 def _principal_claim(payload: dict[str, Any]) -> str | None:
@@ -146,13 +157,28 @@ class XsuaaValidator:
                 options={"verify_aud": True},
             )
         except jwt.InvalidAudienceError:
-            # XSUAA sometimes issues without 'aud'; retry with aud check disabled
+            # XSUAA sometimes issues tokens whose `aud` does not contain our
+            # clientid (e.g. granted-authority flows). A signature check alone
+            # would accept a token issued to ANY app in the same subaccount, so
+            # mirror what SAP's xssec does: accept only tokens that are
+            # demonstrably bound to this app — issued to our client (cid) or
+            # carrying a scope in our xsappname namespace.
             payload = jwt.decode(
                 token,
                 signing_key,
                 algorithms=["RS256"],
                 options={"verify_aud": False},
             )
+            if not self._is_for_this_app(payload):
+                logger.warning(
+                    "Rejected JWT for foreign client %r (aud=%r)",
+                    payload.get("cid") or payload.get("client_id"),
+                    payload.get("aud"),
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="JWT was not issued for this application",
+                )
         except jwt.PyJWTError as e:
             logger.warning("JWT validation failed: %s", e)
             raise HTTPException(
@@ -161,10 +187,31 @@ class XsuaaValidator:
 
         return payload
 
+    def _is_for_this_app(self, payload: dict[str, Any]) -> bool:
+        """Whether a signature-valid token is actually bound to this app.
+
+        True when the token was issued to our OAuth client (``cid`` /
+        ``client_id`` claim), lists our clientid in ``aud``, or carries at
+        least one scope in our ``<xsappname>.`` namespace (granted-authority
+        tokens, e.g. Joule's a2a scope, have a foreign cid but our scope).
+        """
+        cid = payload.get("cid") or payload.get("client_id")
+        if cid == self.client_id:
+            return True
+        aud = payload.get("aud") or []
+        if isinstance(aud, str):
+            aud = [aud]
+        if self.client_id in aud:
+            return True
+        prefix = f"{self.xsappname}."
+        return any(s.startswith(prefix) for s in payload.get("scope") or [])
+
     def has_scope(self, payload: dict[str, Any], scope: str) -> bool:
+        # Only the fully-qualified `<xsappname>.<scope>` form counts: XSUAA
+        # namespaces scopes per app, and accepting a bare name would let an
+        # unrelated token with a generic scope (e.g. "admin") through.
         scopes = payload.get("scope") or []
-        full = f"{self.xsappname}.{scope}"
-        return full in scopes or scope in scopes
+        return f"{self.xsappname}.{scope}" in scopes
 
 
 _validator: XsuaaValidator | None = None
@@ -230,5 +277,30 @@ async def require_admin(request: Request) -> dict[str, Any]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin scope required",
+        )
+    return payload
+
+
+async def require_a2a(request: Request) -> dict[str, Any]:
+    """Ensure caller holds the `<xsappname>.a2a` scope.
+
+    The approuter already enforces this on its `/a2a` route, but the backend
+    has its own public CF route, so the check must also live app-side.
+    """
+    validator = get_validator()
+    token = _extract_token(request)
+
+    if validator is None:
+        return {"user_name": "local-dev", "scope": ["a2a"]}
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
+        )
+    payload = validator.validate(token)
+    if not validator.has_scope(payload, "a2a"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="A2A scope required",
         )
     return payload

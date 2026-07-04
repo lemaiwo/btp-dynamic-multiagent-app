@@ -25,6 +25,7 @@ import base64
 import hashlib
 import logging
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -304,16 +305,35 @@ async def resolve_config(server_key: str, spec_oauth: dict[str, Any] | None) -> 
     return Oauth2Config.from_spec(spec)
 
 
-# Serialize concurrent refreshes for the same (user, server).
-_refresh_locks: dict[str, asyncio.Lock] = {}
+# Serialize concurrent refreshes for the same (user, server). Entries are
+# refcounted and removed once the last holder releases, so the map doesn't
+# grow one lock per (user, server) forever.
+class _KeyedLocks:
+    def __init__(self) -> None:
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._refs: dict[str, int] = {}
+
+    @asynccontextmanager
+    async def acquire(self, key: str):
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._refs[key] = self._refs.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            remaining = self._refs[key] - 1
+            if remaining:
+                self._refs[key] = remaining
+            else:
+                del self._refs[key]
+                self._locks.pop(key, None)
 
 
-def _lock_for(key: str) -> asyncio.Lock:
-    lock = _refresh_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _refresh_locks[key] = lock
-    return lock
+_keyed_locks = _KeyedLocks()
+
+
+def _lock_for(key: str):
+    return _keyed_locks.acquire(key)
 
 
 # ---------------------------------------------------------------------------

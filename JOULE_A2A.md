@@ -262,6 +262,13 @@ same XSUAA app, or introduce a token-exchange step. For the
 provided `btp-agent-*-mcp` MCP servers, add the
 Joule client-id to their XSUAA `oauth2-configuration.allowed-clients`.
 
+**Multi-turn context is lost intermittently**
+A2A conversation contexts and tasks are stored **in process memory**.
+With more than one CF instance of the backend, a follow-up turn may
+land on an instance that never saw the context. Run a single backend
+instance, or add session affinity / an external store before scaling
+horizontally.
+
 ---
 
 ## 7. Reference — agent card example

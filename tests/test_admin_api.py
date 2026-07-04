@@ -76,6 +76,17 @@ def _fake_to_web(self, *args, **kwargs):  # type: ignore[no-untyped-def]
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return
+        # Mimic the real to_web() root behaviour: / redirects to /chat.
+        if scope.get("path", "") in ("", "/"):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 307,
+                    "headers": [(b"location", b"/chat")],
+                }
+            )
+            await send({"type": "http.response.body", "body": b""})
+            return
         await send(
             {
                 "type": "http.response.start",
@@ -179,17 +190,27 @@ async def run_tests() -> None:
 
         # --- List seeded agents --------------------------------------------
         print("\n== GET /admin/api/agents (seeded) ==")
+        # Validate against the actual seed file instead of hardcoding agent
+        # names, so the test doesn't break every time the seed changes.
+        seed_data = json.loads((ROOT / "agents.seed.json").read_text())
+        expected = {a["name"]: a for a in seed_data.get("agents", [])}
         r = await client.get("/admin/api/agents")
         check("200", r.status_code == 200)
         seeded = r.json()
-        check("3 seeded agents", len(seeded) == 3, f"got {len(seeded)}: {[a['name'] for a in seeded]}")
+        check(
+            f"{len(expected)} seeded agents",
+            len(seeded) == len(expected),
+            f"got {len(seeded)}: {[a['name'] for a in seeded]}",
+        )
         names = {a["name"] for a in seeded}
-        check("contains cloudfoundry", "cloudfoundry" in names)
-        check("contains btp", "btp" in names)
-        check("contains auditlog", "auditlog" in names)
-
-        auditlog = next(a for a in seeded if a["name"] == "auditlog")
-        check("auditlog disabled", auditlog["enabled"] is False)
+        check("seed names match", names == set(expected), f"got {names}")
+        for a in seeded:
+            exp = expected.get(a["name"])
+            if exp is not None:
+                check(
+                    f"enabled flag preserved ({a['name']})",
+                    a["enabled"] == exp.get("enabled", True),
+                )
 
         # --- Create a new agent --------------------------------------------
         print("\n== POST /admin/api/agents ==")
@@ -248,7 +269,11 @@ async def run_tests() -> None:
         check("200", r.status_code == 200, f"got {r.status_code}: {r.text}")
         data = r.json()
         check("status reloaded", data.get("status") == "reloaded")
-        check("agents count >= 3", data.get("agents", 0) >= 3, f"got {data}")
+        check(
+            "agents count = seed + testagent",
+            data.get("agents", 0) == len(expected) + 1,
+            f"got {data}",
+        )
 
         # --- Restart (CF not configured → ok=false) ------------------------
         print("\n== POST /admin/api/restart ==")
@@ -263,7 +288,7 @@ async def run_tests() -> None:
         check("200", r.status_code == 200)
         exported = r.json()
         check("version 1", exported.get("version") == 1)
-        check("has agents", len(exported.get("agents", [])) >= 4)
+        check("has agents", len(exported.get("agents", [])) == len(expected) + 1)
 
         # --- Import (merge) -------------------------------------------------
         print("\n== POST /admin/api/import (merge) ==")

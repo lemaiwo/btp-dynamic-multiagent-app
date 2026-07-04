@@ -24,9 +24,19 @@ from agents.db import (
     get_orchestrator_instructions,
     list_agents,
 )
-from agents.shared import create_mcp_server, default_model_name, get_model
+from agents.shared import (
+    create_mcp_server,
+    default_model_name,
+    get_model,
+    owned_http_client,
+)
 
 logger = logging.getLogger(__name__)
+
+# Grace period before the previous build's MCP httpx clients are closed on
+# reload, so chat turns that started before the reload can finish on the old
+# orchestrator instead of failing mid-run. Tunable via env.
+_OLD_CLIENT_CLOSE_DELAY = float(os.environ.get("RELOAD_CLIENT_CLOSE_DELAY_SECONDS", "300"))
 
 # How many times a tool may return a retryable error (pydantic-ai ModelRetry)
 # before the agent gives up. MCP tools like SAP's SAPQuery surface query/syntax
@@ -594,6 +604,8 @@ class Registry:
     def __init__(self) -> None:
         self._build: BuildResult | None = None
         self._lock = asyncio.Lock()
+        # Deferred-close tasks for retired MCP clients, held so they aren't GC'd.
+        self._cleanup_tasks: set[asyncio.Task] = set()
 
     @property
     def orchestrator(self) -> Agent:
@@ -620,19 +632,32 @@ class Registry:
                 len(new.configs),
             )
 
-            # Best-effort cleanup of the previous MCP clients
+            # Best-effort cleanup of the previous MCP clients, after a grace
+            # period so in-flight chat turns still holding the old
+            # orchestrator can finish instead of dying on a closed client.
             if old is not None:
-                for server in old.mcp_clients:
-                    try:
-                        client = getattr(server, "_http_client", None) or getattr(
-                            server, "http_client", None
-                        )
-                        if client is not None:
-                            await client.aclose()
-                    except Exception:
-                        logger.debug("Failed to close old MCP client", exc_info=True)
+                clients = [
+                    c
+                    for c in (owned_http_client(s) for s in old.mcp_clients)
+                    if c is not None
+                ]
+                if clients:
+                    task = asyncio.create_task(
+                        self._close_later(clients, _OLD_CLIENT_CLOSE_DELAY)
+                    )
+                    self._cleanup_tasks.add(task)
+                    task.add_done_callback(self._cleanup_tasks.discard)
 
             return new
+
+    @staticmethod
+    async def _close_later(clients: list, delay: float) -> None:
+        await asyncio.sleep(delay)
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.debug("Failed to close old MCP client", exc_info=True)
 
 
 registry = Registry()
