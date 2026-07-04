@@ -13,7 +13,9 @@ import logging
 import os
 import ssl
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any
+from urllib.parse import quote_plus
 
 from sqlalchemy import (
     DateTime,
@@ -53,8 +55,8 @@ def _build_ssl_context(ca_pem: str | None) -> ssl.SSLContext:
 
     BTP managed postgres uses a self-signed CA chain that isn't in the
     system trust store. If the binding exposes the CA pem, load it.
-    Otherwise (or if PG_SSL_INSECURE=1) skip verification — TLS is still
-    on but the cert chain isn't validated.
+    Verification is only skipped when explicitly opted in with
+    PG_SSL_INSECURE=1 — TLS stays on but the cert chain isn't validated.
     """
     ctx = ssl.create_default_context()
     if ca_pem:
@@ -62,8 +64,11 @@ def _build_ssl_context(ca_pem: str | None) -> ssl.SSLContext:
             ctx.load_verify_locations(cadata=ca_pem)
             return ctx
         except Exception:
-            logger.exception("Failed to load BTP postgres CA from VCAP; disabling verification")
-    if os.environ.get("PG_SSL_INSECURE", "1") == "1":
+            logger.exception("Failed to load BTP postgres CA from VCAP")
+    if os.environ.get("PG_SSL_INSECURE", "0") == "1":
+        logger.warning(
+            "PG_SSL_INSECURE=1: postgres TLS certificate verification is DISABLED"
+        )
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
@@ -93,8 +98,13 @@ def _resolve_database_url() -> str:
                         or creds.get("cert")
                     )
                     sslmode = "require"
+                    # Quote credentials: generated passwords may contain
+                    # URL-significant characters (@ / # ? %) that would
+                    # otherwise corrupt the connection URL.
+                    user_q = quote_plus(str(user)) if user else ""
+                    password_q = quote_plus(str(password)) if password else ""
                     return (
-                        f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
+                        f"postgresql+asyncpg://{user_q}:{password_q}@{host}:{port}/{dbname}"
                         f"?ssl={sslmode}"
                     )
         except Exception:
@@ -174,7 +184,7 @@ class AgentConfig(Base):
             try:
                 oauth = json.loads(self.oauth_json)
                 if isinstance(oauth, dict):
-                    primary["oauth"] = oauth
+                    primary["oauth"] = _decrypt_oauth(oauth)
             except Exception:
                 logger.warning("Malformed oauth_json on agent %s", self.name)
         out: list[dict[str, Any]] = [primary]
@@ -192,7 +202,7 @@ class AgentConfig(Base):
                             "auth_mode": str(e.get("auth_mode") or AUTH_MODE_JWT),
                         }
                         if isinstance(e.get("oauth"), dict):
-                            entry["oauth"] = e["oauth"]
+                            entry["oauth"] = _decrypt_oauth(e["oauth"])
                         out.append(entry)
         return out
 
@@ -220,10 +230,89 @@ class AgentConfig(Base):
         }
 
 
+# ---------------------------------------------------------------------------
+# Encryption at rest for stored secrets (opt-in via TOKEN_ENCRYPTION_KEY)
+#
+# When TOKEN_ENCRYPTION_KEY holds a Fernet key (generate one with
+# `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`),
+# OAuth client secrets and per-user access/refresh tokens are encrypted before
+# they are written to the database and decrypted transparently on read.
+# Values are prefixed "enc:" so pre-existing plaintext rows keep working after
+# the key is introduced (they are re-encrypted on their next update).
+# ---------------------------------------------------------------------------
+_ENC_PREFIX = "enc:"
+
+
+@lru_cache(maxsize=1)
+def _fernet():
+    key = os.environ.get("TOKEN_ENCRYPTION_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+
+        return Fernet(key.encode("ascii"))
+    except Exception:
+        logger.exception(
+            "TOKEN_ENCRYPTION_KEY is set but not a valid Fernet key; "
+            "secrets will be stored in plaintext"
+        )
+        return None
+
+
+def encrypt_secret(value: str | None) -> str | None:
+    """Encrypt a secret for storage. No-op when no key is configured."""
+    f = _fernet()
+    if not value or f is None:
+        return value
+    return _ENC_PREFIX + f.encrypt(value.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(value: str | None) -> str | None:
+    """Decrypt a stored secret. Plaintext values pass through unchanged.
+
+    Returns None when the value is encrypted but cannot be decrypted (key
+    missing or rotated away) — callers treat that as "no credential", which
+    forces a re-authorization instead of sending garbage to a token endpoint.
+    """
+    if not value or not value.startswith(_ENC_PREFIX):
+        return value
+    f = _fernet()
+    if f is None:
+        logger.error(
+            "Stored secret is encrypted but TOKEN_ENCRYPTION_KEY is not set; "
+            "treating it as missing"
+        )
+        return None
+    try:
+        return f.decrypt(value[len(_ENC_PREFIX):].encode("ascii")).decode("utf-8")
+    except Exception:
+        logger.exception("Failed to decrypt stored secret; treating it as missing")
+        return None
+
+
 # OAuth client_secret is never returned over the API or written to exports.
 # The full secret stays in the DB and is read only by the registry when it
 # builds the live MCP server connections.
 OAUTH_SECRET_KEYS = ("client_secret",)
+
+
+def _decrypt_oauth(oauth: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a stored oauth dict with secret values decrypted."""
+    oauth = dict(oauth)
+    for k in OAUTH_SECRET_KEYS:
+        if oauth.get(k):
+            oauth[k] = decrypt_secret(str(oauth[k])) or ""
+    return oauth
+
+
+def _encrypt_oauth(oauth: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of an oauth dict with secret values encrypted for storage."""
+    oauth = dict(oauth)
+    for k in OAUTH_SECRET_KEYS:
+        if oauth.get(k):
+            oauth[k] = encrypt_secret(str(oauth[k]))
+    return oauth
 
 
 def _redact_servers(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -487,7 +576,7 @@ def prepare_servers(
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url))
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
-            entry["oauth"] = oauth
+            entry["oauth"] = _encrypt_oauth(oauth)
         normalized.append(entry)
 
     primary = normalized[0]
@@ -593,7 +682,13 @@ async def get_user_token(
             McpOAuthToken.server_key == server_key,
         )
     )
-    return result.scalar_one_or_none()
+    row = result.scalar_one_or_none()
+    if row is not None:
+        # Decrypt in place for the caller; the mutation is never committed
+        # (upserts overwrite these fields with freshly encrypted values).
+        row.access_token = decrypt_secret(row.access_token) or ""
+        row.refresh_token = decrypt_secret(row.refresh_token)
+    return row
 
 
 async def upsert_user_token(
@@ -611,13 +706,27 @@ async def upsert_user_token(
     if row is None:
         row = McpOAuthToken(user_id=user_id, server_key=server_key)
         session.add(row)
-    row.access_token = access_token
+    row.access_token = encrypt_secret(access_token) or ""
     # A refresh response may omit refresh_token; keep the existing one then.
     if refresh_token:
-        row.refresh_token = refresh_token
+        row.refresh_token = encrypt_secret(refresh_token)
+    elif row.refresh_token:
+        row.refresh_token = encrypt_secret(row.refresh_token)
     row.token_type = token_type or "Bearer"
-    row.scope = scope
-    row.expires_at = expires_at
+    # A refresh response may also omit scope/expires_in; don't wipe what we
+    # know. A previously known expiry is kept only while it is still in the
+    # future (early refresh due to clock skew) — otherwise the new token's
+    # lifetime is unknown and the 401→forced-refresh path is the fallback.
+    if scope is not None:
+        row.scope = scope
+    if expires_at is not None:
+        row.expires_at = expires_at
+    else:
+        prev = row.expires_at
+        if prev is not None and prev.tzinfo is None:
+            prev = prev.replace(tzinfo=timezone.utc)
+        if prev is None or prev <= datetime.now(timezone.utc):
+            row.expires_at = None
     await session.commit()
     await session.refresh(row)
     return row
@@ -638,7 +747,11 @@ async def delete_user_token(
 async def get_oauth_client(
     session: AsyncSession, server_key: str
 ) -> McpOAuthClient | None:
-    return await session.get(McpOAuthClient, server_key)
+    row = await session.get(McpOAuthClient, server_key)
+    if row is not None:
+        # Decrypt in place for the caller; never committed (see get_user_token).
+        row.client_secret = decrypt_secret(row.client_secret)
+    return row
 
 
 async def save_oauth_client(
@@ -659,7 +772,7 @@ async def save_oauth_client(
     row.authorize_url = authorize_url
     row.token_url = token_url
     row.client_id = client_id
-    row.client_secret = client_secret
+    row.client_secret = encrypt_secret(client_secret)
     row.scope = scope
     row.redirect_uri = redirect_uri
     await session.commit()

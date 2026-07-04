@@ -32,6 +32,13 @@ modules:
       command: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
     properties:
       AICORE_RESOURCE_GROUP: "default"
+      # Postgres TLS certificate verification is ON by default (the CA from
+      # the postgresql-db binding is used). If your binding exposes no CA and
+      # startup fails on certificate errors, you can explicitly opt out:
+      # PG_SSL_INSECURE: "1"
+      # Recommended: encrypt stored OAuth secrets/tokens at rest. Generate:
+      # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+      # TOKEN_ENCRYPTION_KEY: ""
       # Optional: restrict the set of MCP URLs admins can register.
       # Comma-separated list of URL prefixes. If empty, any BTP URL is allowed.
       MCP_URL_ALLOWLIST: ""

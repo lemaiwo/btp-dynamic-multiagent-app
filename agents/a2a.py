@@ -12,8 +12,9 @@ Endpoints (mounted by ``app.py``):
                                            methods: message/send, message/stream,
                                                     tasks/get, tasks/cancel
 
-The JSON-RPC endpoint is protected by XSUAA (``require_user`` dependency)
-so that Joule's outbound call carries a valid bearer token. Because the
+The JSON-RPC endpoint is protected by XSUAA (``require_a2a`` dependency —
+the ``<xsappname>.a2a`` scope is enforced app-side, not just at the
+approuter) so that Joule's outbound call carries a valid bearer token. Because the
 existing ``JWTBindingMiddleware`` binds that token to ``current_jwt``,
 downstream MCP servers still see the calling identity transparently.
 
@@ -35,7 +36,7 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from agents.auth import require_user
+from agents.auth import require_a2a
 from agents.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,13 @@ async def build_agent_card(request: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 _CONTEXT_TTL_SECONDS = int(os.environ.get("A2A_CONTEXT_TTL", "3600"))
 _TASK_TTL_SECONDS = int(os.environ.get("A2A_TASK_TTL", "900"))
+# Interval between SSE keepalive comments while message/stream waits on the
+# orchestrator, so approuter/proxy idle timeouts don't kill long runs.
+_STREAM_KEEPALIVE_SECONDS = float(os.environ.get("A2A_STREAM_KEEPALIVE_SECONDS", "15"))
+
+# NOTE: this store is process-local. With more than one CF instance of the
+# backend, contexts and tasks are only visible on the instance that created
+# them — scale horizontally only with session affinity or an external store.
 
 
 class _ConversationStore:
@@ -317,8 +325,14 @@ async def _run_orchestrator(text: str, context_id: str) -> str:
     try:
         result = await agent.run(text, message_history=history or None)
     except BaseException as exc:  # noqa: BLE001
+        # Log the full detail server-side; the remote caller only gets a
+        # generic message so internals (stack details, backend URLs) never
+        # leak over the A2A channel.
         logger.exception("Orchestrator run failed (context=%s)", context_id)
-        raise _OrchestratorError(str(exc)) from exc
+        raise _OrchestratorError(
+            "The orchestrator could not process the request. "
+            "See the application logs for details."
+        ) from exc
 
     # Persist new conversation state for follow-up turns
     try:
@@ -442,8 +456,18 @@ async def _stream_message(req_id: Any, params: dict[str, Any]) -> AsyncIterator[
     }
     yield _sse(_rpc_result(req_id, working_event))
 
+    run_task = asyncio.create_task(_run_orchestrator(text, context_id))
     try:
-        output = await _run_orchestrator(text, context_id)
+        # Emit SSE keepalive comments while the orchestrator works, so proxy
+        # idle timeouts don't cut the stream on long runs.
+        while True:
+            try:
+                output = await asyncio.wait_for(
+                    asyncio.shield(run_task), timeout=_STREAM_KEEPALIVE_SECONDS
+                )
+                break
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
     except _OrchestratorError as exc:
         failure = {
             "kind": "status-update",
@@ -460,6 +484,11 @@ async def _stream_message(req_id: Any, params: dict[str, Any]) -> AsyncIterator[
         }
         yield _sse(_rpc_result(req_id, failure))
         return
+    finally:
+        # The client disconnected (generator closed) or we're done; make sure
+        # the shielded run doesn't keep going in the background.
+        if not run_task.done():
+            run_task.cancel()
 
     agent_message = _make_agent_message(output, context_id)
     artifact_event = {
@@ -519,7 +548,7 @@ async def get_agent_card_legacy(request: Request) -> JSONResponse:
     return JSONResponse(card)
 
 
-@router.post("/a2a", dependencies=[Depends(require_user)])
+@router.post("/a2a", dependencies=[Depends(require_a2a)])
 async def a2a_jsonrpc(
     request: Request,
     accept: str | None = Header(default=None),
@@ -543,9 +572,7 @@ async def a2a_jsonrpc(
         return JSONResponse(_rpc_error(req_id, -32602, "Invalid params: must be an object"))
 
     if method == "message/send":
-        result = await _handle_message_send(req_id, params)
-        status_code = 200 if "result" in result else 200
-        return JSONResponse(result, status_code=status_code)
+        return JSONResponse(await _handle_message_send(req_id, params))
 
     if method == "message/stream":
         return StreamingResponse(

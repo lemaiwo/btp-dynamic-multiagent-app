@@ -36,7 +36,7 @@ from agents.auth import (  # noqa: E402
     current_base_url,
     current_jwt,
     current_principal,
-    principal_from_token,
+    validate_token_principal,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.db import init_db  # noqa: E402
@@ -131,7 +131,7 @@ class JWTBindingMiddleware:
             return
 
         if token:
-            logger.info("JWT bound for %s %s", scope.get("method"), path)
+            logger.debug("JWT bound for %s %s", scope.get("method"), path)
 
         # Public base URL (scheme://host) as seen by the approuter, used to
         # build the OAuth2 redirect_uri. An explicit override wins so the
@@ -149,7 +149,18 @@ class JWTBindingMiddleware:
                 host_str = host.decode("latin-1").split(",")[0].strip()
                 base_url = f"{scheme}://{host_str}"
 
-        principal = principal_from_token(token)
+        valid, principal = validate_token_principal(token)
+        # A presented-but-invalid token (bad signature, foreign audience,
+        # expired) is rejected outright on protected paths — otherwise the
+        # request would proceed "anonymously" while still carrying the bogus
+        # token, which JWTForwardAuth would forward to MCP servers.
+        if needs_jwt and token and not valid:
+            logger.warning(
+                "Rejecting %s %s: bearer token failed validation",
+                scope.get("method"), path,
+            )
+            await _send_json(send, 401, {"detail": "Invalid bearer token."})
+            return
 
         marker = current_jwt.set(token)
         marker_principal = current_principal.set(principal)

@@ -250,11 +250,45 @@
 <div id="toast"></div>
 
 <script>
-const api = (path, opts = {}) => fetch(`/admin/api${path}`, {
-    credentials: 'same-origin',
-    headers: {'Content-Type': 'application/json'},
-    ...opts,
-});
+// CSRF: the approuter protects /admin with a per-session x-csrf-token.
+// Fetch it once (any GET with "x-csrf-token: fetch" returns it) and attach it
+// to every mutating request; refresh + retry once on a 403 (expired token).
+// Locally (no approuter) the header simply comes back empty and is skipped.
+let _csrfToken = null;
+async function csrfToken(force = false) {
+    if (_csrfToken !== null && !force) return _csrfToken;
+    try {
+        const res = await fetch('/admin/api/agents', {
+            credentials: 'same-origin',
+            headers: {'x-csrf-token': 'fetch'},
+        });
+        _csrfToken = res.headers.get('x-csrf-token') || '';
+    } catch (_) {
+        _csrfToken = '';
+    }
+    return _csrfToken;
+}
+
+const api = async (path, opts = {}) => {
+    const method = (opts.method || 'GET').toUpperCase();
+    const headers = {'Content-Type': 'application/json', ...(opts.headers || {})};
+    const mutating = !['GET', 'HEAD', 'OPTIONS'].includes(method);
+    if (mutating) {
+        const token = await csrfToken();
+        if (token) headers['x-csrf-token'] = token;
+    }
+    const doFetch = () => fetch(`/admin/api${path}`, {
+        credentials: 'same-origin',
+        ...opts,
+        headers,
+    });
+    let res = await doFetch();
+    if (mutating && res.status === 403) {
+        const token = await csrfToken(true);
+        if (token) { headers['x-csrf-token'] = token; res = await doFetch(); }
+    }
+    return res;
+};
 
 function toast(msg, kind = '') {
     const t = document.getElementById('toast');

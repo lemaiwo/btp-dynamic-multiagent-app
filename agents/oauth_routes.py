@@ -12,6 +12,7 @@ catch-all). On Cloud Foundry it is reached through the approuter, so the
 from __future__ import annotations
 
 import logging
+from html import escape as _html_escape
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -25,6 +26,11 @@ router = APIRouter(tags=["oauth"])
 
 
 def _page(title: str, body: str, *, ok: bool, auto_close: bool = False) -> HTMLResponse:
+    # title/body can carry attacker-influenced text (OAuth error_description
+    # from the callback query string, token-endpoint response excerpts), so
+    # escape them — this page must never reflect markup.
+    title = _html_escape(title)
+    body = _html_escape(body)
     color = "#2e7d32" if ok else "#c62828"
     # When opened as a popup from the chat, close shortly after success — the
     # chat detects the new token and continues on its own.

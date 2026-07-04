@@ -38,7 +38,7 @@ class _FakeModel:
     model_name = "fake"
 
 
-shared.get_model = lambda: _FakeModel()  # type: ignore[assignment]
+shared.get_model = lambda name=None: _FakeModel()  # type: ignore[assignment]
 
 
 class _FakeMCP:
@@ -47,7 +47,7 @@ class _FakeMCP:
         self.base_url = base_url
 
 
-shared.create_mcp_server = lambda name, base_url: _FakeMCP(name, base_url)  # type: ignore[assignment]
+shared.create_mcp_server = lambda name, base_url, *a, **k: _FakeMCP(name, base_url)  # type: ignore[assignment]
 
 # Patch pydantic_ai.Agent so its __init__ accepts the fake model and toolsets
 # and .run / .to_web don't hit any external service.
@@ -79,7 +79,7 @@ async def _fake_run(self, prompt, message_history=None, **kwargs):  # noqa: ARG0
 pydantic_ai.Agent.run = _fake_run  # type: ignore[method-assign]
 
 
-def _fake_to_web(self, html_source=None):  # noqa: ARG001
+def _fake_to_web(self, html_source=None, **kwargs):  # noqa: ARG001
     async def app(scope, receive, send):
         if scope["type"] != "http":
             return

@@ -14,6 +14,8 @@ import json
 import logging
 import os
 import threading
+import time
+import weakref
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -160,6 +162,21 @@ class JWTForwardAuth(httpx.Auth):
 # ---------------------------------------------------------------------------
 # MCP server factory
 # ---------------------------------------------------------------------------
+# httpx clients created (and therefore owned) by create_mcp_server, keyed by
+# the server they belong to, so the registry can close them on reload without
+# reaching into pydantic-ai private attributes.
+_owned_http_clients: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def owned_http_client(server: Any) -> httpx.AsyncClient | None:
+    """The httpx client create_mcp_server built for ``server``, if any."""
+    try:
+        return _owned_http_clients.get(server)
+    except TypeError:
+        # Not weak-referenceable (e.g. a test stub) — not one of ours.
+        return None
+
+
 def create_mcp_server(
     name: str,
     base_url: str,
@@ -214,15 +231,26 @@ def create_mcp_server(
             callback_handler=_callback_handler,
         )
 
-    return MCPServerStreamableHTTP(
-        url=mcp_url,
-        tool_prefix=tool_prefix,
-        http_client=httpx.AsyncClient(
-            auth=auth,
-            follow_redirects=True,
-            timeout=httpx.Timeout(30.0),
+    http_client = httpx.AsyncClient(
+        auth=auth,
+        follow_redirects=True,
+        # connect/write/pool stay tight, but the READ timeout must cover the
+        # streamable-HTTP response stream: an MCP tool call can legitimately
+        # produce no bytes for a long while (the MCP SDK's own default keeps a
+        # ~300s sse_read_timeout for exactly this reason). A flat 30s read
+        # timeout would kill long tool calls well before the specialist's own
+        # 180s ceiling.
+        timeout=httpx.Timeout(
+            30.0, read=float(os.environ.get("MCP_READ_TIMEOUT_SECONDS", "300"))
         ),
     )
+    server = MCPServerStreamableHTTP(
+        url=mcp_url,
+        tool_prefix=tool_prefix,
+        http_client=http_client,
+    )
+    _owned_http_clients[server] = http_client
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -249,15 +277,36 @@ class SAPAICoreModel(OpenAIChatModel):
         SAPAICoreModel._clean_schema(params)
         return tool
 
+    # Keywords that define a property's type on their own; only when none of
+    # these is present do we default a typeless property to "string" (forcing
+    # a type onto e.g. an anyOf would produce an invalid combined schema).
+    _TYPE_DEFINING_KEYS = ("type", "anyOf", "oneOf", "allOf", "enum", "const", "$ref")
+
     @staticmethod
     def _clean_schema(schema: dict) -> None:
         schema.pop("$schema", None)
         for prop in schema.get("properties", {}).values():
-            if "type" not in prop:
-                prop["type"] = "string"
-            if prop.get("additionalProperties") == {}:
-                del prop["additionalProperties"]
-            SAPAICoreModel._clean_schema(prop)
+            if isinstance(prop, dict):
+                if not any(k in prop for k in SAPAICoreModel._TYPE_DEFINING_KEYS):
+                    prop["type"] = "string"
+                if prop.get("additionalProperties") == {}:
+                    del prop["additionalProperties"]
+                SAPAICoreModel._clean_schema(prop)
+        # Recurse into the other schema-bearing shapes (array items, unions,
+        # shared definitions) so non-standard fields nested there are cleaned
+        # too, not just those directly under `properties`.
+        items = schema.get("items")
+        for sub in items if isinstance(items, list) else [items]:
+            if isinstance(sub, dict):
+                SAPAICoreModel._clean_schema(sub)
+        for key in ("anyOf", "oneOf", "allOf"):
+            for sub in schema.get(key) or []:
+                if isinstance(sub, dict):
+                    SAPAICoreModel._clean_schema(sub)
+        for key in ("$defs", "definitions"):
+            for sub in (schema.get(key) or {}).values():
+                if isinstance(sub, dict):
+                    SAPAICoreModel._clean_schema(sub)
 
 
 DEFAULT_AVAILABLE_MODELS = (
@@ -284,20 +333,33 @@ def _discover_deployed_models() -> list[str]:
         return []
 
 
+# Cache the (network-backed) model discovery: available_models() is called
+# from request handlers and pydantic validators, and a live AI Core query on
+# every call would block the event loop for the duration of the round-trip.
+_MODELS_CACHE_TTL = float(os.environ.get("AICORE_MODELS_CACHE_SECONDS", "300"))
+_models_cache: tuple[float, list[str]] | None = None
+
+
 def available_models() -> list[str]:
     """Models offered in the admin UI and chat dropdown.
 
     Resolution order:
       1. `AICORE_AVAILABLE_MODELS` env var (explicit override, comma-separated)
-      2. Live query of SAP AI Core for deployed models
+      2. Live query of SAP AI Core for deployed models (cached for
+         `AICORE_MODELS_CACHE_SECONDS`, default 300)
       3. `DEFAULT_AVAILABLE_MODELS` as a last-resort fallback
     """
+    global _models_cache
     raw = os.environ.get("AICORE_AVAILABLE_MODELS")
     if raw:
         return [m.strip() for m in raw.split(",") if m.strip()]
+    now = time.monotonic()
+    if _models_cache is not None and now - _models_cache[0] < _MODELS_CACHE_TTL:
+        return list(_models_cache[1])
     discovered = _discover_deployed_models()
     if discovered:
-        return discovered
+        _models_cache = (now, discovered)
+        return list(discovered)
     return [m.strip() for m in DEFAULT_AVAILABLE_MODELS.split(",") if m.strip()]
 
 
