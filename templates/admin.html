@@ -179,6 +179,33 @@
     </div>
 
     <div class="panel">
+        <h2>Skills</h2>
+        <p class="hint">
+            Reusable instruction sets that can be attached to agents. The
+            skill's <em>description</em> tells the agent when to use it; the
+            full <em>content</em> is loaded on demand via a
+            <code>load_skill</code> tool, so it doesn't inflate every request.
+            Attach skills to an agent from the agent's edit dialog.
+        </p>
+        <div class="toolbar">
+            <button onclick="openSkillModal()">+ New skill</button>
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Description</th>
+                    <th>Used by</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="skills-tbody">
+                <tr><td colspan="4" style="color:var(--muted)">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="panel">
         <h2>LLM model</h2>
         <p class="hint">
             Active model used by the orchestrator and all specialists.
@@ -236,6 +263,10 @@
                 </span>
             </label>
             <label class="full">
+                Skills <span style="color:var(--muted);font-weight:normal">(optional — reusable instructions this agent can load on demand)</span>
+                <div id="agent-skills" style="border:1px solid var(--border);border-radius:6px;padding:8px;max-height:160px;overflow-y:auto"></div>
+            </label>
+            <label class="full">
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
             </label>
@@ -243,6 +274,31 @@
         <div class="modal-actions">
             <button class="secondary" onclick="closeAgentModal()">Cancel</button>
             <button onclick="saveAgent()">Save</button>
+        </div>
+    </div>
+</div>
+
+<div id="skill-modal" class="modal-backdrop" onclick="if(event.target===this)closeSkillModal()">
+    <div class="modal">
+        <h3 id="skill-modal-title">New skill</h3>
+        <input type="hidden" id="skill-id">
+        <div class="form-grid">
+            <label class="full">
+                Name
+                <input type="text" id="skill-name" placeholder="cf-troubleshooting" required>
+            </label>
+            <label class="full">
+                Description <span style="color:var(--muted);font-weight:normal">(when should an agent use this skill? Shown in the agent's system prompt)</span>
+                <textarea id="skill-description" rows="2" required></textarea>
+            </label>
+            <label class="full">
+                Content <span style="color:var(--muted);font-weight:normal">(the full instructions, loaded on demand via the <code>load_skill</code> tool)</span>
+                <textarea id="skill-content" rows="10" required></textarea>
+            </label>
+        </div>
+        <div class="modal-actions">
+            <button class="secondary" onclick="closeSkillModal()">Cancel</button>
+            <button onclick="saveSkill()">Save</button>
         </div>
     </div>
 </div>
@@ -263,10 +319,15 @@ function toast(msg, kind = '') {
     setTimeout(() => { t.className = ''; }, 3500);
 }
 
+let allSkills = [];
+let allAgents = [];
+
 async function loadAgents() {
     const res = await api('/agents');
     if (!res.ok) { toast('Failed to load agents', 'error'); return; }
     const agents = await res.json();
+    allAgents = agents;
+    renderSkillsTable();
     const tbody = document.getElementById('agents-tbody');
     if (agents.length === 0) {
         tbody.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">No agents configured yet.</td></tr>';
@@ -284,10 +345,13 @@ async function loadAgents() {
                 : '');
         const modes = [...new Set(servers.map(s => s.auth_mode || 'jwt'))];
         const authCell = modes.map(authLabel).join(' ');
+        const skillChips = (a.skills || []).map(s =>
+            `<span class="status-badge on" style="margin-right:4px">${escapeHtml(s)}</span>`
+        ).join('');
         return `
             <tr>
                 <td><strong>${escapeHtml(a.name)}</strong></td>
-                <td style="max-width:280px">${escapeHtml(a.description)}</td>
+                <td style="max-width:280px">${escapeHtml(a.description)}${skillChips ? `<div style="margin-top:4px">${skillChips}</div>` : ''}</td>
                 <td style="max-width:260px;word-break:break-all">${urlCell}</td>
                 <td>${authCell}</td>
                 <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
@@ -432,6 +496,114 @@ function collectMcpServers() {
     return out;
 }
 
+async function loadSkills() {
+    const res = await api('/skills');
+    if (!res.ok) { toast('Failed to load skills', 'error'); return; }
+    allSkills = await res.json();
+    renderSkillsTable();
+}
+
+function renderSkillsTable() {
+    const tbody = document.getElementById('skills-tbody');
+    if (allSkills.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted)">No skills defined yet.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = allSkills.map(s => {
+        const usedBy = allAgents
+            .filter(a => (a.skills || []).includes(s.name))
+            .map(a => escapeHtml(a.name));
+        return `
+            <tr>
+                <td><strong>${escapeHtml(s.name)}</strong></td>
+                <td style="max-width:380px">${escapeHtml(s.description)}</td>
+                <td>${usedBy.length ? usedBy.join(', ') : '<span style="color:var(--muted)">—</span>'}</td>
+                <td class="row-actions">
+                    <button class="small secondary" onclick="editSkill(${s.id})">Edit</button>
+                    <button class="small danger" onclick="deleteSkillRow(${s.id}, '${escapeHtml(s.name)}')">Delete</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function renderAgentSkillChecks(selected) {
+    const container = document.getElementById('agent-skills');
+    if (allSkills.length === 0) {
+        container.innerHTML = '<span style="color:var(--muted)">No skills defined yet — create one in the Skills panel first.</span>';
+        return;
+    }
+    container.innerHTML = allSkills.map(s => `
+        <label style="margin:2px 0;font-weight:normal;display:flex;gap:6px;align-items:baseline">
+            <input type="checkbox" class="agent-skill-check" value="${escapeHtml(s.name)}"
+                   ${selected.includes(s.name) ? 'checked' : ''}>
+            <span><strong>${escapeHtml(s.name)}</strong>
+                <span style="color:var(--muted)"> — ${escapeHtml(s.description)}</span></span>
+        </label>
+    `).join('');
+}
+
+function collectAgentSkills() {
+    return Array.from(document.querySelectorAll('#agent-skills .agent-skill-check'))
+        .filter(cb => cb.checked)
+        .map(cb => cb.value);
+}
+
+function openSkillModal() {
+    document.getElementById('skill-modal-title').textContent = 'New skill';
+    document.getElementById('skill-id').value = '';
+    document.getElementById('skill-name').value = '';
+    document.getElementById('skill-description').value = '';
+    document.getElementById('skill-content').value = '';
+    document.getElementById('skill-modal').classList.add('open');
+}
+
+function closeSkillModal() {
+    document.getElementById('skill-modal').classList.remove('open');
+}
+
+async function editSkill(id) {
+    const res = await api(`/skills/${id}`);
+    if (!res.ok) { toast('Failed to load skill', 'error'); return; }
+    const s = await res.json();
+    document.getElementById('skill-modal-title').textContent = `Edit skill: ${s.name}`;
+    document.getElementById('skill-id').value = s.id;
+    document.getElementById('skill-name').value = s.name;
+    document.getElementById('skill-description').value = s.description;
+    document.getElementById('skill-content').value = s.content;
+    document.getElementById('skill-modal').classList.add('open');
+}
+
+async function saveSkill() {
+    const id = document.getElementById('skill-id').value;
+    const body = JSON.stringify({
+        name: document.getElementById('skill-name').value.trim(),
+        description: document.getElementById('skill-description').value.trim(),
+        content: document.getElementById('skill-content').value,
+    });
+    const res = id
+        ? await api(`/skills/${id}`, {method: 'PUT', body})
+        : await api('/skills', {method: 'POST', body});
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Save failed: ' + (err.detail || JSON.stringify(err)), 'error');
+        return;
+    }
+    closeSkillModal();
+    toast('Saved. Click "Reload agents" to activate.', 'success');
+    loadSkills();
+    loadAgents();
+}
+
+async function deleteSkillRow(id, name) {
+    if (!confirm(`Delete skill "${name}"? It will be detached from all agents that use it.`)) return;
+    const res = await api(`/skills/${id}`, {method: 'DELETE'});
+    if (!res.ok) { toast('Delete failed', 'error'); return; }
+    toast('Deleted. Click "Reload agents" to activate.', 'success');
+    loadSkills();
+    loadAgents();
+}
+
 async function loadOrchestrator() {
     const res = await api('/orchestrator');
     if (!res.ok) return;
@@ -446,6 +618,7 @@ function openAgentModal() {
     document.getElementById('agent-description').value = '';
     document.getElementById('agent-instructions').value = '';
     renderMcpServers([]);
+    renderAgentSkillChecks([]);
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -467,6 +640,7 @@ async function editAgent(id) {
         ? a.mcp_servers
         : [{url: a.mcp_url || '', auth_mode: a.auth_mode || 'jwt'}];
     renderMcpServers(servers);
+    renderAgentSkillChecks(a.skills || []);
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -483,6 +657,7 @@ async function saveAgent() {
         description: document.getElementById('agent-description').value.trim(),
         instructions: document.getElementById('agent-instructions').value.trim(),
         mcp_servers: servers,
+        skills: collectAgentSkills(),
         enabled: document.getElementById('agent-enabled').checked,
     });
     const res = id
@@ -589,7 +764,8 @@ async function importConfig(evt) {
         return;
     }
     const data = await res.json();
-    toast(`Imported ${data.imported} agents (removed ${data.removed}). Reload to activate.`, 'success');
+    toast(`Imported ${data.imported} agents, ${data.imported_skills || 0} skills (removed ${data.removed}). Reload to activate.`, 'success');
+    loadSkills();
     loadAgents();
     loadOrchestrator();
 }
@@ -600,6 +776,7 @@ function escapeHtml(s) {
     ));
 }
 
+loadSkills();
 loadAgents();
 loadOrchestrator();
 loadModel();

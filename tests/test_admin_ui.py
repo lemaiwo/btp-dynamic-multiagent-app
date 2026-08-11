@@ -201,11 +201,14 @@ async def main() -> None:
         }
         for required in [
             "openAgentModal()",
+            "openSkillModal()",
             "reloadRegistry()",
             "restartApp()",
             "exportConfig()",
             "saveAgent()",
             "closeAgentModal()",
+            "saveSkill()",
+            "closeSkillModal()",
             "saveOrchestrator()",
         ]:
             check(
@@ -216,16 +219,25 @@ async def main() -> None:
 
         # Table structure
         check("agents tbody present", find(coll, "tbody", id="agents-tbody") is not None)
+        check("skills tbody present", find(coll, "tbody", id="skills-tbody") is not None)
         check("orchestrator textarea", find(coll, "textarea", id="orch-instructions") is not None)
 
         # Modal form fields
         for fid in ("agent-id", "agent-name", "agent-description",
-                    "agent-instructions", "agent-mcp-url", "agent-enabled"):
+                    "agent-instructions", "agent-enabled",
+                    "skill-id", "skill-name", "skill-description", "skill-content"):
             found = any(
                 e[1].get("id") == fid for e in coll.elements
                 if e[0] in ("input", "textarea", "select")
             )
             check(f"form field #{fid}", found)
+
+        # Container divs the JS renders into
+        for did in ("agent-mcp-servers", "agent-skills"):
+            check(
+                f"container #{did}",
+                any(e[0] == "div" and e[1].get("id") == did for e in coll.elements),
+            )
 
         # Import file input
         file_input = next(
@@ -241,8 +253,9 @@ async def main() -> None:
         # Toast container
         check("toast container", find(coll, "div", id="toast") is not None)
 
-        # Modal backdrop
+        # Modal backdrops
         check("agent modal", find(coll, "div", id="agent-modal") is not None)
+        check("skill modal", find(coll, "div", id="skill-modal") is not None)
 
         # Back-to-chat link
         links = [e for e in coll.elements if e[0] == "a" and e[1].get("href") == "/"]
@@ -316,6 +329,18 @@ async def main() -> None:
         assert r.status_code == 201
         uitest_id = r.json()["id"]
 
+        # Pre-create one skill so the /skills/{id} endpoints return 200
+        r = await client.post(
+            "/admin/api/skills",
+            json={
+                "name": "uiskill",
+                "description": "UI-flow test skill.",
+                "content": "Follow the UI test procedure.",
+            },
+        )
+        assert r.status_code == 201, r.text
+        uiskill_id = r.json()["id"]
+
         # We need the fixture agent to survive until the DELETE call, so
         # sort with DELETE last.
         def _order(item: tuple[str, str]) -> tuple[int, str, str]:
@@ -324,8 +349,24 @@ async def main() -> None:
 
         for method, path in sorted(discovered, key=_order):
             test_path = path.replace("/agents/1", f"/agents/{uitest_id}")
+            test_path = test_path.replace("/skills/1", f"/skills/{uiskill_id}")
             body = None
-            if method == "POST" and test_path.endswith("/agents"):
+            if method == "POST" and test_path.endswith("/skills"):
+                body = {
+                    "name": "flow-skill",
+                    "description": "Created via UI flow test.",
+                    "content": "Flow skill content.",
+                }
+            elif method == "PUT" and "/skills/" in test_path:
+                body = {
+                    "name": "uiskill",
+                    "description": "Edited via UI flow test.",
+                    "content": "Edited flow skill content.",
+                }
+            elif method == "PUT" and test_path.endswith("/model"):
+                mr = await client.get("/admin/api/model")
+                body = {"model_name": mr.json()["available"][0]}
+            elif method == "POST" and test_path.endswith("/agents"):
                 body = {
                     "name": f"flow_{uitest_id}_created",
                     "description": "Created via UI flow test.",
@@ -454,7 +495,38 @@ async def main() -> None:
             and r.json().get("cf_restart", {}).get("ok") is False,
         )
 
-        # 4i. Validation — UI must surface backend validation as toast errors.
+        # 4i. Skill flows: create -> attach to agent -> reload -> delete detaches
+        r = await client.post("/admin/api/skills", json={
+            "name": "ui-skill-flow",
+            "description": "Skill created by the UI flow test.",
+            "content": "Follow the UI skill flow procedure.",
+        })
+        check("flow: skill created", r.status_code == 201, f"got {r.status_code}: {r.text}")
+        flow_skill_id = r.json()["id"]
+
+        r = await client.post("/admin/api/agents", json={
+            "name": "ui_skill_agent",
+            "description": "Agent with a skill.",
+            "instructions": "You have a skill.",
+            "mcp_url": "https://uiskill.cfapps.eu20-001.hana.ondemand.com",
+            "skills": ["ui-skill-flow"],
+            "enabled": True,
+        })
+        check("flow: agent with skill created", r.status_code == 201, f"got {r.status_code}: {r.text}")
+        skill_agent_id = r.json()["id"]
+        check("flow: agent lists skill", r.json()["skills"] == ["ui-skill-flow"])
+
+        r = await client.post("/admin/api/reload")
+        check("flow: reload with skill attached", r.status_code == 200)
+
+        r = await client.delete(f"/admin/api/skills/{flow_skill_id}")
+        check("flow: skill delete 204", r.status_code == 204)
+        r = await client.get(f"/admin/api/agents/{skill_agent_id}")
+        check("flow: skill detached from agent", r.json()["skills"] == [])
+        r = await client.delete(f"/admin/api/agents/{skill_agent_id}")
+        check("flow: skill agent cleanup", r.status_code == 204)
+
+        # 4j. Validation — UI must surface backend validation as toast errors.
         # Non-BTP host must fail.
         r = await client.post("/admin/api/agents", json={
             "name": "bad_url",

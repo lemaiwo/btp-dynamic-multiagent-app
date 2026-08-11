@@ -8,6 +8,11 @@ Endpoints (all require `<xsappname>.admin` XSUAA scope):
     GET    /admin/api/agents/{id}          — fetch one agent
     PUT    /admin/api/agents/{id}          — update an agent
     DELETE /admin/api/agents/{id}          — delete an agent
+    GET    /admin/api/skills               — list skills
+    POST   /admin/api/skills               — create or upsert a skill
+    GET    /admin/api/skills/{id}          — fetch one skill
+    PUT    /admin/api/skills/{id}          — update a skill
+    DELETE /admin/api/skills/{id}          — delete a skill (detaches it)
     GET    /admin/api/orchestrator         — fetch orchestrator instructions
     PUT    /admin/api/orchestrator         — update orchestrator instructions
     POST   /admin/api/reload               — rebuild the orchestrator in-memory
@@ -38,14 +43,21 @@ from agents.db import (
     VALID_AUTH_MODES,
     SessionLocal,
     delete_agent,
+    delete_skill,
     get_active_model_name,
     get_agent,
     get_orchestrator_instructions,
+    get_skill,
+    get_skill_by_name,
     list_agents,
+    list_skills,
+    normalize_skills_json,
     prepare_servers,
+    rename_skill_references,
     set_active_model_name,
     set_orchestrator_instructions,
     upsert_agent,
+    upsert_skill,
 )
 from agents.registry import registry
 from agents.shared import available_models, default_model_name
@@ -173,12 +185,44 @@ class McpServerPayload(BaseModel):
         return self
 
 
+class SkillPayload(BaseModel):
+    """A reusable skill agents can be equipped with.
+
+    ``description`` tells the specialist *when* to use the skill (it goes
+    into the system prompt); ``content`` is the full instruction body the
+    specialist loads on demand via its ``load_skill`` tool.
+    """
+
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_\- ]+$")
+    description: str = Field(min_length=1, max_length=2000)
+    content: str = Field(min_length=1)
+
+    @field_validator("name", "description")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be blank")
+        return v
+
+
 class AgentPayload(BaseModel):
     name: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_\- ]+$")
     description: str = Field(min_length=1, max_length=2000)
     instructions: str = Field(min_length=1)
     mcp_servers: list[McpServerPayload] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
     enabled: bool = True
+
+    @field_validator("skills")
+    @classmethod
+    def _clean_skills(cls, v: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for s in v:
+            s = str(s).strip()
+            if s and s not in cleaned:
+                cleaned.append(s)
+        return cleaned
 
     @model_validator(mode="before")
     @classmethod
@@ -240,8 +284,9 @@ class ModelPayload(BaseModel):
 
 class ImportPayload(BaseModel):
     orchestrator_instructions: str | None = None
+    skills: list[SkillPayload] = Field(default_factory=list)
     agents: list[AgentPayload] = Field(default_factory=list)
-    replace: bool = False  # if true, delete agents not in the import
+    replace: bool = False  # if true, delete agents/skills not in the import
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +330,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 description=payload.description,
                 instructions=payload.instructions,
                 mcp_servers=payload.to_servers_list(),
+                skills=payload.skills,
                 enabled=payload.enabled,
             )
         except ValueError as e:
@@ -320,6 +366,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             primary, extras, primary_oauth_json = prepare_servers(
                 payload.to_servers_list(), row
             )
+            skills_json = await normalize_skills_json(session, payload.skills)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         row.name = payload.name
@@ -329,6 +376,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.auth_mode = primary["auth_mode"]
         row.extra_servers_json = json.dumps(extras) if extras else None
         row.oauth_json = primary_oauth_json
+        row.skills_json = skills_json
         row.enabled = 1 if payload.enabled else 0
         await session.commit()
         await session.refresh(row)
@@ -345,6 +393,76 @@ async def api_delete_agent(agent_id: int) -> None:
         ok = await delete_agent(session, agent_id)
         if not ok:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+
+# ---------------------------------------------------------------------------
+# Skills CRUD
+# ---------------------------------------------------------------------------
+@router.get("/api/skills", dependencies=[Depends(require_admin)])
+async def api_list_skills() -> list[dict[str, Any]]:
+    async with SessionLocal() as session:
+        rows = await list_skills(session)
+        return [r.to_dict() for r in rows]
+
+
+@router.post(
+    "/api/skills",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_admin)],
+)
+async def api_create_skill(payload: SkillPayload) -> dict[str, Any]:
+    async with SessionLocal() as session:
+        row = await upsert_skill(
+            session,
+            name=payload.name,
+            description=payload.description,
+            content=payload.content,
+        )
+        return row.to_dict()
+
+
+@router.get("/api/skills/{skill_id}", dependencies=[Depends(require_admin)])
+async def api_get_skill(skill_id: int) -> dict[str, Any]:
+    async with SessionLocal() as session:
+        row = await get_skill(session, skill_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        return row.to_dict()
+
+
+@router.put("/api/skills/{skill_id}", dependencies=[Depends(require_admin)])
+async def api_update_skill(skill_id: int, payload: SkillPayload) -> dict[str, Any]:
+    async with SessionLocal() as session:
+        row = await get_skill(session, skill_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if row.name != payload.name:
+            clash = await get_skill_by_name(session, payload.name)
+            if clash and clash.id != skill_id:
+                raise HTTPException(
+                    status_code=409, detail=f"Skill name '{payload.name}' already exists"
+                )
+            # Keep agent references pointing at the renamed skill
+            await rename_skill_references(session, row.name, payload.name)
+        row.name = payload.name
+        row.description = payload.description
+        row.content = payload.content
+        await session.commit()
+        await session.refresh(row)
+        return row.to_dict()
+
+
+@router.delete(
+    "/api/skills/{skill_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_admin)],
+)
+async def api_delete_skill(skill_id: int) -> None:
+    """Delete a skill and detach it from any agents that reference it."""
+    async with SessionLocal() as session:
+        ok = await delete_skill(session, skill_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="Skill not found")
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +557,12 @@ async def api_restart() -> JSONResponse:
 async def api_export() -> dict[str, Any]:
     async with SessionLocal() as session:
         rows = await list_agents(session)
+        skills = await list_skills(session)
         orch = await get_orchestrator_instructions(session)
         return {
             "version": 1,
             "orchestrator_instructions": orch,
+            "skills": [s.to_export() for s in skills],
             "agents": [r.to_export() for r in rows],
         }
 
@@ -453,6 +573,17 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         if payload.orchestrator_instructions:
             await set_orchestrator_instructions(session, payload.orchestrator_instructions)
 
+        # Skills first, so imported agents can reference them.
+        imported_skill_names = set()
+        for skill in payload.skills:
+            await upsert_skill(
+                session,
+                name=skill.name,
+                description=skill.description,
+                content=skill.content,
+            )
+            imported_skill_names.add(skill.name)
+
         imported_names = set()
         for agent in payload.agents:
             try:
@@ -462,6 +593,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     description=agent.description,
                     instructions=agent.instructions,
                     mcp_servers=agent.to_servers_list(),
+                    skills=agent.skills,
                     enabled=agent.enabled,
                 )
             except ValueError as e:
@@ -471,18 +603,29 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             imported_names.add(agent.name)
 
         removed = 0
+        removed_skills = 0
         if payload.replace:
             existing = await list_agents(session)
             for row in existing:
                 if row.name not in imported_names:
                     await session.delete(row)
                     removed += 1
+            # Replace applies to skills only when the import carries a skills
+            # section, so older exports (without one) don't wipe the library.
+            if payload.skills:
+                for srow in await list_skills(session):
+                    if srow.name not in imported_skill_names:
+                        await rename_skill_references(session, srow.name, None)
+                        await session.delete(srow)
+                        removed_skills += 1
             await session.commit()
 
     return {
         "status": "imported",
         "imported": len(payload.agents),
+        "imported_skills": len(payload.skills),
         "removed": removed,
+        "removed_skills": removed_skills,
     }
 
 
@@ -508,6 +651,22 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
         if "orchestrator_instructions" in data and data["orchestrator_instructions"]:
             await set_orchestrator_instructions(session, data["orchestrator_instructions"])
 
+        # Skills first, so seeded agents can reference them.
+        skill_count = 0
+        for entry in data.get("skills", []):
+            try:
+                skill = SkillPayload.model_validate(entry)
+            except Exception as e:
+                logger.warning("Skipping invalid seed skill %r: %s", entry, e)
+                continue
+            await upsert_skill(
+                session,
+                name=skill.name,
+                description=skill.description,
+                content=skill.content,
+            )
+            skill_count += 1
+
         count = 0
         for entry in data.get("agents", []):
             try:
@@ -516,13 +675,18 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             except Exception as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry, e)
                 continue
-            await upsert_agent(
-                session,
-                name=payload.name,
-                description=payload.description,
-                instructions=payload.instructions,
-                mcp_servers=payload.to_servers_list(),
-                enabled=payload.enabled,
-            )
+            try:
+                await upsert_agent(
+                    session,
+                    name=payload.name,
+                    description=payload.description,
+                    instructions=payload.instructions,
+                    mcp_servers=payload.to_servers_list(),
+                    skills=payload.skills,
+                    enabled=payload.enabled,
+                )
+            except ValueError as e:
+                logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
+                continue
             count += 1
-        logger.info("Seeded %d agents from %s", count, seed_path)
+        logger.info("Seeded %d skills and %d agents from %s", skill_count, count, seed_path)
