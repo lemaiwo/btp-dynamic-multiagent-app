@@ -157,11 +157,11 @@ async def run_tests() -> None:
         check("status 200", r.status_code == 200, f"got {r.status_code}")
         check("body {status: ok}", r.json() == {"status": "ok"})
 
-        # --- Root redirect --------------------------------------------------
-        print("\n== / redirect ==")
+        # --- Root serves the chat mount --------------------------------------
+        print("\n== / chat mount ==")
         r = await client.get("/", follow_redirects=False)
-        check("redirects", r.status_code in (302, 307), f"got {r.status_code}")
-        check("to /chat", r.headers.get("location") == "/chat")
+        check("root serves chat", r.status_code == 200 and r.text == "fake-chat",
+              f"got {r.status_code} {r.text[:50]}")
 
         # --- Chat mount -----------------------------------------------------
         print("\n== /chat ==")
@@ -182,14 +182,13 @@ async def run_tests() -> None:
         r = await client.get("/admin/api/agents")
         check("200", r.status_code == 200)
         seeded = r.json()
-        check("3 seeded agents", len(seeded) == 3, f"got {len(seeded)}: {[a['name'] for a in seeded]}")
+        check("1 seeded agent", len(seeded) == 1, f"got {len(seeded)}: {[a['name'] for a in seeded]}")
         names = {a["name"] for a in seeded}
-        check("contains cloudfoundry", "cloudfoundry" in names)
-        check("contains btp", "btp" in names)
-        check("contains auditlog", "auditlog" in names)
-
-        auditlog = next(a for a in seeded if a["name"] == "auditlog")
-        check("auditlog disabled", auditlog["enabled"] is False)
+        check(
+            "contains ABAP Development Agent",
+            "ABAP Development Agent" in names,
+            f"got {names}",
+        )
 
         # --- Create a new agent --------------------------------------------
         print("\n== POST /admin/api/agents ==")
@@ -231,6 +230,81 @@ async def run_tests() -> None:
         check("200", r.status_code == 200, f"got {r.status_code}: {r.text}")
         check("description updated", r.json()["description"] == "Updated description.")
 
+        # --- Skills CRUD ----------------------------------------------------
+        print("\n== Skills CRUD ==")
+        r = await client.get("/admin/api/skills")
+        check("empty skills list", r.status_code == 200 and r.json() == [])
+
+        skill_payload = {
+            "name": "cf-troubleshooting",
+            "description": "How to diagnose failing Cloud Foundry apps.",
+            "content": "1. Check recent logs.\n2. Check crash events.\n3. Check quotas.",
+        }
+        r = await client.post("/admin/api/skills", json=skill_payload)
+        check("201 skill created", r.status_code == 201, f"got {r.status_code}: {r.text}")
+        created_skill = r.json()
+        check("skill name echo", created_skill["name"] == "cf-troubleshooting")
+        check("skill content echo", created_skill["content"] == skill_payload["content"])
+        skill_id = created_skill["id"]
+
+        r = await client.post("/admin/api/skills", json={
+            "name": "quota-checks",
+            "description": "How to verify entitlements and quotas.",
+            "content": "Check the subaccount entitlements before assigning quota.",
+        })
+        check("second skill created", r.status_code == 201)
+
+        r = await client.get("/admin/api/skills")
+        check("2 skills listed", len(r.json()) == 2, f"got {len(r.json())}")
+
+        r = await client.get(f"/admin/api/skills/{skill_id}")
+        check("get one skill", r.status_code == 200 and r.json()["id"] == skill_id)
+
+        print("\n== Attach skills to an agent ==")
+        upd_skills = dict(payload, skills=["cf-troubleshooting"])
+        r = await client.put(f"/admin/api/agents/{new_id}", json=upd_skills)
+        check("attach skill 200", r.status_code == 200, f"got {r.status_code}: {r.text}")
+        check("agent echoes skills", r.json()["skills"] == ["cf-troubleshooting"], f"got {r.json().get('skills')}")
+
+        r = await client.get(f"/admin/api/agents/{new_id}")
+        check("skills persisted", r.json()["skills"] == ["cf-troubleshooting"])
+
+        print("\n== Skill validation ==")
+        r = await client.put(
+            f"/admin/api/agents/{new_id}", json=dict(payload, skills=["no-such-skill"])
+        )
+        check("422 unknown skill on update", r.status_code == 422, f"got {r.status_code}")
+        r = await client.post(
+            "/admin/api/agents",
+            json=dict(payload, name="skillbad", skills=["no-such-skill"]),
+        )
+        check("422 unknown skill on create", r.status_code == 422, f"got {r.status_code}")
+        # The failed update must not have wiped the stored skills
+        r = await client.get(f"/admin/api/agents/{new_id}")
+        check("skills unchanged after 422", r.json()["skills"] == ["cf-troubleshooting"])
+
+        print("\n== Rename skill follows references ==")
+        r = await client.put(f"/admin/api/skills/{skill_id}", json={
+            "name": "cf-diagnostics",
+            "description": "How to diagnose failing Cloud Foundry apps.",
+            "content": "1. Check recent logs.",
+        })
+        check("skill renamed", r.status_code == 200 and r.json()["name"] == "cf-diagnostics")
+        r = await client.get(f"/admin/api/agents/{new_id}")
+        check("agent reference renamed", r.json()["skills"] == ["cf-diagnostics"], f"got {r.json()['skills']}")
+
+        print("\n== Reload with skills attached ==")
+        r = await client.post("/admin/api/reload")
+        check("reload with skills 200", r.status_code == 200, f"got {r.status_code}: {r.text}")
+
+        print("\n== Delete skill detaches it ==")
+        r = await client.delete(f"/admin/api/skills/{skill_id}")
+        check("204 skill deleted", r.status_code == 204, f"got {r.status_code}")
+        r = await client.get(f"/admin/api/agents/{new_id}")
+        check("skill detached from agent", r.json()["skills"] == [], f"got {r.json()['skills']}")
+        r = await client.get("/admin/api/skills")
+        check("1 skill remains", len(r.json()) == 1)
+
         # --- Orchestrator instructions -------------------------------------
         print("\n== GET/PUT /admin/api/orchestrator ==")
         r = await client.get("/admin/api/orchestrator")
@@ -248,7 +322,7 @@ async def run_tests() -> None:
         check("200", r.status_code == 200, f"got {r.status_code}: {r.text}")
         data = r.json()
         check("status reloaded", data.get("status") == "reloaded")
-        check("agents count >= 3", data.get("agents", 0) >= 3, f"got {data}")
+        check("agents count >= 2", data.get("agents", 0) >= 2, f"got {data}")
 
         # --- Restart (CF not configured → ok=false) ------------------------
         print("\n== POST /admin/api/restart ==")
@@ -263,18 +337,35 @@ async def run_tests() -> None:
         check("200", r.status_code == 200)
         exported = r.json()
         check("version 1", exported.get("version") == 1)
-        check("has agents", len(exported.get("agents", [])) >= 4)
+        check("has agents", len(exported.get("agents", [])) >= 2)
+        check(
+            "has skills",
+            [s["name"] for s in exported.get("skills", [])] == ["quota-checks"],
+            f"got {exported.get('skills')}",
+        )
+        check(
+            "agent export has skills key",
+            all("skills" in a for a in exported.get("agents", [])),
+        )
 
         # --- Import (merge) -------------------------------------------------
         print("\n== POST /admin/api/import (merge) ==")
         imp = {
             "orchestrator_instructions": "Imported instructions.",
+            "skills": [
+                {
+                    "name": "imported-skill",
+                    "description": "Imported skill.",
+                    "content": "Follow the imported procedure.",
+                }
+            ],
             "agents": [
                 {
                     "name": "imported1",
                     "description": "Imported agent 1.",
                     "instructions": "Imported 1.",
                     "mcp_url": "https://imp1.cfapps.eu20-001.hana.ondemand.com",
+                    "skills": ["imported-skill"],
                     "enabled": True,
                 }
             ],
@@ -283,22 +374,33 @@ async def run_tests() -> None:
         r = await client.post("/admin/api/import", json=imp)
         check("200", r.status_code == 200, f"got {r.status_code}: {r.text}")
         check("imported 1", r.json().get("imported") == 1)
+        check("imported 1 skill", r.json().get("imported_skills") == 1)
         check("removed 0", r.json().get("removed") == 0)
 
         r = await client.get("/admin/api/agents")
         all_names = {a["name"] for a in r.json()}
         check("imported1 present", "imported1" in all_names)
         check("testagent still present (merge)", "testagent" in all_names)
+        imported1 = next(a for a in r.json() if a["name"] == "imported1")
+        check("imported1 has skill", imported1["skills"] == ["imported-skill"])
 
         # --- Import (replace) ----------------------------------------------
         print("\n== POST /admin/api/import (replace) ==")
         imp2 = {
+            "skills": [
+                {
+                    "name": "only-skill",
+                    "description": "The only remaining skill.",
+                    "content": "You are the only skill.",
+                }
+            ],
             "agents": [
                 {
                     "name": "only",
                     "description": "The only remaining agent.",
                     "instructions": "You are alone.",
                     "mcp_url": "https://only.cfapps.eu20-001.hana.ondemand.com",
+                    "skills": ["only-skill"],
                     "enabled": True,
                 }
             ],
@@ -311,9 +413,17 @@ async def run_tests() -> None:
             r.json().get("removed", 0) > 0,
             f"got {r.json()}",
         )
+        check(
+            "removed 2 skills",
+            r.json().get("removed_skills") == 2,
+            f"got {r.json()}",
+        )
         r = await client.get("/admin/api/agents")
         remaining = {a["name"] for a in r.json()}
         check("only 'only' remains", remaining == {"only"}, f"got {remaining}")
+        r = await client.get("/admin/api/skills")
+        remaining_skills = {s["name"] for s in r.json()}
+        check("only 'only-skill' remains", remaining_skills == {"only-skill"}, f"got {remaining_skills}")
 
         # --- Delete ---------------------------------------------------------
         print("\n== DELETE /admin/api/agents/{id} ==")
