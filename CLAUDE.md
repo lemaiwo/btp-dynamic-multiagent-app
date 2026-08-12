@@ -21,8 +21,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 ## Key files
 - `app.py` — FastAPI entry; middleware binds JWT; lifespan initializes
   DB, seeds from `agents.seed.json`, builds the initial registry
-- `agents/db.py` — SQLAlchemy models (`AgentConfig`, `OrchestratorConfig`),
-  `init_db`, CRUD helpers, VCAP/ENV postgres URL resolver
+- `agents/db.py` — SQLAlchemy models (`AgentConfig`, `SkillConfig`,
+  `OrchestratorConfig`), `init_db`, CRUD helpers, VCAP/ENV postgres URL
+  resolver. Skills are reusable instruction blocks attached to agents by
+  name (`AgentConfig.skills_json`)
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin` FastAPI dependencies
@@ -39,11 +41,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/oauth_routes.py` — `GET /oauth/callback` completes the flow
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
-  singleton with `reload()` for atomic swaps
+  singleton with `reload()` for atomic swaps. Attached skills are listed
+  (name + description) in the specialist's system prompt; full content is
+  served on demand via a per-specialist `load_skill` tool
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
-- `agents/admin.py` — FastAPI `/admin` router: CRUD, reload, restart,
-  import/export, seed-on-startup
+- `agents/admin.py` — FastAPI `/admin` router: agent + skill CRUD, reload,
+  restart, import/export, seed-on-startup
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
   `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
   `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.

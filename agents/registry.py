@@ -15,7 +15,7 @@ import reprlib
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext
 
 from agents.db import (
     AgentConfig,
@@ -23,6 +23,7 @@ from agents.db import (
     get_active_model_name,
     get_orchestrator_instructions,
     list_agents,
+    list_skills,
 )
 from agents.shared import create_mcp_server, default_model_name, get_model
 
@@ -297,6 +298,52 @@ async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | No
 
 
 # ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+def _skills_instructions(attached: list[dict]) -> str:
+    """Prompt block advertising an agent's attached skills.
+
+    Only names + descriptions go into the system prompt; the full skill
+    content stays behind the ``load_skill`` tool so it is loaded on demand
+    instead of inflating every request.
+    """
+    lines = "\n".join(
+        f"- **{s['name']}**: {s['description'].strip()}" for s in attached
+    )
+    return (
+        "\n\n## Skills\n"
+        "You have the following skills available — reusable expert "
+        "instructions for specific kinds of tasks. When a request matches a "
+        "skill's description, call the `load_skill` tool with the skill's "
+        "exact name and follow the returned instructions before answering.\n"
+        f"{lines}"
+    )
+
+
+def _attach_skills_tool(specialist: Agent, agent_name: str, attached: list[dict]) -> None:
+    """Register a ``load_skill`` tool that returns a skill's full content."""
+    contents = {s["name"]: s["content"] for s in attached}
+
+    async def load_skill(name: str) -> str:
+        content = contents.get(name.strip())
+        if content is None:
+            raise ModelRetry(
+                f"Unknown skill {name!r}. Available skills: "
+                + ", ".join(sorted(contents))
+            )
+        logger.info("[skill] %s loaded skill %r", agent_name, name)
+        return content
+
+    specialist.tool_plain(
+        name="load_skill",
+        description=(
+            "Load the full instructions of one of your skills by its exact "
+            "name. Returns the skill content to follow for the current task."
+        ),
+    )(load_skill)
+
+
+# ---------------------------------------------------------------------------
 # Build result
 # ---------------------------------------------------------------------------
 @dataclass
@@ -315,6 +362,10 @@ async def build_orchestrator() -> BuildResult:
         active_model = await get_active_model_name(session)
         configs = [r.to_dict() for r in rows]
         enabled_rows = [r for r in rows if r.enabled]
+        skills_by_name = {
+            s.name: {"name": s.name, "description": s.description, "content": s.content}
+            for s in await list_skills(session)
+        }
 
     model_name = active_model or default_model_name()
     try:
@@ -423,12 +474,29 @@ async def build_orchestrator() -> BuildResult:
 
         mcp_clients.extend(servers)
 
+        attached_skills = []
+        for skill_name in row.skills:
+            skill = skills_by_name.get(skill_name)
+            if skill is None:
+                logger.warning(
+                    "Agent %s references unknown skill %r; skipping it",
+                    row.name, skill_name,
+                )
+                continue
+            attached_skills.append(skill)
+
+        specialist_instructions = row.instructions
+        if attached_skills:
+            specialist_instructions += _skills_instructions(attached_skills)
+
         specialist = Agent(
             model,
-            instructions=row.instructions,
+            instructions=specialist_instructions,
             toolsets=servers,
             retries=_TOOL_RETRIES,
         )
+        if attached_skills:
+            _attach_skills_tool(specialist, row.name, attached_skills)
         specialists[row.name] = specialist
 
         _attach_delegation_tool(orchestrator, specialist, row)

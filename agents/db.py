@@ -154,6 +154,9 @@ class AgentConfig(Base):
     # auth_mode is "oauth2": {client_id, client_secret, uaa_url|authorize_url|
     # token_url, scope?}. Extras carry their own under each entry's "oauth".
     oauth_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON-encoded list of skill names (SkillConfig.name) attached to this
+    # agent. Skills are referenced by name so exports stay portable.
+    skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -196,6 +199,20 @@ class AgentConfig(Base):
                         out.append(entry)
         return out
 
+    @property
+    def skills(self) -> list[str]:
+        """Names of the skills attached to this agent (may be empty)."""
+        if not self.skills_json:
+            return []
+        try:
+            data = json.loads(self.skills_json)
+        except Exception:
+            logger.warning("Malformed skills_json on agent %s", self.name)
+            return []
+        if not isinstance(data, list):
+            return []
+        return [str(s) for s in data if isinstance(s, str) and s.strip()]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -205,6 +222,7 @@ class AgentConfig(Base):
             "mcp_url": self.mcp_url,
             "auth_mode": self.auth_mode,
             "mcp_servers": _redact_servers(self.mcp_servers),
+            "skills": self.skills,
             "enabled": bool(self.enabled),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -216,6 +234,7 @@ class AgentConfig(Base):
             "description": self.description,
             "instructions": self.instructions,
             "mcp_servers": _redact_servers(self.mcp_servers),
+            "skills": self.skills,
             "enabled": bool(self.enabled),
         }
 
@@ -256,6 +275,48 @@ class OrchestratorConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class SkillConfig(Base):
+    """A reusable skill: a named block of expert instructions.
+
+    Skills are attached to agents by name (AgentConfig.skills_json). The
+    registry lists each attached skill's name + description in the
+    specialist's system prompt and exposes the full ``content`` through a
+    ``load_skill`` tool, so the model only pulls in a skill's body when the
+    task at hand actually matches it.
+    """
+
+    __tablename__ = "skill_configs"
+    __table_args__ = (UniqueConstraint("name", name="uq_skill_configs_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    def to_export(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "content": self.content,
+        }
 
 
 class McpOAuthToken(Base):
@@ -360,6 +421,9 @@ async def init_db() -> None:
         )
         await _ensure_column(
             conn, "agent_configs", "oauth_json", "TEXT"
+        )
+        await _ensure_column(
+            conn, "agent_configs", "skills_json", "TEXT"
         )
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
@@ -499,6 +563,30 @@ def prepare_servers(
     return primary_clean, extras, primary_oauth_json
 
 
+async def normalize_skills_json(
+    session: AsyncSession, skills: list[str] | None
+) -> str | None:
+    """Validate a list of skill names and return it JSON-encoded (or None).
+
+    Names are trimmed and de-duplicated (order preserved). Referencing a
+    skill that does not exist raises ValueError so the admin API can reject
+    the request instead of silently storing a dangling reference.
+    """
+    cleaned: list[str] = []
+    for s in skills or []:
+        s = str(s).strip()
+        if s and s not in cleaned:
+            cleaned.append(s)
+    if not cleaned:
+        return None
+    result = await session.execute(select(SkillConfig.name))
+    known = {n for (n,) in result.all()}
+    unknown = [s for s in cleaned if s not in known]
+    if unknown:
+        raise ValueError(f"unknown skill(s): {', '.join(unknown)}")
+    return json.dumps(cleaned)
+
+
 async def upsert_agent(
     session: AsyncSession,
     *,
@@ -506,11 +594,13 @@ async def upsert_agent(
     description: str,
     instructions: str,
     mcp_servers: list[dict[str, Any]],
+    skills: list[str] | None = None,
     enabled: bool = True,
 ) -> AgentConfig:
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     extras_json = json.dumps(extras) if extras else None
+    skills_json = await normalize_skills_json(session, skills)
 
     if existing is None:
         row = AgentConfig(
@@ -521,6 +611,7 @@ async def upsert_agent(
             auth_mode=primary["auth_mode"],
             extra_servers_json=extras_json,
             oauth_json=primary_oauth_json,
+            skills_json=skills_json,
             enabled=1 if enabled else 0,
         )
         session.add(row)
@@ -531,6 +622,7 @@ async def upsert_agent(
         existing.auth_mode = primary["auth_mode"]
         existing.extra_servers_json = extras_json
         existing.oauth_json = primary_oauth_json
+        existing.skills_json = skills_json
         existing.enabled = 1 if enabled else 0
         row = existing
     await session.commit()
@@ -542,6 +634,69 @@ async def delete_agent(session: AsyncSession, agent_id: int) -> bool:
     row = await session.get(AgentConfig, agent_id)
     if row is None:
         return False
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Skills CRUD
+# ---------------------------------------------------------------------------
+async def list_skills(session: AsyncSession) -> list[SkillConfig]:
+    result = await session.execute(select(SkillConfig).order_by(SkillConfig.name))
+    return list(result.scalars().all())
+
+
+async def get_skill(session: AsyncSession, skill_id: int) -> SkillConfig | None:
+    return await session.get(SkillConfig, skill_id)
+
+
+async def get_skill_by_name(session: AsyncSession, name: str) -> SkillConfig | None:
+    result = await session.execute(select(SkillConfig).where(SkillConfig.name == name))
+    return result.scalar_one_or_none()
+
+
+async def upsert_skill(
+    session: AsyncSession, *, name: str, description: str, content: str
+) -> SkillConfig:
+    row = await get_skill_by_name(session, name)
+    if row is None:
+        row = SkillConfig(name=name, description=description, content=content)
+        session.add(row)
+    else:
+        row.description = description
+        row.content = content
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def rename_skill_references(
+    session: AsyncSession, old_name: str, new_name: str | None
+) -> None:
+    """Update every agent's skill list after a skill rename or delete.
+
+    ``new_name=None`` detaches the skill instead. Caller commits (this runs
+    inside the same transaction as the rename/delete itself).
+    """
+    result = await session.execute(
+        select(AgentConfig).where(AgentConfig.skills_json.is_not(None))
+    )
+    for agent in result.scalars().all():
+        skills = agent.skills
+        if old_name not in skills:
+            continue
+        mapped = [new_name if s == old_name else s for s in skills]
+        # Drop detached entries and de-dup in case new_name was already there
+        deduped = list(dict.fromkeys(s for s in mapped if s))
+        agent.skills_json = json.dumps(deduped) if deduped else None
+
+
+async def delete_skill(session: AsyncSession, skill_id: int) -> bool:
+    row = await session.get(SkillConfig, skill_id)
+    if row is None:
+        return False
+    await rename_skill_references(session, row.name, None)
     await session.delete(row)
     await session.commit()
     return True

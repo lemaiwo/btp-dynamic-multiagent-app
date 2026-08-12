@@ -110,13 +110,19 @@ You can also re-import this file at any time via the admin UI's
 ### 4. First steps in the UI
 
 1. Open <http://127.0.0.1:7932/admin>.
-2. You should see the three seeded agents.
+2. You should see the seeded agent(s).
 3. Click **+ New agent**, fill in name / description / instructions /
    MCP URL, save.
-4. Click **Reload agents** — the orchestrator is rebuilt in place and
+4. Optionally define reusable **skills** in the Skills panel (name,
+   description, content) and attach them to agents from the agent's
+   edit dialog. Attached skills are listed in the specialist's system
+   prompt and the full content is loaded on demand through a
+   `load_skill` tool, so large instructions don't inflate every request.
+5. Click **Reload agents** — the orchestrator is rebuilt in place and
    the new specialist is available in the chat without restarting.
-5. Use **Export config** to download a JSON snapshot, or **Import
-   config** to load a saved configuration (merge or replace).
+6. Use **Export config** to download a JSON snapshot, or **Import
+   config** to load a saved configuration (merge or replace). Skills
+   are included in exports and imported before agents.
 
 ### 5. Running the tests
 
@@ -125,10 +131,10 @@ FastAPI app (stubbing SAP AI Core + MCP) over an ASGI transport — no
 external services needed.
 
 ```bash
-# Backend HTTP API tests (45 checks)
+# Backend HTTP API tests (HTML admin API incl. skills CRUD)
 python tests/test_admin_api.py
 
-# Admin UI tests (50 checks: HTML structure, JS syntax, fetch contract, flows)
+# Admin UI tests (HTML structure, JS syntax, fetch contract, flows)
 python tests/test_admin_ui.py
 ```
 
@@ -272,12 +278,20 @@ automatically; on a refresh failure the user is re-prompted.
 {
   "version": 1,
   "orchestrator_instructions": "You are an SAP BTP ... orchestrator. ...",
+  "skills": [
+    {
+      "name": "cf-troubleshooting",
+      "description": "How to diagnose failing Cloud Foundry apps.",
+      "content": "1. Check recent logs ..."
+    }
+  ],
   "agents": [
     {
       "name": "cloudfoundry",
       "description": "Cloud Foundry operations ...",
       "instructions": "You are an SAP BTP Cloud Foundry specialist. ...",
       "mcp_url": "https://...hana.ondemand.com",
+      "skills": ["cf-troubleshooting"],
       "enabled": true
     }
   ]
@@ -285,8 +299,9 @@ automatically; on a refresh failure the user is re-prompted.
 ```
 
 `POST /admin/api/import` accepts an additional top-level `"replace":
-true` field to delete agents not present in the payload (otherwise
-entries are upserted).
+true` field to delete agents (and skills, when a `"skills"` section is
+present) not in the payload (otherwise entries are upserted). Skills
+are imported before agents so agents can reference them.
 
 ## Joule integration (A2A)
 
