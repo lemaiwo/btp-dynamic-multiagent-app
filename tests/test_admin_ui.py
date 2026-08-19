@@ -544,6 +544,21 @@ async def main() -> None:
         check("runs tab present", 'data-tab="runs"' in html)
         check("runs list container", 'id="runs-list"' in html)
         check("run-now button", "runAgentNow" in html)
+
+        # run-as is an opaque XSUAA principal, so the UI must hand it over and
+        # show whether that identity actually holds a token per OAuth2 server.
+        check("whoami loaded on boot", "loadWhoami()" in html)
+        check("use-my-identity button", 'id="agent-use-my-identity"' in html)
+        check("whoami api used", "/admin/api/whoami" in html)
+        check("credentials api used", "/credentials?principal=" in html)
+        check("credentials panel", 'id="agent-credentials"' in html)
+        check("connect button opens login", "function connectServer" in html)
+        # Only ever open our own same-origin sign-in URL in a popup.
+        check("connect guards the login url", "/^\\/oauth\\/login\\?/" in html)
+        # The popup authorizes whoever is logged in — say so, or an admin
+        # connects their own identity while believing they connected the
+        # service account, which is the exact confusion this panel exists for.
+        check("connect warns whose identity is used", "not as the id above" in html)
         check("runs api used", "/admin/api/runs" in html)
         check("exposure field expose_api", 'id="agent-expose-api"' in html)
         check("exposure field api_slug", 'id="agent-api-slug"' in html)
