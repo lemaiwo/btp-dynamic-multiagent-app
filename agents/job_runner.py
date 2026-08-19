@@ -173,9 +173,19 @@ async def execute_run(run_id: str, agent_id: int) -> None:
             ),
         )
     except asyncio.TimeoutError:
+        # `agent` can still be None here (e.g. the initial session.get itself
+        # timed out on a pool acquire — asyncpg raises this same
+        # TimeoutError), so don't dereference it unguarded: that would raise
+        # AttributeError *inside* this handler, escape execute_run, and leave
+        # the row stuck 'running' — the exact bug this whole except chain
+        # exists to prevent.
+        timeout_desc = (
+            f"its {agent.run_timeout_seconds}s timeout" if agent is not None
+            else "its timeout"
+        )
         await _finalize(
             run_id, status="failed",
-            error=f"Run exceeded its {agent.run_timeout_seconds}s timeout.",
+            error=f"Run exceeded {timeout_desc}.",
         )
     except asyncio.CancelledError:
         await _finalize(
