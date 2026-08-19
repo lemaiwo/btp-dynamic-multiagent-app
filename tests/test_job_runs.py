@@ -103,6 +103,32 @@ async def main() -> None:
     check("chat agent still included", any(r.name == "chat-only" for r in chat_rows))
     check("both agents still built as specialists", len(rows) >= 2)
 
+    print("\n== run_as identity binding ==")
+    from agents.auth import current_base_url, current_principal, run_as
+
+    os.environ["PUBLIC_BASE_URL"] = "https://approuter.example.com"
+    check("no principal before", current_principal.get() is None)
+    async with run_as("svc@example.com"):
+        check("principal bound", current_principal.get() == "svc@example.com")
+        check("base url bound", current_base_url.get() == "https://approuter.example.com")
+        check("jwt deliberately unset", __import__("agents.auth", fromlist=["x"]).current_jwt.get() is None)
+    check("principal restored after", current_principal.get() is None)
+
+    try:
+        async with run_as("svc@example.com"):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    check("principal restored after exception", current_principal.get() is None)
+
+    os.environ.pop("PUBLIC_BASE_URL")
+    try:
+        async with run_as("svc@example.com"):
+            pass
+        check("missing PUBLIC_BASE_URL rejected", False, "no error raised")
+    except RuntimeError:
+        check("missing PUBLIC_BASE_URL rejected", True)
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
