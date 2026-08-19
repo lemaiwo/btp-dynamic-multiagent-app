@@ -93,6 +93,7 @@ New columns on `agent_configs`, all added via `_ensure_column`:
 | `expose_api` | bool, default false | agent has a run endpoint |
 | `api_slug` | varchar, unique when set | URL segment; derived from name, editable |
 | `run_as_principal` | varchar | identity API-triggered runs bind |
+| `run_prompt` | text, nullable | user prompt handed to `Agent.run()`; falls back to a fixed default. The *work* is described by instructions and attached skills — this only starts it |
 | `run_timeout_seconds` | int, default 1800 | wall-clock ceiling for one run; must stay below the BTP async timeout (see below) |
 | `expected_sections_json` | text | list of `source_key`s a complete report must contain |
 
