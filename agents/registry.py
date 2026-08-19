@@ -257,21 +257,46 @@ def _oauth2_server_keys(row) -> list[str]:
     return keys
 
 
+# (user, server_key) pairs with a sign-in prompt already on screen. The
+# orchestrator commonly fires several delegations in one turn and pydantic-ai
+# runs them concurrently, so without this every one of them posts its own bubble
+# for the same server — one popup satisfies them all, leaving the extras as
+# stale links. Only the first prompts; the rest just wait for the same token.
+_signin_prompted: set[tuple[str, str]] = set()
+
+
 async def _await_signin(agent_name: str, server_key: str, user_id: str) -> bool:
     """Show the sign-in link for ``server_key`` and wait for the user to
     authorize in the popup. Returns True once a token appears, False on timeout
-    (or if no link could be built). Shared by the pre-check and the in-run path."""
+    (or if no link could be built). Shared by the pre-check and the in-run path.
+
+    Concurrent callers for the same (user, server) share one prompt: whoever
+    gets there first shows the link, the others wait silently on the same
+    sign-in."""
     from agents.progress import report_message, report_note
 
-    link = _build_login_link(agent_name, server_key)
-    if not link:
+    prompt_key = (user_id, server_key)
+    # Claim the prompt. The check and the add must stay adjacent — no await
+    # between them — so two concurrent callers can't both come out first.
+    owns_prompt = prompt_key not in _signin_prompted
+    if owns_prompt:
+        _signin_prompted.add(prompt_key)
+    try:
+        if owns_prompt:
+            link = _build_login_link(agent_name, server_key)
+            if not link:
+                return False
+            report_message(agent_name, _signin_message(agent_name, link))
+        report_note(agent_name, "Waiting for you to sign in…")
+        if await _wait_for_token(user_id, server_key):
+            report_note(agent_name, f"Signed in — resuming {agent_name}…")
+            return True
         return False
-    report_message(agent_name, _signin_message(agent_name, link))
-    report_note(agent_name, "Waiting for you to sign in…")
-    if await _wait_for_token(user_id, server_key):
-        report_note(agent_name, f"Signed in — resuming {agent_name}…")
-        return True
-    return False
+    finally:
+        # Also runs on cancellation (client disconnect), so a dropped request
+        # can't wedge the guard and mute the next genuine prompt.
+        if owns_prompt:
+            _signin_prompted.discard(prompt_key)
 
 
 async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | None:
