@@ -539,6 +539,18 @@ async def main() -> None:
         err = r.json()
         check("flow: error body has detail for toast", "detail" in err)
 
+        # ------------------------------------------------------------------
+        print("\n== job runs UI ==")
+        check("runs tab present", 'data-tab="runs"' in html)
+        check("runs list container", 'id="runs-list"' in html)
+        check("run-now button", "runAgentNow" in html)
+        check("runs api used", "/admin/api/runs" in html)
+        check("exposure field expose_api", 'id="agent-expose-api"' in html)
+        check("exposure field api_slug", 'id="agent-api-slug"' in html)
+        check("run-as field", 'id="agent-run-as"' in html)
+        check("expected sections field", 'id="agent-expected-sections"' in html)
+        check("endpoint URL hint shown", "/api/agents/" in html)
+
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
     try:

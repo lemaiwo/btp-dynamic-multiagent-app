@@ -544,6 +544,79 @@ async def run_tests() -> None:
             updated,
         )
 
+        # --- UI round-trip: all seven exposure fields must survive a
+        # load-then-save cycle using the exact payload shape
+        # templates/admin.html's saveAgent() builds from editAgent()'s
+        # loaded values. AgentPayload has defaults and PUT is whole-object
+        # semantics, so if the form ever omits one of these seven fields,
+        # saving *any* agent through the UI silently resets it (expose_api
+        # -> False, expose_chat -> True, api_slug/run_as_principal/
+        # run_prompt wiped, expected_sections wiped) with no error surfaced
+        # anywhere -- e.g. un-exposing a scheduled agent on its next edit.
+        print("\n== UI round-trip preserves all seven exposure fields ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "UI Roundtrip Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://z.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": False,
+            "expose_api": True,
+            "api_slug": "ui-roundtrip",
+            "run_as_principal": "svc-roundtrip@example.com",
+            "run_prompt": "Perform your configured check now.",
+            "run_timeout_seconds": 900,
+            "expected_sections": ["st22", "slg1", "sm21"],
+        })
+        check("roundtrip agent created", r.status_code == 201, r.text)
+        rt_id = r.json()["id"]
+
+        # editAgent(id) -> GET
+        r = await client.get(f"/admin/api/agents/{rt_id}")
+        check("roundtrip agent loaded", r.status_code == 200, r.text)
+        loaded = r.json()
+
+        # saveAgent() -> PUT, built from the loaded values exactly as the
+        # form's read/populate + collect logic does (including the
+        # comma-separated -> list transform for expected_sections).
+        ui_payload = {
+            "name": loaded["name"],
+            "description": loaded["description"],
+            "instructions": loaded["instructions"],
+            "mcp_servers": loaded["mcp_servers"],
+            "skills": loaded["skills"],
+            "enabled": loaded["enabled"],
+            "expose_chat": loaded["expose_chat"],
+            "expose_api": loaded["expose_api"],
+            "api_slug": loaded["api_slug"] or "",
+            "run_as_principal": loaded["run_as_principal"] or "",
+            "run_prompt": loaded["run_prompt"] or "",
+            "run_timeout_seconds": loaded["run_timeout_seconds"],
+            "expected_sections": loaded["expected_sections"],
+        }
+        r = await client.put(f"/admin/api/agents/{rt_id}", json=ui_payload)
+        check("roundtrip save 200", r.status_code == 200, r.text)
+        saved = r.json()
+        for field, expected in [
+            ("expose_chat", False),
+            ("expose_api", True),
+            ("api_slug", "ui-roundtrip"),
+            ("run_as_principal", "svc-roundtrip@example.com"),
+            ("run_prompt", "Perform your configured check now."),
+            ("run_timeout_seconds", 900),
+            ("expected_sections", ["st22", "slg1", "sm21"]),
+        ]:
+            check(
+                f"roundtrip preserves {field}",
+                saved.get(field) == expected,
+                f"got {saved.get(field)!r}",
+            )
+
+        # The UI's comma-split for a blank "expected sections" field must
+        # produce [] and never [""].
+        blank_sections = [s.strip() for s in "".split(",") if s.strip()]
+        check("blank expected_sections splits to []", blank_sections == [])
+
+        r = await client.delete(f"/admin/api/agents/{rt_id}")
+        check("roundtrip agent cleanup", r.status_code == 204, r.text)
+
         # --- Successful triggers: exercise the 202 contract end-to-end ------
         # Build the specialist so execute_run's background task can look it
         # up (it does not itself crash the test either way -- execute_run
