@@ -34,7 +34,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
-from agents.auth import require_admin
+from agents.auth import current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.db import (
     AUTH_MODE_JWT,
@@ -213,6 +213,13 @@ class AgentPayload(BaseModel):
     mcp_servers: list[McpServerPayload] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
     enabled: bool = True
+    expose_chat: bool = True
+    expose_api: bool = False
+    api_slug: str = Field(default="", max_length=64)
+    run_as_principal: str = Field(default="", max_length=255)
+    run_prompt: str = ""
+    run_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
+    expected_sections: list[str] = Field(default_factory=list)
 
     @field_validator("skills")
     @classmethod
@@ -332,6 +339,13 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 mcp_servers=payload.to_servers_list(),
                 skills=payload.skills,
                 enabled=payload.enabled,
+                expose_chat=payload.expose_chat,
+                expose_api=payload.expose_api,
+                api_slug=payload.api_slug,
+                run_as_principal=payload.run_as_principal,
+                run_prompt=payload.run_prompt,
+                run_timeout_seconds=payload.run_timeout_seconds,
+                expected_sections=payload.expected_sections,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -367,6 +381,18 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 payload.to_servers_list(), row
             )
             skills_json = await normalize_skills_json(session, payload.skills)
+
+            from agents.db import get_agent_by_slug
+
+            slug = payload.api_slug.strip() or None
+            if slug:
+                clash = await get_agent_by_slug(session, slug)
+                if clash is not None and clash.id != agent_id:
+                    raise ValueError(
+                        f"api_slug {slug!r} is already used by agent {clash.name!r}"
+                    )
+            if payload.expose_api and not slug:
+                raise ValueError("expose_api requires an api_slug")
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         row.name = payload.name
@@ -378,6 +404,15 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.oauth_json = primary_oauth_json
         row.skills_json = skills_json
         row.enabled = 1 if payload.enabled else 0
+        row.expose_chat = 1 if payload.expose_chat else 0
+        row.expose_api = 1 if payload.expose_api else 0
+        row.api_slug = slug
+        row.run_as_principal = payload.run_as_principal.strip() or None
+        row.run_prompt = payload.run_prompt.strip() or None
+        row.run_timeout_seconds = payload.run_timeout_seconds
+        row.expected_sections_json = (
+            json.dumps(payload.expected_sections) if payload.expected_sections else None
+        )
         await session.commit()
         await session.refresh(row)
         return row.to_dict()
@@ -393,6 +428,53 @@ async def api_delete_agent(agent_id: int) -> None:
         ok = await delete_agent(session, agent_id)
         if not ok:
             raise HTTPException(status_code=404, detail="Agent not found")
+
+
+# ---------------------------------------------------------------------------
+# Runs (Run-now button + run listing)
+# ---------------------------------------------------------------------------
+@router.post(
+    "/api/agents/{agent_id}/run",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin)],
+)
+async def api_run_now(agent_id: int) -> dict[str, str]:
+    """Run-now button: same runner as the scheduler, no callback."""
+    from agents.job_runner import RunRefused, start_run
+
+    async with SessionLocal() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+    try:
+        run_id = await start_run(
+            row, trigger="manual", created_by=current_principal.get()
+        )
+    except RunRefused as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"run_id": run_id}
+
+
+@router.get("/api/runs", dependencies=[Depends(require_admin)])
+async def api_list_runs(agent_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    from agents.db import list_job_runs
+
+    async with SessionLocal() as session:
+        rows = await list_job_runs(session, limit=limit, agent_id=agent_id)
+        return [r.to_dict() for r in rows]
+
+
+@router.get("/api/runs/{run_id}", dependencies=[Depends(require_admin)])
+async def api_get_run(run_id: str) -> dict[str, Any]:
+    from agents.db import get_job_run
+
+    async with SessionLocal() as session:
+        row = await get_job_run(session, run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        data = row.to_dict()
+        data["report"] = row.report
+        return data
 
 
 # ---------------------------------------------------------------------------
