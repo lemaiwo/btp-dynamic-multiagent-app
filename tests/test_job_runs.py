@@ -334,26 +334,78 @@ async def main() -> None:
     except job_runner.RunRefused:
         check("non-API agent refused", True)
 
-    print("\n== runner: finalize failure does not propagate ==")
+    print("\n== runner: finalize failure inside an except handler still propagates cancellation ==")
+    # This targets the exact bug class Finding 1 was about: a finish_job_run
+    # that raises from INSIDE an except handler. Pre-fix, that raise replaced
+    # the CancelledError that was already unwinding (an exception raised in
+    # an except block escapes instead of the original) -- so this would have
+    # surfaced as a RuntimeError instead of a CancelledError, and the row
+    # would still show whatever finish_job_run half-wrote (or, with the flaky
+    # stub used here, nothing at all, since it always raises). Verified by
+    # running this block against the pre-fix version of execute_run (the one
+    # with unwrapped `finish_job_run` calls, before _finalize existed): it
+    # raises RuntimeError instead of CancelledError, and fails both checks
+    # below -- so this test does distinguish the fixed behaviour.
+    registry._build = _FakeBuild(
+        {"Daily Check": _FakeSpecialist(exc=asyncio.CancelledError())}
+    )
     _real_finish_job_run = job_runner.finish_job_run
-    _raise_once = {"done": False}
 
-    async def _flaky_finish_job_run(session, run_id, **kw):
-        if not _raise_once["done"]:
-            _raise_once["done"] = True
-            raise RuntimeError("db exploded")
-        return await _real_finish_job_run(session, run_id, **kw)
+    async def _always_flaky_finish_job_run(session, run_id, **kw):
+        raise RuntimeError("db exploded during cancellation")
 
-    job_runner.finish_job_run = _flaky_finish_job_run
+    job_runner.finish_job_run = _always_flaky_finish_job_run
     async with SessionLocal() as s:
         job = await get_agent_by_slug(s, "daily-check")
         run_id7 = (await create_job_run(s, agent=job, trigger="manual")).id
+    raised_cancelled = False
+    raised_other: Exception | None = None
     try:
         await job_runner.execute_run(run_id7, agent_id)
-        check("execute_run swallows finalize failure", True)
+    except asyncio.CancelledError:
+        raised_cancelled = True
     except Exception as e:  # noqa: BLE001
-        check("execute_run swallows finalize failure", False, f"{type(e).__name__}: {e}")
+        raised_other = e
     job_runner.finish_job_run = _real_finish_job_run
+    check(
+        "cancellation still propagates when finalize fails",
+        raised_cancelled, f"other={raised_other!r}",
+    )
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id7)
+        # finish_job_run always raised, so nothing was ever persisted -- the
+        # row is exactly where create_job_run left it. That's the honest
+        # outcome of "record-then-reraise, but recording failed": the row
+        # stays 'running' (stale-run sweep cleans it up eventually) rather
+        # than silently claiming 'interrupted' when it isn't.
+        check("row untouched when finalize fails", r.status == "running", r.status)
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
+
+    print("\n== runner: start_run overlap guard is atomic under concurrency ==")
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="Concurrent Check", description="d", instructions="i",
+            mcp_servers=SERVERS, expose_chat=False, expose_api=True,
+            api_slug="concurrent-check", run_as_principal="svc@example.com",
+        )
+        concurrent = await get_agent_by_name(s, "Concurrent Check")
+    # Both calls hit the same (empty) event loop; the lock in start_run
+    # serializes the check-and-create so this is deterministic, not a race
+    # against wall-clock timing -- without the lock both would observe "no
+    # active run" and both would succeed.
+    results = await asyncio.gather(
+        job_runner.start_run(concurrent, trigger="manual"),
+        job_runner.start_run(concurrent, trigger="manual"),
+        return_exceptions=True,
+    )
+    successes = [r for r in results if isinstance(r, str)]
+    refusals = [r for r in results if isinstance(r, job_runner.RunRefused)]
+    check("exactly one concurrent start_run succeeds", len(successes) == 1, results)
+    check("the other concurrent start_run is refused", len(refusals) == 1, results)
+    # Drain the background task the surviving start_run spawned so it
+    # doesn't leak a "Task was destroyed but it is pending" warning at exit.
+    for t in list(job_runner._tasks):
+        await t
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
