@@ -129,6 +129,38 @@ async def main() -> None:
     except RuntimeError:
         check("missing PUBLIC_BASE_URL rejected", True)
 
+    print("\n== report model + completeness ==")
+    from agents.reports import Finding, ReportSection, RunReport, missing_sections
+
+    clean = RunReport(
+        summary="No issues found.",
+        overall_severity="info",
+        sections=[
+            ReportSection(source_key="st22", title="Short dumps", checked=True, findings=[]),
+            ReportSection(source_key="slg1", title="App log", checked=True, findings=[]),
+        ],
+    )
+    check("empty findings is complete", missing_sections(clean, ["st22", "slg1"]) == [])
+
+    unchecked = RunReport(
+        summary="Partial.",
+        overall_severity="info",
+        sections=[
+            ReportSection(source_key="st22", title="Short dumps", checked=True, findings=[]),
+            ReportSection(source_key="slg1", title="App log", checked=False,
+                          note="RFC destination unavailable", findings=[]),
+        ],
+    )
+    check("unchecked section is missing", missing_sections(unchecked, ["st22", "slg1"]) == ["slg1"])
+
+    absent = RunReport(summary="s", overall_severity="info", sections=[])
+    check("absent section is missing", missing_sections(absent, ["st22"]) == ["st22"])
+    check("no expectations means complete", missing_sections(absent, []) == [])
+
+    f = Finding(title="TSV_TNEW_PAGE_ALLOC_FAILED", severity="high", count=12,
+                affected=["ZPROG"], detail="d")
+    check("finding defaults are optional", f.analysis is None and f.references == [])
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
