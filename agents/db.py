@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import ssl
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -367,6 +368,79 @@ class SkillConfig(Base):
             "name": self.name,
             "description": self.description,
             "content": self.content,
+        }
+
+
+class JobRun(Base):
+    """One API-triggered execution of an agent.
+
+    Created before the run starts so the row doubles as the overlap lock: a
+    second trigger while one is `running` is refused rather than double-hitting
+    the target system.
+    """
+
+    __tablename__ = "job_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)  # schedule|manual
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=1800)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    missing_sections_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # False when the notification could not be delivered; the run itself keeps
+    # its real status so a delivery problem never loses a completed run.
+    notified: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # BTP Job Scheduling callback coordinates (increment 3).
+    scheduler_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_schedule_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_host: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def report(self) -> dict[str, Any] | None:
+        if not self.report_json:
+            return None
+        try:
+            return json.loads(self.report_json)
+        except Exception:
+            logger.warning("Malformed report_json on run %s", self.id)
+            return None
+
+    @property
+    def missing_sections(self) -> list[str]:
+        if not self.missing_sections_json:
+            return []
+        try:
+            data = json.loads(self.missing_sections_json)
+        except Exception:
+            return []
+        return [str(x) for x in data] if isinstance(data, list) else []
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "agent_id": self.agent_id,
+            "agent_name": self.agent_name,
+            "trigger": self.trigger,
+            "status": self.status,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "summary": self.summary,
+            "error": self.error,
+            "missing_sections": self.missing_sections,
+            "notified": bool(self.notified),
+            "created_by": self.created_by,
         }
 
 
@@ -1000,3 +1074,109 @@ async def pop_oauth_state(session: AsyncSession, state: str) -> McpOAuthState | 
     if expires_at is not None and expires_at < datetime.now(timezone.utc):
         return None
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Job runs
+# ---------------------------------------------------------------------------
+ACTIVE_RUN_STATUS = "running"
+
+
+async def create_job_run(
+    session: AsyncSession,
+    *,
+    agent: AgentConfig,
+    trigger: str,
+    created_by: str | None = None,
+    scheduler: dict[str, str] | None = None,
+) -> JobRun:
+    row = JobRun(
+        id=str(uuid.uuid4()),
+        agent_id=agent.id,
+        agent_name=agent.name,
+        trigger=trigger,
+        status=ACTIVE_RUN_STATUS,
+        started_at=datetime.now(timezone.utc),
+        timeout_seconds=agent.run_timeout_seconds,
+        created_by=created_by,
+        scheduler_job_id=(scheduler or {}).get("job_id"),
+        scheduler_schedule_id=(scheduler or {}).get("schedule_id"),
+        scheduler_run_id=(scheduler or {}).get("run_id"),
+        scheduler_host=(scheduler or {}).get("host"),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def finish_job_run(
+    session: AsyncSession,
+    run_id: str,
+    *,
+    status: str,
+    summary: str | None = None,
+    report: dict[str, Any] | None = None,
+    error: str | None = None,
+    missing: list[str] | None = None,
+) -> None:
+    row = await session.get(JobRun, run_id)
+    if row is None:
+        return
+    row.status = status
+    row.summary = summary
+    row.report_json = json.dumps(report) if report is not None else None
+    row.error = error
+    row.missing_sections_json = json.dumps(missing) if missing else None
+    row.finished_at = datetime.now(timezone.utc)
+    await session.commit()
+
+
+async def get_job_run(session: AsyncSession, run_id: str) -> JobRun | None:
+    return await session.get(JobRun, run_id)
+
+
+async def list_job_runs(
+    session: AsyncSession, *, limit: int = 50, agent_id: int | None = None
+) -> list[JobRun]:
+    stmt = select(JobRun).order_by(JobRun.started_at.desc()).limit(limit)
+    if agent_id is not None:
+        stmt = stmt.where(JobRun.agent_id == agent_id)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def active_job_run(session: AsyncSession, agent_id: int) -> JobRun | None:
+    result = await session.execute(
+        select(JobRun).where(
+            JobRun.agent_id == agent_id, JobRun.status == ACTIVE_RUN_STATUS
+        )
+    )
+    return result.scalars().first()
+
+
+async def sweep_stale_runs(session: AsyncSession) -> int:
+    """Mark runs that outlived their timeout as interrupted.
+
+    A crashed or redeployed run would otherwise stay `running` forever and
+    wedge the overlap lock, making the agent permanently untriggerable.
+    """
+    result = await session.execute(
+        select(JobRun).where(JobRun.status == ACTIVE_RUN_STATUS)
+    )
+    now = datetime.now(timezone.utc)
+    swept = 0
+    for row in result.scalars().all():
+        started = row.started_at
+        if started is None:
+            continue
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        if (now - started).total_seconds() > row.timeout_seconds:
+            row.status = "interrupted"
+            row.finished_at = now
+            row.error = "Run did not finish within its timeout (app restart or crash)."
+            swept += 1
+    if swept:
+        await session.commit()
+    return swept

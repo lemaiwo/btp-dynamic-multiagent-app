@@ -161,6 +161,57 @@ async def main() -> None:
                 affected=["ZPROG"], detail="d")
     check("finding defaults are optional", f.analysis is None and f.references == [])
 
+    print("\n== JobRun records ==")
+    from datetime import datetime, timedelta, timezone
+
+    from agents.db import (
+        active_job_run,
+        create_job_run,
+        finish_job_run,
+        get_job_run,
+        list_job_runs,
+        sweep_stale_runs,
+    )
+
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run = await create_job_run(s, agent=job, trigger="manual", created_by="me@x")
+        run_id = run.id
+    check("run id is a string", isinstance(run_id, str) and len(run_id) > 10)
+    check("run starts running", run.status == "running")
+
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        check("active run found", (await active_job_run(s, job.id)) is not None)
+
+    async with SessionLocal() as s:
+        await finish_job_run(
+            s, run_id, status="success", summary="All clear",
+            report={"summary": "All clear", "overall_severity": "info", "sections": []},
+        )
+    async with SessionLocal() as s:
+        done = await get_job_run(s, run_id)
+        check("status persisted", done.status == "success")
+        check("summary persisted", done.summary == "All clear")
+        check("report persisted", done.report["overall_severity"] == "info")
+        check("finished_at set", done.finished_at is not None)
+        job = await get_agent_by_slug(s, "daily-check")
+        check("no active run after finish", (await active_job_run(s, job.id)) is None)
+        check("run listed", any(r.id == run_id for r in await list_job_runs(s)))
+
+    print("\n== stale run sweep ==")
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        stale = await create_job_run(s, agent=job, trigger="schedule")
+        stale.started_at = datetime.now(timezone.utc) - timedelta(seconds=job.run_timeout_seconds + 60)
+        await s.commit()
+        stale_id = stale.id
+    async with SessionLocal() as s:
+        swept = await sweep_stale_runs(s)
+        check("stale run swept", swept == 1, f"swept {swept}")
+    async with SessionLocal() as s:
+        check("swept run is interrupted", (await get_job_run(s, stale_id)).status == "interrupted")
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
