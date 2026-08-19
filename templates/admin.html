@@ -468,13 +468,13 @@ function addMcpServerRow(server) {
     row.innerHTML = `
         <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
             <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
-            <select class="mcp-auth-mode" onchange="toggleOauthFields(this)">
+            <select class="mcp-auth-mode" onchange="toggleOauthFields(this); updateEndpointHint()">
                 <option value="jwt">JWT forward (BTP)</option>
                 <option value="oauth2">OAuth2 (per-user)</option>
                 <option value="none">None (public)</option>
             </select>
             <button type="button" class="small danger" title="Remove"
-                    onclick="this.closest('.mcp-server-row').remove()">×</button>
+                    onclick="this.closest('.mcp-server-row').remove(); updateEndpointHint()">×</button>
         </div>
         <div class="mcp-oauth" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
             <label style="font-weight:600">
@@ -531,6 +531,7 @@ function addMcpServerRow(server) {
     row.querySelector('.oauth-redirect').textContent = location.origin + '/oauth/callback';
     container.appendChild(row);
     toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+    updateEndpointHint();
 }
 
 function toggleOauthFields(select) {
@@ -712,8 +713,19 @@ function openAgentModal() {
 function updateEndpointHint() {
     const slug = document.getElementById('agent-api-slug').value.trim();
     const shown = slug ? esc(slug) : '&lt;slug&gt;';
-    document.getElementById('agent-endpoint-hint').innerHTML =
-        'Endpoint: <code>POST /api/agents/' + shown + '/run</code>';
+    let html = 'Endpoint: <code>POST /api/agents/' + shown + '/run</code>';
+    // An API-triggered run binds a technical principal, never a user JWT, so
+    // a "JWT forward" server can only ever fail on such a run. Say so here
+    // rather than letting the operator discover it from a failed run.
+    const jwtServers = [...document.querySelectorAll('#agent-mcp-servers .mcp-auth-mode')]
+        .filter(sel => sel.value === 'jwt').length;
+    if (document.getElementById('agent-expose-api').checked && jwtServers > 0) {
+        html += '<br><strong style="color:var(--warn)">Warning:</strong> '
+            + jwtServers + ' MCP server(s) use "JWT forward". Scheduled runs have no '
+            + 'user JWT to forward and will fail — switch them to OAuth2 (per-user) '
+            + 'and authorize the run-as account.';
+    }
+    document.getElementById('agent-endpoint-hint').innerHTML = html;
 }
 
 function collectExpectedSections() {

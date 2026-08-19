@@ -551,6 +551,29 @@ async def main() -> None:
         check("expected sections field", 'id="agent-expected-sections"' in html)
         check("endpoint URL hint shown", "/api/agents/" in html)
 
+        # An API-triggered run binds a technical principal and deliberately
+        # never binds a user JWT, so an agent that is expose_api AND binds an
+        # auth_mode="jwt" MCP server can only ever fail. The operator has no
+        # way to know that from the form, so the hint must say it.
+        hint = re.search(r"function updateEndpointHint\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("updateEndpointHint() found in JS", hint is not None)
+        hint_body = hint.group(1) if hint else ""
+        check(
+            "hint inspects the auth modes",
+            "mcp-auth-mode" in hint_body and "'jwt'" in hint_body,
+            hint_body,
+        )
+        check(
+            "hint gates the warning on expose_api",
+            "agent-expose-api" in hint_body,
+            hint_body,
+        )
+        check("hint warns about JWT forward", "Warning" in hint_body, hint_body)
+        check(
+            "auth mode change refreshes the hint",
+            "toggleOauthFields(this); updateEndpointHint()" in html,
+        )
+
         # ------------------------------------------------------------------
         # saveAgent() must actually SEND all seven exposure fields, not just
         # have form elements for them. AgentPayload defaults + whole-object
