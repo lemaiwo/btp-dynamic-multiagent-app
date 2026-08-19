@@ -263,9 +263,26 @@ async def require_jobscheduler(request: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Non-interactive identity for scheduled / API-triggered runs
 # ---------------------------------------------------------------------------
+# Env vars that can carry the app's public (approuter) URL, most specific
+# first. A2A_PUBLIC_URL is the same approuter host under a different name and
+# is already configured on deployments that expose the A2A endpoint, so it is
+# a sound fallback rather than a second source of truth.
+PUBLIC_BASE_URL_VARS = ("PUBLIC_BASE_URL", "A2A_PUBLIC_URL")
+
+
 def public_base_url() -> str | None:
-    """The app's public (approuter) URL, for runs that have no request."""
-    return (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/") or None
+    """The app's public (approuter) URL, for code that has no request.
+
+    The single resolver for this concept: the request middleware uses it as
+    the override for the OAuth2 redirect_uri (falling back to the forwarded
+    headers when neither var is set), and ``run_as`` uses it as the only
+    source, since a scheduled run has no request to derive a host from.
+    """
+    for var in PUBLIC_BASE_URL_VARS:
+        value = (os.environ.get(var) or "").strip().rstrip("/")
+        if value:
+            return value
+    return None
 
 
 @asynccontextmanager
@@ -278,13 +295,14 @@ async def run_as(principal: str) -> AsyncIterator[None]:
     "none". auth_mode "jwt" servers will fail, by design.
 
     current_base_url must be set for PerUserOAuth2Auth to resolve its DCR
-    client, and no request exists to derive it from — hence PUBLIC_BASE_URL.
+    client, and no request exists to derive it from — hence public_base_url().
     """
     base_url = public_base_url()
     if not base_url:
         raise RuntimeError(
-            "PUBLIC_BASE_URL must be set for API-triggered runs; there is no "
-            "request to derive the callback URL from."
+            "PUBLIC_BASE_URL (or A2A_PUBLIC_URL) must be set for "
+            "API-triggered runs; there is no request to derive the callback "
+            "URL from."
         )
     marker_principal = current_principal.set(principal)
     marker_base = current_base_url.set(base_url)

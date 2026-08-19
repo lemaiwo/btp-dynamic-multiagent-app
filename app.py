@@ -38,9 +38,11 @@ from agents.auth import (  # noqa: E402
     current_jwt,
     current_principal,
     principal_from_token,
+    public_base_url,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.db import SessionLocal, init_db, sweep_stale_runs  # noqa: E402
+from agents.job_runner import cancel_all_runs  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 
@@ -53,15 +55,22 @@ SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # A process that has just started owns no run, so every row still marked
+    # `running` is a ghost from the previous process (crash, or a CF redeploy
+    # mid-run) — sweep them all, not just the ones past their timeout.
     async with SessionLocal() as session:
-        swept = await sweep_stale_runs(session)
+        swept = await sweep_stale_runs(session, all_running=True)
     if swept:
-        logger.info("Marked %d stale job run(s) as interrupted", swept)
+        logger.info("Marked %d ghost job run(s) as interrupted", swept)
     await seed_from_file_if_empty(SEED_FILE)
     await registry.reload()
     dynamic_chat_app.refresh()
     logger.info("Application startup complete")
     yield
+    # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
+    # rather than being killed mid-await and leaving its row `running`.
+    await cancel_all_runs()
+    logger.info("Application shutdown complete")
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +84,6 @@ async def lifespan(app: FastAPI):
 # MCP calls made during streaming.
 # ---------------------------------------------------------------------------
 ON_CF = "VCAP_APPLICATION" in os.environ
-
-# Optional explicit public base URL for OAuth2 redirect_uri construction.
-# Falls back to A2A_PUBLIC_URL (same approuter host) then request headers.
-_OAUTH_BASE_OVERRIDE = (
-    os.environ.get("PUBLIC_BASE_URL") or os.environ.get("A2A_PUBLIC_URL") or ""
-).rstrip("/")
-
 
 class JWTBindingMiddleware:
     def __init__(self, app) -> None:
@@ -141,7 +143,10 @@ class JWTBindingMiddleware:
         # Public base URL (scheme://host) as seen by the approuter, used to
         # build the OAuth2 redirect_uri. An explicit override wins so the
         # redirect_uri exactly matches what is registered with the target.
-        base_url = _OAUTH_BASE_OVERRIDE
+        # Optional explicit public base URL for OAuth2 redirect_uri
+        # construction (PUBLIC_BASE_URL / A2A_PUBLIC_URL — the same resolver
+        # scheduled runs use), falling back to the forwarded headers.
+        base_url = public_base_url() or ""
         if not base_url:
             host = hdrs.get(b"x-forwarded-host") or hdrs.get(b"host")
             if host:

@@ -407,6 +407,179 @@ async def main() -> None:
     for t in list(job_runner._tasks):
         await t
 
+    print("\n== run_as resolves the public base URL ==")
+    from agents.auth import current_base_url, public_base_url, run_as
+
+    saved_public = os.environ.get("PUBLIC_BASE_URL")
+    saved_a2a = os.environ.get("A2A_PUBLIC_URL")
+    try:
+        # mta.yaml ships PUBLIC_BASE_URL empty, so without the fallback every
+        # deployed run dies in run_as before it starts. A2A_PUBLIC_URL is the
+        # same approuter host and is already configured for the A2A endpoint.
+        os.environ["PUBLIC_BASE_URL"] = ""
+        os.environ["A2A_PUBLIC_URL"] = "https://a2a.example.com/"
+        check(
+            "falls back to A2A_PUBLIC_URL",
+            public_base_url() == "https://a2a.example.com",
+            public_base_url(),
+        )
+        async with run_as("svc@example.com"):
+            check(
+                "run_as binds the fallback base url",
+                current_base_url.get() == "https://a2a.example.com",
+                current_base_url.get(),
+            )
+        os.environ["PUBLIC_BASE_URL"] = "https://explicit.example.com/"
+        check(
+            "PUBLIC_BASE_URL wins over the fallback",
+            public_base_url() == "https://explicit.example.com",
+            public_base_url(),
+        )
+        os.environ.pop("PUBLIC_BASE_URL")
+        os.environ.pop("A2A_PUBLIC_URL")
+        check("no base url configured -> None", public_base_url() is None)
+        raised = None
+        try:
+            async with run_as("svc@example.com"):
+                pass
+        except RuntimeError as e:
+            raised = e
+        check("run_as refuses without a base url", raised is not None, raised)
+    finally:
+        if saved_public is None:
+            os.environ.pop("PUBLIC_BASE_URL", None)
+        else:
+            os.environ["PUBLIC_BASE_URL"] = saved_public
+        if saved_a2a is None:
+            os.environ.pop("A2A_PUBLIC_URL", None)
+        else:
+            os.environ["A2A_PUBLIC_URL"] = saved_a2a
+
+    print("\n== startup sweep clears every running row, whatever its age ==")
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        fresh = await create_job_run(s, agent=job, trigger="schedule")
+        fresh_id = fresh.id
+    async with SessionLocal() as s:
+        # A young row is not stale by age -- this is the in-process sweep.
+        await sweep_stale_runs(s)
+    async with SessionLocal() as s:
+        check(
+            "age-based sweep leaves a young run alone",
+            (await get_job_run(s, fresh_id)).status == "running",
+        )
+    async with SessionLocal() as s:
+        # A freshly started process owns no run, so age is irrelevant here.
+        swept = await sweep_stale_runs(s, all_running=True)
+        check("startup sweep clears the young run", swept >= 1, f"swept {swept}")
+    async with SessionLocal() as s:
+        row = await get_job_run(s, fresh_id)
+        check("ghost run is interrupted", row.status == "interrupted", row.status)
+        check("ghost run explains itself", "restart" in (row.error or "").lower(), row.error)
+
+    print("\n== shutdown cancels in-flight runs ==")
+
+    entered_specialist = asyncio.Event()
+
+    class _HangingSpecialist:
+        async def run(self, prompt, **kw):
+            entered_specialist.set()
+            await asyncio.sleep(300)
+
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="Hanging Check", description="d", instructions="i",
+            mcp_servers=SERVERS, expose_chat=False, expose_api=True,
+            api_slug="hanging-check", run_as_principal="svc@example.com",
+        )
+        hanging = await get_agent_by_name(s, "Hanging Check")
+    registry._build = _FakeBuild({"Hanging Check": _HangingSpecialist()})
+    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    hang_run_id = await job_runner.start_run(hanging, trigger="schedule")
+    # Wait until the task is genuinely inside the (never-returning)
+    # specialist call, so the cancellation lands there and not on some
+    # earlier DB await.
+    await asyncio.wait_for(entered_specialist.wait(), timeout=10)
+    check("run task is tracked", len(job_runner._tasks) == 1, job_runner._tasks)
+    await job_runner.cancel_all_runs()
+    check("no tasks left after shutdown", not job_runner._tasks, job_runner._tasks)
+    async with SessionLocal() as s:
+        row = await get_job_run(s, hang_run_id)
+        check("cancelled run is interrupted", row.status == "interrupted", row.status)
+        check("cancelled run has finished_at", row.finished_at is not None)
+    check("cancel_all_runs is a no-op with nothing in flight",
+          (await job_runner.cancel_all_runs()) is None)
+
+    print("\n== reload keeps MCP clients alive while a run is in flight ==")
+    import agents.registry as registry_module
+    from agents.registry import BuildResult
+
+    class _FakeHttpClient:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    class _FakeServer:
+        def __init__(self):
+            self._http_client = _FakeHttpClient()
+
+    async def _make_old():
+        server = _FakeServer()
+        registry._build = BuildResult(
+            orchestrator=None, specialists={}, mcp_clients=[server], configs=[],
+        )
+        return server
+
+    new_build = BuildResult(
+        orchestrator=None, specialists={}, mcp_clients=[], configs=[],
+    )
+    real_build = registry_module.build_orchestrator
+    registry_module.build_orchestrator = lambda: asyncio.sleep(0, result=new_build)
+    try:
+        old_server = await _make_old()
+        blocker = asyncio.create_task(asyncio.sleep(5))
+        job_runner._tasks.add(blocker)
+        try:
+            await registry.reload()
+        finally:
+            job_runner._tasks.discard(blocker)
+            blocker.cancel()
+        check(
+            "old MCP client kept open during an in-flight run",
+            old_server._http_client.closed is False,
+        )
+
+        old_server = await _make_old()
+        await registry.reload()
+        check(
+            "old MCP client closed when nothing is in flight",
+            old_server._http_client.closed is True,
+        )
+    finally:
+        registry_module.build_orchestrator = real_build
+
+    print("\n== runner: missing principal is not blamed on stale credentials ==")
+    registry._build = _FakeBuild({"No Principal": _FakeSpecialist(good)})
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="No Principal", description="d", instructions="i",
+            mcp_servers=SERVERS, expose_chat=False, expose_api=True,
+            api_slug="no-principal",
+        )
+        unprincipled = await get_agent_by_name(s, "No Principal")
+        check("agent stored without a principal", unprincipled.run_as_principal is None)
+        np_id = unprincipled.id
+        np_run_id = (await create_job_run(s, agent=unprincipled, trigger="manual")).id
+    await job_runner.execute_run(np_run_id, np_id)
+    async with SessionLocal() as s:
+        row = await get_job_run(s, np_run_id)
+        check("run without a principal fails", row.status == "failed", row.status)
+        err = (row.error or "").lower()
+        check("error names the missing principal", "run-as principal" in err, row.error)
+        check("error does not misdirect to re-authorization", "re-author" not in err, row.error)
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
