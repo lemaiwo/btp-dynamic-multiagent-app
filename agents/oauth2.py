@@ -46,6 +46,7 @@ from agents.auth import current_base_url, current_principal
 from agents.db import (
     AUTH_MODE_OAUTH2,
     SessionLocal,
+    delete_oauth_client,
     delete_user_token,
     get_oauth_client,
     get_user_token,
@@ -174,6 +175,45 @@ def _origin_of(url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
+def _callback_uri() -> str | None:
+    """The redirect_uri for the current request, or None outside a request."""
+    base_url = current_base_url.get()
+    return base_url.rstrip("/") + _CALLBACK_PATH if base_url else None
+
+
+def _is_invalid_client(resp: Any) -> bool:
+    """True when the authorization server rejects our client registration.
+
+    Servers that issue *stateless* client_ids (the metadata signed into the id
+    itself, as ARC-1 does) answer ``invalid_client`` for every client they
+    registered before their signing secret last changed.
+    """
+    if resp.status_code not in (400, 401):
+        return False
+    try:
+        return (resp.json() or {}).get("error") == "invalid_client"
+    except Exception:  # noqa: BLE001 — non-JSON error body
+        return "invalid_client" in (resp.text or "")
+
+
+async def _forget_registered_client(server_key: str, spec_oauth: dict[str, Any] | None) -> bool:
+    """Evict a cached DCR registration the target no longer accepts.
+
+    Returns True when a registration was dropped. Only DCR clients are evicted:
+    manual credentials are operator-managed, and deleting those would silently
+    discard configuration the app cannot recreate.
+    """
+    if not (spec_oauth or {}).get("dcr"):
+        return False
+    async with SessionLocal() as session:
+        await delete_oauth_client(session, server_key)
+    logger.info(
+        "Dropped rejected DCR client registration for %s; re-registering on next use",
+        server_key,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Discovery + Dynamic Client Registration (RFC 8414 / 9728 / 7591)
 # ---------------------------------------------------------------------------
@@ -252,10 +292,21 @@ async def _discover_and_register(
 
 async def _get_or_register_client(server_key: str, spec: dict[str, Any]) -> Oauth2Config:
     """Return the cached registered client for a DCR server, registering once
-    on first use."""
-    async with SessionLocal() as session:
-        row = await get_oauth_client(session, server_key)
-    if row is not None:
+    on first use.
+
+    The cache is reused only while it still matches this request's callback
+    URL: the redirect_uri is baked into the registration, so once the app moves
+    to a different public hostname the cached client is dead and must be
+    replaced rather than served.
+    """
+    wanted_redirect = _callback_uri()
+
+    def _usable(row) -> bool:
+        # Outside a request there is no callback URL to compare against — serve
+        # the cache rather than failing a background caller.
+        return not (wanted_redirect and row.redirect_uri and row.redirect_uri != wanted_redirect)
+
+    def _config_from(row) -> Oauth2Config:
         return Oauth2Config(
             authorize_url=row.authorize_url,
             token_url=row.token_url,
@@ -264,22 +315,26 @@ async def _get_or_register_client(server_key: str, spec: dict[str, Any]) -> Oaut
             scope=row.scope or (spec.get("scope") or None),
         )
 
+    async with SessionLocal() as session:
+        row = await get_oauth_client(session, server_key)
+    if row is not None and _usable(row):
+        return _config_from(row)
+
     async with _lock_for(f"register|{server_key}"):
         # Re-check under the lock — another request may have just registered.
         async with SessionLocal() as session:
             row = await get_oauth_client(session, server_key)
+        if row is not None and _usable(row):
+            return _config_from(row)
         if row is not None:
-            return Oauth2Config(
-                authorize_url=row.authorize_url,
-                token_url=row.token_url,
-                client_id=row.client_id,
-                client_secret=row.client_secret,
-                scope=row.scope or (spec.get("scope") or None),
+            logger.info(
+                "Registered client for %s has redirect_uri %s but this request needs %s; "
+                "re-registering",
+                server_key, row.redirect_uri, wanted_redirect,
             )
-        base_url = current_base_url.get()
-        if not base_url:
+        redirect_uri = wanted_redirect
+        if not redirect_uri:
             raise OAuthAuthorizationRequired(server_key, None, "no-base-url")
-        redirect_uri = base_url.rstrip("/") + _CALLBACK_PATH
         cfg = await _discover_and_register(server_key, redirect_uri, spec.get("scope"))
         async with SessionLocal() as session:
             await save_oauth_client(
@@ -406,6 +461,12 @@ class PerUserOAuth2Auth(httpx.Auth):
                     "Refresh rejected (%s) for %s: %s",
                     resp.status_code, self.server_key, resp.text[:200],
                 )
+                # An invalid_client here is about our *registration*, not the
+                # user's token. Evict it so the sign-in link the caller is
+                # about to show mints a fresh client_id — otherwise that
+                # sign-in reuses the dead one and fails identically.
+                if _is_invalid_client(resp):
+                    await _forget_registered_client(self.server_key, self.spec_oauth)
                 return None, "Bearer"
             payload = resp.json()
             access = payload.get("access_token")
@@ -490,11 +551,11 @@ async def begin_authorization_for_agent(
     return None
 
 
-async def find_oauth_config(server_key: str) -> Oauth2Config | None:
-    """Resolve the OAuth config for a server_key.
+async def find_oauth_spec(server_key: str) -> dict[str, Any] | None:
+    """The stored ``oauth`` spec for a server_key, or None if no agent uses it.
 
-    For DCR servers this returns the already-registered client (cached during
-    the authorize step). For manual servers it builds from stored credentials.
+    Callers need the spec (not just the resolved config) to tell a DCR server
+    from a manually configured one.
     """
     async with SessionLocal() as session:
         rows = await list_agents(session)
@@ -503,11 +564,23 @@ async def find_oauth_config(server_key: str) -> Oauth2Config | None:
             if s.get("auth_mode") != AUTH_MODE_OAUTH2:
                 continue
             if normalize_mcp_url(str(s["url"])) == server_key and isinstance(s.get("oauth"), dict):
-                try:
-                    return await resolve_config(server_key, s["oauth"])
-                except Exception:
-                    logger.warning("Bad oauth config for %s", server_key, exc_info=True)
-                    return None
+                return s["oauth"]
+    return None
+
+
+async def find_oauth_config(server_key: str) -> Oauth2Config | None:
+    """Resolve the OAuth config for a server_key.
+
+    For DCR servers this returns the already-registered client (cached during
+    the authorize step). For manual servers it builds from stored credentials.
+    """
+    spec = await find_oauth_spec(server_key)
+    if spec is not None:
+        try:
+            return await resolve_config(server_key, spec)
+        except Exception:
+            logger.warning("Bad oauth config for %s", server_key, exc_info=True)
+            return None
     # Agent may have been removed mid-flow; fall back to the registered client.
     async with SessionLocal() as session:
         row = await get_oauth_client(session, server_key)
@@ -588,6 +661,17 @@ async def complete_authorization(*, code: str, state: str, principal: str | None
         raise ValueError(f"Token endpoint request failed: {e}") from e
 
     if resp.status_code >= 400:
+        # invalid_client means our registration is dead, not that the user did
+        # anything wrong. Evict it so retrying the sign-in registers afresh —
+        # this is the only place the failure surfaces for a user who has no
+        # refresh token to fail on first.
+        if _is_invalid_client(resp) and await _forget_registered_client(
+            flow.server_key, await find_oauth_spec(flow.server_key)
+        ):
+            raise ValueError(
+                "This app's registration with the target was no longer accepted. "
+                "It has been renewed — please retry the sign-in."
+            )
         raise ValueError(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
 
     payload = resp.json()

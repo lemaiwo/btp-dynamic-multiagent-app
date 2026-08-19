@@ -539,6 +539,83 @@ async def main() -> None:
         err = r.json()
         check("flow: error body has detail for toast", "detail" in err)
 
+        # ------------------------------------------------------------------
+        print("\n== job runs UI ==")
+        check("runs tab present", 'data-tab="runs"' in html)
+        check("runs list container", 'id="runs-list"' in html)
+        check("run-now button", "runAgentNow" in html)
+
+        # run-as is an opaque XSUAA principal, so the UI must hand it over and
+        # show whether that identity actually holds a token per OAuth2 server.
+        check("whoami loaded on boot", "loadWhoami()" in html)
+        check("use-my-identity button", 'id="agent-use-my-identity"' in html)
+        check("whoami api used", "/admin/api/whoami" in html)
+        check("credentials api used", "/credentials?principal=" in html)
+        check("credentials panel", 'id="agent-credentials"' in html)
+        check("connect button opens login", "function connectServer" in html)
+        # Only ever open our own same-origin sign-in URL in a popup.
+        check("connect guards the login url", "/^\\/oauth\\/login\\?/" in html)
+        # The popup authorizes whoever is logged in — say so, or an admin
+        # connects their own identity while believing they connected the
+        # service account, which is the exact confusion this panel exists for.
+        check("connect warns whose identity is used", "not as the id above" in html)
+        check("runs api used", "/admin/api/runs" in html)
+        check("exposure field expose_api", 'id="agent-expose-api"' in html)
+        check("exposure field api_slug", 'id="agent-api-slug"' in html)
+        check("run-as field", 'id="agent-run-as"' in html)
+        check("expected sections field", 'id="agent-expected-sections"' in html)
+        check("endpoint URL hint shown", "/api/agents/" in html)
+
+        # An API-triggered run binds a technical principal and deliberately
+        # never binds a user JWT, so an agent that is expose_api AND binds an
+        # auth_mode="jwt" MCP server can only ever fail. The operator has no
+        # way to know that from the form, so the hint must say it.
+        hint = re.search(r"function updateEndpointHint\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("updateEndpointHint() found in JS", hint is not None)
+        hint_body = hint.group(1) if hint else ""
+        check(
+            "hint inspects the auth modes",
+            "mcp-auth-mode" in hint_body and "'jwt'" in hint_body,
+            hint_body,
+        )
+        check(
+            "hint gates the warning on expose_api",
+            "agent-expose-api" in hint_body,
+            hint_body,
+        )
+        check("hint warns about JWT forward", "Warning" in hint_body, hint_body)
+        check(
+            "auth mode change refreshes the hint",
+            "toggleOauthFields(this); updateEndpointHint()" in html,
+        )
+
+        # ------------------------------------------------------------------
+        # saveAgent() must actually SEND all seven exposure fields, not just
+        # have form elements for them. AgentPayload defaults + whole-object
+        # PUT semantics mean a field saveAgent() forgets to include gets
+        # silently reset on every save (expose_api -> False, expose_chat ->
+        # True, etc.) -- deleting one key here is exactly the regression
+        # this check exists to catch, and the earlier ID-presence checks
+        # above would not catch it.
+        print("\n== saveAgent() sends all seven exposure fields ==")
+        m = re.search(r"async function saveAgent\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("saveAgent() function found in JS", m is not None)
+        save_agent_body = m.group(1) if m else ""
+        for field in (
+            "expose_chat",
+            "expose_api",
+            "api_slug",
+            "run_as_principal",
+            "run_prompt",
+            "run_timeout_seconds",
+            "expected_sections",
+        ):
+            check(
+                f"saveAgent() sends {field}",
+                re.search(rf"\b{field}\s*:", save_agent_body) is not None,
+                f"{field}: not found as an object key in saveAgent()",
+            )
+
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
     try:

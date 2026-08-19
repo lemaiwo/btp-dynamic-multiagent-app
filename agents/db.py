@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import ssl
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -157,6 +158,30 @@ class AgentConfig(Base):
     # JSON-encoded list of skill names (SkillConfig.name) attached to this
     # agent. Skills are referenced by name so exports stay portable.
     skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # API exposure. expose_chat keeps the agent in the orchestrator's
+    # delegation list; expose_api gives it a run endpoint. They are
+    # independent: a run-only agent is expose_chat=0, expose_api=1.
+    expose_chat: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    expose_api: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # URL segment for POST /api/agents/{api_slug}/run. Uniqueness is enforced
+    # in upsert_agent, not by a DB constraint (see plan Global Constraints).
+    api_slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Identity API-triggered runs bind via run_as(). No interactive user
+    # exists at 03:00, so this names the technical account whose stored
+    # OAuth2 token the run uses.
+    run_as_principal: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # User prompt handed to Agent.run(). The work itself is described by the
+    # agent's instructions and attached skills; this just starts it.
+    run_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1800, server_default="1800"
+    )
+    # JSON list of source_keys a complete report must contain.
+    expected_sections_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -213,6 +238,20 @@ class AgentConfig(Base):
             return []
         return [str(s) for s in data if isinstance(s, str) and s.strip()]
 
+    @property
+    def expected_sections(self) -> list[str]:
+        """source_keys a complete report must contain (may be empty)."""
+        if not self.expected_sections_json:
+            return []
+        try:
+            data = json.loads(self.expected_sections_json)
+        except Exception:
+            logger.warning("Malformed expected_sections_json on agent %s", self.name)
+            return []
+        if not isinstance(data, list):
+            return []
+        return [str(s) for s in data if isinstance(s, str) and s.strip()]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -224,6 +263,13 @@ class AgentConfig(Base):
             "mcp_servers": _redact_servers(self.mcp_servers),
             "skills": self.skills,
             "enabled": bool(self.enabled),
+            "expose_chat": bool(self.expose_chat),
+            "expose_api": bool(self.expose_api),
+            "api_slug": self.api_slug,
+            "run_as_principal": self.run_as_principal,
+            "run_prompt": self.run_prompt or "",
+            "run_timeout_seconds": self.run_timeout_seconds,
+            "expected_sections": self.expected_sections,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -236,6 +282,12 @@ class AgentConfig(Base):
             "mcp_servers": _redact_servers(self.mcp_servers),
             "skills": self.skills,
             "enabled": bool(self.enabled),
+            "expose_chat": bool(self.expose_chat),
+            "expose_api": bool(self.expose_api),
+            "api_slug": self.api_slug,
+            "run_prompt": self.run_prompt or "",
+            "run_timeout_seconds": self.run_timeout_seconds,
+            "expected_sections": self.expected_sections,
         }
 
 
@@ -316,6 +368,79 @@ class SkillConfig(Base):
             "name": self.name,
             "description": self.description,
             "content": self.content,
+        }
+
+
+class JobRun(Base):
+    """One API-triggered execution of an agent.
+
+    Created before the run starts so the row doubles as the overlap lock: a
+    second trigger while one is `running` is refused rather than double-hitting
+    the target system.
+    """
+
+    __tablename__ = "job_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    agent_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)  # schedule|manual
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=1800)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    missing_sections_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # False when the notification could not be delivered; the run itself keeps
+    # its real status so a delivery problem never loses a completed run.
+    notified: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # BTP Job Scheduling callback coordinates (increment 3).
+    scheduler_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_schedule_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_host: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def report(self) -> dict[str, Any] | None:
+        if not self.report_json:
+            return None
+        try:
+            return json.loads(self.report_json)
+        except Exception:
+            logger.warning("Malformed report_json on run %s", self.id)
+            return None
+
+    @property
+    def missing_sections(self) -> list[str]:
+        if not self.missing_sections_json:
+            return []
+        try:
+            data = json.loads(self.missing_sections_json)
+        except Exception:
+            return []
+        return [str(x) for x in data] if isinstance(data, list) else []
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "agent_id": self.agent_id,
+            "agent_name": self.agent_name,
+            "trigger": self.trigger,
+            "status": self.status,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "summary": self.summary,
+            "error": self.error,
+            "missing_sections": self.missing_sections,
+            "notified": bool(self.notified),
+            "created_by": self.created_by,
         }
 
 
@@ -400,6 +525,10 @@ DEFAULT_ORCHESTRATOR_INSTRUCTIONS = (
     "relevant specialists one at a time and synthesize their responses."
 )
 
+DEFAULT_RUN_PROMPT = (
+    "Perform your configured check now and return the structured report."
+)
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -424,6 +553,26 @@ async def init_db() -> None:
         )
         await _ensure_column(
             conn, "agent_configs", "skills_json", "TEXT"
+        )
+        await _ensure_column(
+            conn, "agent_configs", "expose_chat", "INTEGER NOT NULL DEFAULT 1"
+        )
+        await _ensure_column(
+            conn, "agent_configs", "expose_api", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(conn, "agent_configs", "api_slug", "VARCHAR(64)")
+        await _ensure_column(
+            conn, "agent_configs", "run_as_principal", "VARCHAR(255)"
+        )
+        await _ensure_column(conn, "agent_configs", "run_prompt", "TEXT")
+        await _ensure_column(
+            conn,
+            "agent_configs",
+            "run_timeout_seconds",
+            "INTEGER NOT NULL DEFAULT 1800",
+        )
+        await _ensure_column(
+            conn, "agent_configs", "expected_sections_json", "TEXT"
         )
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
@@ -475,6 +624,13 @@ async def get_agent(session: AsyncSession, agent_id: int) -> AgentConfig | None:
 
 async def get_agent_by_name(session: AsyncSession, name: str) -> AgentConfig | None:
     result = await session.execute(select(AgentConfig).where(AgentConfig.name == name))
+    return result.scalar_one_or_none()
+
+
+async def get_agent_by_slug(session: AsyncSession, slug: str) -> AgentConfig | None:
+    result = await session.execute(
+        select(AgentConfig).where(AgentConfig.api_slug == slug)
+    )
     return result.scalar_one_or_none()
 
 
@@ -587,6 +743,22 @@ async def normalize_skills_json(
     return json.dumps(cleaned)
 
 
+class _Keep:
+    """Sentinel for upsert_agent: leave the stored value untouched.
+
+    ``run_as_principal`` is a landscape-specific service identity and is
+    deliberately absent from exports (see AgentConfig.to_export), so the
+    import and seed paths pass nothing for it. Defaulting it to None instead
+    would silently un-configure every API agent on the first import.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<KEEP>"
+
+
+KEEP = _Keep()
+
+
 async def upsert_agent(
     session: AsyncSession,
     *,
@@ -596,11 +768,26 @@ async def upsert_agent(
     mcp_servers: list[dict[str, Any]],
     skills: list[str] | None = None,
     enabled: bool = True,
+    expose_chat: bool = True,
+    expose_api: bool = False,
+    api_slug: str | None = None,
+    run_as_principal: str | None | _Keep = KEEP,
+    run_prompt: str | None = None,
+    run_timeout_seconds: int = 1800,
+    expected_sections: list[str] | None = None,
 ) -> AgentConfig:
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
+
+    slug = (api_slug or "").strip() or None
+    if slug:
+        clash = await get_agent_by_slug(session, slug)
+        if clash is not None and (existing is None or clash.id != existing.id):
+            raise ValueError(f"api_slug {slug!r} is already used by agent {clash.name!r}")
+    if expose_api and not slug:
+        raise ValueError("expose_api requires an api_slug")
 
     if existing is None:
         row = AgentConfig(
@@ -615,6 +802,18 @@ async def upsert_agent(
             enabled=1 if enabled else 0,
         )
         session.add(row)
+        row.expose_chat = 1 if expose_chat else 0
+        row.expose_api = 1 if expose_api else 0
+        row.api_slug = slug
+        row.run_as_principal = (
+            None if isinstance(run_as_principal, _Keep)
+            else (run_as_principal or "").strip() or None
+        )
+        row.run_prompt = (run_prompt or "").strip() or None
+        row.run_timeout_seconds = int(run_timeout_seconds)
+        row.expected_sections_json = (
+            json.dumps(expected_sections) if expected_sections else None
+        )
     else:
         existing.description = description
         existing.instructions = instructions
@@ -624,6 +823,18 @@ async def upsert_agent(
         existing.oauth_json = primary_oauth_json
         existing.skills_json = skills_json
         existing.enabled = 1 if enabled else 0
+        existing.expose_chat = 1 if expose_chat else 0
+        existing.expose_api = 1 if expose_api else 0
+        existing.api_slug = slug
+        # KEEP: the caller did not carry a principal (import / seed), so the
+        # environment-specific identity already stored here is preserved.
+        if not isinstance(run_as_principal, _Keep):
+            existing.run_as_principal = (run_as_principal or "").strip() or None
+        existing.run_prompt = (run_prompt or "").strip() or None
+        existing.run_timeout_seconds = int(run_timeout_seconds)
+        existing.expected_sections_json = (
+            json.dumps(expected_sections) if expected_sections else None
+        )
         row = existing
     await session.commit()
     await session.refresh(row)
@@ -796,6 +1007,19 @@ async def get_oauth_client(
     return await session.get(McpOAuthClient, server_key)
 
 
+async def delete_oauth_client(session: AsyncSession, server_key: str) -> None:
+    """Drop a registered client so the next use re-runs discovery + DCR.
+
+    Needed when the target's authorization server stops honouring the client
+    we registered (e.g. it signs stateless client_ids with a secret that
+    rotates on restart) — the cached row is otherwise never invalidated.
+    """
+    await session.execute(
+        delete(McpOAuthClient).where(McpOAuthClient.server_key == server_key)
+    )
+    await session.commit()
+
+
 async def save_oauth_client(
     session: AsyncSession,
     *,
@@ -872,3 +1096,123 @@ async def pop_oauth_state(session: AsyncSession, state: str) -> McpOAuthState | 
     if expires_at is not None and expires_at < datetime.now(timezone.utc):
         return None
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# Job runs
+# ---------------------------------------------------------------------------
+ACTIVE_RUN_STATUS = "running"
+
+
+async def create_job_run(
+    session: AsyncSession,
+    *,
+    agent: AgentConfig,
+    trigger: str,
+    created_by: str | None = None,
+    scheduler: dict[str, str] | None = None,
+) -> JobRun:
+    row = JobRun(
+        id=str(uuid.uuid4()),
+        agent_id=agent.id,
+        agent_name=agent.name,
+        trigger=trigger,
+        status=ACTIVE_RUN_STATUS,
+        started_at=datetime.now(timezone.utc),
+        timeout_seconds=agent.run_timeout_seconds,
+        created_by=created_by,
+        scheduler_job_id=(scheduler or {}).get("job_id"),
+        scheduler_schedule_id=(scheduler or {}).get("schedule_id"),
+        scheduler_run_id=(scheduler or {}).get("run_id"),
+        scheduler_host=(scheduler or {}).get("host"),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def finish_job_run(
+    session: AsyncSession,
+    run_id: str,
+    *,
+    status: str,
+    summary: str | None = None,
+    report: dict[str, Any] | None = None,
+    error: str | None = None,
+    missing: list[str] | None = None,
+) -> None:
+    row = await session.get(JobRun, run_id)
+    if row is None:
+        return
+    row.status = status
+    row.summary = summary
+    row.report_json = json.dumps(report) if report is not None else None
+    row.error = error
+    row.missing_sections_json = json.dumps(missing) if missing else None
+    row.finished_at = datetime.now(timezone.utc)
+    await session.commit()
+
+
+async def get_job_run(session: AsyncSession, run_id: str) -> JobRun | None:
+    return await session.get(JobRun, run_id)
+
+
+async def list_job_runs(
+    session: AsyncSession, *, limit: int = 50, agent_id: int | None = None
+) -> list[JobRun]:
+    stmt = select(JobRun).order_by(JobRun.started_at.desc()).limit(limit)
+    if agent_id is not None:
+        stmt = stmt.where(JobRun.agent_id == agent_id)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def active_job_run(session: AsyncSession, agent_id: int) -> JobRun | None:
+    result = await session.execute(
+        select(JobRun).where(
+            JobRun.agent_id == agent_id, JobRun.status == ACTIVE_RUN_STATUS
+        )
+    )
+    return result.scalars().first()
+
+
+async def sweep_stale_runs(session: AsyncSession, *, all_running: bool = False) -> int:
+    """Mark runs that outlived their timeout as interrupted.
+
+    A crashed or redeployed run would otherwise stay `running` forever and
+    wedge the overlap lock, making the agent permanently untriggerable.
+
+    With ``all_running=True`` every `running` row is swept regardless of age.
+    That is the correct behaviour at startup: a freshly started process owns
+    no in-flight run, so any row still marked running is by definition a
+    ghost from the previous process — waiting out its (up to 24h) timeout
+    would leave the agent untriggerable for that whole window. The age-based
+    default is for sweeps taken while this process is live, where a young
+    `running` row may well be one of our own.
+    """
+    result = await session.execute(
+        select(JobRun).where(JobRun.status == ACTIVE_RUN_STATUS)
+    )
+    now = datetime.now(timezone.utc)
+    swept = 0
+    for row in result.scalars().all():
+        if not all_running:
+            started = row.started_at
+            if started is None:
+                continue
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if (now - started).total_seconds() <= row.timeout_seconds:
+                continue
+        row.status = "interrupted"
+        row.finished_at = now
+        row.error = (
+            "Run was interrupted by an app restart."
+            if all_running
+            else "Run did not finish within its timeout (app restart or crash)."
+        )
+        swept += 1
+    if swept:
+        await session.commit()
+    return swept

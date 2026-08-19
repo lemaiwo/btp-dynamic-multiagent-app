@@ -129,6 +129,36 @@
         a.link { color: var(--primary); text-decoration: none; }
         a.link:hover { text-decoration: underline; }
         code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+        fieldset.exposure { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin: 12px 0 0 0; grid-column: 1 / -1; }
+        fieldset.exposure legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
+        fieldset.exposure label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
+        fieldset.exposure label input[type="checkbox"] { margin-right: 6px; font-weight: normal; }
+        .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+        .tab-btn {
+            background: none; color: var(--muted); border: none; border-bottom: 2px solid transparent;
+            border-radius: 0; padding: 10px 4px; margin-right: 20px; font-size: 14px; font-weight: 600;
+        }
+        .tab-btn:hover { background: none; color: var(--text); }
+        .tab-btn.active { color: var(--primary); border-bottom-color: var(--primary); }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+        .status-badge.status-running { background: #dbeafe; color: #1d4ed8; }
+        .status-badge.status-success { background: #d6f5d6; color: var(--success); }
+        .status-badge.status-degraded { background: #fdecc8; color: var(--warn); }
+        .status-badge.status-failed, .status-badge.status-interrupted { background: #f5d6d6; color: var(--danger); }
+        #run-detail section { border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; margin-bottom: 12px; }
+        #run-detail section h4 { margin: 0 0 6px 0; font-size: 14px; }
+        #run-detail .finding { border-top: 1px solid var(--border); padding: 8px 0; }
+        #run-detail .finding:first-of-type { border-top: none; padding-top: 0; }
+        #run-detail p.error { color: var(--danger); }
+        #run-detail .warn { color: var(--warn); }
+        .sev { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 11px; font-weight: 600; margin-left: 6px; }
+        .sev-critical, .sev-high { background: #f5d6d6; color: var(--danger); }
+        .sev-medium { background: #fdecc8; color: var(--warn); }
+        .sev-low, .sev-info { background: #e5e7eb; color: var(--muted); }
+        #runs-list table td, #runs-list table th { cursor: default; }
+        #runs-list .run-row { cursor: pointer; }
+        #runs-list .run-row:hover { background: #f8f9fb; }
     </style>
 </head>
 <body>
@@ -140,6 +170,12 @@
 </header>
 
 <main>
+    <div class="tabs">
+        <button type="button" class="tab-btn active" data-tab="config" onclick="switchTab('config')">Configuration</button>
+        <button type="button" class="tab-btn" data-tab="runs" onclick="switchTab('runs')">Job Runs</button>
+    </div>
+
+    <div id="tab-config" class="tab-panel active">
     <div class="panel">
         <h2>Agents</h2>
         <p class="hint">
@@ -233,6 +269,26 @@
             <button onclick="saveOrchestrator()">Save</button>
         </div>
     </div>
+    </div>
+
+    <div id="tab-runs" class="tab-panel">
+    <div class="panel">
+        <h2>Job Runs</h2>
+        <p class="hint">
+            Runs triggered by the <strong>Run now</strong> button or the
+            scheduled-job API (<code>POST /api/agents/&lt;slug&gt;/run</code>).
+            Click a run to see its full report.
+        </p>
+        <div class="toolbar">
+            <button class="secondary" onclick="loadRuns()">Refresh</button>
+        </div>
+        <div id="runs-list"><p class="hint">Loading…</p></div>
+    </div>
+    <div class="panel">
+        <h2>Run detail</h2>
+        <div id="run-detail"><p class="hint">Select a run above to see its report.</p></div>
+    </div>
+    </div>
 </main>
 
 <div id="agent-modal" class="modal-backdrop" onclick="if(event.target===this)closeAgentModal()">
@@ -270,6 +326,35 @@
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
             </label>
+            <fieldset class="exposure">
+                <legend>Availability</legend>
+                <label><input type="checkbox" id="agent-expose-chat" checked> Available in chat</label>
+                <label><input type="checkbox" id="agent-expose-api" onchange="updateEndpointHint()"> Available via API (schedulable)</label>
+                <label>API slug
+                    <input type="text" id="agent-api-slug" placeholder="daily-check" oninput="updateEndpointHint()">
+                </label>
+                <p class="hint" id="agent-endpoint-hint">Endpoint: <code>POST /api/agents/&lt;slug&gt;/run</code></p>
+                <label>Run as (technical user)
+                    <input type="text" id="agent-run-as" placeholder="XSUAA principal id"
+                           oninput="refreshCredentials()">
+                </label>
+                <p class="hint">
+                    This is an opaque XSUAA principal id, not an email address.
+                    <button type="button" class="secondary" id="agent-use-my-identity"
+                            onclick="useMyIdentity()">Use my identity</button>
+                    <span id="agent-whoami"></span>
+                </p>
+                <div id="agent-credentials"></div>
+                <label>Run prompt
+                    <input type="text" id="agent-run-prompt" placeholder="Perform your configured check now.">
+                </label>
+                <label>Run timeout (seconds)
+                    <input type="number" id="agent-run-timeout" value="1800" min="60" max="86400">
+                </label>
+                <label>Expected report sections (comma-separated)
+                    <input type="text" id="agent-expected-sections" placeholder="st22, slg1, sm21, sm37">
+                </label>
+            </fieldset>
         </div>
         <div class="modal-actions">
             <button class="secondary" onclick="closeAgentModal()">Cancel</button>
@@ -357,6 +442,7 @@ async function loadAgents() {
                 <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
                 <td class="row-actions">
                     <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
+                    ${a.expose_api ? `<button class="small secondary" onclick="runAgentNow(${a.id})">Run now</button>` : ''}
                     <button class="small danger" onclick="deleteAgentRow(${a.id}, '${escapeHtml(a.name)}')">Delete</button>
                 </td>
             </tr>
@@ -390,13 +476,13 @@ function addMcpServerRow(server) {
     row.innerHTML = `
         <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
             <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
-            <select class="mcp-auth-mode" onchange="toggleOauthFields(this)">
+            <select class="mcp-auth-mode" onchange="toggleOauthFields(this); updateEndpointHint()">
                 <option value="jwt">JWT forward (BTP)</option>
                 <option value="oauth2">OAuth2 (per-user)</option>
                 <option value="none">None (public)</option>
             </select>
             <button type="button" class="small danger" title="Remove"
-                    onclick="this.closest('.mcp-server-row').remove()">×</button>
+                    onclick="this.closest('.mcp-server-row').remove(); updateEndpointHint()">×</button>
         </div>
         <div class="mcp-oauth" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
             <label style="font-weight:600">
@@ -453,6 +539,7 @@ function addMcpServerRow(server) {
     row.querySelector('.oauth-redirect').textContent = location.origin + '/oauth/callback';
     container.appendChild(row);
     toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+    updateEndpointHint();
 }
 
 function toggleOauthFields(select) {
@@ -620,7 +707,109 @@ function openAgentModal() {
     renderMcpServers([]);
     renderAgentSkillChecks([]);
     document.getElementById('agent-enabled').checked = true;
+    document.getElementById('agent-expose-chat').checked = true;
+    document.getElementById('agent-expose-api').checked = false;
+    document.getElementById('agent-api-slug').value = '';
+    refreshCredentials();
+    document.getElementById('agent-run-as').value = '';
+    document.getElementById('agent-run-prompt').value = '';
+    document.getElementById('agent-run-timeout').value = 1800;
+    document.getElementById('agent-expected-sections').value = '';
+    updateEndpointHint();
     document.getElementById('agent-modal').classList.add('open');
+}
+
+function updateEndpointHint() {
+    const slug = document.getElementById('agent-api-slug').value.trim();
+    const shown = slug ? esc(slug) : '&lt;slug&gt;';
+    let html = 'Endpoint: <code>POST /api/agents/' + shown + '/run</code>';
+    // An API-triggered run binds a technical principal, never a user JWT, so
+    // a "JWT forward" server can only ever fail on such a run. Say so here
+    // rather than letting the operator discover it from a failed run.
+    const jwtServers = [...document.querySelectorAll('#agent-mcp-servers .mcp-auth-mode')]
+        .filter(sel => sel.value === 'jwt').length;
+    if (document.getElementById('agent-expose-api').checked && jwtServers > 0) {
+        html += '<br><strong style="color:var(--warn)">Warning:</strong> '
+            + jwtServers + ' MCP server(s) use "JWT forward". Scheduled runs have no '
+            + 'user JWT to forward and will fail — switch them to OAuth2 (per-user) '
+            + 'and authorize the run-as account.';
+    }
+    document.getElementById('agent-endpoint-hint').innerHTML = html;
+}
+
+// --- run-as identity helpers ----------------------------------------------
+// run_as_principal holds the opaque XSUAA principal (user_uuid/sub). Nobody
+// can type that from memory, so the UI has to hand it over and show whether
+// the chosen identity actually holds a token for each OAuth2 server.
+let _whoami = null;
+
+async function loadWhoami() {
+    try {
+        const res = await fetch('/admin/api/whoami');
+        if (!res.ok) return;
+        _whoami = await res.json();
+        const label = _whoami.label ? _whoami.label + ' — ' : '';
+        document.getElementById('agent-whoami').innerHTML =
+            'You are ' + esc(label) + '<code>' + esc(_whoami.principal || '') + '</code>';
+    } catch (e) { /* non-fatal: the field still accepts a pasted id */ }
+}
+
+function useMyIdentity() {
+    if (!_whoami || !_whoami.principal) return;
+    document.getElementById('agent-run-as').value = _whoami.principal;
+    refreshCredentials();
+}
+
+async function refreshCredentials() {
+    const box = document.getElementById('agent-credentials');
+    if (!box) return;
+    const agentId = document.getElementById('agent-id').value;
+    if (!agentId) {
+        box.innerHTML = '<p class="hint">Save the agent first to check its credentials.</p>';
+        return;
+    }
+    const principal = document.getElementById('agent-run-as').value.trim();
+    try {
+        const res = await fetch('/admin/api/agents/' + encodeURIComponent(agentId)
+            + '/credentials?principal=' + encodeURIComponent(principal));
+        if (!res.ok) { box.innerHTML = ''; return; }
+        const servers = await res.json();
+        const oauth = servers.filter(s => s.needs_token);
+        if (!oauth.length) {
+            box.innerHTML = '<p class="hint">No OAuth2 servers — this agent needs no sign-in.</p>';
+            return;
+        }
+        box.innerHTML = '<p class="hint">Connecting signs in as <strong>you</strong>'
+            + (_whoami && _whoami.label ? ' (' + esc(_whoami.label) + ')' : '')
+            + ', not as the id above. To connect a service account, log in to this app '
+            + 'as that account first.</p>'
+            + oauth.map(s => '<p class="hint">'
+                + (s.has_token
+                    ? '<span style="color:var(--ok,green)">connected</span>'
+                    : '<span style="color:var(--warn)">not connected</span>')
+                + ' <code>' + esc(s.url) + '</code> '
+                + '<button type="button" class="secondary" '
+                + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                + '</p>').join('');
+    } catch (e) { box.innerHTML = ''; }
+}
+
+function connectServer(loginUrl) {
+    // Same-origin /oauth/login only — never open an arbitrary URL from a
+    // response body in a popup.
+    if (!/^\/oauth\/login\?/.test(loginUrl)) return;
+    const w = window.open(loginUrl, 'mcp-signin', 'width=520,height=700');
+    // The popup closes itself on success; re-check when it does.
+    const timer = setInterval(() => {
+        if (!w || w.closed) { clearInterval(timer); refreshCredentials(); }
+    }, 1000);
+}
+
+function collectExpectedSections() {
+    return document.getElementById('agent-expected-sections').value
+        .split(',')
+        .map(s => s.trim())
+        .filter(s => s.length > 0);
 }
 
 function closeAgentModal() {
@@ -642,6 +831,15 @@ async function editAgent(id) {
     renderMcpServers(servers);
     renderAgentSkillChecks(a.skills || []);
     document.getElementById('agent-enabled').checked = a.enabled;
+    document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
+    document.getElementById('agent-expose-api').checked = !!a.expose_api;
+    document.getElementById('agent-api-slug').value = a.api_slug || '';
+    document.getElementById('agent-run-as').value = a.run_as_principal || '';
+    refreshCredentials();
+    document.getElementById('agent-run-prompt').value = a.run_prompt || '';
+    document.getElementById('agent-run-timeout').value = a.run_timeout_seconds || 1800;
+    document.getElementById('agent-expected-sections').value = (a.expected_sections || []).join(', ');
+    updateEndpointHint();
     document.getElementById('agent-modal').classList.add('open');
 }
 
@@ -659,6 +857,13 @@ async function saveAgent() {
         mcp_servers: servers,
         skills: collectAgentSkills(),
         enabled: document.getElementById('agent-enabled').checked,
+        expose_chat: document.getElementById('agent-expose-chat').checked,
+        expose_api: document.getElementById('agent-expose-api').checked,
+        api_slug: document.getElementById('agent-api-slug').value.trim(),
+        run_as_principal: document.getElementById('agent-run-as').value.trim(),
+        run_prompt: document.getElementById('agent-run-prompt').value.trim(),
+        run_timeout_seconds: parseInt(document.getElementById('agent-run-timeout').value, 10) || 1800,
+        expected_sections: collectExpectedSections(),
     });
     const res = id
         ? await api(`/agents/${id}`, {method: 'PUT', body})
@@ -775,9 +980,97 @@ function escapeHtml(s) {
         {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
     ));
 }
+// Alias used throughout the Job Runs UI — run reports are model-generated
+// text (partly sourced from live SAP systems) and must never be injected
+// into the DOM unescaped.
+const esc = escapeHtml;
+
+// Report `references` URLs come from the model too, so escaping alone is
+// not enough: `javascript:...` contains none of the characters esc()
+// touches and would survive into an href as a clickable script link.
+// Only allow http(s) through; anything else renders as plain text.
+function safeHttpUrl(u) {
+    return /^https?:\/\//i.test(String(u ?? '')) ? String(u) : null;
+}
+
+function switchTab(name) {
+    document.querySelectorAll('.tab-btn').forEach(b =>
+        b.classList.toggle('active', b.dataset.tab === name));
+    document.querySelectorAll('.tab-panel').forEach(p =>
+        p.classList.toggle('active', p.id === 'tab-' + name));
+    if (name === 'runs') loadRuns();
+}
+
+async function loadRuns() {
+    const res = await fetch('/admin/api/runs');
+    if (!res.ok) { toast('Failed to load runs', 'error'); return; }
+    const runs = await res.json();
+    const el = document.getElementById('runs-list');
+    if (!runs.length) { el.innerHTML = '<p class="hint">No runs yet.</p>'; return; }
+    el.innerHTML = '<table><thead><tr><th>Agent</th><th>Status</th><th>Started</th>'
+        + '<th>Trigger</th><th>Summary</th></tr></thead><tbody>'
+        + runs.map(r => `<tr class="run-row" data-id="${esc(r.id)}">
+            <td>${esc(r.agent_name)}</td>
+            <td><span class="status-badge status-${esc(r.status)}">${esc(r.status)}</span></td>
+            <td>${r.started_at ? esc(new Date(r.started_at).toLocaleString()) : ''}</td>
+            <td>${esc(r.trigger)}</td>
+            <td>${esc(r.summary || r.error || '')}</td>
+          </tr>`).join('') + '</tbody></table>';
+    el.querySelectorAll('.run-row').forEach(row =>
+        row.addEventListener('click', () => showRun(row.dataset.id)));
+}
+
+async function showRun(id) {
+    const res = await fetch(`/admin/api/runs/${id}`);
+    const el = document.getElementById('run-detail');
+    if (!res.ok) { el.innerHTML = '<p class="error">Failed to load run.</p>'; return; }
+    const run = await res.json();
+    const sections = (run.report && run.report.sections) || [];
+    el.innerHTML = `<h3>${esc(run.agent_name)} — <span class="status-badge status-${esc(run.status)}">${esc(run.status)}</span></h3>`
+        + `<p class="hint">Trigger: ${esc(run.trigger)} · Started: ${run.started_at ? esc(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + esc(new Date(run.finished_at).toLocaleString()) : ''}</p>`
+        + (run.summary ? `<p>${esc(run.summary)}</p>` : '')
+        + (run.error ? `<p class="error">${esc(run.error)}</p>` : '')
+        + (run.missing_sections && run.missing_sections.length
+            ? `<p class="warn">Not checked: ${run.missing_sections.map(esc).join(', ')}</p>` : '')
+        + sections.map(s => `<section>
+            <h4>${esc(s.title)}${s.checked ? '' : ' <span class="warn">(not checked)</span>'}</h4>
+            ${s.note ? `<p class="hint">${esc(s.note)}</p>` : ''}
+            ${s.findings && s.findings.length
+                ? s.findings.map(f => `<div class="finding">
+                    <strong>${esc(f.title)}</strong>
+                    <span class="sev sev-${esc(f.severity)}">${esc(f.severity)}</span>
+                    ${f.count ? ' ×' + esc(String(f.count)) : ''}
+                    <p>${esc(f.detail)}</p>
+                    ${f.affected && f.affected.length ? `<p class="hint">Affected: ${f.affected.map(esc).join(', ')}</p>` : ''}
+                    ${f.analysis ? `<p>${esc(f.analysis)}</p>` : ''}
+                    ${f.recommendation ? `<p><em>${esc(f.recommendation)}</em></p>` : ''}
+                    ${f.references && f.references.length
+                        ? '<p>' + f.references.map(u => {
+                            const safe = safeHttpUrl(u);
+                            return safe
+                                ? `<a href="${esc(safe)}" target="_blank" rel="noopener">${esc(safe)}</a>`
+                                : `<span>${esc(u)}</span>`;
+                          }).join(' ') + '</p>'
+                        : ''}
+                  </div>`).join('')
+                : (s.checked ? '<p class="hint">No findings.</p>' : '')}
+          </section>`).join('');
+}
+
+async function runAgentNow(agentId) {
+    const res = await fetch(`/admin/api/agents/${agentId}/run`, {method: 'POST'});
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Run failed: ' + (err.detail || JSON.stringify(err)), 'error');
+        return;
+    }
+    toast('Run started.', 'success');
+    switchTab('runs');
+}
 
 loadSkills();
 loadAgents();
+loadWhoami();
 loadOrchestrator();
 loadModel();
 </script>
