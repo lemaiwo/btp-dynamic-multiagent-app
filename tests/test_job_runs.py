@@ -212,6 +212,97 @@ async def main() -> None:
     async with SessionLocal() as s:
         check("swept run is interrupted", (await get_job_run(s, stale_id)).status == "interrupted")
 
+    print("\n== runner ==")
+    import agents.job_runner as job_runner
+    from agents.registry import registry
+
+    class _FakeSpecialist:
+        def __init__(self, report=None, exc=None):
+            self._report = report
+            self._exc = exc
+        async def run(self, prompt, **kw):
+            if self._exc:
+                raise self._exc
+            class _R:
+                pass
+            r = _R()
+            r.output = self._report
+            return r
+
+    class _FakeBuild:
+        def __init__(self, specialists):
+            self.specialists = specialists
+
+    good = RunReport(
+        summary="2 dumps, 0 blockers",
+        overall_severity="medium",
+        sections=[
+            ReportSection(source_key="st22", title="Dumps", checked=True, findings=[]),
+            ReportSection(source_key="slg1", title="Log", checked=True, findings=[]),
+        ],
+    )
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
+    os.environ["PUBLIC_BASE_URL"] = "https://approuter.example.com"
+    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        agent_id, run_id = job.id, (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id)
+        check("complete run is success", r.status == "success", r.status)
+        check("summary stored from report", r.summary == "2 dumps, 0 blockers")
+        check("report stored", r.report["overall_severity"] == "medium")
+
+    partial = RunReport(
+        summary="partial",
+        overall_severity="info",
+        sections=[ReportSection(source_key="st22", title="Dumps", checked=True, findings=[])],
+    )
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(partial)})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id2 = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id2, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id2)
+        check("incomplete run is degraded", r.status == "degraded", r.status)
+        check("missing section named", r.missing_sections == ["slg1"])
+
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(exc=RuntimeError("mcp down"))})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id3 = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id3, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id3)
+        check("failing run is failed", r.status == "failed", r.status)
+        check("error recorded", "mcp down" in (r.error or ""))
+
+    print("\n== runner: credential pre-flight ==")
+    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=False)
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id4 = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id4, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id4)
+        check("no credential fails fast", r.status == "failed")
+        check("re-authorization message", "re-author" in (r.error or "").lower())
+
+    print("\n== runner: overlap guard ==")
+    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        await create_job_run(s, agent=job, trigger="manual")
+        try:
+            await job_runner.start_run(job, trigger="manual")
+            check("overlapping run refused", False, "no error raised")
+        except job_runner.RunRefused:
+            check("overlapping run refused", True)
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
