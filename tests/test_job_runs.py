@@ -303,6 +303,58 @@ async def main() -> None:
         except job_runner.RunRefused:
             check("overlapping run refused", True)
 
+    print("\n== runner: agent no longer exists ==")
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id5 = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id5, 999999)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id5)
+        check("missing agent is failed", r.status == "failed", r.status)
+        check("missing agent error message", "no longer exists" in (r.error or "").lower())
+
+    print("\n== runner: specialist not built ==")
+    registry._build = _FakeBuild({})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id6 = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id6, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id6)
+        check("unbuilt specialist is failed", r.status == "failed", r.status)
+        check("unbuilt specialist error message", "not built" in (r.error or "").lower())
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
+
+    print("\n== runner: start_run refuses non-API agent ==")
+    async with SessionLocal() as s:
+        chat_only = await get_agent_by_name(s, "chat-only")
+    try:
+        await job_runner.start_run(chat_only, trigger="manual")
+        check("non-API agent refused", False, "no error raised")
+    except job_runner.RunRefused:
+        check("non-API agent refused", True)
+
+    print("\n== runner: finalize failure does not propagate ==")
+    _real_finish_job_run = job_runner.finish_job_run
+    _raise_once = {"done": False}
+
+    async def _flaky_finish_job_run(session, run_id, **kw):
+        if not _raise_once["done"]:
+            _raise_once["done"] = True
+            raise RuntimeError("db exploded")
+        return await _real_finish_job_run(session, run_id, **kw)
+
+    job_runner.finish_job_run = _flaky_finish_job_run
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id7 = (await create_job_run(s, agent=job, trigger="manual")).id
+    try:
+        await job_runner.execute_run(run_id7, agent_id)
+        check("execute_run swallows finalize failure", True)
+    except Exception as e:  # noqa: BLE001
+        check("execute_run swallows finalize failure", False, f"{type(e).__name__}: {e}")
+    job_runner.finish_job_run = _real_finish_job_run
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
