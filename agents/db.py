@@ -796,6 +796,19 @@ async def get_oauth_client(
     return await session.get(McpOAuthClient, server_key)
 
 
+async def delete_oauth_client(session: AsyncSession, server_key: str) -> None:
+    """Drop a registered client so the next use re-runs discovery + DCR.
+
+    Needed when the target's authorization server stops honouring the client
+    we registered (e.g. it signs stateless client_ids with a secret that
+    rotates on restart) — the cached row is otherwise never invalidated.
+    """
+    await session.execute(
+        delete(McpOAuthClient).where(McpOAuthClient.server_key == server_key)
+    )
+    await session.commit()
+
+
 async def save_oauth_client(
     session: AsyncSession,
     *,

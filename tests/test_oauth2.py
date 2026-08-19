@@ -358,7 +358,125 @@ async def main() -> None:
     )
     check("login returns None for unknown agent", missing is None)
 
+    # --- DCR: a rotated signing secret invalidates the cached client -------
+    # Stateless-client_id servers (ARC-1) sign the client_id with a secret that
+    # can change across restarts; every cached registration then fails with
+    # invalid_client. Nothing else evicts the cache, so without eviction the
+    # refresh AND the follow-up sign-in reuse the same dead client_id forever.
+    print("\n== DCR: re-register after invalid_client ==")
+    DCR_SPEC = {"dcr": True, "scope": "openid"}
+    async with SessionLocal() as s:
+        from agents.db import upsert_user_token as _up2
+
+        await _up2(
+            s,
+            user_id=USER,
+            server_key=DCR_KEY,
+            access_token="STALE",
+            refresh_token="REFRESH-DCR",
+            expires_at=datetime.now(timezone.utc) - timedelta(seconds=10),
+        )
+    _next_token_status = 400
+    _next_token_payload = {"error": "invalid_client", "error_description": "Invalid client_id"}
+    _token_calls.clear()
+    p = current_principal.set(USER)
+    bp = current_base_url.set("https://approuter.example.com")
+    try:
+        auth = PerUserOAuth2Auth(DCR_KEY, DCR_SPEC)
+        gen = auth.async_auth_flow(httpx.Request("POST", DCR_KEY))
+        try:
+            await gen.__anext__()
+            check("invalid_client refresh re-prompts", False, "no exception")
+        except OAuthAuthorizationRequired:
+            check("invalid_client refresh re-prompts", True)
+        async with SessionLocal() as s:
+            from agents.db import get_oauth_client as _goc
+
+            check(
+                "invalid_client evicts cached DCR client",
+                (await _goc(s, DCR_KEY)) is None,
+            )
+        # The sign-in that follows must now register a *fresh* client.
+        _next_token_status = 200
+        cfg3 = await oauth2.resolve_config(DCR_KEY, DCR_SPEC)
+        check("eviction forces re-registration", reg_calls["n"] == 2)
+        check("re-registered client usable", cfg3.client_id == "dcr-client-1")
+    finally:
+        current_principal.reset(p)
+        current_base_url.reset(bp)
+
+    # A manual (non-DCR) client must NOT be evicted — its credentials are
+    # operator-managed, so dropping them would lose configuration.
+    async with SessionLocal() as s:
+        from agents.db import get_oauth_client as _goc
+
+        before = await _goc(s, DCR_KEY)
+    check("cache repopulated after re-register", before is not None)
+    evicted = await oauth2._forget_registered_client(DCR_KEY, OAUTH)
+    check("manual client not evicted", evicted is False)
+    async with SessionLocal() as s:
+        from agents.db import get_oauth_client as _goc
+
+        check("manual eviction left cache intact", (await _goc(s, DCR_KEY)) is not None)
+
+    # --- DCR: redirect_uri change forces re-registration -------------------
+    # The registered redirect_uri is baked into the client. If the approuter
+    # hostname changes the cached client is unusable, so re-register instead of
+    # serving a client the target will reject.
+    print("\n== DCR: redirect_uri change re-registers ==")
+    reg_before = reg_calls["n"]
+    bp = current_base_url.set("https://new-approuter.example.com")
+    try:
+        await oauth2.resolve_config(DCR_KEY, DCR_SPEC)
+        check("redirect_uri change re-registers", reg_calls["n"] == reg_before + 1)
+    finally:
+        current_base_url.reset(bp)
+    async with SessionLocal() as s:
+        from agents.db import get_oauth_client as _goc
+
+        rc2 = await _goc(s, DCR_KEY)
+        check(
+            "new redirect_uri persisted",
+            rc2 is not None
+            and rc2.redirect_uri == "https://new-approuter.example.com/oauth/callback",
+        )
+    # Same redirect_uri -> still a cache hit (no needless re-registration).
+    reg_before = reg_calls["n"]
+    bp = current_base_url.set("https://new-approuter.example.com")
+    try:
+        await oauth2.resolve_config(DCR_KEY, DCR_SPEC)
+        check("unchanged redirect_uri stays cached", reg_calls["n"] == reg_before)
+    finally:
+        current_base_url.reset(bp)
+    # No base_url in context (background task) -> serve the cache, don't fail.
+    reg_before = reg_calls["n"]
+    cfg_nb = await oauth2.resolve_config(DCR_KEY, DCR_SPEC)
+    check("no base_url still serves cache", reg_calls["n"] == reg_before and cfg_nb.client_id == "dcr-client-1")
+
+    # --- complete_authorization evicts on invalid_client -------------------
+    # Covers the user who has no refresh token: the failure only surfaces at
+    # the code exchange, and must leave the cache clean so a retry can work.
+    print("\n== complete_authorization: invalid_client eviction ==")
+    login_url2 = await oauth2.begin_authorization_for_agent(
+        "arc1dcr", user_id=USER, base_url="https://approuter.example.com"
+    )
+    state2 = up.parse_qs(up.urlparse(login_url2).query)["state"][0]
+    _next_token_status = 400
+    _next_token_payload = {"error": "invalid_client", "error_description": "Invalid client_id"}
+    try:
+        await complete_authorization(code="c", state=state2, principal=USER)
+        check("invalid_client exchange raises", False, "no exception")
+    except ValueError as e:
+        check("invalid_client exchange raises", True)
+        check("error tells the user to retry", "retry" in str(e).lower(), str(e))
+    async with SessionLocal() as s:
+        from agents.db import get_oauth_client as _goc
+
+        check("exchange eviction dropped cached client", (await _goc(s, DCR_KEY)) is None)
+    _next_token_status = 200
+
     # DCR registration needs the request's base_url; without it -> re-prompt
+    reg_before = reg_calls["n"]
     try:
         await oauth2.resolve_config(
             normalize_mcp_url("https://fresh.cfapps.eu20-001.hana.ondemand.com"), {"dcr": True}
@@ -366,7 +484,7 @@ async def main() -> None:
         check("dcr without base_url raises", False, "no exception")
     except OAuthAuthorizationRequired:
         check("dcr without base_url raises", True)
-    check("dcr did not register without base_url", reg_calls["n"] == 1)
+    check("dcr did not register without base_url", reg_calls["n"] == reg_before)
 
     # admin payload: dcr accepted without any credentials
     dcr_payload = McpServerPayload(url=DCR_URL, auth_mode="oauth2", oauth={"dcr": True})
