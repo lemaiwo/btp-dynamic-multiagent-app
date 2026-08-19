@@ -48,7 +48,7 @@ modules:
       # API-triggered (scheduled) runs have no request to read headers from,
       # so they need one of PUBLIC_BASE_URL / A2A_PUBLIC_URL to be set: with
       # both empty, every run fails immediately in run_as.
-      PUBLIC_BASE_URL: ""
+      PUBLIC_BASE_URL: "https://infrabel-app-acc-cf-ai-pydantic-agent-approuter.cfapps.eu20-001.hana.ondemand.com"
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
     requires:
