@@ -39,7 +39,7 @@ from agents.auth import (  # noqa: E402
     principal_from_token,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
-from agents.db import init_db  # noqa: E402
+from agents.db import SessionLocal, init_db, sweep_stale_runs  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 
@@ -52,6 +52,10 @@ SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    async with SessionLocal() as session:
+        swept = await sweep_stale_runs(session)
+    if swept:
+        logger.info("Marked %d stale job run(s) as interrupted", swept)
     await seed_from_file_if_empty(SEED_FILE)
     await registry.reload()
     dynamic_chat_app.refresh()
