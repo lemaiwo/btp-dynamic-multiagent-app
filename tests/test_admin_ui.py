@@ -551,6 +551,33 @@ async def main() -> None:
         check("expected sections field", 'id="agent-expected-sections"' in html)
         check("endpoint URL hint shown", "/api/agents/" in html)
 
+        # ------------------------------------------------------------------
+        # saveAgent() must actually SEND all seven exposure fields, not just
+        # have form elements for them. AgentPayload defaults + whole-object
+        # PUT semantics mean a field saveAgent() forgets to include gets
+        # silently reset on every save (expose_api -> False, expose_chat ->
+        # True, etc.) -- deleting one key here is exactly the regression
+        # this check exists to catch, and the earlier ID-presence checks
+        # above would not catch it.
+        print("\n== saveAgent() sends all seven exposure fields ==")
+        m = re.search(r"async function saveAgent\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("saveAgent() function found in JS", m is not None)
+        save_agent_body = m.group(1) if m else ""
+        for field in (
+            "expose_chat",
+            "expose_api",
+            "api_slug",
+            "run_as_principal",
+            "run_prompt",
+            "run_timeout_seconds",
+            "expected_sections",
+        ):
+            check(
+                f"saveAgent() sends {field}",
+                re.search(rf"\b{field}\s*:", save_agent_body) is not None,
+                f"{field}: not found as an object key in saveAgent()",
+            )
+
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
     try:

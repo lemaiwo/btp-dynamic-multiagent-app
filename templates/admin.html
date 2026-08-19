@@ -151,7 +151,7 @@
         #run-detail .finding { border-top: 1px solid var(--border); padding: 8px 0; }
         #run-detail .finding:first-of-type { border-top: none; padding-top: 0; }
         #run-detail p.error { color: var(--danger); }
-        #run-detail p.warn { color: var(--warn); }
+        #run-detail .warn { color: var(--warn); }
         .sev { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 11px; font-weight: 600; margin-left: 6px; }
         .sev-critical, .sev-high { background: #f5d6d6; color: var(--danger); }
         .sev-medium { background: #fdecc8; color: var(--warn); }
@@ -895,6 +895,14 @@ function escapeHtml(s) {
 // into the DOM unescaped.
 const esc = escapeHtml;
 
+// Report `references` URLs come from the model too, so escaping alone is
+// not enough: `javascript:...` contains none of the characters esc()
+// touches and would survive into an href as a clickable script link.
+// Only allow http(s) through; anything else renders as plain text.
+function safeHttpUrl(u) {
+    return /^https?:\/\//i.test(String(u ?? '')) ? String(u) : null;
+}
+
 function switchTab(name) {
     document.querySelectorAll('.tab-btn').forEach(b =>
         b.classList.toggle('active', b.dataset.tab === name));
@@ -947,8 +955,12 @@ async function showRun(id) {
                     ${f.analysis ? `<p>${esc(f.analysis)}</p>` : ''}
                     ${f.recommendation ? `<p><em>${esc(f.recommendation)}</em></p>` : ''}
                     ${f.references && f.references.length
-                        ? '<p>' + f.references.map(u =>
-                            `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join(' ') + '</p>'
+                        ? '<p>' + f.references.map(u => {
+                            const safe = safeHttpUrl(u);
+                            return safe
+                                ? `<a href="${esc(safe)}" target="_blank" rel="noopener">${esc(safe)}</a>`
+                                : `<span>${esc(u)}</span>`;
+                          }).join(' ') + '</p>'
                         : ''}
                   </div>`).join('')
                 : (s.checked ? '<p class="hint">No findings.</p>' : '')}
