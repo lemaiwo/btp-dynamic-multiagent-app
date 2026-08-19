@@ -257,21 +257,46 @@ def _oauth2_server_keys(row) -> list[str]:
     return keys
 
 
+# (user, server_key) pairs with a sign-in prompt already on screen. The
+# orchestrator commonly fires several delegations in one turn and pydantic-ai
+# runs them concurrently, so without this every one of them posts its own bubble
+# for the same server — one popup satisfies them all, leaving the extras as
+# stale links. Only the first prompts; the rest just wait for the same token.
+_signin_prompted: set[tuple[str, str]] = set()
+
+
 async def _await_signin(agent_name: str, server_key: str, user_id: str) -> bool:
     """Show the sign-in link for ``server_key`` and wait for the user to
     authorize in the popup. Returns True once a token appears, False on timeout
-    (or if no link could be built). Shared by the pre-check and the in-run path."""
+    (or if no link could be built). Shared by the pre-check and the in-run path.
+
+    Concurrent callers for the same (user, server) share one prompt: whoever
+    gets there first shows the link, the others wait silently on the same
+    sign-in."""
     from agents.progress import report_message, report_note
 
-    link = _build_login_link(agent_name, server_key)
-    if not link:
+    prompt_key = (user_id, server_key)
+    # Claim the prompt. The check and the add must stay adjacent — no await
+    # between them — so two concurrent callers can't both come out first.
+    owns_prompt = prompt_key not in _signin_prompted
+    if owns_prompt:
+        _signin_prompted.add(prompt_key)
+    try:
+        if owns_prompt:
+            link = _build_login_link(agent_name, server_key)
+            if not link:
+                return False
+            report_message(agent_name, _signin_message(agent_name, link))
+        report_note(agent_name, "Waiting for you to sign in…")
+        if await _wait_for_token(user_id, server_key):
+            report_note(agent_name, f"Signed in — resuming {agent_name}…")
+            return True
         return False
-    report_message(agent_name, _signin_message(agent_name, link))
-    report_note(agent_name, "Waiting for you to sign in…")
-    if await _wait_for_token(user_id, server_key):
-        report_note(agent_name, f"Signed in — resuming {agent_name}…")
-        return True
-    return False
+    finally:
+        # Also runs on cancellation (client disconnect), so a dropped request
+        # can't wedge the guard and mute the next genuine prompt.
+        if owns_prompt:
+            _signin_prompted.discard(prompt_key)
 
 
 async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | None:
@@ -390,9 +415,12 @@ async def build_orchestrator() -> BuildResult:
     specialists: dict[str, Agent] = {}
     mcp_clients: list = []
 
-    # Build the orchestrator instructions, listing enabled specialists
+    # Build the orchestrator instructions, listing only chat-visible specialists.
+    # Run-only agents (expose_chat=False) are still built into `specialists`
+    # below (a later task's runner needs them) but must stay invisible to chat.
+    chat_rows = [r for r in enabled_rows if r.expose_chat]
     specialist_lines = [
-        f"- **{r.name}**: {r.description.strip()}" for r in enabled_rows
+        f"- **{r.name}**: {r.description.strip()}" for r in chat_rows
     ]
     instructions = orch_instructions.strip()
     if specialist_lines:
@@ -401,8 +429,8 @@ async def build_orchestrator() -> BuildResult:
         # With exactly one specialist there is no routing decision to make —
         # always forward. Deliberating (or trying to answer directly) just adds
         # latency and the occasional refusal, so make delegation mandatory.
-        if len(enabled_rows) == 1:
-            only = enabled_rows[0]
+        if len(chat_rows) == 1:
+            only = chat_rows[0]
             instructions += (
                 f"\n\nThere is currently only ONE specialist available: "
                 f"**{only.name}**. Forward every request that needs a specialist "
@@ -418,7 +446,7 @@ async def build_orchestrator() -> BuildResult:
         instructions += (
             "\n\nBefore you call a specialist, tell the user in one short line "
             "what you're about to do (e.g. \"Checking with the "
-            f"{enabled_rows[0].name} specialist…\"). When a request needs several "
+            f"{chat_rows[0].name} specialist…\"). When a request needs several "
             "specialists, narrate each step before the corresponding call so the "
             "user can follow your progress instead of staring at a silent screen."
         )
@@ -499,7 +527,10 @@ async def build_orchestrator() -> BuildResult:
             _attach_skills_tool(specialist, row.name, attached_skills)
         specialists[row.name] = specialist
 
-        _attach_delegation_tool(orchestrator, specialist, row)
+        # Run-only agents are built (the runner needs them) but must not be
+        # reachable from chat.
+        if row.expose_chat:
+            _attach_delegation_tool(orchestrator, specialist, row)
 
     return BuildResult(
         orchestrator=orchestrator,
@@ -688,17 +719,35 @@ class Registry:
                 len(new.configs),
             )
 
-            # Best-effort cleanup of the previous MCP clients
+            # Best-effort cleanup of the previous MCP clients — but only
+            # when nothing is still using them. An API-triggered run captured
+            # its specialist from the old build and may run for up to its
+            # timeout (30 min by default); closing that build's transports
+            # would kill the run mid-flight with an opaque closed-client
+            # error. Since the admin UI asks the operator to reload after
+            # every save, that is an easy accident to cause. Leaking the
+            # clients until the next reload is the cheaper failure.
             if old is not None:
-                for server in old.mcp_clients:
-                    try:
-                        client = getattr(server, "_http_client", None) or getattr(
-                            server, "http_client", None
-                        )
-                        if client is not None:
-                            await client.aclose()
-                    except Exception:
-                        logger.debug("Failed to close old MCP client", exc_info=True)
+                # Deferred import: job_runner imports this module at load
+                # time, so a top-level import here would be circular.
+                from agents.job_runner import _tasks as in_flight_runs
+
+                if in_flight_runs:
+                    logger.info(
+                        "Keeping %d MCP client(s) from the previous build open: "
+                        "%d job run(s) still in flight are using them.",
+                        len(old.mcp_clients), len(in_flight_runs),
+                    )
+                else:
+                    for server in old.mcp_clients:
+                        try:
+                            client = getattr(server, "_http_client", None) or getattr(
+                                server, "http_client", None
+                            )
+                            if client is not None:
+                                await client.aclose()
+                        except Exception:
+                            logger.debug("Failed to close old MCP client", exc_info=True)
 
             return new
 

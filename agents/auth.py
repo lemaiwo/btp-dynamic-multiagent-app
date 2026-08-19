@@ -13,9 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 import jwt
@@ -232,3 +233,81 @@ async def require_admin(request: Request) -> dict[str, Any]:
             detail="Admin scope required",
         )
     return payload
+
+
+async def require_jobscheduler(request: Request) -> dict[str, Any]:
+    """Ensure the caller holds the `<xsappname>.JOBSCHEDULER` scope.
+
+    Granted to the jobscheduler service instance via `grant-as-authority-to-apps`
+    in xs-security.json, so only the scheduler can trigger runs.
+    """
+    validator = get_validator()
+    token = _extract_token(request)
+
+    if validator is None:
+        return {"user_name": "local-dev", "scope": ["JOBSCHEDULER"]}
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
+        )
+    payload = validator.validate(token)
+    if not validator.has_scope(payload, "JOBSCHEDULER"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Job scheduler scope required",
+        )
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive identity for scheduled / API-triggered runs
+# ---------------------------------------------------------------------------
+# Env vars that can carry the app's public (approuter) URL, most specific
+# first. A2A_PUBLIC_URL is the same approuter host under a different name and
+# is already configured on deployments that expose the A2A endpoint, so it is
+# a sound fallback rather than a second source of truth.
+PUBLIC_BASE_URL_VARS = ("PUBLIC_BASE_URL", "A2A_PUBLIC_URL")
+
+
+def public_base_url() -> str | None:
+    """The app's public (approuter) URL, for code that has no request.
+
+    The single resolver for this concept: the request middleware uses it as
+    the override for the OAuth2 redirect_uri (falling back to the forwarded
+    headers when neither var is set), and ``run_as`` uses it as the only
+    source, since a scheduled run has no request to derive a host from.
+    """
+    for var in PUBLIC_BASE_URL_VARS:
+        value = (os.environ.get(var) or "").strip().rstrip("/")
+        if value:
+            return value
+    return None
+
+
+@asynccontextmanager
+async def run_as(principal: str) -> AsyncIterator[None]:
+    """Bind a non-interactive identity for a scheduled or API-triggered run.
+
+    Mirrors what JWTBindingMiddleware does per request, minus the JWT: there
+    is no user token to forward, so the run can only reach MCP servers on
+    auth_mode "oauth2" (per-user token store, keyed by this principal) or
+    "none". auth_mode "jwt" servers will fail, by design.
+
+    current_base_url must be set for PerUserOAuth2Auth to resolve its DCR
+    client, and no request exists to derive it from — hence public_base_url().
+    """
+    base_url = public_base_url()
+    if not base_url:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL (or A2A_PUBLIC_URL) must be set for "
+            "API-triggered runs; there is no request to derive the callback "
+            "URL from."
+        )
+    marker_principal = current_principal.set(principal)
+    marker_base = current_base_url.set(base_url)
+    try:
+        yield
+    finally:
+        current_principal.reset(marker_principal)
+        current_base_url.reset(marker_base)

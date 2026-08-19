@@ -12,7 +12,7 @@
           "auth_mode": "none"
         },
         {
-          "url": "https://arc1-mcp-server.cfapps.eu20-001.hana.ondemand.com/mcp",
+          "url": "https://infrabel-app-acc-cf-ai-arc1-mcp-server.cfapps.eu20-001.hana.ondemand.com/mcp",
           "auth_mode": "oauth2",
           "oauth": {
             "dcr": true,

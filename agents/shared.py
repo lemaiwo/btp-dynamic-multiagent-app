@@ -25,6 +25,7 @@ from mcp.client.auth import OAuthClientProvider, TokenStorage
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 from openai import omit as OMIT
 from pydantic import AnyUrl
+from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.mcp import MCPServerStreamableHTTP
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIChatModelSettings
 from pydantic_ai.profiles.openai import OpenAIModelProfile
@@ -160,12 +161,61 @@ class JWTForwardAuth(httpx.Auth):
 # ---------------------------------------------------------------------------
 # MCP server factory
 # ---------------------------------------------------------------------------
+# How many times a single MCP tool may be retried within one run before the
+# failure is handed back to the model as an ordinary result. MCP toolsets do
+# NOT inherit Agent(retries=...) — they carry their own max_retries, which
+# defaults to 1 — so this has to be passed explicitly or SAPQuery gets a single
+# attempt to self-correct an invalid query.
+MCP_TOOL_RETRIES = int(os.environ.get("AGENT_TOOL_RETRIES", "3"))
+
+
+async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
+    """Keep one failing MCP tool from killing the whole agent run.
+
+    pydantic-ai raises ``UnexpectedModelBehavior`` out of ``Agent.run()`` once a
+    tool exhausts its retries. For an unattended run that turns "one source was
+    unreachable" into "no report at all", throwing away every source that did
+    work. Returning the failure as an ordinary tool result instead lets the
+    model record that source as unchecked and still produce its report.
+
+    Genuine ``ModelRetry`` errors are re-raised while attempts remain, so
+    pydantic-ai's own retry loop still runs and the model can fix, say, invalid
+    SQL. Only the final attempt degrades to text. Transport and protocol errors
+    degrade immediately — no amount of rewriting the arguments fixes a closed
+    connection, so spending the retry budget on it only delays the report.
+    """
+    try:
+        return await call_tool(name, args, metadata)
+    except asyncio.CancelledError:
+        raise
+    except ModelRetry as e:
+        if ctx.retry < ctx.max_retries:
+            raise
+        logger.warning(
+            "MCP tool %s exhausted its %d retries; degrading to a reported failure",
+            name, ctx.max_retries,
+        )
+        return (
+            f"Tool {name!r} failed after {ctx.retry + 1} attempts: {e.message} "
+            f"Treat this source as unavailable, record it as not checked with "
+            f"this reason, and continue with the other sources."
+        )
+    except Exception as e:  # noqa: BLE001 — a broken server must not end the run
+        logger.warning("MCP tool %s failed: %s", name, e, exc_info=True)
+        return (
+            f"Tool {name!r} failed: {type(e).__name__}: {e} "
+            f"Treat this source as unavailable, record it as not checked with "
+            f"this reason, and continue with the other sources."
+        )
+
+
 def create_mcp_server(
     name: str,
     base_url: str,
     auth_mode: str = "jwt",
     tool_prefix: str | None = None,
     oauth: dict | None = None,
+    max_retries: int = MCP_TOOL_RETRIES,
 ) -> MCPServerStreamableHTTP:
     """Create an MCP server connection.
 
@@ -217,6 +267,8 @@ def create_mcp_server(
     return MCPServerStreamableHTTP(
         url=mcp_url,
         tool_prefix=tool_prefix,
+        max_retries=max_retries,
+        process_tool_call=_resilient_tool_call,
         http_client=httpx.AsyncClient(
             auth=auth,
             follow_redirects=True,

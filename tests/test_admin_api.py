@@ -439,6 +439,398 @@ async def run_tests() -> None:
         r = await client.get("/admin/api/agents/999999")
         check("404", r.status_code == 404)
 
+        # --- Chat exposure filtering (behavioural) --------------------------
+        # Task 1 added AgentConfig.expose_chat; this checks the orchestrator
+        # actually honours it (not just that the DB stores it): a chat-visible
+        # agent must get a delegation tool, a run-only one must not, while both
+        # are still built as specialists (the scheduled/API runner needs them).
+        print("\n== Chat exposure filtering (orchestrator tools) ==")
+        from agents.db import SessionLocal as _SessionLocal
+        from agents.db import upsert_agent
+        from agents.registry import _sanitize_tool_name, registry
+
+        expose_url = "https://expose-test.cfapps.eu20-001.hana.ondemand.com"
+        async with _SessionLocal() as s:
+            await upsert_agent(
+                s, name="chat-visible", description="d", instructions="i",
+                mcp_servers=[{"url": expose_url, "auth_mode": "none"}],
+                enabled=True, expose_chat=True,
+            )
+            await upsert_agent(
+                s, name="run-only", description="d", instructions="i",
+                mcp_servers=[{"url": expose_url, "auth_mode": "none"}],
+                enabled=True, expose_chat=False,
+            )
+
+        r = await client.post("/admin/api/reload")
+        check(
+            "reload after exposure agents 200",
+            r.status_code == 200,
+            f"got {r.status_code}: {r.text}",
+        )
+
+        build = registry.build
+        check(
+            "both agents built as specialists",
+            "chat-visible" in build.specialists and "run-only" in build.specialists,
+            f"got {list(build.specialists)}",
+        )
+
+        # Inspect the orchestrator's registered tools directly (same private
+        # attribute `_attach_delegation_tool` in agents/registry.py relies on
+        # implicitly via Agent.tool()) rather than trying to run the model.
+        tool_names = set(build.orchestrator._function_toolset.tools.keys())
+        check(
+            "chat-visible has a delegation tool",
+            _sanitize_tool_name("chat-visible") in tool_names,
+            f"got {tool_names}",
+        )
+        check(
+            "run-only has NO delegation tool",
+            _sanitize_tool_name("run-only") not in tool_names,
+            f"got {tool_names}",
+        )
+
+        # --- Run endpoints ----------------------------------------------------
+        print("\n== run endpoints ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "Run Agent", "description": "d", "instructions": "i",
+            "mcp_url": "https://x.example.com/mcp", "auth_mode": "none",
+            "expose_api": True, "api_slug": "run-agent",
+            "run_as_principal": "svc@example.com",
+        })
+        check("create api-exposed agent", r.status_code == 201, r.text)
+        run_agent = r.json()
+        agent_id = run_agent["id"]
+        check("expose_api stored on create", run_agent["expose_api"] is True, run_agent)
+        check("api_slug stored on create", run_agent["api_slug"] == "run-agent", run_agent)
+
+        r = await client.get("/admin/api/runs")
+        check("run list endpoint", r.status_code == 200 and isinstance(r.json(), list))
+
+        r = await client.post("/api/agents/does-not-exist/run")
+        check("unknown slug -> 404", r.status_code == 404, r.text)
+
+        r = await client.post("/admin/api/agents/999999/run")
+        check("unknown agent id -> 404", r.status_code == 404, r.text)
+
+        r = await client.post("/admin/api/agents", json={
+            "name": "Chat Only", "description": "d", "instructions": "i",
+            "mcp_url": "https://y.example.com/mcp", "auth_mode": "none",
+        })
+        chat_id = r.json()["id"]
+        r = await client.post(f"/admin/api/agents/{chat_id}/run")
+        check("non-API agent rejected", r.status_code == 409, r.text)
+
+        # --- Update parity: exposure fields must survive a PUT, not just a
+        # create. Task 7's highest-risk spot: wiring the new AgentPayload
+        # fields into api_create_agent but forgetting api_update_agent would
+        # silently un-expose a scheduled agent on its next edit.
+        print("\n== PUT preserves exposure fields ==")
+        r = await client.put(f"/admin/api/agents/{agent_id}", json={
+            "name": "Run Agent", "description": "Updated d", "instructions": "i",
+            "mcp_url": "https://x.example.com/mcp", "auth_mode": "none",
+            "expose_api": True, "api_slug": "run-agent",
+            "run_as_principal": "svc@example.com",
+        })
+        check("update 200", r.status_code == 200, r.text)
+        updated = r.json()
+        check("description updated", updated["description"] == "Updated d")
+        check("expose_api survives update", updated["expose_api"] is True, updated)
+        check("api_slug survives update", updated["api_slug"] == "run-agent", updated)
+        check(
+            "run_as_principal survives update",
+            updated["run_as_principal"] == "svc@example.com",
+            updated,
+        )
+
+        # --- UI round-trip: all seven exposure fields must survive a
+        # load-then-save cycle using the exact payload shape
+        # templates/admin.html's saveAgent() builds from editAgent()'s
+        # loaded values. AgentPayload has defaults and PUT is whole-object
+        # semantics, so if the form ever omits one of these seven fields,
+        # saving *any* agent through the UI silently resets it (expose_api
+        # -> False, expose_chat -> True, api_slug/run_as_principal/
+        # run_prompt wiped, expected_sections wiped) with no error surfaced
+        # anywhere -- e.g. un-exposing a scheduled agent on its next edit.
+        print("\n== UI round-trip preserves all seven exposure fields ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "UI Roundtrip Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://z.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": False,
+            "expose_api": True,
+            "api_slug": "ui-roundtrip",
+            "run_as_principal": "svc-roundtrip@example.com",
+            "run_prompt": "Perform your configured check now.",
+            "run_timeout_seconds": 900,
+            "expected_sections": ["st22", "slg1", "sm21"],
+        })
+        check("roundtrip agent created", r.status_code == 201, r.text)
+        rt_id = r.json()["id"]
+
+        # editAgent(id) -> GET
+        r = await client.get(f"/admin/api/agents/{rt_id}")
+        check("roundtrip agent loaded", r.status_code == 200, r.text)
+        loaded = r.json()
+
+        # saveAgent() -> PUT, built from the loaded values exactly as the
+        # form's read/populate + collect logic does (including the
+        # comma-separated -> list transform for expected_sections).
+        ui_payload = {
+            "name": loaded["name"],
+            "description": loaded["description"],
+            "instructions": loaded["instructions"],
+            "mcp_servers": loaded["mcp_servers"],
+            "skills": loaded["skills"],
+            "enabled": loaded["enabled"],
+            "expose_chat": loaded["expose_chat"],
+            "expose_api": loaded["expose_api"],
+            "api_slug": loaded["api_slug"] or "",
+            "run_as_principal": loaded["run_as_principal"] or "",
+            "run_prompt": loaded["run_prompt"] or "",
+            "run_timeout_seconds": loaded["run_timeout_seconds"],
+            "expected_sections": loaded["expected_sections"],
+        }
+        r = await client.put(f"/admin/api/agents/{rt_id}", json=ui_payload)
+        check("roundtrip save 200", r.status_code == 200, r.text)
+        saved = r.json()
+        for field, expected in [
+            ("expose_chat", False),
+            ("expose_api", True),
+            ("api_slug", "ui-roundtrip"),
+            ("run_as_principal", "svc-roundtrip@example.com"),
+            ("run_prompt", "Perform your configured check now."),
+            ("run_timeout_seconds", 900),
+            ("expected_sections", ["st22", "slg1", "sm21"]),
+        ]:
+            check(
+                f"roundtrip preserves {field}",
+                saved.get(field) == expected,
+                f"got {saved.get(field)!r}",
+            )
+
+        # The UI's comma-split for a blank "expected sections" field must
+        # produce [] and never [""].
+        blank_sections = [s.strip() for s in "".split(",") if s.strip()]
+        check("blank expected_sections splits to []", blank_sections == [])
+
+        r = await client.delete(f"/admin/api/agents/{rt_id}")
+        check("roundtrip agent cleanup", r.status_code == 204, r.text)
+
+        # --- Export -> import round-trip ------------------------------------
+        # Import-with-replace is the documented dev->prod promotion path, so
+        # an export that carries the exposure fields but an import that drops
+        # them silently un-schedules every API agent on first promotion.
+        # run_as_principal is the deliberate exception: it is a
+        # landscape-specific service identity, so it must NOT travel in the
+        # export -- and an import must not wipe the one already configured.
+        print("\n== export -> import round-trip preserves exposure ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "Export Roundtrip", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://ex.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": False,
+            "expose_api": True,
+            "api_slug": "export-roundtrip",
+            "run_as_principal": "svc-export@example.com",
+            "run_prompt": "Run the nightly check.",
+            "run_timeout_seconds": 1200,
+            "expected_sections": ["st22", "sm21"],
+        })
+        check("export roundtrip agent created", r.status_code == 201, r.text)
+        er_id = r.json()["id"]
+
+        r = await client.get("/admin/api/export")
+        exported = next(
+            (a for a in r.json()["agents"] if a["name"] == "Export Roundtrip"), None
+        )
+        check("agent present in export", exported is not None)
+        for field, expected in [
+            ("expose_chat", False),
+            ("expose_api", True),
+            ("api_slug", "export-roundtrip"),
+            ("run_prompt", "Run the nightly check."),
+            ("run_timeout_seconds", 1200),
+            ("expected_sections", ["st22", "sm21"]),
+        ]:
+            check(
+                f"export carries {field}",
+                (exported or {}).get(field) == expected,
+                f"got {(exported or {}).get(field)!r}",
+            )
+        check(
+            "export omits run_as_principal (landscape-specific)",
+            "run_as_principal" not in (exported or {}),
+            f"got {exported!r}",
+        )
+
+        # Drift the target landscape: everything exposure-related reset,
+        # except the principal, which this landscape owns.
+        r = await client.put(f"/admin/api/agents/{er_id}", json={
+            "name": "Export Roundtrip", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://ex.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": True,
+            "expose_api": False,
+            "api_slug": "",
+            "run_as_principal": "svc-export@example.com",
+            "run_prompt": "",
+            "run_timeout_seconds": 1800,
+            "expected_sections": [],
+        })
+        check("exposure reset before import", r.status_code == 200, r.text)
+
+        r = await client.post(
+            "/admin/api/import", json={"agents": [exported], "replace": False}
+        )
+        check("import of export succeeds", r.status_code == 200, r.text)
+        r = await client.get(f"/admin/api/agents/{er_id}")
+        reimported = r.json()
+        for field, expected in [
+            ("expose_chat", False),
+            ("expose_api", True),
+            ("api_slug", "export-roundtrip"),
+            ("run_prompt", "Run the nightly check."),
+            ("run_timeout_seconds", 1200),
+            ("expected_sections", ["st22", "sm21"]),
+        ]:
+            check(
+                f"import restores {field}",
+                reimported.get(field) == expected,
+                f"got {reimported.get(field)!r}",
+            )
+        check(
+            "import preserves existing run_as_principal",
+            reimported.get("run_as_principal") == "svc-export@example.com",
+            f"got {reimported.get('run_as_principal')!r}",
+        )
+
+        r = await client.delete(f"/admin/api/agents/{er_id}")
+        check("export roundtrip cleanup", r.status_code == 204, r.text)
+
+        # --- /admin/api/runs limit is capped --------------------------------
+        print("\n== GET /admin/api/runs limit bounds ==")
+        r = await client.get("/admin/api/runs", params={"limit": 100000})
+        check("oversized limit rejected", r.status_code == 422, r.text)
+        r = await client.get("/admin/api/runs", params={"limit": 0})
+        check("zero limit rejected", r.status_code == 422, r.text)
+        r = await client.get("/admin/api/runs", params={"limit": 10})
+        check("in-range limit accepted", r.status_code == 200, r.text)
+
+        # --- Successful triggers: exercise the 202 contract end-to-end ------
+        # Build the specialist so execute_run's background task can look it
+        # up (it does not itself crash the test either way -- execute_run
+        # never raises -- but this keeps the trigger meaningful).
+        r = await client.post("/admin/api/reload")
+        check("reload before triggering 200", r.status_code == 200, r.text)
+
+        print("\n== POST /api/agents/{slug}/run (scheduler-facing) ==")
+        import agents.job_runner as job_runner
+
+        r = await client.post("/api/agents/run-agent/run")
+        check("scheduled run accepted", r.status_code == 202, r.text)
+        sched_run_id = r.json().get("run_id")
+        check("run_id returned", bool(sched_run_id), r.text)
+
+        # Drain the background task the run spawned so it doesn't leak a
+        # "Task was destroyed but it is pending" warning at process exit
+        # (same pattern as tests/test_job_runs.py).
+        for t in list(job_runner._tasks):
+            await t
+
+        r = await client.get(f"/admin/api/runs/{sched_run_id}")
+        check("run detail 200", r.status_code == 200, r.text)
+        detail = r.json()
+        check("run detail has report key", "report" in detail, detail)
+        check("run detail id matches", detail["id"] == sched_run_id, detail)
+
+        r = await client.get("/admin/api/runs/does-not-exist")
+        check("unknown run id -> 404", r.status_code == 404, r.text)
+
+        print("\n== POST /admin/api/agents/{id}/run (run-now) ==")
+        r = await client.post(f"/admin/api/agents/{agent_id}/run")
+        check("run-now accepted", r.status_code == 202, r.text)
+        manual_run_id = r.json().get("run_id")
+        check("run_id returned", bool(manual_run_id), r.text)
+
+        for t in list(job_runner._tasks):
+            await t
+
+        r = await client.get("/admin/api/runs", params={"agent_id": agent_id})
+        check(
+            "run list filtered by agent_id",
+            r.status_code == 200 and all(run["agent_id"] == agent_id for run in r.json()),
+            r.text,
+        )
+        check(
+            "both runs present in filtered list",
+            {sched_run_id, manual_run_id} <= {run["id"] for run in r.json()},
+            r.text,
+        )
+
+        # --- whoami: the caller's own principal ----------------------------
+        # run_as_principal must hold the opaque XSUAA principal (user_uuid/sub),
+        # not an email — an admin cannot know or type that, so the UI has to
+        # offer it. Without this the field is unusable by construction.
+        print("\n== whoami ==")
+        r = await client.get("/admin/api/whoami")
+        # Note: an unmatched /admin/api/* path falls through to the chat app
+        # mounted at "/", which answers 200 with HTML — so assert on the body
+        # type, not just the status, or a missing route looks like a pass.
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        check("whoami returns JSON", body is not None, r.text[:120])
+        check("whoami exposes principal", isinstance(body, dict) and "principal" in body, r.text[:120])
+        check("whoami exposes a display label", isinstance(body, dict) and "label" in body, r.text[:120])
+
+        # --- credential status per MCP server ------------------------------
+        # Shows whether a given principal actually holds a token for each of
+        # the agent's oauth2 servers, so a misconfigured run-as is visible in
+        # the form instead of surfacing as a failed run hours later.
+        print("\n== credential status ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "Cred Agent", "description": "d", "instructions": "i",
+            "mcp_url": "https://cred.example.com/mcp", "auth_mode": "none",
+            "expose_api": True, "api_slug": "cred-agent",
+        })
+        check("create agent for credential check", r.status_code == 201, r.text)
+        cred_id = r.json()["id"]
+
+        r = await client.get(f"/admin/api/agents/{cred_id}/credentials")
+        is_json = r.headers.get("content-type", "").startswith("application/json")
+        check("credentials returns JSON", is_json, r.text[:120])
+        servers = r.json() if is_json else []
+        check("credentials lists every server", len(servers) == 1, r.text)
+        check(
+            "auth_mode none needs no token",
+            servers[0]["auth_mode"] == "none" and servers[0]["needs_token"] is False,
+            r.text,
+        )
+
+        r = await client.get("/admin/api/agents/999999/credentials")
+        check("credentials 404s on unknown agent", r.status_code == 404, r.text)
+
+        # An oauth2 server with no stored token for the principal reports False.
+        r = await client.put(f"/admin/api/agents/{cred_id}", json={
+            "name": "Cred Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{
+                "url": "https://cred.cfapps.eu20-001.hana.ondemand.com/mcp",
+                "auth_mode": "oauth2",
+                "oauth": {"dcr": True},
+            }],
+            "expose_api": True, "api_slug": "cred-agent",
+        })
+        check("switch server to oauth2", r.status_code == 200, r.text)
+        r = await client.get(
+            f"/admin/api/agents/{cred_id}/credentials", params={"principal": "nobody"}
+        )
+        srv = r.json()[0]
+        check("oauth2 server needs a token", srv["needs_token"] is True, r.text)
+        check("unknown principal has no token", srv["has_token"] is False, r.text)
+        check("credentials exposes a login link", bool(srv.get("login_url")), r.text)
+        check(
+            "login link targets this server",
+            "server=" in srv.get("login_url", "") and "agent=" in srv.get("login_url", ""),
+            r.text,
+        )
+
         # --- Lifespan shutdown ---------------------------------------------
         received.append({"type": "lifespan.shutdown"})
         try:
