@@ -157,6 +157,30 @@ class AgentConfig(Base):
     # JSON-encoded list of skill names (SkillConfig.name) attached to this
     # agent. Skills are referenced by name so exports stay portable.
     skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # API exposure. expose_chat keeps the agent in the orchestrator's
+    # delegation list; expose_api gives it a run endpoint. They are
+    # independent: a run-only agent is expose_chat=0, expose_api=1.
+    expose_chat: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    expose_api: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # URL segment for POST /api/agents/{api_slug}/run. Uniqueness is enforced
+    # in upsert_agent, not by a DB constraint (see plan Global Constraints).
+    api_slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Identity API-triggered runs bind via run_as(). No interactive user
+    # exists at 03:00, so this names the technical account whose stored
+    # OAuth2 token the run uses.
+    run_as_principal: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # User prompt handed to Agent.run(). The work itself is described by the
+    # agent's instructions and attached skills; this just starts it.
+    run_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    run_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1800, server_default="1800"
+    )
+    # JSON list of source_keys a complete report must contain.
+    expected_sections_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -213,6 +237,20 @@ class AgentConfig(Base):
             return []
         return [str(s) for s in data if isinstance(s, str) and s.strip()]
 
+    @property
+    def expected_sections(self) -> list[str]:
+        """source_keys a complete report must contain (may be empty)."""
+        if not self.expected_sections_json:
+            return []
+        try:
+            data = json.loads(self.expected_sections_json)
+        except Exception:
+            logger.warning("Malformed expected_sections_json on agent %s", self.name)
+            return []
+        if not isinstance(data, list):
+            return []
+        return [str(s) for s in data if isinstance(s, str) and s.strip()]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -224,6 +262,13 @@ class AgentConfig(Base):
             "mcp_servers": _redact_servers(self.mcp_servers),
             "skills": self.skills,
             "enabled": bool(self.enabled),
+            "expose_chat": bool(self.expose_chat),
+            "expose_api": bool(self.expose_api),
+            "api_slug": self.api_slug,
+            "run_as_principal": self.run_as_principal,
+            "run_prompt": self.run_prompt or "",
+            "run_timeout_seconds": self.run_timeout_seconds,
+            "expected_sections": self.expected_sections,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -236,6 +281,12 @@ class AgentConfig(Base):
             "mcp_servers": _redact_servers(self.mcp_servers),
             "skills": self.skills,
             "enabled": bool(self.enabled),
+            "expose_chat": bool(self.expose_chat),
+            "expose_api": bool(self.expose_api),
+            "api_slug": self.api_slug,
+            "run_prompt": self.run_prompt or "",
+            "run_timeout_seconds": self.run_timeout_seconds,
+            "expected_sections": self.expected_sections,
         }
 
 
@@ -400,6 +451,10 @@ DEFAULT_ORCHESTRATOR_INSTRUCTIONS = (
     "relevant specialists one at a time and synthesize their responses."
 )
 
+DEFAULT_RUN_PROMPT = (
+    "Perform your configured check now and return the structured report."
+)
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -424,6 +479,26 @@ async def init_db() -> None:
         )
         await _ensure_column(
             conn, "agent_configs", "skills_json", "TEXT"
+        )
+        await _ensure_column(
+            conn, "agent_configs", "expose_chat", "INTEGER NOT NULL DEFAULT 1"
+        )
+        await _ensure_column(
+            conn, "agent_configs", "expose_api", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(conn, "agent_configs", "api_slug", "VARCHAR(64)")
+        await _ensure_column(
+            conn, "agent_configs", "run_as_principal", "VARCHAR(255)"
+        )
+        await _ensure_column(conn, "agent_configs", "run_prompt", "TEXT")
+        await _ensure_column(
+            conn,
+            "agent_configs",
+            "run_timeout_seconds",
+            "INTEGER NOT NULL DEFAULT 1800",
+        )
+        await _ensure_column(
+            conn, "agent_configs", "expected_sections_json", "TEXT"
         )
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
@@ -475,6 +550,13 @@ async def get_agent(session: AsyncSession, agent_id: int) -> AgentConfig | None:
 
 async def get_agent_by_name(session: AsyncSession, name: str) -> AgentConfig | None:
     result = await session.execute(select(AgentConfig).where(AgentConfig.name == name))
+    return result.scalar_one_or_none()
+
+
+async def get_agent_by_slug(session: AsyncSession, slug: str) -> AgentConfig | None:
+    result = await session.execute(
+        select(AgentConfig).where(AgentConfig.api_slug == slug)
+    )
     return result.scalar_one_or_none()
 
 
@@ -596,11 +678,26 @@ async def upsert_agent(
     mcp_servers: list[dict[str, Any]],
     skills: list[str] | None = None,
     enabled: bool = True,
+    expose_chat: bool = True,
+    expose_api: bool = False,
+    api_slug: str | None = None,
+    run_as_principal: str | None = None,
+    run_prompt: str | None = None,
+    run_timeout_seconds: int = 1800,
+    expected_sections: list[str] | None = None,
 ) -> AgentConfig:
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
+
+    slug = (api_slug or "").strip() or None
+    if slug:
+        clash = await get_agent_by_slug(session, slug)
+        if clash is not None and (existing is None or clash.id != existing.id):
+            raise ValueError(f"api_slug {slug!r} is already used by agent {clash.name!r}")
+    if expose_api and not slug:
+        raise ValueError("expose_api requires an api_slug")
 
     if existing is None:
         row = AgentConfig(
@@ -615,6 +712,15 @@ async def upsert_agent(
             enabled=1 if enabled else 0,
         )
         session.add(row)
+        row.expose_chat = 1 if expose_chat else 0
+        row.expose_api = 1 if expose_api else 0
+        row.api_slug = slug
+        row.run_as_principal = (run_as_principal or "").strip() or None
+        row.run_prompt = (run_prompt or "").strip() or None
+        row.run_timeout_seconds = int(run_timeout_seconds)
+        row.expected_sections_json = (
+            json.dumps(expected_sections) if expected_sections else None
+        )
     else:
         existing.description = description
         existing.instructions = instructions
@@ -624,6 +730,15 @@ async def upsert_agent(
         existing.oauth_json = primary_oauth_json
         existing.skills_json = skills_json
         existing.enabled = 1 if enabled else 0
+        existing.expose_chat = 1 if expose_chat else 0
+        existing.expose_api = 1 if expose_api else 0
+        existing.api_slug = slug
+        existing.run_as_principal = (run_as_principal or "").strip() or None
+        existing.run_prompt = (run_prompt or "").strip() or None
+        existing.run_timeout_seconds = int(run_timeout_seconds)
+        existing.expected_sections_json = (
+            json.dumps(expected_sections) if expected_sections else None
+        )
         row = existing
     await session.commit()
     await session.refresh(row)
