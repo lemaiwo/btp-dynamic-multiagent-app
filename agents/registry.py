@@ -415,9 +415,12 @@ async def build_orchestrator() -> BuildResult:
     specialists: dict[str, Agent] = {}
     mcp_clients: list = []
 
-    # Build the orchestrator instructions, listing enabled specialists
+    # Build the orchestrator instructions, listing only chat-visible specialists.
+    # Run-only agents (expose_chat=False) are still built into `specialists`
+    # below (a later task's runner needs them) but must stay invisible to chat.
+    chat_rows = [r for r in enabled_rows if r.expose_chat]
     specialist_lines = [
-        f"- **{r.name}**: {r.description.strip()}" for r in enabled_rows
+        f"- **{r.name}**: {r.description.strip()}" for r in chat_rows
     ]
     instructions = orch_instructions.strip()
     if specialist_lines:
@@ -426,8 +429,8 @@ async def build_orchestrator() -> BuildResult:
         # With exactly one specialist there is no routing decision to make —
         # always forward. Deliberating (or trying to answer directly) just adds
         # latency and the occasional refusal, so make delegation mandatory.
-        if len(enabled_rows) == 1:
-            only = enabled_rows[0]
+        if len(chat_rows) == 1:
+            only = chat_rows[0]
             instructions += (
                 f"\n\nThere is currently only ONE specialist available: "
                 f"**{only.name}**. Forward every request that needs a specialist "
@@ -443,7 +446,7 @@ async def build_orchestrator() -> BuildResult:
         instructions += (
             "\n\nBefore you call a specialist, tell the user in one short line "
             "what you're about to do (e.g. \"Checking with the "
-            f"{enabled_rows[0].name} specialist…\"). When a request needs several "
+            f"{chat_rows[0].name} specialist…\"). When a request needs several "
             "specialists, narrate each step before the corresponding call so the "
             "user can follow your progress instead of staring at a silent screen."
         )
@@ -524,7 +527,10 @@ async def build_orchestrator() -> BuildResult:
             _attach_skills_tool(specialist, row.name, attached_skills)
         specialists[row.name] = specialist
 
-        _attach_delegation_tool(orchestrator, specialist, row)
+        # Run-only agents are built (the runner needs them) but must not be
+        # reachable from chat.
+        if row.expose_chat:
+            _attach_delegation_tool(orchestrator, specialist, row)
 
     return BuildResult(
         orchestrator=orchestrator,

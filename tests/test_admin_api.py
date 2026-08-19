@@ -439,6 +439,58 @@ async def run_tests() -> None:
         r = await client.get("/admin/api/agents/999999")
         check("404", r.status_code == 404)
 
+        # --- Chat exposure filtering (behavioural) --------------------------
+        # Task 1 added AgentConfig.expose_chat; this checks the orchestrator
+        # actually honours it (not just that the DB stores it): a chat-visible
+        # agent must get a delegation tool, a run-only one must not, while both
+        # are still built as specialists (the scheduled/API runner needs them).
+        print("\n== Chat exposure filtering (orchestrator tools) ==")
+        from agents.db import SessionLocal as _SessionLocal
+        from agents.db import upsert_agent
+        from agents.registry import _sanitize_tool_name, registry
+
+        expose_url = "https://expose-test.cfapps.eu20-001.hana.ondemand.com"
+        async with _SessionLocal() as s:
+            await upsert_agent(
+                s, name="chat-visible", description="d", instructions="i",
+                mcp_servers=[{"url": expose_url, "auth_mode": "none"}],
+                enabled=True, expose_chat=True,
+            )
+            await upsert_agent(
+                s, name="run-only", description="d", instructions="i",
+                mcp_servers=[{"url": expose_url, "auth_mode": "none"}],
+                enabled=True, expose_chat=False,
+            )
+
+        r = await client.post("/admin/api/reload")
+        check(
+            "reload after exposure agents 200",
+            r.status_code == 200,
+            f"got {r.status_code}: {r.text}",
+        )
+
+        build = registry.build
+        check(
+            "both agents built as specialists",
+            "chat-visible" in build.specialists and "run-only" in build.specialists,
+            f"got {list(build.specialists)}",
+        )
+
+        # Inspect the orchestrator's registered tools directly (same private
+        # attribute `_attach_delegation_tool` in agents/registry.py relies on
+        # implicitly via Agent.tool()) rather than trying to run the model.
+        tool_names = set(build.orchestrator._function_toolset.tools.keys())
+        check(
+            "chat-visible has a delegation tool",
+            _sanitize_tool_name("chat-visible") in tool_names,
+            f"got {tool_names}",
+        )
+        check(
+            "run-only has NO delegation tool",
+            _sanitize_tool_name("run-only") not in tool_names,
+            f"got {tool_names}",
+        )
+
         # --- Lifespan shutdown ---------------------------------------------
         received.append({"type": "lifespan.shutdown"})
         try:
