@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
@@ -46,6 +46,7 @@ from agents.db import (
     delete_skill,
     get_active_model_name,
     get_agent,
+    get_agent_by_slug,
     get_orchestrator_instructions,
     get_skill,
     get_skill_by_name,
@@ -382,8 +383,6 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
-            from agents.db import get_agent_by_slug
-
             slug = payload.api_slug.strip() or None
             if slug:
                 clash = await get_agent_by_slug(session, slug)
@@ -456,7 +455,10 @@ async def api_run_now(agent_id: int) -> dict[str, str]:
 
 
 @router.get("/api/runs", dependencies=[Depends(require_admin)])
-async def api_list_runs(agent_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+async def api_list_runs(
+    agent_id: int | None = None,
+    limit: int = Query(50, ge=1, le=500),
+) -> list[dict[str, Any]]:
     from agents.db import list_job_runs
 
     async with SessionLocal() as session:
@@ -669,6 +671,10 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         imported_names = set()
         for agent in payload.agents:
             try:
+                # run_as_principal is deliberately not carried by exports
+                # (it is a landscape-specific service identity), and is
+                # therefore omitted here so upsert_agent preserves whatever
+                # this landscape already has rather than wiping it.
                 await upsert_agent(
                     session,
                     name=agent.name,
@@ -677,6 +683,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     mcp_servers=agent.to_servers_list(),
                     skills=agent.skills,
                     enabled=agent.enabled,
+                    expose_chat=agent.expose_chat,
+                    expose_api=agent.expose_api,
+                    api_slug=agent.api_slug,
+                    run_prompt=agent.run_prompt,
+                    run_timeout_seconds=agent.run_timeout_seconds,
+                    expected_sections=agent.expected_sections,
                 )
             except ValueError as e:
                 raise HTTPException(
@@ -766,6 +778,13 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     mcp_servers=payload.to_servers_list(),
                     skills=payload.skills,
                     enabled=payload.enabled,
+                    expose_chat=payload.expose_chat,
+                    expose_api=payload.expose_api,
+                    api_slug=payload.api_slug,
+                    run_as_principal=payload.run_as_principal,
+                    run_prompt=payload.run_prompt,
+                    run_timeout_seconds=payload.run_timeout_seconds,
+                    expected_sections=payload.expected_sections,
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
