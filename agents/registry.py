@@ -719,17 +719,35 @@ class Registry:
                 len(new.configs),
             )
 
-            # Best-effort cleanup of the previous MCP clients
+            # Best-effort cleanup of the previous MCP clients — but only
+            # when nothing is still using them. An API-triggered run captured
+            # its specialist from the old build and may run for up to its
+            # timeout (30 min by default); closing that build's transports
+            # would kill the run mid-flight with an opaque closed-client
+            # error. Since the admin UI asks the operator to reload after
+            # every save, that is an easy accident to cause. Leaking the
+            # clients until the next reload is the cheaper failure.
             if old is not None:
-                for server in old.mcp_clients:
-                    try:
-                        client = getattr(server, "_http_client", None) or getattr(
-                            server, "http_client", None
-                        )
-                        if client is not None:
-                            await client.aclose()
-                    except Exception:
-                        logger.debug("Failed to close old MCP client", exc_info=True)
+                # Deferred import: job_runner imports this module at load
+                # time, so a top-level import here would be circular.
+                from agents.job_runner import _tasks as in_flight_runs
+
+                if in_flight_runs:
+                    logger.info(
+                        "Keeping %d MCP client(s) from the previous build open: "
+                        "%d job run(s) still in flight are using them.",
+                        len(old.mcp_clients), len(in_flight_runs),
+                    )
+                else:
+                    for server in old.mcp_clients:
+                        try:
+                            client = getattr(server, "_http_client", None) or getattr(
+                                server, "http_client", None
+                            )
+                            if client is not None:
+                                await client.aclose()
+                        except Exception:
+                            logger.debug("Failed to close old MCP client", exc_info=True)
 
             return new
 

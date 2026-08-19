@@ -50,6 +50,25 @@ class RunRefused(Exception):
     """The run could not be started (already running, or not API-exposed)."""
 
 
+async def cancel_all_runs() -> None:
+    """Cancel every in-flight run and wait for it to finalize.
+
+    Called from the lifespan shutdown. Without this, SIGTERM tears the event
+    loop down under the running tasks, the CancelledError -> `interrupted`
+    path in execute_run is never reliably reached, and the rows stay
+    `running` until the next startup sweep clears them.
+    """
+    tasks = [t for t in _tasks if not t.done()]
+    if not tasks:
+        return
+    logger.info("Cancelling %d in-flight job run(s) for shutdown", len(tasks))
+    for task in tasks:
+        task.cancel()
+    # return_exceptions: each task re-raises CancelledError after recording
+    # itself as interrupted, and that must not abort the shutdown sequence.
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _has_usable_credentials(agent: AgentConfig) -> bool:
     """True when every oauth2 server this agent binds has a usable token for
     its run-as principal. Patched in tests."""
@@ -130,6 +149,23 @@ async def execute_run(run_id: str, agent_id: int) -> None:
             agent = await session.get(AgentConfig, agent_id)
         if agent is None:
             await _finalize(run_id, status="failed", error="Agent no longer exists.")
+            return
+
+        # Distinguish "never configured" from "configured but stale": both
+        # stop the run, but they need opposite fixes, and pointing an
+        # operator at re-authorization when no service account exists yet is
+        # a dead end.
+        if not agent.run_as_principal:
+            await _finalize(
+                run_id, status="failed",
+                error=(
+                    "No run-as principal is configured for this agent. Set "
+                    "'Run as (technical user)' in the admin UI to a service "
+                    "account that has authorized this agent's MCP servers; a "
+                    "scheduled run has no interactive user to borrow an "
+                    "identity from."
+                ),
+            )
             return
 
         if not await _has_usable_credentials(agent):
