@@ -93,6 +93,16 @@ async def main() -> None:
     print("\n== default run prompt ==")
     check("DEFAULT_RUN_PROMPT is non-empty", bool(DEFAULT_RUN_PROMPT.strip()))
 
+    print("\n== chat exposure filtering ==")
+    from agents.db import list_agents
+
+    async with SessionLocal() as s:
+        rows = [r for r in await list_agents(s) if r.enabled]
+    chat_rows = [r for r in rows if r.expose_chat]
+    check("run-only agent excluded from chat", all(r.name != "Daily Check" for r in chat_rows))
+    check("chat agent still included", any(r.name == "chat-only" for r in chat_rows))
+    check("both agents still built as specialists", len(rows) >= 2)
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
