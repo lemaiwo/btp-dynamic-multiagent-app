@@ -335,8 +335,16 @@
                 </label>
                 <p class="hint" id="agent-endpoint-hint">Endpoint: <code>POST /api/agents/&lt;slug&gt;/run</code></p>
                 <label>Run as (technical user)
-                    <input type="text" id="agent-run-as" placeholder="svc-account@company.com">
+                    <input type="text" id="agent-run-as" placeholder="XSUAA principal id"
+                           oninput="refreshCredentials()">
                 </label>
+                <p class="hint">
+                    This is an opaque XSUAA principal id, not an email address.
+                    <button type="button" class="secondary" id="agent-use-my-identity"
+                            onclick="useMyIdentity()">Use my identity</button>
+                    <span id="agent-whoami"></span>
+                </p>
+                <div id="agent-credentials"></div>
                 <label>Run prompt
                     <input type="text" id="agent-run-prompt" placeholder="Perform your configured check now.">
                 </label>
@@ -702,6 +710,7 @@ function openAgentModal() {
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-expose-api').checked = false;
     document.getElementById('agent-api-slug').value = '';
+    refreshCredentials();
     document.getElementById('agent-run-as').value = '';
     document.getElementById('agent-run-prompt').value = '';
     document.getElementById('agent-run-timeout').value = 1800;
@@ -726,6 +735,74 @@ function updateEndpointHint() {
             + 'and authorize the run-as account.';
     }
     document.getElementById('agent-endpoint-hint').innerHTML = html;
+}
+
+// --- run-as identity helpers ----------------------------------------------
+// run_as_principal holds the opaque XSUAA principal (user_uuid/sub). Nobody
+// can type that from memory, so the UI has to hand it over and show whether
+// the chosen identity actually holds a token for each OAuth2 server.
+let _whoami = null;
+
+async function loadWhoami() {
+    try {
+        const res = await fetch('/admin/api/whoami');
+        if (!res.ok) return;
+        _whoami = await res.json();
+        const label = _whoami.label ? _whoami.label + ' — ' : '';
+        document.getElementById('agent-whoami').innerHTML =
+            'You are ' + esc(label) + '<code>' + esc(_whoami.principal || '') + '</code>';
+    } catch (e) { /* non-fatal: the field still accepts a pasted id */ }
+}
+
+function useMyIdentity() {
+    if (!_whoami || !_whoami.principal) return;
+    document.getElementById('agent-run-as').value = _whoami.principal;
+    refreshCredentials();
+}
+
+async function refreshCredentials() {
+    const box = document.getElementById('agent-credentials');
+    if (!box) return;
+    const agentId = document.getElementById('agent-id').value;
+    if (!agentId) {
+        box.innerHTML = '<p class="hint">Save the agent first to check its credentials.</p>';
+        return;
+    }
+    const principal = document.getElementById('agent-run-as').value.trim();
+    try {
+        const res = await fetch('/admin/api/agents/' + encodeURIComponent(agentId)
+            + '/credentials?principal=' + encodeURIComponent(principal));
+        if (!res.ok) { box.innerHTML = ''; return; }
+        const servers = await res.json();
+        const oauth = servers.filter(s => s.needs_token);
+        if (!oauth.length) {
+            box.innerHTML = '<p class="hint">No OAuth2 servers — this agent needs no sign-in.</p>';
+            return;
+        }
+        box.innerHTML = '<p class="hint">Connecting signs in as <strong>you</strong>'
+            + (_whoami && _whoami.label ? ' (' + esc(_whoami.label) + ')' : '')
+            + ', not as the id above. To connect a service account, log in to this app '
+            + 'as that account first.</p>'
+            + oauth.map(s => '<p class="hint">'
+                + (s.has_token
+                    ? '<span style="color:var(--ok,green)">connected</span>'
+                    : '<span style="color:var(--warn)">not connected</span>')
+                + ' <code>' + esc(s.url) + '</code> '
+                + '<button type="button" class="secondary" '
+                + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                + '</p>').join('');
+    } catch (e) { box.innerHTML = ''; }
+}
+
+function connectServer(loginUrl) {
+    // Same-origin /oauth/login only — never open an arbitrary URL from a
+    // response body in a popup.
+    if (!/^\/oauth\/login\?/.test(loginUrl)) return;
+    const w = window.open(loginUrl, 'mcp-signin', 'width=520,height=700');
+    // The popup closes itself on success; re-check when it does.
+    const timer = setInterval(() => {
+        if (!w || w.closed) { clearInterval(timer); refreshCredentials(); }
+    }, 1000);
 }
 
 function collectExpectedSections() {
@@ -758,6 +835,7 @@ async function editAgent(id) {
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
     document.getElementById('agent-api-slug').value = a.api_slug || '';
     document.getElementById('agent-run-as').value = a.run_as_principal || '';
+    refreshCredentials();
     document.getElementById('agent-run-prompt').value = a.run_prompt || '';
     document.getElementById('agent-run-timeout').value = a.run_timeout_seconds || 1800;
     document.getElementById('agent-expected-sections').value = (a.expected_sections || []).join(', ');
@@ -992,6 +1070,7 @@ async function runAgentNow(agentId) {
 
 loadSkills();
 loadAgents();
+loadWhoami();
 loadOrchestrator();
 loadModel();
 </script>

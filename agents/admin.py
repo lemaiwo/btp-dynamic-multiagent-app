@@ -430,6 +430,79 @@ async def api_delete_agent(agent_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Identity helpers for run-as configuration
+# ---------------------------------------------------------------------------
+@router.get("/api/whoami")
+async def api_whoami(payload: dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    """The caller's own principal, so the admin UI can offer it for run-as.
+
+    ``run_as_principal`` stores the opaque XSUAA principal (``user_uuid`` /
+    ``sub``), which nobody can recall or type. Without the UI handing it over,
+    the field is unusable: an admin naturally types an email address, which
+    matches no row in the token store, and every run then fails claiming the
+    service account needs re-authorization.
+    """
+    label = payload.get("email") or payload.get("user_name") or ""
+    return {"principal": current_principal.get() or "", "label": str(label)}
+
+
+@router.get("/api/agents/{agent_id}/credentials", dependencies=[Depends(require_admin)])
+async def api_agent_credentials(
+    agent_id: int, principal: str = Query(default="", max_length=255)
+) -> list[dict[str, Any]]:
+    """Per-MCP-server credential status for a principal, plus a sign-in link.
+
+    Lets the agent form show whether the configured run-as identity actually
+    holds a token for each oauth2 server *before* a run is triggered, instead
+    of the mismatch surfacing hours later as a failed scheduled run.
+
+    ``principal`` defaults to the agent's stored ``run_as_principal``.
+    """
+    from urllib.parse import quote
+
+    from agents.oauth2 import has_usable_token, normalize_mcp_url
+
+    async with SessionLocal() as session:
+        row = await get_agent(session, agent_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        agent_name = row.name
+        servers = row.mcp_servers
+        stored_principal = row.run_as_principal
+
+    who = (principal or "").strip() or (stored_principal or "")
+    out: list[dict[str, Any]] = []
+    for spec in servers:
+        url = str(spec.get("url") or "")
+        auth_mode = str(spec.get("auth_mode") or "")
+        needs_token = auth_mode == AUTH_MODE_OAUTH2
+        has_token = False
+        login_url = ""
+        if needs_token:
+            server_key = normalize_mcp_url(url)
+            login_url = (
+                f"/oauth/login?agent={quote(agent_name)}"
+                f"&server={quote(server_key, safe='')}"
+            )
+            if who:
+                try:
+                    has_token = await has_usable_token(who, server_key)
+                except Exception:  # noqa: BLE001 — status display must not 500
+                    logger.warning(
+                        "Could not read token status for %s on %s",
+                        who, server_key, exc_info=True,
+                    )
+        out.append({
+            "url": url,
+            "auth_mode": auth_mode,
+            "needs_token": needs_token,
+            "has_token": has_token,
+            "login_url": login_url,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Runs (Run-now button + run listing)
 # ---------------------------------------------------------------------------
 @router.post(

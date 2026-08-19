@@ -766,6 +766,71 @@ async def run_tests() -> None:
             r.text,
         )
 
+        # --- whoami: the caller's own principal ----------------------------
+        # run_as_principal must hold the opaque XSUAA principal (user_uuid/sub),
+        # not an email — an admin cannot know or type that, so the UI has to
+        # offer it. Without this the field is unusable by construction.
+        print("\n== whoami ==")
+        r = await client.get("/admin/api/whoami")
+        # Note: an unmatched /admin/api/* path falls through to the chat app
+        # mounted at "/", which answers 200 with HTML — so assert on the body
+        # type, not just the status, or a missing route looks like a pass.
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        check("whoami returns JSON", body is not None, r.text[:120])
+        check("whoami exposes principal", isinstance(body, dict) and "principal" in body, r.text[:120])
+        check("whoami exposes a display label", isinstance(body, dict) and "label" in body, r.text[:120])
+
+        # --- credential status per MCP server ------------------------------
+        # Shows whether a given principal actually holds a token for each of
+        # the agent's oauth2 servers, so a misconfigured run-as is visible in
+        # the form instead of surfacing as a failed run hours later.
+        print("\n== credential status ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "Cred Agent", "description": "d", "instructions": "i",
+            "mcp_url": "https://cred.example.com/mcp", "auth_mode": "none",
+            "expose_api": True, "api_slug": "cred-agent",
+        })
+        check("create agent for credential check", r.status_code == 201, r.text)
+        cred_id = r.json()["id"]
+
+        r = await client.get(f"/admin/api/agents/{cred_id}/credentials")
+        is_json = r.headers.get("content-type", "").startswith("application/json")
+        check("credentials returns JSON", is_json, r.text[:120])
+        servers = r.json() if is_json else []
+        check("credentials lists every server", len(servers) == 1, r.text)
+        check(
+            "auth_mode none needs no token",
+            servers[0]["auth_mode"] == "none" and servers[0]["needs_token"] is False,
+            r.text,
+        )
+
+        r = await client.get("/admin/api/agents/999999/credentials")
+        check("credentials 404s on unknown agent", r.status_code == 404, r.text)
+
+        # An oauth2 server with no stored token for the principal reports False.
+        r = await client.put(f"/admin/api/agents/{cred_id}", json={
+            "name": "Cred Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{
+                "url": "https://cred.cfapps.eu20-001.hana.ondemand.com/mcp",
+                "auth_mode": "oauth2",
+                "oauth": {"dcr": True},
+            }],
+            "expose_api": True, "api_slug": "cred-agent",
+        })
+        check("switch server to oauth2", r.status_code == 200, r.text)
+        r = await client.get(
+            f"/admin/api/agents/{cred_id}/credentials", params={"principal": "nobody"}
+        )
+        srv = r.json()[0]
+        check("oauth2 server needs a token", srv["needs_token"] is True, r.text)
+        check("unknown principal has no token", srv["has_token"] is False, r.text)
+        check("credentials exposes a login link", bool(srv.get("login_url")), r.text)
+        check(
+            "login link targets this server",
+            "server=" in srv.get("login_url", "") and "agent=" in srv.get("login_url", ""),
+            r.text,
+        )
+
         # --- Lifespan shutdown ---------------------------------------------
         received.append({"type": "lifespan.shutdown"})
         try:
