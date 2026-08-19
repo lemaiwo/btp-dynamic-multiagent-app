@@ -743,6 +743,22 @@ async def normalize_skills_json(
     return json.dumps(cleaned)
 
 
+class _Keep:
+    """Sentinel for upsert_agent: leave the stored value untouched.
+
+    ``run_as_principal`` is a landscape-specific service identity and is
+    deliberately absent from exports (see AgentConfig.to_export), so the
+    import and seed paths pass nothing for it. Defaulting it to None instead
+    would silently un-configure every API agent on the first import.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<KEEP>"
+
+
+KEEP = _Keep()
+
+
 async def upsert_agent(
     session: AsyncSession,
     *,
@@ -755,7 +771,7 @@ async def upsert_agent(
     expose_chat: bool = True,
     expose_api: bool = False,
     api_slug: str | None = None,
-    run_as_principal: str | None = None,
+    run_as_principal: str | None | _Keep = KEEP,
     run_prompt: str | None = None,
     run_timeout_seconds: int = 1800,
     expected_sections: list[str] | None = None,
@@ -789,7 +805,10 @@ async def upsert_agent(
         row.expose_chat = 1 if expose_chat else 0
         row.expose_api = 1 if expose_api else 0
         row.api_slug = slug
-        row.run_as_principal = (run_as_principal or "").strip() or None
+        row.run_as_principal = (
+            None if isinstance(run_as_principal, _Keep)
+            else (run_as_principal or "").strip() or None
+        )
         row.run_prompt = (run_prompt or "").strip() or None
         row.run_timeout_seconds = int(run_timeout_seconds)
         row.expected_sections_json = (
@@ -807,7 +826,10 @@ async def upsert_agent(
         existing.expose_chat = 1 if expose_chat else 0
         existing.expose_api = 1 if expose_api else 0
         existing.api_slug = slug
-        existing.run_as_principal = (run_as_principal or "").strip() or None
+        # KEEP: the caller did not carry a principal (import / seed), so the
+        # environment-specific identity already stored here is preserved.
+        if not isinstance(run_as_principal, _Keep):
+            existing.run_as_principal = (run_as_principal or "").strip() or None
         existing.run_prompt = (run_prompt or "").strip() or None
         existing.run_timeout_seconds = int(run_timeout_seconds)
         existing.expected_sections_json = (
@@ -1155,11 +1177,19 @@ async def active_job_run(session: AsyncSession, agent_id: int) -> JobRun | None:
     return result.scalars().first()
 
 
-async def sweep_stale_runs(session: AsyncSession) -> int:
+async def sweep_stale_runs(session: AsyncSession, *, all_running: bool = False) -> int:
     """Mark runs that outlived their timeout as interrupted.
 
     A crashed or redeployed run would otherwise stay `running` forever and
     wedge the overlap lock, making the agent permanently untriggerable.
+
+    With ``all_running=True`` every `running` row is swept regardless of age.
+    That is the correct behaviour at startup: a freshly started process owns
+    no in-flight run, so any row still marked running is by definition a
+    ghost from the previous process — waiting out its (up to 24h) timeout
+    would leave the agent untriggerable for that whole window. The age-based
+    default is for sweeps taken while this process is live, where a young
+    `running` row may well be one of our own.
     """
     result = await session.execute(
         select(JobRun).where(JobRun.status == ACTIVE_RUN_STATUS)
@@ -1167,16 +1197,22 @@ async def sweep_stale_runs(session: AsyncSession) -> int:
     now = datetime.now(timezone.utc)
     swept = 0
     for row in result.scalars().all():
-        started = row.started_at
-        if started is None:
-            continue
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        if (now - started).total_seconds() > row.timeout_seconds:
-            row.status = "interrupted"
-            row.finished_at = now
-            row.error = "Run did not finish within its timeout (app restart or crash)."
-            swept += 1
+        if not all_running:
+            started = row.started_at
+            if started is None:
+                continue
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if (now - started).total_seconds() <= row.timeout_seconds:
+                continue
+        row.status = "interrupted"
+        row.finished_at = now
+        row.error = (
+            "Run was interrupted by an app restart."
+            if all_running
+            else "Run did not finish within its timeout (app restart or crash)."
+        )
+        swept += 1
     if swept:
         await session.commit()
     return swept

@@ -617,6 +617,104 @@ async def run_tests() -> None:
         r = await client.delete(f"/admin/api/agents/{rt_id}")
         check("roundtrip agent cleanup", r.status_code == 204, r.text)
 
+        # --- Export -> import round-trip ------------------------------------
+        # Import-with-replace is the documented dev->prod promotion path, so
+        # an export that carries the exposure fields but an import that drops
+        # them silently un-schedules every API agent on first promotion.
+        # run_as_principal is the deliberate exception: it is a
+        # landscape-specific service identity, so it must NOT travel in the
+        # export -- and an import must not wipe the one already configured.
+        print("\n== export -> import round-trip preserves exposure ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "Export Roundtrip", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://ex.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": False,
+            "expose_api": True,
+            "api_slug": "export-roundtrip",
+            "run_as_principal": "svc-export@example.com",
+            "run_prompt": "Run the nightly check.",
+            "run_timeout_seconds": 1200,
+            "expected_sections": ["st22", "sm21"],
+        })
+        check("export roundtrip agent created", r.status_code == 201, r.text)
+        er_id = r.json()["id"]
+
+        r = await client.get("/admin/api/export")
+        exported = next(
+            (a for a in r.json()["agents"] if a["name"] == "Export Roundtrip"), None
+        )
+        check("agent present in export", exported is not None)
+        for field, expected in [
+            ("expose_chat", False),
+            ("expose_api", True),
+            ("api_slug", "export-roundtrip"),
+            ("run_prompt", "Run the nightly check."),
+            ("run_timeout_seconds", 1200),
+            ("expected_sections", ["st22", "sm21"]),
+        ]:
+            check(
+                f"export carries {field}",
+                (exported or {}).get(field) == expected,
+                f"got {(exported or {}).get(field)!r}",
+            )
+        check(
+            "export omits run_as_principal (landscape-specific)",
+            "run_as_principal" not in (exported or {}),
+            f"got {exported!r}",
+        )
+
+        # Drift the target landscape: everything exposure-related reset,
+        # except the principal, which this landscape owns.
+        r = await client.put(f"/admin/api/agents/{er_id}", json={
+            "name": "Export Roundtrip", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://ex.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": True,
+            "expose_api": False,
+            "api_slug": "",
+            "run_as_principal": "svc-export@example.com",
+            "run_prompt": "",
+            "run_timeout_seconds": 1800,
+            "expected_sections": [],
+        })
+        check("exposure reset before import", r.status_code == 200, r.text)
+
+        r = await client.post(
+            "/admin/api/import", json={"agents": [exported], "replace": False}
+        )
+        check("import of export succeeds", r.status_code == 200, r.text)
+        r = await client.get(f"/admin/api/agents/{er_id}")
+        reimported = r.json()
+        for field, expected in [
+            ("expose_chat", False),
+            ("expose_api", True),
+            ("api_slug", "export-roundtrip"),
+            ("run_prompt", "Run the nightly check."),
+            ("run_timeout_seconds", 1200),
+            ("expected_sections", ["st22", "sm21"]),
+        ]:
+            check(
+                f"import restores {field}",
+                reimported.get(field) == expected,
+                f"got {reimported.get(field)!r}",
+            )
+        check(
+            "import preserves existing run_as_principal",
+            reimported.get("run_as_principal") == "svc-export@example.com",
+            f"got {reimported.get('run_as_principal')!r}",
+        )
+
+        r = await client.delete(f"/admin/api/agents/{er_id}")
+        check("export roundtrip cleanup", r.status_code == 204, r.text)
+
+        # --- /admin/api/runs limit is capped --------------------------------
+        print("\n== GET /admin/api/runs limit bounds ==")
+        r = await client.get("/admin/api/runs", params={"limit": 100000})
+        check("oversized limit rejected", r.status_code == 422, r.text)
+        r = await client.get("/admin/api/runs", params={"limit": 0})
+        check("zero limit rejected", r.status_code == 422, r.text)
+        r = await client.get("/admin/api/runs", params={"limit": 10})
+        check("in-range limit accepted", r.status_code == 200, r.text)
+
         # --- Successful triggers: exercise the 202 contract end-to-end ------
         # Build the specialist so execute_run's background task can look it
         # up (it does not itself crash the test either way -- execute_run
