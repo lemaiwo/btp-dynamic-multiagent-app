@@ -491,6 +491,110 @@ async def run_tests() -> None:
             f"got {tool_names}",
         )
 
+        # --- Run endpoints ----------------------------------------------------
+        print("\n== run endpoints ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "Run Agent", "description": "d", "instructions": "i",
+            "mcp_url": "https://x.example.com/mcp", "auth_mode": "none",
+            "expose_api": True, "api_slug": "run-agent",
+            "run_as_principal": "svc@example.com",
+        })
+        check("create api-exposed agent", r.status_code == 201, r.text)
+        run_agent = r.json()
+        agent_id = run_agent["id"]
+        check("expose_api stored on create", run_agent["expose_api"] is True, run_agent)
+        check("api_slug stored on create", run_agent["api_slug"] == "run-agent", run_agent)
+
+        r = await client.get("/admin/api/runs")
+        check("run list endpoint", r.status_code == 200 and isinstance(r.json(), list))
+
+        r = await client.post("/api/agents/does-not-exist/run")
+        check("unknown slug -> 404", r.status_code == 404, r.text)
+
+        r = await client.post("/admin/api/agents/999999/run")
+        check("unknown agent id -> 404", r.status_code == 404, r.text)
+
+        r = await client.post("/admin/api/agents", json={
+            "name": "Chat Only", "description": "d", "instructions": "i",
+            "mcp_url": "https://y.example.com/mcp", "auth_mode": "none",
+        })
+        chat_id = r.json()["id"]
+        r = await client.post(f"/admin/api/agents/{chat_id}/run")
+        check("non-API agent rejected", r.status_code == 409, r.text)
+
+        # --- Update parity: exposure fields must survive a PUT, not just a
+        # create. Task 7's highest-risk spot: wiring the new AgentPayload
+        # fields into api_create_agent but forgetting api_update_agent would
+        # silently un-expose a scheduled agent on its next edit.
+        print("\n== PUT preserves exposure fields ==")
+        r = await client.put(f"/admin/api/agents/{agent_id}", json={
+            "name": "Run Agent", "description": "Updated d", "instructions": "i",
+            "mcp_url": "https://x.example.com/mcp", "auth_mode": "none",
+            "expose_api": True, "api_slug": "run-agent",
+            "run_as_principal": "svc@example.com",
+        })
+        check("update 200", r.status_code == 200, r.text)
+        updated = r.json()
+        check("description updated", updated["description"] == "Updated d")
+        check("expose_api survives update", updated["expose_api"] is True, updated)
+        check("api_slug survives update", updated["api_slug"] == "run-agent", updated)
+        check(
+            "run_as_principal survives update",
+            updated["run_as_principal"] == "svc@example.com",
+            updated,
+        )
+
+        # --- Successful triggers: exercise the 202 contract end-to-end ------
+        # Build the specialist so execute_run's background task can look it
+        # up (it does not itself crash the test either way -- execute_run
+        # never raises -- but this keeps the trigger meaningful).
+        r = await client.post("/admin/api/reload")
+        check("reload before triggering 200", r.status_code == 200, r.text)
+
+        print("\n== POST /api/agents/{slug}/run (scheduler-facing) ==")
+        import agents.job_runner as job_runner
+
+        r = await client.post("/api/agents/run-agent/run")
+        check("scheduled run accepted", r.status_code == 202, r.text)
+        sched_run_id = r.json().get("run_id")
+        check("run_id returned", bool(sched_run_id), r.text)
+
+        # Drain the background task the run spawned so it doesn't leak a
+        # "Task was destroyed but it is pending" warning at process exit
+        # (same pattern as tests/test_job_runs.py).
+        for t in list(job_runner._tasks):
+            await t
+
+        r = await client.get(f"/admin/api/runs/{sched_run_id}")
+        check("run detail 200", r.status_code == 200, r.text)
+        detail = r.json()
+        check("run detail has report key", "report" in detail, detail)
+        check("run detail id matches", detail["id"] == sched_run_id, detail)
+
+        r = await client.get("/admin/api/runs/does-not-exist")
+        check("unknown run id -> 404", r.status_code == 404, r.text)
+
+        print("\n== POST /admin/api/agents/{id}/run (run-now) ==")
+        r = await client.post(f"/admin/api/agents/{agent_id}/run")
+        check("run-now accepted", r.status_code == 202, r.text)
+        manual_run_id = r.json().get("run_id")
+        check("run_id returned", bool(manual_run_id), r.text)
+
+        for t in list(job_runner._tasks):
+            await t
+
+        r = await client.get("/admin/api/runs", params={"agent_id": agent_id})
+        check(
+            "run list filtered by agent_id",
+            r.status_code == 200 and all(run["agent_id"] == agent_id for run in r.json()),
+            r.text,
+        )
+        check(
+            "both runs present in filtered list",
+            {sched_run_id, manual_run_id} <= {run["id"] for run in r.json()},
+            r.text,
+        )
+
         # --- Lifespan shutdown ---------------------------------------------
         received.append({"type": "lifespan.shutdown"})
         try:

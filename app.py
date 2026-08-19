@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
+from agents.api_runs import router as runs_router  # noqa: E402
 from agents.auth import (  # noqa: E402
     current_base_url,
     current_jwt,
@@ -193,6 +194,10 @@ app.include_router(a2a_router)
 # OAuth2 per-user authorization callback (auth_mode="oauth2"). Registered
 # before the chat mount so /oauth/callback resolves here.
 app.include_router(oauth_router)
+# Scheduler-facing run endpoint (POST /api/agents/{slug}/run). Registered
+# before the chat mount so it resolves here rather than falling through to
+# the catch-all.
+app.include_router(runs_router)
 
 
 @app.get("/healthz")

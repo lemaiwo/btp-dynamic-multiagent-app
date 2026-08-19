@@ -235,6 +235,31 @@ async def require_admin(request: Request) -> dict[str, Any]:
     return payload
 
 
+async def require_jobscheduler(request: Request) -> dict[str, Any]:
+    """Ensure the caller holds the `<xsappname>.JOBSCHEDULER` scope.
+
+    Granted to the jobscheduler service instance via `grant-as-authority-to-apps`
+    in xs-security.json, so only the scheduler can trigger runs.
+    """
+    validator = get_validator()
+    token = _extract_token(request)
+
+    if validator is None:
+        return {"user_name": "local-dev", "scope": ["JOBSCHEDULER"]}
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
+        )
+    payload = validator.validate(token)
+    if not validator.has_scope(payload, "JOBSCHEDULER"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Job scheduler scope required",
+        )
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # Non-interactive identity for scheduled / API-triggered runs
 # ---------------------------------------------------------------------------
