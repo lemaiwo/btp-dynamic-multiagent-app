@@ -13,9 +13,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 import jwt
@@ -232,3 +233,38 @@ async def require_admin(request: Request) -> dict[str, Any]:
             detail="Admin scope required",
         )
     return payload
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive identity for scheduled / API-triggered runs
+# ---------------------------------------------------------------------------
+def public_base_url() -> str | None:
+    """The app's public (approuter) URL, for runs that have no request."""
+    return (os.environ.get("PUBLIC_BASE_URL") or "").strip().rstrip("/") or None
+
+
+@asynccontextmanager
+async def run_as(principal: str) -> AsyncIterator[None]:
+    """Bind a non-interactive identity for a scheduled or API-triggered run.
+
+    Mirrors what JWTBindingMiddleware does per request, minus the JWT: there
+    is no user token to forward, so the run can only reach MCP servers on
+    auth_mode "oauth2" (per-user token store, keyed by this principal) or
+    "none". auth_mode "jwt" servers will fail, by design.
+
+    current_base_url must be set for PerUserOAuth2Auth to resolve its DCR
+    client, and no request exists to derive it from — hence PUBLIC_BASE_URL.
+    """
+    base_url = public_base_url()
+    if not base_url:
+        raise RuntimeError(
+            "PUBLIC_BASE_URL must be set for API-triggered runs; there is no "
+            "request to derive the callback URL from."
+        )
+    marker_principal = current_principal.set(principal)
+    marker_base = current_base_url.set(base_url)
+    try:
+        yield
+    finally:
+        current_principal.reset(marker_principal)
+        current_base_url.reset(marker_base)
