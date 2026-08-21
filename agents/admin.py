@@ -220,7 +220,6 @@ class AgentPayload(BaseModel):
     run_as_principal: str = Field(default="", max_length=255)
     run_prompt: str = ""
     run_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
-    expected_sections: list[str] = Field(default_factory=list)
 
     @field_validator("skills")
     @classmethod
@@ -346,7 +345,6 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 run_as_principal=payload.run_as_principal,
                 run_prompt=payload.run_prompt,
                 run_timeout_seconds=payload.run_timeout_seconds,
-                expected_sections=payload.expected_sections,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -409,9 +407,6 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.run_as_principal = payload.run_as_principal.strip() or None
         row.run_prompt = payload.run_prompt.strip() or None
         row.run_timeout_seconds = payload.run_timeout_seconds
-        row.expected_sections_json = (
-            json.dumps(payload.expected_sections) if payload.expected_sections else None
-        )
         await session.commit()
         await session.refresh(row)
         return row.to_dict()
@@ -761,7 +756,6 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     api_slug=agent.api_slug,
                     run_prompt=agent.run_prompt,
                     run_timeout_seconds=agent.run_timeout_seconds,
-                    expected_sections=agent.expected_sections,
                 )
             except ValueError as e:
                 raise HTTPException(
@@ -857,7 +851,6 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     run_as_principal=payload.run_as_principal,
                     run_prompt=payload.run_prompt,
                     run_timeout_seconds=payload.run_timeout_seconds,
-                    expected_sections=payload.expected_sections,
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)

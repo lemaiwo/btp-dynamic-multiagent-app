@@ -77,7 +77,6 @@ async def main() -> None:
             mcp_servers=SERVERS, expose_chat=False, expose_api=True,
             api_slug="daily-check", run_as_principal="svc@example.com",
             run_prompt="Run the daily check.", run_timeout_seconds=900,
-            expected_sections=["st22", "slg1"],
         )
     async with SessionLocal() as s:
         chat = await get_agent_by_name(s, "chat-only")
@@ -85,7 +84,6 @@ async def main() -> None:
         check("expose_api defaults off", bool(chat.expose_api) is False)
         check("run_prompt defaults empty", not chat.run_prompt)
         check("timeout defaults to 1800", chat.run_timeout_seconds == 1800)
-        check("expected_sections defaults empty", chat.expected_sections == [])
 
         job = await get_agent_by_slug(s, "daily-check")
         check("lookup by slug", job is not None and job.name == "Daily Check")
@@ -93,7 +91,6 @@ async def main() -> None:
         check("expose_api stored on", bool(job.expose_api) is True)
         check("run_as stored", job.run_as_principal == "svc@example.com")
         check("timeout stored", job.run_timeout_seconds == 900)
-        check("expected_sections stored", job.expected_sections == ["st22", "slg1"])
         check("to_dict exposes fields", job.to_dict()["api_slug"] == "daily-check")
 
     print("\n== slug uniqueness ==")

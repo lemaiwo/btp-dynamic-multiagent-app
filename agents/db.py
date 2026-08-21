@@ -238,20 +238,6 @@ class AgentConfig(Base):
             return []
         return [str(s) for s in data if isinstance(s, str) and s.strip()]
 
-    @property
-    def expected_sections(self) -> list[str]:
-        """source_keys a complete report must contain (may be empty)."""
-        if not self.expected_sections_json:
-            return []
-        try:
-            data = json.loads(self.expected_sections_json)
-        except Exception:
-            logger.warning("Malformed expected_sections_json on agent %s", self.name)
-            return []
-        if not isinstance(data, list):
-            return []
-        return [str(s) for s in data if isinstance(s, str) and s.strip()]
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -269,7 +255,6 @@ class AgentConfig(Base):
             "run_as_principal": self.run_as_principal,
             "run_prompt": self.run_prompt or "",
             "run_timeout_seconds": self.run_timeout_seconds,
-            "expected_sections": self.expected_sections,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -287,7 +272,6 @@ class AgentConfig(Base):
             "api_slug": self.api_slug,
             "run_prompt": self.run_prompt or "",
             "run_timeout_seconds": self.run_timeout_seconds,
-            "expected_sections": self.expected_sections,
         }
 
 
@@ -417,16 +401,6 @@ class JobRun(Base):
             logger.warning("Malformed report_json on run %s", self.id)
             return None
 
-    @property
-    def missing_sections(self) -> list[str]:
-        if not self.missing_sections_json:
-            return []
-        try:
-            data = json.loads(self.missing_sections_json)
-        except Exception:
-            return []
-        return [str(x) for x in data] if isinstance(data, list) else []
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -438,7 +412,6 @@ class JobRun(Base):
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "summary": self.summary,
             "error": self.error,
-            "missing_sections": self.missing_sections,
             "notified": bool(self.notified),
             "created_by": self.created_by,
         }
@@ -774,7 +747,6 @@ async def upsert_agent(
     run_as_principal: str | None | _Keep = KEEP,
     run_prompt: str | None = None,
     run_timeout_seconds: int = 1800,
-    expected_sections: list[str] | None = None,
 ) -> AgentConfig:
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
@@ -811,9 +783,6 @@ async def upsert_agent(
         )
         row.run_prompt = (run_prompt or "").strip() or None
         row.run_timeout_seconds = int(run_timeout_seconds)
-        row.expected_sections_json = (
-            json.dumps(expected_sections) if expected_sections else None
-        )
     else:
         existing.description = description
         existing.instructions = instructions
@@ -832,9 +801,6 @@ async def upsert_agent(
             existing.run_as_principal = (run_as_principal or "").strip() or None
         existing.run_prompt = (run_prompt or "").strip() or None
         existing.run_timeout_seconds = int(run_timeout_seconds)
-        existing.expected_sections_json = (
-            json.dumps(expected_sections) if expected_sections else None
-        )
         row = existing
     await session.commit()
     await session.refresh(row)
