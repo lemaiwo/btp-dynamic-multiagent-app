@@ -221,10 +221,15 @@ async def main() -> None:
         check("agents tbody present", find(coll, "tbody", id="agents-tbody") is not None)
         check("skills tbody present", find(coll, "tbody", id="skills-tbody") is not None)
         check("orchestrator textarea", find(coll, "textarea", id="orch-instructions") is not None)
+        # Run prompts carry multi-line content (e.g. mermaid syntax templates the
+        # model must copy). A single-line <input> silently strips the newlines on
+        # paste, so the tag itself is the requirement, not just the id.
+        check("run prompt is a textarea, not an input",
+              find(coll, "textarea", id="agent-run-prompt") is not None)
 
         # Modal form fields
         for fid in ("agent-id", "agent-name", "agent-description",
-                    "agent-instructions", "agent-enabled",
+                    "agent-instructions", "agent-enabled", "agent-run-prompt",
                     "skill-id", "skill-name", "skill-description", "skill-content"):
             found = any(
                 e[1].get("id") == fid for e in coll.elements
