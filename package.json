@@ -1,0 +1,11 @@
+{
+  "name": "pydantic-agent-dev",
+  "private": true,
+  "description": "Dev-only tooling for the Python app: a DOM for the report-rendering tests. Not deployed — mta.yaml ignores this file, package-lock.json and node_modules/.",
+  "scripts": {
+    "test": "node tests/test_report_render.mjs && node tests/test_report_sanitize.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^27.0.0"
+  }
+}
