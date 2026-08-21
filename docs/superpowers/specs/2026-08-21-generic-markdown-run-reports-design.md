@@ -386,13 +386,34 @@ contains, deliberately, all four cases:
 4. `<script>window.__pwned = 1</script>` and an `<img onerror=...>` → neither
    executes; `window.__pwned` is undefined afterwards
 
-### Known gap
+### Sanitization is tested behaviourally (added 2026-08-21, after the branch)
 
-Sanitization has no automated behavioural test, because DOMPurify requires a
-DOM and the harness has none. Closing it means adding `jsdom` as a dev
-dependency, which means a root `package.json` and `node_modules` in a project
-that is otherwise pure Python plus a separate approuter. Not worth it for this
-change; revisit if more model-authored content reaches the admin UI.
+The gap this section originally recorded — that DOMPurify needs a DOM the harness
+lacks — is closed. `tests/test_report_sanitize.mjs` runs the real vendored
+`marked` and `purify` bundles against a jsdom document and asserts what
+sanitization actually does: `<script>` removed, `onerror` stripped,
+`javascript:` hrefs dropped, `style`/`form`/`input`/`button`/`textarea`
+removed, and legitimate content (headings, tables, https links, and the
+`code.language-mermaid` class the renderer selects on) preserved. It also asserts
+`DOMPurify.isSupported`, because a sanitizer that silently no-ops would make every
+other assertion pass while sanitizing nothing.
+
+`jsdom` is a dev dependency in the root `package.json`. `mta.yaml` ignores
+`node_modules/`, `package.json` and `package-lock.json` so none of it deploys.
+If jsdom is missing the suite exits non-zero telling you to run `npm install`; it
+does not skip, because a skipped security test reads the same as a passing one.
+
+Mutation-tested when written: removing `FORBID_TAGS` fails 4 checks, and bypassing
+the sanitize call entirely fails 8. One nuance found doing so — `<style>` is
+dropped by DOMPurify's defaults even without `FORBID_TAGS`, so that entry is
+belt-and-braces; `form`/`input`/`button`/`textarea` are what the hardening
+actually buys.
+
+**Still not covered:** Mermaid. Its UMD bundle assigns `globalThis.mermaid` from a
+`var` that does not survive Node/jsdom module scope, and it needs layout APIs
+(`getBBox`) jsdom lacks. Two approaches were tried and abandoned. Diagram
+rendering, labels and the lazy-load path remain verifiable only in a real browser,
+via the manual step above.
 
 ## Known trade-offs
 
