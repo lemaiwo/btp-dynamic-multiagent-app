@@ -268,8 +268,9 @@ async def main() -> None:
 
         # ------------------------------------------------------------------
         print("\n== 2. JavaScript validity ==")
-        check("exactly one <script>", len(coll.scripts) == 1, f"got {len(coll.scripts)}")
-        js = coll.scripts[0]
+        inline = [s for s in coll.scripts if s.strip()]
+        check("exactly one inline <script>", len(inline) == 1, f"got {len(inline)}")
+        js = inline[0]
 
         if shutil.which("node") is None:
             check("node available", False, "node not on PATH, skipping syntax check")
@@ -570,6 +571,11 @@ async def main() -> None:
         check("run-as field", 'id="agent-run-as"' in html)
         check("expected-sections input removed", 'id="agent-expected-sections"' not in html)
         check("endpoint URL hint shown", "/api/agents/" in html)
+
+        check("template loads marked", "/static/vendor/marked.min.js" in html)
+        check("template loads purify", "/static/vendor/purify.min.js" in html)
+        check("mermaid is NOT eagerly loaded",
+              '<script src="/static/vendor/mermaid.min.js"' not in html)
 
         # An API-triggered run binds a technical principal and deliberately
         # never binds a user JWT, so an agent that is expose_api AND binds an
