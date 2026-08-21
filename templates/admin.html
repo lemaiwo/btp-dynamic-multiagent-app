@@ -1024,12 +1024,27 @@ function loadMermaid() {
         const s = document.createElement('script');
         s.src = '/static/vendor/mermaid.min.js';
         s.onload = () => {
-            window.mermaid.initialize({
-                startOnLoad: false, securityLevel: 'strict', theme: 'dark',
-            });
-            resolve(window.mermaid);
+            try {
+                if (!window.mermaid) throw new Error('mermaid script loaded but window.mermaid is missing');
+                window.mermaid.initialize({
+                    startOnLoad: false, securityLevel: 'strict', theme: 'dark',
+                    // foreignObject labels would be stripped whole by the SVG
+                    // sanitize profile below, leaving unlabeled shapes.
+                    htmlLabels: false, flowchart: { htmlLabels: false },
+                    // A malformed fence must not inject mermaid's error SVG
+                    // straight into document.body, outside our sanitized container.
+                    suppressErrorRendering: true,
+                });
+                resolve(window.mermaid);
+            } catch (e) {
+                _mermaidLoading = null;
+                reject(e);
+            }
         };
-        s.onerror = () => reject(new Error('mermaid failed to load'));
+        s.onerror = () => {
+            _mermaidLoading = null;
+            reject(new Error('mermaid failed to load'));
+        };
         document.head.appendChild(s);
     });
     return _mermaidLoading;
@@ -1038,14 +1053,23 @@ function loadMermaid() {
 async function renderReportBody(container, report, runId) {
     if (!report || typeof report.body_md !== 'string') {
         // Pre-change runs have no markdown body; show what is stored.
-        container.innerHTML = '<h4>Report</h4><pre class="md"></pre>';
-        container.querySelector('pre').textContent =
-            report ? JSON.stringify(report, null, 2) : 'No report recorded.';
+        // Append rather than replace — container already holds the run
+        // header/status/trigger/summary/error markup written by showRun().
+        const heading = document.createElement('h4');
+        heading.textContent = 'Report';
+        const pre = document.createElement('pre');
+        pre.className = 'md';
+        pre.textContent = report ? JSON.stringify(report, null, 2) : 'No report recorded.';
+        container.appendChild(heading);
+        container.appendChild(pre);
         return;
     }
     const body = document.createElement('div');
     body.className = 'md';
-    body.innerHTML = DOMPurify.sanitize(marked.parse(report.body_md, {gfm: true}));
+    body.innerHTML = DOMPurify.sanitize(marked.parse(report.body_md, {gfm: true}), {
+        FORBID_TAGS: ['style', 'form', 'input', 'button', 'select', 'textarea'],
+        FORBID_ATTR: ['style'],
+    });
     container.appendChild(body);
 
     const link = document.createElement('p');
