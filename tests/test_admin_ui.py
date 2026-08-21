@@ -38,6 +38,10 @@ if TEST_DB.exists():
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
+# A developer .env may set this. Set it EMPTY rather than popping it: app.py
+# calls load_dotenv(), which fills in vars that are absent but never overrides
+# ones already present. Empty means "no allowlist", i.e. the default rule.
+os.environ["MCP_URL_ALLOWLIST"] = ""
 
 # ---------------------------------------------------------------------------
 # Same stubs as the API test so the app can boot without AICORE/MCP

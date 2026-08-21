@@ -125,10 +125,15 @@ class OAuthAuthorizationRequired(Exception):
 # Helpers
 # ---------------------------------------------------------------------------
 def normalize_mcp_url(base_url: str) -> str:
-    """Normalize an MCP base URL the same way ``create_mcp_server`` does, so a
-    server_key computed here matches the one used by the live connection."""
-    base_url = base_url.rstrip("/")
-    return base_url if base_url.endswith("/mcp") else f"{base_url}/mcp"
+    """The server_key for a configured MCP URL.
+
+    Delegates to ``agents.shared.mcp_endpoint_url`` rather than repeating the
+    rule, so the key tokens are stored under always matches the URL the live
+    connection actually calls.
+    """
+    from agents.shared import mcp_endpoint_url
+
+    return mcp_endpoint_url(base_url)
 
 
 def _pkce_pair() -> tuple[str, str]:
