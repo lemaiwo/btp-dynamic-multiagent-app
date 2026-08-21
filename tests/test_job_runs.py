@@ -49,6 +49,23 @@ SERVERS = [{"url": "https://arc1.example.com/mcp", "auth_mode": "none"}]
 async def main() -> None:
     await init_db()
 
+    print("\n== report model ==")
+    from agents.reports import RunReport
+    import agents.reports as reports_mod
+
+    r = RunReport(summary="one line", body_md="# Title\n\n| a |\n| --- |\n| 1 |\n")
+    check("summary field", r.summary == "one line")
+    check("body_md field", r.body_md.startswith("# Title"))
+    check("model_dump has exactly two keys",
+          set(r.model_dump().keys()) == {"summary", "body_md"},
+          str(set(r.model_dump().keys())))
+    check("Finding removed", not hasattr(reports_mod, "Finding"))
+    check("ReportSection removed", not hasattr(reports_mod, "ReportSection"))
+    check("missing_sections removed", not hasattr(reports_mod, "missing_sections"))
+    schema = RunReport.model_json_schema()
+    check("body_md description mentions mermaid",
+          "mermaid" in schema["properties"]["body_md"]["description"])
+
     print("\n== agent exposure fields ==")
     async with SessionLocal() as s:
         await upsert_agent(
@@ -130,7 +147,6 @@ async def main() -> None:
         check("missing PUBLIC_BASE_URL rejected", True)
 
     print("\n== report model + completeness ==")
-    from agents.reports import Finding, ReportSection, RunReport, missing_sections
 
     clean = RunReport(
         summary="No issues found.",
