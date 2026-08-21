@@ -262,6 +262,11 @@ async def main() -> None:
         check("back-to-chat link", len(links) > 0)
 
         # ------------------------------------------------------------------
+        print("\n== report rendering assets ==")
+        for name in ("marked.min.js", "purify.min.js", "mermaid.min.js"):
+            check(f"{name} vendored", (ROOT / "static" / "vendor" / name).exists())
+
+        # ------------------------------------------------------------------
         print("\n== 2. JavaScript validity ==")
         check("exactly one <script>", len(coll.scripts) == 1, f"got {len(coll.scripts)}")
         js = coll.scripts[0]
