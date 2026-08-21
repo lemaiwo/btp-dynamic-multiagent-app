@@ -180,7 +180,9 @@ class AgentConfig(Base):
     run_timeout_seconds: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1800, server_default="1800"
     )
-    # JSON list of source_keys a complete report must contain.
+    # Retained only so the schema is unchanged for existing deployments;
+    # nothing reads or writes this column any more (see
+    # docs/superpowers/specs/2026-08-21-generic-markdown-run-reports-design.md).
     expected_sections_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
@@ -499,7 +501,7 @@ DEFAULT_ORCHESTRATOR_INSTRUCTIONS = (
 )
 
 DEFAULT_RUN_PROMPT = (
-    "Perform your configured check now and return the structured report."
+    "Perform your configured check now and return the report."
 )
 
 
