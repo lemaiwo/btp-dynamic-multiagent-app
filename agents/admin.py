@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
@@ -545,6 +545,29 @@ async def api_get_run(run_id: str) -> dict[str, Any]:
         data = row.to_dict()
         data["report"] = row.report
         return data
+
+
+@router.get("/api/runs/{run_id}/report.md", dependencies=[Depends(require_admin)])
+async def api_get_run_markdown(run_id: str) -> PlainTextResponse:
+    """The run's report as a downloadable .md file.
+
+    Runs recorded before reports became markdown have no body_md; there is
+    nothing to serve for those, so they 404 rather than returning an empty file.
+    """
+    from agents.db import get_job_run
+
+    async with SessionLocal() as session:
+        row = await get_job_run(session, run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        body = (row.report or {}).get("body_md")
+        if not isinstance(body, str):
+            raise HTTPException(status_code=404, detail="Run has no markdown report")
+        return PlainTextResponse(
+            body,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="run-{run_id}.md"'},
+        )
 
 
 # ---------------------------------------------------------------------------

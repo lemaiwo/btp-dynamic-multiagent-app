@@ -738,6 +738,33 @@ async def run_tests() -> None:
         r = await client.get("/admin/api/runs/does-not-exist")
         check("unknown run id -> 404", r.status_code == 404, r.text)
 
+        print("\n== GET /admin/api/runs/{id}/report.md ==")
+        from agents.db import finish_job_run, SessionLocal as _SL
+
+        async with _SL() as s:
+            await finish_job_run(s, sched_run_id, status="success",
+                                 summary="one line",
+                                 report={"summary": "one line",
+                                         "body_md": "# What's new\n\n| a |\n| --- |\n"})
+        r = await client.get(f"/admin/api/runs/{sched_run_id}/report.md")
+        check("200", r.status_code == 200, f"got {r.status_code}: {r.text[:200]}")
+        check("markdown content type",
+              r.headers["content-type"].startswith("text/markdown"),
+              r.headers.get("content-type"))
+        check("attachment filename",
+              f'filename="run-{sched_run_id}.md"' in r.headers.get("content-disposition", ""),
+              r.headers.get("content-disposition"))
+        check("body is the markdown verbatim", r.text.startswith("# What's new"))
+
+        async with _SL() as s:
+            await finish_job_run(s, sched_run_id, status="success", summary="old",
+                                 report={"summary": "old", "sections": []})
+        r = await client.get(f"/admin/api/runs/{sched_run_id}/report.md")
+        check("legacy run 404s", r.status_code == 404, f"got {r.status_code}")
+
+        r = await client.get("/admin/api/runs/does-not-exist/report.md")
+        check("unknown run 404s", r.status_code == 404)
+
         print("\n== POST /admin/api/agents/{id}/run (run-now) ==")
         r = await client.post(f"/admin/api/agents/{agent_id}/run")
         check("run-now accepted", r.status_code == 202, r.text)
