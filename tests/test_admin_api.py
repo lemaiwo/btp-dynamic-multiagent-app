@@ -632,6 +632,50 @@ async def run_tests() -> None:
         check("export roundtrip agent created", r.status_code == 201, r.text)
         er_id = r.json()["id"]
 
+        # --- multi-line run_prompt survives the round trip --------------------
+        # The admin form's Run prompt is a <textarea> precisely so a prompt can
+        # carry fenced mermaid syntax templates the model must copy verbatim.
+        # That is worthless if a newline does not survive PUT -> DB -> GET.
+        print("\n== multi-line run_prompt round trip ==")
+        MULTILINE = (
+            "Line one.\n\n"
+            "```mermaid\n"
+            "pie title T\n"
+            '    "a" : 1\n'
+            "```\n\n"
+            "Line after fence."
+        )
+        r = await client.put(f"/admin/api/agents/{er_id}", json={
+            "name": "Export Roundtrip",
+            "description": "d",
+            "instructions": "i",
+            "mcp_servers": [{"url": "https://ex.example.com/mcp", "auth_mode": "none"}],
+            "expose_api": True,
+            "api_slug": "export-roundtrip",
+            "run_prompt": MULTILINE,
+        })
+        check("multi-line prompt accepted", r.status_code == 200, r.text[:200])
+        r = await client.get(f"/admin/api/agents/{er_id}")
+        got = r.json().get("run_prompt") or ""
+        check("newlines preserved exactly", got == MULTILINE, repr(got[:80]))
+        check("fence survives", "```mermaid" in got)
+        check("text after the fence survives", got.rstrip().endswith("Line after fence."))
+
+        # Restore the prompt the export assertions below expect.
+        r = await client.put(f"/admin/api/agents/{er_id}", json={
+            "name": "Export Roundtrip",
+            "description": "d",
+            "instructions": "i",
+            "mcp_servers": [{"url": "https://ex.example.com/mcp", "auth_mode": "none"}],
+            "expose_chat": False,
+            "expose_api": True,
+            "api_slug": "export-roundtrip",
+            "run_as_principal": "svc-export@example.com",
+            "run_prompt": "Run the nightly check.",
+            "run_timeout_seconds": 1200,
+        })
+        check("prompt restored for export checks", r.status_code == 200, r.text[:200])
+
         r = await client.get("/admin/api/export")
         exported = next(
             (a for a in r.json()["agents"] if a["name"] == "Export Roundtrip"), None
