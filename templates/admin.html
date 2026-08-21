@@ -145,12 +145,7 @@
         .status-badge.status-running { background: #dbeafe; color: #1d4ed8; }
         .status-badge.status-success { background: #d6f5d6; color: var(--success); }
         .status-badge.status-failed, .status-badge.status-interrupted { background: #f5d6d6; color: var(--danger); }
-        #run-detail section { border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; margin-bottom: 12px; }
-        #run-detail section h4 { margin: 0 0 6px 0; font-size: 14px; }
-        #run-detail .finding { border-top: 1px solid var(--border); padding: 8px 0; }
-        #run-detail .finding:first-of-type { border-top: none; padding-top: 0; }
         #run-detail p.error { color: var(--danger); }
-        #run-detail .warn { color: var(--warn); }
         #run-detail .md img { max-width: 100%; height: auto; }
         #run-detail .md pre { overflow-x: auto; }
         #run-detail .md table { border-collapse: collapse; margin: 10px 0; }
@@ -158,10 +153,6 @@
             border: 1px solid var(--border); padding: 4px 8px; text-align: left;
         }
         #run-detail .mermaid-error { color: var(--muted); font-size: 12px; margin-top: 4px; }
-        .sev { display: inline-block; padding: 1px 6px; border-radius: 8px; font-size: 11px; font-weight: 600; margin-left: 6px; }
-        .sev-critical, .sev-high { background: #f5d6d6; color: var(--danger); }
-        .sev-medium { background: #fdecc8; color: var(--warn); }
-        .sev-low, .sev-info { background: #e5e7eb; color: var(--muted); }
         #runs-list table td, #runs-list table th { cursor: default; }
         #runs-list .run-row { cursor: pointer; }
         #runs-list .run-row:hover { background: #f8f9fb; }
@@ -980,14 +971,6 @@ function escapeHtml(s) {
 // into the DOM unescaped.
 const esc = escapeHtml;
 
-// Report `references` URLs come from the model too, so escaping alone is
-// not enough: `javascript:...` contains none of the characters esc()
-// touches and would survive into an href as a clickable script link.
-// Only allow http(s) through; anything else renders as plain text.
-function safeHttpUrl(u) {
-    return /^https?:\/\//i.test(String(u ?? '')) ? String(u) : null;
-}
-
 function switchTab(name) {
     document.querySelectorAll('.tab-btn').forEach(b =>
         b.classList.toggle('active', b.dataset.tab === name));
@@ -1057,11 +1040,15 @@ async function renderReportBody(container, report, runId) {
         // header/status/trigger/summary/error markup written by showRun().
         const heading = document.createElement('h4');
         heading.textContent = 'Report';
+        // Wrap in a `.md` container rather than classing the <pre> itself —
+        // the CSS rule is `#run-detail .md pre`, a descendant selector.
+        const wrap = document.createElement('div');
+        wrap.className = 'md';
         const pre = document.createElement('pre');
-        pre.className = 'md';
         pre.textContent = report ? JSON.stringify(report, null, 2) : 'No report recorded.';
+        wrap.appendChild(pre);
         container.appendChild(heading);
-        container.appendChild(pre);
+        container.appendChild(wrap);
         return;
     }
     const body = document.createElement('div');
@@ -1111,7 +1098,14 @@ async function showRun(id) {
         + `<p class="hint">Trigger: ${esc(run.trigger)} · Started: ${run.started_at ? esc(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + esc(new Date(run.finished_at).toLocaleString()) : ''}</p>`
         + (run.summary ? `<p>${esc(run.summary)}</p>` : '')
         + (run.error ? `<p class="error">${esc(run.error)}</p>` : '');
-    await renderReportBody(el, run.report, run.id);
+    try {
+        await renderReportBody(el, run.report, run.id);
+    } catch (e) {
+        const err = document.createElement('p');
+        err.className = 'error';
+        err.textContent = 'Failed to render report body.';
+        el.appendChild(err);
+    }
 }
 
 async function runAgentNow(agentId) {

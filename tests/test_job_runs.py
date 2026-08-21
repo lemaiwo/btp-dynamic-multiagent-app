@@ -167,6 +167,11 @@ async def main() -> None:
         check("active run found", (await active_job_run(s, job.id)) is not None)
 
     async with SessionLocal() as s:
+        # Deliberately a legacy-shaped dict, not a RunReport — this is the
+        # only test proving report_json stores an arbitrary shape opaquely.
+        # The UI's legacy `<pre>` branch and the export endpoint's 404 for
+        # pre-change runs both depend on report_json accepting any JSON, so
+        # do not "clean this up" to the new {summary, body_md} shape.
         await finish_job_run(
             s, run_id, status="success", summary="All clear",
             report={"summary": "All clear", "overall_severity": "info", "sections": []},
