@@ -1,5 +1,7 @@
 .env
 .env.bak*
+# Google OAuth client secret JSON downloaded from Cloud Console
+client_secret_*.json
 .tokens.json
 .tokens-*.json
 __pycache__/
