@@ -204,6 +204,9 @@ async def run_tests() -> None:
         created = r.json()
         check("returned id", "id" in created)
         check("name echo", created["name"] == "testagent")
+        check("expected_sections gone from agent payload",
+              "expected_sections" not in created,
+              str(sorted(created.keys())))
         new_id = created["id"]
 
         # --- Validation: bad URL -------------------------------------------
@@ -544,16 +547,16 @@ async def run_tests() -> None:
             updated,
         )
 
-        # --- UI round-trip: all seven exposure fields must survive a
+        # --- UI round-trip: all six exposure fields must survive a
         # load-then-save cycle using the exact payload shape
         # templates/admin.html's saveAgent() builds from editAgent()'s
         # loaded values. AgentPayload has defaults and PUT is whole-object
-        # semantics, so if the form ever omits one of these seven fields,
+        # semantics, so if the form ever omits one of these six fields,
         # saving *any* agent through the UI silently resets it (expose_api
         # -> False, expose_chat -> True, api_slug/run_as_principal/
-        # run_prompt wiped, expected_sections wiped) with no error surfaced
-        # anywhere -- e.g. un-exposing a scheduled agent on its next edit.
-        print("\n== UI round-trip preserves all seven exposure fields ==")
+        # run_prompt wiped) with no error surfaced anywhere -- e.g.
+        # un-exposing a scheduled agent on its next edit.
+        print("\n== UI round-trip preserves all six exposure fields ==")
         r = await client.post("/admin/api/agents", json={
             "name": "UI Roundtrip Agent", "description": "d", "instructions": "i",
             "mcp_servers": [{"url": "https://z.example.com/mcp", "auth_mode": "none"}],
@@ -563,7 +566,6 @@ async def run_tests() -> None:
             "run_as_principal": "svc-roundtrip@example.com",
             "run_prompt": "Perform your configured check now.",
             "run_timeout_seconds": 900,
-            "expected_sections": ["st22", "slg1", "sm21"],
         })
         check("roundtrip agent created", r.status_code == 201, r.text)
         rt_id = r.json()["id"]
@@ -574,8 +576,7 @@ async def run_tests() -> None:
         loaded = r.json()
 
         # saveAgent() -> PUT, built from the loaded values exactly as the
-        # form's read/populate + collect logic does (including the
-        # comma-separated -> list transform for expected_sections).
+        # form's read/populate + collect logic does.
         ui_payload = {
             "name": loaded["name"],
             "description": loaded["description"],
@@ -589,7 +590,6 @@ async def run_tests() -> None:
             "run_as_principal": loaded["run_as_principal"] or "",
             "run_prompt": loaded["run_prompt"] or "",
             "run_timeout_seconds": loaded["run_timeout_seconds"],
-            "expected_sections": loaded["expected_sections"],
         }
         r = await client.put(f"/admin/api/agents/{rt_id}", json=ui_payload)
         check("roundtrip save 200", r.status_code == 200, r.text)
@@ -601,18 +601,12 @@ async def run_tests() -> None:
             ("run_as_principal", "svc-roundtrip@example.com"),
             ("run_prompt", "Perform your configured check now."),
             ("run_timeout_seconds", 900),
-            ("expected_sections", ["st22", "slg1", "sm21"]),
         ]:
             check(
                 f"roundtrip preserves {field}",
                 saved.get(field) == expected,
                 f"got {saved.get(field)!r}",
             )
-
-        # The UI's comma-split for a blank "expected sections" field must
-        # produce [] and never [""].
-        blank_sections = [s.strip() for s in "".split(",") if s.strip()]
-        check("blank expected_sections splits to []", blank_sections == [])
 
         r = await client.delete(f"/admin/api/agents/{rt_id}")
         check("roundtrip agent cleanup", r.status_code == 204, r.text)
@@ -634,7 +628,6 @@ async def run_tests() -> None:
             "run_as_principal": "svc-export@example.com",
             "run_prompt": "Run the nightly check.",
             "run_timeout_seconds": 1200,
-            "expected_sections": ["st22", "sm21"],
         })
         check("export roundtrip agent created", r.status_code == 201, r.text)
         er_id = r.json()["id"]
@@ -650,7 +643,6 @@ async def run_tests() -> None:
             ("api_slug", "export-roundtrip"),
             ("run_prompt", "Run the nightly check."),
             ("run_timeout_seconds", 1200),
-            ("expected_sections", ["st22", "sm21"]),
         ]:
             check(
                 f"export carries {field}",
@@ -674,7 +666,6 @@ async def run_tests() -> None:
             "run_as_principal": "svc-export@example.com",
             "run_prompt": "",
             "run_timeout_seconds": 1800,
-            "expected_sections": [],
         })
         check("exposure reset before import", r.status_code == 200, r.text)
 
@@ -690,7 +681,6 @@ async def run_tests() -> None:
             ("api_slug", "export-roundtrip"),
             ("run_prompt", "Run the nightly check."),
             ("run_timeout_seconds", 1200),
-            ("expected_sections", ["st22", "sm21"]),
         ]:
             check(
                 f"import restores {field}",
@@ -741,6 +731,9 @@ async def run_tests() -> None:
         detail = r.json()
         check("run detail has report key", "report" in detail, detail)
         check("run detail id matches", detail["id"] == sched_run_id, detail)
+        check("missing_sections gone from run payload",
+              "missing_sections" not in r.json(),
+              str(sorted(r.json().keys())))
 
         r = await client.get("/admin/api/runs/does-not-exist")
         check("unknown run id -> 404", r.status_code == 404, r.text)

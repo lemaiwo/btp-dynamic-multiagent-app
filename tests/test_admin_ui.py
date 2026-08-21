@@ -563,7 +563,7 @@ async def main() -> None:
         check("exposure field expose_api", 'id="agent-expose-api"' in html)
         check("exposure field api_slug", 'id="agent-api-slug"' in html)
         check("run-as field", 'id="agent-run-as"' in html)
-        check("expected sections field", 'id="agent-expected-sections"' in html)
+        check("expected-sections input removed", 'id="agent-expected-sections"' not in html)
         check("endpoint URL hint shown", "/api/agents/" in html)
 
         # An API-triggered run binds a technical principal and deliberately
@@ -590,14 +590,14 @@ async def main() -> None:
         )
 
         # ------------------------------------------------------------------
-        # saveAgent() must actually SEND all seven exposure fields, not just
+        # saveAgent() must actually SEND all six exposure fields, not just
         # have form elements for them. AgentPayload defaults + whole-object
         # PUT semantics mean a field saveAgent() forgets to include gets
         # silently reset on every save (expose_api -> False, expose_chat ->
         # True, etc.) -- deleting one key here is exactly the regression
         # this check exists to catch, and the earlier ID-presence checks
         # above would not catch it.
-        print("\n== saveAgent() sends all seven exposure fields ==")
+        print("\n== saveAgent() sends all six exposure fields ==")
         m = re.search(r"async function saveAgent\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
         check("saveAgent() function found in JS", m is not None)
         save_agent_body = m.group(1) if m else ""
@@ -608,7 +608,6 @@ async def main() -> None:
             "run_as_principal",
             "run_prompt",
             "run_timeout_seconds",
-            "expected_sections",
         ):
             check(
                 f"saveAgent() sends {field}",

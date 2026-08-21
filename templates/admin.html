@@ -144,7 +144,6 @@
         .tab-panel.active { display: block; }
         .status-badge.status-running { background: #dbeafe; color: #1d4ed8; }
         .status-badge.status-success { background: #d6f5d6; color: var(--success); }
-        .status-badge.status-degraded { background: #fdecc8; color: var(--warn); }
         .status-badge.status-failed, .status-badge.status-interrupted { background: #f5d6d6; color: var(--danger); }
         #run-detail section { border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; margin-bottom: 12px; }
         #run-detail section h4 { margin: 0 0 6px 0; font-size: 14px; }
@@ -350,9 +349,6 @@
                 </label>
                 <label>Run timeout (seconds)
                     <input type="number" id="agent-run-timeout" value="1800" min="60" max="86400">
-                </label>
-                <label>Expected report sections (comma-separated)
-                    <input type="text" id="agent-expected-sections" placeholder="st22, slg1, sm21, sm37">
                 </label>
             </fieldset>
         </div>
@@ -714,7 +710,6 @@ function openAgentModal() {
     document.getElementById('agent-run-as').value = '';
     document.getElementById('agent-run-prompt').value = '';
     document.getElementById('agent-run-timeout').value = 1800;
-    document.getElementById('agent-expected-sections').value = '';
     updateEndpointHint();
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -805,13 +800,6 @@ function connectServer(loginUrl) {
     }, 1000);
 }
 
-function collectExpectedSections() {
-    return document.getElementById('agent-expected-sections').value
-        .split(',')
-        .map(s => s.trim())
-        .filter(s => s.length > 0);
-}
-
 function closeAgentModal() {
     document.getElementById('agent-modal').classList.remove('open');
 }
@@ -838,7 +826,6 @@ async function editAgent(id) {
     refreshCredentials();
     document.getElementById('agent-run-prompt').value = a.run_prompt || '';
     document.getElementById('agent-run-timeout').value = a.run_timeout_seconds || 1800;
-    document.getElementById('agent-expected-sections').value = (a.expected_sections || []).join(', ');
     updateEndpointHint();
     document.getElementById('agent-modal').classList.add('open');
 }
@@ -863,7 +850,6 @@ async function saveAgent() {
         run_as_principal: document.getElementById('agent-run-as').value.trim(),
         run_prompt: document.getElementById('agent-run-prompt').value.trim(),
         run_timeout_seconds: parseInt(document.getElementById('agent-run-timeout').value, 10) || 1800,
-        expected_sections: collectExpectedSections(),
     });
     const res = id
         ? await api(`/agents/${id}`, {method: 'PUT', body})
@@ -1030,8 +1016,6 @@ async function showRun(id) {
         + `<p class="hint">Trigger: ${esc(run.trigger)} · Started: ${run.started_at ? esc(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + esc(new Date(run.finished_at).toLocaleString()) : ''}</p>`
         + (run.summary ? `<p>${esc(run.summary)}</p>` : '')
         + (run.error ? `<p class="error">${esc(run.error)}</p>` : '')
-        + (run.missing_sections && run.missing_sections.length
-            ? `<p class="warn">Not checked: ${run.missing_sections.map(esc).join(', ')}</p>` : '')
         + sections.map(s => `<section>
             <h4>${esc(s.title)}${s.checked ? '' : ' <span class="warn">(not checked)</span>'}</h4>
             ${s.note ? `<p class="hint">${esc(s.note)}</p>` : ''}
