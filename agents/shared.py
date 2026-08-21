@@ -209,6 +209,24 @@ async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
         )
 
 
+def mcp_endpoint_url(base_url: str) -> str:
+    """The MCP endpoint for a configured base URL.
+
+    A bare host gets ``/mcp`` appended: that is where MCP servers conventionally
+    listen and admins routinely configure only the host. A URL that already
+    carries a path is taken as final -- servers publishing a versioned or nested
+    endpoint must not have ``/mcp`` bolted on. Google's Gmail MCP server lives at
+    ``/mcp/v1``; appending would produce ``/mcp/v1/mcp``, which 404s.
+
+    ``normalize_mcp_url`` in agents.oauth2 delegates here so the endpoint and the
+    token-storage key can never disagree. They used to be separate copies of the
+    same rule; drift would store tokens under a key the live connection never
+    looks up, and every request would silently reauthenticate.
+    """
+    base_url = base_url.rstrip("/")
+    return base_url if urlparse(base_url).path else f"{base_url}/mcp"
+
+
 def create_mcp_server(
     name: str,
     base_url: str,
@@ -232,10 +250,7 @@ def create_mcp_server(
     `{tool_prefix}_{tool_name}`. Use to disambiguate when a single agent
     binds multiple MCP servers that share tool names.
     """
-    base_url = base_url.rstrip("/")
-    # Accept URLs both with and without the `/mcp` suffix. The configured
-    # URL is normalized to include exactly one `/mcp` at the end.
-    mcp_url = base_url if base_url.endswith("/mcp") else f"{base_url}/mcp"
+    mcp_url = mcp_endpoint_url(base_url)
 
     auth: httpx.Auth | None
     if auth_mode == "none":
