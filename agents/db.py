@@ -1140,7 +1140,6 @@ async def finish_job_run(
     summary: str | None = None,
     report: dict[str, Any] | None = None,
     error: str | None = None,
-    missing: list[str] | None = None,
 ) -> None:
     row = await session.get(JobRun, run_id)
     if row is None:
@@ -1149,7 +1148,6 @@ async def finish_job_run(
     row.summary = summary
     row.report_json = json.dumps(report) if report is not None else None
     row.error = error
-    row.missing_sections_json = json.dumps(missing) if missing else None
     row.finished_at = datetime.now(timezone.utc)
     await session.commit()
 

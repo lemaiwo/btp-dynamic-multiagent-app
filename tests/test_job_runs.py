@@ -146,37 +146,6 @@ async def main() -> None:
     except RuntimeError:
         check("missing PUBLIC_BASE_URL rejected", True)
 
-    print("\n== report model + completeness ==")
-
-    clean = RunReport(
-        summary="No issues found.",
-        overall_severity="info",
-        sections=[
-            ReportSection(source_key="st22", title="Short dumps", checked=True, findings=[]),
-            ReportSection(source_key="slg1", title="App log", checked=True, findings=[]),
-        ],
-    )
-    check("empty findings is complete", missing_sections(clean, ["st22", "slg1"]) == [])
-
-    unchecked = RunReport(
-        summary="Partial.",
-        overall_severity="info",
-        sections=[
-            ReportSection(source_key="st22", title="Short dumps", checked=True, findings=[]),
-            ReportSection(source_key="slg1", title="App log", checked=False,
-                          note="RFC destination unavailable", findings=[]),
-        ],
-    )
-    check("unchecked section is missing", missing_sections(unchecked, ["st22", "slg1"]) == ["slg1"])
-
-    absent = RunReport(summary="s", overall_severity="info", sections=[])
-    check("absent section is missing", missing_sections(absent, ["st22"]) == ["st22"])
-    check("no expectations means complete", missing_sections(absent, []) == [])
-
-    f = Finding(title="TSV_TNEW_PAGE_ALLOC_FAILED", severity="high", count=12,
-                affected=["ZPROG"], detail="d")
-    check("finding defaults are optional", f.analysis is None and f.references == [])
-
     print("\n== JobRun records ==")
     from datetime import datetime, timedelta, timezone
 
@@ -250,12 +219,12 @@ async def main() -> None:
             self.specialists = specialists
 
     good = RunReport(
-        summary="2 dumps, 0 blockers",
-        overall_severity="medium",
-        sections=[
-            ReportSection(source_key="st22", title="Dumps", checked=True, findings=[]),
-            ReportSection(source_key="slg1", title="Log", checked=True, findings=[]),
-        ],
+        summary="3 ADT changes, 0 blockers",
+        body_md=(
+            "# What's new\n\n"
+            "| Source | Findings |\n| --- | --- |\n| ADT | 3 |\n\n"
+            "```mermaid\npie title Findings by source\n  \"ADT\" : 3\n```\n"
+        ),
     )
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
     os.environ["PUBLIC_BASE_URL"] = "https://approuter.example.com"
@@ -265,26 +234,16 @@ async def main() -> None:
         job = await get_agent_by_slug(s, "daily-check")
         agent_id, run_id = job.id, (await create_job_run(s, agent=job, trigger="manual")).id
     await job_runner.execute_run(run_id, agent_id)
+
     async with SessionLocal() as s:
         r = await get_job_run(s, run_id)
-        check("complete run is success", r.status == "success", r.status)
-        check("summary stored from report", r.summary == "2 dumps, 0 blockers")
-        check("report stored", r.report["overall_severity"] == "medium")
-
-    partial = RunReport(
-        summary="partial",
-        overall_severity="info",
-        sections=[ReportSection(source_key="st22", title="Dumps", checked=True, findings=[])],
-    )
-    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(partial)})
-    async with SessionLocal() as s:
-        job = await get_agent_by_slug(s, "daily-check")
-        run_id2 = (await create_job_run(s, agent=job, trigger="manual")).id
-    await job_runner.execute_run(run_id2, agent_id)
-    async with SessionLocal() as s:
-        r = await get_job_run(s, run_id2)
-        check("incomplete run is degraded", r.status == "degraded", r.status)
-        check("missing section named", r.missing_sections == ["slg1"])
+        check("run is success", r.status == "success", r.status)
+        check("summary stored", r.summary == "3 ADT changes, 0 blockers")
+        check("markdown body stored", "| Source | Findings |" in r.report["body_md"])
+        check("mermaid fence survives storage", "```mermaid" in r.report["body_md"])
+        check("no legacy keys",
+              "sections" not in r.report and "overall_severity" not in r.report,
+              str(sorted(r.report.keys())))
 
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(exc=RuntimeError("mcp down"))})
     async with SessionLocal() as s:

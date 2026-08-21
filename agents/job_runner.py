@@ -20,7 +20,7 @@ from agents.db import (
 )
 from agents.db import DEFAULT_RUN_PROMPT
 from agents.registry import registry
-from agents.reports import RunReport, missing_sections
+from agents.reports import RunReport
 
 logger = logging.getLogger(__name__)
 
@@ -197,16 +197,11 @@ async def execute_run(run_id: str, agent_id: int) -> None:
                 timeout=agent.run_timeout_seconds,
             )
         report: RunReport = result.output
-        missing = missing_sections(report, agent.expected_sections)
         await _finalize(
             run_id,
-            status="degraded" if missing else "success",
+            status="success",
             summary=report.summary,
             report=report.model_dump(mode="json"),
-            missing=missing,
-            error=(
-                "Report did not check: " + ", ".join(missing) if missing else None
-            ),
         )
     except asyncio.TimeoutError:
         # `agent` can still be None here (e.g. the initial session.get itself
