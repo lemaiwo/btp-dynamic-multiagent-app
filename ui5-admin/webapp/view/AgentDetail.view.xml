@@ -92,6 +92,87 @@
                     </MultiComboBox>
                 </Panel>
 
+                <Panel headerText="{i18n>jobSettings}" expandable="false" class="sapUiSmallMarginTop">
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>exposeApi}" />
+                        <Switch id="agentExposeApi" state="{agent>/data/expose_api}" />
+
+                        <Label text="{i18n>apiSlug}" />
+                        <Input
+                            id="agentApiSlug"
+                            value="{agent>/data/api_slug}"
+                            enabled="{agent>/data/expose_api}"
+                            valueState="{agent>/errors/api_slugState}"
+                            valueStateText="{agent>/errors/api_slug}"
+                            maxLength="64" />
+
+                        <Label text="{i18n>runPrompt}" />
+                        <TextArea
+                            id="agentRunPrompt"
+                            value="{agent>/data/run_prompt}"
+                            rows="6"
+                            width="100%" />
+
+                        <Label text="{i18n>runTimeout}" />
+                        <StepInput
+                            id="agentRunTimeout"
+                            value="{agent>/data/run_timeout_seconds}"
+                            min="60"
+                            max="86400"
+                            step="60" />
+
+                        <Label text="{i18n>runAsPrincipal}" />
+                        <HBox>
+                            <Input
+                                id="agentRunAsPrincipal"
+                                value="{agent>/data/run_as_principal}"
+                                width="24rem"
+                                placeholder="{i18n>runAsHint}" />
+                            <Button
+                                id="useMyPrincipalButton"
+                                text="{i18n>useMyPrincipal}"
+                                press=".onUseMyPrincipal"
+                                class="sapUiTinyMarginBegin" />
+                        </HBox>
+                    </f:SimpleForm>
+                </Panel>
+
+                <Panel headerText="{i18n>credentials}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>credentialsHint}" />
+                    <Table
+                        id="credentialsTable"
+                        items="{agent>/credentials}"
+                        noDataText="{i18n>noCredentialChecks}"
+                        class="sapUiSmallMarginTop">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <ToolbarSpacer />
+                                <Button id="refreshCredentialsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefreshCredentials" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>serverUrl}" /></Column>
+                            <Column><Text text="{i18n>colStatus}" /></Column>
+                            <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem>
+                                <cells>
+                                    <Text text="{agent>url}" />
+                                    <ObjectStatus
+                                        text="{= !${agent>needs_token} ? ${i18n>credNotNeeded} : (${agent>has_token} ? ${i18n>credSignedIn} : ${i18n>credMissing}) }"
+                                        state="{= !${agent>needs_token} ? 'None' : (${agent>has_token} ? 'Success' : 'Warning') }" />
+                                    <Button
+                                        text="{i18n>signIn}"
+                                        type="Transparent"
+                                        visible="{= ${agent>needs_token} &amp;&amp; !${agent>has_token} }"
+                                        press=".onSignIn" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                </Panel>
+
             </VBox>
         </content>
         <footer>

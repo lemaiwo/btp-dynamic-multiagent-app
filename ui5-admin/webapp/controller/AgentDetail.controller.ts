@@ -11,7 +11,7 @@ import type Dialog from "sap/m/Dialog";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
-import type { AgentInput, McpServer } from "../service/types";
+import type { AgentInput, CredentialStatus, McpServer } from "../service/types";
 
 const EMPTY_AGENT: AgentInput = {
     name: "",
@@ -37,6 +37,7 @@ export default class AgentDetail extends BaseController {
     private serverDialog?: Dialog;
     /** Index being edited in the server dialog; -1 means "adding a new one". */
     private editingServerIndex = -1;
+    private publicBaseUrl = "";
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -67,6 +68,9 @@ export default class AgentDetail extends BaseController {
             this.agentId = undefined;
             model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
             model.setProperty("/title", this.text("newAgent"));
+            // Otherwise a credential table left over from whichever agent was
+            // open before navigating here would still be showing.
+            model.setProperty("/credentials", []);
             return;
         }
 
@@ -95,6 +99,13 @@ export default class AgentDetail extends BaseController {
             run_timeout_seconds: agent.run_timeout_seconds ?? 1800
         } as AgentInput);
         model.setProperty("/title", agent.name);
+
+        const config = await this.run(
+            this.getAdminService().getConfig(),
+            "Could not read the public base URL."
+        );
+        this.publicBaseUrl = config?.public_base_url ?? "";
+        void this.loadCredentials();
     }
 
     // --- MCP server dialog -----------------------------------------------
@@ -164,6 +175,16 @@ export default class AgentDetail extends BaseController {
 
         const entry: McpServer = { url, auth_mode: authMode };
         if (oauth) {
+            // cleanOAuth drops has_client_secret (to_config() ignores it on
+            // input), but this entry is also what re-opens the dialog if the
+            // same server is edited again later in this session, and
+            // openServerDialog reads has_client_secret to decide whether to
+            // show the "stored" placeholder. Carry it forward or that hint
+            // silently disappears the second time round.
+            if (oauth.dcr !== true) {
+                oauth.has_client_secret = !!oauth.client_secret
+                    || !!(oauthRaw as { has_client_secret?: boolean }).has_client_secret;
+            }
             entry.oauth = oauth;
         }
 
@@ -267,6 +288,61 @@ export default class AgentDetail extends BaseController {
 
     public onBack(): void {
         this.getRouter().navTo("agents");
+    }
+
+    // --- Job settings and credentials -------------------------------------
+
+    /** Fills the run-as field from the caller's own opaque XSUAA principal. */
+    public async onUseMyPrincipal(): Promise<void> {
+        const who = await this.run(
+            this.getAdminService().whoami(),
+            "Could not read your principal."
+        );
+        if (who) {
+            (this.getModel("agent") as JSONModel).setProperty("/data/run_as_principal", who.principal);
+            MessageToast.show(this.text("principalFilled").replace("{0}", who.label));
+            void this.loadCredentials();
+        }
+    }
+
+    /**
+     * Per-server token status for the configured run-as identity.
+     *
+     * Checking here is the point: a mismatch otherwise surfaces hours later as
+     * a failed scheduled run.
+     */
+    public async loadCredentials(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        if (this.agentId === undefined) {
+            model.setProperty("/credentials", []);
+            return;
+        }
+        const principal = model.getProperty("/data/run_as_principal") as string;
+        const statuses = await this.run(
+            this.getAdminService().agentCredentials(this.agentId, principal),
+            "Could not read the credential status."
+        );
+        model.setProperty("/credentials", statuses ?? []);
+    }
+
+    public onRefreshCredentials(): void {
+        void this.loadCredentials();
+    }
+
+    /**
+     * Opens the OAuth sign-in on the backend host, absolutely.
+     *
+     * `/oauth/login` and the callback live outside this app's path, so a
+     * relative link breaks the moment the app is served from a Work Zone site.
+     */
+    public onSignIn(event: Event): void {
+        const status = (event.getSource() as Control)
+            .getBindingContext("agent")?.getObject() as CredentialStatus;
+        if (!this.publicBaseUrl) {
+            MessageBox.error(this.text("noPublicBaseUrl"));
+            return;
+        }
+        window.open(this.publicBaseUrl + status.login_url, "_blank", "noopener");
     }
 
     // text(key) is inherited from BaseController — do not redeclare it.
