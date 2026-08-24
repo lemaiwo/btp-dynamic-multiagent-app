@@ -27,6 +27,10 @@ if TEST_DB.exists():
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
+# A developer .env may set this. Set it EMPTY rather than popping it: app.py
+# calls load_dotenv(), which fills in vars that are absent but never overrides
+# ones already present. Empty means "no allowlist", i.e. the default rule.
+os.environ["MCP_URL_ALLOWLIST"] = ""
 
 import agents.oauth2 as oauth2  # noqa: E402
 from agents.auth import current_base_url, current_principal  # noqa: E402
@@ -99,6 +103,34 @@ async def main() -> None:
     _orig_post_token = oauth2._post_token
     oauth2._post_token = _fake_post_token  # type: ignore[assignment]
     await init_db()
+
+    # --- URL normalization -------------------------------------------------
+    # `/mcp` is appended only when the URL has no path of its own. Servers that
+    # publish a versioned or nested endpoint (Google's Gmail MCP server lives at
+    # /mcp/v1) must be left alone; appending would produce /mcp/v1/mcp, which
+    # 404s. create_mcp_server and normalize_mcp_url implement this rule
+    # separately and MUST agree: normalize_mcp_url builds the token-storage
+    # key, so any drift stores tokens under a key the live connection never
+    # looks up, and every request silently reauthenticates.
+    print("\n== MCP URL normalization ==")
+    from agents.shared import mcp_endpoint_url
+
+    for raw, expected in [
+        ("https://host.hana.ondemand.com", "https://host.hana.ondemand.com/mcp"),
+        ("https://host.hana.ondemand.com/", "https://host.hana.ondemand.com/mcp"),
+        ("https://host.hana.ondemand.com/mcp", "https://host.hana.ondemand.com/mcp"),
+        ("https://host.hana.ondemand.com/mcp/", "https://host.hana.ondemand.com/mcp"),
+        ("https://gmailmcp.googleapis.com/mcp/v1", "https://gmailmcp.googleapis.com/mcp/v1"),
+        ("https://gmailmcp.googleapis.com/mcp/v1/", "https://gmailmcp.googleapis.com/mcp/v1"),
+        ("https://host.example.com/api/mcp", "https://host.example.com/api/mcp"),
+    ]:
+        got = normalize_mcp_url(raw)
+        check(f"normalize {raw}", got == expected, f"got {got}, want {expected}")
+        check(
+            f"create_mcp_server agrees for {raw}",
+            mcp_endpoint_url(raw) == got,
+            f"shared={mcp_endpoint_url(raw)} oauth2={got}",
+        )
 
     # --- DB: store an oauth2 agent ----------------------------------------
     print("\n== DB storage + redaction ==")
