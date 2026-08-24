@@ -849,27 +849,39 @@ async def run_tests() -> None:
         check("whoami exposes a display label", isinstance(body, dict) and "label" in body, r.text[:120])
 
         # --- Config (public base URL for OAuth sign-in links) ---------------
+        # Same body-type guard as whoami above: an unmatched /admin/api/*
+        # path falls through to the chat app mounted at "/", which answers
+        # 200 with HTML, so asserting on status alone would pass against a
+        # route that doesn't exist.
         r = await client.get("/admin/api/config")
-        check("config returns 200", r.status_code == 200, r.text)
-        check(
-            "config exposes public_base_url",
-            "public_base_url" in r.json(),
-            r.text,
-        )
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        check("config returns JSON", body is not None, r.text[:120])
+        check("config exposes public_base_url", isinstance(body, dict) and "public_base_url" in body, r.text[:120])
         check(
             "public_base_url is a string",
-            isinstance(r.json().get("public_base_url"), str),
-            r.text,
+            isinstance(body, dict) and isinstance(body.get("public_base_url"), str),
+            r.text[:120],
         )
 
         os.environ["PUBLIC_BASE_URL"] = "https://example.test"
         r = await client.get("/admin/api/config")
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
         check(
             "config prefers PUBLIC_BASE_URL",
-            r.json().get("public_base_url") == "https://example.test",
-            r.text,
+            isinstance(body, dict) and body.get("public_base_url") == "https://example.test",
+            r.text[:120],
         )
         os.environ.pop("PUBLIC_BASE_URL", None)
+
+        os.environ["A2A_PUBLIC_URL"] = "https://a2a.example.test"
+        r = await client.get("/admin/api/config")
+        body = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        check(
+            "config falls back to A2A_PUBLIC_URL",
+            isinstance(body, dict) and body.get("public_base_url") == "https://a2a.example.test",
+            r.text[:120],
+        )
+        os.environ.pop("A2A_PUBLIC_URL", None)
 
         # --- credential status per MCP server ------------------------------
         # Shows whether a given principal actually holds a token for each of

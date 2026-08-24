@@ -461,15 +461,13 @@ async def api_config() -> dict[str, Any]:
     the UI5 app's path. A relative link to them breaks the moment the app is
     served from a Work Zone site, so the app builds absolute URLs from this.
 
-    The precedence matches how `agents/oauth2.py` derives `redirect_uri`, so
-    the sign-in link and the callback can never disagree about the host.
+    Reports the same `current_base_url` the OAuth callback reads to build
+    `redirect_uri` (`agents/oauth2.py`, `agents/oauth_routes.py`) — set once
+    per request by `JWTBindingMiddleware` from `PUBLIC_BASE_URL` /
+    `A2A_PUBLIC_URL` / the forwarded host headers, in that order — so the
+    sign-in link and the callback can never disagree about the host.
     """
-    base = (
-        os.environ.get("PUBLIC_BASE_URL", "").strip()
-        or os.environ.get("A2A_PUBLIC_URL", "").strip()
-        or (current_base_url.get() or "")
-    )
-    return {"public_base_url": base.rstrip("/")}
+    return {"public_base_url": (current_base_url.get() or "").rstrip("/")}
 
 
 @router.get("/api/agents/{agent_id}/credentials", dependencies=[Depends(require_admin)])
