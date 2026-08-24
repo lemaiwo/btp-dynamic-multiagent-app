@@ -1,0 +1,8 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.Skills"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="skillsPage" title="{i18n>navSkills}">
+        <Text text="Skills" />
+    </Page>
+</mvc:View>
