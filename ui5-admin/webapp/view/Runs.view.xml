@@ -3,6 +3,39 @@
     xmlns="sap.m"
     xmlns:mvc="sap.ui.core.mvc">
     <Page id="runsPage" title="{i18n>navRuns}">
-        <Text text="Runs" />
+        <headerContent>
+            <Button id="refreshRunsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefresh" />
+        </headerContent>
+        <content>
+            <Table
+                id="runsTable"
+                items="{runs>/items}"
+                growing="true"
+                growingThreshold="50"
+                noDataText="{i18n>noRuns}">
+                <columns>
+                    <Column><Text text="{i18n>colAgent}" /></Column>
+                    <Column><Text text="{i18n>colStatus}" /></Column>
+                    <Column><Text text="{i18n>colTrigger}" /></Column>
+                    <Column><Text text="{i18n>colStarted}" /></Column>
+                    <Column><Text text="{i18n>colDuration}" /></Column>
+                    <Column><Text text="{i18n>colSummary}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectIdentifier title="{runs>agent_name}" text="{runs>id}" />
+                            <ObjectStatus
+                                text="{runs>status}"
+                                state="{ path: 'runs>status', formatter: '.formatter.runStatusState' }" />
+                            <Text text="{runs>trigger}" />
+                            <Text text="{ path: 'runs>started_at', formatter: '.formatter.timestamp' }" />
+                            <Text text="{ parts: ['runs>started_at', 'runs>finished_at'], formatter: '.formatter.runDuration' }" />
+                            <Text text="{runs>summary}" maxLines="2" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
     </Page>
 </mvc:View>

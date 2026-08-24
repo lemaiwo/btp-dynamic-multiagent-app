@@ -20,3 +20,16 @@ builder:
   customTasks:
     - name: ui5-tooling-transpile-task
       afterTask: replaceVersion
+  bundles:
+    - bundleDefinition:
+        name: com/agent/admin/Component-preload.js
+        defaultFileTypes: [".js", ".fragment.xml", ".view.xml", ".properties", ".json"]
+        sections:
+          - mode: preload
+            filters:
+              - "com/agent/admin/"
+              - "!com/agent/admin/vendor/mermaid.min.js"
+              - "!com/agent/admin/test/"
+            resolve: true
+          - mode: require
+            filters: ["ui5loader-autoconfig.js"]

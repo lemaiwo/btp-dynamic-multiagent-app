@@ -12,7 +12,8 @@ sap.ui.define(function () {
             "unit/AdminService": { title: "Unit: AdminService" },
             "unit/ErrorHandler": { title: "Unit: ErrorHandler" },
             "unit/formatter": { title: "Unit: formatter" },
-            "unit/validators": { title: "Unit: validators" }
+            "unit/validators": { title: "Unit: validators" },
+            "unit/ReportRenderer": { title: "Unit: ReportRenderer" }
         }
     };
 });
