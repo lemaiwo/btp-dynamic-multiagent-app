@@ -88,10 +88,4 @@ export default class SkillDetail extends BaseController {
         this.getRouter().navTo("skills");
     }
 
-    private text(key: string): string {
-        const bundle = this.getOwnerComponentTyped().getModel("i18n") as unknown as {
-            getResourceBundle(): { getText(k: string): string };
-        };
-        return bundle.getResourceBundle().getText(key);
-    }
 }
