@@ -36,6 +36,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from agents.auth import current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
+from agents.gmail_tools import BUILTIN_URLS, is_builtin_url
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -148,6 +149,16 @@ class McpServerPayload(BaseModel):
     @model_validator(mode="after")
     def _validate_url(self) -> "McpServerPayload":
         v = self.url.strip().rstrip("/")
+        # Built-in toolsets are served in-process, so there is no host to reach
+        # and none of the transport rules below apply. The set is closed: an
+        # unknown builtin: value is a typo, not an extension point.
+        if v.lower().startswith("builtin"):
+            if not is_builtin_url(v):
+                raise ValueError(
+                    f"unknown built-in toolset {v!r}; known: {', '.join(sorted(BUILTIN_URLS))}"
+                )
+            self.url = v.lower()
+            return self
         public = self.auth_mode == AUTH_MODE_NONE
         # Public servers may use http; authenticated servers must use https
         # so forwarded JWTs are not exposed on the wire.
