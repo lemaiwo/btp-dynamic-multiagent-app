@@ -1,0 +1,8 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.Agents"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="agentsPage" title="{i18n>navAgents}">
+        <Text text="Agents" />
+    </Page>
+</mvc:View>

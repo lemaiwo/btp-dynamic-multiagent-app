@@ -28,6 +28,38 @@
       "async": true,
       "id": "app"
     },
+    "routing": {
+      "config": {
+        "routerClass": "sap.m.routing.Router",
+        "type": "View",
+        "viewType": "XML",
+        "path": "com.infrabel.agentadmin.view",
+        "controlId": "pageContainer",
+        "controlAggregation": "pages",
+        "async": true,
+        "bypassed": { "target": "notFound" }
+      },
+      "routes": [
+        { "pattern": "", "name": "root", "target": "agents" },
+        { "pattern": "agents", "name": "agents", "target": "agents" },
+        { "pattern": "agents/{agentId}", "name": "agentDetail", "target": "agentDetail" },
+        { "pattern": "skills", "name": "skills", "target": "skills" },
+        { "pattern": "skills/{skillId}", "name": "skillDetail", "target": "skillDetail" },
+        { "pattern": "runs", "name": "runs", "target": "runs" },
+        { "pattern": "runs/{runId}", "name": "runDetail", "target": "runDetail" },
+        { "pattern": "settings", "name": "settings", "target": "settings" }
+      ],
+      "targets": {
+        "agents": { "id": "agents", "name": "Agents" },
+        "agentDetail": { "id": "agentDetail", "name": "AgentDetail" },
+        "skills": { "id": "skills", "name": "Skills" },
+        "skillDetail": { "id": "skillDetail", "name": "SkillDetail" },
+        "runs": { "id": "runs", "name": "Runs" },
+        "runDetail": { "id": "runDetail", "name": "RunDetail" },
+        "settings": { "id": "settings", "name": "Settings" },
+        "notFound": { "id": "notFound", "name": "NotFound", "transition": "show" }
+      }
+    },
     "models": {
       "i18n": {
         "type": "sap.ui.model.resource.ResourceModel",

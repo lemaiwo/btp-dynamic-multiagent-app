@@ -1,0 +1,8 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.Settings"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="settingsPage" title="{i18n>navSettings}">
+        <Text text="Settings" />
+    </Page>
+</mvc:View>
