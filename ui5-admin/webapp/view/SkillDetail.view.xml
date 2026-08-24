@@ -1,8 +1,48 @@
 <mvc:View
     controllerName="com.infrabel.agentadmin.controller.SkillDetail"
     xmlns="sap.m"
-    xmlns:mvc="sap.ui.core.mvc">
-    <Page id="skillDetailPage" title="{i18n>navSkills}">
-        <Text text="SkillDetail" />
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="skillDetailPage"
+        title="{skill>/title}"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <content>
+            <f:SimpleForm layout="ResponsiveGridLayout" editable="true" class="sapUiSmallMargin">
+                <Label text="{i18n>colName}" required="true" />
+                <Input
+                    id="skillName"
+                    value="{skill>/data/name}"
+                    valueState="{skill>/errors/nameState}"
+                    valueStateText="{skill>/errors/name}"
+                    maxLength="64" />
+
+                <Label text="{i18n>colDescription}" required="true" />
+                <TextArea
+                    id="skillDescription"
+                    value="{skill>/data/description}"
+                    valueState="{skill>/errors/descriptionState}"
+                    valueStateText="{skill>/errors/description}"
+                    rows="3"
+                    width="100%" />
+
+                <Label text="{i18n>skillContent}" required="true" />
+                <TextArea
+                    id="skillContent"
+                    value="{skill>/data/content}"
+                    valueState="{skill>/errors/contentState}"
+                    valueStateText="{skill>/errors/content}"
+                    rows="18"
+                    width="100%" />
+            </f:SimpleForm>
+        </content>
+        <footer>
+            <OverflowToolbar>
+                <ToolbarSpacer />
+                <Button id="saveSkillButton" text="{i18n>save}" type="Emphasized" press=".onSave" />
+                <Button id="cancelSkillButton" text="{i18n>cancel}" press=".onBack" />
+            </OverflowToolbar>
+        </footer>
     </Page>
 </mvc:View>
