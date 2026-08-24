@@ -302,8 +302,10 @@ models.
 `test:e2e` (Playwright). The root `npm test` — today only the two report-render
 Node tests — chains `ui5-admin`'s unit and integration run, so one command
 covers both. Playwright stays a separate `npm run test:e2e` because it boots
-servers. The Python suite runs unchanged; `GET /admin/api/config` gets a pytest
-alongside the existing admin tests.
+servers. The Python suite runs unchanged; `GET /admin/api/config` is covered by
+new `check()` assertions inside `tests/test_admin_api.py`, following this
+repository's convention of standalone scripts run as `python tests/<name>.py`
+(there is no pytest configuration here).
 
 **Manual smoke** on the deployed BTP app before any cutover is proposed.
 
