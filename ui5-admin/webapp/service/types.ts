@@ -58,9 +58,10 @@ export interface AgentInput {
 /** What GET /admin/api/agents returns. Servers are redacted. */
 export interface Agent extends AgentInput {
     id: number;
-    /** Legacy single-server fields, still emitted by to_dict(). */
-    mcp_url?: string | null;
-    auth_mode?: AuthMode | null;
+    /** Legacy single-server fields; the DB columns are NOT NULL and
+     * to_dict() always emits them. */
+    mcp_url: string;
+    auth_mode: AuthMode;
     created_at: string | null;
     updated_at: string | null;
 }
@@ -77,7 +78,7 @@ export interface Skill extends SkillInput {
     updated_at: string | null;
 }
 
-export type RunStatus = "running" | "success" | "failed" | "degraded" | "refused";
+export type RunStatus = "running" | "success" | "failed" | "interrupted";
 
 export interface JobRun {
     id: string;
@@ -95,6 +96,8 @@ export interface JobRun {
 
 /** GET /admin/api/runs/{id} adds the report body to the list shape. */
 export interface JobRunDetail extends JobRun {
+    /** Inner fields stay optional: runs predating markdown reports have no
+     * body_md (see api_get_run_markdown's 404 path). */
     report?: { body_md?: string; summary?: string } | null;
 }
 
