@@ -13,6 +13,10 @@ framework:
     - name: sap.ui.layout
     - name: themelib_sap_horizon
 builder:
+  resources:
+    excludes:
+      - "/test/**"
+      - "/localService/**"
   customTasks:
     - name: ui5-tooling-transpile-task
       afterTask: replaceVersion

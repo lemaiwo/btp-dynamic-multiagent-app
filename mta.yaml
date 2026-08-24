@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.2.0
+version: 2.3.0
 
 parameters:
   enable-parallel-deployments: true
@@ -28,6 +28,7 @@ modules:
         - "mta_archives/"
         - "*.mtar"
         - "approuter/"
+        - "ui5-admin/"
     parameters:
       memory: 1G
       disk-quota: 2G
@@ -70,6 +71,9 @@ modules:
       memory: 128M
       disk-quota: 256M
       buildpack: nodejs_buildpack
+    properties:
+      destinations: >
+        [{"name":"ui5","url":"https://ui5.sap.com","forwardAuthToken":false}]
     requires:
       - name: uaa-service
       - name: pydantic-agent-api
@@ -78,6 +82,33 @@ modules:
           name: pydantic-agent-backend
           url: ~{url}
           forwardAuthToken: true
+      - name: ui5-admin-repo-runtime
+
+  - name: ui5-admin
+    type: html5
+    path: ui5-admin
+    build-parameters:
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build:ui5
+      supported-platforms: []
+      build-result: dist
+
+  - name: ui5-admin-deployer
+    type: com.sap.application.content
+    path: .
+    requires:
+      - name: ui5-admin-repo-host
+        parameters:
+          content-target: true
+    build-parameters:
+      build-result: resources
+      requires:
+        - name: ui5-admin
+          artifacts:
+            - ui5-admin-content.zip
+          target-path: resources/
 
 resources:
   - name: aicore-service
@@ -106,3 +137,15 @@ resources:
         # storage: 20                   # GB; grow-only (default/floor is 20)
         multi_az: false               # false = no HA standby (dev). Set true for prod HA.
         # backup_retention_period: 14   # days; allowed 7–35
+
+  - name: ui5-admin-repo-host
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: html5-apps-repo
+      service-plan: app-host
+
+  - name: ui5-admin-repo-runtime
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: html5-apps-repo
+      service-plan: app-runtime
