@@ -32,6 +32,19 @@
       "scope": "$XSAPPNAME.a2a"
     },
     {
+      "source": "^/ui5admin$",
+      "target": "/ui5admin/",
+      "authenticationType": "none",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5admin/(.*)$",
+      "target": "/cominfrabelagentadmin/$1",
+      "service": "html5-apps-repo-rt",
+      "authenticationType": "xsuaa",
+      "csrfProtection": false
+    },
+    {
       "source": "^(.*)$",
       "target": "$1",
       "destination": "pydantic-agent-backend",
