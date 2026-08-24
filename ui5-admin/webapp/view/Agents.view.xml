@@ -1,8 +1,61 @@
 <mvc:View
     controllerName="com.infrabel.agentadmin.controller.Agents"
     xmlns="sap.m"
-    xmlns:mvc="sap.ui.core.mvc">
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core">
     <Page id="agentsPage" title="{i18n>navAgents}">
-        <Text text="Agents" />
+        <headerContent>
+            <Button id="addAgentButton" icon="sap-icon://add" text="{i18n>newAgent}" press=".onCreate" />
+        </headerContent>
+        <content>
+            <Table
+                id="agentsTable"
+                items="{agents>/items}"
+                growing="true"
+                growingThreshold="50"
+                noDataText="{i18n>noAgents}">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <SearchField
+                            id="agentSearch"
+                            width="18rem"
+                            placeholder="{i18n>searchAgents}"
+                            liveChange=".onSearch" />
+                        <ToolbarSpacer />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <Column><Text text="{i18n>colName}" /></Column>
+                    <Column><Text text="{i18n>colDescription}" /></Column>
+                    <Column><Text text="{i18n>colToolsets}" /></Column>
+                    <Column><Text text="{i18n>colStatus}" /></Column>
+                    <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectIdentifier title="{agents>name}" text="{agents>api_slug}" />
+                            <Text text="{agents>description}" maxLines="2" />
+                            <Text text="{ path: 'agents>mcp_servers', formatter: '.formatter.serverSummary' }" />
+                            <ObjectStatus
+                                text="{= ${agents>enabled} ? ${i18n>enabled} : ${i18n>disabled} }"
+                                state="{= ${agents>enabled} ? 'Success' : 'None' }" />
+                            <HBox>
+                                <Button
+                                    icon="sap-icon://play"
+                                    type="Transparent"
+                                    tooltip="{i18n>runNow}"
+                                    press=".onRunNow" />
+                                <Button
+                                    icon="sap-icon://delete"
+                                    type="Transparent"
+                                    tooltip="{i18n>delete}"
+                                    press=".onDelete" />
+                            </HBox>
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
     </Page>
 </mvc:View>

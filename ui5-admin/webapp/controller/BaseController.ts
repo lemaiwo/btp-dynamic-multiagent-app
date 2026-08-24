@@ -72,4 +72,20 @@ export default abstract class BaseController extends Controller {
             return false;
         }
     }
+
+    /**
+     * Looks up a text from the `i18n` resource bundle.
+     *
+     * The component-scoped `getModel("i18n")` returns `Model | undefined`
+     * (unlike this class's view-scoped `getModel()`), and `Model` itself has
+     * no `getResourceBundle()` — only the concrete `ResourceModel` does. The
+     * cast expresses just the shape used here without pulling in the
+     * `ResourceModel` type.
+     */
+    protected text(key: string): string {
+        const model = this.getOwnerComponentTyped().getModel("i18n") as unknown as {
+            getResourceBundle(): { getText(k: string): string };
+        };
+        return model.getResourceBundle().getText(key);
+    }
 }
