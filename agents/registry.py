@@ -25,7 +25,7 @@ from agents.db import (
     list_agents,
     list_skills,
 )
-from agents.gmail_tools import gmail_toolset, is_builtin_url
+from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.shared import create_mcp_server, default_model_name, get_model
 
 logger = logging.getLogger(__name__)
@@ -489,8 +489,8 @@ async def build_orchestrator() -> BuildResult:
                 if is_builtin_url(spec["url"]):
                     # Served in-process: no MCP connection, but the same oauth
                     # block and the same stored per-user token.
-                    toolset = gmail_toolset(
-                        spec.get("oauth") or {}, server_key=spec["url"]
+                    toolset = build_builtin_toolset(
+                        spec["url"], spec.get("oauth")
                     )
                     servers.append(toolset.prefixed(prefix) if prefix else toolset)
                     continue

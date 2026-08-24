@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from agents.auth import current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
-from agents.gmail_tools import BUILTIN_URLS, is_builtin_url
+from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
