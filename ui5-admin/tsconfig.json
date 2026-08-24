@@ -14,7 +14,7 @@
     "paths": {
       "com/infrabel/agentadmin/*": ["webapp/*"]
     },
-    "types": ["@sapui5/types"]
+    "types": ["@sapui5/types", "qunit"]
   },
   "include": ["webapp/**/*"]
 }

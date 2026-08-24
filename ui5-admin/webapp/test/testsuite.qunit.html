@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Agent Administration - Test Suite</title>
+    <!--
+        NOTE: this project is UI5-Tooling type "application", which is served
+        "flat" (no namespaced resources/test-resources prefix) by both
+        `ui5 serve` and karma-ui5's default middleware. The generic UI5 test
+        starter assumes a "library" layout with a real test-resources area,
+        so it 404s here. Instead, this page boots UI5 directly and reads the
+        suite list from testsuite.qunit.js itself.
+
+        Careful when editing this comment: karma-ui5's discovery step sniffs
+        this file's raw text for the substring that names that starter's
+        create-suite module, and would otherwise wait forever for a
+        window.suite() it will never get from this page.
+    -->
+    <script
+        id="sap-ui-bootstrap"
+        src="../resources/sap-ui-core.js"
+        data-sap-ui-theme="sap_horizon"
+        data-sap-ui-language="EN"
+        data-sap-ui-compat-version="edge"
+        data-sap-ui-async="true"
+        data-sap-ui-resourceroots='{"com.infrabel.agentadmin": "../"}'
+    ></script>
+    <script>
+        sap.ui.require([
+            "sap/ui/thirdparty/qunit-2",
+            "com/infrabel/agentadmin/test/testsuite.qunit"
+        ], function (_qunit, oSuite) {
+            "use strict";
+            QUnit.config.autostart = false;
+            var aModules = Object.keys(oSuite.tests).map(function (sName) {
+                return "com/infrabel/agentadmin/test/" + sName + ".qunit";
+            });
+            sap.ui.require(aModules, function () {
+                QUnit.start();
+            });
+        });
+    </script>
+</head>
+<body>
+    <div id="qunit"></div>
+    <div id="qunit-fixture"></div>
+</body>
+</html>
