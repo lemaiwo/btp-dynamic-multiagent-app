@@ -1,0 +1,20 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "node",
+    "skipLibCheck": true,
+    "allowJs": true,
+    "strict": true,
+    "strictNullChecks": true,
+    "noImplicitAny": true,
+    "noUnusedLocals": true,
+    "rootDir": "webapp",
+    "baseUrl": "./",
+    "paths": {
+      "com/infrabel/agentadmin/*": ["webapp/*"]
+    },
+    "types": ["@sapui5/types"]
+  },
+  "include": ["webapp/**/*"]
+}

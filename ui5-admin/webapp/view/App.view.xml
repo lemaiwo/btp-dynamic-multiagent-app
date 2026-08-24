@@ -1,0 +1,13 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.App"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    displayBlock="true">
+    <Shell>
+        <App id="rootApp">
+            <Page title="{i18n>appTitle}">
+                <Text text="Scaffold OK" />
+            </Page>
+        </App>
+    </Shell>
+</mvc:View>

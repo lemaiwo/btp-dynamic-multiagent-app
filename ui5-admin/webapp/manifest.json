@@ -1,0 +1,39 @@
+{
+  "_version": "1.59.0",
+  "sap.app": {
+    "id": "com.infrabel.agentadmin",
+    "type": "application",
+    "title": "Agent Administration",
+    "description": "Administer dynamic agents, skills and job runs",
+    "applicationVersion": { "version": "1.0.0" }
+  },
+  "sap.ui": {
+    "technology": "UI5",
+    "deviceTypes": { "desktop": true, "tablet": true, "phone": false }
+  },
+  "sap.ui5": {
+    "dependencies": {
+      "minUI5Version": "1.120.0",
+      "libs": {
+        "sap.m": {},
+        "sap.ui.core": {},
+        "sap.f": {},
+        "sap.tnt": {},
+        "sap.ui.layout": {}
+      }
+    },
+    "rootView": {
+      "viewName": "com.infrabel.agentadmin.view.App",
+      "type": "XML",
+      "async": true,
+      "id": "app"
+    },
+    "models": {
+      "i18n": {
+        "type": "sap.ui.model.resource.ResourceModel",
+        "settings": { "bundleName": "com.infrabel.agentadmin.i18n.i18n" }
+      }
+    },
+    "resources": { "css": [{ "uri": "css/style.css" }] }
+  }
+}
