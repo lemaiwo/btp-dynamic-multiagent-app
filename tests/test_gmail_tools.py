@@ -34,11 +34,11 @@ os.environ["MCP_URL_ALLOWLIST"] = ""
 
 import httpx  # noqa: E402
 
+from agents.builtins import is_builtin_url  # noqa: E402
 from agents.gmail_tools import (  # noqa: E402
     BUILTIN_GMAIL_URL,
     GmailClient,
     gmail_toolset,
-    is_builtin_url,
 )
 
 PASSED = 0

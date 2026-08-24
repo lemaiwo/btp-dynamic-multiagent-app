@@ -8,9 +8,15 @@ the reasoning; this document is the Microsoft variant and stands on its own.
 
 ## Status
 
-**Nothing is built yet.** This is the setup and the go/no-go probe. Write the
-toolset only once the probe passes — the risk here is your tenant's policy, not
-the code, and it is answerable in minutes.
+**The toolset is built and unit-tested; it has never touched a real mailbox.**
+`agents/outlook_tools.py` exists with all four tools, 39 assertions against a
+mocked transport, and the registry wiring done. What is missing is a tenant to
+run it against: the three gates below are unanswered, so nothing here has been
+verified end to end the way the Gmail path was.
+
+Run the probe in section 5 first. If it passes, connect the agent and the tools
+should work; if it fails, the code is fine and the answer is a conversation with
+IT, not a change here.
 
 Microsoft's own hosted Outlook MCP server (Work IQ Mail, under Agent 365) is not
 a route for this app: preview only, requires a Microsoft 365 Copilot licence,
@@ -131,7 +137,7 @@ carries the offline request in the scope instead.
 Also set the agent's **Run-as identity** (`run_as_principal`): scheduled runs
 have no logged-in user and use that principal's stored token.
 
-## 5. The probe — run this before writing any code
+## 5. The probe — run this before connecting the agent
 
 `scripts/probe_outlook.py` does one delegated sign-in and reports which gates
 you cleared. It talks to Entra and Graph only, touches none of this app's code
@@ -150,7 +156,7 @@ prints a verdict. What each outcome means:
 
 | Result | Meaning |
 | --- | --- |
-| refresh token present, folder found | All three gates clear. Build it |
+| refresh token present, folder found | All three gates clear. Connect the agent |
 | token but **no refresh token** | `offline_access` missing from step 3 |
 | `AADSTS65001` / `AADSTS90094` | Admin consent required — ask IT to grant it |
 | `AADSTS50011` | Redirect URI mismatch — see the localhost note in step 1 |
@@ -163,14 +169,16 @@ Create a subfolder under Inbox in Outlook — `agent` below, matching the Gmail
 setup — plus wherever handled mail should land. Moving to a second folder such
 as `agent-done` keeps an audit trail; moving back to the Inbox does not.
 
-The probe resolves the folder by display name and prints its id. Folder ids are
-opaque and stable, so the id goes in the agent config and the display name is
-never used at runtime.
+The probe prints each subfolder's id, which is useful for debugging, but **no
+folder id goes in the config**: the toolset resolves the display name at
+runtime and caches it. So the run prompt names the folder (`agent`), and
+renaming it in Outlook is all it takes to point the agent elsewhere.
 
-## 7. What gets built afterwards
+## 7. The toolset (built, unverified)
 
-A sibling of `agents/gmail_tools.py`, attached the same way — `agents/registry.py`
-already branches on the `builtin:` scheme, so no framework change is needed.
+`agents/outlook_tools.py`, a sibling of `agents/gmail_tools.py`, dispatched by
+`agents/builtins.py`. No framework change was needed — `agents/registry.py`
+already branches on the `builtin:` scheme.
 
 | Tool | Graph call |
 | --- | --- |
@@ -182,6 +190,48 @@ already branches on the `builtin:` scheme, so no framework change is needed.
 Four tools rather than Gmail's five, and no send tool. `createReply` builds the
 threaded draft itself, so none of the MIME assembly and `In-Reply-To` handling
 in the Gmail version is needed.
+
+Behaviour worth knowing before writing the run prompt:
+
+- **`move_message` takes a folder display name**, so where handled mail goes is
+  a prompt decision, not a config one: `agent-done` keeps an audit trail,
+  `inbox` puts it back. Well-known names (`inbox`, `archive`, `deleteditems`)
+  are passed to Graph as-is; anything else is resolved among the Inbox's
+  subfolders.
+- **Folders resolve by display name at runtime**, cached per toolset, so nothing
+  needs a folder id in config. An unknown name raises and lists what it did
+  find — "no mail waiting" and "wrong folder name" must not look alike.
+- **`list_pending` returns oldest first** and never includes bodies; a folder
+  listing carrying bodies would exhaust the context before the first reply.
+- **Tool names are prefixed when an agent binds more than one server** —
+  `outlook_list_pending`, not `list_pending`. Same trap as Gmail.
+
+### Suggested run prompt
+
+```
+Handle the emails waiting for me.
+
+1. Call outlook_list_pending with folder: agent
+2. If there are none, say so in one line and stop.
+3. For each message, in order:
+   a. Call outlook_get_message to read it.
+   b. Write a reply in my voice: brief, direct, no filler. Answer what was
+      actually asked. If you cannot answer without information I have not
+      given you, draft a reply that asks for exactly that, and say so.
+   c. Call outlook_create_reply_draft with the reply.
+   d. Call outlook_move_message to move it to agent-done.
+
+Never send anything. Drafts only.
+
+Report a markdown table with the columns: From | Subject | What the draft says |
+Status. One row per message. If a step failed, say which step and why in the
+Status column rather than dropping the row.
+```
+
+Step (d) is the idempotency mechanism: the message leaves the queue folder, so
+the next run does not see it. Create `agent-done` in Outlook first — like
+Gmail's labels, `move_message` refuses an unknown destination rather than
+silently skipping.
 
 ## Security notes
 
