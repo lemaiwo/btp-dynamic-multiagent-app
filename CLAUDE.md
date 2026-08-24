@@ -39,6 +39,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   Tokens in `mcp_oauth_tokens`, flow state in `mcp_oauth_states`, registered
   DCR clients in `mcp_oauth_clients`
 - `agents/oauth_routes.py` — `GET /oauth/callback` completes the flow
+- `agents/gmail_tools.py` — in-process Gmail tools over the REST API,
+  attached when an agent lists the pseudo-URL `builtin:gmail` instead of an
+  MCP endpoint. Google's hosted Gmail MCP server refuses every `tools/call`
+  from a self-registered OAuth client; see `docs/GMAIL_SETUP.md`. Auth reuses
+  `PerUserOAuth2Auth`, so sign-in and refresh are unchanged
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps. Attached skills are listed

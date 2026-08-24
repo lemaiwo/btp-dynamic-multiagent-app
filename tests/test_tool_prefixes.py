@@ -63,6 +63,13 @@ def main() -> None:
     )
     check("colliding first-labels disambiguated", collide[0] != collide[1])
 
+    # builtin: URLs have no hostname. Falling back to the path keeps them
+    # distinguishable; without it every hostless entry slugs to "mcp" and two
+    # built-ins on one agent would collide into mcp_0 / mcp_1.
+    builtin = _compute_tool_prefixes([ARC1, "builtin:gmail"])
+    check("builtin prefixes from its path", builtin[1] == "gmail", f"got {builtin[1]!r}")
+    check("builtin does not collide with a real host", builtin[0] != builtin[1])
+
     # Sanity: the OLD full-hostname slug would have failed.
     full = "infrabel_app_acc_cf_ai_arc1_mcp_server_cfapps_eu20_001_hana_ondemand_com"
     check("old full-hostname prefix would exceed 64", len(f"{full}_SAPContext") > 64)

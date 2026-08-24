@@ -3,7 +3,16 @@
 Move a mail into a Gmail label, and a scheduled agent reads it, writes a draft
 reply, and takes the label off again.
 
-## Status (2026-08-22)
+**Working since 2026-08-24, over the Gmail REST API.** Google's hosted MCP
+server is a dead end for a self-registered OAuth client (the whole Status
+section below is the evidence), so the five tools this needs are served
+in-process by `agents/gmail_tools.py`. Sections 1 and 3-7 still apply -- the
+same Google Cloud project, the same OAuth client, the same agent config -- only
+the server URL changes, to `builtin:gmail`. If you are setting this up fresh,
+read [section 5](#5-the-built-in-gmail-toolset) and skip the Status section
+entirely.
+
+## Status (2026-08-24, second pass)
 
 **Google's hosted Gmail MCP server does not work with a self-registered OAuth
 client.** `https://gmailmcp.googleapis.com/mcp/v1` authenticates a token issued
@@ -16,9 +25,14 @@ by your own OAuth client and then refuses to authorize it:
 This was tested to exhaustion against a real personal Gmail account. See
 [Appendix: what was ruled out](#appendix-what-was-ruled-out) — the short version
 is that scope, identity, API enablement and audience were each eliminated, and
-the same token reads the mailbox fine through `gmail.googleapis.com`. Google's
-own documentation only ever shows redirect URIs for two clients — Antigravity
-and Claude — which fits a service that accepts only its own approved clients.
+the same token reads the mailbox fine through `gmail.googleapis.com`.
+
+Google's documentation shows worked examples only for Antigravity and Claude,
+but it does **not** describe an allowlist, an approval process or a verification
+requirement — it presents a self-registered OAuth client as the normal path and
+says "many AI applications have ways to connect to a remote MCP server". So the
+cause of the refusal remains genuinely unexplained; an undocumented client gate
+is a hypothesis that fits the behaviour, not something Google states.
 
 **The route that should work is a self-hosted MCP server** calling the Gmail API
 directly, since a token from your own client demonstrably works against that
@@ -30,6 +44,57 @@ working deployment here.
 
 Sections 1–4 are validated and worth keeping either way: the OAuth client you
 create is the same one a self-hosted server will use.
+
+### Validated 2026-08-24: the read + draft loop, and a query-syntax trap
+
+The tool sequence this design depends on was exercised end to end against the
+same mailbox, through Claude Code's own Gmail connector. That connector reaches
+a Gmail MCP service that answers `tools/call` normally.
+
+**This does not unblock the hosted server.** The connector uses Anthropic's own
+credential, which a BTP-hosted agent cannot borrow, and there is no way to see
+from the client which endpoint it talks to. What it does confirm is that the
+403 above is about *which client is asking*, not about anything you configured
+— and it settles the tool behaviour the prompt in section 6 relies on:
+
+| Step | Tool | Result |
+| --- | --- | --- |
+| Find labelled mail | `search_threads` `label:agent` | works — **by display name only**, see below |
+| Read the mail | `get_thread` `PLAIN_TEXT` | full body and signature, clean |
+| Draft the reply | `create_draft` + `replyToMessageId` | draft created on the right thread |
+| Relabel | `label_thread` / `unlabel_thread` | refused: `Request had insufficient authentication scopes` |
+
+**The trap: `label:` wants the display name, not the label ID.** A query built
+from an ID returns zero results and no error — indistinguishable from an empty
+label. This contradicts the tool's own description, which states it accepts IDs
+and not display names. Verified both ways against a label with 240 live threads:
+
+```
+label:Label_5781717798834007196   ->  {}          zero results, no error
+label:Partners/Amista             ->  201 threads
+```
+
+Nested labels take the full path (`Partners/Amista`). Names containing spaces
+need quoting (`label:"TE BETALEN"`).
+
+**The app's own client was then run against Google's hosted server** —
+`create_mcp_server` → `PerUserOAuth2Auth`, the real code path, stored config
+untouched. The boundary is sharp:
+
+| Stage | Result |
+| --- | --- |
+| Token refresh (stored token had expired) | works |
+| `initialize`, `tools/list` | works — all 22 tools listed, including the four this design needs |
+| `tools/call` — `list_labels`, `search_threads`, `get_thread` | all refused: `The caller does not have permission` |
+
+Note the refusal arrives as **HTTP 200 with a JSON-RPC `isError` body**, not an
+HTTP 403; the 403 is what the raw transport returns. Anything that only checks
+the HTTP status will read this as success.
+
+The relabel refusal is a property of that particular connector's scope grant,
+not of Gmail — a self-hosted server holding `gmail.modify` can relabel. But
+since a read-plus-compose deployment is a plausible place to end up, the
+idempotency fallback under [How it works](#how-it-works) is worth knowing.
 
 ## How it works
 
@@ -48,6 +113,13 @@ BTP Job Scheduler  --cron-->  POST /api/agents/<slug>/run
 
 Removing the label is what makes it idempotent: a handled mail no longer matches
 the search, so the next run skips it.
+
+**If the server cannot write labels**, there is a fallback that needs no write
+scope at all: `list_drafts` returns a `threadId` on every draft, so the agent
+lists existing drafts first and skips any thread that already has one. Verified
+2026-08-24. Note the check has to go through `list_drafts` — `get_thread` does
+**not** include the draft among the thread's messages, so a thread that has
+already been drafted looks untouched from the thread side.
 
 ## Prerequisites
 
@@ -184,7 +256,7 @@ In **/admin → Agents**, add an MCP server row:
 
 | Field | Value |
 | --- | --- |
-| URL | your MCP server's endpoint |
+| URL | `builtin:gmail` (see [section 5](#5-the-built-in-gmail-toolset)) |
 | Auth mode | `oauth2` |
 | DCR checkbox | **unchecked** — Google does not support Dynamic Client Registration |
 | Client ID / Secret | from step 1.4 (the secret field is a password input; the API never returns it) |
@@ -206,23 +278,45 @@ send, and nothing here needs it.
 Also set the agent's **Run-as identity** (`run_as_principal`): scheduled runs
 have no logged-in user and use this principal's stored token.
 
-## 5. The MCP server itself — NOT YET VALIDATED
+## 5. The built-in Gmail toolset
 
-Google's hosted server is ruled out (see Status). The remaining option is to run
-one. From [`workspace-mcp`](https://workspacemcp.com/docs)'s documentation:
+`builtin:gmail` is not a URL. `agents/registry.py` recognises the scheme and
+attaches `agents/gmail_tools.py` in-process instead of opening an MCP
+connection. Nothing is deployed and nothing is listening -- the tools call
+`https://gmail.googleapis.com` directly, with the same per-user token the OAuth2
+MCP servers use, through the same `PerUserOAuth2Auth`. Sign-in, refresh and the
+"connect this agent" link all behave exactly as they do for a real MCP server.
 
-- `uvx workspace-mcp --tool-tier core`
-- `--transport streamable-http` for OAuth 2.1 support
-- `MCP_ENABLE_OAUTH21=true`
-- tools include `draft_gmail_message` and `modify_gmail_message_labels`
+Five tools, and deliberately no sixth:
 
-Deploy it somewhere this app can reach — beside the other MCP servers in the CF
-space is the obvious spot — then register it per section 4 and add its host to
-`MCP_URL_ALLOWLIST`.
+| Tool | Does |
+| --- | --- |
+| `search_threads(query, max_results)` | Gmail search; metadata only, capped at 50 threads |
+| `get_thread(thread_id, max_chars)` | every message as plain text, per-message cap |
+| `create_draft(thread_id, body)` | threaded reply saved as a draft |
+| `list_labels()` | `{display name: label id}` |
+| `modify_labels(thread_id, add, remove)` | add/remove on a whole thread, by name or id |
 
-**None of this has been run.** Treat the above as a starting point, not a
-recipe, and expect the tool names in section 6's prompt to need adjusting to
-whatever the server actually exposes.
+**There is no send tool.** "Drafts only" is then a property of the toolset
+rather than a line in a prompt a model can talk itself out of.
+
+Two details that cost time if you meet them cold:
+
+- **Search matches labels by display name** (`label:agent`), but **`modify_labels`
+  resolves names to ids** for you, because the REST API modifies by id. An
+  unknown label raises rather than being skipped -- silently dropping a removal
+  would leave the mail labelled and every later run would redo the thread.
+- **Tool names are prefixed when an agent binds more than one server.** With
+  three servers attached the model sees `gmail_search_threads`, not
+  `search_threads`, and the run prompt in section 6 has to match. Check the
+  actual names before blaming the model for not calling a tool.
+
+### Switching an existing agent over
+
+Replace the `https://gmailmcp.googleapis.com/mcp/v1` row with `builtin:gmail`,
+keeping the same oauth block. Tokens are stored per server key, so the existing
+grant does not carry over: the agent will report "no-token" until you reconnect
+once through the sign-in link. Nothing else changes.
 
 ## 6. Give the agent its prompt
 
@@ -249,8 +343,13 @@ Status. One row per thread. If a step failed for a thread, say which step and
 why in the Status column rather than dropping the row.
 ```
 
+- **Use the label's display name in the query, never its ID.** `label:agent`
+  finds mail; `label:Label_8458289880304789230` silently returns nothing. See
+  Status.
 - **Step (d) is the idempotency mechanism.** Without it every run re-drafts
-  every mail.
+  every mail. If the deployed server has no label-write scope, replace (d) with
+  a check at the top of step 3: list existing drafts and skip any thread that
+  already has one.
 - **"Never send anything"** costs nothing and removes any doubt.
 - **Keep failures in the table.** A row that quietly disappears is how a mail
   ends up never handled without you noticing.
@@ -275,6 +374,56 @@ personal Gmail account:
 | No refresh token | Eliminated — refresh token present, refresh returned 200 |
 | Missing RFC 8707 resource indicator | Eliminated as a fix — adding `resource=` to the authorize URL left `aud` as the client ID; Google ignored it |
 | The `agent` label did not exist | Eliminated — found in the label list |
+| Scope too *broad* — restricted scopes refused from an unverified app | Eliminated 2026-08-24 — refreshed down to exactly the two documented scopes (`gmail.readonly` + `gmail.compose`, per Google's setup guide). Google honoured the narrowing; the server refused all the same |
+| Something in this app's MCP client | Eliminated 2026-08-24 — `tools/list` succeeds through the app and returns all 22 tools; only `tools/call` is refused |
+| A stale or badly-minted token | Eliminated 2026-08-24 — a fresh grant taken through the app's own `/oauth/login` → consent → callback is refused identically |
+| Workspace admin policy blocking the app | Eliminated 2026-08-24 — services all Unrestricted, no configured-app restriction, and the OAuth audit log records **zero** denials |
+| Publishing status / External user type | Eliminated 2026-08-24 — switched the app to **Internal**, reconnected for a fresh grant, still refused |
+| Wrong or cross-project API enablement | Eliminated 2026-08-24 — both APIs enabled in `btp-ai-gmail`, whose project number matches the OAuth client id |
+
+### The Workspace and Cloud Console sweep (2026-08-24)
+
+The mailbox is a **Google Workspace** account (`lemaire.tech`, MX
+`aspmx.l.google.com`), not a personal one — so the admin-side controls were
+checked too. All clean:
+
+| Checked | Finding |
+| --- | --- |
+| Security → API controls → App access control | All 18 Google services **Unrestricted**, Gmail included; **Configured apps empty** |
+| Agents → Agent access management | Empty; its banner defers non-Gemini connections to app access control |
+| Reporting → **OAuth log events**, 7 days | 18 events, **all Grant/Revoke — no denial of any kind**. The client's two grants are recorded and nothing blocked them |
+| Cloud project | `btp-ai-gmail`, org parent present; **both APIs enabled in that same project**; client id prefix matches the project number |
+| Verification centre | "Verification is not required since your app is configured with a testing publishing status" — nothing pending or rejected |
+
+Then the publishing-status hypothesis was tested directly: the OAuth app was
+switched from **External / Testing** to **Internal** (possible because the
+project sits under the Workspace org), reconnected through the app for a fresh
+grant, and re-probed. **Still refused.** Eliminated.
+
+### Where this leaves it
+
+Everything a customer can configure has now been checked and is correct: the
+app's code, its OAuth implementation, the token, the scopes, the Cloud project,
+the enabled APIs, the Workspace policy, and the publishing status. `tools/list`
+succeeds; every `tools/call` is refused.
+
+The one remaining observable difference is that clients known to work with
+Google's connectors carry Google's **verification badge** and this one does not
+— correlation, not a demonstrated cause. Chasing it means Google's OAuth
+verification review, and Gmail's scopes are all *restricted*, so that is the
+expensive tier (privacy policy, verified domain, demo video, typically a CASA
+security assessment; weeks to months). Note also that **an Internal app cannot
+be verified at all** — verification applies to External apps — so the two
+remaining levers are mutually exclusive.
+
+**Recommendation: stop here and self-host.** The Gmail REST API accepts this
+exact token (200 from `users/me/profile`), only four tools are needed
+(`search_threads`, `get_thread`, `create_draft`, `list_drafts`), and that path
+is bounded work rather than an open-ended bet on an unproven hypothesis.
+
+One thing worth keeping regardless of which way you go: leave the app
+**Internal**. Testing mode expires refresh tokens after 7 days, which would
+break a scheduled agent every week; Internal does not.
 
 The control that makes this conclusive: **the same token returns 200 from
 `https://gmail.googleapis.com/gmail/v1/users/me/profile`** and lists the
@@ -330,6 +479,11 @@ service, never at your scopes. Send no `Authorization` header at all to read the
 | `RuntimeError: PUBLIC_BASE_URL must be set for API-triggered runs` | Set `PUBLIC_BASE_URL` (locally `http://127.0.0.1:7932`) |
 | `ModelHTTPError ... context_length_exceeded` | A tool returned a huge payload. Narrow the search (`label:agent newer_than:7d`) and cap threads per run |
 | Every run re-drafts the same mails | Step (d) of the prompt is being skipped, or the label name does not match |
+| `search_threads` returns `{}` for a label you can see in `list_labels` | The query used the label **ID**. Use the display name: `label:agent`, not `label:Label_8458…` |
+| `Request had insufficient authentication scopes` on a label write | The token has read/compose but not `gmail.modify`. Reconnect with the scope from 1.3, or use the `list_drafts` idempotency fallback |
+| `OAuthAuthorizationRequired: no-token` after switching to `builtin:gmail` | Expected once. Tokens are keyed by server key; reconnect through the sign-in link |
+| The agent never calls a Gmail tool | Tool names are prefixed per server. With several servers attached it is `gmail_search_threads`, not `search_threads` |
+| `unknown label 'x'; call list_labels for valid names` | The label does not exist in the mailbox. Create it in Gmail or drop it from the prompt — `modify_labels` refuses rather than silently skipping |
 
 ## Security notes
 
