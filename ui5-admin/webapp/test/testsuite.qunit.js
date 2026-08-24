@@ -9,7 +9,9 @@ sap.ui.define(function () {
             loader: { paths: { "com/infrabel/agentadmin": "../" } }
         },
         tests: {
-            "unit/AdminService": { title: "Unit: AdminService" }
+            "unit/AdminService": { title: "Unit: AdminService" },
+            "unit/formatter": { title: "Unit: formatter" },
+            "unit/validators": { title: "Unit: validators" }
         }
     };
 });
