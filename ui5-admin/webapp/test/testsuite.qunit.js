@@ -10,6 +10,7 @@ sap.ui.define(function () {
         },
         tests: {
             "unit/AdminService": { title: "Unit: AdminService" },
+            "unit/ErrorHandler": { title: "Unit: ErrorHandler" },
             "unit/formatter": { title: "Unit: formatter" },
             "unit/validators": { title: "Unit: validators" }
         }
