@@ -3,6 +3,35 @@
     xmlns="sap.m"
     xmlns:mvc="sap.ui.core.mvc">
     <Page id="skillsPage" title="{i18n>navSkills}">
-        <Text text="Skills" />
+        <headerContent>
+            <Button id="addSkillButton" icon="sap-icon://add" text="{i18n>newSkill}" press=".onCreate" />
+        </headerContent>
+        <content>
+            <Table
+                id="skillsTable"
+                items="{skills>/items}"
+                growing="true"
+                growingThreshold="50"
+                noDataText="{i18n>noSkills}">
+                <columns>
+                    <Column><Text text="{i18n>colName}" /></Column>
+                    <Column><Text text="{i18n>colDescription}" /></Column>
+                    <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectIdentifier title="{skills>name}" />
+                            <Text text="{skills>description}" maxLines="2" />
+                            <Button
+                                icon="sap-icon://delete"
+                                type="Transparent"
+                                tooltip="{i18n>delete}"
+                                press=".onDelete" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
     </Page>
 </mvc:View>
