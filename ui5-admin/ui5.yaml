@@ -20,3 +20,16 @@ builder:
   customTasks:
     - name: ui5-tooling-transpile-task
       afterTask: replaceVersion
+  bundles:
+    - bundleDefinition:
+        name: com/infrabel/agentadmin/Component-preload.js
+        defaultFileTypes: [".js", ".fragment.xml", ".view.xml", ".properties", ".json"]
+        sections:
+          - mode: preload
+            filters:
+              - "com/infrabel/agentadmin/"
+              - "!com/infrabel/agentadmin/vendor/mermaid.min.js"
+              - "!com/infrabel/agentadmin/test/"
+            resolve: true
+          - mode: require
+            filters: ["ui5loader-autoconfig.js"]
