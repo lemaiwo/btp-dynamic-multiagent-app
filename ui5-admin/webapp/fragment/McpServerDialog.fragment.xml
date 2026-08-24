@@ -1,0 +1,83 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <Dialog id="serverDialog" title="{i18n>mcpServer}" contentWidth="42rem">
+        <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+
+            <Label text="{i18n>serverUrl}" required="true" />
+            <Input
+                id="serverUrl"
+                value="{server>/url}"
+                valueState="{server>/errors/urlState}"
+                valueStateText="{server>/errors/url}"
+                placeholder="{i18n>serverUrlPlaceholder}"
+                showSuggestion="true"
+                suggestionItems="{server>/builtins}">
+                <suggestionItems>
+                    <core:Item text="{server>}" />
+                </suggestionItems>
+            </Input>
+
+            <Label text="{i18n>authMode}" />
+            <Select id="serverAuthMode" selectedKey="{server>/auth_mode}" change=".onAuthModeChange">
+                <core:Item key="jwt" text="{i18n>authJwt}" />
+                <core:Item key="none" text="{i18n>authNone}" />
+                <core:Item key="oauth2" text="{i18n>authOauth2}" />
+            </Select>
+
+            <Label text="{i18n>oauthDcr}" visible="{= ${server>/auth_mode} === 'oauth2' }" />
+            <CheckBox
+                id="oauthDcr"
+                selected="{server>/oauth/dcr}"
+                text="{i18n>oauthDcrHint}"
+                visible="{= ${server>/auth_mode} === 'oauth2' }" />
+
+            <Label text="{i18n>clientId}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Input
+                id="oauthClientId"
+                value="{server>/oauth/client_id}"
+                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+
+            <Label text="{i18n>clientSecret}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Input
+                id="oauthClientSecret"
+                type="Password"
+                value="{server>/oauth/client_secret}"
+                placeholder="{server>/secretPlaceholder}"
+                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+
+            <Label text="{i18n>uaaUrl}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Input
+                id="oauthUaaUrl"
+                value="{server>/oauth/uaa_url}"
+                placeholder="{i18n>uaaUrlHint}"
+                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+
+            <Label text="{i18n>authorizeUrl}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Input
+                id="oauthAuthorizeUrl"
+                value="{server>/oauth/authorize_url}"
+                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+
+            <Label text="{i18n>tokenUrl}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Input
+                id="oauthTokenUrl"
+                value="{server>/oauth/token_url}"
+                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+
+            <Label text="{i18n>oauthScope}" visible="{= ${server>/auth_mode} === 'oauth2' }" />
+            <Input
+                id="oauthScope"
+                value="{server>/oauth/scope}"
+                visible="{= ${server>/auth_mode} === 'oauth2' }" />
+
+        </f:SimpleForm>
+        <beginButton>
+            <Button id="serverConfirm" text="{i18n>ok}" type="Emphasized" press=".onConfirmServer" />
+        </beginButton>
+        <endButton>
+            <Button id="serverCancel" text="{i18n>cancel}" press=".onCancelServer" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>
