@@ -18,6 +18,7 @@ Endpoints (all require `<xsappname>.admin` XSUAA scope):
     POST   /admin/api/reload               — rebuild the orchestrator in-memory
     POST   /admin/api/restart              — reload + trigger CF app restart
     GET    /admin/api/export               — dump full config as JSON
+    GET    /admin/api/config               — public base URL for OAuth links
     POST   /admin/api/import               — bulk upsert from JSON
 """
 
@@ -34,7 +35,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
-from agents.auth import current_principal, require_admin
+from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.db import (
@@ -450,6 +451,25 @@ async def api_whoami(payload: dict[str, Any] = Depends(require_admin)) -> dict[s
     """
     label = payload.get("email") or payload.get("user_name") or ""
     return {"principal": current_principal.get() or "", "label": str(label)}
+
+
+@router.get("/api/config", dependencies=[Depends(require_admin)])
+async def api_config() -> dict[str, Any]:
+    """Public host the UI5 admin needs for absolute OAuth sign-in links.
+
+    `/oauth/login` and the OAuth callback live on the approuter host, outside
+    the UI5 app's path. A relative link to them breaks the moment the app is
+    served from a Work Zone site, so the app builds absolute URLs from this.
+
+    The precedence matches how `agents/oauth2.py` derives `redirect_uri`, so
+    the sign-in link and the callback can never disagree about the host.
+    """
+    base = (
+        os.environ.get("PUBLIC_BASE_URL", "").strip()
+        or os.environ.get("A2A_PUBLIC_URL", "").strip()
+        or (current_base_url.get() or "")
+    )
+    return {"public_base_url": base.rstrip("/")}
 
 
 @router.get("/api/agents/{agent_id}/credentials", dependencies=[Depends(require_admin)])

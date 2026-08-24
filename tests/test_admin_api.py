@@ -848,6 +848,29 @@ async def run_tests() -> None:
         check("whoami exposes principal", isinstance(body, dict) and "principal" in body, r.text[:120])
         check("whoami exposes a display label", isinstance(body, dict) and "label" in body, r.text[:120])
 
+        # --- Config (public base URL for OAuth sign-in links) ---------------
+        r = await client.get("/admin/api/config")
+        check("config returns 200", r.status_code == 200, r.text)
+        check(
+            "config exposes public_base_url",
+            "public_base_url" in r.json(),
+            r.text,
+        )
+        check(
+            "public_base_url is a string",
+            isinstance(r.json().get("public_base_url"), str),
+            r.text,
+        )
+
+        os.environ["PUBLIC_BASE_URL"] = "https://example.test"
+        r = await client.get("/admin/api/config")
+        check(
+            "config prefers PUBLIC_BASE_URL",
+            r.json().get("public_base_url") == "https://example.test",
+            r.text,
+        )
+        os.environ.pop("PUBLIC_BASE_URL", None)
+
         # --- credential status per MCP server ------------------------------
         # Shows whether a given principal actually holds a token for each of
         # the agent's oauth2 servers, so a misconfigured run-as is visible in
