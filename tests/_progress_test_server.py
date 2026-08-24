@@ -47,6 +47,10 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
+# A developer .env may set this. Set it EMPTY rather than popping it: app.py
+# calls load_dotenv(), which fills in vars that are absent but never overrides
+# ones already present. Empty means "no allowlist", i.e. the default rule.
+os.environ["MCP_URL_ALLOWLIST"] = ""
 
 from pydantic_ai import Agent, RunContext  # noqa: E402
 from pydantic_ai.models.test import TestModel  # noqa: E402

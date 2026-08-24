@@ -25,6 +25,7 @@ from agents.db import (
     list_agents,
     list_skills,
 )
+from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.shared import create_mcp_server, default_model_name, get_model
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,11 @@ def _compute_tool_prefixes(urls: list[str]) -> list[str]:
     64-char function-name limit (the full hostname would blow past it)."""
     slugs = []
     for u in urls:
-        host = (urlparse(u).hostname or "mcp").lower()
+        parsed = urlparse(u)
+        # builtin: URLs carry no host -- the name lives in the path, so
+        # `builtin:gmail` prefixes as `gmail` rather than collapsing to `mcp`
+        # like every other hostless entry.
+        host = (parsed.hostname or parsed.path or "mcp").lower()
         first_label = host.split(".")[0]
         slug = re.sub(r"[^a-z0-9]+", "_", first_label).strip("_") or "mcp"
         slug = slug[:_MAX_PREFIX_LEN].strip("_") or "mcp"
@@ -481,6 +486,14 @@ async def build_orchestrator() -> BuildResult:
         for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:
+                if is_builtin_url(spec["url"]):
+                    # Served in-process: no MCP connection, but the same oauth
+                    # block and the same stored per-user token.
+                    toolset = build_builtin_toolset(
+                        spec["url"], spec.get("oauth")
+                    )
+                    servers.append(toolset.prefixed(prefix) if prefix else toolset)
+                    continue
                 servers.append(
                     create_mcp_server(
                         server_name,

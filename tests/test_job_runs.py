@@ -19,6 +19,10 @@ if TEST_DB.exists():
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
+# A developer .env may set this. Set it EMPTY rather than popping it: app.py
+# calls load_dotenv(), which fills in vars that are absent but never overrides
+# ones already present. Empty means "no allowlist", i.e. the default rule.
+os.environ["MCP_URL_ALLOWLIST"] = ""
 
 from agents.db import (  # noqa: E402
     DEFAULT_RUN_PROMPT,
@@ -49,6 +53,23 @@ SERVERS = [{"url": "https://arc1.example.com/mcp", "auth_mode": "none"}]
 async def main() -> None:
     await init_db()
 
+    print("\n== report model ==")
+    from agents.reports import RunReport
+    import agents.reports as reports_mod
+
+    r = RunReport(summary="one line", body_md="# Title\n\n| a |\n| --- |\n| 1 |\n")
+    check("summary field", r.summary == "one line")
+    check("body_md field", r.body_md.startswith("# Title"))
+    check("model_dump has exactly two keys",
+          set(r.model_dump().keys()) == {"summary", "body_md"},
+          str(set(r.model_dump().keys())))
+    check("Finding removed", not hasattr(reports_mod, "Finding"))
+    check("ReportSection removed", not hasattr(reports_mod, "ReportSection"))
+    check("missing_sections removed", not hasattr(reports_mod, "missing_sections"))
+    schema = RunReport.model_json_schema()
+    check("body_md description mentions mermaid",
+          "mermaid" in schema["properties"]["body_md"]["description"])
+
     print("\n== agent exposure fields ==")
     async with SessionLocal() as s:
         await upsert_agent(
@@ -60,7 +81,6 @@ async def main() -> None:
             mcp_servers=SERVERS, expose_chat=False, expose_api=True,
             api_slug="daily-check", run_as_principal="svc@example.com",
             run_prompt="Run the daily check.", run_timeout_seconds=900,
-            expected_sections=["st22", "slg1"],
         )
     async with SessionLocal() as s:
         chat = await get_agent_by_name(s, "chat-only")
@@ -68,7 +88,6 @@ async def main() -> None:
         check("expose_api defaults off", bool(chat.expose_api) is False)
         check("run_prompt defaults empty", not chat.run_prompt)
         check("timeout defaults to 1800", chat.run_timeout_seconds == 1800)
-        check("expected_sections defaults empty", chat.expected_sections == [])
 
         job = await get_agent_by_slug(s, "daily-check")
         check("lookup by slug", job is not None and job.name == "Daily Check")
@@ -76,7 +95,6 @@ async def main() -> None:
         check("expose_api stored on", bool(job.expose_api) is True)
         check("run_as stored", job.run_as_principal == "svc@example.com")
         check("timeout stored", job.run_timeout_seconds == 900)
-        check("expected_sections stored", job.expected_sections == ["st22", "slg1"])
         check("to_dict exposes fields", job.to_dict()["api_slug"] == "daily-check")
 
     print("\n== slug uniqueness ==")
@@ -129,38 +147,6 @@ async def main() -> None:
     except RuntimeError:
         check("missing PUBLIC_BASE_URL rejected", True)
 
-    print("\n== report model + completeness ==")
-    from agents.reports import Finding, ReportSection, RunReport, missing_sections
-
-    clean = RunReport(
-        summary="No issues found.",
-        overall_severity="info",
-        sections=[
-            ReportSection(source_key="st22", title="Short dumps", checked=True, findings=[]),
-            ReportSection(source_key="slg1", title="App log", checked=True, findings=[]),
-        ],
-    )
-    check("empty findings is complete", missing_sections(clean, ["st22", "slg1"]) == [])
-
-    unchecked = RunReport(
-        summary="Partial.",
-        overall_severity="info",
-        sections=[
-            ReportSection(source_key="st22", title="Short dumps", checked=True, findings=[]),
-            ReportSection(source_key="slg1", title="App log", checked=False,
-                          note="RFC destination unavailable", findings=[]),
-        ],
-    )
-    check("unchecked section is missing", missing_sections(unchecked, ["st22", "slg1"]) == ["slg1"])
-
-    absent = RunReport(summary="s", overall_severity="info", sections=[])
-    check("absent section is missing", missing_sections(absent, ["st22"]) == ["st22"])
-    check("no expectations means complete", missing_sections(absent, []) == [])
-
-    f = Finding(title="TSV_TNEW_PAGE_ALLOC_FAILED", severity="high", count=12,
-                affected=["ZPROG"], detail="d")
-    check("finding defaults are optional", f.analysis is None and f.references == [])
-
     print("\n== JobRun records ==")
     from datetime import datetime, timedelta, timezone
 
@@ -185,6 +171,11 @@ async def main() -> None:
         check("active run found", (await active_job_run(s, job.id)) is not None)
 
     async with SessionLocal() as s:
+        # Deliberately a legacy-shaped dict, not a RunReport — this is the
+        # only test proving report_json stores an arbitrary shape opaquely.
+        # The UI's legacy `<pre>` branch and the export endpoint's 404 for
+        # pre-change runs both depend on report_json accepting any JSON, so
+        # do not "clean this up" to the new {summary, body_md} shape.
         await finish_job_run(
             s, run_id, status="success", summary="All clear",
             report={"summary": "All clear", "overall_severity": "info", "sections": []},
@@ -234,12 +225,12 @@ async def main() -> None:
             self.specialists = specialists
 
     good = RunReport(
-        summary="2 dumps, 0 blockers",
-        overall_severity="medium",
-        sections=[
-            ReportSection(source_key="st22", title="Dumps", checked=True, findings=[]),
-            ReportSection(source_key="slg1", title="Log", checked=True, findings=[]),
-        ],
+        summary="3 ADT changes, 0 blockers",
+        body_md=(
+            "# What's new\n\n"
+            "| Source | Findings |\n| --- | --- |\n| ADT | 3 |\n\n"
+            "```mermaid\npie title Findings by source\n  \"ADT\" : 3\n```\n"
+        ),
     )
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
     os.environ["PUBLIC_BASE_URL"] = "https://approuter.example.com"
@@ -249,26 +240,16 @@ async def main() -> None:
         job = await get_agent_by_slug(s, "daily-check")
         agent_id, run_id = job.id, (await create_job_run(s, agent=job, trigger="manual")).id
     await job_runner.execute_run(run_id, agent_id)
+
     async with SessionLocal() as s:
         r = await get_job_run(s, run_id)
-        check("complete run is success", r.status == "success", r.status)
-        check("summary stored from report", r.summary == "2 dumps, 0 blockers")
-        check("report stored", r.report["overall_severity"] == "medium")
-
-    partial = RunReport(
-        summary="partial",
-        overall_severity="info",
-        sections=[ReportSection(source_key="st22", title="Dumps", checked=True, findings=[])],
-    )
-    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(partial)})
-    async with SessionLocal() as s:
-        job = await get_agent_by_slug(s, "daily-check")
-        run_id2 = (await create_job_run(s, agent=job, trigger="manual")).id
-    await job_runner.execute_run(run_id2, agent_id)
-    async with SessionLocal() as s:
-        r = await get_job_run(s, run_id2)
-        check("incomplete run is degraded", r.status == "degraded", r.status)
-        check("missing section named", r.missing_sections == ["slg1"])
+        check("run is success", r.status == "success", r.status)
+        check("summary stored", r.summary == "3 ADT changes, 0 blockers")
+        check("markdown body stored", "| Source | Findings |" in r.report["body_md"])
+        check("mermaid fence survives storage", "```mermaid" in r.report["body_md"])
+        check("no legacy keys",
+              "sections" not in r.report and "overall_severity" not in r.report,
+              str(sorted(r.report.keys())))
 
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(exc=RuntimeError("mcp down"))})
     async with SessionLocal() as s:

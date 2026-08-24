@@ -38,6 +38,10 @@ if TEST_DB.exists():
 os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
+# A developer .env may set this. Set it EMPTY rather than popping it: app.py
+# calls load_dotenv(), which fills in vars that are absent but never overrides
+# ones already present. Empty means "no allowlist", i.e. the default rule.
+os.environ["MCP_URL_ALLOWLIST"] = ""
 
 # ---------------------------------------------------------------------------
 # Same stubs as the API test so the app can boot without AICORE/MCP
@@ -221,10 +225,15 @@ async def main() -> None:
         check("agents tbody present", find(coll, "tbody", id="agents-tbody") is not None)
         check("skills tbody present", find(coll, "tbody", id="skills-tbody") is not None)
         check("orchestrator textarea", find(coll, "textarea", id="orch-instructions") is not None)
+        # Run prompts carry multi-line content (e.g. mermaid syntax templates the
+        # model must copy). A single-line <input> silently strips the newlines on
+        # paste, so the tag itself is the requirement, not just the id.
+        check("run prompt is a textarea, not an input",
+              find(coll, "textarea", id="agent-run-prompt") is not None)
 
         # Modal form fields
         for fid in ("agent-id", "agent-name", "agent-description",
-                    "agent-instructions", "agent-enabled",
+                    "agent-instructions", "agent-enabled", "agent-run-prompt",
                     "skill-id", "skill-name", "skill-description", "skill-content"):
             found = any(
                 e[1].get("id") == fid for e in coll.elements
@@ -262,9 +271,15 @@ async def main() -> None:
         check("back-to-chat link", len(links) > 0)
 
         # ------------------------------------------------------------------
+        print("\n== report rendering assets ==")
+        for name in ("marked.min.js", "purify.min.js", "mermaid.min.js"):
+            check(f"{name} vendored", (ROOT / "static" / "vendor" / name).exists())
+
+        # ------------------------------------------------------------------
         print("\n== 2. JavaScript validity ==")
-        check("exactly one <script>", len(coll.scripts) == 1, f"got {len(coll.scripts)}")
-        js = coll.scripts[0]
+        inline = [s for s in coll.scripts if s.strip()]
+        check("exactly one inline <script>", len(inline) == 1, f"got {len(inline)}")
+        js = inline[0]
 
         if shutil.which("node") is None:
             check("node available", False, "node not on PATH, skipping syntax check")
@@ -563,8 +578,13 @@ async def main() -> None:
         check("exposure field expose_api", 'id="agent-expose-api"' in html)
         check("exposure field api_slug", 'id="agent-api-slug"' in html)
         check("run-as field", 'id="agent-run-as"' in html)
-        check("expected sections field", 'id="agent-expected-sections"' in html)
+        check("expected-sections input removed", 'id="agent-expected-sections"' not in html)
         check("endpoint URL hint shown", "/api/agents/" in html)
+
+        check("template loads marked", "/static/vendor/marked.min.js" in html)
+        check("template loads purify", "/static/vendor/purify.min.js" in html)
+        check("mermaid is NOT eagerly loaded",
+              '<script src="/static/vendor/mermaid.min.js"' not in html)
 
         # An API-triggered run binds a technical principal and deliberately
         # never binds a user JWT, so an agent that is expose_api AND binds an
@@ -590,14 +610,14 @@ async def main() -> None:
         )
 
         # ------------------------------------------------------------------
-        # saveAgent() must actually SEND all seven exposure fields, not just
+        # saveAgent() must actually SEND all six exposure fields, not just
         # have form elements for them. AgentPayload defaults + whole-object
         # PUT semantics mean a field saveAgent() forgets to include gets
         # silently reset on every save (expose_api -> False, expose_chat ->
         # True, etc.) -- deleting one key here is exactly the regression
         # this check exists to catch, and the earlier ID-presence checks
         # above would not catch it.
-        print("\n== saveAgent() sends all seven exposure fields ==")
+        print("\n== saveAgent() sends all six exposure fields ==")
         m = re.search(r"async function saveAgent\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
         check("saveAgent() function found in JS", m is not None)
         save_agent_body = m.group(1) if m else ""
@@ -608,7 +628,6 @@ async def main() -> None:
             "run_as_principal",
             "run_prompt",
             "run_timeout_seconds",
-            "expected_sections",
         ):
             check(
                 f"saveAgent() sends {field}",

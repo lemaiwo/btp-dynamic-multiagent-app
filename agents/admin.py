@@ -30,12 +30,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from agents.auth import current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
+from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -148,6 +149,16 @@ class McpServerPayload(BaseModel):
     @model_validator(mode="after")
     def _validate_url(self) -> "McpServerPayload":
         v = self.url.strip().rstrip("/")
+        # Built-in toolsets are served in-process, so there is no host to reach
+        # and none of the transport rules below apply. The set is closed: an
+        # unknown builtin: value is a typo, not an extension point.
+        if v.lower().startswith("builtin"):
+            if not is_builtin_url(v):
+                raise ValueError(
+                    f"unknown built-in toolset {v!r}; known: {', '.join(sorted(BUILTIN_URLS))}"
+                )
+            self.url = v.lower()
+            return self
         public = self.auth_mode == AUTH_MODE_NONE
         # Public servers may use http; authenticated servers must use https
         # so forwarded JWTs are not exposed on the wire.
@@ -220,7 +231,6 @@ class AgentPayload(BaseModel):
     run_as_principal: str = Field(default="", max_length=255)
     run_prompt: str = ""
     run_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
-    expected_sections: list[str] = Field(default_factory=list)
 
     @field_validator("skills")
     @classmethod
@@ -346,7 +356,6 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 run_as_principal=payload.run_as_principal,
                 run_prompt=payload.run_prompt,
                 run_timeout_seconds=payload.run_timeout_seconds,
-                expected_sections=payload.expected_sections,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -409,9 +418,6 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.run_as_principal = payload.run_as_principal.strip() or None
         row.run_prompt = payload.run_prompt.strip() or None
         row.run_timeout_seconds = payload.run_timeout_seconds
-        row.expected_sections_json = (
-            json.dumps(payload.expected_sections) if payload.expected_sections else None
-        )
         await session.commit()
         await session.refresh(row)
         return row.to_dict()
@@ -550,6 +556,29 @@ async def api_get_run(run_id: str) -> dict[str, Any]:
         data = row.to_dict()
         data["report"] = row.report
         return data
+
+
+@router.get("/api/runs/{run_id}/report.md", dependencies=[Depends(require_admin)])
+async def api_get_run_markdown(run_id: str) -> PlainTextResponse:
+    """The run's report as a downloadable .md file.
+
+    Runs recorded before reports became markdown have no body_md; there is
+    nothing to serve for those, so they 404 rather than returning an empty file.
+    """
+    from agents.db import get_job_run
+
+    async with SessionLocal() as session:
+        row = await get_job_run(session, run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        body = (row.report or {}).get("body_md")
+        if not isinstance(body, str):
+            raise HTTPException(status_code=404, detail="Run has no markdown report")
+        return PlainTextResponse(
+            body,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="run-{run_id}.md"'},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +790,6 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     api_slug=agent.api_slug,
                     run_prompt=agent.run_prompt,
                     run_timeout_seconds=agent.run_timeout_seconds,
-                    expected_sections=agent.expected_sections,
                 )
             except ValueError as e:
                 raise HTTPException(
@@ -857,7 +885,6 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     run_as_principal=payload.run_as_principal,
                     run_prompt=payload.run_prompt,
                     run_timeout_seconds=payload.run_timeout_seconds,
-                    expected_sections=payload.expected_sections,
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
