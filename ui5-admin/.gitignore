@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.ui5/
+coverage/
+test-results/
+playwright-report/

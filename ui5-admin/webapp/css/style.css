@@ -1,0 +1,19 @@
+.agentAdminReport {
+    padding: 1rem;
+    overflow-x: auto;
+}
+.agentAdminReport table {
+    border-collapse: collapse;
+    width: 100%;
+}
+.agentAdminReport th,
+.agentAdminReport td {
+    border: 1px solid var(--sapList_BorderColor);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+}
+.agentAdminReport pre {
+    background: var(--sapNeutralBackground);
+    padding: 0.75rem;
+    overflow-x: auto;
+}
