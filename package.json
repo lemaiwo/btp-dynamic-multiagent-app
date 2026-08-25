@@ -3,7 +3,9 @@
   "private": true,
   "description": "Dev-only tooling for the Python app: a DOM for the report-rendering tests. Not deployed — mta.yaml ignores this file, package-lock.json and node_modules/.",
   "scripts": {
-    "test": "node tests/test_report_render.mjs && node tests/test_report_sanitize.mjs"
+    "test": "node tests/test_report_render.mjs && node tests/test_report_sanitize.mjs && npm --prefix ui5-admin test",
+    "test:ui5": "npm --prefix ui5-admin test",
+    "test:e2e": "npm --prefix ui5-admin run test:e2e"
   },
   "devDependencies": {
     "jsdom": "^27.0.0"
