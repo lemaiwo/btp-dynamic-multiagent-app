@@ -36,6 +36,7 @@ import httpx  # noqa: E402
 
 from agents.builtins import BUILTIN_URLS, build_builtin_toolset, is_builtin_url  # noqa: E402
 from agents.gmail_tools import BUILTIN_GMAIL_URL  # noqa: E402
+from agents.jira_tools import BUILTIN_JIRA_URL  # noqa: E402
 from agents.outlook_tools import (  # noqa: E402
     BUILTIN_OUTLOOK_URL,
     OutlookClient,
@@ -140,7 +141,8 @@ def _client(rec: Recorder) -> OutlookClient:
 async def main() -> None:
     # --- dispatch and validation -------------------------------------------
     print("\n== builtin registry ==")
-    check("both built-ins registered", BUILTIN_URLS == {BUILTIN_GMAIL_URL, BUILTIN_OUTLOOK_URL},
+    check("all three built-ins registered",
+          BUILTIN_URLS == {BUILTIN_GMAIL_URL, BUILTIN_OUTLOOK_URL, BUILTIN_JIRA_URL},
           f"got {sorted(BUILTIN_URLS)}")
     check("recognises builtin:outlook", is_builtin_url(BUILTIN_OUTLOOK_URL))
     check("still recognises builtin:gmail", is_builtin_url(BUILTIN_GMAIL_URL))
