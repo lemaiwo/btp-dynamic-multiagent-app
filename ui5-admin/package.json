@@ -1,0 +1,26 @@
+{
+  "name": "ui5-admin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SAPUI5 admin application for the dynamic multi-agent app",
+  "scripts": {
+    "start": "ui5 serve --config ui5-local.yaml --open index.html",
+    "build:ui5": "ui5 build --config ui5.yaml --clean-dest --dest dist && node -e \"require('fs').copyFileSync('xs-app.json','dist/xs-app.json')\"",
+    "ts:check": "tsc --noEmit",
+    "test": "npm run ts:check && karma start karma.conf.js --single-run",
+    "test:watch": "karma start karma.conf.js",
+    "test:e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0",
+    "@sapui5/types": "1.120.20",
+    "@ui5/cli": "^3.11.0",
+    "karma": "^6.4.3",
+    "karma-chrome-launcher": "^3.2.0",
+    "karma-ui5": "^4.0.1",
+    "typescript": "^5.4.0",
+    "ui5-middleware-simpleproxy": "^3.4.0",
+    "ui5-task-zipper": "^3.7.0",
+    "ui5-tooling-transpile": "^3.5.0"
+  }
+}

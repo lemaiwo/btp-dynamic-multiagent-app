@@ -18,6 +18,7 @@ Endpoints (all require `<xsappname>.admin` XSUAA scope):
     POST   /admin/api/reload               — rebuild the orchestrator in-memory
     POST   /admin/api/restart              — reload + trigger CF app restart
     GET    /admin/api/export               — dump full config as JSON
+    GET    /admin/api/config               — public base URL for OAuth links
     POST   /admin/api/import               — bulk upsert from JSON
 """
 
@@ -34,13 +35,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
-from agents.auth import current_principal, require_admin
+from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
+    AUTH_MODE_APP_ONLY,
     AUTH_MODE_OAUTH2,
+    OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
     SessionLocal,
     delete_agent,
@@ -91,6 +94,25 @@ class OAuthClientPayload(BaseModel):
     scope: str = Field(default="", max_length=512)
     # Read-only flag echoed back by the API; ignored on input.
     has_client_secret: bool = False
+    # client_credentials only. `mailbox` names the target, since an app-only
+    # token identifies no user. `allow_send` is a capability switch kept
+    # separate from the token's permissions on purpose -- see
+    # agents/outlook_tools.py on why sending is opt-in.
+    mailbox: str = Field(default="", max_length=320)
+    allow_send: bool = False
+    # How far back a mail listing may reach: "90m", "5h", "2d", "1w", or a bare
+    # number of hours. A ceiling, not a default the agent can widen.
+    lookback: str = Field(default="", max_length=16)
+
+    @field_validator("lookback")
+    @classmethod
+    def _validate_lookback(cls, v: str) -> str:
+        # Parsed here so a typo is a 422 naming the field, rather than a Graph
+        # 400 surfacing mid-run with no hint where it came from.
+        from agents.outlook_tools import parse_lookback
+
+        parse_lookback(v)
+        return (v or "").strip()
 
     def to_config(self) -> dict[str, Any]:
         if self.dcr:
@@ -105,8 +127,13 @@ class OAuthClientPayload(BaseModel):
             "authorize_url": self.authorize_url.strip(),
             "token_url": self.token_url.strip(),
             "scope": self.scope.strip(),
+            "mailbox": self.mailbox.strip(),
+            "lookback": self.lookback.strip(),
         }
-        return {k: v for k, v in fields.items() if v}
+        config = {k: v for k, v in fields.items() if v}
+        if self.allow_send:
+            config["allow_send"] = True
+        return config
 
 
 class McpServerPayload(BaseModel):
@@ -142,8 +169,31 @@ class McpServerPayload(BaseModel):
                 )
             # client_secret may be blank here (preserved from storage on edit);
             # the DB layer enforces that a secret ultimately exists.
+        elif self.auth_mode == AUTH_MODE_APP_ONLY:
+            cfg = self.oauth.to_config() if self.oauth else {}
+            if cfg.get("dcr"):
+                raise ValueError(
+                    "client_credentials cannot use DCR: dynamic registration "
+                    "produces a client with no admin-consented application "
+                    "permissions, so its tokens can reach nothing"
+                )
+            if not cfg.get("client_id"):
+                raise ValueError("client_credentials server requires oauth.client_id")
+            if not (cfg.get("token_url") or cfg.get("uaa_url")):
+                raise ValueError(
+                    "client_credentials server requires oauth.token_url or "
+                    "oauth.uaa_url (there is no authorize_url: no browser is involved)"
+                )
+            if is_builtin_url(self.url) and not cfg.get("mailbox"):
+                raise ValueError(
+                    f"{self.url} with auth_mode=client_credentials requires "
+                    "oauth.mailbox: an app-only token identifies no user, so the "
+                    "target mailbox has to be named"
+                )
         elif self.oauth is not None and self.oauth.to_config():
-            raise ValueError("oauth config is only valid when auth_mode=oauth2")
+            raise ValueError(
+                "oauth config is only valid when auth_mode=oauth2 or client_credentials"
+            )
         return self
 
     @model_validator(mode="after")
@@ -277,7 +327,7 @@ class AgentPayload(BaseModel):
         out: list[dict[str, Any]] = []
         for s in self.mcp_servers:
             entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
-            if s.auth_mode == AUTH_MODE_OAUTH2 and s.oauth is not None:
+            if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
                 entry["oauth"] = s.oauth.to_config()
             out.append(entry)
         return out
@@ -452,6 +502,23 @@ async def api_whoami(payload: dict[str, Any] = Depends(require_admin)) -> dict[s
     return {"principal": current_principal.get() or "", "label": str(label)}
 
 
+@router.get("/api/config", dependencies=[Depends(require_admin)])
+async def api_config() -> dict[str, Any]:
+    """Public host the UI5 admin needs for absolute OAuth sign-in links.
+
+    `/oauth/login` and the OAuth callback live on the approuter host, outside
+    the UI5 app's path. A relative link to them breaks the moment the app is
+    served from a Work Zone site, so the app builds absolute URLs from this.
+
+    Reports the same `current_base_url` the OAuth callback reads to build
+    `redirect_uri` (`agents/oauth2.py`, `agents/oauth_routes.py`) — set once
+    per request by `JWTBindingMiddleware` from `PUBLIC_BASE_URL` /
+    `A2A_PUBLIC_URL` / the forwarded host headers, in that order — so the
+    sign-in link and the callback can never disagree about the host.
+    """
+    return {"public_base_url": (current_base_url.get() or "").rstrip("/")}
+
+
 @router.get("/api/agents/{agent_id}/credentials", dependencies=[Depends(require_admin)])
 async def api_agent_credentials(
     agent_id: int, principal: str = Query(default="", max_length=255)
@@ -498,12 +565,17 @@ async def api_agent_credentials(
                         "Could not read token status for %s on %s",
                         who, server_key, exc_info=True,
                     )
+        # An app-only server needs no user token, and reporting has_token=False
+        # for it would render as "not connected" forever with no way to fix it.
+        # It is connected by configuration, not by anyone signing in.
+        app_only = auth_mode == AUTH_MODE_APP_ONLY
         out.append({
             "url": url,
             "auth_mode": auth_mode,
             "needs_token": needs_token,
-            "has_token": has_token,
+            "has_token": has_token or app_only,
             "login_url": login_url,
+            "app_only": app_only,
         })
     return out
 

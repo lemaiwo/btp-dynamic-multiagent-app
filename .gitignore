@@ -13,3 +13,7 @@ dist/
 node_modules/
 agents_registry.db
 tests/_*.db
+
+ui5-admin/node_modules/
+ui5-admin/dist/
+resources/

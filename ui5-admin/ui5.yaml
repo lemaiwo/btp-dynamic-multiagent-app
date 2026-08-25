@@ -1,0 +1,48 @@
+specVersion: "3.0"
+metadata:
+  name: com.infrabel.agentadmin
+type: application
+framework:
+  name: SAPUI5
+  version: "1.120.20"
+  libraries:
+    - name: sap.m
+    - name: sap.ui.core
+    - name: sap.f
+    - name: sap.tnt
+    - name: sap.ui.layout
+    - name: themelib_sap_horizon
+builder:
+  resources:
+    excludes:
+      - "/test/**"
+      - "/localService/**"
+  customTasks:
+    - name: ui5-tooling-transpile-task
+      afterTask: replaceVersion
+    # Produces dist/ui5-admin-content.zip, which mta.yaml's
+    # `ui5-admin-deployer` module names in its `artifacts` list. `ui5 build`
+    # alone emits loose files and no archive, so without this the deployer
+    # packages an EMPTY resources/ folder and the HTML5 Application Repository
+    # rejects the upload with "Could not find applications in the request" —
+    # while `mbt build` still exits 0. xs-app.json must be listed here because
+    # the repository reads each app's routes from inside its own archive.
+    - name: ui5-task-zipper
+      afterTask: generateVersionInfo
+      configuration:
+        archiveName: ui5-admin-content
+        additionalFiles:
+          - xs-app.json
+  bundles:
+    - bundleDefinition:
+        name: com/infrabel/agentadmin/Component-preload.js
+        defaultFileTypes: [".js", ".fragment.xml", ".view.xml", ".properties", ".json"]
+        sections:
+          - mode: preload
+            filters:
+              - "com/infrabel/agentadmin/"
+              - "!com/infrabel/agentadmin/vendor/mermaid.min.js"
+              - "!com/infrabel/agentadmin/test/"
+            resolve: true
+          - mode: require
+            filters: ["ui5loader-autoconfig.js"]

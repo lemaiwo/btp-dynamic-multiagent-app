@@ -1,0 +1,40 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.App"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:tnt="sap.tnt"
+    displayBlock="true"
+    height="100%">
+    <tnt:ToolPage id="toolPage" sideExpanded="{appView>/sideExpanded}">
+        <tnt:header>
+            <tnt:ToolHeader id="toolHeader" visible="{appView>/showHeader}">
+                <Button
+                    icon="sap-icon://menu2"
+                    type="Transparent"
+                    press=".onToggleSideNav"
+                    tooltip="{i18n>toggleNavigation}" />
+                <ToolbarSpacer />
+                <Title text="{i18n>appTitle}" level="H1" />
+                <ToolbarSpacer />
+                <Text text="{appView>/userLabel}" />
+            </tnt:ToolHeader>
+        </tnt:header>
+        <tnt:sideContent>
+            <tnt:SideNavigation
+                id="sideNavigation"
+                expanded="{appView>/sideExpanded}"
+                selectedKey="{appView>/selectedKey}"
+                itemSelect=".onNavItemSelect">
+                <tnt:NavigationList>
+                    <tnt:NavigationListItem text="{i18n>navAgents}" icon="sap-icon://person-placeholder" key="agents" />
+                    <tnt:NavigationListItem text="{i18n>navSkills}" icon="sap-icon://learning-assistant" key="skills" />
+                    <tnt:NavigationListItem text="{i18n>navRuns}" icon="sap-icon://history" key="runs" />
+                    <tnt:NavigationListItem text="{i18n>navSettings}" icon="sap-icon://action-settings" key="settings" />
+                </tnt:NavigationList>
+            </tnt:SideNavigation>
+        </tnt:sideContent>
+        <tnt:mainContents>
+            <NavContainer id="pageContainer" />
+        </tnt:mainContents>
+    </tnt:ToolPage>
+</mvc:View>

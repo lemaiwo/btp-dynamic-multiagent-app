@@ -1,0 +1,186 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.AgentDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="agentDetailPage"
+        title="{agent>/title}"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <content>
+            <VBox class="sapUiSmallMargin">
+
+                <Panel headerText="{i18n>general}" expandable="false">
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>colName}" required="true" />
+                        <Input
+                            id="agentName"
+                            value="{agent>/data/name}"
+                            valueState="{agent>/errors/nameState}"
+                            valueStateText="{agent>/errors/name}"
+                            maxLength="64" />
+
+                        <Label text="{i18n>colDescription}" required="true" />
+                        <TextArea
+                            id="agentDescription"
+                            value="{agent>/data/description}"
+                            valueState="{agent>/errors/descriptionState}"
+                            valueStateText="{agent>/errors/description}"
+                            rows="3"
+                            width="100%" />
+
+                        <Label text="{i18n>instructions}" required="true" />
+                        <TextArea
+                            id="agentInstructions"
+                            value="{agent>/data/instructions}"
+                            valueState="{agent>/errors/instructionsState}"
+                            valueStateText="{agent>/errors/instructions}"
+                            rows="14"
+                            width="100%" />
+
+                        <Label text="{i18n>enabled}" />
+                        <Switch id="agentEnabled" state="{agent>/data/enabled}" />
+
+                        <Label text="{i18n>exposeChat}" />
+                        <Switch id="agentExposeChat" state="{agent>/data/expose_chat}" />
+                    </f:SimpleForm>
+                </Panel>
+
+                <Panel headerText="{i18n>toolsets}" expandable="false" class="sapUiSmallMarginTop">
+                    <Table
+                        id="serversTable"
+                        items="{agent>/data/mcp_servers}"
+                        noDataText="{i18n>noServers}">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <Text text="{agent>/errors/servers}" />
+                                <ToolbarSpacer />
+                                <Button id="addServerButton" icon="sap-icon://add" text="{i18n>addServer}" press=".onAddServer" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>serverUrl}" /></Column>
+                            <Column><Text text="{i18n>authMode}" /></Column>
+                            <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem>
+                                <cells>
+                                    <Text text="{agent>url}" />
+                                    <Text text="{agent>auth_mode}" />
+                                    <HBox>
+                                        <Button icon="sap-icon://edit" type="Transparent" tooltip="{i18n>edit}" press=".onEditServer" />
+                                        <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>delete}" press=".onRemoveServer" />
+                                    </HBox>
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                </Panel>
+
+                <Panel headerText="{i18n>skillsPanel}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>skillsHint}" />
+                    <MultiComboBox
+                        id="agentSkills"
+                        width="100%"
+                        class="sapUiSmallMarginTop"
+                        items="{agent>/availableSkills}"
+                        selectedKeys="{agent>/data/skills}">
+                        <core:Item key="{agent>name}" text="{agent>name}" />
+                    </MultiComboBox>
+                </Panel>
+
+                <Panel headerText="{i18n>jobSettings}" expandable="false" class="sapUiSmallMarginTop">
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>exposeApi}" />
+                        <Switch id="agentExposeApi" state="{agent>/data/expose_api}" />
+
+                        <Label text="{i18n>apiSlug}" />
+                        <Input
+                            id="agentApiSlug"
+                            value="{agent>/data/api_slug}"
+                            enabled="{agent>/data/expose_api}"
+                            valueState="{agent>/errors/api_slugState}"
+                            valueStateText="{agent>/errors/api_slug}"
+                            maxLength="64" />
+
+                        <Label text="{i18n>runPrompt}" />
+                        <TextArea
+                            id="agentRunPrompt"
+                            value="{agent>/data/run_prompt}"
+                            rows="6"
+                            width="100%" />
+
+                        <Label text="{i18n>runTimeout}" />
+                        <StepInput
+                            id="agentRunTimeout"
+                            value="{agent>/data/run_timeout_seconds}"
+                            min="60"
+                            max="86400"
+                            step="60" />
+
+                        <Label text="{i18n>runAsPrincipal}" />
+                        <HBox>
+                            <Input
+                                id="agentRunAsPrincipal"
+                                value="{agent>/data/run_as_principal}"
+                                width="24rem"
+                                placeholder="{i18n>runAsHint}" />
+                            <Button
+                                id="useMyPrincipalButton"
+                                text="{i18n>useMyPrincipal}"
+                                press=".onUseMyPrincipal"
+                                class="sapUiTinyMarginBegin" />
+                        </HBox>
+                    </f:SimpleForm>
+                </Panel>
+
+                <Panel headerText="{i18n>credentials}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>credentialsHint}" />
+                    <Table
+                        id="credentialsTable"
+                        items="{agent>/credentials}"
+                        noDataText="{i18n>noCredentialChecks}"
+                        class="sapUiSmallMarginTop">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <ToolbarSpacer />
+                                <Button id="refreshCredentialsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefreshCredentials" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>serverUrl}" /></Column>
+                            <Column><Text text="{i18n>colStatus}" /></Column>
+                            <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem>
+                                <cells>
+                                    <Text text="{agent>url}" />
+                                    <ObjectStatus
+                                        text="{= !${agent>needs_token} ? ${i18n>credNotNeeded} : (${agent>has_token} ? ${i18n>credSignedIn} : ${i18n>credMissing}) }"
+                                        state="{= !${agent>needs_token} ? 'None' : (${agent>has_token} ? 'Success' : 'Warning') }" />
+                                    <Button
+                                        text="{i18n>signIn}"
+                                        type="Transparent"
+                                        visible="{= ${agent>needs_token} &amp;&amp; !${agent>has_token} }"
+                                        press=".onSignIn" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                </Panel>
+
+            </VBox>
+        </content>
+        <footer>
+            <OverflowToolbar>
+                <ToolbarSpacer />
+                <Button id="saveAgentButton" text="{i18n>save}" type="Emphasized" press=".onSave" />
+                <Button id="cancelAgentButton" text="{i18n>cancel}" press=".onBack" />
+            </OverflowToolbar>
+        </footer>
+    </Page>
+</mvc:View>

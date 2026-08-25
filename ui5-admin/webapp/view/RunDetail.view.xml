@@ -1,0 +1,58 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.RunDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="runDetailPage"
+        title="{run>/data/agent_name}"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <headerContent>
+            <Button
+                id="downloadReportButton"
+                icon="sap-icon://download"
+                text="{i18n>downloadReport}"
+                visible="{run>/hasReport}"
+                press=".onDownload" />
+        </headerContent>
+        <content>
+            <VBox class="sapUiSmallMargin">
+                <f:SimpleForm layout="ResponsiveGridLayout" editable="false">
+                    <Label text="{i18n>colStatus}" />
+                    <ObjectStatus
+                        text="{run>/data/status}"
+                        state="{ path: 'run>/data/status', formatter: '.formatter.runStatusState' }" />
+
+                    <Label text="{i18n>colTrigger}" />
+                    <Text text="{run>/data/trigger}" />
+
+                    <Label text="{i18n>colStarted}" />
+                    <Text text="{ path: 'run>/data/started_at', formatter: '.formatter.timestamp' }" />
+
+                    <Label text="{i18n>colDuration}" />
+                    <Text text="{ parts: ['run>/data/started_at', 'run>/data/finished_at'], formatter: '.formatter.runDuration' }" />
+
+                    <Label text="{i18n>colSummary}" />
+                    <Text text="{run>/data/summary}" />
+                </f:SimpleForm>
+
+                <MessageStrip
+                    id="runError"
+                    text="{run>/data/error}"
+                    type="Error"
+                    visible="{= !!${run>/data/error} }"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop" />
+
+                <Title text="{i18n>report}" level="H3" class="sapUiSmallMarginTop" />
+                <core:HTML id="reportHtml" content="{run>/reportHtml}" sanitizeContent="false" />
+                <Text
+                    id="noReportText"
+                    text="{i18n>noReport}"
+                    visible="{= !${run>/hasReport} }" />
+            </VBox>
+        </content>
+    </Page>
+</mvc:View>

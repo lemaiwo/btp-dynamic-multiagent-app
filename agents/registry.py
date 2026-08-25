@@ -490,7 +490,7 @@ async def build_orchestrator() -> BuildResult:
                     # Served in-process: no MCP connection, but the same oauth
                     # block and the same stored per-user token.
                     toolset = build_builtin_toolset(
-                        spec["url"], spec.get("oauth")
+                        spec["url"], spec.get("oauth"), spec.get("auth_mode")
                     )
                     servers.append(toolset.prefixed(prefix) if prefix else toolset)
                     continue

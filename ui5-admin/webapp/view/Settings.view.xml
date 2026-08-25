@@ -1,0 +1,62 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.Settings"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:f="sap.ui.layout.form">
+    <Page id="settingsPage" title="{i18n>navSettings}">
+        <VBox class="sapUiSmallMargin">
+
+            <Panel headerText="{i18n>llmModel}" expandable="false">
+                <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                    <Label text="{i18n>activeModel}" />
+                    <Select
+                        id="modelSelect"
+                        selectedKey="{settings>/model/model_name}"
+                        items="{settings>/model/available}">
+                        <core:Item key="{settings>}" text="{settings>}" xmlns:core="sap.ui.core" />
+                    </Select>
+                    <Label text="" />
+                    <Button
+                        id="saveModelButton"
+                        text="{i18n>saveModel}"
+                        type="Emphasized"
+                        press=".onSaveModel" />
+                </f:SimpleForm>
+            </Panel>
+
+            <Panel headerText="{i18n>orchestratorInstructions}" expandable="false" class="sapUiSmallMarginTop">
+                <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                    <Label text="{i18n>orchestratorInstructions}" labelFor="orchestratorInstructions" />
+                    <TextArea
+                        id="orchestratorInstructions"
+                        value="{settings>/orchestrator/instructions}"
+                        rows="14"
+                        growing="false"
+                        width="100%" />
+                    <Label text="" />
+                    <Button
+                        id="saveOrchestratorButton"
+                        text="{i18n>saveInstructions}"
+                        type="Emphasized"
+                        press=".onSaveOrchestrator" />
+                </f:SimpleForm>
+            </Panel>
+
+            <Panel headerText="{i18n>lifecycle}" expandable="false" class="sapUiSmallMarginTop">
+                <Text text="{i18n>lifecycleHint}" />
+                <HBox class="sapUiSmallMarginTop">
+                    <Button id="reloadButton" text="{i18n>reload}" press=".onReload" />
+                    <Button id="restartButton" text="{i18n>restart}" type="Attention" press=".onRestart" class="sapUiTinyMarginBegin" />
+                </HBox>
+            </Panel>
+
+            <Panel headerText="{i18n>importExport}" expandable="false" class="sapUiSmallMarginTop">
+                <HBox>
+                    <Button id="exportButton" text="{i18n>exportConfig}" press=".onExport" />
+                    <Button id="importButton" text="{i18n>importConfig}" press=".onOpenImport" class="sapUiTinyMarginBegin" />
+                </HBox>
+            </Panel>
+
+        </VBox>
+    </Page>
+</mvc:View>

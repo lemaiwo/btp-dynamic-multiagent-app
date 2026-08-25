@@ -36,12 +36,19 @@ def is_builtin_url(url: str | None) -> bool:
     return str(url or "").strip().lower() in BUILTIN_URLS
 
 
-def build_builtin_toolset(url: str, oauth: dict[str, Any] | None):
-    """The toolset for a ``builtin:`` URL, authenticated as the current user."""
+def build_builtin_toolset(
+    url: str, oauth: dict[str, Any] | None, auth_mode: str | None = None
+):
+    """The toolset for a ``builtin:`` URL.
+
+    ``auth_mode`` decides who the tools act as: ``client_credentials`` means the
+    application itself, anything else means the signed-in user. It is optional
+    so existing callers keep the per-user behaviour they already had.
+    """
     key = str(url).strip().lower()
     factory = _FACTORIES.get(key)
     if factory is None:
         raise ValueError(
             f"unknown built-in toolset {url!r}; known: {', '.join(sorted(BUILTIN_URLS))}"
         )
-    return factory(oauth or {}, server_key=key)
+    return factory(oauth or {}, server_key=key, auth_mode=auth_mode)

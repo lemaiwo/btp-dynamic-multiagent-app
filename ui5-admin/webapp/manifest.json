@@ -1,0 +1,71 @@
+{
+  "_version": "1.59.0",
+  "sap.app": {
+    "id": "com.infrabel.agentadmin",
+    "type": "application",
+    "title": "Agent Administration",
+    "description": "Administer dynamic agents, skills and job runs",
+    "applicationVersion": { "version": "1.0.0" }
+  },
+  "sap.ui": {
+    "technology": "UI5",
+    "deviceTypes": { "desktop": true, "tablet": true, "phone": false }
+  },
+  "sap.ui5": {
+    "dependencies": {
+      "minUI5Version": "1.120.0",
+      "libs": {
+        "sap.m": {},
+        "sap.ui.core": {},
+        "sap.f": {},
+        "sap.tnt": {},
+        "sap.ui.layout": {}
+      }
+    },
+    "rootView": {
+      "viewName": "com.infrabel.agentadmin.view.App",
+      "type": "XML",
+      "async": true,
+      "id": "app"
+    },
+    "routing": {
+      "config": {
+        "routerClass": "sap.m.routing.Router",
+        "type": "View",
+        "viewType": "XML",
+        "path": "com.infrabel.agentadmin.view",
+        "controlId": "pageContainer",
+        "controlAggregation": "pages",
+        "async": true,
+        "bypassed": { "target": "notFound" }
+      },
+      "routes": [
+        { "pattern": "", "name": "root", "target": "agents" },
+        { "pattern": "agents", "name": "agents", "target": "agents" },
+        { "pattern": "agents/{agentId}", "name": "agentDetail", "target": "agentDetail" },
+        { "pattern": "skills", "name": "skills", "target": "skills" },
+        { "pattern": "skills/{skillId}", "name": "skillDetail", "target": "skillDetail" },
+        { "pattern": "runs", "name": "runs", "target": "runs" },
+        { "pattern": "runs/{runId}", "name": "runDetail", "target": "runDetail" },
+        { "pattern": "settings", "name": "settings", "target": "settings" }
+      ],
+      "targets": {
+        "agents": { "id": "agents", "name": "Agents" },
+        "agentDetail": { "id": "agentDetail", "name": "AgentDetail" },
+        "skills": { "id": "skills", "name": "Skills" },
+        "skillDetail": { "id": "skillDetail", "name": "SkillDetail" },
+        "runs": { "id": "runs", "name": "Runs" },
+        "runDetail": { "id": "runDetail", "name": "RunDetail" },
+        "settings": { "id": "settings", "name": "Settings" },
+        "notFound": { "id": "notFound", "name": "NotFound", "transition": "show" }
+      }
+    },
+    "models": {
+      "i18n": {
+        "type": "sap.ui.model.resource.ResourceModel",
+        "settings": { "bundleName": "com.infrabel.agentadmin.i18n.i18n" }
+      }
+    },
+    "resources": { "css": [{ "uri": "css/style.css" }] }
+  }
+}

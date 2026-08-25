@@ -1,0 +1,25 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <Dialog id="importDialog" title="{i18n>importConfig}" contentWidth="40rem">
+        <VBox class="sapUiSmallMargin">
+            <Text text="{i18n>importHint}" />
+            <TextArea
+                id="importJson"
+                value="{import>/text}"
+                rows="16"
+                width="100%"
+                class="sapUiSmallMarginTop" />
+            <CheckBox
+                id="importReplace"
+                text="{i18n>importReplace}"
+                selected="{import>/replace}" />
+        </VBox>
+        <beginButton>
+            <Button id="importConfirm" text="{i18n>importConfig}" type="Emphasized" press=".onConfirmImport" />
+        </beginButton>
+        <endButton>
+            <Button id="importCancel" text="{i18n>cancel}" press=".onCancelImport" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>
