@@ -38,7 +38,19 @@ AUTH_MODE_NONE = "none"
 # the resulting access/refresh tokens are stored per (user, server) and
 # forwarded on every MCP request. See agents/oauth2.py.
 AUTH_MODE_OAUTH2 = "oauth2"
-VALID_AUTH_MODES = frozenset({AUTH_MODE_JWT, AUTH_MODE_NONE, AUTH_MODE_OAUTH2})
+# App-only OAuth2 client_credentials: the agent authenticates as *itself*, not
+# as anyone signed in, so it works against a mailbox or system nobody logs into
+# and scheduled runs need no stored user token. The trade is that there is no
+# user identity to scope access with -- the grant is whatever an admin
+# consented to for the whole registration -- so the target must be named
+# explicitly in config (`mailbox` for builtin:outlook). See
+# agents/client_credentials.py.
+AUTH_MODE_CLIENT_CREDENTIALS = "client_credentials"
+VALID_AUTH_MODES = frozenset({
+    AUTH_MODE_JWT, AUTH_MODE_NONE, AUTH_MODE_OAUTH2, AUTH_MODE_CLIENT_CREDENTIALS,
+})
+# Modes carrying an `oauth` config block.
+OAUTH_CONFIG_MODES = frozenset({AUTH_MODE_OAUTH2, AUTH_MODE_CLIENT_CREDENTIALS})
 
 logger = logging.getLogger(__name__)
 
@@ -610,6 +622,41 @@ async def get_agent_by_slug(session: AsyncSession, slug: str) -> AgentConfig | N
 
 
 _OAUTH_KEYS = ("client_id", "client_secret", "uaa_url", "authorize_url", "token_url", "scope")
+# client_credentials has no browser leg, so no authorize_url. It gains a target
+# (`mailbox`) because an app-only token names no user, and `allow_send`, which
+# is deliberately separate from the token's permissions: holding Mail.Send must
+# not be enough to give an agent a send tool.
+_CC_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope", "mailbox")
+
+
+def _clean_client_credentials(
+    oauth: Any, fallback: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Normalize a ``client_credentials`` oauth block for storage.
+
+    Deliberately stricter than the oauth2 shape in one place: ``allow_send`` is
+    stored as a real boolean and defaults to False. An app-only token's scope
+    is whatever an admin consented to for the entire registration, so a tenant
+    that granted Mail.Send would otherwise hand every agent bound to it the
+    ability to send mail. The capability has to be turned on here, per server,
+    on purpose.
+    """
+    src = oauth if isinstance(oauth, dict) else {}
+    cleaned: dict[str, Any] = {}
+    for k in _CC_KEYS:
+        v = src.get(k)
+        if v is not None and str(v).strip() != "":
+            cleaned[k] = str(v).strip()
+    if not cleaned.get("client_secret") and fallback and fallback.get("client_secret"):
+        cleaned["client_secret"] = fallback["client_secret"]
+    if not cleaned.get("client_id"):
+        raise ValueError("client_credentials server requires a client_id")
+    if not cleaned.get("client_secret"):
+        raise ValueError("client_credentials server requires a client_secret")
+    if not (cleaned.get("token_url") or cleaned.get("uaa_url")):
+        raise ValueError("client_credentials server requires a token_url or uaa_url")
+    cleaned["allow_send"] = bool(src.get("allow_send"))
+    return cleaned
 
 
 def _clean_oauth(
@@ -627,8 +674,14 @@ def _clean_oauth(
       preserved so edits from the admin UI — which never receives the secret —
       don't wipe it.
 
-    Returns None for non-oauth2 modes.
+    ``client_credentials`` takes a third shape: ``{client_id, client_secret,
+    token_url|uaa_url, scope?, mailbox?, allow_send?}``. No authorize_url,
+    because nobody visits a browser.
+
+    Returns None for modes that carry no oauth block.
     """
+    if mode == AUTH_MODE_CLIENT_CREDENTIALS:
+        return _clean_client_credentials(oauth, fallback)
     if mode != AUTH_MODE_OAUTH2:
         return None
     src = oauth if isinstance(oauth, dict) else {}
