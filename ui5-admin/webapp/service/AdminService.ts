@@ -1,6 +1,6 @@
 import type {
     Agent, AgentInput, AdminConfig, CredentialStatus, ImportPayload,
-    JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, Skill, SkillInput, WhoAmI
+    JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI
 } from "./types";
 
 /**
@@ -172,8 +172,8 @@ export default class AdminService {
         });
     }
 
-    public reload(): Promise<unknown> {
-        return this.request<unknown>("reload", { method: "POST" });
+    public reload(): Promise<ReloadResult> {
+        return this.request<ReloadResult>("reload", { method: "POST" });
     }
 
     public restart(): Promise<unknown> {
