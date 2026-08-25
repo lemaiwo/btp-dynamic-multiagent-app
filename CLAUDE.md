@@ -66,6 +66,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
 - `templates/admin.html` — Admin UI (single-page, vanilla JS)
+- `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
+  BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
+  `templates/admin.html`, which is unchanged and still the supported admin at
+  `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
+  `docs/UI5_ADMIN.md`
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …)
@@ -103,3 +108,5 @@ Local falls back to SQLite if no `DATABASE_URL` is set.
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
 - `sqlalchemy[asyncio]`, `asyncpg` — dynamic agent storage
 - `pyjwt[crypto]` — XSUAA JWT validation
+- `@ui5/cli`, `ui5-tooling-transpile`, `@sapui5/types`, `karma-ui5`,
+  `@playwright/test` — UI5 admin app (dev-only; not in `requirements.txt`)

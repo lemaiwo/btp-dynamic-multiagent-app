@@ -88,6 +88,12 @@ Open:
 - **Admin:** <http://127.0.0.1:7932/admin>
 - **Health check:** <http://127.0.0.1:7932/healthz>
 
+### UI5 admin (preview)
+
+A SAPUI5 rebuild of the admin UI is available at `/ui5admin`. It is **not** a
+replacement yet — `/admin` remains the supported admin interface. See
+`docs/UI5_ADMIN.md`.
+
 On first startup the database is empty, so the app imports
 [`agents.seed.json`](./agents.seed.json) which contains the Cloud Foundry,
 BTP platform, and audit log agents from the previous hard-coded setup.
