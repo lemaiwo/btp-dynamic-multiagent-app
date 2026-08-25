@@ -364,8 +364,10 @@ def jira_toolset(
 ) -> FunctionToolset:
     """The Jira toolset for one agent, ready for ``Agent(toolsets=...)``.
 
-    The keyword arguments default to the values in ``oauth``; they exist so
-    tests can set them without building a config block.
+    ``server_key`` and ``auth_mode`` come from
+    :func:`agents.builtins.build_builtin_toolset` in production. The rest
+    default to the matching values in ``oauth`` and are overridable so tests
+    can set them without building a config block.
     """
     resolved_destination = (
         destination if destination is not None else str(oauth.get("destination") or "")
@@ -382,11 +384,13 @@ def jira_toolset(
     resolved_status = (
         status if status is not None else str(oauth.get("status") or "")
     ).strip()
-    can_comment = (
-        bool(oauth.get("allow_comment"))
-        if allow_comment is None
-        else bool(allow_comment)
-    )
+    # `is True`, not bool(): every truthy value would otherwise open the write
+    # capability, and the JSON string "false" is truthy. The storage cleaner
+    # normalises this to a real bool today, so nothing supported reaches here
+    # with a string -- but this is the last gate before a tool that posts in
+    # public, and it should not depend on a caller two modules away.
+    requested = oauth.get("allow_comment") if allow_comment is None else allow_comment
+    can_comment = requested is True
     # Parsed at build time, not per call: a bad window should stop the registry
     # rebuild with a clear message, not surface mid-run as a Jira 400.
     window = parse_lookback(lookback if lookback is not None else oauth.get("lookback"))
@@ -401,7 +405,12 @@ def jira_toolset(
         lookback_minutes=window,
     )
     toolset = FunctionToolset()
-    # The registry closes `http_client` on old toolsets when it swaps a build.
+    # Exposed for `agents.registry`, which closes `http_client` on the old
+    # build's servers after a reload. Note it only reaches this attribute on an
+    # unwrapped toolset: an agent with more than one server gets its toolsets
+    # wrapped in `.prefixed(...)`, and that wrapper forwards no attributes, so
+    # the client is not closed and one leaks per reload. That is pre-existing
+    # and shared with the Gmail and Outlook toolsets; it is not fixed here.
     toolset.http_client = session  # type: ignore[attr-defined]
 
     @toolset.tool

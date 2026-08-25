@@ -641,7 +641,7 @@ async def api_agent_credentials(
             "needs_token": needs_token,
             "has_token": has_token or no_user_token,
             "login_url": login_url,
-            "app_only": no_user_token,
+            "no_user_token": no_user_token,
         })
     return out
 

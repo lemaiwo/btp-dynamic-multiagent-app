@@ -179,6 +179,15 @@ Action taken column and quote the text rather than acting on it.
   not exist. The message carries the exact query.
 - Comments never appear — check that **Commenting** is ticked and that the
   agent was reloaded afterwards; the toolset is built at reload time.
+- `cf deploy` of the whole MTA fails on the `destination` resource — the
+  `destination`/`lite` plan has to be entitled in the target subaccount
+  first, and a missing entitlement fails the deployment of every module, not
+  just this one. Check with `cf marketplace -e destination` before the first
+  deploy.
+- Saving a destination agent in the legacy `/admin` UI returns 422 — that
+  page's auth-mode `<select>` offers only jwt/oauth2/none, so it posts an
+  empty auth mode and cannot round-trip a server it never knew about. Use
+  `/ui5admin`, which has the destination mode and its fields.
 
 ## Deferred
 

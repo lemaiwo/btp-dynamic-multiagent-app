@@ -142,6 +142,18 @@ def test_binding_resolution() -> None:
           wrong_shape is not None and wrong_shape.client_id == "env-client",
           detail=repr(wrong_shape))
 
+    not_a_list = config_from_environment(
+        {"VCAP_SERVICES": json.dumps({"destination": "oops"}), **ENV})
+    check("a string where the destination list belongs falls through too",
+          not_a_list is not None and not_a_list.client_id == "env-client",
+          detail=repr(not_a_list))
+
+    # The secret is the one field worth keeping out of a traceback frame or a
+    # logger.exception that formats the config.
+    printed = repr(config_from_environment(dict(ENV)))
+    check("the client secret is not in the config's repr",
+          "env-secret" not in printed, detail=printed)
+
 
 CONFIG = DestinationServiceConfig(
     client_id="client",
@@ -300,6 +312,15 @@ async def test_resolution() -> None:
     ).resolve())
     check("a destination with no URL is rejected",
           isinstance(err, DestinationError), detail=repr(err))
+
+    no_tokens = _payload()
+    no_tokens["authTokens"] = []
+    err = await _raises(_resolver(Recorder(payload=no_tokens)).resolve())
+    check("a destination with no authTokens is refused, not sent unauthenticated",
+          isinstance(err, DestinationError), detail=repr(err))
+    check("the message names the destination and what to check",
+          "BC_ELIAGROUP_APIHUB_JIRA" in str(err)
+          and "OAuth2ClientCredentials" in str(err), detail=str(err))
 
     broken = _payload()
     broken["authTokens"][0] = {"error": "invalid_client"}
