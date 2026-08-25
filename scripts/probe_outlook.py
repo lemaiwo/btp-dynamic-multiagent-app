@@ -114,6 +114,14 @@ def _explain(err: str, desc: str) -> str:
 DEFAULT_ENV_FILE = str(Path(__file__).resolve().parent.parent / ".env")
 DEFAULT_FOLDER = "agent"
 
+# Names Graph resolves itself, so they are never among the Inbox's children.
+# Mirrors WELL_KNOWN_FOLDERS in agents/outlook_tools.py, duplicated rather than
+# imported because the probe must run before this app is installed.
+WELL_KNOWN = {
+    "inbox", "archive", "drafts", "sentitems", "deleteditems",
+    "junkemail", "outbox", "clutter", "msgfolderroot",
+}
+
 # env var -> the flag that overrides it, for the "what is missing" message.
 _REQUIRED = {
     "OUTLOOK_TENANT_ID": "--tenant",
@@ -321,6 +329,18 @@ def main() -> int:
         return 1
     folders = {f.get("displayName"): f.get("id") for f in kids.json().get("value", [])}
     print(f"      Inbox subfolders: {', '.join(sorted(folders)) or '(none)'}")
+
+    if args.folder.lower() in WELL_KNOWN:
+        # The toolset accepts these and Graph resolves them, so this is not an
+        # error. But the Inbox itself is a bad queue: every mail that arrives is
+        # in scope, and "move out once handled" means moving mail out of the
+        # Inbox. Say so here rather than let it be discovered in production.
+        print(f"\nNOTE  {args.folder!r} is a well-known Graph folder, not a subfolder.")
+        print("      The toolset will accept it, but using the Inbox itself as the")
+        print("      queue means every arriving mail gets a drafted reply, and")
+        print("      handled mail is moved out of the Inbox. Prefer a subfolder.")
+        print("\nAll gates clear.")
+        return 0
 
     if args.folder in folders:
         print(f"\nPASS  folder {args.folder!r} found")
