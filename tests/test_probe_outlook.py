@@ -26,6 +26,7 @@ from probe_outlook import (  # noqa: E402
     ConfigError,
     DEFAULT_FOLDER,
     _fingerprint,
+    _token_roles,
     read_env_file,
     resolve_config,
 )
@@ -147,6 +148,28 @@ def main() -> None:
         check("a whitespace-only secret is treated as missing", False, "accepted")
     except ConfigError:
         check("a whitespace-only secret is treated as missing", True)
+
+    print("\n-- app-only token roles --")
+
+    def _jwt(claims: dict) -> str:
+        import base64 as b64
+        import json as js
+        body = b64.urlsafe_b64encode(js.dumps(claims).encode()).decode().rstrip("=")
+        return f"header.{body}.signature"
+
+    check("roles are read out of the token",
+          _token_roles(_jwt({"roles": ["Mail.ReadWrite"]})) == ["Mail.ReadWrite"])
+    check("several roles come back in full",
+          sorted(_token_roles(_jwt({"roles": ["Mail.Read", "Mail.Send"]})))
+          == ["Mail.Read", "Mail.Send"])
+    # A delegated-only registration still gets a token; the absence of this
+    # claim is the only signal that it holds no application permissions.
+    check("a token with no roles claim yields an empty list",
+          _token_roles(_jwt({"aud": "https://graph.microsoft.com"})) == [])
+    check("a malformed token is empty rather than an exception",
+          _token_roles("not-a-jwt") == [])
+    check("an empty token is empty rather than an exception",
+          _token_roles("") == [])
 
     print("\n-- the secret is never echoed --")
 
