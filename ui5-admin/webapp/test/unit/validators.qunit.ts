@@ -26,6 +26,10 @@ QUnit.test("a blank url is rejected", function (assert) {
     assert.notStrictEqual(validators.validateServerUrl("   ", "jwt"), "");
 });
 
+QUnit.test("builtin:jira is a known toolset URL", (assert) => {
+    assert.strictEqual(validators.validateServerUrl("builtin:jira", "destination"), "");
+});
+
 QUnit.module("validators.validateOAuth");
 
 QUnit.test("dcr needs no manual credentials", function (assert) {
@@ -65,6 +69,41 @@ QUnit.test("oauth config on a non-oauth2 server is rejected", function (assert) 
 
 QUnit.test("no oauth config on a non-oauth2 server is fine", function (assert) {
     assert.strictEqual(validators.validateOAuth(undefined, "jwt"), "");
+});
+
+QUnit.test("destination mode requires a destination name", (assert) => {
+    const error = validators.validateOAuth({ project: "ABC" }, "destination", "builtin:jira");
+    assert.ok(error.length > 0, "an error is returned");
+    assert.ok(
+        error.toLowerCase().indexOf("destination") > -1,
+        "the message names the missing field"
+    );
+});
+
+QUnit.test("destination mode accepts a name alone", (assert) => {
+    assert.strictEqual(
+        validators.validateOAuth(
+            { destination: "BC_ELIAGROUP_APIHUB_JIRA" },
+            "destination",
+            "builtin:jira"
+        ),
+        ""
+    );
+});
+
+QUnit.test("destination mode refuses credentials", (assert) => {
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", client_id: "x" },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.length > 0, "credentials are rejected before the request is sent");
+});
+
+QUnit.test("destination mode refuses dynamic registration", (assert) => {
+    assert.ok(
+        validators.validateOAuth({ dcr: true }, "destination", "builtin:jira").length > 0
+    );
 });
 
 QUnit.module("validators.validateServers");
