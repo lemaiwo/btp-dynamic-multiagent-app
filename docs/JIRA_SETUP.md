@@ -99,10 +99,13 @@ run's proposed replies look right.
 
 `jira_list_issues` skips any issue this account has already commented on —
 the agent's own comment on an issue *is* the record that it was handled, so
-there is nothing extra to track. That is a real difference from the Outlook
-agent (`docs/OUTLOOK_SETUP.md`), which had no way to mark a message
-handled and so re-sent a reply to every message on every run. This agent can
-be put on a schedule without that risk.
+there is nothing extra to track. The Outlook agent (`docs/OUTLOOK_SETUP.md`)
+draws the same line differently: replying and recording are two separate
+tool calls there, `create_reply_draft` and `move_message`, so recording
+depends on the model remembering the second step (and, in the deployment
+this app currently targets, on a `Mail.ReadWrite` grant it does not hold).
+Here there is only one call to make, so there is nothing to forget. This
+agent can be put on a schedule without that risk.
 
 ## 6. Instructions
 

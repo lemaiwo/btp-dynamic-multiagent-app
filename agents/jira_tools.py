@@ -99,9 +99,10 @@ def _comments_of(issue: dict[str, Any]) -> list[dict[str, Any]]:
 def _answered_by(issue: dict[str, Any], account: str) -> bool:
     """Whether this account already commented on the issue.
 
-    This is the idempotency marker the Outlook integration never had: with no
-    way to record that a message was handled, every run re-sent the same
-    replies. Jira carries the record in the issue itself.
+    Answering and recording are the same call here: the comment this account
+    posts *is* the marker the next run reads. Outlook's equivalent,
+    `move_message`, is a separate step the model has to remember to take --
+    see `agents/outlook_tools.py`.
     """
     if not account:
         return False
