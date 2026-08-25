@@ -32,7 +32,30 @@
       "scope": "$XSAPPNAME.a2a"
     },
     {
-      "source": "^/ui5admin/?(.*)$",
+      "source": "^/ui5admin/resources/(.*)$",
+      "target": "/1.120.20/resources/$1",
+      "destination": "ui5",
+      "authenticationType": "none",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5admin/backend/(.*)$",
+      "target": "/admin/api/$1",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.admin",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5admin/?$",
+      "target": "/cominfrabelagentadmin/index.html",
+      "service": "html5-apps-repo-rt",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.admin",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5admin/(.*)$",
       "target": "/cominfrabelagentadmin/$1",
       "service": "html5-apps-repo-rt",
       "authenticationType": "xsuaa",
