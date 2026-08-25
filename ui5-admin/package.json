@@ -19,7 +19,8 @@
     "karma-chrome-launcher": "^3.2.0",
     "karma-ui5": "^4.0.1",
     "typescript": "^5.4.0",
-    "ui5-tooling-transpile": "^3.5.0",
-    "ui5-middleware-simpleproxy": "^3.4.0"
+    "ui5-middleware-simpleproxy": "^3.4.0",
+    "ui5-task-zipper": "^3.7.0",
+    "ui5-tooling-transpile": "^3.5.0"
   }
 }
