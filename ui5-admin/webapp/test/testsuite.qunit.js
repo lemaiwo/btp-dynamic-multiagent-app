@@ -13,7 +13,8 @@ sap.ui.define(function () {
             "unit/ErrorHandler": { title: "Unit: ErrorHandler" },
             "unit/formatter": { title: "Unit: formatter" },
             "unit/validators": { title: "Unit: validators" },
-            "unit/ReportRenderer": { title: "Unit: ReportRenderer" }
+            "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
+            "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }
     };
 });
