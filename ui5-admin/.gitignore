@@ -4,3 +4,4 @@ dist/
 coverage/
 test-results/
 playwright-report/
+_e2e_registry.db
