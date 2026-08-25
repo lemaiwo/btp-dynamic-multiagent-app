@@ -43,6 +43,10 @@ from typing import Any
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
+from agents.lookback import parse_lookback
+
+__all__ = ["parse_lookback", "outlook_toolset", "OutlookClient", "BUILTIN_OUTLOOK_URL"]
+
 logger = logging.getLogger(__name__)
 
 GRAPH_API = "https://graph.microsoft.com"
@@ -67,47 +71,6 @@ _TRUNCATED = "…[truncated]"
 # message, on purpose: a folder listing that carried them would blow the run's
 # context long before the agent got to the first reply.
 _LIST_FIELDS = "id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead"
-
-
-# Suffixes accepted by `lookback`. Minutes is the internal unit: it divides
-# every other unit exactly, so no window is unrepresentable.
-_LOOKBACK_UNITS = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7}
-
-
-def parse_lookback(value: Any) -> int | None:
-    """A lookback window in minutes, or None when unset.
-
-    Accepts ``"90m"``, ``"5h"``, ``"2d"``, ``"1w"``, and a bare number, which
-    means **hours** -- the unit people reach for when saying how far back to
-    look. A unit suffix is the unambiguous form and the one the docs use.
-
-    Raises on anything it cannot parse rather than defaulting. A typo'd window
-    that silently became "no filter" would quietly hand the agent a whole
-    mailbox, which is the precise failure this setting exists to prevent.
-    """
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-
-    unit = _LOOKBACK_UNITS.get(text[-1])
-    number = text[:-1].strip() if unit else text
-    if unit is None:
-        unit = _LOOKBACK_UNITS["h"]  # bare number means hours
-
-    try:
-        amount = float(number)
-    except ValueError:
-        raise ValueError(
-            f"invalid lookback {value!r}; use a number of hours or a value with "
-            f"a unit such as '90m', '5h', '2d', '1w'"
-        ) from None
-    if amount <= 0:
-        raise ValueError(f"lookback must be positive, got {value!r}")
-
-    minutes = int(round(amount * unit))
-    return max(minutes, 1)
 
 
 def _cutoff(minutes: int) -> str:
