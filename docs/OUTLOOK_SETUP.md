@@ -9,10 +9,18 @@ the reasoning; this document is the Microsoft variant and stands on its own.
 ## Status
 
 **The toolset is built and unit-tested; it has never touched a real mailbox.**
-`agents/outlook_tools.py` exists with all four tools, 39 assertions against a
-mocked transport, and the registry wiring done. What is missing is a tenant to
-run it against: the three gates below are unanswered, so nothing here has been
-verified end to end the way the Gmail path was.
+`agents/outlook_tools.py` exists with all its tools, 39 assertions against a
+mocked transport, app-only auth (`agents/client_credentials.py`, 35 more
+assertions), and the registry wiring done. What is missing is a tenant to run
+it against, so nothing here has been verified end to end the way the Gmail path
+was.
+
+Two routes exist, and which one applies depends on whether a human can sign in
+to the target mailbox:
+
+* **delegated** (sections 1-3, 4) -- a person signs in; the agent acts as them.
+* **app-only** (section 3b) -- the agent authenticates as itself. The only
+  option for a shared or service mailbox with no interactive login.
 
 Run the probe in section 5 first. If it passes, connect the agent and the tools
 should work; if it fails, the code is fine and the answer is a conversation with
@@ -116,6 +124,70 @@ click it**, do — it settles gate 2 in advance. If it is greyed out you are not
 an admin, which is fine: the probe in section 5 will tell you whether user
 consent alone is enough.
 
+## 3b. The app-only route (for a mailbox nobody signs into)
+
+Everything above describes *delegated* access: a person signs in and the agent
+acts as them. That is impossible for a shared or service mailbox with no
+interactive login, which is the common case for an automated inbox.
+
+App-only (`client_credentials`) solves it. The agent authenticates as itself,
+so there is no sign-in, no stored user token, and nothing that breaks when
+someone leaves the company. Scheduled runs need no human at all.
+
+**What it needs, and only an admin can give it:**
+
+| Permission type | Permission | Why |
+| --- | --- | --- |
+| **Application** | `Mail.ReadWrite` | read the folder, draft replies, move messages |
+
+Application permissions always require admin consent — no user can self-serve
+them. Note the type: a *delegated* `Mail.ReadWrite` will not work here, and the
+two look identical in the portal's permission list.
+
+**Do not grant `Mail.Send`.** An application `Mail.Send` lets the registration
+send as any mailbox it can reach. This toolset has no send tool unless one is
+switched on deliberately (below), but the permission is worth refusing at the
+source.
+
+**Scope the app.** Application `Mail.ReadWrite` reaches *every mailbox in the
+tenant* by default. An Exchange admin narrows it with an Application Access
+Policy:
+
+```powershell
+New-ApplicationAccessPolicy -AppId <CLIENT_ID> `
+    -PolicyScopeGroupId agent-mailboxes@example.com `
+    -AccessRight RestrictAccess `
+    -Description "Limit the agent to the mailboxes in this group"
+```
+
+Without it the blast radius of a leaked secret is the whole tenant's mail.
+
+**Check what you actually have** before configuring anything:
+
+```bash
+python scripts/probe_outlook.py --app-only --mailbox service.mailbox@example.com
+```
+
+No browser and no user — it can be run by anyone holding the credentials. It
+prints the token's `roles` claim, which is the only reliable way to see which
+application permissions were consented to: Entra issues a token whether or not
+any were, and the difference otherwise surfaces as a 403 several calls later.
+
+### On sending
+
+`send_reply` exists, and is off unless a server's config sets `allow_send`.
+
+The intended output is a draft that a human approves. The tool exists only
+because a tenant may grant `Mail.Send` without `Mail.ReadWrite`, leaving an app
+able to send but not to draft — and holding the permission is deliberately not
+enough to switch the tool on.
+
+The reason for the separation: this toolset reads mail written by strangers and
+feeds it to a language model, so a message body is attacker-controlled text.
+With drafting, a prompt injection wastes somebody's time. With sending, it
+reaches the outside world signed as the mailbox owner. Leave it off unless you
+have a specific reason, and turn it off again once `Mail.ReadWrite` lands.
+
 ## 4. Agent configuration (once the probe passes)
 
 In **/admin → Agents**, on the agent's MCP server list:
@@ -136,6 +208,31 @@ carries the offline request in the scope instead.
 
 Also set the agent's **Run-as identity** (`run_as_principal`): scheduled runs
 have no logged-in user and use that principal's stored token.
+
+### App-only variant
+
+For the `client_credentials` route from section 3b, the same server row instead
+reads:
+
+| Field | Value |
+| --- | --- |
+| URL | `builtin:outlook` |
+| Auth mode | `App-only (client credentials)` |
+| Client ID / Secret | from steps 1–2 |
+| Token URL | `https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/token` |
+| Scope | `https://graph.microsoft.com/.default` |
+| Mailbox | the target address, e.g. `service.mailbox@example.com` |
+| Sending | leave unchecked |
+
+Three differences from the delegated row, each following from there being no
+user: no Authorize URL (nobody visits a browser), a Mailbox (the token names
+nobody, so the target cannot be inferred — the app refuses to start rather than
+fall back to `/me`), and `.default` as the scope, which is the only form this
+grant accepts.
+
+**`run_as_principal` is not needed** app-only, and the credentials panel shows
+the server as connected without anyone signing in. It is connected by
+configuration.
 
 ## 5. The probe — run this before connecting the agent
 
