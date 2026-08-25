@@ -13,9 +13,21 @@ its id for the agent config.
 Standalone on purpose: it imports nothing from this app, touches no database,
 and creates, moves or deletes nothing in the mailbox. Reads only.
 
+Credentials come from ``.env`` so that a client secret never has to be typed on
+a command line (where it lands in shell history, in ``ps`` output, and in the
+transcript of any agent asked to run the probe):
+
+    OUTLOOK_TENANT_ID=...
+    OUTLOOK_CLIENT_ID=...
+    OUTLOOK_CLIENT_SECRET=...
+    OUTLOOK_FOLDER=agent        # optional, defaults to "agent"
+
 Usage:
+    python scripts/probe_outlook.py                     # reads the repo's .env
+    python scripts/probe_outlook.py --env-file .env.outlook
     python scripts/probe_outlook.py --tenant <ID> --client <ID> --secret <VALUE>
-                                    [--folder agent] [--port 7932]
+
+Explicit flags override the environment, which overrides ``.env``.
 
 See docs/OUTLOOK_SETUP.md for what each outcome means.
 """
@@ -33,10 +45,19 @@ import threading
 import urllib.parse
 import webbrowser
 
+from dataclasses import dataclass
+from pathlib import Path
+
 try:
     import httpx
 except ImportError:  # pragma: no cover - the script may run outside the venv
     sys.exit("httpx is required:  pip install httpx   (or use .venv's python)")
+
+# The probe blocks for up to five minutes waiting on a browser sign-in. Piped
+# to anything other than a terminal, Python's block buffering would hold the
+# sign-in URL until the process exits -- so if the browser fails to open, the
+# one line telling you where to go by hand arrives after it is too late.
+sys.stdout.reconfigure(line_buffering=True)
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPE = "https://graph.microsoft.com/Mail.ReadWrite offline_access"
@@ -92,14 +113,265 @@ def _explain(err: str, desc: str) -> str:
     return f"{err}: {desc}" if err else "unknown error"
 
 
+# Relative to the repo root rather than the cwd: the probe is run from
+# wherever the user happens to be standing, and a silently-empty .env
+# would surface as "missing 3 of 3 values" with no hint that the file
+# it looked at was not the one they edited.
+DEFAULT_ENV_FILE = str(Path(__file__).resolve().parent.parent / ".env")
+DEFAULT_FOLDER = "agent"
+
+# Names Graph resolves itself, so they are never among the Inbox's children.
+# Mirrors WELL_KNOWN_FOLDERS in agents/outlook_tools.py, duplicated rather than
+# imported because the probe must run before this app is installed.
+WELL_KNOWN = {
+    "inbox", "archive", "drafts", "sentitems", "deleteditems",
+    "junkemail", "outbox", "clutter", "msgfolderroot",
+}
+
+# env var -> the flag that overrides it, for the "what is missing" message.
+_REQUIRED = {
+    "OUTLOOK_TENANT_ID": "--tenant",
+    "OUTLOOK_CLIENT_ID": "--client",
+    "OUTLOOK_CLIENT_SECRET": "--secret",
+}
+
+
+@dataclass(frozen=True)
+class Config:
+    tenant: str
+    client: str
+    secret: str
+    folder: str
+    port: int
+    mailbox: str = ""
+
+
+class ConfigError(Exception):
+    """Raised with a message that says exactly which values are missing."""
+
+
+def read_env_file(path: str | os.PathLike[str]) -> dict[str, str]:
+    """Parse a ``.env`` file into a dict, ignoring blanks and comments.
+
+    Hand-rolled rather than python-dotenv: the probe's whole point is that it
+    runs before anything else is set up, so it must not need this project's
+    dependencies installed. The format is the ``KEY=value`` subset that actually
+    appears in a ``.env`` -- optional ``export`` prefix, optional surrounding
+    quotes. A malformed line is skipped, not fatal; the missing-value message
+    downstream is a better error than a parse error pointing at line 14.
+    """
+    values: dict[str, str] = {}
+    file = Path(path)
+    if not file.is_file():
+        return values
+    for line in file.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key = key.strip().removeprefix("export ").strip()
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        if key:
+            values[key] = raw
+    return values
+
+
+def resolve_config(args: argparse.Namespace, environ: dict[str, str]) -> Config:
+    """Merge flags, real environment and ``.env`` into one config.
+
+    Precedence is flag > process environment > ``.env`` file, so an exported
+    variable can override a stale ``.env`` without editing it, and a flag can
+    override both for a one-off run against a second tenant.
+    """
+    from_file = read_env_file(args.env_file)
+    merged = {**from_file, **{k: v for k, v in environ.items() if v}}
+
+    picked = {
+        "OUTLOOK_TENANT_ID": args.tenant or merged.get("OUTLOOK_TENANT_ID", ""),
+        "OUTLOOK_CLIENT_ID": args.client or merged.get("OUTLOOK_CLIENT_ID", ""),
+        "OUTLOOK_CLIENT_SECRET": args.secret or merged.get("OUTLOOK_CLIENT_SECRET", ""),
+    }
+    missing = [name for name, value in picked.items() if not value.strip()]
+    if missing:
+        lines = [
+            f"Missing {len(missing)} of 3 required values.",
+            "",
+            f"Add these to {Path(args.env_file)} (it is gitignored):",
+            "",
+        ]
+        lines += [f"    {name}=..." for name in missing]
+        lines += [
+            "",
+            "Or pass them as flags: "
+            + " ".join(_REQUIRED[name] + " <value>" for name in missing),
+            "",
+            "See docs/OUTLOOK_SETUP.md steps 1-2 for where each value comes from.",
+        ]
+        raise ConfigError("\n".join(lines))
+
+    return Config(
+        tenant=picked["OUTLOOK_TENANT_ID"].strip(),
+        client=picked["OUTLOOK_CLIENT_ID"].strip(),
+        secret=picked["OUTLOOK_CLIENT_SECRET"].strip(),
+        folder=(args.folder or merged.get("OUTLOOK_FOLDER") or DEFAULT_FOLDER).strip(),
+        port=args.port,
+        mailbox=(getattr(args, "mailbox", "") or merged.get("OUTLOOK_MAILBOX", "")).strip(),
+    )
+
+
+def _fingerprint(secret: str) -> str:
+    """A stable, non-reversible tag for the secret.
+
+    Enough to tell "the value I pasted" from "a different value" across runs
+    without printing any of it -- the probe is meant to be runnable by an agent
+    whose output the user reads, so nothing here may echo the credential.
+    """
+    return hashlib.sha256(secret.encode()).hexdigest()[:8]
+
+
+def _token_roles(access_token: str) -> list[str]:
+    """The ``roles`` claim of an app-only token, without validating it.
+
+    Read-only diagnostics: the token was just handed to us by Entra over TLS,
+    and we are reporting what it says about itself, not trusting it to
+    authorize anything. It is the fastest way to see which *application*
+    permissions were actually consented to -- Entra issues a token whether or
+    not any were, and the difference only shows up as a 403 several calls
+    later.
+    """
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # base64url needs its padding back
+        import json
+        return list(json.loads(base64.urlsafe_b64decode(payload)).get("roles") or [])
+    except Exception:
+        return []
+
+
+def probe_app_only(cfg: Config) -> int:
+    """Client-credentials probe: does this app registration hold app-only rights?
+
+    No browser and no user, which is the entire point -- it answers whether the
+    agent could run against a mailbox nobody signs into. Distinct from the
+    delegated probe in every respect that matters: the grant is
+    ``client_credentials``, the scope is ``.default`` (Entra rejects per-scope
+    requests here), and Graph has no ``/me`` because there is no user, so every
+    path is ``/users/{mailbox}``.
+    """
+    base = f"https://login.microsoftonline.com/{cfg.tenant}/oauth2/v2.0"
+    print("App-only  requesting a client-credentials token (no sign-in needed)...")
+
+    tok = httpx.post(f"{base}/token", data={
+        "grant_type": "client_credentials",
+        "client_id": cfg.client,
+        "client_secret": cfg.secret,
+        "scope": "https://graph.microsoft.com/.default",
+    }, timeout=30)
+    payload = tok.json()
+    if tok.status_code != 200:
+        print(f"FAIL  token request returned {tok.status_code}")
+        print("     ", _explain(payload.get("error", ""),
+                                payload.get("error_description", "")))
+        if payload.get("error") == "invalid_client":
+            print("      The client id or secret is wrong, or the secret has expired.")
+        return 1
+    print("PASS  the app registration can get an app-only token")
+
+    roles = _token_roles(payload.get("access_token", ""))
+    if not roles:
+        print("FAIL  the token carries no application permissions (no 'roles' claim).")
+        print("      The registration has DELEGATED permissions only. App-only access")
+        print("      needs Application permissions plus admin consent -- both are")
+        print("      granted by an Entra admin and neither can be self-served.")
+        return 1
+
+    print(f"      application permissions granted: {', '.join(sorted(roles))}")
+    mail_roles = [r for r in roles if r.startswith("Mail.")]
+    if not mail_roles:
+        print("FAIL  none of them are Mail.* -- the app cannot touch a mailbox.")
+        return 1
+    if any(r in {"Mail.Send", "Mail.ReadWrite"} for r in roles) and "Mail.Send" in roles:
+        print("NOTE  Mail.Send is granted. Nothing in this app sends, but the")
+        print("      permission is broader than the design assumes -- worth removing.")
+
+    if not cfg.mailbox:
+        print("\nNOTE  no OUTLOOK_MAILBOX set, so the mailbox itself was not tested.")
+        print("      Add OUTLOOK_MAILBOX=<address> to .env and re-run to confirm")
+        print("      the app can actually read that mailbox.")
+        return 0
+
+    h = {"Authorization": f"Bearer {payload['access_token']}"}
+    kids = httpx.get(f"{GRAPH}/users/{cfg.mailbox}/mailFolders/inbox/childFolders",
+                     params={"$top": 100}, headers=h, timeout=30)
+    if kids.status_code == 403:
+        print(f"\nFAIL  Graph refused access to {cfg.mailbox} (403).")
+        print("      Usually an Application Access Policy scoping this app to a")
+        print("      different set of mailboxes. That is an Exchange admin fix.")
+        print(f"      {kids.text[:300]}")
+        return 1
+    if kids.status_code == 404:
+        print(f"\nFAIL  no mailbox found for {cfg.mailbox!r} (404).")
+        print("      Check the address, and that it is a real mailbox rather than")
+        print("      a distribution list or an unlicensed account.")
+        return 1
+    if kids.status_code != 200:
+        print(f"\nFAIL  Graph returned {kids.status_code}: {kids.text[:300]}")
+        return 1
+
+    folders = {f.get("displayName"): f.get("id") for f in kids.json().get("value", [])}
+    print(f"\nPASS  can read {cfg.mailbox}")
+    print(f"      Inbox subfolders: {', '.join(sorted(folders)) or '(none)'}")
+
+    if cfg.folder.lower() in WELL_KNOWN:
+        print(f"\nNOTE  {cfg.folder!r} is a well-known Graph folder, not a subfolder.")
+    elif cfg.folder in folders:
+        print(f"\nPASS  folder {cfg.folder!r} found")
+    else:
+        print(f"\nNOTE  folder {cfg.folder!r} does not exist yet -- create it.")
+        print("      Everything else passed; this is not a blocker.")
+
+    print("\nApp-only access works. No user sign-in is needed for this mailbox.")
+    return 0
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tenant", required=True, help="Directory (tenant) ID")
-    ap.add_argument("--client", required=True, help="Application (client) ID")
-    ap.add_argument("--secret", required=True, help="Client secret VALUE, not its id")
-    ap.add_argument("--folder", default="agent", help="Inbox subfolder to look for")
+    ap = argparse.ArgumentParser(
+        description="Go/no-go probe for the Outlook (Graph) integration. "
+                    "Reads credentials from .env by default.",
+    )
+    ap.add_argument("--env-file", default=DEFAULT_ENV_FILE,
+                    help=f"file holding OUTLOOK_* values (default: {DEFAULT_ENV_FILE})")
+    ap.add_argument("--tenant", default="", help="Directory (tenant) ID; overrides .env")
+    ap.add_argument("--client", default="", help="Application (client) ID; overrides .env")
+    ap.add_argument("--secret", default="",
+                    help="Client secret VALUE, not its id; prefer .env over this flag")
+    ap.add_argument("--folder", default="", help=f"Inbox subfolder (default: {DEFAULT_FOLDER})")
     ap.add_argument("--port", type=int, default=7932)
-    args = ap.parse_args()
+    ap.add_argument("--app-only", action="store_true",
+                    help="probe client-credentials (app-only) access instead of "
+                         "delegated sign-in; needs no browser and no user")
+    ap.add_argument("--mailbox", default="",
+                    help="target mailbox address, app-only mode (OUTLOOK_MAILBOX)")
+    raw_args = ap.parse_args()
+
+    try:
+        args = resolve_config(raw_args, dict(os.environ))
+    except ConfigError as exc:
+        print(exc)
+        return 2
+
+    print(f"          tenant {args.tenant}")
+    print(f"          client {args.client}")
+    print(f"          secret sha256:{_fingerprint(args.secret)} (never printed)")
+    print(f"          folder {args.folder!r}")
+    if args.mailbox:
+        print(f"          mailbox {args.mailbox}")
+    print()
+
+    if raw_args.app_only:
+        return probe_app_only(args)
 
     redirect = f"http://{REDIRECT_HOST}:{args.port}/oauth/callback"
     base = f"https://login.microsoftonline.com/{args.tenant}/oauth2/v2.0"
@@ -181,6 +453,18 @@ def main() -> int:
         return 1
     folders = {f.get("displayName"): f.get("id") for f in kids.json().get("value", [])}
     print(f"      Inbox subfolders: {', '.join(sorted(folders)) or '(none)'}")
+
+    if args.folder.lower() in WELL_KNOWN:
+        # The toolset accepts these and Graph resolves them, so this is not an
+        # error. But the Inbox itself is a bad queue: every mail that arrives is
+        # in scope, and "move out once handled" means moving mail out of the
+        # Inbox. Say so here rather than let it be discovered in production.
+        print(f"\nNOTE  {args.folder!r} is a well-known Graph folder, not a subfolder.")
+        print("      The toolset will accept it, but using the Inbox itself as the")
+        print("      queue means every arriving mail gets a drafted reply, and")
+        print("      handled mail is moved out of the Inbox. Prefer a subfolder.")
+        print("\nAll gates clear.")
+        return 0
 
     if args.folder in folders:
         print(f"\nPASS  folder {args.folder!r} found")

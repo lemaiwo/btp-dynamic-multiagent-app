@@ -265,8 +265,21 @@ def gmail_toolset(
     *,
     http: httpx.AsyncClient | None = None,
     server_key: str = BUILTIN_GMAIL_URL,
+    auth_mode: str | None = None,
 ) -> FunctionToolset:
-    """The Gmail toolset for one agent, ready to pass to ``Agent(toolsets=...)``."""
+    """The Gmail toolset for one agent, ready to pass to ``Agent(toolsets=...)``.
+
+    ``auth_mode`` is accepted so every built-in factory has the same signature,
+    and rejected if it asks for app-only: Google's service-account equivalent
+    needs domain-wide delegation, which is a different setup entirely and is not
+    implemented here. Failing loudly beats silently falling back to per-user
+    auth on an agent configured to expect no user.
+    """
+    if auth_mode == "app_only":
+        raise ValueError(
+            "builtin:gmail does not support client_credentials; Google app-only "
+            "access needs domain-wide delegation. Use auth_mode 'oauth2'."
+        )
     session = http or build_http_client(oauth, server_key)
     client = GmailClient(session)
     toolset = FunctionToolset()
