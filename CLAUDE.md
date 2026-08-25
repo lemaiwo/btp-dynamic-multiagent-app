@@ -23,8 +23,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   DB, seeds from `agents.seed.json`, builds the initial registry
 - `agents/db.py` — SQLAlchemy models (`AgentConfig`, `SkillConfig`,
   `OrchestratorConfig`), `init_db`, CRUD helpers, VCAP/ENV postgres URL
-  resolver. Skills are reusable instruction blocks attached to agents by
-  name (`AgentConfig.skills_json`)
+  resolver. `AgentConfig.auth_mode` is one of `jwt`, `none`, `oauth2`,
+  `app_only`, `destination`. Skills are reusable instruction blocks attached
+  to agents by name (`AgentConfig.skills_json`)
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin` FastAPI dependencies
@@ -52,6 +53,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   label. Built and unit-tested but **never run against a real mailbox**:
   `docs/OUTLOOK_SETUP.md` and `scripts/probe_outlook.py` cover the tenant
   gates that have to clear first
+- `agents/destination.py` — resolves a BTP destination (URL + ready
+  `Authorization` header) from the destination service, cached until its
+  token nears expiry. Stores no credential for the target: the destination
+  holds it. Binding comes from `VCAP_SERVICES` or `DESTINATION_*` env vars
+- `agents/jira_tools.py` — in-process Jira tools over REST v2
+  (`builtin:jira`), reached through a destination. JQL is built server-side
+  from pinned `project`/`status` and a `lookback` ceiling; issues this
+  account already commented on are skipped, so runs are repeatable.
+  `add_comment` is registered only when `allow_comment` is set.
+  See `docs/JIRA_SETUP.md`
+- `agents/lookback.py` — the shared `parse_lookback` window parser
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps. Attached skills are listed
