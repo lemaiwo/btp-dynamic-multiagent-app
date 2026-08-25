@@ -445,6 +445,89 @@ def test_toolset_build() -> None:
           detail=str(sorted(BUILTIN_URLS)))
 
 
+def test_storage_and_validation() -> None:
+    print("\n-- storage and admin validation --")
+
+    from agents.admin import McpServerPayload, OAuthClientPayload
+    from agents.db import (
+        AUTH_MODE_DESTINATION,
+        AUTH_MODE_MAX_LENGTH,
+        OAUTH_CONFIG_MODES,
+        VALID_AUTH_MODES,
+        _clean_oauth,
+    )
+
+    check("the destination mode is a valid auth mode",
+          AUTH_MODE_DESTINATION in VALID_AUTH_MODES)
+    check("the destination mode carries an oauth block",
+          AUTH_MODE_DESTINATION in OAUTH_CONFIG_MODES)
+    # SQLite ignores VARCHAR limits; Postgres does not. This guard, not the
+    # column, is what actually stopped "client_credentials" a second time.
+    check("every auth mode fits the column",
+          all(len(m) <= AUTH_MODE_MAX_LENGTH for m in VALID_AUTH_MODES),
+          detail=str(sorted(VALID_AUTH_MODES)))
+
+    cleaned = _clean_oauth({
+        "destination": " BC_ELIAGROUP_APIHUB_JIRA ",
+        "project": "ABC",
+        "status": "Open",
+        "lookback": "2d",
+        "allow_comment": True,
+        "client_secret": "should-not-survive",
+        "client_id": "nor-this",
+    }, AUTH_MODE_DESTINATION, None)
+    check("only the destination keys are stored, never a credential",
+          cleaned == {
+              "destination": "BC_ELIAGROUP_APIHUB_JIRA",
+              "project": "ABC",
+              "status": "Open",
+              "lookback": "2d",
+              "allow_comment": True,
+          }, detail=str(cleaned))
+
+    off = _clean_oauth({"destination": "X"}, AUTH_MODE_DESTINATION, None)
+    check("commenting defaults to off", off["allow_comment"] is False,
+          detail=str(off))
+
+    err = _sync_raises(
+        lambda: _clean_oauth({"project": "ABC"}, AUTH_MODE_DESTINATION, None))
+    check("storage refuses a block with no destination name",
+          isinstance(err, ValueError), detail=repr(err))
+
+    payload = McpServerPayload(
+        url="builtin:jira",
+        auth_mode="destination",
+        oauth=OAuthClientPayload(
+            destination="BC_ELIAGROUP_APIHUB_JIRA", project="ABC", status="Open"),
+    )
+    check("a well-formed destination server validates",
+          payload.oauth.to_config()["destination"] == "BC_ELIAGROUP_APIHUB_JIRA",
+          detail=str(payload.oauth.to_config()))
+
+    err = _sync_raises(lambda: McpServerPayload(
+        url="builtin:jira", auth_mode="destination",
+        oauth=OAuthClientPayload(project="ABC")))
+    check("the API refuses a destination server with no name", err is not None,
+          detail=repr(err))
+
+    err = _sync_raises(lambda: McpServerPayload(
+        url="builtin:jira", auth_mode="destination",
+        oauth=OAuthClientPayload(
+            destination="BC_ELIAGROUP_APIHUB_JIRA", client_id="nope")))
+    check("the API refuses credentials on a destination server",
+          err is not None and "credential" in str(err).lower(), detail=repr(err))
+
+    err = _sync_raises(lambda: McpServerPayload(
+        url="builtin:jira", auth_mode="destination",
+        oauth=OAuthClientPayload(dcr=True)))
+    check("the API refuses DCR on a destination server", err is not None,
+          detail=repr(err))
+
+    err = _sync_raises(lambda: OAuthClientPayload(destination="X", lookback="soon"))
+    check("a bad lookback is a field error, not a 500", err is not None,
+          detail=repr(err))
+
+
 async def main() -> None:
     test_jql()
     await test_filters()
@@ -452,6 +535,7 @@ async def main() -> None:
     await test_transport()
     await test_read_and_write()
     test_toolset_build()
+    test_storage_and_validation()
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
