@@ -872,9 +872,9 @@ Ceilings: `project` and `status` are pinned by configuration; `lookback` can
 be narrowed by a call but never widened.
 
 Repeat-run safety: an issue this account already commented on is dropped from
-the listing. That is the record the Outlook agent never had -- with nothing
-able to mark a message handled, every run re-sent the same replies. Jira
-carries the record in the issue itself.
+the listing. Answering and recording are the same call here -- the comment the
+agent posts is the marker the next run reads -- whereas the Outlook agent
+records with a separate `move_message` call the model has to remember.
 
 The destination is stubbed with a resolver double rather than a MockTransport:
 these tests are about Jira, and destination resolution has its own file.
@@ -1293,9 +1293,10 @@ def _comments_of(issue: dict[str, Any]) -> list[dict[str, Any]]:
 def _answered_by(issue: dict[str, Any], account: str) -> bool:
     """Whether this account already commented on the issue.
 
-    This is the idempotency marker the Outlook integration never had: with no
-    way to record that a message was handled, every run re-sent the same
-    replies. Jira carries the record in the issue itself.
+    Answering and recording are the same call here: the comment this account
+    posts *is* the marker the next run reads. Outlook's equivalent,
+    `move_message`, is a separate step the model has to remember to take --
+    see `agents/outlook_tools.py`.
     """
     if not account:
         return False
@@ -2403,7 +2404,7 @@ State that `.env` is gitignored and must stay so, and that the service key can b
 
 Note that Commenting is what registers the `add_comment` tool: with it off, the tool does not exist and no prompt can reach it.
 
-**§5 Why repeated runs are safe here.** The agent's own comment is the record that an issue was handled, so `list_issues` skips it next time. Unlike the Outlook agent — which could not mark a message handled and so re-sent every reply on every run — this one can be scheduled.
+**§5 Why repeated runs are safe here.** The agent's own comment is the record that an issue was handled, so `list_issues` skips it next time. Answering and recording are one call, with nothing extra to track. The Outlook agent draws the line differently: `create_reply_draft` and `move_message` are two separate tool calls there, so recording depends on the model remembering the second — and, in the deployment this app currently targets, on a `Mail.ReadWrite` grant it does not hold. State that as a property of the grant, not of the toolset.
 
 **§6 Instructions**, to paste into the agent's Instructions field:
 
