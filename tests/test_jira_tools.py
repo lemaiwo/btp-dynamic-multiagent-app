@@ -42,9 +42,11 @@ import httpx  # noqa: E402
 
 from agents.destination import Destination  # noqa: E402
 from agents.jira_tools import (  # noqa: E402
+    BUILTIN_JIRA_URL,
     DEFAULT_MAX_ISSUES,
     JiraClient,
     build_jql,
+    jira_toolset,
 )
 
 PASSED = 0
@@ -306,11 +308,150 @@ async def test_transport() -> None:
           err is not None and 'project = "ABC"' in str(err), detail=str(err))
 
 
+DEST_ENV = {
+    "DESTINATION_CLIENT_ID": "client",
+    "DESTINATION_CLIENT_SECRET": "secret",
+    "DESTINATION_TOKEN_URL": "https://uaa.example/oauth/token",
+    "DESTINATION_URI": "https://dest.example",
+}
+
+
+def _tool_names(toolset) -> list[str]:
+    """Tool names registered on a FunctionToolset, across pydantic-ai versions.
+
+    Copied from tests/test_client_credentials.py for the same reason it exists
+    there: the attribute has moved between releases.
+    """
+    tools = getattr(toolset, "tools", None)
+    if isinstance(tools, dict):
+        return list(tools)
+    if tools is not None:
+        return [getattr(t, "name", str(t)) for t in tools]
+    return list(getattr(toolset, "_tools", {}))
+
+
+def _with_dest_env() -> None:
+    for key, value in DEST_ENV.items():
+        os.environ[key] = value
+
+
+def _without_dest_env() -> None:
+    for key in DEST_ENV:
+        os.environ.pop(key, None)
+    os.environ.pop("DESTINATION_UAA_URL", None)
+    os.environ.pop("VCAP_SERVICES", None)
+
+
+def _build(oauth, http=None):
+    return jira_toolset(
+        oauth,
+        http=http or httpx.AsyncClient(transport=httpx.MockTransport(_responder([]))),
+        auth_mode="destination",
+    )
+
+
+def _sync_raises(fn) -> Exception | None:
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001 — the test is what kind
+        return exc
+    return None
+
+
+async def test_read_and_write() -> None:
+    print("\n-- get_issue and add_comment --")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/2/myself"):
+            return httpx.Response(200, json={"name": "agent-svc"})
+        return httpx.Response(200, json=_issue(
+            "ABC-1", comments=[_comment(author="jsmith", body="any news?")]))
+
+    client, http = _client(handle, project="ABC")
+    async with http:
+        issue = await client.get_issue("ABC-1")
+    check("get_issue returns the issue and its comment thread",
+          issue["key"] == "ABC-1" and issue["comments"][0]["body"] == "any news?",
+          detail=str(issue))
+
+    capture: dict = {}
+
+    def record(request: httpx.Request) -> httpx.Response:
+        capture["method"] = request.method
+        capture["path"] = request.url.path
+        capture["sent"] = json.loads(request.content)
+        return httpx.Response(201, json={"id": "10", "author": {"name": "agent-svc"}})
+
+    client, http = _client(record, project="ABC")
+    async with http:
+        await client.add_comment("ABC-1", "Try clearing the cache.")
+    check("add_comment POSTs to the issue's comment endpoint",
+          capture["method"] == "POST"
+          and capture["path"] == "/rest/api/2/issue/ABC-1/comment",
+          detail=f"{capture.get('method')} {capture.get('path')}")
+    check("the body is a plain wiki-markup string, not ADF",
+          capture["sent"] == {"body": "Try clearing the cache."},
+          detail=str(capture.get("sent")))
+
+    client, http = _client(record, project="ABC")
+    async with http:
+        err = await _raises(client.add_comment("ABC-1", "   "))
+    check("an empty comment is refused", isinstance(err, ValueError), detail=repr(err))
+
+
+def test_toolset_build() -> None:
+    print("\n-- toolset construction and gating --")
+    _with_dest_env()
+
+    names = _tool_names(_build({"destination": "BC_ELIAGROUP_APIHUB_JIRA",
+                                "project": "ABC"}))
+    check("the read tools are present",
+          "list_issues" in names and "get_issue" in names, detail=str(names))
+    # The security-relevant assertion in this file: holding a credential that
+    # can write must not be enough to give an agent a comment tool.
+    check("add_comment is absent when commenting is off",
+          "add_comment" not in names, detail=str(names))
+
+    names = _tool_names(_build({"destination": "BC_ELIAGROUP_APIHUB_JIRA",
+                                "project": "ABC", "allow_comment": True}))
+    check("add_comment appears when commenting is opted into",
+          "add_comment" in names, detail=str(names))
+
+    err = _sync_raises(lambda: _build({"project": "ABC"}))
+    check("a build without a destination name is refused",
+          isinstance(err, ValueError) and "destination" in str(err), detail=repr(err))
+
+    err = _sync_raises(lambda: _build({"destination": "X", "lookback": "soon"}))
+    check("a bad lookback fails at build time, not mid-run",
+          isinstance(err, ValueError), detail=repr(err))
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(_responder([])))
+    toolset = _build({"destination": "BC_ELIAGROUP_APIHUB_JIRA"}, http=http)
+    check("the toolset exposes its http client for the registry to close",
+          getattr(toolset, "http_client", None) is http)
+
+    _without_dest_env()
+    err = _sync_raises(lambda: jira_toolset(
+        {"destination": "BC_ELIAGROUP_APIHUB_JIRA"},
+        http=httpx.AsyncClient(), auth_mode="destination"))
+    check("a missing binding names the variables to set",
+          err is not None and "DESTINATION_CLIENT_ID" in str(err), detail=repr(err))
+    _with_dest_env()
+
+    from agents.builtins import BUILTIN_URLS, is_builtin_url
+
+    check("builtin:jira is registered",
+          BUILTIN_JIRA_URL in BUILTIN_URLS and is_builtin_url("builtin:jira"),
+          detail=str(sorted(BUILTIN_URLS)))
+
+
 async def main() -> None:
     test_jql()
     await test_filters()
     await test_answered_filtering()
     await test_transport()
+    await test_read_and_write()
+    test_toolset_build()
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
