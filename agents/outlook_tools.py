@@ -37,6 +37,7 @@ reaches the outside world under the mailbox owner's name.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -68,6 +69,58 @@ _TRUNCATED = "…[truncated]"
 _LIST_FIELDS = "id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead"
 
 
+# Suffixes accepted by `lookback`. Minutes is the internal unit: it divides
+# every other unit exactly, so no window is unrepresentable.
+_LOOKBACK_UNITS = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7}
+
+
+def parse_lookback(value: Any) -> int | None:
+    """A lookback window in minutes, or None when unset.
+
+    Accepts ``"90m"``, ``"5h"``, ``"2d"``, ``"1w"``, and a bare number, which
+    means **hours** -- the unit people reach for when saying how far back to
+    look. A unit suffix is the unambiguous form and the one the docs use.
+
+    Raises on anything it cannot parse rather than defaulting. A typo'd window
+    that silently became "no filter" would quietly hand the agent a whole
+    mailbox, which is the precise failure this setting exists to prevent.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+
+    unit = _LOOKBACK_UNITS.get(text[-1])
+    number = text[:-1].strip() if unit else text
+    if unit is None:
+        unit = _LOOKBACK_UNITS["h"]  # bare number means hours
+
+    try:
+        amount = float(number)
+    except ValueError:
+        raise ValueError(
+            f"invalid lookback {value!r}; use a number of hours or a value with "
+            f"a unit such as '90m', '5h', '2d', '1w'"
+        ) from None
+    if amount <= 0:
+        raise ValueError(f"lookback must be positive, got {value!r}")
+
+    minutes = int(round(amount * unit))
+    return max(minutes, 1)
+
+
+def _cutoff(minutes: int) -> str:
+    """The Graph-formatted UTC instant `minutes` ago.
+
+    Graph wants an ISO 8601 instant; anything with an offset other than Z is
+    rejected on some tenants, so it is normalised here rather than trusted to
+    the caller's locale.
+    """
+    moment = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _address(node: Any) -> str:
     """The bare address out of Graph's nested emailAddress shape."""
     if not isinstance(node, dict):
@@ -94,13 +147,33 @@ class OutlookClient:
     nobody is signed in. Naming the mailbox in config rather than deriving it
     is deliberate; an app-only token typically reaches every mailbox in the
     tenant, so the target should come from configuration a human wrote.
+
+    ``lookback_minutes`` is a ceiling on how far back a listing may reach. It
+    exists because the queue is not always a folder that drains: pointed at a
+    busy Inbox, an unfiltered listing returns the oldest mail in the mailbox,
+    which is rarely what anyone wants triaged and may be years stale. A tool
+    call can narrow the window further but never widen it past this.
     """
 
-    def __init__(self, http: httpx.AsyncClient, mailbox: str = "") -> None:
+    def __init__(
+        self,
+        http: httpx.AsyncClient,
+        mailbox: str = "",
+        lookback_minutes: int | None = None,
+    ) -> None:
         self._http = http
         self._folders: dict[str, str] | None = None
         self.mailbox = (mailbox or "").strip()
         self._root = f"/users/{self.mailbox}" if self.mailbox else "/me"
+        self.lookback_minutes = lookback_minutes
+
+    def _window(self, requested: int | None) -> int | None:
+        """The effective window: the tighter of the request and the ceiling."""
+        if requested is None:
+            return self.lookback_minutes
+        if self.lookback_minutes is None:
+            return requested
+        return min(requested, self.lookback_minutes)
 
     async def _req(self, method: str, path: str, **kw: Any) -> dict[str, Any]:
         r = await self._http.request(method, f"{GRAPH_V1}{path}", **kw)
@@ -135,20 +208,35 @@ class OutlookClient:
         )
 
     async def list_pending(
-        self, folder: str, limit: int = DEFAULT_MAX_MESSAGES
+        self,
+        folder: str,
+        limit: int = DEFAULT_MAX_MESSAGES,
+        lookback_minutes: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Messages waiting in a folder, oldest first, metadata only."""
+        """Messages waiting in a folder, oldest first, metadata only.
+
+        With a window in effect the listing covers only mail received inside
+        it. That changes what "oldest first" means in a useful way: the oldest
+        message *in the window*, rather than the oldest in the mailbox.
+        """
         capped = max(1, min(int(limit or DEFAULT_MAX_MESSAGES), MAX_MESSAGES))
         fid = await self._folder_id(folder)
+        params: dict[str, Any] = {
+            "$top": capped,
+            "$select": _LIST_FIELDS,
+            # Oldest first: the queue should drain in arrival order.
+            "$orderby": "receivedDateTime asc",
+        }
+        window = self._window(lookback_minutes)
+        if window is not None:
+            # Graph requires the filtered property to lead $orderby; both use
+            # receivedDateTime here, so the existing ordering already satisfies
+            # it. Changing the sort without revisiting this returns a 400.
+            params["$filter"] = f"receivedDateTime ge {_cutoff(window)}"
         data = await self._req(
             "GET",
             f"{self._root}/mailFolders/{fid}/messages",
-            params={
-                "$top": capped,
-                "$select": _LIST_FIELDS,
-                # Oldest first: the queue should drain in arrival order.
-                "$orderby": "receivedDateTime asc",
-            },
+            params=params,
         )
         return [
             {
@@ -270,6 +358,7 @@ def outlook_toolset(
     auth_mode: str | None = None,
     mailbox: str | None = None,
     allow_send: bool | None = None,
+    lookback: str | None = None,
 ) -> FunctionToolset:
     """The Outlook toolset for one agent, ready for ``Agent(toolsets=...)``.
 
@@ -291,25 +380,34 @@ def outlook_toolset(
         )
 
     can_send = bool(oauth.get("allow_send")) if allow_send is None else bool(allow_send)
+    # Parsed at build time, not per call: a bad window should stop the registry
+    # rebuild with a clear message, not surface mid-run as a Graph 400.
+    window = parse_lookback(lookback if lookback is not None else oauth.get("lookback"))
 
     session = http or build_http_client(oauth, server_key, auth_mode)
-    client = OutlookClient(session, mailbox=resolved_mailbox)
+    client = OutlookClient(session, mailbox=resolved_mailbox, lookback_minutes=window)
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.
     toolset.http_client = session  # type: ignore[attr-defined]
 
     @toolset.tool
     async def list_pending(
-        folder: str, limit: int = DEFAULT_MAX_MESSAGES
+        folder: str,
+        limit: int = DEFAULT_MAX_MESSAGES,
+        lookback: str = "",
     ) -> list[dict[str, Any]]:
-        """List the mail waiting in an Inbox subfolder, oldest first.
+        """List the mail waiting in a folder, oldest first.
 
         Args:
             folder: Display name of the Inbox subfolder acting as the queue,
-                e.g. `agent`.
+                e.g. `agent`. Well-known names such as `inbox` also work.
             limit: How many messages to return (capped at 50).
+            lookback: Only return mail received within this window, e.g. `90m`,
+                `5h`, `2d`, `1w`. A bare number means hours. The server may
+                impose its own window; the tighter of the two applies, so this
+                can narrow the range but never widen it.
         """
-        return await client.list_pending(folder, limit)
+        return await client.list_pending(folder, limit, parse_lookback(lookback))
 
     @toolset.tool
     async def get_message(

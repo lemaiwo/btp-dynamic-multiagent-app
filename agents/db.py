@@ -642,7 +642,8 @@ _OAUTH_KEYS = ("client_id", "client_secret", "uaa_url", "authorize_url", "token_
 # (`mailbox`) because an app-only token names no user, and `allow_send`, which
 # is deliberately separate from the token's permissions: holding Mail.Send must
 # not be enough to give an agent a send tool.
-_CC_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope", "mailbox")
+_CC_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope", "mailbox",
+            "lookback")
 
 
 def _clean_client_credentials(

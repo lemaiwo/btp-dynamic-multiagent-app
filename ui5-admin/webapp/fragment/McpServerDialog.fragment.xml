@@ -81,6 +81,13 @@
                 placeholder="{i18n>mailboxHint}"
                 visible="{= ${server>/auth_mode} === 'app_only' }" />
 
+            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' }" />
+            <Input
+                id="oauthLookback"
+                value="{server>/oauth/lookback}"
+                placeholder="{i18n>lookbackHint}"
+                visible="{= ${server>/auth_mode} === 'app_only' }" />
+
             <Label text="{i18n>allowSend}" visible="{= ${server>/auth_mode} === 'app_only' }" />
             <CheckBox
                 id="oauthAllowSend"

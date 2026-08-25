@@ -222,6 +222,7 @@ reads:
 | Token URL | `https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/token` |
 | Scope | `https://graph.microsoft.com/.default` |
 | Mailbox | the target address, e.g. `service.mailbox@example.com` |
+| Look back | `2d` — how far back a listing may reach; blank means no limit |
 | Sending | leave unchecked |
 
 Three differences from the delegated row, each following from there being no
@@ -229,6 +230,28 @@ user: no Authorize URL (nobody visits a browser), a Mailbox (the token names
 nobody, so the target cannot be inferred — the app refuses to start rather than
 fall back to `/me`), and `.default` as the scope, which is the only form this
 grant accepts.
+
+### The look-back window
+
+`lookback` bounds how far back `list_pending` will reach: `90m`, `5h`, `2d`,
+`1w`, or a bare number meaning hours. Blank means no limit, which is the
+original behaviour.
+
+It matters most when the queue is not a folder that drains. Pointed at a busy
+Inbox, an unfiltered listing returns the *oldest* mail in the mailbox — mail
+that may be months stale and was never meant for triage — and the recent
+message somebody actually wants answered never appears within the limit. A
+window of `2d` fixes that without anyone having to tidy the folder first.
+
+It is a **ceiling, not a default**. `list_pending` also takes a `lookback`
+argument, so a prompt can ask for a narrower window, but the tighter of the two
+always wins. A prompt cannot talk its way into reading more of the mailbox than
+the configuration allows — the same reasoning as `allow_send`: capabilities are
+bounded by config, not by wording a model may reinterpret.
+
+A malformed value is rejected when the agent is saved, naming the field.
+Defaulting it to "no filter" would silently hand the agent the whole mailbox,
+which is the exact failure the setting exists to prevent.
 
 **`run_as_principal` is not needed** app-only, and the credentials panel shows
 the server as connected without anyone signing in. It is connected by

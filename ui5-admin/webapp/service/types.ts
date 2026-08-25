@@ -43,6 +43,12 @@ export type OAuthClient =
            * send mail. See agents/outlook_tools.py.
            */
           allow_send?: boolean;
+          /**
+           * How far back a mail listing may reach: "90m", "5h", "2d", "1w", or
+           * a bare number of hours. A ceiling the agent can narrow but not
+           * widen, so a busy Inbox does not hand it years of backlog.
+           */
+          lookback?: string;
       };
 
 export interface McpServer {

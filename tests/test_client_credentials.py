@@ -279,6 +279,79 @@ async def main() -> None:
         ok = outlook_toolset({}, http=c, auth_mode="oauth2")
         check("delegated without a mailbox is fine", ok is not None)
 
+    print("\n-- lookback parsing --")
+
+    from agents.outlook_tools import parse_lookback
+
+    for value, minutes in [
+        ("90m", 90), ("5h", 300), ("2d", 2880), ("1w", 10080),
+        ("  3h  ", 180), ("2D", 2880), ("0.5h", 30),
+        (48, 2880), ("48", 2880),   # bare numbers are hours
+    ]:
+        check(f"{value!r} -> {minutes} minutes",
+              parse_lookback(value) == minutes, str(parse_lookback(value)))
+
+    for empty in (None, "", "   "):
+        check(f"{empty!r} means no window", parse_lookback(empty) is None)
+
+    for bad in ("soon", "5x", "h", "-3h", "0", "0h", "abc2d"):
+        try:
+            parse_lookback(bad)
+            check(f"rejects {bad!r}", False, "accepted")
+        except ValueError:
+            check(f"rejects {bad!r}", True)
+
+    print("\n-- the window is a ceiling, not a default --")
+
+    windows: list[str] = []
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        windows.append(request.url.params.get("$filter") or "")
+        return httpx.Response(200, json={"value": []})
+
+    async with httpx.AsyncClient(
+        base_url="https://graph.microsoft.com", transport=httpx.MockTransport(capture)
+    ) as c:
+        unbounded = OutlookClient(c, mailbox="m@e.com")
+        await unbounded.list_pending("inbox")
+        check("no config and no argument means no filter at all",
+              windows[-1] == "", windows[-1])
+
+        await unbounded.list_pending("inbox", lookback_minutes=60)
+        check("an argument alone applies a filter",
+              windows[-1].startswith("receivedDateTime ge "), windows[-1])
+
+        bounded = OutlookClient(c, mailbox="m@e.com", lookback_minutes=120)
+        await bounded.list_pending("inbox")
+        check("config alone applies a filter",
+              windows[-1].startswith("receivedDateTime ge "), windows[-1])
+
+        # The point of the ceiling: a prompt cannot talk its way past it.
+        check("a wider request is clamped to the configured ceiling",
+              bounded._window(10080) == 120, str(bounded._window(10080)))
+        check("a narrower request is honoured",
+              bounded._window(30) == 30, str(bounded._window(30)))
+        check("an absent request falls back to the ceiling",
+              bounded._window(None) == 120, str(bounded._window(None)))
+
+    print("\n-- the filter and the sort agree --")
+
+    # Graph rejects $filter+$orderby unless the filtered property leads the
+    # sort. Both use receivedDateTime; asserting it stops a future reorder
+    # from producing a 400 that only shows up against a live mailbox.
+    sorts: list[str] = []
+
+    def capture_sort(request: httpx.Request) -> httpx.Response:
+        sorts.append(request.url.params.get("$orderby") or "")
+        return httpx.Response(200, json={"value": []})
+
+    async with httpx.AsyncClient(
+        base_url="https://graph.microsoft.com", transport=httpx.MockTransport(capture_sort)
+    ) as c:
+        await OutlookClient(c, lookback_minutes=60).list_pending("inbox")
+        check("the sort leads with the filtered property",
+              sorts[-1].startswith("receivedDateTime"), sorts[-1])
+
     print("\n-- auth_mode fits its column --")
 
     from agents.db import AUTH_MODE_MAX_LENGTH, VALID_AUTH_MODES
