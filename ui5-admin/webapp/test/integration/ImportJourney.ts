@@ -53,16 +53,23 @@ opaTest("importing valid JSON closes the dialog; invalid JSON leaves it open wit
     });
     When.waitFor({ id: "importConfirm", viewName: "Settings", searchOpenDialogs: true, actions: new Press() });
 
-    // onConfirmImport() reports invalid JSON via MessageBox.error(). The
-    // closed importDialog is excluded from this search by OPA5's default
-    // "visible" control filter, so only the MessageBox dialog can match.
-    // (Common.iStopTheApp() destroys any dialog still open during teardown
-    // below, so this does not need to close it itself.)
+    // onConfirmImport() reports invalid JSON via MessageBox.error(), whose
+    // default title is the "Error" resource text (sap/m/messagebundle.
+    // properties: MSGBOX_TITLE_ERROR). Matching on that title -- rather than
+    // just "some sap.m.Dialog is open" -- matters here specifically: the
+    // reopened importDialog ("{i18n>importConfig}" titled) is itself already
+    // open at this point, so a bare existence check would pass even if
+    // MessageBox.error() were never called.
     Then.waitFor({
         controlType: "sap.m.Dialog",
-        success: function (elements: UI5Element[]) {
-            Opa5.assert.ok((elements as Dialog[]).length > 0, "an error dialog appeared for invalid JSON");
-        }
+        searchOpenDialogs: true,
+        matchers: function (element: UI5Element) {
+            return (element as Dialog).getTitle() === "Error";
+        },
+        success: function () {
+            Opa5.assert.ok(true, "an error dialog appeared for invalid JSON");
+        },
+        errorMessage: "No dialog titled 'Error' appeared for invalid JSON"
     });
     Then.waitFor({
         id: "importJson",
