@@ -38,6 +38,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
+from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -169,6 +170,22 @@ class McpServerPayload(BaseModel):
 
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
+        # Before the per-mode rules, because the oauth2 branch below returns
+        # early for DCR.
+        if (
+            str(self.url or "").strip().rstrip("/").lower() == BUILTIN_JIRA_URL
+            and self.auth_mode != AUTH_MODE_DESTINATION
+        ):
+            # Caught here rather than at reload: jira_toolset has no other way
+            # to reach Jira, so a server saved with any other mode builds fine,
+            # then raises during the rebuild. The registry logs that and drops
+            # the whole agent, which still looks configured in the UI but no
+            # longer exists in chat.
+            raise ValueError(
+                f"{BUILTIN_JIRA_URL} requires auth_mode=destination: it holds "
+                "no credential of its own and reaches Jira only through the "
+                "BTP destination named in oauth.destination"
+            )
         if self.auth_mode == AUTH_MODE_OAUTH2:
             cfg = self.oauth.to_config() if self.oauth else {}
             if cfg.get("dcr"):
@@ -208,6 +225,17 @@ class McpServerPayload(BaseModel):
                 )
         elif self.auth_mode == AUTH_MODE_DESTINATION:
             cfg = self.oauth.to_config() if self.oauth else {}
+            if not is_builtin_url(self.url):
+                # Nothing reads the destination for a real MCP URL: the
+                # transport falls through to JWT forwarding, so the user's
+                # XSUAA token would go to that host while the UI reported the
+                # server as connected by configuration.
+                raise ValueError(
+                    "auth_mode=destination is only supported for built-in "
+                    f"toolsets ({', '.join(sorted(BUILTIN_URLS))}); an MCP "
+                    "server over HTTP cannot be reached through a destination, "
+                    "so use auth_mode=jwt, oauth2 or none for this URL"
+                )
             if cfg.get("dcr"):
                 raise ValueError(
                     "a destination server cannot use DCR: the destination "
@@ -228,7 +256,8 @@ class McpServerPayload(BaseModel):
                 )
         elif self.oauth is not None and self.oauth.to_config():
             raise ValueError(
-                "oauth config is only valid when auth_mode=oauth2 or client_credentials"
+                "oauth config is only valid when auth_mode=oauth2, app_only "
+                "or destination"
             )
         return self
 

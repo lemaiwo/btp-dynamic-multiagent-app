@@ -622,6 +622,32 @@ def test_storage_and_validation() -> None:
     check("a bad lookback is a field error, not a 500", err is not None,
           detail=repr(err))
 
+    # auth_mode and URL have to agree, in both directions. Neither mismatch
+    # fails loudly on its own: one forwards the user's JWT to a host the
+    # destination was supposed to cover, the other saves cleanly and then
+    # disappears from the orchestrator at the next reload.
+    err = _sync_raises(lambda: McpServerPayload(
+        url="https://mcp.example.com/mcp", auth_mode="destination",
+        oauth=OAuthClientPayload(destination="BC_ELIAGROUP_APIHUB_JIRA")))
+    check("the API refuses auth_mode=destination on a real MCP URL",
+          err is not None and "built-in" in str(err), detail=repr(err))
+
+    for mode in ("jwt", "none", "oauth2", "app_only"):
+        err = _sync_raises(lambda m=mode: McpServerPayload(
+            url="builtin:jira", auth_mode=m,
+            oauth=OAuthClientPayload(
+                destination="BC_ELIAGROUP_APIHUB_JIRA",
+                client_id="c", client_secret="s",
+                uaa_url="https://uaa.example", token_url="https://uaa.example/t",
+                mailbox="svc@example.com")))
+        check(f"the API refuses builtin:jira with auth_mode={mode}",
+              err is not None and "destination" in str(err), detail=repr(err))
+
+    err = _sync_raises(lambda: McpServerPayload(
+        url="builtin:jira", auth_mode="oauth2", oauth=OAuthClientPayload(dcr=True)))
+    check("the DCR shortcut does not slip builtin:jira past the check",
+          err is not None, detail=repr(err))
+
 
 async def main() -> None:
     test_jql()
