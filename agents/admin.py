@@ -41,7 +41,9 @@ from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
+    AUTH_MODE_CLIENT_CREDENTIALS,
     AUTH_MODE_OAUTH2,
+    OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
     SessionLocal,
     delete_agent,
@@ -92,6 +94,12 @@ class OAuthClientPayload(BaseModel):
     scope: str = Field(default="", max_length=512)
     # Read-only flag echoed back by the API; ignored on input.
     has_client_secret: bool = False
+    # client_credentials only. `mailbox` names the target, since an app-only
+    # token identifies no user. `allow_send` is a capability switch kept
+    # separate from the token's permissions on purpose -- see
+    # agents/outlook_tools.py on why sending is opt-in.
+    mailbox: str = Field(default="", max_length=320)
+    allow_send: bool = False
 
     def to_config(self) -> dict[str, Any]:
         if self.dcr:
@@ -106,8 +114,12 @@ class OAuthClientPayload(BaseModel):
             "authorize_url": self.authorize_url.strip(),
             "token_url": self.token_url.strip(),
             "scope": self.scope.strip(),
+            "mailbox": self.mailbox.strip(),
         }
-        return {k: v for k, v in fields.items() if v}
+        config = {k: v for k, v in fields.items() if v}
+        if self.allow_send:
+            config["allow_send"] = True
+        return config
 
 
 class McpServerPayload(BaseModel):
@@ -143,8 +155,31 @@ class McpServerPayload(BaseModel):
                 )
             # client_secret may be blank here (preserved from storage on edit);
             # the DB layer enforces that a secret ultimately exists.
+        elif self.auth_mode == AUTH_MODE_CLIENT_CREDENTIALS:
+            cfg = self.oauth.to_config() if self.oauth else {}
+            if cfg.get("dcr"):
+                raise ValueError(
+                    "client_credentials cannot use DCR: dynamic registration "
+                    "produces a client with no admin-consented application "
+                    "permissions, so its tokens can reach nothing"
+                )
+            if not cfg.get("client_id"):
+                raise ValueError("client_credentials server requires oauth.client_id")
+            if not (cfg.get("token_url") or cfg.get("uaa_url")):
+                raise ValueError(
+                    "client_credentials server requires oauth.token_url or "
+                    "oauth.uaa_url (there is no authorize_url: no browser is involved)"
+                )
+            if is_builtin_url(self.url) and not cfg.get("mailbox"):
+                raise ValueError(
+                    f"{self.url} with auth_mode=client_credentials requires "
+                    "oauth.mailbox: an app-only token identifies no user, so the "
+                    "target mailbox has to be named"
+                )
         elif self.oauth is not None and self.oauth.to_config():
-            raise ValueError("oauth config is only valid when auth_mode=oauth2")
+            raise ValueError(
+                "oauth config is only valid when auth_mode=oauth2 or client_credentials"
+            )
         return self
 
     @model_validator(mode="after")
@@ -278,7 +313,7 @@ class AgentPayload(BaseModel):
         out: list[dict[str, Any]] = []
         for s in self.mcp_servers:
             entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
-            if s.auth_mode == AUTH_MODE_OAUTH2 and s.oauth is not None:
+            if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
                 entry["oauth"] = s.oauth.to_config()
             out.append(entry)
         return out
@@ -516,12 +551,17 @@ async def api_agent_credentials(
                         "Could not read token status for %s on %s",
                         who, server_key, exc_info=True,
                     )
+        # An app-only server needs no user token, and reporting has_token=False
+        # for it would render as "not connected" forever with no way to fix it.
+        # It is connected by configuration, not by anyone signing in.
+        app_only = auth_mode == AUTH_MODE_CLIENT_CREDENTIALS
         out.append({
             "url": url,
             "auth_mode": auth_mode,
             "needs_token": needs_token,
-            "has_token": has_token,
+            "has_token": has_token or app_only,
             "login_url": login_url,
+            "app_only": app_only,
         })
     return out
 
