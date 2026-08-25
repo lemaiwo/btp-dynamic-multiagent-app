@@ -33,7 +33,7 @@
     },
     {
       "source": "^/ui5admin/resources/(.*)$",
-      "target": "/1.120/resources/$1",
+      "target": "/1.120.50/resources/$1",
       "destination": "ui5",
       "authenticationType": "none",
       "csrfProtection": false
