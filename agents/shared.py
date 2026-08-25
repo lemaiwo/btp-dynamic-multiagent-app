@@ -244,7 +244,8 @@ def create_mcp_server(
       - "oauth2": per-user OAuth2 authorization_code against the server's own
         authorization server (e.g. a separate XSUAA). `oauth` carries the
         client config. Each user authorizes once; tokens are stored per user.
-      - "client_credentials": app-only OAuth2. The agent authenticates as
+      - "app_only": app-only OAuth2 (client_credentials grant). The agent
+        authenticates as
         itself, so there is nobody to sign in and nothing stored per user —
         which is what makes unattended, scheduled runs work. The access it
         gets is whatever was granted to the registration, not to a person.
@@ -265,7 +266,7 @@ def create_mcp_server(
         if not oauth:
             raise ValueError(f"oauth2 server {name!r} is missing its oauth config")
         auth = PerUserOAuth2Auth(server_key=mcp_url, spec_oauth=oauth)
-    elif auth_mode == "client_credentials":
+    elif auth_mode == "app_only":
         from agents.client_credentials import ClientCredentialsAuth, config_from_oauth
 
         if not oauth:

@@ -10,7 +10,7 @@
       "mcp_servers": [
         {
           "url": "builtin:outlook",
-          "auth_mode": "client_credentials",
+          "auth_mode": "app_only",
           "oauth": {
             "client_id": "23a8f282-b850-4a84-ac63-57e0b37c9534",
             "token_url": "https://login.microsoftonline.com/b82bc314-ab8e-4d6f-b189-46f02e1f27f2/oauth2/v2.0/token",

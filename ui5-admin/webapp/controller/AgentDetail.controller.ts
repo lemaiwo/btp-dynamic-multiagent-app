@@ -134,7 +134,7 @@ export default class AgentDetail extends BaseController {
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
             // App-only tokens carry no per-scope request: providers want the
             // ".default" form, and asking for individual scopes is rejected.
-            scopeHint: server.auth_mode === "client_credentials"
+            scopeHint: server.auth_mode === "app_only"
                 ? "https://graph.microsoft.com/.default"
                 : "",
             errors: {}
@@ -171,7 +171,7 @@ export default class AgentDetail extends BaseController {
             return;
         }
 
-        const carriesOAuth = authMode === "oauth2" || authMode === "client_credentials";
+        const carriesOAuth = authMode === "oauth2" || authMode === "app_only";
         const oauth = carriesOAuth
             ? AgentDetail.cleanOAuth(oauthRaw, authMode)
             : undefined;
@@ -212,7 +212,7 @@ export default class AgentDetail extends BaseController {
     private static cleanOAuth(
         raw: Record<string, unknown>, authMode: AuthMode = "oauth2"
     ): McpServer["oauth"] {
-        const appOnly = authMode === "client_credentials";
+        const appOnly = authMode === "app_only";
         // DCR is meaningless app-only: a client registered on the fly holds no
         // admin-consented application permissions, so its tokens reach nothing.
         if (!appOnly && raw.dcr === true) {

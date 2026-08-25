@@ -94,7 +94,7 @@ const APP_ONLY = {
 
 QUnit.test("a complete app-only config passes", function (assert) {
     assert.strictEqual(
-        validators.validateOAuth(APP_ONLY, "client_credentials", "builtin:outlook"),
+        validators.validateOAuth(APP_ONLY, "app_only", "builtin:outlook"),
         ""
     );
 });
@@ -102,7 +102,7 @@ QUnit.test("a complete app-only config passes", function (assert) {
 QUnit.test("app-only needs a client id", function (assert) {
     const { client_id, ...rest } = APP_ONLY;
     assert.notStrictEqual(
-        validators.validateOAuth(rest as never, "client_credentials", "builtin:outlook"),
+        validators.validateOAuth(rest as never, "app_only", "builtin:outlook"),
         ""
     );
 });
@@ -111,7 +111,7 @@ QUnit.test("app-only needs a token url, not an authorize url", function (assert)
     const { token_url, ...rest } = APP_ONLY;
     const error = validators.validateOAuth(
         { ...rest, authorize_url: "https://login.microsoftonline.com/t/authorize" } as never,
-        "client_credentials",
+        "app_only",
         "builtin:outlook"
     );
     assert.ok(error.indexOf("token URL") > -1, "an authorize URL does not substitute");
@@ -120,7 +120,7 @@ QUnit.test("app-only needs a token url, not an authorize url", function (assert)
 QUnit.test("a built-in toolset needs a mailbox", function (assert) {
     const { mailbox, ...rest } = APP_ONLY;
     const error = validators.validateOAuth(
-        rest as never, "client_credentials", "builtin:outlook"
+        rest as never, "app_only", "builtin:outlook"
     );
     assert.ok(error.indexOf("mailbox") > -1, "the mailbox cannot be inferred");
 });
@@ -129,7 +129,7 @@ QUnit.test("a remote MCP server needs no mailbox", function (assert) {
     const { mailbox, ...rest } = APP_ONLY;
     assert.strictEqual(
         validators.validateOAuth(
-            rest as never, "client_credentials", "https://mcp.example.com/mcp"
+            rest as never, "app_only", "https://mcp.example.com/mcp"
         ),
         "",
         "only built-ins address a mailbox"
@@ -141,7 +141,7 @@ QUnit.test("a remote MCP server needs no mailbox", function (assert) {
 // a config that authenticates and then 403s on every call.
 QUnit.test("app-only rejects dynamic registration", function (assert) {
     const error = validators.validateOAuth(
-        { dcr: true }, "client_credentials", "builtin:outlook"
+        { dcr: true }, "app_only", "builtin:outlook"
     );
     assert.ok(error.indexOf("dynamic registration") > -1, error);
 });

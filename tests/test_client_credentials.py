@@ -242,7 +242,7 @@ async def main() -> None:
         transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))
     ) as c:
         default = outlook_toolset(dict(CC_OAUTH), http=c,
-                                  auth_mode="client_credentials")
+                                  auth_mode="app_only")
         names = set(await _tool_names(default))
         check("send_reply is absent by default", "send_reply" not in names, str(names))
         check("the read and draft tools are present",
@@ -250,14 +250,14 @@ async def main() -> None:
                "move_message"} <= names, str(names))
 
         opted_in = outlook_toolset({**CC_OAUTH, "allow_send": True}, http=c,
-                                   auth_mode="client_credentials")
+                                   auth_mode="app_only")
         names = set(await _tool_names(opted_in))
         check("send_reply appears only when allow_send is set",
               "send_reply" in names, str(names))
 
         # The token's own permissions must not be what decides this.
         not_opted = outlook_toolset({**CC_OAUTH, "allow_send": False}, http=c,
-                                    auth_mode="client_credentials")
+                                    auth_mode="app_only")
         check("allow_send=False keeps the tool away",
               "send_reply" not in set(await _tool_names(not_opted)))
 
@@ -268,7 +268,7 @@ async def main() -> None:
     ) as c:
         without = {k: v for k, v in CC_OAUTH.items() if k != "mailbox"}
         try:
-            outlook_toolset(without, http=c, auth_mode="client_credentials")
+            outlook_toolset(without, http=c, auth_mode="app_only")
             check("app-only without a mailbox is refused", False, "accepted")
         except ValueError as exc:
             check("app-only without a mailbox is refused", True)
@@ -279,20 +279,40 @@ async def main() -> None:
         ok = outlook_toolset({}, http=c, auth_mode="oauth2")
         check("delegated without a mailbox is fine", ok is not None)
 
+    print("\n-- auth_mode fits its column --")
+
+    from agents.db import AUTH_MODE_MAX_LENGTH, VALID_AUTH_MODES
+
+    # This is the assertion that was missing when "client_credentials" (18
+    # chars) shipped into a varchar(16). Every suite here runs on SQLite, which
+    # ignores VARCHAR limits entirely, so nothing failed until Postgres rejected
+    # the first insert in a deployed environment. Checking the values against
+    # the declared width is the only thing that catches it without a real
+    # Postgres in the loop.
+    for mode in sorted(VALID_AUTH_MODES):
+        check(f"{mode!r} fits in varchar({AUTH_MODE_MAX_LENGTH})",
+              len(mode) <= AUTH_MODE_MAX_LENGTH,
+              f"{len(mode)} chars")
+
+    from agents.db import AgentConfig
+    declared = AgentConfig.__table__.c.auth_mode.type.length
+    check("the column width matches the constant the check uses",
+          declared == AUTH_MODE_MAX_LENGTH, f"column={declared}")
+
     print("\n-- admin validation --")
 
     from agents.admin import McpServerPayload
 
-    ok = McpServerPayload(url="builtin:outlook", auth_mode="client_credentials",
+    ok = McpServerPayload(url="builtin:outlook", auth_mode="app_only",
                           oauth={"client_id": "a", "client_secret": "b",
                                  "token_url": "https://login.microsoftonline.com/t/token",
                                  "mailbox": "service@example.com"})
     check("a complete app-only server is accepted",
-          ok.auth_mode == "client_credentials")
+          ok.auth_mode == "app_only")
     check("allow_send is absent from the stored config unless set",
           "allow_send" not in ok.oauth.to_config(), str(ok.oauth.to_config()))
 
-    on = McpServerPayload(url="builtin:outlook", auth_mode="client_credentials",
+    on = McpServerPayload(url="builtin:outlook", auth_mode="app_only",
                           oauth={"client_id": "a", "client_secret": "b",
                                  "token_url": "https://x/t",
                                  "mailbox": "m@example.com", "allow_send": True})
@@ -309,7 +329,7 @@ async def main() -> None:
         ({"dcr": True}, "DCR, which cannot hold application permissions"),
     ]:
         try:
-            McpServerPayload(url="builtin:outlook", auth_mode="client_credentials",
+            McpServerPayload(url="builtin:outlook", auth_mode="app_only",
                              oauth=bad)
             check(f"rejects app-only config with {why}", False, "accepted")
         except Exception:
@@ -318,7 +338,7 @@ async def main() -> None:
     # A real MCP server has no mailbox concept; only builtins require one.
     remote = McpServerPayload(
         url="https://mcp.example.hana.ondemand.com/mcp",
-        auth_mode="client_credentials",
+        auth_mode="app_only",
         oauth={"client_id": "a", "client_secret": "b", "token_url": "https://x/t"})
     check("a remote MCP server needs no mailbox", remote is not None)
 

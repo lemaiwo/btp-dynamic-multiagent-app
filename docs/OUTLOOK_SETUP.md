@@ -130,7 +130,7 @@ Everything above describes *delegated* access: a person signs in and the agent
 acts as them. That is impossible for a shared or service mailbox with no
 interactive login, which is the common case for an automated inbox.
 
-App-only (`client_credentials`) solves it. The agent authenticates as itself,
+App-only (`app_only`) solves it. The agent authenticates as itself,
 so there is no sign-in, no stored user token, and nothing that breaks when
 someone leaves the company. Scheduled runs need no human at all.
 
@@ -211,7 +211,7 @@ have no logged-in user and use that principal's stored token.
 
 ### App-only variant
 
-For the `client_credentials` route from section 3b, the same server row instead
+For the `app_only` route from section 3b, the same server row instead
 reads:
 
 | Field | Value |

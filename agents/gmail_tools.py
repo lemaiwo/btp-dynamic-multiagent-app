@@ -275,7 +275,7 @@ def gmail_toolset(
     implemented here. Failing loudly beats silently falling back to per-user
     auth on an agent configured to expect no user.
     """
-    if auth_mode == "client_credentials":
+    if auth_mode == "app_only":
         raise ValueError(
             "builtin:gmail does not support client_credentials; Google app-only "
             "access needs domain-wide delegation. Use auth_mode 'oauth2'."

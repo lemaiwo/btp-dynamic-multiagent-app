@@ -41,7 +41,7 @@ from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
-    AUTH_MODE_CLIENT_CREDENTIALS,
+    AUTH_MODE_APP_ONLY,
     AUTH_MODE_OAUTH2,
     OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
@@ -155,7 +155,7 @@ class McpServerPayload(BaseModel):
                 )
             # client_secret may be blank here (preserved from storage on edit);
             # the DB layer enforces that a secret ultimately exists.
-        elif self.auth_mode == AUTH_MODE_CLIENT_CREDENTIALS:
+        elif self.auth_mode == AUTH_MODE_APP_ONLY:
             cfg = self.oauth.to_config() if self.oauth else {}
             if cfg.get("dcr"):
                 raise ValueError(
@@ -554,7 +554,7 @@ async def api_agent_credentials(
         # An app-only server needs no user token, and reporting has_token=False
         # for it would render as "not connected" forever with no way to fix it.
         # It is connected by configuration, not by anyone signing in.
-        app_only = auth_mode == AUTH_MODE_CLIENT_CREDENTIALS
+        app_only = auth_mode == AUTH_MODE_APP_ONLY
         out.append({
             "url": url,
             "auth_mode": auth_mode,

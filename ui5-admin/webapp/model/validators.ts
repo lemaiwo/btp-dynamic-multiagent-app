@@ -41,7 +41,7 @@ export default {
 
     /** Returns an error message, or an empty string when the config is valid. */
     validateOAuth(oauth: OAuthClient | undefined, authMode: AuthMode, url = ""): string {
-        if (authMode === "client_credentials") {
+        if (authMode === "app_only") {
             if (!oauth || ("dcr" in oauth && oauth.dcr === true)) {
                 return oauth
                     ? "App-only auth cannot use dynamic registration: a client "
