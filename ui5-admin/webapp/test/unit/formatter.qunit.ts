@@ -9,6 +9,13 @@ QUnit.test("run status maps to a ValueState", function (assert) {
     assert.strictEqual(formatter.runStatusState("running"), "Information");
 });
 
+QUnit.test("the legacy 'degraded' status still gets a colour", function (assert) {
+    // No current code writes this, but stored rows carry it — half the runs in
+    // the deployed acceptance database do. Without this it rendered neutral,
+    // which is indistinguishable from a status the app does not understand.
+    assert.strictEqual(formatter.runStatusState("degraded"), "Warning");
+});
+
 QUnit.test("an unknown status degrades to None rather than throwing", function (assert) {
     assert.strictEqual(formatter.runStatusState("bogus" as never), "None");
 });
