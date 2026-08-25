@@ -11,7 +11,7 @@ import type Dialog from "sap/m/Dialog";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
-import type { AgentInput, CredentialStatus, McpServer } from "../service/types";
+import type { AgentInput, AuthMode, CredentialStatus, McpServer } from "../service/types";
 
 const EMPTY_AGENT: AgentInput = {
     name: "",
@@ -127,11 +127,16 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "" },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false },
             builtins: validators.BUILTIN_URLS.slice(),
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
+            // App-only tokens carry no per-scope request: providers want the
+            // ".default" form, and asking for individual scopes is rejected.
+            scopeHint: server.auth_mode === "client_credentials"
+                ? "https://graph.microsoft.com/.default"
+                : "",
             errors: {}
         });
 
@@ -166,8 +171,11 @@ export default class AgentDetail extends BaseController {
             return;
         }
 
-        const oauth = authMode === "oauth2" ? AgentDetail.cleanOAuth(oauthRaw) : undefined;
-        const oauthError = validators.validateOAuth(oauth, authMode);
+        const carriesOAuth = authMode === "oauth2" || authMode === "client_credentials";
+        const oauth = carriesOAuth
+            ? AgentDetail.cleanOAuth(oauthRaw, authMode)
+            : undefined;
+        const oauthError = validators.validateOAuth(oauth, authMode, url);
         if (oauthError) {
             MessageBox.error(oauthError);
             return;
@@ -201,18 +209,32 @@ export default class AgentDetail extends BaseController {
     }
 
     /** Drops blank fields so the server sees the same shape `to_config()` builds. */
-    private static cleanOAuth(raw: Record<string, unknown>): McpServer["oauth"] {
-        if (raw.dcr === true) {
+    private static cleanOAuth(
+        raw: Record<string, unknown>, authMode: AuthMode = "oauth2"
+    ): McpServer["oauth"] {
+        const appOnly = authMode === "client_credentials";
+        // DCR is meaningless app-only: a client registered on the fly holds no
+        // admin-consented application permissions, so its tokens reach nothing.
+        if (!appOnly && raw.dcr === true) {
             const scope = String(raw.scope ?? "").trim();
             return scope ? { dcr: true, scope } : { dcr: true };
         }
         const out: Record<string, unknown> = { client_id: String(raw.client_id ?? "").trim() };
-        ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"].forEach((key) => {
+        const keys = appOnly
+            ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox"]
+            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"];
+        keys.forEach((key) => {
             const value = String(raw[key] ?? "").trim();
             if (value) {
                 out[key] = value;
             }
         });
+        // Only ever sent as `true`. Omitting it when off keeps the stored
+        // config identical to what a config file would carry, so an exported
+        // agent does not gain a field it never asked for.
+        if (appOnly && raw.allow_send === true) {
+            out.allow_send = true;
+        }
         return out as McpServer["oauth"];
     }
 

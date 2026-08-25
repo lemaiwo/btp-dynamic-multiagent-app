@@ -40,7 +40,29 @@ export default {
     },
 
     /** Returns an error message, or an empty string when the config is valid. */
-    validateOAuth(oauth: OAuthClient | undefined, authMode: AuthMode): string {
+    validateOAuth(oauth: OAuthClient | undefined, authMode: AuthMode, url = ""): string {
+        if (authMode === "client_credentials") {
+            if (!oauth || ("dcr" in oauth && oauth.dcr === true)) {
+                return oauth
+                    ? "App-only auth cannot use dynamic registration: a client "
+                      + "registered on the fly holds no admin-consented permissions."
+                    : "App-only auth requires a client ID and secret.";
+            }
+            const app = oauth as Exclude<OAuthClient, { dcr: true }>;
+            if (!(app.client_id || "").trim()) {
+                return "App-only auth requires a client ID.";
+            }
+            if (!(app.token_url || "").trim() && !(app.uaa_url || "").trim()) {
+                return "App-only auth requires a token URL (no authorize URL: "
+                    + "nobody signs in).";
+            }
+            const isBuiltin = (url || "").trim().toLowerCase().startsWith("builtin:");
+            if (isBuiltin && !(app.mailbox || "").trim()) {
+                return "App-only auth requires a mailbox: the token identifies no "
+                    + "user, so there is no 'me' to fall back to.";
+            }
+            return "";
+        }
         if (authMode !== "oauth2") {
             const hasConfig = !!oauth && Object.keys(oauth).some((k) => {
                 const v = (oauth as Record<string, unknown>)[k];
@@ -86,7 +108,7 @@ export default {
                 errors[index] = urlError;
                 return;
             }
-            const oauthError = this.validateOAuth(server.oauth, server.auth_mode);
+            const oauthError = this.validateOAuth(server.oauth, server.auth_mode, server.url);
             if (oauthError) {
                 errors[index] = oauthError;
                 return;
