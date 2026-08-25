@@ -237,14 +237,14 @@ class OutlookClient:
         return {"message_id": message_id, "moved_to": destination}
 
 
-AUTH_MODE_CLIENT_CREDENTIALS = "client_credentials"
+AUTH_MODE_APP_ONLY = "app_only"
 
 
 def build_http_client(
     oauth: dict[str, Any], server_key: str, auth_mode: str | None = None
 ) -> httpx.AsyncClient:
     """An httpx client carrying a Microsoft token, app-only or per-user."""
-    if auth_mode == AUTH_MODE_CLIENT_CREDENTIALS:
+    if auth_mode == AUTH_MODE_APP_ONLY:
         from agents.client_credentials import ClientCredentialsAuth, config_from_oauth
 
         auth: httpx.Auth = ClientCredentialsAuth(
@@ -283,7 +283,7 @@ def outlook_toolset(
     resolved_mailbox = (
         mailbox if mailbox is not None else str(oauth.get("mailbox") or "")
     ).strip()
-    if auth_mode == AUTH_MODE_CLIENT_CREDENTIALS and not resolved_mailbox:
+    if auth_mode == AUTH_MODE_APP_ONLY and not resolved_mailbox:
         raise ValueError(
             "builtin:outlook with auth_mode 'client_credentials' requires a "
             "'mailbox' in the oauth config: an app-only token identifies no user, "

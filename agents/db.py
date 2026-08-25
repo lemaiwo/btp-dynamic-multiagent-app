@@ -45,12 +45,27 @@ AUTH_MODE_OAUTH2 = "oauth2"
 # consented to for the whole registration -- so the target must be named
 # explicitly in config (`mailbox` for builtin:outlook). See
 # agents/client_credentials.py.
-AUTH_MODE_CLIENT_CREDENTIALS = "client_credentials"
+AUTH_MODE_APP_ONLY = "app_only"
 VALID_AUTH_MODES = frozenset({
-    AUTH_MODE_JWT, AUTH_MODE_NONE, AUTH_MODE_OAUTH2, AUTH_MODE_CLIENT_CREDENTIALS,
+    AUTH_MODE_JWT, AUTH_MODE_NONE, AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY,
 })
 # Modes carrying an `oauth` config block.
-OAUTH_CONFIG_MODES = frozenset({AUTH_MODE_OAUTH2, AUTH_MODE_CLIENT_CREDENTIALS})
+OAUTH_CONFIG_MODES = frozenset({AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY})
+
+# Width of AgentConfig.auth_mode. Asserted rather than assumed: SQLite ignores
+# VARCHAR limits, so a mode too long for the column passes every local test and
+# every SQLite-backed suite, then fails on Postgres with
+# StringDataRightTruncationError at the first insert. That is exactly how
+# "client_credentials" (18 chars) reached a deployed environment. Failing at
+# import makes the mistake impossible to ship.
+AUTH_MODE_MAX_LENGTH = 16
+_too_long = sorted(m for m in VALID_AUTH_MODES if len(m) > AUTH_MODE_MAX_LENGTH)
+if _too_long:
+    raise ValueError(
+        f"auth_mode value(s) exceed the {AUTH_MODE_MAX_LENGTH}-char column: "
+        f"{', '.join(_too_long)}. Shorten the value, or widen "
+        f"AgentConfig.auth_mode and migrate existing rows."
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +172,8 @@ class AgentConfig(Base):
     instructions: Mapped[str] = mapped_column(Text, nullable=False)
     mcp_url: Mapped[str] = mapped_column(Text, nullable=False)
     auth_mode: Mapped[str] = mapped_column(
-        String(16), nullable=False, default=AUTH_MODE_JWT, server_default=AUTH_MODE_JWT
+        String(AUTH_MODE_MAX_LENGTH), nullable=False,
+        default=AUTH_MODE_JWT, server_default=AUTH_MODE_JWT,
     )
     # JSON-encoded list of additional MCP servers beyond the primary
     # (mcp_url/auth_mode). Each entry is {"url": str, "auth_mode": str,
@@ -680,7 +696,7 @@ def _clean_oauth(
 
     Returns None for modes that carry no oauth block.
     """
-    if mode == AUTH_MODE_CLIENT_CREDENTIALS:
+    if mode == AUTH_MODE_APP_ONLY:
         return _clean_client_credentials(oauth, fallback)
     if mode != AUTH_MODE_OAUTH2:
         return None
