@@ -143,13 +143,25 @@ have no logged-in user and use that principal's stored token.
 you cleared. It talks to Entra and Graph only, touches none of this app's code
 or database, and creates nothing in the mailbox.
 
-```bash
-python scripts/probe_outlook.py \
-    --tenant  <TENANT_ID> \
-    --client  <CLIENT_ID> \
-    --secret  <CLIENT_SECRET> \
-    --folder  "agent"          # the Inbox subfolder, optional
+Put the credentials in `.env` (gitignored) rather than on the command line:
+
 ```
+OUTLOOK_TENANT_ID=<TENANT_ID>
+OUTLOOK_CLIENT_ID=<CLIENT_ID>
+OUTLOOK_CLIENT_SECRET=<CLIENT_SECRET>
+OUTLOOK_FOLDER=agent            # the Inbox subfolder, optional
+```
+
+```bash
+python scripts/probe_outlook.py
+```
+
+A secret passed as `--secret` ends up in shell history, in `ps` output, and in
+the transcript of any agent asked to run the probe. The flags still exist and
+override `.env` — useful for a one-off run against a second tenant — but `.env`
+is the intended route. The probe prints the tenant and client ids it loaded and
+a `sha256:` fingerprint of the secret: enough to tell one value from another
+across runs without echoing any of it.
 
 It opens a browser, waits on `http://localhost:7932/oauth/callback`, then
 prints a verdict. What each outcome means:
