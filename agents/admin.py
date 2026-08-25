@@ -100,6 +100,19 @@ class OAuthClientPayload(BaseModel):
     # agents/outlook_tools.py on why sending is opt-in.
     mailbox: str = Field(default="", max_length=320)
     allow_send: bool = False
+    # How far back a mail listing may reach: "90m", "5h", "2d", "1w", or a bare
+    # number of hours. A ceiling, not a default the agent can widen.
+    lookback: str = Field(default="", max_length=16)
+
+    @field_validator("lookback")
+    @classmethod
+    def _validate_lookback(cls, v: str) -> str:
+        # Parsed here so a typo is a 422 naming the field, rather than a Graph
+        # 400 surfacing mid-run with no hint where it came from.
+        from agents.outlook_tools import parse_lookback
+
+        parse_lookback(v)
+        return (v or "").strip()
 
     def to_config(self) -> dict[str, Any]:
         if self.dcr:
@@ -115,6 +128,7 @@ class OAuthClientPayload(BaseModel):
             "token_url": self.token_url.strip(),
             "scope": self.scope.strip(),
             "mailbox": self.mailbox.strip(),
+            "lookback": self.lookback.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:
