@@ -20,12 +20,14 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
+from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
 
 # url -> factory(oauth, server_key) -> AbstractToolset
 _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_GMAIL_URL: gmail_toolset,
     BUILTIN_OUTLOOK_URL: outlook_toolset,
+    BUILTIN_JIRA_URL: jira_toolset,
 }
 
 BUILTIN_URLS = frozenset(_FACTORIES)
@@ -41,9 +43,10 @@ def build_builtin_toolset(
 ):
     """The toolset for a ``builtin:`` URL.
 
-    ``auth_mode`` decides who the tools act as: ``client_credentials`` means the
-    application itself, anything else means the signed-in user. It is optional
-    so existing callers keep the per-user behaviour they already had.
+    ``auth_mode`` decides who the tools act as: ``app_only`` means the
+    application itself, ``destination`` means whatever credential the BTP
+    destination holds, and anything else means the signed-in user. It is
+    optional so existing callers keep the per-user behaviour they already had.
     """
     key = str(url).strip().lower()
     factory = _FACTORIES.get(key)
