@@ -8,7 +8,7 @@
  */
 
 /** MCP transport auth. Mirrors VALID_AUTH_MODES in agents/db.py. */
-export type AuthMode = "jwt" | "none" | "oauth2";
+export type AuthMode = "jwt" | "none" | "oauth2" | "client_credentials";
 
 /**
  * OAuth2 client config for an `auth_mode: "oauth2"` server.
@@ -31,6 +31,18 @@ export type OAuthClient =
           scope?: string;
           /** Read-only echo from the server; ignored on input. */
           has_client_secret?: boolean;
+          /**
+           * `client_credentials` only. An app-only token identifies no user,
+           * so the target mailbox cannot be inferred and must be named.
+           */
+          mailbox?: string;
+          /**
+           * `client_credentials` only. Whether the agent gets a send tool.
+           * Deliberately separate from what the token permits: a tenant that
+           * granted Mail.Send must not thereby hand every agent the ability to
+           * send mail. See agents/outlook_tools.py.
+           */
+          allow_send?: boolean;
       };
 
 export interface McpServer {

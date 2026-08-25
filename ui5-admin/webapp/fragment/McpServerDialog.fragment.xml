@@ -24,6 +24,7 @@
                 <core:Item key="jwt" text="{i18n>authJwt}" />
                 <core:Item key="none" text="{i18n>authNone}" />
                 <core:Item key="oauth2" text="{i18n>authOauth2}" />
+                <core:Item key="client_credentials" text="{i18n>authClientCredentials}" />
             </Select>
 
             <Label text="{i18n>oauthDcr}" visible="{= ${server>/auth_mode} === 'oauth2' }" />
@@ -33,26 +34,26 @@
                 text="{i18n>oauthDcrHint}"
                 visible="{= ${server>/auth_mode} === 'oauth2' }" />
 
-            <Label text="{i18n>clientId}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Label text="{i18n>clientId}" visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
             <Input
                 id="oauthClientId"
                 value="{server>/oauth/client_id}"
-                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+                visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
 
-            <Label text="{i18n>clientSecret}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Label text="{i18n>clientSecret}" visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
             <Input
                 id="oauthClientSecret"
                 type="Password"
                 value="{server>/oauth/client_secret}"
                 placeholder="{server>/secretPlaceholder}"
-                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+                visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
 
-            <Label text="{i18n>uaaUrl}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Label text="{i18n>uaaUrl}" visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
             <Input
                 id="oauthUaaUrl"
                 value="{server>/oauth/uaa_url}"
                 placeholder="{i18n>uaaUrlHint}"
-                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+                visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
 
             <Label text="{i18n>authorizeUrl}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
             <Input
@@ -60,17 +61,32 @@
                 value="{server>/oauth/authorize_url}"
                 visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
 
-            <Label text="{i18n>tokenUrl}" visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+            <Label text="{i18n>tokenUrl}" visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
             <Input
                 id="oauthTokenUrl"
                 value="{server>/oauth/token_url}"
-                visible="{= ${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr} }" />
+                visible="{= (${server>/auth_mode} === 'oauth2' &amp;&amp; !${server>/oauth/dcr}) || ${server>/auth_mode} === 'client_credentials' }" />
 
-            <Label text="{i18n>oauthScope}" visible="{= ${server>/auth_mode} === 'oauth2' }" />
+            <Label text="{i18n>oauthScope}" visible="{= ${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'client_credentials' }" />
             <Input
                 id="oauthScope"
                 value="{server>/oauth/scope}"
-                visible="{= ${server>/auth_mode} === 'oauth2' }" />
+                placeholder="{server>/scopeHint}"
+                visible="{= ${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'client_credentials' }" />
+
+            <Label text="{i18n>mailbox}" required="true" visible="{= ${server>/auth_mode} === 'client_credentials' }" />
+            <Input
+                id="oauthMailbox"
+                value="{server>/oauth/mailbox}"
+                placeholder="{i18n>mailboxHint}"
+                visible="{= ${server>/auth_mode} === 'client_credentials' }" />
+
+            <Label text="{i18n>allowSend}" visible="{= ${server>/auth_mode} === 'client_credentials' }" />
+            <CheckBox
+                id="oauthAllowSend"
+                selected="{server>/oauth/allow_send}"
+                text="{i18n>allowSendHint}"
+                visible="{= ${server>/auth_mode} === 'client_credentials' }" />
 
         </f:SimpleForm>
         <beginButton>
