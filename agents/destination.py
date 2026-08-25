@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 import httpx
@@ -59,7 +59,9 @@ class DestinationServiceConfig:
     """Credentials for the destination service itself, not for the target."""
 
     client_id: str
-    client_secret: str
+    # Kept out of repr(): a config that reaches a log line through
+    # logger.exception or a traceback frame must not print the secret.
+    client_secret: str = field(repr=False)
     token_url: str
     api_url: str
 
@@ -87,6 +89,15 @@ def _config_from_vcap(raw: str | None) -> DestinationServiceConfig | None:
         # fallback: locally it is sometimes set to something hand-edited and
         # half-finished, or to valid JSON that isn't the object we expect.
         logger.warning("Could not parse VCAP_SERVICES for destination", exc_info=True)
+        return None
+    if not isinstance(destinations, list):
+        # Same defence as the except above, for the other half of the shape:
+        # {"destination": "oops"} would iterate the string's characters and
+        # raise an AttributeError nothing catches. Any unusable shape falls
+        # through to the environment fallback.
+        logger.warning(
+            "VCAP_SERVICES 'destination' is not a list; ignoring the binding"
+        )
         return None
     for entry in destinations:
         creds = (entry or {}).get("credentials") or {}
@@ -256,24 +267,34 @@ class DestinationResolver:
         headers: dict[str, str] = {}
         lifetime = DEFAULT_LIFETIME_SECONDS
         tokens = (payload or {}).get("authTokens") or []
-        if tokens:
-            token = tokens[0] or {}
-            if token.get("error"):
-                raise DestinationError(
-                    f"destination {self.name!r} could not obtain a token from the "
-                    f"target: {token['error']}"
-                )
-            header = token.get("http_header") or {}
-            key = str(header.get("key") or "").strip()
-            value = str(header.get("value") or "").strip()
-            if key and value:
-                headers[key] = value
-            elif token.get("type") and token.get("value"):
-                headers["Authorization"] = f"{token['type']} {token['value']}"
-            try:
-                lifetime = int(float(token.get("expires_in")))
-            except (TypeError, ValueError):
-                lifetime = DEFAULT_LIFETIME_SECONDS
+        if not tokens:
+            # A destination created with NoAuthentication resolves perfectly
+            # well and hands back no credential at all. Saying so here beats
+            # the bare 401-after-one-retry the caller would otherwise report,
+            # which points at the target rather than at the destination.
+            raise DestinationError(
+                f"destination {self.name!r} returned no authentication token; "
+                f"check its Authentication type in the subaccount -- this "
+                f"integration needs OAuth2ClientCredentials, and a destination "
+                f"set to NoAuthentication carries no credential to send"
+            )
+        token = tokens[0] or {}
+        if token.get("error"):
+            raise DestinationError(
+                f"destination {self.name!r} could not obtain a token from the "
+                f"target: {token['error']}"
+            )
+        header = token.get("http_header") or {}
+        key = str(header.get("key") or "").strip()
+        value = str(header.get("value") or "").strip()
+        if key and value:
+            headers[key] = value
+        elif token.get("type") and token.get("value"):
+            headers["Authorization"] = f"{token['type']} {token['value']}"
+        try:
+            lifetime = int(float(token.get("expires_in")))
+        except (TypeError, ValueError):
+            lifetime = DEFAULT_LIFETIME_SECONDS
 
         deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
         return Destination(url=url, headers=headers, expires_at=deadline)
