@@ -12,7 +12,7 @@ import type { AuthMode, McpServer, OAuthClient } from "../service/types";
  */
 
 /** Closed set; an unknown `builtin:` value is a typo, not an extension point. */
-const BUILTIN_URLS = ["builtin:gmail", "builtin:outlook"] as const;
+const BUILTIN_URLS = ["builtin:gmail", "builtin:outlook", "builtin:jira"] as const;
 
 export default {
 
@@ -60,6 +60,26 @@ export default {
             if (isBuiltin && !(app.mailbox || "").trim()) {
                 return "App-only auth requires a mailbox: the token identifies no "
                     + "user, so there is no 'me' to fall back to.";
+            }
+            return "";
+        }
+        if (authMode === "destination") {
+            if (!oauth) {
+                return "A destination server requires a destination name.";
+            }
+            if ("dcr" in oauth && oauth.dcr === true) {
+                return "A destination server cannot use dynamic registration: the "
+                    + "destination already holds the target's credential.";
+            }
+            const dest = oauth as Exclude<OAuthClient, { dcr: true }>;
+            if (!(dest.destination || "").trim()) {
+                return "A destination server requires a destination name: it names "
+                    + "the BTP destination holding the target's URL and credential.";
+            }
+            if ((dest.client_id || "").trim() || (dest.client_secret || "").trim()) {
+                return "A destination server stores no credential of its own. Keep "
+                    + "the secret in the destination, where it can be rotated "
+                    + "without touching this app.";
             }
             return "";
         }

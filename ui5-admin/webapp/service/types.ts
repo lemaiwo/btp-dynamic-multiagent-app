@@ -8,7 +8,7 @@
  */
 
 /** MCP transport auth. Mirrors VALID_AUTH_MODES in agents/db.py. */
-export type AuthMode = "jwt" | "none" | "oauth2" | "app_only";
+export type AuthMode = "jwt" | "none" | "oauth2" | "app_only" | "destination";
 
 /**
  * OAuth2 client config for an `auth_mode: "oauth2"` server.
@@ -22,7 +22,11 @@ export type OAuthClient =
     | { dcr: true; scope?: string }
     | {
           dcr?: false;
-          client_id: string;
+          /**
+           * Required for `oauth2`/`app_only`; validated at runtime rather than
+           * by the type, because `destination` mode carries none at all.
+           */
+          client_id?: string;
           /** Blank on edit means "keep the stored secret". */
           client_secret?: string;
           uaa_url?: string;
@@ -49,6 +53,22 @@ export type OAuthClient =
            * widen, so a busy Inbox does not hand it years of backlog.
            */
           lookback?: string;
+          /**
+           * `destination` only. Names the BTP destination that holds the
+           * target's URL and credential. This mode stores no credential at
+           * all: rotation happens in the destination, not here.
+           */
+          destination?: string;
+          /** `destination` only. Jira project key the listing is pinned to. */
+          project?: string;
+          /** `destination` only. Issue status the listing is pinned to. */
+          status?: string;
+          /**
+           * `destination` only. Whether the agent gets a comment tool.
+           * Separate from what the destination's credential permits, for the
+           * same reason `allow_send` is.
+           */
+          allow_comment?: boolean;
       };
 
 export interface McpServer {
