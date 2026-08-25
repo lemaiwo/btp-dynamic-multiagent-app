@@ -7,7 +7,7 @@
     "start": "ui5 serve --config ui5-local.yaml --open index.html",
     "build:ui5": "ui5 build --config ui5.yaml --clean-dest --dest dist && node -e \"require('fs').copyFileSync('xs-app.json','dist/xs-app.json')\"",
     "ts:check": "tsc --noEmit",
-    "test": "karma start karma.conf.js --single-run",
+    "test": "npm run ts:check && karma start karma.conf.js --single-run",
     "test:watch": "karma start karma.conf.js",
     "test:e2e": "playwright test"
   },

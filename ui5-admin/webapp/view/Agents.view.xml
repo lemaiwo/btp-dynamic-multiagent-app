@@ -45,6 +45,7 @@
                                     icon="sap-icon://play"
                                     type="Transparent"
                                     tooltip="{i18n>runNow}"
+                                    visible="{agents>expose_api}"
                                     press=".onRunNow" />
                                 <Button
                                     icon="sap-icon://delete"

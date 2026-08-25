@@ -32,16 +32,11 @@
       "scope": "$XSAPPNAME.a2a"
     },
     {
-      "source": "^/ui5admin$",
-      "target": "/ui5admin/",
-      "authenticationType": "none",
-      "csrfProtection": false
-    },
-    {
-      "source": "^/ui5admin/(.*)$",
+      "source": "^/ui5admin/?(.*)$",
       "target": "/cominfrabelagentadmin/$1",
       "service": "html5-apps-repo-rt",
       "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.admin",
       "csrfProtection": false
     },
     {

@@ -19,7 +19,14 @@ export default defineConfig({
             // backslashes here even though the rest of the repo uses "/".
             command: "..\\.venv\\Scripts\\python.exe ..\\app.py",
             url: "http://127.0.0.1:7932/healthz",
-            reuseExistingServer: true,
+            // Deliberately false (unlike the UI entry below): if a dev
+            // backend from `python app.py` at the repo root is already
+            // listening on this port, reusing it would point the suite at
+            // the real `agents_registry.db` instead of the isolated
+            // `_e2e_registry.db` below. false makes Playwright fail loudly
+            // ("port already in use") instead of silently writing into the
+            // developer's real database.
+            reuseExistingServer: false,
             timeout: 60_000,
             env: {
                 DATABASE_URL: "sqlite+aiosqlite:///./_e2e_registry.db",

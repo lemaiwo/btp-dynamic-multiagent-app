@@ -1,6 +1,7 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
 import BaseController from "./BaseController";
 import ReportRenderer from "../service/ReportRenderer";
+import ErrorHandler from "../service/ErrorHandler";
 import formatter from "../model/formatter";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type HTML from "sap/ui/core/HTML";
@@ -39,9 +40,14 @@ export default class RunDetail extends BaseController {
         if (!bodyMd) {
             return;
         }
-        await ReportRenderer.ensureLibraries();
-        model.setProperty("/reportHtml", `<div class="agentAdminReport">${ReportRenderer.renderMarkdown(bodyMd)}</div>`);
-        model.setProperty("/hasReport", true);
+        try {
+            await ReportRenderer.ensureLibraries();
+            model.setProperty("/reportHtml", `<div class="agentAdminReport">${ReportRenderer.renderMarkdown(bodyMd)}</div>`);
+            model.setProperty("/hasReport", true);
+        } catch (error) {
+            ErrorHandler.handle(error, "Could not render the run report.");
+            return;
+        }
 
         // Diagrams are replaced after the HTML control has rendered, so the
         // fences exist in the DOM to be swapped.
