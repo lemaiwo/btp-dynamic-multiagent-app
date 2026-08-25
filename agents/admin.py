@@ -42,6 +42,7 @@ from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
     AUTH_MODE_APP_ONLY,
+    AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
     OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
@@ -103,13 +104,23 @@ class OAuthClientPayload(BaseModel):
     # How far back a mail listing may reach: "90m", "5h", "2d", "1w", or a bare
     # number of hours. A ceiling, not a default the agent can widen.
     lookback: str = Field(default="", max_length=16)
+    # destination only. `destination` names the BTP destination holding the
+    # target's URL and credential -- there is nothing else to store, which is
+    # the point of this mode. `allow_comment` is a capability switch kept
+    # separate from what that credential permits, for the same reason
+    # `allow_send` is: a credential that can write must not thereby hand every
+    # agent the ability to write.
+    destination: str = Field(default="", max_length=256)
+    project: str = Field(default="", max_length=64)
+    status: str = Field(default="", max_length=64)
+    allow_comment: bool = False
 
     @field_validator("lookback")
     @classmethod
     def _validate_lookback(cls, v: str) -> str:
         # Parsed here so a typo is a 422 naming the field, rather than a Graph
         # 400 surfacing mid-run with no hint where it came from.
-        from agents.outlook_tools import parse_lookback
+        from agents.lookback import parse_lookback
 
         parse_lookback(v)
         return (v or "").strip()
@@ -129,10 +140,15 @@ class OAuthClientPayload(BaseModel):
             "scope": self.scope.strip(),
             "mailbox": self.mailbox.strip(),
             "lookback": self.lookback.strip(),
+            "destination": self.destination.strip(),
+            "project": self.project.strip(),
+            "status": self.status.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:
             config["allow_send"] = True
+        if self.allow_comment:
+            config["allow_comment"] = True
         return config
 
 
@@ -189,6 +205,26 @@ class McpServerPayload(BaseModel):
                     f"{self.url} with auth_mode=client_credentials requires "
                     "oauth.mailbox: an app-only token identifies no user, so the "
                     "target mailbox has to be named"
+                )
+        elif self.auth_mode == AUTH_MODE_DESTINATION:
+            cfg = self.oauth.to_config() if self.oauth else {}
+            if cfg.get("dcr"):
+                raise ValueError(
+                    "a destination server cannot use DCR: the destination "
+                    "already holds the target's credential, so there is nothing "
+                    "to register"
+                )
+            if not cfg.get("destination"):
+                raise ValueError(
+                    "destination server requires oauth.destination: the name of "
+                    "the BTP destination holding the target's URL and credential"
+                )
+            if cfg.get("client_id") or cfg.get("client_secret"):
+                raise ValueError(
+                    "a destination server stores no credential of its own; "
+                    "remove oauth.client_id and oauth.client_secret and keep the "
+                    "secret in the destination, where it can be rotated without "
+                    "touching this app"
                 )
         elif self.oauth is not None and self.oauth.to_config():
             raise ValueError(
@@ -565,17 +601,18 @@ async def api_agent_credentials(
                         "Could not read token status for %s on %s",
                         who, server_key, exc_info=True,
                     )
-        # An app-only server needs no user token, and reporting has_token=False
-        # for it would render as "not connected" forever with no way to fix it.
-        # It is connected by configuration, not by anyone signing in.
-        app_only = auth_mode == AUTH_MODE_APP_ONLY
+        # An app-only or destination-backed server needs no user token, and
+        # reporting has_token=False for it would render as "not connected"
+        # forever with no way to fix it. It is connected by configuration, not
+        # by anyone signing in.
+        no_user_token = auth_mode in (AUTH_MODE_APP_ONLY, AUTH_MODE_DESTINATION)
         out.append({
             "url": url,
             "auth_mode": auth_mode,
             "needs_token": needs_token,
-            "has_token": has_token or app_only,
+            "has_token": has_token or no_user_token,
             "login_url": login_url,
-            "app_only": app_only,
+            "app_only": no_user_token,
         })
     return out
 
