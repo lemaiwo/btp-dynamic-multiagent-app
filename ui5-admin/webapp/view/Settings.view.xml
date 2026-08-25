@@ -25,18 +25,21 @@
             </Panel>
 
             <Panel headerText="{i18n>orchestratorInstructions}" expandable="false" class="sapUiSmallMarginTop">
-                <TextArea
-                    id="orchestratorInstructions"
-                    value="{settings>/orchestrator/instructions}"
-                    rows="14"
-                    growing="false"
-                    width="100%" />
-                <Button
-                    id="saveOrchestratorButton"
-                    text="{i18n>saveInstructions}"
-                    type="Emphasized"
-                    press=".onSaveOrchestrator"
-                    class="sapUiSmallMarginTop" />
+                <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                    <Label text="{i18n>orchestratorInstructions}" labelFor="orchestratorInstructions" />
+                    <TextArea
+                        id="orchestratorInstructions"
+                        value="{settings>/orchestrator/instructions}"
+                        rows="14"
+                        growing="false"
+                        width="100%" />
+                    <Label text="" />
+                    <Button
+                        id="saveOrchestratorButton"
+                        text="{i18n>saveInstructions}"
+                        type="Emphasized"
+                        press=".onSaveOrchestrator" />
+                </f:SimpleForm>
             </Panel>
 
             <Panel headerText="{i18n>lifecycle}" expandable="false" class="sapUiSmallMarginTop">
