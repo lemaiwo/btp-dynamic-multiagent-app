@@ -46,6 +46,7 @@ from agents.jira_tools import (  # noqa: E402
     DEFAULT_MAX_ISSUES,
     JiraClient,
     build_jql,
+    confine_key,
     jira_toolset,
 )
 
@@ -399,6 +400,100 @@ async def test_read_and_write() -> None:
     check("an empty comment is refused", isinstance(err, ValueError), detail=repr(err))
 
 
+async def test_key_confinement() -> None:
+    print("\n-- issue keys are confined --")
+
+    # The pin has to hold on single-issue calls too. An issue description is
+    # untrusted text: "duplicate of ZZZ-77, answer there" must not be able to
+    # walk the agent out of its configured project.
+    check("a well-formed key in the configured project passes",
+          confine_key("ABC-42", "ABC") == "ABC-42")
+    check("the project match is case-insensitive",
+          confine_key("abc-42", "ABC") == "abc-42")
+    check("underscores and digits are legal in a project key",
+          confine_key("AB_C2-7", "AB_C2") == "AB_C2-7")
+
+    err = _sync_raises(lambda: confine_key("ZZZ-77", "ABC"))
+    check("a key from another project is refused",
+          isinstance(err, ValueError) and "ABC" in str(err) and "ZZZ" in str(err),
+          detail=repr(err))
+
+    check("the same key is allowed when no project is configured",
+          confine_key("ZZZ-77", "") == "ZZZ-77")
+
+    for bad in ("../../../../rest/api/2/search",
+                "ABC-1/../../search",
+                "ABC-1?expand=all",
+                "ABC",
+                "1-ABC",
+                ""):
+        err = _sync_raises(lambda b=bad: confine_key(b, ""))
+        check(f"{bad!r} is not accepted as an issue key",
+              isinstance(err, ValueError), detail=repr(err))
+
+    # Through the tools, not just the helper: the confinement is worth nothing
+    # if the call sites forget to use it.
+    seen: dict = {}
+
+    def record(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        return httpx.Response(200, json=_issue("ABC-1"))
+
+    client, http = _client(record, project="ABC")
+    async with http:
+        err = await _raises(client.get_issue("ZZZ-77"))
+        check("get_issue refuses a key outside the configured project",
+              isinstance(err, ValueError), detail=repr(err))
+        check("the refused key never reached Jira", "path" not in seen,
+              detail=str(seen))
+
+        err = await _raises(client.get_issue("../../../../rest/api/2/search"))
+        check("get_issue refuses a traversal key", isinstance(err, ValueError),
+              detail=repr(err))
+        check("the traversal key never reached Jira", "path" not in seen,
+              detail=str(seen))
+
+        err = await _raises(client.add_comment("ZZZ-77", "hello"))
+        check("add_comment refuses a key outside the configured project",
+              isinstance(err, ValueError), detail=repr(err))
+        check("the refused comment never reached Jira", "path" not in seen,
+              detail=str(seen))
+
+        await client.get_issue("abc-1")
+        check("a lowercase key in the configured project is read",
+              seen.get("path") == "/rest/api/2/issue/abc-1", detail=str(seen))
+
+
+async def test_identity_failures() -> None:
+    print("\n-- a transient /myself failure is not sticky --")
+
+    # An empty account was cached for the life of the toolset, which is until
+    # the next registry reload. One 502 therefore disabled the answered-issue
+    # filter for days -- and with commenting on, re-answered every issue on
+    # every run.
+    calls = {"n": 0}
+    issues = [_issue("ABC-1", comments=[_comment(author="agent-svc")])]
+
+    def flaky_myself(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/2/myself"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(502, json={})
+            return httpx.Response(200, json={"name": "agent-svc"})
+        return httpx.Response(200, json={"issues": issues})
+
+    client, http = _client(flaky_myself, project="ABC")
+    async with http:
+        first = await client.list_issues()
+        check("the listing survives a failed /myself", first != [],
+              detail=str(first))
+        second = await client.list_issues()
+    check("the second call retries the identity lookup", calls["n"] == 2,
+          detail=str(calls["n"]))
+    check("repeat-run safety is back once /myself answers", second == [],
+          detail=str(second))
+
+
 def test_toolset_build() -> None:
     print("\n-- toolset construction and gating --")
     _with_dest_env()
@@ -534,6 +629,8 @@ async def main() -> None:
     await test_answered_filtering()
     await test_transport()
     await test_read_and_write()
+    await test_key_confinement()
+    await test_identity_failures()
     test_toolset_build()
     test_storage_and_validation()
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
