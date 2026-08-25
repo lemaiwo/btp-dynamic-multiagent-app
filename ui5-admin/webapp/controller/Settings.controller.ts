@@ -77,13 +77,23 @@ export default class Settings extends BaseController {
         }
     }
 
+    /**
+     * Reload rebuilds the orchestrator AND every specialist from the database
+     * -- toolsets, auth and all. The toast used to say only "Orchestrator
+     * reloaded", which read as though the agents needed a separate step and
+     * sent at least one operator hunting for a button that does not exist.
+     * Reporting the counts the endpoint already returns makes the scope
+     * self-evident.
+     */
     public async onReload(): Promise<void> {
-        const ok = await this.runOk(
+        const result = await this.run(
             this.getAdminService().reload(),
             "The reload failed."
         );
-        if (ok) {
-            MessageToast.show(this.text("reloadDone"));
+        if (result) {
+            MessageToast.show(this.text("reloadDone", [
+                String(result.agents ?? "?"), String(result.enabled ?? "?")
+            ]));
         }
     }
 

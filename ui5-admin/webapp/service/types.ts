@@ -166,3 +166,12 @@ export interface ImportPayload {
     /** If true, delete agents/skills absent from the import. */
     replace: boolean;
 }
+
+/** POST /admin/api/reload. `agents` is the total; `enabled` the subset the
+ * orchestrator can delegate to. Reload rebuilds all of them, not just the
+ * orchestrator. */
+export interface ReloadResult {
+    status: string;
+    agents: number;
+    enabled: number;
+}

@@ -82,10 +82,12 @@ export default abstract class BaseController extends Controller {
      * cast expresses just the shape used here without pulling in the
      * `ResourceModel` type.
      */
-    protected text(key: string): string {
+    protected text(key: string, args?: (string | number)[]): string {
         const model = this.getOwnerComponentTyped().getModel("i18n") as unknown as {
-            getResourceBundle(): { getText(k: string): string };
+            getResourceBundle(): {
+                getText(k: string, a?: (string | number)[]): string;
+            };
         };
-        return model.getResourceBundle().getText(key);
+        return model.getResourceBundle().getText(key, args);
     }
 }
