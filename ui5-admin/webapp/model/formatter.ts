@@ -7,7 +7,10 @@ const STATUS_STATES: Record<string, ValueState> = {
     success: ValueState.Success,
     failed: ValueState.Error,
     interrupted: ValueState.Warning,
-    running: ValueState.Information
+    running: ValueState.Information,
+    // Legacy: no current code writes it, but stored rows still carry it —
+    // it meant "finished, but something needs attention", so Warning.
+    degraded: ValueState.Warning
 };
 
 export default {

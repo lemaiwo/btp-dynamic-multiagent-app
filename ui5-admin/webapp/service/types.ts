@@ -78,7 +78,22 @@ export interface Skill extends SkillInput {
     updated_at: string | null;
 }
 
-export type RunStatus = "running" | "success" | "failed" | "interrupted";
+/**
+ * Run statuses.
+ *
+ * The first four are what `agents/job_runner.py` and `agents/db.py` assign
+ * today. `"degraded"` is a LEGACY value: it is written by no current code
+ * path, but rows carrying it still exist — half the runs in the deployed
+ * acceptance database have it, left over from the superseded checklist-report
+ * design. Grepping the writer is not enough; superseding the writer does not
+ * rewrite history. Do not remove it without checking stored data.
+ */
+export type RunStatus =
+    | "running"
+    | "success"
+    | "failed"
+    | "interrupted"
+    | "degraded";
 
 export interface JobRun {
     id: string;
