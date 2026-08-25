@@ -53,6 +53,12 @@ try:
 except ImportError:  # pragma: no cover - the script may run outside the venv
     sys.exit("httpx is required:  pip install httpx   (or use .venv's python)")
 
+# The probe blocks for up to five minutes waiting on a browser sign-in. Piped
+# to anything other than a terminal, Python's block buffering would hold the
+# sign-in URL until the process exits -- so if the browser fails to open, the
+# one line telling you where to go by hand arrives after it is too late.
+sys.stdout.reconfigure(line_buffering=True)
+
 GRAPH = "https://graph.microsoft.com/v1.0"
 SCOPE = "https://graph.microsoft.com/Mail.ReadWrite offline_access"
 
@@ -137,6 +143,7 @@ class Config:
     secret: str
     folder: str
     port: int
+    mailbox: str = ""
 
 
 class ConfigError(Exception):
@@ -210,6 +217,7 @@ def resolve_config(args: argparse.Namespace, environ: dict[str, str]) -> Config:
         secret=picked["OUTLOOK_CLIENT_SECRET"].strip(),
         folder=(args.folder or merged.get("OUTLOOK_FOLDER") or DEFAULT_FOLDER).strip(),
         port=args.port,
+        mailbox=(getattr(args, "mailbox", "") or merged.get("OUTLOOK_MAILBOX", "")).strip(),
     )
 
 
@@ -221,6 +229,111 @@ def _fingerprint(secret: str) -> str:
     whose output the user reads, so nothing here may echo the credential.
     """
     return hashlib.sha256(secret.encode()).hexdigest()[:8]
+
+
+def _token_roles(access_token: str) -> list[str]:
+    """The ``roles`` claim of an app-only token, without validating it.
+
+    Read-only diagnostics: the token was just handed to us by Entra over TLS,
+    and we are reporting what it says about itself, not trusting it to
+    authorize anything. It is the fastest way to see which *application*
+    permissions were actually consented to -- Entra issues a token whether or
+    not any were, and the difference only shows up as a 403 several calls
+    later.
+    """
+    try:
+        payload = access_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # base64url needs its padding back
+        import json
+        return list(json.loads(base64.urlsafe_b64decode(payload)).get("roles") or [])
+    except Exception:
+        return []
+
+
+def probe_app_only(cfg: Config) -> int:
+    """Client-credentials probe: does this app registration hold app-only rights?
+
+    No browser and no user, which is the entire point -- it answers whether the
+    agent could run against a mailbox nobody signs into. Distinct from the
+    delegated probe in every respect that matters: the grant is
+    ``client_credentials``, the scope is ``.default`` (Entra rejects per-scope
+    requests here), and Graph has no ``/me`` because there is no user, so every
+    path is ``/users/{mailbox}``.
+    """
+    base = f"https://login.microsoftonline.com/{cfg.tenant}/oauth2/v2.0"
+    print("App-only  requesting a client-credentials token (no sign-in needed)...")
+
+    tok = httpx.post(f"{base}/token", data={
+        "grant_type": "client_credentials",
+        "client_id": cfg.client,
+        "client_secret": cfg.secret,
+        "scope": "https://graph.microsoft.com/.default",
+    }, timeout=30)
+    payload = tok.json()
+    if tok.status_code != 200:
+        print(f"FAIL  token request returned {tok.status_code}")
+        print("     ", _explain(payload.get("error", ""),
+                                payload.get("error_description", "")))
+        if payload.get("error") == "invalid_client":
+            print("      The client id or secret is wrong, or the secret has expired.")
+        return 1
+    print("PASS  the app registration can get an app-only token")
+
+    roles = _token_roles(payload.get("access_token", ""))
+    if not roles:
+        print("FAIL  the token carries no application permissions (no 'roles' claim).")
+        print("      The registration has DELEGATED permissions only. App-only access")
+        print("      needs Application permissions plus admin consent -- both are")
+        print("      granted by an Entra admin and neither can be self-served.")
+        return 1
+
+    print(f"      application permissions granted: {', '.join(sorted(roles))}")
+    mail_roles = [r for r in roles if r.startswith("Mail.")]
+    if not mail_roles:
+        print("FAIL  none of them are Mail.* -- the app cannot touch a mailbox.")
+        return 1
+    if any(r in {"Mail.Send", "Mail.ReadWrite"} for r in roles) and "Mail.Send" in roles:
+        print("NOTE  Mail.Send is granted. Nothing in this app sends, but the")
+        print("      permission is broader than the design assumes -- worth removing.")
+
+    if not cfg.mailbox:
+        print("\nNOTE  no OUTLOOK_MAILBOX set, so the mailbox itself was not tested.")
+        print("      Add OUTLOOK_MAILBOX=<address> to .env and re-run to confirm")
+        print("      the app can actually read that mailbox.")
+        return 0
+
+    h = {"Authorization": f"Bearer {payload['access_token']}"}
+    kids = httpx.get(f"{GRAPH}/users/{cfg.mailbox}/mailFolders/inbox/childFolders",
+                     params={"$top": 100}, headers=h, timeout=30)
+    if kids.status_code == 403:
+        print(f"\nFAIL  Graph refused access to {cfg.mailbox} (403).")
+        print("      Usually an Application Access Policy scoping this app to a")
+        print("      different set of mailboxes. That is an Exchange admin fix.")
+        print(f"      {kids.text[:300]}")
+        return 1
+    if kids.status_code == 404:
+        print(f"\nFAIL  no mailbox found for {cfg.mailbox!r} (404).")
+        print("      Check the address, and that it is a real mailbox rather than")
+        print("      a distribution list or an unlicensed account.")
+        return 1
+    if kids.status_code != 200:
+        print(f"\nFAIL  Graph returned {kids.status_code}: {kids.text[:300]}")
+        return 1
+
+    folders = {f.get("displayName"): f.get("id") for f in kids.json().get("value", [])}
+    print(f"\nPASS  can read {cfg.mailbox}")
+    print(f"      Inbox subfolders: {', '.join(sorted(folders)) or '(none)'}")
+
+    if cfg.folder.lower() in WELL_KNOWN:
+        print(f"\nNOTE  {cfg.folder!r} is a well-known Graph folder, not a subfolder.")
+    elif cfg.folder in folders:
+        print(f"\nPASS  folder {cfg.folder!r} found")
+    else:
+        print(f"\nNOTE  folder {cfg.folder!r} does not exist yet -- create it.")
+        print("      Everything else passed; this is not a blocker.")
+
+    print("\nApp-only access works. No user sign-in is needed for this mailbox.")
+    return 0
 
 
 def main() -> int:
@@ -236,6 +349,11 @@ def main() -> int:
                     help="Client secret VALUE, not its id; prefer .env over this flag")
     ap.add_argument("--folder", default="", help=f"Inbox subfolder (default: {DEFAULT_FOLDER})")
     ap.add_argument("--port", type=int, default=7932)
+    ap.add_argument("--app-only", action="store_true",
+                    help="probe client-credentials (app-only) access instead of "
+                         "delegated sign-in; needs no browser and no user")
+    ap.add_argument("--mailbox", default="",
+                    help="target mailbox address, app-only mode (OUTLOOK_MAILBOX)")
     raw_args = ap.parse_args()
 
     try:
@@ -247,7 +365,13 @@ def main() -> int:
     print(f"          tenant {args.tenant}")
     print(f"          client {args.client}")
     print(f"          secret sha256:{_fingerprint(args.secret)} (never printed)")
-    print(f"          folder {args.folder!r}\n")
+    print(f"          folder {args.folder!r}")
+    if args.mailbox:
+        print(f"          mailbox {args.mailbox}")
+    print()
+
+    if raw_args.app_only:
+        return probe_app_only(args)
 
     redirect = f"http://{REDIRECT_HOST}:{args.port}/oauth/callback"
     base = f"https://login.microsoftonline.com/{args.tenant}/oauth2/v2.0"
