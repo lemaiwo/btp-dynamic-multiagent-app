@@ -1,7 +1,7 @@
 _schema-version: "3.1"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.5.0
+version: 2.6.0
 
 parameters:
   enable-parallel-deployments: true
@@ -59,6 +59,7 @@ modules:
       - name: aicore-service
       - name: uaa-service
       - name: agent-registry-db
+      - name: agent-destination
     provides:
       - name: pydantic-agent-api
         properties:
@@ -155,3 +156,9 @@ resources:
     parameters:
       service: html5-apps-repo
       service-plan: app-runtime
+
+  - name: agent-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
