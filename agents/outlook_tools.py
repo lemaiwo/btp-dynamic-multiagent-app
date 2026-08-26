@@ -36,7 +36,9 @@ reaches the outside world under the mailbox owner's name.
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -95,6 +97,34 @@ def _truncate(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars] + _TRUNCATED
+
+
+# One or more blank lines -- a paragraph break rather than a line break.
+_PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n\s*")
+
+
+def _text_to_html(body: str) -> str:
+    """Plain text as minimal HTML, for the ``comment`` of the reply action.
+
+    Graph builds the reply *as HTML* on the JSON path -- the reply API's
+    ``Prefer: outlook.timezone`` note says it "creates [the reply message] in
+    HTML ... based on the request body". A comment carrying ``\\n`` therefore
+    arrives as HTML whitespace: every line break collapses and the whole answer
+    lands as one run-on paragraph.
+
+    Converting here rather than asking the model for HTML keeps the tool's
+    contract plain text, and keeps the escaping on this side -- the model's text
+    is never markup, so a stray ``<`` in a code example cannot become a tag.
+    ``create_reply_draft`` needs none of this: it PATCHes ``contentType: text``,
+    where newlines mean what they say.
+    """
+    escaped = html.escape(body or "", quote=False).strip()
+    if not escaped:
+        return ""
+    paragraphs = [p.strip() for p in _PARAGRAPH_BREAK.split(escaped)]
+    return "".join(
+        "<p>" + p.replace("\n", "<br>") + "</p>" for p in paragraphs if p
+    )
 
 
 class OutlookClient:
@@ -273,9 +303,13 @@ class OutlookClient:
             "sending a reply to message %s as %s -- this leaves the mailbox",
             message_id, self.mailbox or "the signed-in user",
         )
+        # `comment`, not `message.body`: the docs are explicit that sending both
+        # is a 400, and `comment` is the form that keeps Graph's own threading
+        # -- the reply headers and the quoted original -- instead of replacing
+        # the generated body wholesale.
         await self._req(
             "POST", f"{self._root}/messages/{message_id}/reply",
-            json={"comment": body},
+            json={"comment": _text_to_html(body)},
         )
         return {"message_id": message_id, "sent": True}
 

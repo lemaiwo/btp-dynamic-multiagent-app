@@ -317,14 +317,25 @@ already branches on the `builtin:` scheme.
 | `list_pending(limit)` | `GET /me/mailFolders/{id}/messages` |
 | `get_message(id)` | `GET /me/messages/{id}` |
 | `create_reply_draft(id, body)` | `POST /me/messages/{id}/createReply`, then `PATCH` the body |
+| `send_reply(id, body)` | `POST /me/messages/{id}/reply` — only when `allow_send` is set |
 | `move_message(id, folder)` | `POST /me/messages/{id}/move` |
 
-Four tools rather than Gmail's five, and no send tool. `createReply` builds the
-threaded draft itself, so none of the MIME assembly and `In-Reply-To` handling
-in the Gmail version is needed.
+`createReply` builds the threaded draft itself, so none of the MIME assembly and
+`In-Reply-To` handling in the Gmail version is needed. Gmail has no `send_reply`
+counterpart: its toolset registers no send tool at all.
 
 Behaviour worth knowing before writing the run prompt:
 
+- **`send_reply` bodies are converted to HTML before sending.** On the JSON
+  path Graph builds the reply as HTML — the reply API's `Prefer: outlook.timezone`
+  note says it creates the message "in HTML … based on the request body" — so a
+  plain-text `comment` arrives with every newline collapsed as HTML whitespace
+  and the answer reads as one run-on paragraph. `_text_to_html` escapes the
+  model's text and turns blank lines into `<p>` and single newlines into `<br>`.
+  The tool contract stays plain text: the model must not be asked for HTML, both
+  because escaping belongs on this side and because `comment` and
+  `message.body` cannot both be sent (Graph returns 400). `create_reply_draft`
+  needs none of this — it PATCHes `contentType: text`.
 - **`move_message` takes a folder display name**, so where handled mail goes is
   a prompt decision, not a config one: `agent-done` keeps an audit trail,
   `inbox` puts it back. Well-known names (`inbox`, `archive`, `deleteditems`)

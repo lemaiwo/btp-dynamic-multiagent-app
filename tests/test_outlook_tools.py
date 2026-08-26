@@ -8,8 +8,9 @@ The queue is an Inbox subfolder rather than a label: listing the folder is the
 search, and moving a message out of it is what marks the mail handled.
 
 Covered: folder resolution, request shaping, HTML-vs-text body handling, the
-two-step reply draft, move destinations, the absence of any send capability,
-and that both built-ins are dispatched and validated.
+two-step reply draft, the HTML conversion a sent reply needs, move destinations,
+and that both built-ins are dispatched and validated. Whether the send tool is
+registered at all is `tests/test_client_credentials.py`, next to `allow_send`.
 
 No network, no live mailbox, no tenant required.
 
@@ -116,6 +117,9 @@ class Recorder:
             return httpx.Response(200, json=MESSAGES)
         if path.endswith("/messages/msg1/createReply"):
             return httpx.Response(201, json={"id": "draft9", "conversationId": "conv1"})
+        # Graph answers the reply action with 202 Accepted and an empty body.
+        if path.endswith("/messages/msg1/reply"):
+            return httpx.Response(202)
         if path.endswith("/messages/msg1/move"):
             return httpx.Response(201, json={"id": "msg1-moved"})
         if path.endswith("/messages/draft9"):
@@ -223,6 +227,42 @@ async def main() -> None:
     check("carries our text", "Here is the answer." in (sent.get("body") or {}).get("content", ""))
     check("returns the draft id", res.get("draft_id") == "draft9", f"got {res}")
     check("never calls send", not any("send" in p.lower() for p in rec.paths()), f"{rec.paths()}")
+
+    # --- send_reply body formatting -----------------------------------------
+    # Graph builds the reply as HTML -- the reply API's `Prefer: outlook.timezone`
+    # note says the JSON path creates "the reply message in HTML ... based on the
+    # request body". So a plain-text comment arrives with every newline collapsed
+    # as HTML whitespace and the whole answer reads as one run-on paragraph. The
+    # tool converts the breaks before sending rather than asking the model for
+    # HTML, which keeps the tool contract plain text and the escaping ours.
+    print("\n== send_reply body formatting ==")
+    rec = Recorder()
+    await _client(rec).send_reply(
+        "msg1",
+        "Hi Wouter,\n\nStep 1: open the cockpit.\nStep 2: click Edit.\n\nKind regards,\nFinops SAP",
+    )
+    rep = rec.find("/messages/msg1/reply")
+    check("posts to reply", len(rep) == 1, f"{rec.paths()}")
+    payload = rep[0]["body"] if rep else {}
+    comment = payload.get("comment", "")
+    check("keeps single newlines as line breaks", comment.count("<br>") == 2, f"got {comment!r}")
+    check("keeps blank lines as paragraphs", comment.count("<p>") == 3, f"got {comment!r}")
+    check("leaves no raw newline to be collapsed", "\n" not in comment, f"got {comment!r}")
+    # The docs are explicit: sending both is a 400.
+    check("never sends message.body alongside comment", "message" not in payload, f"got {payload}")
+
+    rec = Recorder()
+    await _client(rec).send_reply("msg1", 'Use <ABAP> & "quotes" <b>here</b>')
+    esc = (rec.find("/messages/msg1/reply")[0]["body"] or {}).get("comment", "")
+    check("escapes markup in the model's text",
+          "<ABAP>" not in esc and "&lt;ABAP&gt;" in esc, f"got {esc!r}")
+    check("escapes ampersands", "&amp;" in esc, f"got {esc!r}")
+    check("does not let the model inject tags", "<b>" not in esc, f"got {esc!r}")
+
+    rec = Recorder()
+    await _client(rec).send_reply("msg1", "   ")
+    blank = (rec.find("/messages/msg1/reply")[0]["body"] or {}).get("comment", None)
+    check("an empty body stays an empty comment", blank == "", f"got {blank!r}")
 
     # --- move_message -------------------------------------------------------
     # Moving out of the queue folder is the idempotency step.
