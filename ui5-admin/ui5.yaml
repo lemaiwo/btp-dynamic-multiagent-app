@@ -33,6 +33,16 @@ builder:
         archiveName: ui5-admin-content
         additionalFiles:
           - xs-app.json
+  # `resolve: false` is load-bearing. With `resolve: true` the builder follows
+  # each app module's dependencies and inlines SAPUI5's own modules into
+  # Component-preload.js -- 499 of 517 modules, when this was last measured.
+  # The app then runs framework JS frozen at BUILD time against framework CSS
+  # fetched at SERVE time, and the two drift apart the moment SAPUI5 renames a
+  # CSS class. That is not theoretical: sap.tnt renamed `.sapTntNavLI` to
+  # `.sapTntNL` after 1.120, and the deployed admin's side navigation collapsed
+  # into an unstyled bulleted list. Keep the framework out of the bundle and let
+  # the version-pinned /resources/ route in xs-app.json supply all of it.
+  # Guarded by tests/test_ui5_asset_versioning.mjs.
   bundles:
     - bundleDefinition:
         name: com/infrabel/agentadmin/Component-preload.js
@@ -43,6 +53,6 @@ builder:
               - "com/infrabel/agentadmin/"
               - "!com/infrabel/agentadmin/vendor/mermaid.min.js"
               - "!com/infrabel/agentadmin/test/"
-            resolve: true
+            resolve: false
           - mode: require
             filters: ["ui5loader-autoconfig.js"]

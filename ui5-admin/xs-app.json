@@ -12,7 +12,7 @@
     },
     {
       "source": "^/resources/(.*)$",
-      "target": "/resources/$1",
+      "target": "/1.120.50/resources/$1",
       "destination": "ui5",
       "authenticationType": "none"
     },

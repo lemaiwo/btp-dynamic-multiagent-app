@@ -54,6 +54,29 @@ framework — it ships only the app's own code. Without a route to the
 framework's CDN or repository copy, the deployed app fetches `sap-ui-core.js`,
 gets a 404, and never boots past a blank page.
 
+**Both `/resources` routes pin the same SAPUI5 version, `1.120.50`, and they
+have to.** The unversioned `https://ui5.sap.com/resources/…` path is not a
+stable target: it serves whatever SAPUI5 shipped most recently. Pointing the
+app at it means the framework silently changes under a build that was never
+tested against it — and because these files are served with a multi-day
+`Cache-Control`, a returning browser can end up holding *half* of one version
+and half of another. Two things follow, and both were live defects on
+2026-08-26:
+
+- Keep `resolve: false` in `ui5.yaml`. With `resolve: true` the builder inlines
+  SAPUI5's own modules into `Component-preload.js` (499 of 517 modules), so the
+  app runs framework JS frozen at build time against framework CSS fetched at
+  serve time. sap.tnt renamed `.sapTntNavLI` to `.sapTntNL` after 1.120, so
+  every SideNavigation rule missed and the menu rendered as an unstyled
+  bulleted `<ul>`; sap.m Dialogs clipped their first form row.
+- Keep the two files' pins equal. The approuter serves `/ui5admin/*`, but the
+  HTML5 repository serves `/cominfrabelagentadmin/*` using the app's *own*
+  `xs-app.json`. When only one of them was pinned, the bug reproduced on one
+  URL and not the other.
+
+`tests/test_ui5_asset_versioning.mjs` asserts all of this — run it after
+touching either `xs-app.json` or the `bundles:` block.
+
 ## Known constraints
 
 - Binding `html5-apps-repo` to the approuter means it can never also serve
