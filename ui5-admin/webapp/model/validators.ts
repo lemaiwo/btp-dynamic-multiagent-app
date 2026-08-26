@@ -81,6 +81,18 @@ export default {
                     + "the secret in the destination, where it can be rotated "
                     + "without touching this app.";
             }
+            // Caught here as well as server-side so the dialog says what is
+            // wrong while the field is still on screen. A URL is the mistake
+            // worth naming: it would aim the destination's credential at a
+            // host the destination never mentioned.
+            const apiBase = (dest.api_base || "").trim();
+            if (apiBase && (apiBase.includes("://") || apiBase.startsWith("//"))) {
+                return "The API base path is a path, not a URL: the host comes "
+                    + "from the destination. Try /rest/api/2 or /api/2.";
+            }
+            if (apiBase && !apiBase.startsWith("/")) {
+                return "The API base path must start with '/', e.g. /rest/api/2.";
+            }
             return "";
         }
         if (authMode !== "oauth2") {

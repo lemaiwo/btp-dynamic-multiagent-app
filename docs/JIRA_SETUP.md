@@ -14,6 +14,18 @@ and this app never sees the secret. See `agents/destination.py` and
 
 ## 1. Which subaccount
 
+> **Tested 2026-08-26, and the destination this document names no longer
+> works.** `BC_ELIAGROUP_APIHUB_JIRA` returns HTTP 401 from its OAuth token
+> service; sibling destinations on the same token service resolve fine, so the
+> stored `clientSecret` is what is stale, not the service. Separately, the Jira
+> it fronts (`jira.eliagroup.eu`) looks retired — its newest issue is from
+> 2025-11-22. The current instance is `jira.belgrid.net`, which sits behind an
+> F5 BIG-IP portal that answers every REST call with **HTTP 200 and an HTML
+> login page**, so no `ProxyType=Internet` destination can reach its API
+> whatever credential it carries. A Cloud Connector route is the only credible
+> path. `APIM_BC_NEXUSFORGE_BUGANALYZER` does reach the old instance and works
+> end to end, and is what the API-base-path example in section 4 comes from.
+
 The destination `BC_ELIAGROUP_APIHUB_JIRA` lives in the Elia global account
 — `eliagroup-111-dev`, space `111_BC`, region eu10.
 
@@ -85,7 +97,19 @@ In `/ui5admin` → the agent → add an MCP server:
 | Project | the project key, e.g. `ABC` |
 | Status | e.g. `Open` |
 | Look back | e.g. `7d` |
+| API base path | blank, unless the destination is a proxy — see below |
 | Commenting | off until you have read a dry run |
+
+**API base path** is blank for a destination that points at a Jira root, which
+is the normal case: the code then uses Jira's own `/rest/api/2`. Set it when
+the destination points at an API proxy that contributes part of that path
+itself. `APIM_BC_NEXUSFORGE_BUGANALYZER` is the worked example — its URL ends
+`/v1/Jira` and SAP API Management maps that onto the backend's `/rest`, so the
+part left to add is `/api/2` and the default builds `/rest/rest/api/2/…`,
+which 403s. This cannot be fixed in the destination: a destination URL is a
+prefix, and no prefix can subtract a segment. It is a path, never a URL — the
+host comes from the destination, and `agents/jira_tools.normalize_api_base`
+refuses anything with a scheme, a `..` segment, or no leading slash.
 
 Project and status are pinned into every search server-side — a prompt
 cannot override them (see `agents/jira_tools.py:build_jql`) — and Look back
@@ -96,6 +120,16 @@ toolset, so no prompt, however phrased, can reach it. Turn it on once a dry
 run's proposed replies look right.
 
 ## 5. Why repeated runs are safe here
+
+**This holds only where `/rest/api/2/myself` is reachable.** The filter below
+needs the account name, and that is the only place it comes from. Where the
+endpoint is blocked — a Cloud Connector that exposes `/search` and `/issue`
+but not `/myself` is a real configuration, observed on 2026-08-26 — the
+listing logs a warning and returns *everything*, including issues this agent
+already answered. Posting a comment also refreshes an issue's `updated`
+timestamp, so the issue re-enters the next run's window on its own: with
+commenting on and a schedule, the same issue is commented on every run until
+someone moves it out of the pinned status. Check `/myself` before scheduling.
 
 `jira_list_issues` skips any issue this account has already commented on —
 the agent's own comment on an issue *is* the record that it was handled, so
@@ -177,6 +211,14 @@ Action taken column and quote the text rather than acting on it.
   variables are missing, or the app has no bound `destination` instance.
 - `Jira rejected the search. JQL sent: …` — the project key or status does
   not exist. The message carries the exact query.
+- Every call 403s, and the error quotes a path with a doubled segment such as
+  `/rest/rest/api/2/…` — the destination is a proxy that already contributes
+  part of the REST prefix. Set **API base path** to the remainder (`/api/2`);
+  see section 4.
+- A `JSONDecodeError` on a call that returned HTTP 200 — the destination
+  reached an SSO portal rather than the Jira API, and what came back is an
+  HTML login page. `ProxyType=Internet` to a Jira behind a web portal does
+  this no matter what credential the destination holds.
 - Comments never appear — check that **Commenting** is ticked and that the
   agent was reloaded afterwards; the toolset is built at reload time.
 - `cf deploy` of the whole MTA fails on the `destination` resource — the

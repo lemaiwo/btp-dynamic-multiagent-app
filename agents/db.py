@@ -685,7 +685,7 @@ def _clean_client_credentials(
 
 # A destination server stores no credential: the destination itself holds the
 # target's URL and its secret. `destination` names it; the rest is filtering.
-_DEST_KEYS = ("destination", "project", "status", "lookback")
+_DEST_KEYS = ("destination", "project", "status", "lookback", "api_base")
 
 
 def _clean_destination(oauth: Any) -> dict[str, Any]:

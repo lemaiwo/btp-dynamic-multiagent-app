@@ -48,6 +48,7 @@ from agents.jira_tools import (  # noqa: E402
     build_jql,
     confine_key,
     jira_toolset,
+    normalize_api_base,
 )
 
 PASSED = 0
@@ -267,6 +268,73 @@ async def test_answered_filtering() -> None:
         await client.list_issues()
     check("the account identity is fetched once across calls", calls["n"] == 1,
           detail=str(calls["n"]))
+
+
+def test_api_base() -> None:
+    """The REST prefix is configuration, because a proxy may supply part of it.
+
+    Observed live: a destination fronted by SAP API Management maps its own
+    `/v1/Jira` prefix onto Jira's `/rest`, so the default `/rest/api/2` builds
+    `/rest/rest/api/2/...` and every call 403s. No destination URL can fix that
+    -- a URL is a prefix and cannot subtract a segment -- so the remainder has
+    to be configurable here.
+    """
+    print("\n-- api_base --")
+
+    check("blank falls back to Jira's own prefix",
+          normalize_api_base("") == "/rest/api/2",
+          detail=normalize_api_base(""))
+    check("None falls back too", normalize_api_base(None) == "/rest/api/2")
+    check("a proxy prefix is kept", normalize_api_base("/api/2") == "/api/2")
+    check("surrounding space is trimmed",
+          normalize_api_base("  /api/2  ") == "/api/2")
+    check("a trailing slash is dropped",
+          normalize_api_base("/api/2/") == "/api/2")
+    check("'/' alone is the default, not an empty prefix",
+          normalize_api_base("/") == "/rest/api/2")
+
+    # A URL here would point the destination's credential at a host of the
+    # editor's choosing; a '..' would reach endpoints the toolset does not
+    # expose while carrying it. Both are refusals, not silent normalisation.
+    for bad, why in [
+        ("https://evil.example/rest", "a URL, not a path"),
+        ("//evil.example/rest", "protocol-relative"),
+        ("rest/api/2", "no leading slash"),
+        ("/rest/../../admin", "'..' escape"),
+        ("/rest/api/2?x=1", "query string"),
+        ("/rest/api/2#f", "fragment"),
+    ]:
+        err = _sync_raises(lambda b=bad: normalize_api_base(b))
+        check(f"refused: {why}", isinstance(err, ValueError), detail=repr(err))
+
+
+async def test_api_base_transport() -> None:
+    """The configured prefix is the one that reaches the wire."""
+    print("\n-- api_base on the wire --")
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith("/myself"):
+            return httpx.Response(200, json={"name": "agent-svc"})
+        return httpx.Response(200, json={"issues": []})
+
+    client, http = _client(handler, project="ABC", api_base="/api/2")
+    async with http:
+        await client.list_issues()
+    check("the proxy prefix is used, and not doubled",
+          seen and all(p.startswith("/api/2/") for p in seen)
+          and not any("/rest/rest/" in p for p in seen),
+          detail=str(seen))
+
+    seen.clear()
+    client, http = _client(handler, project="ABC")
+    async with http:
+        await client.get_issue("ABC-1")
+    check("the default is still Jira's own prefix",
+          seen and all(p.startswith("/rest/api/2/") for p in seen),
+          detail=str(seen))
 
 
 async def test_transport() -> None:
@@ -520,6 +588,11 @@ def test_toolset_build() -> None:
     check("a bad lookback fails at build time, not mid-run",
           isinstance(err, ValueError), detail=repr(err))
 
+    err = _sync_raises(
+        lambda: _build({"destination": "X", "api_base": "https://evil.example"}))
+    check("a bad api_base fails at build time too",
+          isinstance(err, ValueError), detail=repr(err))
+
     http = httpx.AsyncClient(transport=httpx.MockTransport(_responder([])))
     toolset = _build({"destination": "BC_ELIAGROUP_APIHUB_JIRA"}, http=http)
     check("the toolset exposes its http client for the registry to close",
@@ -622,6 +695,27 @@ def test_storage_and_validation() -> None:
     check("a bad lookback is a field error, not a 500", err is not None,
           detail=repr(err))
 
+    stored = _clean_oauth(
+        {"destination": "X", "api_base": "/api/2"}, AUTH_MODE_DESTINATION, None)
+    check("api_base round-trips through storage",
+          stored.get("api_base") == "/api/2", detail=str(stored))
+
+    cfg = OAuthClientPayload(destination="X", api_base="/api/2").to_config()
+    check("api_base survives the API payload", cfg.get("api_base") == "/api/2",
+          detail=str(cfg))
+
+    blank = OAuthClientPayload(destination="X").to_config()
+    check("an unset api_base is not stored at all", "api_base" not in blank,
+          detail=str(blank))
+
+    # A URL in this field would aim the destination's credential somewhere the
+    # destination never named, so it has to fail at the boundary rather than
+    # be normalised away deeper in.
+    err = _sync_raises(
+        lambda: OAuthClientPayload(destination="X", api_base="https://evil.example"))
+    check("a URL in api_base is a field error, not a 500", err is not None,
+          detail=repr(err))
+
     # auth_mode and URL have to agree, in both directions. Neither mismatch
     # fails loudly on its own: one forwards the user's JWT to a host the
     # destination was supposed to cover, the other saves cleanly and then
@@ -651,6 +745,8 @@ def test_storage_and_validation() -> None:
 
 async def main() -> None:
     test_jql()
+    test_api_base()
+    await test_api_base_transport()
     await test_filters()
     await test_answered_filtering()
     await test_transport()

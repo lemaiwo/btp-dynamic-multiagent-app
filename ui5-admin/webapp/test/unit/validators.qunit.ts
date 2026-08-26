@@ -91,6 +91,38 @@ QUnit.test("destination mode accepts a name alone", (assert) => {
     );
 });
 
+QUnit.test("destination mode accepts a proxy API base path", (assert) => {
+    assert.strictEqual(
+        validators.validateOAuth(
+            { destination: "BC_ELIAGROUP_APIHUB_JIRA", api_base: "/api/2" },
+            "destination",
+            "builtin:jira"
+        ),
+        ""
+    );
+});
+
+QUnit.test("destination mode refuses a URL as the API base path", (assert) => {
+    // A URL here would send the destination's credential to a host the
+    // destination never named.
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", api_base: "https://evil.example" },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.length > 0, "an error is returned");
+    assert.ok(error.indexOf("path, not a URL") > -1, "the message says why");
+});
+
+QUnit.test("destination mode refuses a relative API base path", (assert) => {
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", api_base: "rest/api/2" },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.indexOf("must start with") > -1, error);
+});
+
 QUnit.test("destination mode refuses credentials", (assert) => {
     const error = validators.validateOAuth(
         { destination: "BC_ELIAGROUP_APIHUB_JIRA", client_id: "x" },

@@ -23,6 +23,8 @@ from agents.lookback import parse_lookback
 logger = logging.getLogger(__name__)
 
 BUILTIN_JIRA_URL = "builtin:jira"
+# Jira's own REST prefix, and the default for `api_base`. Not a constant the
+# code may assume: see `normalize_api_base`.
 JIRA_API = "/rest/api/2"
 
 MAX_ISSUES = 50
@@ -35,6 +37,48 @@ _TRUNCATED = "…[truncated]"
 # must fetch every issue in full to triage a list burns its context on issues
 # it will skip.
 _LIST_FIELDS = ["summary", "status", "reporter", "updated", "description", "comment"]
+
+
+def normalize_api_base(value: Any) -> str:
+    """The REST base path Jira's endpoints hang off, normalised.
+
+    Defaults to Jira's own ``/rest/api/2``, which is right whenever the
+    destination points at a Jira root. It is configurable because a
+    destination does not always do that: an API Management proxy can map its
+    own prefix onto ``/rest`` on the way through, so the part left for this
+    app to contribute is ``/api/2`` and the default would build
+    ``/rest/rest/api/2`` and 403.
+
+    This cannot be fixed in the destination. Its URL is a prefix and the
+    proxy's mapping is fixed, so no URL can *subtract* the extra segment --
+    which is why the value belongs in the server's config block next to
+    ``project`` and ``status``.
+
+    A path, never a URL: the host comes from the destination, and accepting
+    one here would let a config edit redirect the destination's credential at
+    a server of the editor's choosing.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return JIRA_API
+    if "://" in text or text.startswith("//"):
+        raise ValueError(
+            f"invalid api_base {text!r}; it is a path, not a URL -- the host "
+            f"comes from the destination"
+        )
+    if not text.startswith("/"):
+        raise ValueError(f"invalid api_base {text!r}; it must start with '/'")
+    if "?" in text or "#" in text:
+        raise ValueError(
+            f"invalid api_base {text!r}; a query string or fragment does not "
+            f"belong in a base path"
+        )
+    if any(segment == ".." for segment in text.split("/")):
+        raise ValueError(
+            f"invalid api_base {text!r}; '..' would reach endpoints this "
+            f"toolset does not expose, carrying the destination's credential"
+        )
+    return text.rstrip("/") or JIRA_API
 
 
 def _jql_quote(value: str) -> str:
@@ -163,6 +207,11 @@ class JiraClient:
     ``project``, ``status`` and ``lookback_minutes`` are the configured values.
     The first two are pinned: a call cannot override them. The last is a
     ceiling: a call can narrow the window but never widen it.
+
+    ``api_base`` is the REST prefix these endpoints hang off, normally Jira's
+    own ``/rest/api/2``. It is configuration, not a constant, because the
+    destination may be a proxy that contributes part of that path itself --
+    see :func:`normalize_api_base`. No tool argument reaches it.
     """
 
     def __init__(
@@ -172,12 +221,14 @@ class JiraClient:
         project: str = "",
         status: str = "",
         lookback_minutes: int | None = None,
+        api_base: str = "",
     ) -> None:
         self._resolver = resolver
         self._http = http
         self.project = (project or "").strip()
         self.status = (status or "").strip()
         self.lookback_minutes = lookback_minutes
+        self.api_base = normalize_api_base(api_base)
         self._account: str | None = None
 
     def _window(self, requested: int | None) -> int | None:
@@ -198,7 +249,7 @@ class JiraClient:
         destination = await self._resolver.resolve()
         response = await self._http.request(
             method,
-            f"{destination.url}{JIRA_API}{path}",
+            f"{destination.url}{self.api_base}{path}",
             headers=destination.headers,
             **kw,
         )
@@ -207,7 +258,7 @@ class JiraClient:
             destination = await self._resolver.resolve()
             response = await self._http.request(
                 method,
-                f"{destination.url}{JIRA_API}{path}",
+                f"{destination.url}{self.api_base}{path}",
                 headers=destination.headers,
                 **kw,
             )
@@ -361,6 +412,7 @@ def jira_toolset(
     status: str | None = None,
     allow_comment: bool | None = None,
     lookback: str | None = None,
+    api_base: str | None = None,
 ) -> FunctionToolset:
     """The Jira toolset for one agent, ready for ``Agent(toolsets=...)``.
 
@@ -394,6 +446,11 @@ def jira_toolset(
     # Parsed at build time, not per call: a bad window should stop the registry
     # rebuild with a clear message, not surface mid-run as a Jira 400.
     window = parse_lookback(lookback if lookback is not None else oauth.get("lookback"))
+    # Same reasoning as the window: a bad base path should stop the rebuild
+    # here, not surface as a 403 from a proxy that saw a doubled prefix.
+    resolved_api_base = normalize_api_base(
+        api_base if api_base is not None else oauth.get("api_base")
+    )
 
     resolver = build_resolver(resolved_destination)
     session = http or httpx.AsyncClient(timeout=httpx.Timeout(30.0))
@@ -403,6 +460,7 @@ def jira_toolset(
         project=resolved_project,
         status=resolved_status,
         lookback_minutes=window,
+        api_base=resolved_api_base,
     )
     toolset = FunctionToolset()
     # Exposed for `agents.registry`, which closes `http_client` on the old
