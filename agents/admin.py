@@ -115,6 +115,20 @@ class OAuthClientPayload(BaseModel):
     project: str = Field(default="", max_length=64)
     status: str = Field(default="", max_length=64)
     allow_comment: bool = False
+    # The REST prefix under the destination's URL. Blank means Jira's own
+    # `/rest/api/2`; a proxy that already contributes part of that path needs
+    # the remainder here instead. See agents/jira_tools.normalize_api_base.
+    api_base: str = Field(default="", max_length=64)
+
+    @field_validator("api_base")
+    @classmethod
+    def _validate_api_base(cls, v: str) -> str:
+        # Same reason as `lookback` below: a typo should be a 422 naming the
+        # field, not a 403 from a proxy that saw a doubled prefix mid-run.
+        from agents.jira_tools import normalize_api_base
+
+        normalize_api_base(v)
+        return (v or "").strip()
 
     @field_validator("lookback")
     @classmethod
@@ -144,6 +158,7 @@ class OAuthClientPayload(BaseModel):
             "destination": self.destination.strip(),
             "project": self.project.strip(),
             "status": self.status.strip(),
+            "api_base": self.api_base.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:

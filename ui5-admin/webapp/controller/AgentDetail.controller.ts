@@ -127,7 +127,7 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", allow_comment: false },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", allow_comment: false },
             builtins: validators.BUILTIN_URLS.slice(),
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
@@ -218,6 +218,7 @@ export default class AgentDetail extends BaseController {
                 project: String(raw.project ?? "").trim(),
                 status: String(raw.status ?? "").trim(),
                 lookback: String(raw.lookback ?? "").trim(),
+                api_base: String(raw.api_base ?? "").trim(),
                 allow_comment: raw.allow_comment === true
             } as McpServer["oauth"];
         }

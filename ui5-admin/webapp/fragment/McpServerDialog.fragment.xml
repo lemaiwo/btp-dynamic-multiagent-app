@@ -118,6 +118,13 @@
                 placeholder="Open"
                 visible="{= ${server>/auth_mode} === 'destination' }" />
 
+            <Label text="{i18n>jiraApiBase}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Input
+                id="oauthApiBase"
+                value="{server>/oauth/api_base}"
+                placeholder="{i18n>jiraApiBaseHint}"
+                visible="{= ${server>/auth_mode} === 'destination' }" />
+
             <Label text="{i18n>allowComment}" visible="{= ${server>/auth_mode} === 'destination' }" />
             <CheckBox
                 id="oauthAllowComment"

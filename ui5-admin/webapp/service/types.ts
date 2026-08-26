@@ -64,6 +64,14 @@ export type OAuthClient =
           /** `destination` only. Issue status the listing is pinned to. */
           status?: string;
           /**
+           * `destination` only. REST prefix appended to the destination's URL,
+           * defaulting to Jira's own `/rest/api/2`. Configurable because a
+           * destination fronted by an API proxy may contribute part of that
+           * path itself, where the default would double the `/rest` segment.
+           * A path, never a URL — the host comes from the destination.
+           */
+          api_base?: string;
+          /**
            * `destination` only. Whether the agent gets a comment tool.
            * Separate from what the destination's credential permits, for the
            * same reason `allow_send` is.
