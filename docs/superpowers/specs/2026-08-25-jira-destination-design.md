@@ -231,9 +231,17 @@ description truncated to a bounded length.
 **Already-answered issues are filtered out.** The `comment` field arrives in
 the same response, so any issue already carrying a comment authored by this
 service account (from `whoami()`, cached for the client's lifetime) is dropped
-before returning. This is the idempotency marker the Outlook integration had
-no way to write: a repeated run does not re-comment. Default on; it is
+before returning, so a repeated run does not re-comment. Default on; it is
 behaviour, not a config flag.
+
+What makes it reliable is that answering and recording are the *same call*:
+the comment the agent posts is the marker the next run reads. The Outlook
+agent draws the line differently — `create_reply_draft` and `move_message`
+are two separate tool calls, so its record depends on the model remembering
+the second one. (Separately, the tenant this app currently targets grants
+`Mail.Read` + `Mail.Send` rather than `Mail.ReadWrite`, so `move_message` is
+unavailable *in that deployment* — a property of the grant, not of the
+toolset.)
 
 ### `get_issue(key)`
 

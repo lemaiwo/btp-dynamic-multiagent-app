@@ -26,6 +26,10 @@ QUnit.test("a blank url is rejected", function (assert) {
     assert.notStrictEqual(validators.validateServerUrl("   ", "jwt"), "");
 });
 
+QUnit.test("builtin:jira is a known toolset URL", (assert) => {
+    assert.strictEqual(validators.validateServerUrl("builtin:jira", "destination"), "");
+});
+
 QUnit.module("validators.validateOAuth");
 
 QUnit.test("dcr needs no manual credentials", function (assert) {
@@ -65,6 +69,73 @@ QUnit.test("oauth config on a non-oauth2 server is rejected", function (assert) 
 
 QUnit.test("no oauth config on a non-oauth2 server is fine", function (assert) {
     assert.strictEqual(validators.validateOAuth(undefined, "jwt"), "");
+});
+
+QUnit.test("destination mode requires a destination name", (assert) => {
+    const error = validators.validateOAuth({ project: "ABC" }, "destination", "builtin:jira");
+    assert.ok(error.length > 0, "an error is returned");
+    assert.ok(
+        error.toLowerCase().indexOf("destination") > -1,
+        "the message names the missing field"
+    );
+});
+
+QUnit.test("destination mode accepts a name alone", (assert) => {
+    assert.strictEqual(
+        validators.validateOAuth(
+            { destination: "BC_ELIAGROUP_APIHUB_JIRA" },
+            "destination",
+            "builtin:jira"
+        ),
+        ""
+    );
+});
+
+QUnit.test("destination mode accepts a proxy API base path", (assert) => {
+    assert.strictEqual(
+        validators.validateOAuth(
+            { destination: "BC_ELIAGROUP_APIHUB_JIRA", api_base: "/api/2" },
+            "destination",
+            "builtin:jira"
+        ),
+        ""
+    );
+});
+
+QUnit.test("destination mode refuses a URL as the API base path", (assert) => {
+    // A URL here would send the destination's credential to a host the
+    // destination never named.
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", api_base: "https://evil.example" },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.length > 0, "an error is returned");
+    assert.ok(error.indexOf("path, not a URL") > -1, "the message says why");
+});
+
+QUnit.test("destination mode refuses a relative API base path", (assert) => {
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", api_base: "rest/api/2" },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.indexOf("must start with") > -1, error);
+});
+
+QUnit.test("destination mode refuses credentials", (assert) => {
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", client_id: "x" },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.length > 0, "credentials are rejected before the request is sent");
+});
+
+QUnit.test("destination mode refuses dynamic registration", (assert) => {
+    assert.ok(
+        validators.validateOAuth({ dcr: true }, "destination", "builtin:jira").length > 0
+    );
 });
 
 QUnit.module("validators.validateServers");

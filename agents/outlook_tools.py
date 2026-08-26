@@ -36,12 +36,18 @@ reaches the outside world under the mailbox owner's name.
 
 from __future__ import annotations
 
+import html
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
+
+from agents.lookback import parse_lookback
+
+__all__ = ["parse_lookback", "outlook_toolset", "OutlookClient", "BUILTIN_OUTLOOK_URL"]
 
 logger = logging.getLogger(__name__)
 
@@ -69,47 +75,6 @@ _TRUNCATED = "…[truncated]"
 _LIST_FIELDS = "id,conversationId,subject,from,receivedDateTime,bodyPreview,isRead"
 
 
-# Suffixes accepted by `lookback`. Minutes is the internal unit: it divides
-# every other unit exactly, so no window is unrepresentable.
-_LOOKBACK_UNITS = {"m": 1, "h": 60, "d": 60 * 24, "w": 60 * 24 * 7}
-
-
-def parse_lookback(value: Any) -> int | None:
-    """A lookback window in minutes, or None when unset.
-
-    Accepts ``"90m"``, ``"5h"``, ``"2d"``, ``"1w"``, and a bare number, which
-    means **hours** -- the unit people reach for when saying how far back to
-    look. A unit suffix is the unambiguous form and the one the docs use.
-
-    Raises on anything it cannot parse rather than defaulting. A typo'd window
-    that silently became "no filter" would quietly hand the agent a whole
-    mailbox, which is the precise failure this setting exists to prevent.
-    """
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-
-    unit = _LOOKBACK_UNITS.get(text[-1])
-    number = text[:-1].strip() if unit else text
-    if unit is None:
-        unit = _LOOKBACK_UNITS["h"]  # bare number means hours
-
-    try:
-        amount = float(number)
-    except ValueError:
-        raise ValueError(
-            f"invalid lookback {value!r}; use a number of hours or a value with "
-            f"a unit such as '90m', '5h', '2d', '1w'"
-        ) from None
-    if amount <= 0:
-        raise ValueError(f"lookback must be positive, got {value!r}")
-
-    minutes = int(round(amount * unit))
-    return max(minutes, 1)
-
-
 def _cutoff(minutes: int) -> str:
     """The Graph-formatted UTC instant `minutes` ago.
 
@@ -132,6 +97,34 @@ def _truncate(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[:max_chars] + _TRUNCATED
+
+
+# One or more blank lines -- a paragraph break rather than a line break.
+_PARAGRAPH_BREAK = re.compile(r"\n[ \t]*\n\s*")
+
+
+def _text_to_html(body: str) -> str:
+    """Plain text as minimal HTML, for the ``comment`` of the reply action.
+
+    Graph builds the reply *as HTML* on the JSON path -- the reply API's
+    ``Prefer: outlook.timezone`` note says it "creates [the reply message] in
+    HTML ... based on the request body". A comment carrying ``\\n`` therefore
+    arrives as HTML whitespace: every line break collapses and the whole answer
+    lands as one run-on paragraph.
+
+    Converting here rather than asking the model for HTML keeps the tool's
+    contract plain text, and keeps the escaping on this side -- the model's text
+    is never markup, so a stray ``<`` in a code example cannot become a tag.
+    ``create_reply_draft`` needs none of this: it PATCHes ``contentType: text``,
+    where newlines mean what they say.
+    """
+    escaped = html.escape(body or "", quote=False).strip()
+    if not escaped:
+        return ""
+    paragraphs = [p.strip() for p in _PARAGRAPH_BREAK.split(escaped)]
+    return "".join(
+        "<p>" + p.replace("\n", "<br>") + "</p>" for p in paragraphs if p
+    )
 
 
 class OutlookClient:
@@ -310,9 +303,13 @@ class OutlookClient:
             "sending a reply to message %s as %s -- this leaves the mailbox",
             message_id, self.mailbox or "the signed-in user",
         )
+        # `comment`, not `message.body`: the docs are explicit that sending both
+        # is a 400, and `comment` is the form that keeps Graph's own threading
+        # -- the reply headers and the quoted original -- instead of replacing
+        # the generated body wholesale.
         await self._req(
             "POST", f"{self._root}/messages/{message_id}/reply",
-            json={"comment": body},
+            json={"comment": _text_to_html(body)},
         )
         return {"message_id": message_id, "sent": True}
 

@@ -46,11 +46,18 @@ AUTH_MODE_OAUTH2 = "oauth2"
 # explicitly in config (`mailbox` for builtin:outlook). See
 # agents/client_credentials.py.
 AUTH_MODE_APP_ONLY = "app_only"
+# Reached through a BTP destination: the destination holds the target's URL
+# and credential, so nothing secret is stored here at all. 11 characters --
+# see AUTH_MODE_MAX_LENGTH below, and what happened to "client_credentials".
+AUTH_MODE_DESTINATION = "destination"
 VALID_AUTH_MODES = frozenset({
     AUTH_MODE_JWT, AUTH_MODE_NONE, AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY,
+    AUTH_MODE_DESTINATION,
 })
 # Modes carrying an `oauth` config block.
-OAUTH_CONFIG_MODES = frozenset({AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY})
+OAUTH_CONFIG_MODES = frozenset({
+    AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY, AUTH_MODE_DESTINATION,
+})
 
 # Width of AgentConfig.auth_mode. Asserted rather than assumed: SQLite ignores
 # VARCHAR limits, so a mode too long for the column passes every local test and
@@ -676,6 +683,32 @@ def _clean_client_credentials(
     return cleaned
 
 
+# A destination server stores no credential: the destination itself holds the
+# target's URL and its secret. `destination` names it; the rest is filtering.
+_DEST_KEYS = ("destination", "project", "status", "lookback", "api_base")
+
+
+def _clean_destination(oauth: Any) -> dict[str, Any]:
+    """Normalize a ``destination`` oauth block for storage.
+
+    Credential keys are dropped rather than rejected here: an admin editing a
+    server that used to be oauth2 will still be POSTing a client_id, and
+    silently not storing it is what keeps this mode's promise that nothing
+    secret lands in the database. The payload validator refuses them earlier,
+    with a message explaining why.
+    """
+    src = oauth if isinstance(oauth, dict) else {}
+    cleaned: dict[str, Any] = {}
+    for k in _DEST_KEYS:
+        v = src.get(k)
+        if v is not None and str(v).strip() != "":
+            cleaned[k] = str(v).strip()
+    if not cleaned.get("destination"):
+        raise ValueError("destination server requires a destination name")
+    cleaned["allow_comment"] = bool(src.get("allow_comment"))
+    return cleaned
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None
 ) -> dict[str, Any] | None:
@@ -697,6 +730,8 @@ def _clean_oauth(
 
     Returns None for modes that carry no oauth block.
     """
+    if mode == AUTH_MODE_DESTINATION:
+        return _clean_destination(oauth)
     if mode == AUTH_MODE_APP_ONLY:
         return _clean_client_credentials(oauth, fallback)
     if mode != AUTH_MODE_OAUTH2:
