@@ -35,7 +35,9 @@ from agents.db import (  # noqa: E402
     get_agent_by_name,
     init_db,
     upsert_agent,
+    list_agents,
 )
+import json  # noqa: E402
 
 FAILED = 0
 PASSED = 0
@@ -56,6 +58,7 @@ def servers(host: str) -> list[dict[str, str]]:
 
 
 async def main() -> None:
+    # This function is the original test (storage + registry)
     await init_db()
 
     print("\n== storage ==")
@@ -128,6 +131,48 @@ async def main() -> None:
           "broken" in build.specialists, str(sorted(build.specialists)))
     check("bad override falls back to the global model",
           build.specialists["broken"].model is default_model)
+
+    print("\n== export/import round-trip ==")
+    async with SessionLocal() as s:
+        # Export the current agents via to_export()
+        all_agents = await list_agents(s)
+        small_agent = None
+        for agent in all_agents:
+            if agent.name == "small":
+                small_agent = agent
+                break
+        check("small agent exists before export", small_agent is not None)
+
+        # Simulate export: get the to_export() data
+        export_data = small_agent.to_export()
+        check("export carries model_name",
+              export_data.get("model_name") == "gpt-4o-mini",
+              f"expected 'gpt-4o-mini', got {export_data.get('model_name')}")
+
+        # Simulate import: re-upsert using the exported data
+        # This mimics what api_import does
+        await upsert_agent(
+            s,
+            name=export_data["name"],
+            description=export_data["description"],
+            instructions=export_data["instructions"],
+            mcp_servers=[{"url": "https://small.example.com/mcp", "auth_mode": "none"}],
+            skills=export_data.get("skills", []),
+            enabled=export_data.get("enabled", True),
+            expose_chat=export_data.get("expose_chat", True),
+            expose_api=export_data.get("expose_api", False),
+            api_slug=export_data.get("api_slug"),
+            run_prompt=export_data.get("run_prompt"),
+            run_timeout_seconds=export_data.get("run_timeout_seconds", 1800),
+            model_name=export_data.get("model_name") or None,  # Key test: pass model_name through
+        )
+
+        # Verify it survived the round-trip
+        small_after_import = await get_agent_by_name(s, "small")
+        check("small agent found after import", small_after_import is not None)
+        check("model_name survived round-trip",
+              small_after_import.model_name == "gpt-4o-mini" if small_after_import else False,
+              f"expected 'gpt-4o-mini', got {small_after_import.model_name if small_after_import else 'N/A'}")
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
