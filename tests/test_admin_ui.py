@@ -773,6 +773,46 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 f"{field}: not found as an object key in saveAgent()",
             )
 
+        # The HTML admin is the only writer that carries peers/model_name, so
+        # it is also the only way to CLEAR either one. The backend now treats
+        # an absent key as "keep the stored value" (so the UI5 admin, which
+        # sends neither, stops wiping them) -- which makes it load-bearing
+        # that saveAgent() keeps sending both explicitly, including when they
+        # are empty. Drop either key here and clearing silently stops working.
+        print("\n== saveAgent() sends peers and model_name (clearing depends on it) ==")
+        for field in ("peers", "model_name"):
+            check(
+                f"saveAgent() sends {field}",
+                re.search(rf"\b{field}\s*:", save_agent_body) is not None,
+                f"{field}: not found as an object key in saveAgent()",
+            )
+
+        # FastAPI returns `detail` as a plain string for the HTTPExceptions we
+        # raise, but as a list of {loc, msg} objects for any pydantic body
+        # validation error. Concatenating that into a toast yields
+        # "Save failed: [object Object]", which tells the admin nothing.
+        print("\n== error toasts render a pydantic detail array readably ==")
+        check("errText helper exists", "function errText(" in js)
+        check("errText handles an array detail", "Array.isArray(d)" in js)
+        check("errText uses loc and msg", ".loc" in js and "e.msg" in js)
+        for handler, label in (
+            (r"async function saveAgent\(\)\s*\{(.*?)\n\}", "saveAgent"),
+            (r"async function importConfig\(evt\)\s*\{(.*?)\n\}", "importConfig"),
+        ):
+            hm = re.search(handler, js, re.DOTALL)
+            check(f"{label}() found in JS", hm is not None)
+            body = hm.group(1) if hm else ""
+            check(
+                f"{label}() renders errors via errText",
+                "errText(" in body,
+                body[-300:],
+            )
+            check(
+                f"{label}() no longer concatenates err.detail raw",
+                "err.detail" not in body,
+                body[-300:],
+            )
+
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
     try:
