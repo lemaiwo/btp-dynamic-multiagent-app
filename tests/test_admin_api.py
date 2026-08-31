@@ -30,6 +30,8 @@ os.environ.pop("VCAP_APPLICATION", None)
 # calls load_dotenv(), which fills in vars that are absent but never overrides
 # ones already present. Empty means "no allowlist", i.e. the default rule.
 os.environ["MCP_URL_ALLOWLIST"] = ""
+# Pin the model list: available_models() would otherwise try to reach AI Core.
+os.environ["AICORE_AVAILABLE_MODELS"] = "gpt-4o,gpt-4o-mini"
 
 # Stub SAP AI Core model + MCP server factory before importing the app
 import agents.shared as shared  # noqa: E402
@@ -743,6 +745,130 @@ async def run_tests() -> None:
 
         r = await client.delete(f"/admin/api/agents/{er_id}")
         check("export roundtrip cleanup", r.status_code == 204, r.text)
+
+        # --- Writers that do not carry peers/model_name must not wipe them --
+        # The UI5 admin builds its PUT body from an explicit field list that
+        # has neither key, and any bundle exported before those fields existed
+        # carries neither either. With plain pydantic defaults ([] and "")
+        # both arrive as "clear it", so one save from /ui5admin -- or one
+        # import of an old bundle -- silently deletes a configured peer list
+        # and model override, and reports success. Absent must mean "keep".
+        print("\n== absent peers/model_name are kept, explicit blanks clear ==")
+        BASE = {
+            "name": "Keep Fields Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://keep.example.com/mcp", "auth_mode": "none"}],
+        }
+        r = await client.post("/admin/api/agents", json={
+            **BASE, "peers": ["Export Roundtrip"], "model_name": "gpt-4o-mini",
+        })
+        check("keep-fields agent created", r.status_code == 201, r.text)
+        kf_id = r.json()["id"]
+        check("created with peers", r.json()["peers"] == ["Export Roundtrip"], r.text)
+        check("created with model_name", r.json()["model_name"] == "gpt-4o-mini", r.text)
+
+        # 1. A PUT that omits both keys -- the UI5 admin's body shape.
+        r = await client.put(f"/admin/api/agents/{kf_id}", json=dict(BASE))
+        check("PUT without the new fields succeeds", r.status_code == 200, r.text)
+        saved = r.json()
+        check("omitted peers are kept",
+              saved["peers"] == ["Export Roundtrip"], f"got {saved['peers']!r}")
+        check("omitted model_name is kept",
+              saved["model_name"] == "gpt-4o-mini", f"got {saved['model_name']!r}")
+        # Re-read: prove it is the stored row, not just the echoed response.
+        r = await client.get(f"/admin/api/agents/{kf_id}")
+        check("omitted fields still stored after re-read",
+              r.json()["peers"] == ["Export Roundtrip"]
+              and r.json()["model_name"] == "gpt-4o-mini", r.text)
+
+        # 2. The HTML admin always sends both, so clearing must still work.
+        r = await client.put(f"/admin/api/agents/{kf_id}", json={
+            **BASE, "peers": [], "model_name": "",
+        })
+        check("PUT with explicit blanks succeeds", r.status_code == 200, r.text)
+        saved = r.json()
+        check("explicit empty list clears peers",
+              saved["peers"] == [], f"got {saved['peers']!r}")
+        check("explicit empty string clears model_name",
+              saved["model_name"] == "", f"got {saved['model_name']!r}")
+        r = await client.get(f"/admin/api/agents/{kf_id}")
+        check("cleared fields stay cleared after re-read",
+              r.json()["peers"] == [] and r.json()["model_name"] == "", r.text)
+
+        # 3. An import bundle without the keys -- a pre-branch export -- keeps
+        # whatever this landscape already has.
+        r = await client.put(f"/admin/api/agents/{kf_id}", json={
+            **BASE, "peers": ["Export Roundtrip"], "model_name": "gpt-4o-mini",
+        })
+        check("keep-fields agent re-armed", r.status_code == 200, r.text)
+        r = await client.post("/admin/api/import", json={"agents": [{
+            "name": "Keep Fields Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://keep.example.com/mcp", "auth_mode": "none"}],
+            "enabled": True, "expose_chat": True, "expose_api": False,
+            "api_slug": "", "run_prompt": "", "run_timeout_seconds": 1800,
+        }], "replace": False})
+        check("legacy bundle imports", r.status_code == 200, r.text)
+        r = await client.get(f"/admin/api/agents/{kf_id}")
+        legacy = r.json()
+        check("import without peers keeps them",
+              legacy["peers"] == ["Export Roundtrip"], f"got {legacy['peers']!r}")
+        check("import without model_name keeps it",
+              legacy["model_name"] == "gpt-4o-mini", f"got {legacy['model_name']!r}")
+
+        # 5. A model this landscape does not offer is saved, not rejected:
+        # available_models() is an env override / a live AI Core query / a
+        # static fallback, so it goes stale exactly when an operator most
+        # needs to save, and one landscape-specific name must not 422 a whole
+        # bundle. registry._model_for already degrades safely at build time.
+        print("\n== an unavailable model override is accepted, not 422 ==")
+        r = await client.put(f"/admin/api/agents/{kf_id}", json={
+            **BASE, "model_name": "gpt-5-not-deployed-here",
+        })
+        check("unavailable model saved", r.status_code == 200, r.text)
+        check("unavailable model stored",
+              r.json().get("model_name") == "gpt-5-not-deployed-here", r.text)
+        r = await client.post("/admin/api/import", json={"agents": [{
+            **BASE, "model_name": "gpt-5-not-deployed-here",
+            "api_slug": None, "peers": [],
+        }], "replace": False})
+        check("unavailable model imported", r.status_code == 200, r.text)
+        check("import reports the unavailable model",
+              any("gpt-5-not-deployed-here" in w for w in r.json().get("warnings", [])),
+              r.text)
+
+        r = await client.delete(f"/admin/api/agents/{kf_id}")
+        check("keep-fields cleanup", r.status_code == 204, r.text)
+
+        # --- 4. Export -> import posted VERBATIM ---------------------------
+        # "Export config" then "Import config" in the admin UI posts the
+        # export body unchanged. to_export() emits api_slug: null for every
+        # agent without a slug (the normal case), and AgentPayload.api_slug is
+        # typed str -- in pydantic v2 a default only applies to an ABSENT key,
+        # so an explicit null 422s the whole bundle.
+        print("\n== verbatim export -> import round trip ==")
+        r = await client.post("/admin/api/agents", json={
+            "name": "No Slug Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://noslug.example.com/mcp", "auth_mode": "none"}],
+        })
+        check("slugless agent created", r.status_code == 201, r.text)
+        ns_id = r.json()["id"]
+        check("slugless agent really has no slug",
+              r.json().get("api_slug", "missing") is None, r.text)
+
+        r = await client.get("/admin/api/export")
+        check("export for verbatim import 200", r.status_code == 200, r.text)
+        bundle = r.json()
+        check("export carries a null api_slug",
+              any(a.get("api_slug") is None for a in bundle["agents"]),
+              str([a.get("api_slug") for a in bundle["agents"]]))
+        r = await client.post("/admin/api/import", json=bundle)
+        check("verbatim export imports", r.status_code == 200, r.text[:400])
+        r = await client.get(f"/admin/api/agents/{ns_id}")
+        check("slugless agent survived the round trip",
+              r.status_code == 200 and r.json().get("api_slug", "missing") is None,
+              r.text)
+        r = await client.delete(f"/admin/api/agents/{ns_id}")
+        check("slugless cleanup", r.status_code == 204, r.text)
+
 
         # --- /admin/api/runs limit is capped --------------------------------
         print("\n== GET /admin/api/runs limit bounds ==")

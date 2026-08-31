@@ -861,6 +861,13 @@ class _Keep:
     deliberately absent from exports (see AgentConfig.to_export), so the
     import and seed paths pass nothing for it. Defaulting it to None instead
     would silently un-configure every API agent on the first import.
+
+    ``model_name`` and ``peers`` need the same distinction for a different
+    reason: a writer that predates them (an older exported bundle, or a
+    client whose form has no field for them) sends no key at all. Without a
+    sentinel their absence is indistinguishable from "clear it", so every
+    such write would wipe a configured override or peer list. KEEP means
+    "not sent"; an explicit ``""`` / ``[]`` still clears.
     """
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
@@ -885,8 +892,8 @@ async def upsert_agent(
     run_as_principal: str | None | _Keep = KEEP,
     run_prompt: str | None = None,
     run_timeout_seconds: int = 1800,
-    model_name: str | None = None,
-    peers: list[str] | None = None,
+    model_name: str | None | _Keep = KEEP,
+    peers: list[str] | None | _Keep = KEEP,
 ) -> AgentConfig:
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
@@ -894,14 +901,17 @@ async def upsert_agent(
     skills_json = await normalize_skills_json(session, skills)
     # Order-preserving de-duplication: the same peer listed twice would
     # otherwise register the same delegation tool twice on the same agent.
-    seen: set[str] = set()
-    cleaned_peers: list[str] = []
-    for p in peers or []:
-        p = str(p).strip()
-        if p and p not in seen:
-            seen.add(p)
-            cleaned_peers.append(p)
-    peers_json = json.dumps(cleaned_peers) if cleaned_peers else None
+    # KEEP short-circuits it: nothing was sent, so nothing is written below.
+    peers_json: str | None = None
+    if not isinstance(peers, _Keep):
+        seen: set[str] = set()
+        cleaned_peers: list[str] = []
+        for p in peers or []:
+            p = str(p).strip()
+            if p and p not in seen:
+                seen.add(p)
+                cleaned_peers.append(p)
+        peers_json = json.dumps(cleaned_peers) if cleaned_peers else None
 
     slug = (api_slug or "").strip() or None
     if slug:
@@ -933,7 +943,11 @@ async def upsert_agent(
         )
         row.run_prompt = (run_prompt or "").strip() or None
         row.run_timeout_seconds = int(run_timeout_seconds)
-        row.model_name = (model_name or "").strip() or None
+        # A brand-new row has nothing to keep, so KEEP simply means "unset".
+        row.model_name = (
+            None if isinstance(model_name, _Keep)
+            else (model_name or "").strip() or None
+        )
         row.peers_json = peers_json
     else:
         existing.description = description
@@ -953,8 +967,13 @@ async def upsert_agent(
             existing.run_as_principal = (run_as_principal or "").strip() or None
         existing.run_prompt = (run_prompt or "").strip() or None
         existing.run_timeout_seconds = int(run_timeout_seconds)
-        existing.model_name = (model_name or "").strip() or None
-        existing.peers_json = peers_json
+        # KEEP: the caller carries no model override / peer list (an older
+        # bundle, or a client without those fields), so what this landscape
+        # already has is preserved instead of being silently wiped.
+        if not isinstance(model_name, _Keep):
+            existing.model_name = (model_name or "").strip() or None
+        if not isinstance(peers, _Keep):
+            existing.peers_json = peers_json
         row = existing
     await session.commit()
     await session.refresh(row)

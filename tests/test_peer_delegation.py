@@ -379,8 +379,7 @@ async def test_export_import_via_http() -> None:
             check("deleted agent not found", get_resp.status_code == 404)
 
             # 4. Re-import via POST /admin/api/import — exercises api_import.
-            if test_agent_export:
-                test_agent_export["api_slug"] = test_agent_export.get("api_slug") or ""
+            # Posted verbatim: the export carries api_slug: null.
             import_resp = await client.post(
                 "/admin/api/import",
                 json={

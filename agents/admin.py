@@ -45,6 +45,7 @@ from agents.db import (
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
+    KEEP,
     OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
     SessionLocal,
@@ -354,8 +355,11 @@ class AgentPayload(BaseModel):
     instructions: str = Field(min_length=1)
     mcp_servers: list[McpServerPayload] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
-    peers: list[str] = Field(default_factory=list)
-    model_name: str = Field(default="", max_length=128)
+    # None (key absent) means "the writer does not carry this field, keep
+    # whatever is stored"; an explicit [] / "" means "clear it". See the
+    # _Keep docstring in agents/db.py for why the distinction is needed.
+    peers: list[str] | None = None
+    model_name: str | None = Field(default=None, max_length=128)
     enabled: bool = True
     expose_chat: bool = True
     expose_api: bool = False
@@ -376,7 +380,9 @@ class AgentPayload(BaseModel):
 
     @field_validator("peers")
     @classmethod
-    def _clean_peers(cls, v: list[str]) -> list[str]:
+    def _clean_peers(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
         seen: set[str] = set()
         out: list[str] = []
         for p in v:
@@ -388,14 +394,23 @@ class AgentPayload(BaseModel):
 
     @field_validator("model_name")
     @classmethod
-    def _validate_model_name(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            return ""
-        allowed = available_models()
-        if v not in allowed:
-            raise ValueError(f"model_name must be one of {allowed}")
-        return v
+    def _clean_model_name(cls, v: str | None) -> str | None:
+        # Deliberately no allowlist check here: see _unknown_model_note.
+        if v is None:
+            return None
+        return v.strip()
+
+    @field_validator("api_slug", mode="before")
+    @classmethod
+    def _slug_null_is_blank(cls, v: Any) -> Any:
+        """Accept an explicit ``null`` slug as "no slug".
+
+        ``AgentConfig.to_export`` emits ``"api_slug": null`` for every agent
+        without one (the normal case -- a slug is only needed by expose_api),
+        so without this an exported bundle re-imported verbatim 422s on the
+        type, not on anything the operator can fix.
+        """
+        return "" if v is None else v
 
     @model_validator(mode="before")
     @classmethod
@@ -482,6 +497,38 @@ async def admin_ui(request: Request) -> HTMLResponse:
 # ---------------------------------------------------------------------------
 # Agents CRUD
 # ---------------------------------------------------------------------------
+def _or_keep(value: Any) -> Any:
+    """Translate an AgentPayload "not sent" (None) into upsert_agent's KEEP."""
+    return KEEP if value is None else value
+
+
+def _unknown_model_note(agent_name: str, model_name: str | None) -> str | None:
+    """Warn -- never reject -- when an override names an unavailable model.
+
+    ``available_models()`` is not authoritative: it is an env override, else
+    a live AI Core query, else a small static fallback. During an AI Core
+    outage it shrinks to a handful of names, so rejecting on it would make an
+    already-configured override unsaveable; and on import it would fail a
+    whole bundle over one landscape-specific name -- the same property that
+    keeps ``run_as_principal`` out of exports entirely. An override that
+    cannot be loaded already degrades safely at build time in
+    ``registry._model_for``, which falls back to the active model and logs.
+    So this records the mismatch instead of blocking the write.
+    """
+    if not model_name:
+        return None
+    allowed = available_models()
+    if allowed and model_name in allowed:
+        return None
+    note = (
+        f"Agent {agent_name!r}: model {model_name!r} is not among this "
+        f"landscape's available models; the agent will fall back to the "
+        f"active model until that deployment exists."
+    )
+    logger.warning("%s", note)
+    return note
+
+
 @router.get("/api/agents", dependencies=[Depends(require_admin)])
 async def api_list_agents() -> list[dict[str, Any]]:
     async with SessionLocal() as session:
@@ -504,7 +551,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 instructions=payload.instructions,
                 mcp_servers=payload.to_servers_list(),
                 skills=payload.skills,
-                peers=payload.peers,
+                peers=_or_keep(payload.peers),
                 enabled=payload.enabled,
                 expose_chat=payload.expose_chat,
                 expose_api=payload.expose_api,
@@ -512,10 +559,11 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 run_as_principal=payload.run_as_principal,
                 run_prompt=payload.run_prompt,
                 run_timeout_seconds=payload.run_timeout_seconds,
-                model_name=payload.model_name,
+                model_name=_or_keep(payload.model_name),
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
+        _unknown_model_note(payload.name, payload.model_name)
         return row.to_dict()
 
 
@@ -575,10 +623,15 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.run_as_principal = payload.run_as_principal.strip() or None
         row.run_prompt = payload.run_prompt.strip() or None
         row.run_timeout_seconds = payload.run_timeout_seconds
-        row.model_name = payload.model_name.strip() or None
-        row.peers_json = json.dumps(payload.peers) if payload.peers else None
+        # None means the client carries no such field (the UI5 admin form
+        # does not), so the stored value stays; "" / [] still clear it.
+        if payload.model_name is not None:
+            row.model_name = payload.model_name.strip() or None
+        if payload.peers is not None:
+            row.peers_json = json.dumps(payload.peers) if payload.peers else None
         await session.commit()
         await session.refresh(row)
+        _unknown_model_note(payload.name, payload.model_name)
         return row.to_dict()
 
 
@@ -953,12 +1006,16 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             imported_skill_names.add(skill.name)
 
         imported_names = set()
+        warnings: list[str] = []
         for agent in payload.agents:
             try:
                 # run_as_principal is deliberately not carried by exports
                 # (it is a landscape-specific service identity), and is
                 # therefore omitted here so upsert_agent preserves whatever
                 # this landscape already has rather than wiping it.
+                # peers/model_name use the same KEEP semantics via _or_keep:
+                # a bundle exported before those fields existed carries
+                # neither key, and must not wipe what is configured here.
                 await upsert_agent(
                     session,
                     name=agent.name,
@@ -966,19 +1023,22 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     instructions=agent.instructions,
                     mcp_servers=agent.to_servers_list(),
                     skills=agent.skills,
-                    peers=agent.peers,
+                    peers=_or_keep(agent.peers),
                     enabled=agent.enabled,
                     expose_chat=agent.expose_chat,
                     expose_api=agent.expose_api,
                     api_slug=agent.api_slug,
                     run_prompt=agent.run_prompt,
                     run_timeout_seconds=agent.run_timeout_seconds,
-                    model_name=agent.model_name,
+                    model_name=_or_keep(agent.model_name),
                 )
             except ValueError as e:
                 raise HTTPException(
                     status_code=422, detail=f"Agent '{agent.name}': {e}"
                 ) from e
+            note = _unknown_model_note(agent.name, agent.model_name)
+            if note:
+                warnings.append(note)
             imported_names.add(agent.name)
 
         removed = 0
@@ -1005,6 +1065,9 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         "imported_skills": len(payload.skills),
         "removed": removed,
         "removed_skills": removed_skills,
+        # Model overrides this landscape cannot currently serve are imported
+        # rather than rejected, so the operator is told about them here.
+        "warnings": warnings,
     }
 
 
@@ -1062,7 +1125,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     instructions=payload.instructions,
                     mcp_servers=payload.to_servers_list(),
                     skills=payload.skills,
-                    peers=payload.peers,
+                    peers=_or_keep(payload.peers),
                     enabled=payload.enabled,
                     expose_chat=payload.expose_chat,
                     expose_api=payload.expose_api,
@@ -1070,7 +1133,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     run_as_principal=payload.run_as_principal,
                     run_prompt=payload.run_prompt,
                     run_timeout_seconds=payload.run_timeout_seconds,
-                    model_name=payload.model_name,
+                    model_name=_or_keep(payload.model_name),
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
