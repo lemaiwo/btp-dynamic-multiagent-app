@@ -25,8 +25,18 @@ const EMPTY_AGENT: AgentInput = {
     api_slug: "",
     run_as_principal: "",
     run_prompt: "",
-    run_timeout_seconds: 1800
+    run_timeout_seconds: 1800,
+    peers: [],
+    model_name: ""
 };
+
+/** One entry of the model `<Select>`: a real model name, or the blank
+ * "use the active model" option, or a stored override the current model
+ * list no longer carries. */
+interface ModelOption {
+    key: string;
+    text: string;
+}
 
 /**
  * @namespace com.infrabel.agentadmin.controller
@@ -44,6 +54,8 @@ export default class AgentDetail extends BaseController {
             title: "",
             data: JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput,
             availableSkills: [],
+            availableAgents: [],
+            availableModels: [],
             errors: {}
         }), "agent");
         this.setModel(new JSONModel({}), "server");
@@ -64,6 +76,20 @@ export default class AgentDetail extends BaseController {
         );
         model.setProperty("/availableSkills", skills ?? []);
 
+        // Both calls must not block the form from opening: a peer picker
+        // with no options, or a model list that fell back to just the
+        // stored override, still leaves the agent editable. See the model
+        // control's "not currently available" handling below.
+        const agents = await this.run(
+            this.getAdminService().listAgents(),
+            "Could not load the agent list."
+        );
+        const modelInfo = await this.run(
+            this.getAdminService().getModel(),
+            "Could not load the LLM model list."
+        );
+        const availableModelNames = modelInfo?.available ?? [];
+
         if (id === "new") {
             this.agentId = undefined;
             model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
@@ -71,6 +97,10 @@ export default class AgentDetail extends BaseController {
             // Otherwise a credential table left over from whichever agent was
             // open before navigating here would still be showing.
             model.setProperty("/credentials", []);
+            // A new agent has no name yet, so it excludes nothing from its
+            // own peer list — every existing agent is offered.
+            model.setProperty("/availableAgents", agents ?? []);
+            model.setProperty("/availableModels", this.buildModelOptions(availableModelNames, ""));
             return;
         }
 
@@ -96,9 +126,17 @@ export default class AgentDetail extends BaseController {
             api_slug: agent.api_slug ?? "",
             run_as_principal: agent.run_as_principal ?? "",
             run_prompt: agent.run_prompt ?? "",
-            run_timeout_seconds: agent.run_timeout_seconds ?? 1800
+            run_timeout_seconds: agent.run_timeout_seconds ?? 1800,
+            peers: agent.peers ?? [],
+            model_name: agent.model_name ?? ""
         } as AgentInput);
         model.setProperty("/title", agent.name);
+        // An agent must never be offered itself as a peer.
+        model.setProperty("/availableAgents", (agents ?? []).filter((a) => a.name !== agent.name));
+        model.setProperty(
+            "/availableModels",
+            this.buildModelOptions(availableModelNames, agent.model_name ?? "")
+        );
 
         const config = await this.run(
             this.getAdminService().getConfig(),
@@ -106,6 +144,25 @@ export default class AgentDetail extends BaseController {
         );
         this.publicBaseUrl = config?.public_base_url ?? "";
         void this.loadCredentials();
+    }
+
+    /**
+     * Builds the model `<Select>`'s options: a blank "use the active model"
+     * entry, the fetched models, and — only if the stored override is not
+     * among them — the override itself, labelled as unavailable.
+     *
+     * Without that last entry, a `Select` with an unknown `selectedKey` shows
+     * blank, which looks like a deliberate "use the active model" and
+     * destroys the override on the next save. See `templates/admin.html`'s
+     * `renderAgentModelOptions`, where this exact bug was found once already.
+     */
+    private buildModelOptions(available: string[], selected: string): ModelOption[] {
+        const options: ModelOption[] = [{ key: "", text: this.text("useActiveModel") }];
+        available.forEach((name) => options.push({ key: name, text: name }));
+        if (selected && !available.includes(selected)) {
+            options.push({ key: selected, text: this.text("modelNotAvailable", [selected]) });
+        }
+        return options;
     }
 
     // --- MCP server dialog -----------------------------------------------

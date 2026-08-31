@@ -8,6 +8,14 @@ supported admin UI. The UI5 app runs alongside it against the same
 `/admin/api/*` endpoints and the same database. Cutover has not happened and is
 a separate decision.
 
+**The two front-ends are independent and do not share code.** Each maintains
+its own copy of the `AgentInput` shape -- `templates/admin.html`'s inline JS
+and `ui5-admin/webapp/service/types.ts` -- and its own form. Adding a field to
+one does not add it to the other. This has already caused two bugs: an
+absent field silently wiped on save from whichever admin lacked it, and the
+same field simply missing from the other admin's form. When `AgentInput`
+gains a field on the backend, add it to *both* admins in the same change.
+
 ## Layout
 
 - `ui5-admin/webapp/service/` — `AdminService` (the only code that performs
