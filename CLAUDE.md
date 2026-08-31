@@ -25,7 +25,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `OrchestratorConfig`), `init_db`, CRUD helpers, VCAP/ENV postgres URL
   resolver. `AgentConfig.auth_mode` is one of `jwt`, `none`, `oauth2`,
   `app_only`, `destination`. Skills are reusable instruction blocks attached
-  to agents by name (`AgentConfig.skills_json`)
+  to agents by name (`AgentConfig.skills_json`). Six more tables back the
+  workflow engine: `Workflow`, `WorkflowBranch`, `WorkflowStep` (the
+  definition), and `WorkflowRun`, `WorkflowItemRun`, `WorkflowStepRun` (what
+  happened on a run). `validate_workflow_parts` is the save-time gate that
+  rejects a definition that cannot run
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin` FastAPI dependencies
@@ -76,8 +80,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   overrides the globally active model per agent
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
-- `agents/admin.py` — FastAPI `/admin` router: agent + skill CRUD, reload,
-  restart, import/export, seed-on-startup
+- `agents/workflow_runner.py` — runs a workflow: the declared main line, a
+  fan-out step returning `WorkItem`s, and per-item branches the fan-out step
+  selects. Mirrors `job_runner.py` (task set, start lock, never-raising
+  `_finalize`, shutdown cancel). Steps hand plain text to each other; the join
+  step sees one `## From` block per branch taken. See
+  `docs/superpowers/specs/2026-08-31-agent-workflows-design.md`
+- `agents/admin.py` — FastAPI `/admin` router: agent + skill + workflow CRUD,
+  reload, restart, import/export, seed-on-startup
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
   `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
   `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
@@ -107,6 +117,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 3. Admin reload: `POST /admin/api/reload` → `registry.reload()` rebuilds
    orchestrator from DB → `dynamic_chat_app.refresh()` swaps the ASGI
    inner app → next chat request gets the new agents
+4. `POST /api/workflows/{slug}/run` is the second scheduler entry point
+   alongside `POST /api/agents/{slug}/run`: both acknowledge within the BTP
+   Job Scheduling Service's 15s synchronous budget and run in the background
 
 ## Running locally
 ```bash

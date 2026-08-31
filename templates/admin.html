@@ -239,6 +239,39 @@
     </div>
 
     <div class="panel">
+        <h2>Workflows</h2>
+        <p class="hint">
+            A workflow runs several agents in a declared order as one
+            background job. Its fan-out step returns the work items; each
+            item enters only the branches that step selected for it, and the
+            remaining main-line steps then run as the join.
+        </p>
+        <div class="toolbar">
+            <button onclick="openWorkflowModal()">+ New workflow</button>
+        </div>
+        <table>
+            <thead><tr><th>Name</th><th>Steps</th><th>Slug</th><th></th></tr></thead>
+            <tbody id="workflows-tbody">
+                <tr><td colspan="4" style="color:var(--muted)">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="panel">
+        <h2>Workflow runs</h2>
+        <div class="toolbar">
+            <button class="secondary" onclick="loadWorkflowRuns()">Refresh</button>
+        </div>
+        <table>
+            <thead><tr><th>Workflow</th><th>Status</th><th>Items</th><th>Started</th><th></th></tr></thead>
+            <tbody id="workflow-runs-tbody">
+                <tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr>
+            </tbody>
+        </table>
+        <div id="workflow-run-detail"></div>
+    </div>
+
+    <div class="panel">
         <h2>LLM model</h2>
         <p class="hint">
             Active model used by the orchestrator and all specialists.
@@ -389,6 +422,62 @@
         <div class="modal-actions">
             <button class="secondary" onclick="closeSkillModal()">Cancel</button>
             <button onclick="saveSkill()">Save</button>
+        </div>
+    </div>
+</div>
+
+<div id="workflow-modal" class="modal-backdrop" onclick="if(event.target===this)closeWorkflowModal()">
+    <div class="modal">
+        <h3 id="workflow-modal-title">New workflow</h3>
+        <input type="hidden" id="workflow-id">
+        <div class="form-grid">
+            <label class="full">Name
+                <input type="text" id="workflow-name" placeholder="mail-triage" required>
+            </label>
+            <label class="full">Description
+                <textarea id="workflow-description" rows="2"></textarea>
+            </label>
+            <label class="full">API slug <span style="color:var(--muted);font-weight:normal">(the BTP scheduler posts to /api/workflows/&lt;slug&gt;/run)</span>
+                <input type="text" id="workflow-api-slug" placeholder="mail-triage">
+            </label>
+            <label class="full">Run as (technical user) <span style="color:var(--muted);font-weight:normal">(fallback for steps whose agent has none)</span>
+                <input type="text" id="workflow-run-as" placeholder="svc@example.com">
+            </label>
+            <label>Run timeout (seconds)
+                <input type="number" id="workflow-timeout" value="1800" min="60">
+            </label>
+            <label>Max items in parallel <span style="color:var(--muted);font-weight:normal">(1 keeps load on the target systems predictable)</span>
+                <input type="number" id="workflow-max-parallel" value="1" min="1">
+            </label>
+            <label>If an item names an unknown branch
+                <select id="workflow-on-unknown-branch">
+                    <option value="fail">Fail that item</option>
+                    <option value="skip">Ignore the unknown branch</option>
+                </select>
+            </label>
+            <label>
+                <input type="checkbox" id="workflow-skip-seen" checked>
+                Skip items this workflow already completed
+            </label>
+            <label>
+                <input type="checkbox" id="workflow-enabled" checked> Enabled
+            </label>
+
+            <label class="full">
+                Branches <span style="color:var(--muted);font-weight:normal">(optional — the fan-out step picks per item from this list, so write descriptions it can choose by)</span>
+                <div id="workflow-branches"></div>
+                <button type="button" class="secondary small" onclick="addWorkflowBranchRow()">+ Add branch</button>
+            </label>
+            <label class="full">
+                Steps <span style="color:var(--muted);font-weight:normal">(run in this order; exactly one may be the fan-out step)</span>
+                <div id="workflow-steps"></div>
+                <button type="button" class="secondary small" onclick="addWorkflowStepRow()">+ Add step</button>
+            </label>
+        </div>
+
+        <div class="modal-actions">
+            <button class="secondary" onclick="closeWorkflowModal()">Cancel</button>
+            <button onclick="saveWorkflow()">Save</button>
         </div>
     </div>
 </div>
@@ -768,6 +857,291 @@ async function deleteSkillRow(id, name) {
     toast('Deleted. Click "Reload agents" to activate.', 'success');
     loadSkills();
     loadAgents();
+}
+
+// ---------------------------------------------------------------------------
+// Workflows
+// ---------------------------------------------------------------------------
+let allWorkflows = [];
+let allWorkflowRuns = [];
+
+async function loadWorkflows() {
+    const res = await api('/workflows');
+    if (!res.ok) { toast('Failed to load workflows', 'error'); return; }
+    allWorkflows = await res.json();
+    renderWorkflows();
+    // The list is scalar fields only; the step count needs the detail
+    // endpoint. Fetch it per workflow and re-render once counts are in.
+    await Promise.all(allWorkflows.map(async w => {
+        try {
+            const dres = await api(`/workflows/${w.id}`);
+            if (dres.ok) w._stepCount = (await dres.json()).steps.length;
+        } catch (e) { /* leave the step count blank */ }
+    }));
+    renderWorkflows();
+}
+
+function renderWorkflows() {
+    const tbody = document.getElementById('workflows-tbody');
+    if (allWorkflows.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:var(--muted)">No workflows defined yet.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = allWorkflows.map(w => `
+        <tr>
+            <td><strong>${escapeHtml(w.name)}</strong>${w.enabled ? '' : ' <span class="status-badge off">disabled</span>'}</td>
+            <td>${w._stepCount === undefined ? '…' : w._stepCount}</td>
+            <td>${w.api_slug ? `<code>${escapeHtml(w.api_slug)}</code>` : '<span style="color:var(--muted)">—</span>'}</td>
+            <td class="row-actions">
+                <button class="small secondary" onclick="editWorkflow(${w.id})">Edit</button>
+                <button class="small secondary" onclick="runWorkflowNow(${w.id})">Run now</button>
+                <button class="small danger" onclick="deleteWorkflow(${w.id}, '${escapeHtml(w.name)}')">Delete</button>
+            </td>
+        </tr>
+    `).join('');
+}
+
+function openWorkflowModal() {
+    document.getElementById('workflow-modal-title').textContent = 'New workflow';
+    document.getElementById('workflow-id').value = '';
+    document.getElementById('workflow-name').value = '';
+    document.getElementById('workflow-description').value = '';
+    document.getElementById('workflow-api-slug').value = '';
+    document.getElementById('workflow-run-as').value = '';
+    document.getElementById('workflow-timeout').value = 1800;
+    document.getElementById('workflow-max-parallel').value = 1;
+    document.getElementById('workflow-on-unknown-branch').value = 'fail';
+    document.getElementById('workflow-skip-seen').checked = true;
+    document.getElementById('workflow-enabled').checked = true;
+    document.getElementById('workflow-branches').innerHTML = '';
+    document.getElementById('workflow-steps').innerHTML = '';
+    document.getElementById('workflow-modal').classList.add('open');
+}
+
+function closeWorkflowModal() {
+    document.getElementById('workflow-modal').classList.remove('open');
+}
+
+async function editWorkflow(id) {
+    const res = await api(`/workflows/${id}`);
+    if (!res.ok) { toast('Failed to load workflow', 'error'); return; }
+    const w = await res.json();
+    document.getElementById('workflow-modal-title').textContent = `Edit workflow: ${w.name}`;
+    document.getElementById('workflow-id').value = w.id;
+    document.getElementById('workflow-name').value = w.name;
+    document.getElementById('workflow-description').value = w.description;
+    document.getElementById('workflow-api-slug').value = w.api_slug || '';
+    document.getElementById('workflow-run-as').value = w.run_as_principal || '';
+    document.getElementById('workflow-timeout').value = w.run_timeout_seconds;
+    document.getElementById('workflow-max-parallel').value = w.max_parallel_items;
+    document.getElementById('workflow-on-unknown-branch').value = w.on_unknown_branch;
+    document.getElementById('workflow-skip-seen').checked = w.skip_seen_items;
+    document.getElementById('workflow-enabled').checked = w.enabled;
+
+    // Branches before steps: each step row's branch dropdown is built by
+    // reading the branch rows currently in the DOM.
+    document.getElementById('workflow-branches').innerHTML = '';
+    (w.branches || []).forEach(b => addWorkflowBranchRow(b));
+    document.getElementById('workflow-steps').innerHTML = '';
+    (w.steps || []).forEach(s => addWorkflowStepRow(s));
+
+    document.getElementById('workflow-modal').classList.add('open');
+}
+
+async function saveWorkflow() {
+    const id = document.getElementById('workflow-id').value;
+    const body = JSON.stringify({
+        name: document.getElementById('workflow-name').value.trim(),
+        description: document.getElementById('workflow-description').value.trim(),
+        api_slug: document.getElementById('workflow-api-slug').value.trim(),
+        run_as_principal: document.getElementById('workflow-run-as').value.trim(),
+        run_timeout_seconds: parseInt(document.getElementById('workflow-timeout').value, 10) || 1800,
+        skip_seen_items: document.getElementById('workflow-skip-seen').checked,
+        max_parallel_items: parseInt(document.getElementById('workflow-max-parallel').value, 10) || 1,
+        on_unknown_branch: document.getElementById('workflow-on-unknown-branch').value,
+        enabled: document.getElementById('workflow-enabled').checked,
+        branches: collectWorkflowBranches(),
+        steps: collectWorkflowSteps(),
+    });
+    const res = id
+        ? await api(`/workflows/${id}`, {method: 'PUT', body})
+        : await api('/workflows', {method: 'POST', body});
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Save failed: ' + errText(err), 'error');
+        return;
+    }
+    closeWorkflowModal();
+    toast('Workflow saved.', 'success');
+    loadWorkflows();
+}
+
+async function deleteWorkflow(id, name) {
+    if (!confirm(`Delete workflow "${name}"?`)) return;
+    const res = await api(`/workflows/${id}`, {method: 'DELETE'});
+    if (!res.ok) { toast('Delete failed', 'error'); return; }
+    toast('Workflow deleted.', 'success');
+    loadWorkflows();
+}
+
+function addWorkflowBranchRow(branch) {
+    branch = branch || {key: '', description: ''};
+    const row = document.createElement('div');
+    row.className = 'wf-branch-row';
+    row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px';
+    row.innerHTML = `
+        <input type="text" class="wf-branch-key" placeholder="abap" style="flex:0 0 140px"
+               value="${escapeHtml(branch.key || '')}">
+        <input type="text" class="wf-branch-description" style="flex:1"
+               placeholder="When should an item take this branch?"
+               value="${escapeHtml(branch.description || '')}">
+        <button type="button" class="secondary small" onclick="this.parentNode.remove()">Remove</button>
+    `;
+    document.getElementById('workflow-branches').appendChild(row);
+}
+
+function addWorkflowStepRow(step) {
+    step = step || {branch_key: null, agent_name: '', instructions: '',
+                    fan_out: false, step_timeout_seconds: 600};
+    // Branch options come from the rows currently in the branch editor, so a
+    // branch added moments ago is selectable without saving first.
+    const branchKeys = Array.from(
+        document.querySelectorAll('#workflow-branches .wf-branch-key')
+    ).map(i => i.value.trim()).filter(Boolean);
+    const row = document.createElement('div');
+    row.className = 'wf-step-row';
+    row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px;align-items:flex-start';
+    row.innerHTML = `
+        <select class="wf-step-branch" style="flex:0 0 130px">
+            <option value="">Main line</option>
+            ${branchKeys.map(k =>
+                `<option value="${escapeHtml(k)}" ${k === step.branch_key ? 'selected' : ''}>${escapeHtml(k)}</option>`
+            ).join('')}
+        </select>
+        <select class="wf-step-agent" style="flex:0 0 170px">
+            ${allAgents.map(a =>
+                `<option value="${escapeHtml(a.name)}" ${a.name === step.agent_name ? 'selected' : ''}>${escapeHtml(a.name)}</option>`
+            ).join('')}
+        </select>
+        <textarea class="wf-step-instructions" rows="2" style="flex:1"
+                  placeholder="What should this agent do with what it was handed?">${escapeHtml(step.instructions || '')}</textarea>
+        <label style="font-weight:normal;white-space:nowrap">
+            <input type="checkbox" class="wf-step-fanout" ${step.fan_out ? 'checked' : ''}> fan-out
+        </label>
+        <input type="number" class="wf-step-timeout" style="flex:0 0 80px"
+               value="${step.step_timeout_seconds || 600}" min="10">
+        <button type="button" class="secondary small" onclick="this.parentNode.remove()">Remove</button>
+    `;
+    document.getElementById('workflow-steps').appendChild(row);
+}
+
+function collectWorkflowSteps() {
+    const rows = Array.from(document.querySelectorAll('#workflow-steps .wf-step-row'));
+    const counters = {};
+    return rows.map(row => {
+        const branch = row.querySelector('.wf-step-branch').value || null;
+        const groupKey = branch === null ? '__main__' : branch;
+        counters[groupKey] = (counters[groupKey] || 0) + 1;
+        return {
+            branch_key: branch,
+            position: counters[groupKey],
+            agent_name: row.querySelector('.wf-step-agent').value,
+            instructions: row.querySelector('.wf-step-instructions').value,
+            fan_out: row.querySelector('.wf-step-fanout').checked,
+            step_timeout_seconds: parseInt(row.querySelector('.wf-step-timeout').value, 10) || 600,
+        };
+    });
+}
+
+function collectWorkflowBranches() {
+    return Array.from(document.querySelectorAll('#workflow-branches .wf-branch-row'))
+        .map((row, i) => ({
+            key: row.querySelector('.wf-branch-key').value.trim(),
+            description: row.querySelector('.wf-branch-description').value,
+            position: i + 1,
+        }))
+        .filter(b => b.key);
+}
+
+async function runWorkflowNow(id) {
+    const res = await api(`/workflows/${id}/run`, {method: 'POST'});
+    if (!res.ok) { toast((await res.json()).detail || 'Run failed to start', 'error'); return; }
+    toast('Run started');
+    loadWorkflowRuns();
+}
+
+async function loadWorkflowRuns() {
+    const res = await api('/workflow-runs');
+    if (!res.ok) { toast('Failed to load workflow runs', 'error'); return; }
+    allWorkflowRuns = await res.json();
+    renderWorkflowRuns();
+}
+
+function renderWorkflowRuns() {
+    const tbody = document.getElementById('workflow-runs-tbody');
+    if (allWorkflowRuns.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="5" style="color:var(--muted)">No workflow runs yet.</td></tr>';
+        return;
+    }
+    tbody.innerHTML = allWorkflowRuns.map(r => {
+        const counts = `${r.items_succeeded}/${r.items_total} ok`
+            + (r.items_failed ? `, ${r.items_failed} failed` : '')
+            + (r.items_skipped ? `, ${r.items_skipped} skipped` : '');
+        return `
+            <tr class="run-row" style="cursor:pointer" onclick="showWorkflowRun('${r.id}')">
+                <td>${escapeHtml(r.workflow_name)}</td>
+                <td><span class="status-badge status-${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></td>
+                <td>${escapeHtml(counts)}</td>
+                <td>${r.started_at ? escapeHtml(new Date(r.started_at).toLocaleString()) : ''}</td>
+                <td class="row-actions">
+                    <button class="small secondary" onclick="event.stopPropagation();showWorkflowRun('${r.id}')">View</button>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+async function showWorkflowRun(runId) {
+    const res = await api(`/workflow-runs/${runId}`);
+    const el = document.getElementById('workflow-run-detail');
+    if (!res.ok) { el.innerHTML = '<p class="hint">Failed to load run.</p>'; return; }
+    const data = await res.json();
+    const run = data.run;
+    const items = data.items || [];
+    const itemTitleByRunId = {};
+    items.forEach(i => { itemTitleByRunId[i.id] = i.title || i.item_key; });
+
+    const itemRows = items.map(i => `
+        <tr>
+            <td>${escapeHtml(i.title || i.item_key)}</td>
+            <td><span class="status-badge status-${escapeHtml(i.status)}">${escapeHtml(i.status)}</span></td>
+            <td>${(i.branches || []).map(escapeHtml).join(', ') || '<span style="color:var(--muted)">—</span>'}</td>
+            <td>${i.error ? escapeHtml(i.error) : ''}</td>
+        </tr>
+    `).join('');
+
+    const stepRows = (data.steps || []).map(s => `
+        <tr>
+            <td>${s.item_run_id ? escapeHtml(itemTitleByRunId[s.item_run_id] || s.item_run_id) : '<span style="color:var(--muted)">main line</span>'}</td>
+            <td>${s.branch_key ? escapeHtml(s.branch_key) : '—'}</td>
+            <td>${s.position}</td>
+            <td>${escapeHtml(s.agent_name)}</td>
+            <td><span class="status-badge status-${escapeHtml(s.status)}">${escapeHtml(s.status)}</span></td>
+        </tr>
+    `).join('');
+
+    el.innerHTML = `
+        <h3>${escapeHtml(run.workflow_name)} — <span class="status-badge status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></h3>
+        <p class="hint">Trigger: ${escapeHtml(run.trigger)} · Started: ${run.started_at ? escapeHtml(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + escapeHtml(new Date(run.finished_at).toLocaleString()) : ''}</p>
+        ${run.summary ? `<p>${escapeHtml(run.summary)}</p>` : ''}
+        ${run.error ? `<p class="error">${escapeHtml(run.error)}</p>` : ''}
+        <h4>Items</h4>
+        <table><thead><tr><th>Item</th><th>Status</th><th>Branches taken</th><th>Error</th></tr></thead>
+            <tbody>${itemRows || '<tr><td colspan="4" style="color:var(--muted)">No items.</td></tr>'}</tbody></table>
+        <h4>Steps</h4>
+        <table><thead><tr><th>Item</th><th>Branch</th><th>#</th><th>Agent</th><th>Status</th></tr></thead>
+            <tbody>${stepRows || '<tr><td colspan="5" style="color:var(--muted)">No steps recorded.</td></tr>'}</tbody></table>
+    `;
 }
 
 async function loadOrchestrator() {
@@ -1217,6 +1591,8 @@ loadAgents();
 loadWhoami();
 loadOrchestrator();
 loadModel();
+loadWorkflows();
+loadWorkflowRuns();
 </script>
 </body>
 </html>

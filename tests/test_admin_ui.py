@@ -224,6 +224,10 @@ async def main() -> None:
         # Table structure
         check("agents tbody present", find(coll, "tbody", id="agents-tbody") is not None)
         check("skills tbody present", find(coll, "tbody", id="skills-tbody") is not None)
+        check("workflows tbody present",
+              find(coll, "tbody", id="workflows-tbody") is not None)
+        check("workflow runs tbody present",
+              find(coll, "tbody", id="workflow-runs-tbody") is not None)
         check("orchestrator textarea", find(coll, "textarea", id="orch-instructions") is not None)
         # Run prompts carry multi-line content (e.g. mermaid syntax templates the
         # model must copy). A single-line <input> silently strips the newlines on
@@ -295,6 +299,11 @@ async def main() -> None:
             "a.name !== currentName" in js,
         )
         check("model options are rendered", "renderAgentModelOptions" in js)
+        check("workflow steps are collected on save", "collectWorkflowSteps()" in js)
+        check("workflow branches are collected on save",
+              "collectWorkflowBranches()" in js)
+        check("run-now posts to the workflow run endpoint",
+              "/workflows/${id}/run" in js or "/workflows/' + id + '/run" in js)
 
         if shutil.which("node") is None:
             check("node available", False, "node not on PATH, skipping syntax check")
@@ -494,6 +503,34 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         assert r.status_code == 201, r.text
         uiskill_id = r.json()["id"]
 
+        # Pre-create one workflow (referencing the fixture agent above) and
+        # trigger a run, so the id=1 endpoints -- including the run detail
+        # view -- return 200 rather than 404.
+        r = await client.post(
+            "/admin/api/workflows",
+            json={
+                "name": "uiworkflow",
+                "description": "UI-flow test workflow.",
+                "api_slug": "uiworkflow",
+                "steps": [
+                    {"branch_key": None, "position": 1, "agent_name": "uitest",
+                     "instructions": "do it", "fan_out": False,
+                     "step_timeout_seconds": 600},
+                ],
+            },
+        )
+        assert r.status_code == 201, r.text
+        uiworkflow_id = r.json()["id"]
+
+        r = await client.post(f"/admin/api/workflows/{uiworkflow_id}/run")
+        assert r.status_code in (200, 202), r.text
+        uiworkflow_run_id = r.json()["run_id"]
+
+        import agents.workflow_runner as _wr  # noqa: PLC0415
+
+        await asyncio.gather(*[t for t in _wr._tasks if not t.done()],
+                             return_exceptions=True)
+
         # We need the fixture agent to survive until the DELETE call, so
         # sort with DELETE last.
         def _order(item: tuple[str, str]) -> tuple[int, str, str]:
@@ -503,6 +540,10 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         for method, path in sorted(discovered, key=_order):
             test_path = path.replace("/agents/1", f"/agents/{uitest_id}")
             test_path = test_path.replace("/skills/1", f"/skills/{uiskill_id}")
+            test_path = test_path.replace("/workflows/1", f"/workflows/{uiworkflow_id}")
+            test_path = test_path.replace(
+                "/workflow-runs/1", f"/workflow-runs/{uiworkflow_run_id}"
+            )
             body = None
             if method == "POST" and test_path.endswith("/skills"):
                 body = {
@@ -537,6 +578,28 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 }
             elif method == "PUT" and test_path.endswith("/orchestrator"):
                 body = {"instructions": "UI flow orchestrator instructions."}
+            elif method == "POST" and test_path.endswith("/workflows"):
+                body = {
+                    "name": "flow-workflow",
+                    "description": "Created via UI flow test.",
+                    "api_slug": "flow-workflow",
+                    "steps": [
+                        {"branch_key": None, "position": 1, "agent_name": "uitest",
+                         "instructions": "do it", "fan_out": False,
+                         "step_timeout_seconds": 600},
+                    ],
+                }
+            elif method == "PUT" and "/workflows/" in test_path:
+                body = {
+                    "name": "uiworkflow",
+                    "description": "Edited via UI flow test.",
+                    "api_slug": "uiworkflow",
+                    "steps": [
+                        {"branch_key": None, "position": 1, "agent_name": "uitest",
+                         "instructions": "edited", "fan_out": False,
+                         "step_timeout_seconds": 600},
+                    ],
+                }
             elif method == "POST" and test_path.endswith("/import"):
                 body = {
                     "orchestrator_instructions": "Imported.",
