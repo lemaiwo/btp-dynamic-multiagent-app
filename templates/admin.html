@@ -320,6 +320,16 @@
                 <div id="agent-skills" style="border:1px solid var(--border);border-radius:6px;padding:8px;max-height:160px;overflow-y:auto"></div>
             </label>
             <label class="full">
+                Can consult <span style="color:var(--muted);font-weight:normal">(optional — other agents this one may ask directly, without going through the orchestrator)</span>
+                <div id="agent-peers" style="border:1px solid var(--border);border-radius:6px;padding:8px;max-height:160px;overflow-y:auto"></div>
+            </label>
+            <label class="full">
+                Model <span style="color:var(--muted);font-weight:normal">(optional — leave on "Use the active model" unless this agent needs its own, e.g. a cheaper one for simple triage)</span>
+                <select id="agent-model-name">
+                    <option value="">Use the active model</option>
+                </select>
+            </label>
+            <label class="full">
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
             </label>
@@ -633,6 +643,46 @@ function collectAgentSkills() {
         .map(cb => cb.value);
 }
 
+function renderAgentPeerChecks(selected, currentName) {
+    const container = document.getElementById('agent-peers');
+    // An agent consulting itself would be an immediate loop, so it is never
+    // offered. The backend skips it too; this just avoids showing a dead option.
+    const others = allAgents.filter(a => a.name !== currentName);
+    if (others.length === 0) {
+        container.innerHTML = '<span style="color:var(--muted)">No other agents defined yet.</span>';
+        return;
+    }
+    container.innerHTML = others.map(a => `
+        <label style="margin:2px 0;font-weight:normal;display:flex;gap:6px;align-items:baseline">
+            <input type="checkbox" class="agent-peer-check" value="${escapeHtml(a.name)}"
+                   ${selected.includes(a.name) ? 'checked' : ''}>
+            <span><strong>${escapeHtml(a.name)}</strong>
+                <span style="color:var(--muted)"> — ${escapeHtml(a.description)}</span></span>
+        </label>
+    `).join('');
+}
+
+function collectAgentPeers() {
+    return Array.from(document.querySelectorAll('#agent-peers .agent-peer-check'))
+        .filter(cb => cb.checked)
+        .map(cb => cb.value);
+}
+
+async function renderAgentModelOptions(selected) {
+    const sel = document.getElementById('agent-model-name');
+    const res = await api('/model');
+    let available = [];
+    if (res.ok) {
+        const data = await res.json();
+        available = data.available || [];
+    }
+    sel.innerHTML = '<option value="">Use the active model</option>' +
+        available.map(m =>
+            `<option value="${escapeHtml(m)}" ${m === selected ? 'selected' : ''}>${escapeHtml(m)}</option>`
+        ).join('');
+    sel.value = selected || '';
+}
+
 function openSkillModal() {
     document.getElementById('skill-modal-title').textContent = 'New skill';
     document.getElementById('skill-id').value = '';
@@ -695,7 +745,7 @@ async function loadOrchestrator() {
     document.getElementById('orch-instructions').value = data.instructions;
 }
 
-function openAgentModal() {
+async function openAgentModal() {
     document.getElementById('modal-title').textContent = 'New agent';
     document.getElementById('agent-id').value = '';
     document.getElementById('agent-name').value = '';
@@ -703,6 +753,8 @@ function openAgentModal() {
     document.getElementById('agent-instructions').value = '';
     renderMcpServers([]);
     renderAgentSkillChecks([]);
+    renderAgentPeerChecks([], '');
+    await renderAgentModelOptions('');
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-expose-api').checked = false;
@@ -819,6 +871,8 @@ async function editAgent(id) {
         : [{url: a.mcp_url || '', auth_mode: a.auth_mode || 'jwt'}];
     renderMcpServers(servers);
     renderAgentSkillChecks(a.skills || []);
+    renderAgentPeerChecks(a.peers || [], a.name);
+    await renderAgentModelOptions(a.model_name || '');
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
@@ -844,6 +898,8 @@ async function saveAgent() {
         instructions: document.getElementById('agent-instructions').value.trim(),
         mcp_servers: servers,
         skills: collectAgentSkills(),
+        peers: collectAgentPeers(),
+        model_name: document.getElementById('agent-model-name').value,
         enabled: document.getElementById('agent-enabled').checked,
         expose_chat: document.getElementById('agent-expose-chat').checked,
         expose_api: document.getElementById('agent-expose-api').checked,

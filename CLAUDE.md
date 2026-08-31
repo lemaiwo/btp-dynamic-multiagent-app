@@ -68,7 +68,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps. Attached skills are listed
   (name + description) in the specialist's system prompt; full content is
-  served on demand via a per-specialist `load_skill` tool
+  served on demand via a per-specialist `load_skill` tool. Agents may list
+  `peers` (other agents' names); a second build pass attaches a delegation
+  tool per peer to that agent, so a chain can run specialist to specialist
+  instead of through the orchestrator. Recursion is bounded by
+  `AGENT_DELEGATION_MAX_DEPTH` and a re-entry guard. `AgentConfig.model_name`
+  overrides the globally active model per agent
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/admin.py` — FastAPI `/admin` router: agent + skill CRUD, reload,
