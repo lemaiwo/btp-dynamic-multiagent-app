@@ -51,14 +51,23 @@ from agents.db import (
     SessionLocal,
     delete_agent,
     delete_skill,
+    delete_workflow,
     get_active_model_name,
     get_agent,
     get_agent_by_slug,
     get_orchestrator_instructions,
     get_skill,
     get_skill_by_name,
+    get_workflow,
+    get_workflow_by_name,
+    get_workflow_parts,
+    get_workflow_run,
     list_agents,
+    list_item_runs,
     list_skills,
+    list_step_runs,
+    list_workflow_runs,
+    list_workflows,
     normalize_skills_json,
     prepare_servers,
     rename_skill_references,
@@ -66,9 +75,12 @@ from agents.db import (
     set_orchestrator_instructions,
     upsert_agent,
     upsert_skill,
+    upsert_workflow,
 )
 from agents.registry import registry
 from agents.shared import available_models, default_model_name
+from agents.workflow_runner import RunRefused as WorkflowRunRefused
+from agents.workflow_runner import start_workflow_run
 
 logger = logging.getLogger(__name__)
 
@@ -475,6 +487,35 @@ class ImportPayload(BaseModel):
     skills: list[SkillPayload] = Field(default_factory=list)
     agents: list[AgentPayload] = Field(default_factory=list)
     replace: bool = False  # if true, delete agents/skills not in the import
+
+
+class WorkflowBranchPayload(BaseModel):
+    key: str = Field(min_length=1, max_length=64)
+    description: str = ""
+    position: int = 1
+
+
+class WorkflowStepPayload(BaseModel):
+    branch_key: str | None = None
+    position: int
+    agent_name: str = Field(min_length=1, max_length=64)
+    instructions: str = ""
+    fan_out: bool = False
+    step_timeout_seconds: int = 600
+
+
+class WorkflowPayload(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    description: str = ""
+    api_slug: str = ""
+    run_as_principal: str = ""
+    run_timeout_seconds: int = 1800
+    skip_seen_items: bool = True
+    max_parallel_items: int = 1
+    on_unknown_branch: str = "fail"
+    enabled: bool = True
+    branches: list[WorkflowBranchPayload] = Field(default_factory=list)
+    steps: list[WorkflowStepPayload] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -884,6 +925,132 @@ async def api_delete_skill(skill_id: int) -> None:
         ok = await delete_skill(session, skill_id)
         if not ok:
             raise HTTPException(status_code=404, detail="Skill not found")
+
+
+# ---------------------------------------------------------------------------
+# Workflows
+# ---------------------------------------------------------------------------
+async def _save_workflow(payload: WorkflowPayload, workflow_id: int | None):
+    """Shared create/update body. ValueError from the DB layer is a 400.
+
+    Every save-time rule lives in validate_workflow_parts, so surfacing its
+    message verbatim is what tells an operator which step is wrong.
+    """
+    async with SessionLocal() as session:
+        if workflow_id is not None:
+            existing = await get_workflow(session, workflow_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Workflow not found")
+            if existing.name != payload.name:
+                clash = await get_workflow_by_name(session, payload.name)
+                if clash is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Workflow name '{payload.name}' already exists",
+                    )
+                existing.name = payload.name
+                await session.commit()
+        try:
+            row = await upsert_workflow(
+                session,
+                name=payload.name,
+                description=payload.description,
+                api_slug=payload.api_slug,
+                run_as_principal=payload.run_as_principal,
+                run_timeout_seconds=payload.run_timeout_seconds,
+                skip_seen_items=payload.skip_seen_items,
+                max_parallel_items=payload.max_parallel_items,
+                on_unknown_branch=payload.on_unknown_branch,
+                enabled=payload.enabled,
+                branches=[b.model_dump() for b in payload.branches],
+                steps=[s.model_dump() for s in payload.steps],
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        branches, steps = await get_workflow_parts(session, row.id)
+        return {
+            **row.to_dict(),
+            "branches": [b.to_dict() for b in branches],
+            "steps": [s.to_dict() for s in steps],
+        }
+
+
+@router.get("/api/workflows", dependencies=[Depends(require_admin)])
+async def api_list_workflows() -> list[dict[str, Any]]:
+    async with SessionLocal() as session:
+        return [w.to_dict() for w in await list_workflows(session)]
+
+
+@router.post("/api/workflows", status_code=status.HTTP_201_CREATED,
+             dependencies=[Depends(require_admin)])
+async def api_create_workflow(payload: WorkflowPayload) -> dict[str, Any]:
+    return await _save_workflow(payload, None)
+
+
+@router.get("/api/workflows/{workflow_id}", dependencies=[Depends(require_admin)])
+async def api_get_workflow(workflow_id: int) -> dict[str, Any]:
+    async with SessionLocal() as session:
+        row = await get_workflow(session, workflow_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        branches, steps = await get_workflow_parts(session, workflow_id)
+        return {
+            **row.to_dict(),
+            "branches": [b.to_dict() for b in branches],
+            "steps": [s.to_dict() for s in steps],
+        }
+
+
+@router.put("/api/workflows/{workflow_id}", dependencies=[Depends(require_admin)])
+async def api_update_workflow(workflow_id: int, payload: WorkflowPayload) -> dict[str, Any]:
+    return await _save_workflow(payload, workflow_id)
+
+
+@router.delete("/api/workflows/{workflow_id}",
+               status_code=status.HTTP_204_NO_CONTENT,
+               dependencies=[Depends(require_admin)])
+async def api_delete_workflow(workflow_id: int) -> None:
+    async with SessionLocal() as session:
+        if not await delete_workflow(session, workflow_id):
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+
+@router.post("/api/workflows/{workflow_id}/run", dependencies=[Depends(require_admin)])
+async def api_run_workflow_now(workflow_id: int) -> dict[str, str]:
+    async with SessionLocal() as session:
+        row = await get_workflow(session, workflow_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+    try:
+        run_id = await start_workflow_run(row, trigger="manual")
+    except WorkflowRunRefused as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"run_id": run_id}
+
+
+@router.get("/api/workflow-runs", dependencies=[Depends(require_admin)])
+async def api_list_workflow_runs(
+    limit: int = Query(default=50, ge=1, le=200),
+    workflow_id: int | None = Query(default=None),
+) -> list[dict[str, Any]]:
+    async with SessionLocal() as session:
+        rows = await list_workflow_runs(session, limit=limit, workflow_id=workflow_id)
+        return [r.to_dict() for r in rows]
+
+
+@router.get("/api/workflow-runs/{run_id}", dependencies=[Depends(require_admin)])
+async def api_get_workflow_run(run_id: str) -> dict[str, Any]:
+    async with SessionLocal() as session:
+        row = await get_workflow_run(session, run_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        items = await list_item_runs(session, run_id)
+        steps = await list_step_runs(session, run_id)
+        return {
+            "run": row.to_dict(),
+            "items": [i.to_dict() for i in items],
+            "steps": [s.to_dict() for s in steps],
+        }
 
 
 # ---------------------------------------------------------------------------
