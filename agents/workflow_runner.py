@@ -353,12 +353,25 @@ async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
 
 
 async def _run_main_line(run_id, workflow, branches, steps, agent_rows) -> None:
-    """Run the main line. Fan-out and branches arrive in later tasks."""
+    """Run the pre-fan-out steps once, then every item through the rest."""
     main_line = sorted(
         [s for s in steps if s.branch_key is None], key=lambda s: s.position
     )
+    branch_steps: dict[str, list] = {}
+    for s in steps:
+        if s.branch_key is not None:
+            branch_steps.setdefault(s.branch_key, []).append(s)
+    for group in branch_steps.values():
+        group.sort(key=lambda s: s.position)
+
+    fan_index = next(
+        (i for i, s in enumerate(main_line) if s.fan_out), None
+    )
+    before = main_line if fan_index is None else main_line[:fan_index]
+    after = [] if fan_index is None else main_line[fan_index + 1:]
+
     previous: list[tuple[str, str]] = []
-    for step in main_line:
+    for step in before:
         try:
             output = await _run_step(
                 run_id=run_id, item_run_id=None, step=step,
@@ -368,5 +381,100 @@ async def _run_main_line(run_id, workflow, branches, steps, agent_rows) -> None:
         except _WorkflowError as e:
             await _finalize(run_id, status="failed", error=str(e))
             return
-        previous = [(step.agent_name, output if isinstance(output, str) else str(output))]
-    await _finalize(run_id, status="success", summary="Completed.")
+        previous = [(step.agent_name, str(output))]
+
+    if fan_index is None:
+        # No fan-out step: a linear main line that runs once, with no items.
+        await _finalize(run_id, status="success", summary="Completed.")
+        return
+
+    fan_step = main_line[fan_index]
+    try:
+        items = await _run_step(
+            run_id=run_id, item_run_id=None, step=fan_step,
+            agent_row=agent_rows[fan_step.agent_name], workflow=workflow,
+            prompt=build_prompt(fan_step.instructions, previous)
+                   + branch_catalogue(branches),
+            output_type=list[WorkItem],
+        )
+    except _WorkflowError as e:
+        await _finalize(run_id, status="failed", error=str(e))
+        return
+
+    await _run_items(run_id, workflow, branches, branch_steps, after,
+                     agent_rows, fan_step, list(items or []))
+
+
+async def _run_items(run_id, workflow, branches, branch_steps, after,
+                     agent_rows, fan_step, items) -> None:
+    """Run every discovered item through the post-fan-out steps."""
+    counts = {"items_total": len(items), "items_succeeded": 0,
+              "items_failed": 0, "items_skipped": 0}
+    semaphore = asyncio.Semaphore(max(1, workflow.max_parallel_items))
+    lock = asyncio.Lock()
+
+    async def process(item: WorkItem) -> None:
+        async with semaphore:
+            if workflow.skip_seen_items:
+                async with SessionLocal() as session:
+                    seen = await item_succeeded_before(
+                        session, workflow_id=workflow.id, item_key=item.id
+                    )
+                if seen:
+                    async with SessionLocal() as session:
+                        item_run = await create_item_run(
+                            session, run_id=run_id, item_key=item.id,
+                            title=item.title, branches=item.branches,
+                        )
+                        await finish_item_run(session, item_run.id, status="skipped")
+                    async with lock:
+                        counts["items_skipped"] += 1
+                    return
+
+            async with SessionLocal() as session:
+                item_run = await create_item_run(
+                    session, run_id=run_id, item_key=item.id,
+                    title=item.title, branches=item.branches,
+                )
+            try:
+                sources = await _run_item_branches(
+                    run_id, workflow, branches, branch_steps, agent_rows,
+                    item, item_run.id, fan_step,
+                )
+                for step in after:
+                    output = await _run_step(
+                        run_id=run_id, item_run_id=item_run.id, step=step,
+                        agent_row=agent_rows[step.agent_name], workflow=workflow,
+                        prompt=build_prompt(step.instructions, sources),
+                    )
+                    sources = [(step.agent_name, str(output))]
+            except _WorkflowError as e:
+                async with SessionLocal() as session:
+                    await finish_item_run(session, item_run.id, status="failed",
+                                          error=str(e))
+                async with lock:
+                    counts["items_failed"] += 1
+                return
+            async with SessionLocal() as session:
+                await finish_item_run(session, item_run.id, status="success")
+            async with lock:
+                counts["items_succeeded"] += 1
+
+    await asyncio.gather(*(process(i) for i in items))
+
+    if counts["items_failed"]:
+        status = "partial" if counts["items_succeeded"] or counts["items_skipped"] else "failed"
+    else:
+        status = "success"
+    summary = (
+        f"{counts['items_total']} item(s): {counts['items_succeeded']} succeeded, "
+        f"{counts['items_failed']} failed, {counts['items_skipped']} skipped."
+    )
+    await _finalize(run_id, status=status, summary=summary, counts=counts)
+
+
+async def _run_item_branches(run_id, workflow, branches, branch_steps,
+                             agent_rows, item, item_run_id,
+                             fan_step) -> list[tuple[str, str]]:
+    """Branches arrive in the next task; for now hand the item text straight on."""
+    return [(fan_step.agent_name, item.text)]
