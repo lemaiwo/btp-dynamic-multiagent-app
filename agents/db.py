@@ -533,6 +533,142 @@ class WorkflowStep(Base):
         }
 
 
+class WorkflowRun(Base):
+    """One execution of a workflow.
+
+    Created before the run starts so the row doubles as the overlap lock, the
+    same way JobRun does: a second trigger while one is running is refused
+    rather than double-hitting the target systems.
+    """
+
+    __tablename__ = "workflow_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    workflow_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    items_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    items_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    scheduler_job_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_schedule_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    scheduler_host: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "workflow_id": self.workflow_id,
+            "workflow_name": self.workflow_name,
+            "trigger": self.trigger,
+            "status": self.status,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            "items_total": self.items_total,
+            "items_succeeded": self.items_succeeded,
+            "items_failed": self.items_failed,
+            "items_skipped": self.items_skipped,
+            "summary": self.summary,
+            "error": self.error,
+            "created_by": self.created_by,
+        }
+
+
+class WorkflowItemRun(Base):
+    """One work item flowing through a workflow run."""
+
+    __tablename__ = "workflow_item_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    workflow_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    # The fan-out step's stable key for this item (e.g. a Gmail message id).
+    # Repeat-run safety looks items up by (workflow_id, item_key).
+    item_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Which branches the reader selected. Stored so the routing decision is
+    # auditable and correctable rather than buried in a model's reasoning.
+    branches_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def branches(self) -> list[str]:
+        if not self.branches_json:
+            return []
+        try:
+            data = json.loads(self.branches_json)
+        except Exception:
+            logger.warning("Malformed branches_json on item run %s", self.id)
+            return []
+        return [str(b) for b in data] if isinstance(data, list) else []
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "workflow_run_id": self.workflow_run_id,
+            "item_key": self.item_key,
+            "title": self.title,
+            "branches": self.branches,
+            "status": self.status,
+            "error": self.error,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+        }
+
+
+class WorkflowStepRun(Base):
+    """One agent invocation inside a workflow run."""
+
+    __tablename__ = "workflow_step_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # Null for steps that run before the fan-out, i.e. once per run.
+    item_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    branch_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "item_run_id": self.item_run_id,
+            "branch_key": self.branch_key,
+            "position": self.position,
+            "agent_name": self.agent_name,
+            "status": self.status,
+            "output": self.output,
+            "error": self.error,
+        }
+
+
 class JobRun(Base):
     """One API-triggered execution of an agent.
 
@@ -1396,6 +1532,233 @@ async def delete_workflow(session: AsyncSession, workflow_id: int) -> bool:
     await session.delete(row)
     await session.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Workflow run records
+# ---------------------------------------------------------------------------
+async def create_workflow_run(
+    session: AsyncSession,
+    *,
+    workflow: Workflow,
+    trigger: str,
+    created_by: str | None = None,
+    scheduler: dict[str, str] | None = None,
+) -> WorkflowRun:
+    row = WorkflowRun(
+        id=str(uuid.uuid4()),
+        workflow_id=workflow.id,
+        workflow_name=workflow.name,
+        trigger=trigger,
+        status=ACTIVE_RUN_STATUS,
+        started_at=datetime.now(timezone.utc),
+        created_by=created_by,
+        scheduler_job_id=(scheduler or {}).get("job_id"),
+        scheduler_schedule_id=(scheduler or {}).get("schedule_id"),
+        scheduler_run_id=(scheduler or {}).get("run_id"),
+        scheduler_host=(scheduler or {}).get("host"),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def finish_workflow_run(
+    session: AsyncSession,
+    run_id: str,
+    *,
+    status: str,
+    summary: str | None = None,
+    error: str | None = None,
+    counts: dict[str, int] | None = None,
+) -> None:
+    row = await session.get(WorkflowRun, run_id)
+    if row is None:
+        return
+    row.status = status
+    row.summary = summary
+    row.error = error
+    for key, value in (counts or {}).items():
+        setattr(row, key, int(value))
+    row.finished_at = datetime.now(timezone.utc)
+    await session.commit()
+
+
+async def create_item_run(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    item_key: str,
+    title: str,
+    branches: list[str],
+) -> WorkflowItemRun:
+    parent = await session.get(WorkflowRun, run_id)
+    row = WorkflowItemRun(
+        id=str(uuid.uuid4()),
+        workflow_run_id=run_id,
+        workflow_id=parent.workflow_id if parent is not None else 0,
+        item_key=item_key[:255],
+        title=title,
+        branches_json=json.dumps(branches) if branches else None,
+        status=ACTIVE_RUN_STATUS,
+        started_at=datetime.now(timezone.utc),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def finish_item_run(
+    session: AsyncSession, item_run_id: str, *, status: str, error: str | None = None
+) -> None:
+    row = await session.get(WorkflowItemRun, item_run_id)
+    if row is None:
+        return
+    row.status = status
+    row.error = error
+    row.finished_at = datetime.now(timezone.utc)
+    await session.commit()
+
+
+async def create_step_run(
+    session: AsyncSession,
+    *,
+    run_id: str,
+    item_run_id: str | None,
+    branch_key: str | None,
+    position: int,
+    agent_name: str,
+) -> WorkflowStepRun:
+    row = WorkflowStepRun(
+        id=str(uuid.uuid4()),
+        workflow_run_id=run_id,
+        item_run_id=item_run_id,
+        branch_key=branch_key,
+        position=position,
+        agent_name=agent_name,
+        status=ACTIVE_RUN_STATUS,
+        started_at=datetime.now(timezone.utc),
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def finish_step_run(
+    session: AsyncSession,
+    step_run_id: str,
+    *,
+    status: str,
+    output: str | None = None,
+    error: str | None = None,
+) -> None:
+    row = await session.get(WorkflowStepRun, step_run_id)
+    if row is None:
+        return
+    row.status = status
+    row.output = output
+    row.error = error
+    row.finished_at = datetime.now(timezone.utc)
+    await session.commit()
+
+
+async def get_workflow_run(session: AsyncSession, run_id: str) -> WorkflowRun | None:
+    return await session.get(WorkflowRun, run_id)
+
+
+async def list_workflow_runs(
+    session: AsyncSession, *, limit: int = 50, workflow_id: int | None = None
+) -> list[WorkflowRun]:
+    stmt = select(WorkflowRun).order_by(WorkflowRun.started_at.desc()).limit(limit)
+    if workflow_id is not None:
+        stmt = stmt.where(WorkflowRun.workflow_id == workflow_id)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def list_item_runs(session: AsyncSession, run_id: str) -> list[WorkflowItemRun]:
+    result = await session.execute(
+        select(WorkflowItemRun)
+        .where(WorkflowItemRun.workflow_run_id == run_id)
+        .order_by(WorkflowItemRun.started_at, WorkflowItemRun.id)
+    )
+    return list(result.scalars().all())
+
+
+async def list_step_runs(session: AsyncSession, run_id: str) -> list[WorkflowStepRun]:
+    result = await session.execute(
+        select(WorkflowStepRun)
+        .where(WorkflowStepRun.workflow_run_id == run_id)
+        .order_by(WorkflowStepRun.started_at, WorkflowStepRun.id)
+    )
+    return list(result.scalars().all())
+
+
+async def active_workflow_run(
+    session: AsyncSession, workflow_id: int
+) -> WorkflowRun | None:
+    result = await session.execute(
+        select(WorkflowRun).where(
+            WorkflowRun.workflow_id == workflow_id,
+            WorkflowRun.status == ACTIVE_RUN_STATUS,
+        )
+    )
+    return result.scalars().first()
+
+
+async def item_succeeded_before(
+    session: AsyncSession, *, workflow_id: int, item_key: str
+) -> bool:
+    """Has this workflow already completed this item successfully?
+
+    Per workflow, not global: the same email may legitimately be processed by
+    two different workflows.
+    """
+    result = await session.execute(
+        select(WorkflowItemRun.id).where(
+            WorkflowItemRun.workflow_id == workflow_id,
+            WorkflowItemRun.item_key == item_key,
+            WorkflowItemRun.status == "success",
+        ).limit(1)
+    )
+    return result.scalars().first() is not None
+
+
+async def sweep_stale_workflow_runs(
+    session: AsyncSession, *, all_running: bool = False
+) -> int:
+    """Mark leftover `running` rows interrupted. Returns how many were swept.
+
+    A run row is the overlap lock, so a row left `running` by a hard crash
+    would wedge the workflow until someone noticed.
+    """
+    result = await session.execute(
+        select(WorkflowRun).where(WorkflowRun.status == ACTIVE_RUN_STATUS)
+    )
+    rows = list(result.scalars().all())
+    if not all_running:
+        return len(rows)
+    for row in rows:
+        row.status = "interrupted"
+        row.error = "Run was still marked running at startup; marked interrupted."
+        row.finished_at = datetime.now(timezone.utc)
+    items = await session.execute(
+        select(WorkflowItemRun).where(WorkflowItemRun.status == ACTIVE_RUN_STATUS)
+    )
+    for item in items.scalars().all():
+        item.status = "interrupted"
+        item.finished_at = datetime.now(timezone.utc)
+    steps = await session.execute(
+        select(WorkflowStepRun).where(WorkflowStepRun.status == ACTIVE_RUN_STATUS)
+    )
+    for step in steps.scalars().all():
+        step.status = "interrupted"
+        step.finished_at = datetime.now(timezone.utc)
+    await session.commit()
+    return len(rows)
 
 
 async def get_orchestrator_instructions(session: AsyncSession) -> str:
