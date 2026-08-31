@@ -41,10 +41,16 @@ from agents.auth import (  # noqa: E402
     public_base_url,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
-from agents.db import SessionLocal, init_db, sweep_stale_runs  # noqa: E402
+from agents.db import (  # noqa: E402
+    SessionLocal,
+    init_db,
+    sweep_stale_runs,
+    sweep_stale_workflow_runs,
+)
 from agents.job_runner import cancel_all_runs  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
+from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
 
 SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
 
@@ -60,8 +66,11 @@ async def lifespan(app: FastAPI):
     # mid-run) — sweep them all, not just the ones past their timeout.
     async with SessionLocal() as session:
         swept = await sweep_stale_runs(session, all_running=True)
+        swept_wf = await sweep_stale_workflow_runs(session, all_running=True)
     if swept:
         logger.info("Marked %d ghost job run(s) as interrupted", swept)
+    if swept_wf:
+        logger.info("Swept %d stale workflow run(s) at startup", swept_wf)
     await seed_from_file_if_empty(SEED_FILE)
     await registry.reload()
     dynamic_chat_app.refresh()
@@ -70,6 +79,7 @@ async def lifespan(app: FastAPI):
     # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
     # rather than being killed mid-await and leaving its row `running`.
     await cancel_all_runs()
+    await cancel_all_workflow_runs()
     logger.info("Application shutdown complete")
 
 

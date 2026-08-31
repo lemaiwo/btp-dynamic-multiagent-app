@@ -833,15 +833,17 @@ class Registry:
             # every save, that is an easy accident to cause. Leaking the
             # clients until the next reload is the cheaper failure.
             if old is not None:
-                # Deferred import: job_runner imports this module at load
+                # Deferred import: both runners import this module at load
                 # time, so a top-level import here would be circular.
                 from agents.job_runner import _tasks as in_flight_runs
+                from agents.workflow_runner import _tasks as in_flight_workflows
 
-                if in_flight_runs:
+                busy = len(in_flight_runs) + len(in_flight_workflows)
+                if busy:
                     logger.info(
                         "Keeping %d MCP client(s) from the previous build open: "
-                        "%d job run(s) still in flight are using them.",
-                        len(old.mcp_clients), len(in_flight_runs),
+                        "%d run(s) still in flight are using them.",
+                        len(old.mcp_clients), busy,
                     )
                 else:
                     for server in old.mcp_clients:
