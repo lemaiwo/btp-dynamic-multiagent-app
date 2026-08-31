@@ -675,11 +675,21 @@ async function renderAgentModelOptions(selected) {
     if (res.ok) {
         const data = await res.json();
         available = data.available || [];
+    } else {
+        toast('Failed to load available models', 'error');
     }
-    sel.innerHTML = '<option value="">Use the active model</option>' +
+    let options = '<option value="">Use the active model</option>' +
         available.map(m =>
             `<option value="${escapeHtml(m)}" ${m === selected ? 'selected' : ''}>${escapeHtml(m)}</option>`
         ).join('');
+    // The stored override may name a model the fetch didn't return — either
+    // the fetch itself failed, or the deployment behind it was since removed.
+    // Keep it selectable and visible rather than silently falling back to
+    // "Use the active model" underneath the admin's feet.
+    if (selected && !available.includes(selected)) {
+        options += `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)} (not currently available)</option>`;
+    }
+    sel.innerHTML = options;
     sel.value = selected || '';
 }
 
