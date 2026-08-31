@@ -354,6 +354,7 @@ class AgentPayload(BaseModel):
     instructions: str = Field(min_length=1)
     mcp_servers: list[McpServerPayload] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
+    peers: list[str] = Field(default_factory=list)
     model_name: str = Field(default="", max_length=128)
     enabled: bool = True
     expose_chat: bool = True
@@ -372,6 +373,18 @@ class AgentPayload(BaseModel):
             if s and s not in cleaned:
                 cleaned.append(s)
         return cleaned
+
+    @field_validator("peers")
+    @classmethod
+    def _clean_peers(cls, v: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in v:
+            p = str(p).strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
 
     @field_validator("model_name")
     @classmethod
@@ -491,6 +504,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 instructions=payload.instructions,
                 mcp_servers=payload.to_servers_list(),
                 skills=payload.skills,
+                peers=payload.peers,
                 enabled=payload.enabled,
                 expose_chat=payload.expose_chat,
                 expose_api=payload.expose_api,
@@ -562,6 +576,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.run_prompt = payload.run_prompt.strip() or None
         row.run_timeout_seconds = payload.run_timeout_seconds
         row.model_name = payload.model_name.strip() or None
+        row.peers_json = json.dumps(payload.peers) if payload.peers else None
         await session.commit()
         await session.refresh(row)
         return row.to_dict()
@@ -951,6 +966,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     instructions=agent.instructions,
                     mcp_servers=agent.to_servers_list(),
                     skills=agent.skills,
+                    peers=agent.peers,
                     enabled=agent.enabled,
                     expose_chat=agent.expose_chat,
                     expose_api=agent.expose_api,
@@ -1046,6 +1062,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     instructions=payload.instructions,
                     mcp_servers=payload.to_servers_list(),
                     skills=payload.skills,
+                    peers=payload.peers,
                     enabled=payload.enabled,
                     expose_chat=payload.expose_chat,
                     expose_api=payload.expose_api,
