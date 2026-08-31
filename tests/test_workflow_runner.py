@@ -758,6 +758,115 @@ async def main() -> None:
           items[0].status == "success", f"{items[0].status} / {items[0].error}")
     check("the known branch still ran", agents_map["abap"].prompts != [])
 
+    print("\n== registry reload keeps MCP clients alive during a run ==")
+
+    class FakeClient:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    class FakeServer:
+        def __init__(self, client):
+            self._http_client = client
+
+    client = FakeClient()
+    old_build = BuildResult(orchestrator=None, specialists={},
+                            mcp_clients=[FakeServer(client)], configs=[])
+    registry._build = old_build
+    new_build = BuildResult(orchestrator=None, specialists={}, mcp_clients=[],
+                            configs=[])
+    real_build_fn = registry_module.build_orchestrator
+    registry_module.build_orchestrator = lambda: asyncio.sleep(0, result=new_build)
+    try:
+        async def never_ends():
+            await asyncio.sleep(3600)
+
+        sentinel = asyncio.create_task(never_ends())
+        wr._tasks.add(sentinel)
+        try:
+            await registry.reload()
+            check("client kept open while a workflow run is in flight",
+                  not client.closed)
+        finally:
+            sentinel.cancel()
+            wr._tasks.discard(sentinel)
+            await asyncio.gather(sentinel, return_exceptions=True)
+
+        registry._build = old_build
+        await registry.reload()
+        check("client closed once no workflow run is in flight", client.closed)
+    finally:
+        registry_module.build_orchestrator = real_build_fn
+
+    print("\n== cancel_all_workflow_runs records interrupted ==")
+    slow_reader = FakeAgent("reader", answers=[[]], delay=5)
+    install_specialists({"reader": slow_reader, "drafter": FakeAgent("drafter")})
+    async with SessionLocal() as s:
+        wf = await get_workflow_by_name(s, "fanout")
+    run_id = await wr.start_workflow_run(wf, trigger="manual")
+    await asyncio.sleep(0.05)
+    await wr.cancel_all_workflow_runs()
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+    check("cancelled run is interrupted", row.status == "interrupted", row.status)
+
+    print("\n== _finalize never lets a DB failure escape ==")
+    # The run row IS the overlap lock, so an exception escaping the finalizer
+    # would wedge the workflow forever AND surface only as an "exception was
+    # never retrieved" warning at GC time.
+    real_finish = wr.finish_workflow_run
+
+    async def boom(*a, **kw):
+        raise RuntimeError("pool exhausted")
+
+    wr.finish_workflow_run = boom
+    escaped = False
+    try:
+        await wr._finalize("no-such-run-id", status="failed", error="x")
+    except Exception:
+        escaped = True
+    finally:
+        wr.finish_workflow_run = real_finish
+    check("_finalize swallows a DB failure", not escaped)
+
+    print("\n== the scheduler endpoint ==")
+    # No auth setup is needed: with VCAP_SERVICES popped there is no XSUAA
+    # validator, and require_jobscheduler returns a local-dev payload. This is
+    # the same reason tests/test_admin_api.py can call these routes directly.
+    from httpx import ASGITransport, AsyncClient  # noqa: PLC0415
+
+    import app as app_module  # noqa: PLC0415
+
+    install_specialists({"reader": FakeAgent("reader", answers=[[]]),
+                         "drafter": FakeAgent("drafter")})
+    transport = ASGITransport(app=app_module.app)
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post("/api/workflows/fanout-slug/run")
+        check("unknown slug is 404", r.status_code == 404, str(r.status_code))
+
+    async with SessionLocal() as s:
+        wf = await get_workflow_by_name(s, "fanout")
+        await upsert_workflow(
+            s, name="fanout", description="d", enabled=True, branches=[],
+            api_slug="fanout-slug", skip_seen_items=False,
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 2, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    async with AsyncClient(transport=transport, base_url="http://test") as c:
+        r = await c.post("/api/workflows/fanout-slug/run")
+        check("accepted with 202", r.status_code == 202, str(r.status_code))
+        check("returns a run id", "run_id" in r.json(), r.text)
+    await asyncio.gather(*[t for t in wr._tasks if not t.done()],
+                         return_exceptions=True)
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
