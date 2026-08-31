@@ -120,6 +120,61 @@ async def main() -> None:
         row.peers_json = '["abap"]'
         await s.commit()
 
+    print("\n== second pass attaches peer tools ==")
+    async with SessionLocal() as s:
+        # "zulu" sorts after "abap", and list_agents() orders by name, so zulu's
+        # peer is built BEFORE zulu itself — the case a single-pass build gets
+        # wrong. "alpha" sorts first and consults zulu, covering the opposite
+        # order in the same build.
+        await upsert_agent(
+            s, name="zulu", description="Z specialist", instructions="z",
+            mcp_servers=servers("zulu"), peers=["abap"],
+        )
+        await upsert_agent(
+            s, name="alpha", description="A specialist", instructions="a",
+            mcp_servers=servers("alpha"), peers=["zulu"],
+        )
+        await upsert_agent(
+            s, name="lonely", description="no peers", instructions="l",
+            mcp_servers=servers("lonely"),
+        )
+
+    build = await build_with_test_model()
+    check("peer built before its consumer is attached",
+          "delegate_abap" in tool_names(build.specialists["zulu"]),
+          str(tool_names(build.specialists["zulu"])))
+    check("peer built after its consumer is attached",
+          "delegate_zulu" in tool_names(build.specialists["alpha"]),
+          str(tool_names(build.specialists["alpha"])))
+    check("an agent without peers gets no delegation tools",
+          tool_names(build.specialists["lonely"]) == [],
+          str(tool_names(build.specialists["lonely"])))
+    check("the orchestrator still delegates to every chat agent",
+          "delegate_abap" in tool_names(build.orchestrator)
+          and "delegate_lonely" in tool_names(build.orchestrator),
+          str(tool_names(build.orchestrator)))
+
+    print("\n== unusable peer names are skipped ==")
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="picky", description="odd peers", instructions="p",
+            mcp_servers=servers("picky"),
+            peers=["picky", "ghost", "disabled-one", "abap"],
+        )
+        await upsert_agent(
+            s, name="disabled-one", description="off", instructions="d",
+            mcp_servers=servers("disabled"), enabled=False,
+        )
+
+    build = await build_with_test_model()
+    picky_tools = tool_names(build.specialists["picky"])
+    check("self-reference skipped", "delegate_picky" not in picky_tools, str(picky_tools))
+    check("unknown peer skipped", "delegate_ghost" not in picky_tools, str(picky_tools))
+    check("disabled peer skipped",
+          "delegate_disabled_one" not in picky_tools, str(picky_tools))
+    check("valid peer still attached", "delegate_abap" in picky_tools, str(picky_tools))
+    check("build survives bad peers", "picky" in build.specialists)
+
     # The storage test above proves upsert_agent()/AgentConfig.peers work in
     # isolation. It would still pass even if the *admin API* silently dropped
     # peers on the way through export/import (that bug shipped for model_name
