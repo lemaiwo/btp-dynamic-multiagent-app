@@ -253,6 +253,23 @@ async def main() -> None:
           recorded.get("usage") is sentinel, str(list(recorded)))
     check("delegation returns the specialist's output", out == "done", out[:80])
 
+    # The guard checks above never reach `stack_token = _delegation_stack.set(...)`
+    # (they return before it), so they don't exercise _delegate's own reset —
+    # only the call just above does (guards pass on an empty stack, a real
+    # push happens, and the finally pops it). Prove the reset actually ran.
+    check("_delegate reset the stack on exit", stack_var.get() == ())
+
+    # And prove the practical consequence the reset exists for: a later,
+    # independent call to the same agent is not spuriously refused as a
+    # re-entry because a stale name was left on the stack.
+    pong_agent.run = recording_run
+    try:
+        out2 = await ping_tool.function(FakeCtx(sentinel), "hi again")
+    finally:
+        pong_agent.run = real_run
+    check("a later independent call to the same agent still works",
+          out2 == "done", out2[:160])
+
     print("\n== guards return text, never raise ==")
     token = stack_var.set(("pong",))
     try:
