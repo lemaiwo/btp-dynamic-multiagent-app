@@ -234,6 +234,7 @@ async def main() -> None:
         # Modal form fields
         for fid in ("agent-id", "agent-name", "agent-description",
                     "agent-instructions", "agent-enabled", "agent-run-prompt",
+                    "agent-model-name",
                     "skill-id", "skill-name", "skill-description", "skill-content"):
             found = any(
                 e[1].get("id") == fid for e in coll.elements
@@ -242,11 +243,17 @@ async def main() -> None:
             check(f"form field #{fid}", found)
 
         # Container divs the JS renders into
-        for did in ("agent-mcp-servers", "agent-skills"):
+        for did in ("agent-mcp-servers", "agent-skills", "agent-peers"):
             check(
                 f"container #{did}",
                 any(e[0] == "div" and e[1].get("id") == did for e in coll.elements),
             )
+
+        check(
+            "model override is a select, not a free-text input",
+            any(e[0] == "select" and e[1].get("id") == "agent-model-name"
+                for e in coll.elements),
+        )
 
         # Import file input
         file_input = next(
@@ -280,6 +287,14 @@ async def main() -> None:
         inline = [s for s in coll.scripts if s.strip()]
         check("exactly one inline <script>", len(inline) == 1, f"got {len(inline)}")
         js = inline[0]
+
+        check("peers are collected on save", "collectAgentPeers()" in js)
+        check("peer checkboxes are rendered", "renderAgentPeerChecks" in js)
+        check(
+            "an agent is not offered itself as a peer",
+            "a.name !== currentName" in js,
+        )
+        check("model options are rendered", "renderAgentModelOptions" in js)
 
         if shutil.which("node") is None:
             check("node available", False, "node not on PATH, skipping syntax check")
