@@ -1036,6 +1036,17 @@ function addWorkflowStepRow(step) {
     const branchKeys = Array.from(
         document.querySelectorAll('#workflow-branches .wf-branch-key')
     ).map(i => i.value.trim()).filter(Boolean);
+    // An agent that no longer exists matches no <option>, and the browser then
+    // silently selects the FIRST one. collectWorkflowSteps would submit that
+    // substitute, validation would pass (it is a real, enabled agent) and the
+    // save would succeed with a success toast -- leaving the step running a
+    // different agent, unattended, under a different principal. Carry the
+    // missing name as a selected but disabled option so the save fails loudly
+    // and names it. (A merely *disabled* agent is still in allAgents, so it
+    // matches here and is rejected clearly by the server.)
+    const missingAgent =
+        step.agent_name && !allAgents.some(a => a.name === step.agent_name)
+            ? step.agent_name : null;
     const row = document.createElement('div');
     row.className = 'wf-step-row';
     row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px;align-items:flex-start';
@@ -1047,6 +1058,9 @@ function addWorkflowStepRow(step) {
             ).join('')}
         </select>
         <select class="wf-step-agent" style="flex:0 0 170px">
+            ${missingAgent
+                ? `<option value="${escapeHtml(missingAgent)}" selected disabled>${escapeHtml(missingAgent)} (missing)</option>`
+                : ''}
             ${allAgents.map(a =>
                 `<option value="${escapeHtml(a.name)}" ${a.name === step.agent_name ? 'selected' : ''}>${escapeHtml(a.name)}</option>`
             ).join('')}
