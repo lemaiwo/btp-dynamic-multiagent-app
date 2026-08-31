@@ -528,6 +528,78 @@ async def main() -> None:
     check("dedup is per workflow", other_drafter.prompts != [],
           "the item was skipped, but it belongs to a different workflow")
 
+    print("\n== a step before the fan-out runs once and reaches its prompt ==")
+    await seed_agents(["scanner"])
+    scanner = FakeAgent("scanner", answers=["scan output"])
+    reader = FakeAgent("reader", answers=[[
+        wr.WorkItem(id="p1", title="a", branches=[], text="body one"),
+    ]])
+    drafter = FakeAgent("drafter")
+    install_specialists({"scanner": scanner, "reader": reader, "drafter": drafter})
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="prefan", description="d", enabled=True, branches=[],
+            skip_seen_items=False,
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "scanner",
+                 "instructions": "scan", "fan_out": False,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 2, "agent_name": "reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 3, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    run_id = await run_workflow("prefan")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run succeeded", row.status == "success", f"{row.status} / {row.error}")
+    check("the pre-fan-out step ran exactly once, with no item",
+          sum(1 for st in steps if st.agent_name == "scanner") == 1 and
+          all(st.item_run_id is None for st in steps if st.agent_name == "scanner"),
+          str([(st.agent_name, st.item_run_id) for st in steps]))
+    check("the fan-out step's prompt carried the pre-fan-out step's output",
+          any("scan output" in p for p in reader.prompts), str(reader.prompts))
+    check("the post-fan-out step ran once for the one item",
+          sum(1 for st in steps if st.agent_name == "drafter") == 1,
+          str([(st.agent_name, st.item_run_id) for st in steps]))
+
+    print("\n== a create_item_run failure fails only that item ==")
+    original_create_item_run = wr.create_item_run
+
+    async def flaky_create_item_run(session, *, run_id, item_key, title, branches):
+        if item_key == "boom":
+            raise ValueError("simulated create_item_run failure")
+        return await original_create_item_run(
+            session, run_id=run_id, item_key=item_key, title=title, branches=branches,
+        )
+
+    wr.create_item_run = flaky_create_item_run
+    try:
+        reader = FakeAgent("reader", answers=[[
+            wr.WorkItem(id="ok3", title="a", branches=[], text="body one"),
+            wr.WorkItem(id="boom", title="b", branches=[], text="body two"),
+        ]])
+        install_specialists({"reader": reader, "drafter": FakeAgent("drafter")})
+        run_id = await run_workflow("fanout")
+    finally:
+        wr.create_item_run = original_create_item_run
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = await list_item_runs(s, run_id)
+    check("run is partial when create_item_run raises for one item",
+          row.status == "partial", row.status)
+    check("the item whose row could not be created recorded no row",
+          all(i.item_key != "boom" for i in items), str(items))
+    check("the other item still succeeded",
+          any(i.item_key == "ok3" and i.status == "success" for i in items), str(items))
+    check("counts reflect the split",
+          (row.items_succeeded, row.items_failed) == (1, 1),
+          f"{row.items_succeeded}/{row.items_failed}")
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
