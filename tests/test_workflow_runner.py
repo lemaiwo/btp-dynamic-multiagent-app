@@ -600,6 +600,164 @@ async def main() -> None:
           (row.items_succeeded, row.items_failed) == (1, 1),
           f"{row.items_succeeded}/{row.items_failed}")
 
+    print("\n== branches ==")
+    BRANCH_STEPS = [
+        {"branch_key": None, "position": 1, "agent_name": "reader",
+         "instructions": "triage", "fan_out": True, "step_timeout_seconds": 60},
+        {"branch_key": None, "position": 2, "agent_name": "drafter",
+         "instructions": "draft the reply", "fan_out": False,
+         "step_timeout_seconds": 60},
+        {"branch_key": "abap", "position": 1, "agent_name": "abap",
+         "instructions": "analyze the dump", "fan_out": False,
+         "step_timeout_seconds": 60},
+        {"branch_key": "abap", "position": 2, "agent_name": "abap2",
+         "instructions": "review the analysis", "fan_out": False,
+         "step_timeout_seconds": 60},
+        {"branch_key": "fiori", "position": 1, "agent_name": "fiori",
+         "instructions": "analyze the ui", "fan_out": False,
+         "step_timeout_seconds": 60},
+    ]
+    BRANCH_DEFS = [
+        {"key": "abap", "description": "ABAP dumps and ST22", "position": 1},
+        {"key": "fiori", "description": "UI5 and launchpad", "position": 2},
+    ]
+    await seed_agents(["abap2"])
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="branched", description="d", enabled=True,
+            skip_seen_items=False, branches=BRANCH_DEFS, steps=BRANCH_STEPS,
+        )
+
+    def branch_agents(reader_items):
+        return {
+            "reader": FakeAgent("reader", answers=[reader_items]),
+            "abap": FakeAgent("abap", answers=["abap says dump"]),
+            "abap2": FakeAgent("abap2", answers=["abap2 confirms"]),
+            "fiori": FakeAgent("fiori", answers=["fiori says layout"]),
+            "drafter": FakeAgent("drafter", answers=["drafted"]),
+        }
+
+    print("\n-- the catalogue reaches the reader --")
+    agents_map = branch_agents([wr.WorkItem(id="c1", title="t", branches=["abap"],
+                                            text="body")])
+    install_specialists(agents_map)
+    await run_workflow("branched")
+    reader_prompt = agents_map["reader"].prompts[0]
+    check("catalogue lists every branch key",
+          "abap:" in reader_prompt and "fiori:" in reader_prompt,
+          reader_prompt[-300:])
+    check("catalogue carries the descriptions",
+          "ABAP dumps and ST22" in reader_prompt, reader_prompt[-300:])
+    check("catalogue tells the reader to pick only what is needed",
+          "only the branches" in reader_prompt.lower(), reader_prompt[-300:])
+
+    print("\n-- one branch selected runs only that branch --")
+    agents_map = branch_agents([wr.WorkItem(id="one", title="t", branches=["abap"],
+                                            text="the mail body")])
+    install_specialists(agents_map)
+    run_id = await run_workflow("branched")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run succeeded", row.status == "success", f"{row.status} / {row.error}")
+    check("the abap branch ran", agents_map["abap"].prompts != [])
+    check("the fiori branch did NOT run", agents_map["fiori"].prompts == [],
+          str(agents_map["fiori"].prompts))
+    check("branch step 1 saw the item text",
+          "the mail body" in agents_map["abap"].prompts[0],
+          agents_map["abap"].prompts[0][:200])
+    check("branch step 2 chained from step 1",
+          "abap says dump" in agents_map["abap2"].prompts[0],
+          agents_map["abap2"].prompts[0][:200])
+    check("branch step runs are tagged with the branch",
+          {st.branch_key for st in steps if st.agent_name in ("abap", "abap2")} == {"abap"},
+          str([(st.agent_name, st.branch_key) for st in steps]))
+    check("the join saw the branch tail",
+          "abap2 confirms" in agents_map["drafter"].prompts[0],
+          agents_map["drafter"].prompts[0][:250])
+
+    print("\n-- two branches selected fork and join --")
+    agents_map = branch_agents([wr.WorkItem(id="two", title="t",
+                                            branches=["fiori", "abap"],
+                                            text="mixed question")])
+    install_specialists(agents_map)
+    run_id = await run_workflow("branched")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+    join_prompt = agents_map["drafter"].prompts[0]
+    check("both branches ran",
+          agents_map["abap"].prompts != [] and agents_map["fiori"].prompts != [])
+    check("the join saw both branch outputs",
+          "abap2 confirms" in join_prompt and "fiori says layout" in join_prompt,
+          join_prompt[:300])
+    check("one From block per branch", join_prompt.count("## From ") == 2,
+          join_prompt[:300])
+    check("branches run in declared position order, not item order",
+          join_prompt.index("abap2 confirms") < join_prompt.index("fiori says layout"),
+          join_prompt[:300])
+    check("run succeeded", row.status == "success", f"{row.status} / {row.error}")
+
+    print("\n-- no branches selected goes straight to the join --")
+    agents_map = branch_agents([wr.WorkItem(id="none", title="t", branches=[],
+                                            text="plain question")])
+    install_specialists(agents_map)
+    run_id = await run_workflow("branched")
+    check("no branch ran",
+          agents_map["abap"].prompts == [] and agents_map["fiori"].prompts == [])
+    check("the join saw the item text",
+          "plain question" in agents_map["drafter"].prompts[0],
+          agents_map["drafter"].prompts[0][:200])
+
+    print("\n-- a failing branch fails its item and skips the join --")
+    agents_map = branch_agents([wr.WorkItem(id="boom", title="t",
+                                            branches=["abap", "fiori"],
+                                            text="body")])
+    agents_map["abap"] = FakeAgent("abap", fail_with=RuntimeError("ARC-1 down"))
+    install_specialists(agents_map)
+    run_id = await run_workflow("branched")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = await list_item_runs(s, run_id)
+    check("item failed", items[0].status == "failed", items[0].status)
+    check("run failed", row.status == "failed", row.status)
+    check("the later branch did not run", agents_map["fiori"].prompts == [],
+          str(agents_map["fiori"].prompts))
+    check("the join did not run", agents_map["drafter"].prompts == [],
+          str(agents_map["drafter"].prompts))
+
+    print("\n-- on_unknown_branch --")
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="branched", description="d", enabled=True,
+            skip_seen_items=False, on_unknown_branch="fail",
+            branches=BRANCH_DEFS, steps=BRANCH_STEPS,
+        )
+    agents_map = branch_agents([wr.WorkItem(id="ghost", title="t",
+                                            branches=["nope"], text="body")])
+    install_specialists(agents_map)
+    run_id = await run_workflow("branched")
+    async with SessionLocal() as s:
+        items = await list_item_runs(s, run_id)
+    check("unknown branch fails the item under 'fail'",
+          items[0].status == "failed", items[0].status)
+    check("error names the branch", "nope" in (items[0].error or ""), items[0].error)
+
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="branched", description="d", enabled=True,
+            skip_seen_items=False, on_unknown_branch="skip",
+            branches=BRANCH_DEFS, steps=BRANCH_STEPS,
+        )
+    agents_map = branch_agents([wr.WorkItem(id="ghost2", title="t",
+                                            branches=["nope", "abap"], text="body")])
+    install_specialists(agents_map)
+    run_id = await run_workflow("branched")
+    async with SessionLocal() as s:
+        items = await list_item_runs(s, run_id)
+    check("unknown branch is ignored under 'skip'",
+          items[0].status == "success", f"{items[0].status} / {items[0].error}")
+    check("the known branch still ran", agents_map["abap"].prompts != [])
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 

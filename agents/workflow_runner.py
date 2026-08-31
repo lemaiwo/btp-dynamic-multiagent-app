@@ -499,5 +499,53 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
 async def _run_item_branches(run_id, workflow, branches, branch_steps,
                              agent_rows, item, item_run_id,
                              fan_step) -> list[tuple[str, str]]:
-    """Branches arrive in the next task; for now hand the item text straight on."""
-    return [(fan_step.agent_name, item.text)]
+    """Run the branches this item selected and return one source per branch.
+
+    The branches taken are the ones the fan-out step selected, never every
+    branch declared — that is the whole point of having a cheap model read the
+    question first. Selected branches run sequentially in declared position
+    order: concurrent branches would multiply load on the target systems and
+    the model quota.
+
+    Returns one (agent_name, output) pair per branch, which the join step's
+    prompt renders as one "## From" block each. An item that selected nothing
+    yields the item text itself, so the join still has something to read.
+    """
+    by_key = {b.key: b for b in branches}
+    selected = []
+    for key in item.branches:
+        branch = by_key.get(key)
+        if branch is None:
+            if workflow.on_unknown_branch == "skip":
+                logger.info(
+                    "Workflow run %s item %s names unknown branch %r; skipping it",
+                    run_id, item.id, key,
+                )
+                continue
+            raise _WorkflowError(
+                f"Item {item.id!r} selected branch {key!r}, which this workflow "
+                f"does not declare. Declared branches: {sorted(by_key) or 'none'}."
+            )
+        if branch not in selected:
+            selected.append(branch)
+    # Declared order, not the order the reader happened to list them in, so two
+    # runs of the same item produce the same sequence.
+    selected.sort(key=lambda b: (b.position, b.id))
+
+    if not selected:
+        return [(fan_step.agent_name, item.text)]
+
+    sources: list[tuple[str, str]] = []
+    for branch in selected:
+        chained: list[tuple[str, str]] = [(fan_step.agent_name, item.text)]
+        last_agent, last_output = fan_step.agent_name, item.text
+        for step in branch_steps.get(branch.key, []):
+            output = await _run_step(
+                run_id=run_id, item_run_id=item_run_id, step=step,
+                agent_row=agent_rows[step.agent_name], workflow=workflow,
+                prompt=build_prompt(step.instructions, chained),
+            )
+            last_agent, last_output = step.agent_name, str(output)
+            chained = [(last_agent, last_output)]
+        sources.append((last_agent, last_output))
+    return sources
