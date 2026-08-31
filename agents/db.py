@@ -1190,6 +1190,13 @@ def validate_workflow_parts(
         raise ValueError(
             f"A workflow may have at most one fan-out step; found {len(fan_out_steps)}."
         )
+    for s in fan_out_steps:
+        bk = s.get("branch_key")
+        if bk is not None:
+            raise ValueError(
+                f"The fan-out step must be on the main line; step {s.get('position')} "
+                f"in branch {str(bk)!r} cannot be the fan-out step."
+            )
 
     keys: list[str] = []
     for b in branches:
@@ -1341,8 +1348,11 @@ async def upsert_workflow(
     row.max_parallel_items = max(1, int(max_parallel_items))
     row.on_unknown_branch = on_unknown_branch
     row.enabled = 1 if enabled else 0
-    await session.commit()
-    await session.refresh(row)
+    # flush (not commit): a new row's id must be assigned before the branch/
+    # step rows below can reference it, but the whole save must land in one
+    # transaction so a crash mid-save can never pair the new scalar fields
+    # with stale branches/steps.
+    await session.flush()
 
     await session.execute(
         delete(WorkflowBranch).where(WorkflowBranch.workflow_id == row.id)
