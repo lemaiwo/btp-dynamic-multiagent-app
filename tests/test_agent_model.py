@@ -288,10 +288,9 @@ async def test_export_import_via_http() -> None:
         get_resp = await client.get(f"/admin/api/agents/{agent_id}")
         check("deleted agent not found", get_resp.status_code == 404)
 
-        # 4. Re-import via POST /admin/api/import (this exercises api_import code path)
-        # Clean up the export to ensure api_slug is an empty string, not null
-        if test_agent_export:
-            test_agent_export["api_slug"] = test_agent_export.get("api_slug") or ""
+        # 4. Re-import via POST /admin/api/import (this exercises api_import
+        # code path). The export body goes back verbatim -- api_slug is null
+        # here and AgentPayload has to accept that.
         import_resp = await client.post(
             "/admin/api/import",
             json={
