@@ -354,6 +354,7 @@ class AgentPayload(BaseModel):
     instructions: str = Field(min_length=1)
     mcp_servers: list[McpServerPayload] = Field(default_factory=list)
     skills: list[str] = Field(default_factory=list)
+    model_name: str = Field(default="", max_length=128)
     enabled: bool = True
     expose_chat: bool = True
     expose_api: bool = False
@@ -371,6 +372,17 @@ class AgentPayload(BaseModel):
             if s and s not in cleaned:
                 cleaned.append(s)
         return cleaned
+
+    @field_validator("model_name")
+    @classmethod
+    def _validate_model_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            return ""
+        allowed = available_models()
+        if v not in allowed:
+            raise ValueError(f"model_name must be one of {allowed}")
+        return v
 
     @model_validator(mode="before")
     @classmethod
@@ -486,6 +498,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 run_as_principal=payload.run_as_principal,
                 run_prompt=payload.run_prompt,
                 run_timeout_seconds=payload.run_timeout_seconds,
+                model_name=payload.model_name,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -548,6 +561,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.run_as_principal = payload.run_as_principal.strip() or None
         row.run_prompt = payload.run_prompt.strip() or None
         row.run_timeout_seconds = payload.run_timeout_seconds
+        row.model_name = payload.model_name.strip() or None
         await session.commit()
         await session.refresh(row)
         return row.to_dict()

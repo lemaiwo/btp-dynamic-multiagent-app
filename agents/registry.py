@@ -384,6 +384,33 @@ class BuildResult:
     configs: list[dict]  # snapshot of AgentConfig.to_dict()
 
 
+def _model_for(row: AgentConfig, *, default_model, default_name: str, cache: dict):
+    """The model this agent should run on.
+
+    Null or blank ``model_name`` means "use the globally active model", which
+    is what every agent did before per-agent models existed. An override that
+    cannot be loaded falls back to the global model with a warning rather than
+    failing the build: one bad value must not take the whole registry down,
+    for the same reason the global resolution already falls back.
+    """
+    name = (row.model_name or "").strip()
+    if not name or name == default_name:
+        return default_model
+    if name in cache:
+        return cache[name]
+    try:
+        model = get_model(name)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Agent %s requests model %r, which could not be loaded; using the "
+            "active model %r instead. Pick a valid model in /admin to clear this.",
+            row.name, name, default_name, exc_info=True,
+        )
+        model = default_model
+    cache[name] = model
+    return model
+
+
 async def build_orchestrator() -> BuildResult:
     """Build a fresh orchestrator + specialists from the current DB state."""
     async with SessionLocal() as session:
@@ -419,6 +446,7 @@ async def build_orchestrator() -> BuildResult:
 
     specialists: dict[str, Agent] = {}
     mcp_clients: list = []
+    model_cache: dict = {}
 
     # Build the orchestrator instructions, listing only chat-visible specialists.
     # Run-only agents (expose_chat=False) are still built into `specialists`
@@ -531,7 +559,8 @@ async def build_orchestrator() -> BuildResult:
             specialist_instructions += _skills_instructions(attached_skills)
 
         specialist = Agent(
-            model,
+            _model_for(row, default_model=model, default_name=model_name,
+                       cache=model_cache),
             instructions=specialist_instructions,
             toolsets=servers,
             retries=_TOOL_RETRIES,
