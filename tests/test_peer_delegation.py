@@ -175,6 +175,96 @@ async def main() -> None:
     check("valid peer still attached", "delegate_abap" in picky_tools, str(picky_tools))
     check("build survives bad peers", "picky" in build.specialists)
 
+    print("\n== recursion guards ==")
+    from pydantic_ai import RunContext  # noqa: PLC0415
+
+    # A→B→A must not recurse. Build a mutual pair and drive the tool directly:
+    # the guards live in the tool body, so calling it is the honest test.
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="ping", description="P", instructions="p",
+            mcp_servers=servers("ping"), peers=["pong"],
+        )
+        await upsert_agent(
+            s, name="pong", description="Q", instructions="q",
+            mcp_servers=servers("pong"), peers=["ping"],
+        )
+
+    build = await build_with_test_model()
+    check("mutual peers are both wired",
+          "delegate_pong" in tool_names(build.specialists["ping"])
+          and "delegate_ping" in tool_names(build.specialists["pong"]))
+
+    stack_var = registry_module._delegation_stack
+    ping_tool = build.specialists["ping"]._function_toolset.tools["delegate_pong"]
+
+    async def call_tool(tool, query: str) -> str:
+        """Invoke a registered delegation tool the way the agent runtime does."""
+        return await tool.function(None, query)
+
+    token = stack_var.set(("pong",))
+    try:
+        out = await call_tool(ping_tool, "hello")
+    finally:
+        stack_var.reset(token)
+    check("re-entry into an agent already on the stack is refused",
+          "already" in out.lower() and "pong" in out, out[:160])
+
+    token = stack_var.set(tuple(f"a{i}" for i in range(registry_module._MAX_DELEGATION_DEPTH)))
+    try:
+        out = await call_tool(ping_tool, "hello")
+    finally:
+        stack_var.reset(token)
+    check("depth cap is refused", "depth" in out.lower() or "too many" in out.lower(),
+          out[:160])
+
+    check("stack is reset after a call", stack_var.get() == ())
+
+    print("\n== nested usage is forwarded to the parent run ==")
+
+    # Token usage from a peer must aggregate into the run that triggered it, or
+    # a chain's cost is invisible. _delegate already forwards usage=ctx.usage;
+    # this pins that it keeps doing so now that peers can trigger it.
+    class FakeUsage:
+        pass
+
+    class FakeCtx:
+        def __init__(self, usage):
+            self.usage = usage
+
+    class FakeResult:
+        output = "done"
+
+    sentinel = FakeUsage()
+    recorded: dict = {}
+    pong_agent = build.specialists["pong"]
+    real_run = pong_agent.run
+
+    async def recording_run(query, **kwargs):
+        recorded.update(kwargs)
+        return FakeResult()
+
+    pong_agent.run = recording_run
+    try:
+        out = await ping_tool.function(FakeCtx(sentinel), "hi")
+    finally:
+        pong_agent.run = real_run
+    check("nested run receives the parent's usage object",
+          recorded.get("usage") is sentinel, str(list(recorded)))
+    check("delegation returns the specialist's output", out == "done", out[:80])
+
+    print("\n== guards return text, never raise ==")
+    token = stack_var.set(("pong",))
+    try:
+        raised = False
+        try:
+            await call_tool(ping_tool, "hello")
+        except Exception:
+            raised = True
+    finally:
+        stack_var.reset(token)
+    check("re-entry does not raise", not raised)
+
     # The storage test above proves upsert_agent()/AgentConfig.peers work in
     # isolation. It would still pass even if the *admin API* silently dropped
     # peers on the way through export/import (that bug shipped for model_name
