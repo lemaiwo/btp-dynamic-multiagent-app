@@ -415,28 +415,34 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
 
     async def process(item: WorkItem) -> None:
         async with semaphore:
-            if workflow.skip_seen_items:
-                async with SessionLocal() as session:
-                    seen = await item_succeeded_before(
-                        session, workflow_id=workflow.id, item_key=item.id
-                    )
-                if seen:
-                    async with SessionLocal() as session:
-                        item_run = await create_item_run(
-                            session, run_id=run_id, item_key=item.id,
-                            title=item.title, branches=item.branches,
-                        )
-                        await finish_item_run(session, item_run.id, status="skipped")
-                    async with lock:
-                        counts["items_skipped"] += 1
-                    return
-
-            async with SessionLocal() as session:
-                item_run = await create_item_run(
-                    session, run_id=run_id, item_key=item.id,
-                    title=item.title, branches=item.branches,
-                )
+            # item_run is created inside this try, not before it: creating the
+            # row (create_item_run, in either the skip or the normal path) can
+            # itself raise, and that must fail only this item — same as a step
+            # failure — never escape process() and abort sibling items via
+            # asyncio.gather below, which has no return_exceptions=True.
+            item_run = None
             try:
+                if workflow.skip_seen_items:
+                    async with SessionLocal() as session:
+                        seen = await item_succeeded_before(
+                            session, workflow_id=workflow.id, item_key=item.id
+                        )
+                    if seen:
+                        async with SessionLocal() as session:
+                            item_run = await create_item_run(
+                                session, run_id=run_id, item_key=item.id,
+                                title=item.title, branches=item.branches,
+                            )
+                            await finish_item_run(session, item_run.id, status="skipped")
+                        async with lock:
+                            counts["items_skipped"] += 1
+                        return
+
+                async with SessionLocal() as session:
+                    item_run = await create_item_run(
+                        session, run_id=run_id, item_key=item.id,
+                        title=item.title, branches=item.branches,
+                    )
                 sources = await _run_item_branches(
                     run_id, workflow, branches, branch_steps, agent_rows,
                     item, item_run.id, fan_step,
@@ -449,9 +455,26 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
                     )
                     sources = [(step.agent_name, str(output))]
             except _WorkflowError as e:
-                async with SessionLocal() as session:
-                    await finish_item_run(session, item_run.id, status="failed",
-                                          error=str(e))
+                if item_run is not None:
+                    async with SessionLocal() as session:
+                        await finish_item_run(session, item_run.id, status="failed",
+                                              error=str(e))
+                async with lock:
+                    counts["items_failed"] += 1
+                return
+            except Exception as e:  # noqa: BLE001
+                # Anything else unexpected here — most plausibly create_item_run
+                # or item_succeeded_before hitting a DB error — is a failure of
+                # this item, not of the run. item_run may still be None (the
+                # row itself never got created), so there is nothing to mark.
+                logger.exception(
+                    "Workflow run %s item %s failed outside step handling",
+                    run_id, item.id,
+                )
+                if item_run is not None:
+                    async with SessionLocal() as session:
+                        await finish_item_run(session, item_run.id, status="failed",
+                                              error=f"{type(e).__name__}: {e}")
                 async with lock:
                     counts["items_failed"] += 1
                 return
