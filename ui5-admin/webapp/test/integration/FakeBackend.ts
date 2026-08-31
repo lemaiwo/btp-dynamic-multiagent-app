@@ -48,7 +48,21 @@ export default class FakeBackend {
     }
 
     public reset(): void {
+        // Without this, ids drift across tests: nextId is a field on this
+        // singleton instance, so any agent/skill a PRIOR test created (e.g.
+        // the "new-agent" POST in AgentJourney's first test) permanently
+        // shifts every id assigned afterwards -- silently breaking any test
+        // that opens a fixture by a hardcoded id/hash, and `this.runs` below
+        // already assumes btp-agent is id 100.
+        this.nextId = 100;
         this.agents = [this.makeAgent("btp-agent"), this.makeAgent("gmail-agent")];
+        // btp-agent carries a peer and a model override that IS in the fake
+        // GET /model list below, so it exercises the ordinary populate-on-load
+        // path. gmail-agent's override is deliberately NOT in that list, so it
+        // exercises the "stored override the fetch didn't return" path.
+        this.agents[0].peers = ["gmail-agent"];
+        this.agents[0].model_name = "gpt-4o";
+        this.agents[1].model_name = "retired-model";
         this.skills = [{
             id: 1, name: "sap-notes", description: "How to read SAP notes",
             content: "Full instructions here.", created_at: null, updated_at: null
@@ -70,7 +84,8 @@ export default class FakeBackend {
             mcp_servers: [{ url: "https://x.hana.ondemand.com/mcp", auth_mode: "jwt" }],
             skills: [], enabled: true, expose_chat: true, expose_api: false,
             api_slug: "", run_as_principal: "", run_prompt: "",
-            run_timeout_seconds: 1800, created_at: null, updated_at: null,
+            run_timeout_seconds: 1800, peers: [], model_name: "",
+            created_at: null, updated_at: null,
             mcp_url: "", auth_mode: "jwt"
         };
     }

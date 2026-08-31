@@ -92,6 +92,32 @@
                     </MultiComboBox>
                 </Panel>
 
+                <Panel headerText="{i18n>peersPanel}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>peersHint}" />
+                    <MultiComboBox
+                        id="agentPeers"
+                        width="100%"
+                        class="sapUiSmallMarginTop"
+                        showSecondaryValues="true"
+                        items="{agent>/availableAgents}"
+                        selectedKeys="{agent>/data/peers}">
+                        <core:ListItem key="{agent>name}" text="{agent>name}" additionalText="{agent>description}" />
+                    </MultiComboBox>
+                </Panel>
+
+                <Panel headerText="{i18n>modelPanel}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>modelHint}" />
+                    <Select
+                        id="agentModelName"
+                        width="100%"
+                        class="sapUiSmallMarginTop"
+                        forceSelection="false"
+                        selectedKey="{agent>/data/model_name}"
+                        items="{agent>/availableModels}">
+                        <core:Item key="{agent>key}" text="{agent>text}" />
+                    </Select>
+                </Panel>
+
                 <Panel headerText="{i18n>jobSettings}" expandable="false" class="sapUiSmallMarginTop">
                     <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
                         <Label text="{i18n>exposeApi}" />

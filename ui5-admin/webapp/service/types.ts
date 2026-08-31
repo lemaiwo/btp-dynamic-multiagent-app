@@ -99,6 +99,12 @@ export interface AgentInput {
     run_as_principal: string;
     run_prompt: string;
     run_timeout_seconds: number;
+    /** Names of other agents this one may consult directly; each becomes a
+     * `delegate_<peer>` tool on it. */
+    peers: string[];
+    /** Overrides the globally-active LLM for this agent only. Blank means
+     * "use the active model" (see `ModelInfo`, `GET /admin/api/model`). */
+    model_name: string;
 }
 
 /** What GET /admin/api/agents returns. Servers are redacted. */
