@@ -350,6 +350,184 @@ async def main() -> None:
     await asyncio.gather(*[t for t in wr._tasks if not t.done()],
                          return_exceptions=True)
 
+    print("\n== fan-out produces one item run per work item ==")
+    items_out = [
+        wr.WorkItem(id="m1", title="dump", branches=[], text="body one"),
+        wr.WorkItem(id="m2", title="ui", branches=[], text="body two"),
+    ]
+    reader = FakeAgent("reader", answers=[items_out])
+    drafter = FakeAgent("drafter")
+    install_specialists({"reader": reader, "drafter": drafter})
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="fanout", description="d", enabled=True, branches=[],
+            skip_seen_items=False,
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 2, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    run_id = await run_workflow("fanout")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = await list_item_runs(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run succeeded", row.status == "success", f"{row.status} / {row.error}")
+    check("one item run per item", len(items) == 2, str(len(items)))
+    check("item keys recorded",
+          sorted(i.item_key for i in items) == ["m1", "m2"],
+          str([i.item_key for i in items]))
+    check("counts recorded",
+          (row.items_total, row.items_succeeded, row.items_failed) == (2, 2, 0),
+          f"{row.items_total}/{row.items_succeeded}/{row.items_failed}")
+    check("fan-out step run has no item",
+          any(st.item_run_id is None and st.agent_name == "reader" for st in steps))
+    check("post-fan-out step ran once per item",
+          sum(1 for st in steps if st.agent_name == "drafter") == 2,
+          str([st.agent_name for st in steps]))
+    check("the drafter saw the item text",
+          any("body one" in p for p in drafter.prompts), str(drafter.prompts)[:200])
+
+    print("\n== an empty item list is a successful, empty run ==")
+    reader = FakeAgent("reader", answers=[[]])
+    install_specialists({"reader": reader, "drafter": FakeAgent("drafter")})
+    run_id = await run_workflow("fanout")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = await list_item_runs(s, run_id)
+    check("empty fan-out succeeds", row.status == "success", f"{row.status} / {row.error}")
+    check("zero items recorded", row.items_total == 0 and items == [], str(items))
+
+    print("\n== one failing item does not stop the others ==")
+    class PickyDrafter(FakeAgent):
+        async def run(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            if "body two" in prompt:
+                raise RuntimeError("drafting blew up")
+            return FakeResult("drafted")
+
+    reader = FakeAgent("reader", answers=[[
+        wr.WorkItem(id="ok1", title="a", branches=[], text="body one"),
+        wr.WorkItem(id="bad", title="b", branches=[], text="body two"),
+        wr.WorkItem(id="ok2", title="c", branches=[], text="body three"),
+    ]])
+    install_specialists({"reader": reader, "drafter": PickyDrafter("drafter")})
+    run_id = await run_workflow("fanout")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = await list_item_runs(s, run_id)
+    by_key = {i.item_key: i for i in items}
+    check("run is partial", row.status == "partial", row.status)
+    check("good items succeeded",
+          by_key["ok1"].status == "success" and by_key["ok2"].status == "success",
+          str({k: v.status for k, v in by_key.items()}))
+    check("bad item failed", by_key["bad"].status == "failed", by_key["bad"].status)
+    check("failure recorded on the item",
+          "blew up" in (by_key["bad"].error or ""), by_key["bad"].error)
+    check("counts reflect the split",
+          (row.items_succeeded, row.items_failed) == (2, 1),
+          f"{row.items_succeeded}/{row.items_failed}")
+
+    print("\n== a step timeout fails only its own item ==")
+
+    class SlowForOne(FakeAgent):
+        async def run(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            if "body two" in prompt:
+                await asyncio.sleep(5)  # far beyond the 1s step timeout below
+            return FakeResult("drafted")
+
+    reader = FakeAgent("reader", answers=[[
+        wr.WorkItem(id="t-ok", title="a", branches=[], text="body one"),
+        wr.WorkItem(id="t-slow", title="b", branches=[], text="body two"),
+    ]])
+    install_specialists({"reader": reader, "drafter": SlowForOne("drafter")})
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="timeouts", description="d", enabled=True, branches=[],
+            skip_seen_items=False,
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 2, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 1},
+            ],
+        )
+    run_id = await run_workflow("timeouts")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = {i.item_key: i for i in await list_item_runs(s, run_id)}
+        steps = await list_step_runs(s, run_id)
+    check("the fast item succeeded", items["t-ok"].status == "success",
+          items["t-ok"].status)
+    check("the slow item failed", items["t-slow"].status == "failed",
+          items["t-slow"].status)
+    check("the error names the timeout",
+          "timeout" in (items["t-slow"].error or "").lower(), items["t-slow"].error)
+    check("the run is partial", row.status == "partial", row.status)
+    check("the timed-out step run is recorded failed",
+          any(st.status == "failed" and "timeout" in (st.error or "").lower()
+              for st in steps),
+          str([(st.agent_name, st.status) for st in steps]))
+
+    print("\n== skip_seen_items skips an item completed before ==")
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="dedup", description="d", enabled=True, branches=[],
+            skip_seen_items=True,
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 2, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    same_items = [wr.WorkItem(id="dup1", title="a", branches=[], text="body")]
+    install_specialists({"reader": FakeAgent("reader", answers=[list(same_items)]),
+                         "drafter": FakeAgent("drafter")})
+    await run_workflow("dedup")
+    second_drafter = FakeAgent("drafter")
+    install_specialists({"reader": FakeAgent("reader", answers=[list(same_items)]),
+                         "drafter": second_drafter})
+    run_id = await run_workflow("dedup")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = await list_item_runs(s, run_id)
+    check("repeat item is skipped", items[0].status == "skipped", items[0].status)
+    check("skipped item ran no steps", second_drafter.prompts == [],
+          str(second_drafter.prompts))
+    check("skip counted", row.items_skipped == 1, str(row.items_skipped))
+    check("a run of only skips still succeeds", row.status == "success", row.status)
+
+    print("\n== the same key under a different workflow is not skipped ==")
+    other_drafter = FakeAgent("drafter")
+    install_specialists({"reader": FakeAgent("reader", answers=[list(same_items)]),
+                         "drafter": other_drafter})
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="dedup-other", description="d", enabled=True, branches=[],
+            skip_seen_items=True,
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": None, "position": 2, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    await run_workflow("dedup-other")
+    check("dedup is per workflow", other_drafter.prompts != [],
+          "the item was skipped, but it belongs to a different workflow")
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
