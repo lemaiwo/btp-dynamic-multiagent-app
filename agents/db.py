@@ -193,6 +193,11 @@ class AgentConfig(Base):
     # JSON-encoded list of skill names (SkillConfig.name) attached to this
     # agent. Skills are referenced by name so exports stay portable.
     skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # JSON-encoded list of agent names this agent may consult directly. Peers
+    # become delegation tools on this agent, so a chain can run specialist to
+    # specialist instead of routing every hop through the orchestrator.
+    # Referenced by name, like skills, so exports stay portable.
+    peers_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # API exposure. expose_chat keeps the agent in the orchestrator's
     # delegation list; expose_api gives it a run endpoint. They are
     # independent: a run-only agent is expose_chat=0, expose_api=1.
@@ -279,6 +284,20 @@ class AgentConfig(Base):
             return []
         return [str(s) for s in data if isinstance(s, str) and s.strip()]
 
+    @property
+    def peers(self) -> list[str]:
+        """Names of the agents this agent may consult (may be empty)."""
+        if not self.peers_json:
+            return []
+        try:
+            data = json.loads(self.peers_json)
+        except Exception:
+            logger.warning("Malformed peers_json on agent %s", self.name)
+            return []
+        if not isinstance(data, list):
+            return []
+        return [str(p) for p in data if isinstance(p, str) and p.strip()]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -289,6 +308,7 @@ class AgentConfig(Base):
             "auth_mode": self.auth_mode,
             "mcp_servers": _redact_servers(self.mcp_servers),
             "skills": self.skills,
+            "peers": self.peers,
             "enabled": bool(self.enabled),
             "expose_chat": bool(self.expose_chat),
             "expose_api": bool(self.expose_api),
@@ -308,6 +328,7 @@ class AgentConfig(Base):
             "instructions": self.instructions,
             "mcp_servers": _redact_servers(self.mcp_servers),
             "skills": self.skills,
+            "peers": self.peers,
             "enabled": bool(self.enabled),
             "expose_chat": bool(self.expose_chat),
             "expose_api": bool(self.expose_api),
@@ -593,6 +614,7 @@ async def init_db() -> None:
         await _ensure_column(
             conn, "agent_configs", "model_name", "VARCHAR(128)"
         )
+        await _ensure_column(conn, "agent_configs", "peers_json", "TEXT")
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
         )
@@ -864,11 +886,22 @@ async def upsert_agent(
     run_prompt: str | None = None,
     run_timeout_seconds: int = 1800,
     model_name: str | None = None,
+    peers: list[str] | None = None,
 ) -> AgentConfig:
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
+    # Order-preserving de-duplication: the same peer listed twice would
+    # otherwise register the same delegation tool twice on the same agent.
+    seen: set[str] = set()
+    cleaned_peers: list[str] = []
+    for p in peers or []:
+        p = str(p).strip()
+        if p and p not in seen:
+            seen.add(p)
+            cleaned_peers.append(p)
+    peers_json = json.dumps(cleaned_peers) if cleaned_peers else None
 
     slug = (api_slug or "").strip() or None
     if slug:
@@ -901,6 +934,7 @@ async def upsert_agent(
         row.run_prompt = (run_prompt or "").strip() or None
         row.run_timeout_seconds = int(run_timeout_seconds)
         row.model_name = (model_name or "").strip() or None
+        row.peers_json = peers_json
     else:
         existing.description = description
         existing.instructions = instructions
@@ -920,6 +954,7 @@ async def upsert_agent(
         existing.run_prompt = (run_prompt or "").strip() or None
         existing.run_timeout_seconds = int(run_timeout_seconds)
         existing.model_name = (model_name or "").strip() or None
+        existing.peers_json = peers_json
         row = existing
     await session.commit()
     await session.refresh(row)
