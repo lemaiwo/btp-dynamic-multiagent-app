@@ -111,6 +111,35 @@ async def main() -> None:
             check(f"{label} explains why",
                   expect.lower() in r.text.lower(), r.text[:200])
 
+        print("\n== numeric fields are bounded ==")
+        # Unbounded, `run_timeout_seconds: 0` makes every run of this workflow
+        # fail instantly at asyncio.wait_for -- a save that reads as accepted
+        # producing a workflow that can never run. The ceiling matters too: the
+        # BTP scheduler's async timeout defaults to 30 minutes, so a run
+        # allowed past 1800s is reported failed while it is still working.
+        for label, field, value in [
+            ("zero run timeout", "run_timeout_seconds", 0),
+            ("run timeout past the scheduler's 30-minute limit",
+             "run_timeout_seconds", 3600),
+            ("zero parallelism", "max_parallel_items", 0),
+            ("unbounded parallelism", "max_parallel_items", 500),
+        ]:
+            payload = {**GOOD, "name": "bounded", "api_slug": "bounded",
+                       field: value,
+                       "branches": [dict(b) for b in GOOD["branches"]],
+                       "steps": [dict(s) for s in GOOD["steps"]]}
+            r = await c.post("/admin/api/workflows", json=payload)
+            check(f"{label} rejected", 400 <= r.status_code < 500,
+                  f"{r.status_code} {r.text[:160]}")
+        for label, value in [("zero step timeout", 0), ("huge step timeout", 99999)]:
+            payload = {**GOOD, "name": "bounded", "api_slug": "bounded",
+                       "branches": [dict(b) for b in GOOD["branches"]],
+                       "steps": [dict(s) for s in GOOD["steps"]]}
+            payload["steps"][0]["step_timeout_seconds"] = value
+            r = await c.post("/admin/api/workflows", json=payload)
+            check(f"{label} rejected", 400 <= r.status_code < 500,
+                  f"{r.status_code} {r.text[:160]}")
+
         print("\n== duplicate slug ==")
         dup = {**GOOD, "name": "second"}
         r = await c.post("/admin/api/workflows", json=dup)
