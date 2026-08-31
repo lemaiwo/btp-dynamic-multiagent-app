@@ -117,6 +117,21 @@ async def main() -> None:
         check("duplicate slug rejected", 400 <= r.status_code < 500,
               f"{r.status_code} {r.text[:160]}")
 
+        print("\n== a rejected rename must not stick ==")
+        # Renaming and breaking the steps in the same PUT must not leave the
+        # rename applied: the whole save is one unit, and a 400 here has to
+        # mean nothing changed, not "renamed, but steps still broken."
+        renamed_and_broken = {**GOOD, "name": "mail-triage-renamed",
+                               "branches": [dict(b) for b in GOOD["branches"]],
+                               "steps": [dict(s) for s in GOOD["steps"]]}
+        renamed_and_broken["steps"][1]["fan_out"] = True  # two fan-out steps
+        r = await c.put(f"/admin/api/workflows/{wf_id}", json=renamed_and_broken)
+        check("rename + invalid steps rejected with 4xx",
+              400 <= r.status_code < 500, f"{r.status_code} {r.text[:200]}")
+        r = await c.get(f"/admin/api/workflows/{wf_id}")
+        check("name was NOT renamed by the rejected save",
+              r.json()["name"] == "mail-triage", r.text[:200])
+
         print("\n== update and delete ==")
         updated = {**GOOD, "description": "changed"}
         r = await c.put(f"/admin/api/workflows/{wf_id}", json=updated)

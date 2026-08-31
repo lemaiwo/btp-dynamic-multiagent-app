@@ -948,8 +948,18 @@ async def _save_workflow(payload: WorkflowPayload, workflow_id: int | None):
                         status_code=409,
                         detail=f"Workflow name '{payload.name}' already exists",
                     )
+                # Flush, not commit: upsert_workflow's own by-name lookup
+                # below needs to see the rename within this transaction (it
+                # is how it identifies "this is the same row" rather than
+                # creating a second one), but nothing may become durable
+                # until validate_workflow_parts, called inside
+                # upsert_workflow, has actually accepted the save. If it
+                # rejects the new branches/steps, the except block below
+                # rolls this back -- otherwise a rejected save would still
+                # rename the workflow out from under its unchanged, invalid
+                # steps, and the operator would never know.
                 existing.name = payload.name
-                await session.commit()
+                await session.flush()
         try:
             row = await upsert_workflow(
                 session,
@@ -966,6 +976,7 @@ async def _save_workflow(payload: WorkflowPayload, workflow_id: int | None):
                 steps=[s.model_dump() for s in payload.steps],
             )
         except ValueError as e:
+            await session.rollback()
             raise HTTPException(status_code=400, detail=str(e)) from e
         branches, steps = await get_workflow_parts(session, row.id)
         return {

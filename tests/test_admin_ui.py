@@ -450,6 +450,221 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             finally:
                 os.unlink(harness_path)
 
+            # --------------------------------------------------------------
+            # showWorkflowRun() must actually render what a step produced.
+            # WorkflowStepRun carries `output`/`error`, and the API returns
+            # them, but nothing forces the renderer to read them -- this
+            # proves the rendered HTML contains the (escaped) step output,
+            # not just that the function exists.
+            wf_run_harness = r"""
+'use strict';
+const assert = require('node:assert');
+
+const detailEl = { innerHTML: '' };
+global.document = {
+    getElementById(id) {
+        if (id === 'workflow-run-detail') return detailEl;
+        throw new Error('unstubbed getElementById: ' + id);
+    },
+};
+
+""" + js_no_autoinvoke + r"""
+
+async function main() {
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ({
+            run: {
+                id: 'run-1', workflow_name: 'mail-triage', status: 'success',
+                trigger: 'manual', started_at: null, finished_at: null,
+                summary: null, error: null,
+            },
+            items: [],
+            steps: [
+                {
+                    id: 'step-1', item_run_id: null, branch_key: null,
+                    position: 1, agent_name: 'reader', status: 'success',
+                    output: 'found 3 <urgent> mails', error: null,
+                },
+            ],
+        }),
+    });
+    await showWorkflowRun('run-1');
+    assert.ok(
+        detailEl.innerHTML.includes('found 3 &lt;urgent&gt; mails'),
+        'a step\'s output must reach the rendered run detail, HTML-escaped',
+    );
+    assert.ok(
+        !detailEl.innerHTML.includes('found 3 <urgent> mails'),
+        'step output must be escaped, not injected raw',
+    );
+
+    console.log('showWorkflowRun output-rendering scenario passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(wf_run_harness)
+                wf_run_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", wf_run_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                check(
+                    "showWorkflowRun() renders a step's output, escaped",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:500],
+                )
+            finally:
+                os.unlink(wf_run_harness_path)
+
+            # --------------------------------------------------------------
+            # A name containing a quote and a parenthesis must round-trip
+            # safely through the Delete buttons on all three tables. Before
+            # this fix, the name was interpolated straight into an inline
+            # onclick="...('...')" attribute: escapeHtml encodes `'` as
+            # `&#39;`, but the browser HTML-decodes the attribute BEFORE
+            # compiling it as JS, turning `&#39;` back into `'` -- so a
+            # workflow/agent/skill named e.g. `x'); alert(1); //` broke out
+            # of the string literal and ran arbitrary JS in anyone's admin
+            # session who clicked Delete. This proves the real DOM wiring
+            # (data-id/data-name read via addEventListener, not an inline
+            # handler string) carries the name through intact and inert.
+            xss_harness = r"""
+'use strict';
+const assert = require('node:assert');
+
+// A minimal tbody stub: real enough to parse the <button ...> markup the
+// shipped code writes via innerHTML and to let addEventListener/click work,
+// without needing a full DOM. Entity decoding covers exactly the five
+// entities escapeHtml() can produce, mirroring the browser's own
+// attribute-value decoding that made the inline-onclick version exploitable.
+function makeTbodyStub() {
+    let buttons = [];
+    function reparse(html) {
+        buttons = [];
+        const btnRe = /<button\b([^>]*)>/g;
+        let m;
+        while ((m = btnRe.exec(html))) {
+            const attrs = m[1];
+            const cls = (attrs.match(/class="([^"]*)"/) || [, ''])[1].split(/\s+/);
+            const dataset = {};
+            const dataRe = /data-([\w-]+)="([^"]*)"/g;
+            let dm;
+            while ((dm = dataRe.exec(attrs))) {
+                const decoded = dm[2]
+                    .replace(/&amp;/g, '&')
+                    .replace(/&lt;/g, '<')
+                    .replace(/&gt;/g, '>')
+                    .replace(/&quot;/g, '"')
+                    .replace(/&#39;/g, "'");
+                const key = dm[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+                dataset[key] = decoded;
+            }
+            const listeners = {};
+            buttons.push({
+                classes: cls,
+                dataset,
+                addEventListener(type, cb) { listeners[type] = cb; },
+                click() { if (listeners.click) listeners.click(); },
+            });
+        }
+    }
+    let html = '';
+    return {
+        get innerHTML() { return html; },
+        set innerHTML(h) { html = h; reparse(h); },
+        querySelectorAll(selector) {
+            const cls = selector.replace('.', '');
+            return buttons.filter(b => b.classes.includes(cls));
+        },
+    };
+}
+
+const wfTbody = makeTbodyStub();
+const skillTbody = makeTbodyStub();
+const agentTbody = makeTbodyStub();
+global.document = {
+    getElementById(id) {
+        if (id === 'workflows-tbody') return wfTbody;
+        if (id === 'skills-tbody') return skillTbody;
+        if (id === 'agents-tbody') return agentTbody;
+        throw new Error('unstubbed getElementById: ' + id);
+    },
+};
+
+""" + js_no_autoinvoke + r"""
+
+async function main() {
+    const evilName = `o'Brien"'); alert(1); //`;
+    let capturedMsg = null;
+    global.confirm = (msg) => { capturedMsg = msg; return false; };
+
+    // Workflows
+    allWorkflows = [{id: 7, name: evilName, enabled: true, api_slug: '', _stepCount: 1}];
+    renderWorkflows();
+    const wfBtn = wfTbody.querySelectorAll('.delete-workflow-btn')[0];
+    assert.strictEqual(wfBtn.dataset.name, evilName,
+        'workflow name must round-trip through data-name intact');
+    wfBtn.click();
+    assert.ok(capturedMsg && capturedMsg.includes(evilName),
+        'deleteWorkflow must receive the real name via dataset, not a mangled one');
+
+    // Skills
+    capturedMsg = null;
+    allSkills = [{id: 3, name: evilName, description: 'x'}];
+    renderSkillsTable();
+    const skillBtn = skillTbody.querySelectorAll('.delete-skill-btn')[0];
+    assert.strictEqual(skillBtn.dataset.name, evilName);
+    skillBtn.click();
+    assert.ok(capturedMsg && capturedMsg.includes(evilName));
+
+    // Agents
+    capturedMsg = null;
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ([{
+            id: 9, name: evilName, description: 'x',
+            mcp_servers: [{url: 'https://x.example.com', auth_mode: 'jwt'}],
+            skills: [], enabled: true, expose_api: false,
+        }]),
+    });
+    await loadAgents();
+    const agentBtn = agentTbody.querySelectorAll('.delete-agent-btn')[0];
+    assert.strictEqual(agentBtn.dataset.name, evilName);
+    agentBtn.click();
+    assert.ok(capturedMsg && capturedMsg.includes(evilName));
+
+    console.log('delete-button name round-trip scenario passed (no inline-onclick breakout)');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(xss_harness)
+                xss_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", xss_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                check(
+                    "delete buttons carry a quote-and-paren name safely "
+                    "(no inline-onclick breakout)",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:500],
+                )
+            finally:
+                os.unlink(xss_harness_path)
+
         # ------------------------------------------------------------------
         print("\n== 3. fetch() call discovery ==")
         # The JS wraps every call in `api('/path', opts)` — extract paths
