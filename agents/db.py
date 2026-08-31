@@ -419,6 +419,120 @@ class SkillConfig(Base):
         }
 
 
+class Workflow(Base):
+    """A declared, ordered sequence of agents run as one background job.
+
+    The definition is the authority: the engine runs exactly these steps in
+    exactly this order. No model gets to reorder or skip them — the only
+    per-item decision is which branches to enter, and that is data the
+    fan-out step emits.
+    """
+
+    __tablename__ = "workflows"
+    __table_args__ = (UniqueConstraint("name", name="uq_workflows_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    api_slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Fallback identity for steps whose agent has no run_as_principal of its
+    # own. A scheduled run has no interactive user to borrow one from.
+    run_as_principal: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    run_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1800, server_default="1800"
+    )
+    # Repeat-run safety: an item already completed by an earlier run is
+    # skipped, so a retry after a crash resumes rather than re-drafting.
+    skip_seen_items: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    max_parallel_items: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    on_unknown_branch: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="fail", server_default="fail"
+    )
+    enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "api_slug": self.api_slug,
+            "run_as_principal": self.run_as_principal,
+            "run_timeout_seconds": self.run_timeout_seconds,
+            "skip_seen_items": bool(self.skip_seen_items),
+            "max_parallel_items": self.max_parallel_items,
+            "on_unknown_branch": self.on_unknown_branch,
+            "enabled": bool(self.enabled),
+        }
+
+
+class WorkflowBranch(Base):
+    """A named sub-sequence of steps an item may or may not enter.
+
+    ``key`` is what the fan-out step emits to select this branch;
+    ``description`` is shown to it in the branch catalogue so it chooses from
+    a list it can see rather than guessing label strings.
+    """
+
+    __tablename__ = "workflow_branches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workflow_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "description": self.description,
+            "position": self.position,
+        }
+
+
+class WorkflowStep(Base):
+    """One agent invocation in a workflow.
+
+    ``branch_key`` null means the main line; otherwise the step belongs to
+    that branch. Every step names exactly one agent — branch selection is the
+    item's, not the step's.
+    """
+
+    __tablename__ = "workflow_steps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workflow_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    branch_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    agent_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    instructions: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    fan_out: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    step_timeout_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=600, server_default="600"
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "branch_key": self.branch_key,
+            "position": self.position,
+            "agent_name": self.agent_name,
+            "instructions": self.instructions,
+            "fan_out": bool(self.fan_out),
+            "step_timeout_seconds": self.step_timeout_seconds,
+        }
+
+
 class JobRun(Base):
     """One API-triggered execution of an agent.
 
@@ -1047,6 +1161,228 @@ async def delete_skill(session: AsyncSession, skill_id: int) -> bool:
     if row is None:
         return False
     await rename_skill_references(session, row.name, None)
+    await session.delete(row)
+    await session.commit()
+    return True
+
+
+VALID_ON_UNKNOWN_BRANCH = ("fail", "skip")
+
+
+def validate_workflow_parts(
+    branches: list[dict[str, Any]],
+    steps: list[dict[str, Any]],
+    known_agents: set[str],
+    *,
+    enabled: bool,
+) -> None:
+    """Reject a workflow definition that cannot run.
+
+    Raises ValueError with a message naming the offending value. This runs at
+    save time on purpose: a workflow that cannot run must say so while someone
+    is looking at it, not at 03:00 when the scheduler fires.
+    """
+    if enabled and not steps:
+        raise ValueError("An enabled workflow must have at least one step; this has no steps.")
+
+    fan_out_steps = [s for s in steps if s.get("fan_out")]
+    if len(fan_out_steps) > 1:
+        raise ValueError(
+            f"A workflow may have at most one fan-out step; found {len(fan_out_steps)}."
+        )
+
+    keys: list[str] = []
+    for b in branches:
+        key = str(b.get("key") or "").strip()
+        if not key:
+            raise ValueError("A branch key must not be empty.")
+        if key in keys:
+            raise ValueError(f"Duplicate branch key {key!r}.")
+        keys.append(key)
+
+    if branches and not fan_out_steps:
+        raise ValueError(
+            "A workflow that declares branches must have a fan-out step: "
+            "branches are entered per work item, and without a fan-out step "
+            "there are no items."
+        )
+
+    for s in steps:
+        agent = str(s.get("agent_name") or "").strip()
+        if agent not in known_agents:
+            raise ValueError(
+                f"Step {s.get('position')} names agent {agent!r}, which does not "
+                "exist or is disabled."
+            )
+        bk = s.get("branch_key")
+        if bk is not None and str(bk).strip() not in keys:
+            raise ValueError(
+                f"Step {s.get('position')} belongs to branch {str(bk)!r}, "
+                "which is not declared on this workflow."
+            )
+
+    used_branches = {str(s["branch_key"]).strip() for s in steps
+                     if s.get("branch_key") is not None}
+    for key in keys:
+        if key not in used_branches:
+            raise ValueError(f"Branch {key!r} has no steps.")
+
+    def _check_positions(label: str, group: list[dict[str, Any]]) -> None:
+        positions = [int(s.get("position") or 0) for s in group]
+        if len(set(positions)) != len(positions):
+            raise ValueError(f"Duplicate step positions in {label}: {sorted(positions)}.")
+        if sorted(positions) != list(range(1, len(positions) + 1)):
+            raise ValueError(
+                f"Step positions in {label} must be contiguous from 1; got "
+                f"{sorted(positions)}."
+            )
+
+    _check_positions("the main line", [s for s in steps if s.get("branch_key") is None])
+    for key in keys:
+        _check_positions(
+            f"branch {key!r}",
+            [s for s in steps if str(s.get("branch_key") or "").strip() == key],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Workflow CRUD
+# ---------------------------------------------------------------------------
+async def list_workflows(session: AsyncSession) -> list[Workflow]:
+    result = await session.execute(select(Workflow).order_by(Workflow.name))
+    return list(result.scalars().all())
+
+
+async def get_workflow(session: AsyncSession, workflow_id: int) -> Workflow | None:
+    return await session.get(Workflow, workflow_id)
+
+
+async def get_workflow_by_name(session: AsyncSession, name: str) -> Workflow | None:
+    result = await session.execute(select(Workflow).where(Workflow.name == name))
+    return result.scalar_one_or_none()
+
+
+async def get_workflow_by_slug(session: AsyncSession, slug: str) -> Workflow | None:
+    result = await session.execute(select(Workflow).where(Workflow.api_slug == slug))
+    return result.scalar_one_or_none()
+
+
+async def get_workflow_parts(
+    session: AsyncSession, workflow_id: int
+) -> tuple[list[WorkflowBranch], list[WorkflowStep]]:
+    """Branches in position order, and steps in (branch, position) order."""
+    b = await session.execute(
+        select(WorkflowBranch)
+        .where(WorkflowBranch.workflow_id == workflow_id)
+        .order_by(WorkflowBranch.position, WorkflowBranch.id)
+    )
+    s = await session.execute(
+        select(WorkflowStep)
+        .where(WorkflowStep.workflow_id == workflow_id)
+        .order_by(WorkflowStep.branch_key, WorkflowStep.position, WorkflowStep.id)
+    )
+    return list(b.scalars().all()), list(s.scalars().all())
+
+
+async def upsert_workflow(
+    session: AsyncSession,
+    *,
+    name: str,
+    description: str = "",
+    api_slug: str | None = None,
+    run_as_principal: str | None = None,
+    run_timeout_seconds: int = 1800,
+    skip_seen_items: bool = True,
+    max_parallel_items: int = 1,
+    on_unknown_branch: str = "fail",
+    enabled: bool = True,
+    branches: list[dict[str, Any]] | None = None,
+    steps: list[dict[str, Any]] | None = None,
+) -> Workflow:
+    """Create or replace a workflow and its parts.
+
+    Branches and steps are replaced wholesale rather than diffed: a definition
+    is small and edited as a unit, so reconciliation would add bugs and buy
+    nothing.
+    """
+    branches = branches or []
+    steps = steps or []
+
+    if on_unknown_branch not in VALID_ON_UNKNOWN_BRANCH:
+        raise ValueError(
+            f"on_unknown_branch must be one of {VALID_ON_UNKNOWN_BRANCH}, "
+            f"got {on_unknown_branch!r}"
+        )
+
+    known_agents = {
+        r.name for r in await list_agents(session) if r.enabled
+    }
+    validate_workflow_parts(branches, steps, known_agents, enabled=enabled)
+
+    existing = await get_workflow_by_name(session, name)
+    slug = (api_slug or "").strip() or None
+    if slug:
+        clash = await get_workflow_by_slug(session, slug)
+        if clash is not None and (existing is None or clash.id != existing.id):
+            raise ValueError(
+                f"api_slug {slug!r} is already used by workflow {clash.name!r}"
+            )
+
+    if existing is None:
+        row = Workflow(name=name)
+        session.add(row)
+    else:
+        row = existing
+    row.description = description
+    row.api_slug = slug
+    row.run_as_principal = (run_as_principal or "").strip() or None
+    row.run_timeout_seconds = int(run_timeout_seconds)
+    row.skip_seen_items = 1 if skip_seen_items else 0
+    row.max_parallel_items = max(1, int(max_parallel_items))
+    row.on_unknown_branch = on_unknown_branch
+    row.enabled = 1 if enabled else 0
+    await session.commit()
+    await session.refresh(row)
+
+    await session.execute(
+        delete(WorkflowBranch).where(WorkflowBranch.workflow_id == row.id)
+    )
+    await session.execute(
+        delete(WorkflowStep).where(WorkflowStep.workflow_id == row.id)
+    )
+    for b in branches:
+        session.add(WorkflowBranch(
+            workflow_id=row.id,
+            key=str(b["key"]).strip(),
+            description=str(b.get("description") or ""),
+            position=int(b.get("position") or 1),
+        ))
+    for s in steps:
+        bk = s.get("branch_key")
+        session.add(WorkflowStep(
+            workflow_id=row.id,
+            branch_key=str(bk).strip() if bk is not None else None,
+            position=int(s["position"]),
+            agent_name=str(s["agent_name"]).strip(),
+            instructions=str(s.get("instructions") or ""),
+            fan_out=1 if s.get("fan_out") else 0,
+            step_timeout_seconds=int(s.get("step_timeout_seconds") or 600),
+        ))
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def delete_workflow(session: AsyncSession, workflow_id: int) -> bool:
+    row = await session.get(Workflow, workflow_id)
+    if row is None:
+        return False
+    await session.execute(
+        delete(WorkflowBranch).where(WorkflowBranch.workflow_id == workflow_id)
+    )
+    await session.execute(
+        delete(WorkflowStep).where(WorkflowStep.workflow_id == workflow_id)
+    )
     await session.delete(row)
     await session.commit()
     return True
