@@ -864,6 +864,13 @@ async def main() -> None:
         r = await c.post("/api/workflows/fanout-slug/run")
         check("accepted with 202", r.status_code == 202, str(r.status_code))
         check("returns a run id", "run_id" in r.json(), r.text)
+
+        # start_workflow_run creates the run row (the overlap lock) and
+        # returns before the background task does any work, so this second
+        # POST -- issued before draining the first's task -- lands on a run
+        # that is already `running` and must be refused.
+        r2 = await c.post("/api/workflows/fanout-slug/run")
+        check("second concurrent trigger is 409", r2.status_code == 409, str(r2.status_code))
     await asyncio.gather(*[t for t in wr._tasks if not t.done()],
                          return_exceptions=True)
 
