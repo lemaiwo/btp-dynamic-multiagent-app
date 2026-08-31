@@ -3,9 +3,9 @@
 **Date:** 2026-08-31
 **Status:** Approved for planning
 **First use case:** an email triage workflow — a small-model reader agent
-classifies unhandled mail into work items, each item is dispatched to the ABAP
-or Fiori specialist named by its own route, and a draft-writer agent produces
-the reply. Runs unattended on a BTP schedule.
+classifies unhandled mail into work items and picks which specialist branches
+each one needs, those branches run, and a draft-writer agent produces the reply
+from their combined output. Runs unattended on a BTP schedule.
 
 ## Goal
 
@@ -16,7 +16,8 @@ cannot express:
    chat topology is configurable rather than always a star through the one
    orchestrator.
 2. **Workflows** — a declared, ordered sequence of agents executed as one
-   background job, fanning out over the work items the first step discovers.
+   background job, fanning out over the work items the first step discovers and
+   branching per item into the specialists that item actually needs.
 
 Plus the enabler both need: a **per-agent model**, so a cheap reader and an
 expensive specialist can coexist in one chain.
@@ -84,13 +85,19 @@ orchestrator                       agents/workflow_runner.py
  v                                    |  step 1 (fan_out)
 abap-specialist  ------.              v
  |  delegate_fiori...  |          email-reader (small model)
- v                     |              |  -> [item A, item B, item C]
+ v                     |              |  -> [item A, item B, ...]
 fiori-specialist       |              |
-                       |              +-- item A: route=abap
-config: peers_json ----'              |     step 2 -> abap-specialist
-                                      |     step 3 -> draft-writer
-                                      +-- item B: route=fiori
-                                      |     ...
+                       |              +-- item A: branches=[abap]
+config: peers_json ----'              |     +- [abap] abap-specialist
+                                      |     |         abap-reviewer
+                                      |     +- join -> draft-writer
+                                      |
+                                      +-- item B: branches=[abap, fiori]
+                                      |     +- [abap]  abap-specialist ...
+                                      |     +- [fiori] fiori-specialist ...
+                                      |     +- join -> draft-writer
+                                      |               (sees both outputs)
+                                      |
                                       +-- item C: FAILED, others continue
                                       |
                                       v
@@ -190,11 +197,28 @@ The orchestrator itself keeps using the global model.
 | `run_timeout_seconds` | int, default 1800 | ceiling for the whole run; must stay under the BTP async timeout |
 | `skip_seen_items` | int, default 1 | skip items already completed by a previous run |
 | `max_parallel_items` | int, default 1 | items processed concurrently |
+| `on_unknown_branch` | varchar(16), default `fail` | `fail` or `skip` when an item names a branch that does not exist |
 | `enabled` | int, default 1 | |
 | `created_at` / `updated_at` | timestamptz | |
 
 Uniqueness of `name` and `api_slug` is enforced in the upsert helper, matching
 how `agent_configs.api_slug` is handled today.
+
+### `workflow_branches`
+
+A branch is a named, ordered sub-sequence of steps that an item may or may not
+enter. Branches exist so the "which specialist?" decision has somewhere
+structured to land, and so a branch can be more than one step long
+(`abap-specialist` → `abap-reviewer`) — which a bare agent-per-route mapping
+could not express.
+
+| column | type | purpose |
+|---|---|---|
+| `id` | int pk | |
+| `workflow_id` | int | |
+| `key` | varchar(64) | what the reader emits to select this branch; unique within a workflow |
+| `description` | text | shown to the reader so it can choose (see the branch catalogue below) |
+| `position` | int | deterministic execution order when an item selects several |
 
 ### `workflow_steps`
 
@@ -202,23 +226,36 @@ how `agent_configs.api_slug` is handled today.
 |---|---|---|
 | `id` | int pk | |
 | `workflow_id` | int | |
-| `position` | int | execution order, unique within a workflow |
-| `agent_name` | varchar(64), nullable | fixed agent for this step |
-| `route_map_json` | text, nullable | JSON object mapping a route value to an agent name |
+| `branch_key` | varchar(64), nullable | null = main line; otherwise the branch this step belongs to |
+| `position` | int | order within the main line, or within the branch |
+| `agent_name` | varchar(64) | the agent that runs this step |
 | `instructions` | text | the step's task text, appended to the prompt |
 | `fan_out` | int, default 0 | this step produces the work items |
-| `on_missing_route` | varchar(16), default `fail` | `fail` or `skip` when an item's route matches no key |
 | `step_timeout_seconds` | int, default 600 | ceiling for one step of one item |
 
-Exactly one of `agent_name` / `route_map_json` must be set — validated on save.
+Every step names exactly one agent. There is no per-step routing table: branch
+selection is the item's, made once by the reader, and the branch structure is
+what the workflow declares.
+
+**Where the branch block sits.** Branches run immediately after the fan-out
+step, before any remaining main-line steps. One fork–join block per workflow,
+in a fixed place. This is a deliberate restriction: it covers the use case
+exactly, it makes the run record's shape predictable, and it removes a whole
+class of "which block does this step belong to" validation. Arbitrary branch
+positions and nested branches are listed under Out of scope.
 
 **Validation at save time**, because a workflow that cannot run must not wait
 until 03:00 to say so:
 
 - At most one step may have `fan_out`.
-- Every `agent_name` and every value in `route_map_json` must name an existing,
-  enabled agent.
-- Positions must be unique and contiguous from 1.
+- A workflow that declares branches must have a fan-out step.
+- Every `agent_name`, on the main line and in every branch, must name an
+  existing, enabled agent.
+- Every step's `branch_key`, when set, must name a declared branch.
+- Branch keys are unique within a workflow, and non-empty.
+- Every declared branch has at least one step.
+- Positions are unique and contiguous from 1 within the main line, and
+  independently within each branch.
 - A workflow with no steps cannot be enabled.
 
 ### Run records
@@ -231,11 +268,12 @@ Three tables, mirroring the fan-out shape:
   `summary`, `error`, `created_by`, and the four `scheduler_*` columns
   `JobRun` already carries.
 - **`workflow_item_runs`** — `id`, `workflow_run_id`, `item_key` (the reader's
-  `id`), `title`, `route_json`, `status`, `error`, timestamps.
+  `id`), `title`, `branches_json` (the branch keys the reader selected, so the
+  routing decision is auditable and correctable), `status`, `error`,
+  timestamps.
 - **`workflow_step_runs`** — `id`, `workflow_run_id`, `item_run_id` (null for
-  steps that run before the fan-out), `position`, `route` (nullable; which
-  route value produced this row, for multi-route dispatch), `agent_name`,
-  `status`, `output` (text), `error`, timestamps.
+  steps that run before the fan-out), `branch_key` (null for main-line steps),
+  `position`, `agent_name`, `status`, `output` (text), `error`, timestamps.
 
 `status` values match `JobRun`'s vocabulary: `running`, `success`, `failed`,
 `interrupted`, plus `skipped` on item runs and `partial` on workflow runs.
@@ -251,25 +289,39 @@ those exists; the reasons apply identically here.
 
 ```python
 class WorkItem(BaseModel):
-    id: str            # stable dedup key (e.g. the Gmail message id)
-    route: list[str]   # dispatch keys; empty means the step's fixed agent
-    text: str          # everything the next step should read
+    id: str               # stable dedup key (e.g. the Gmail message id)
+    title: str            # short label for the run record
+    branches: list[str]   # branch keys to enter; may be empty
+    text: str             # everything the next step should read
 ```
 
 This is the *only* structure the engine understands. `id` exists because
-fan-out needs item identity for reporting and repeat-run safety; `route` exists
-because dispatch is data, not an LLM decision. Everything else the reader wants
-to convey goes in `text`, unparsed.
+fan-out needs item identity for reporting and repeat-run safety; `branches`
+exists because branch selection is data, not an opaque LLM side effect.
+Everything else the reader wants to convey goes in `text`, unparsed.
 
-`route` is a list because one item can legitimately need two specialists — an
-email that is half an ABAP dump and half a Fiori rendering question. A dispatch
-step therefore runs **once per route value, in list order**, chaining each
-agent's output into the next as an ordinary handoff. A fixed (`agent_name`)
-step ignores `route` entirely and runs once.
+### The branch catalogue
 
-This is why `workflow_step_runs` carries a `route` column: two rows can share
-one `position` within a single item run, distinguished by which route value
-produced them.
+The engine appends the declared branches — key and description — to the
+fan-out step's prompt:
+
+```
+## Available branches
+- abap:  ABAP runtime errors, short dumps, ST22, performance analysis.
+- fiori: UI5/Fiori rendering, launchpad, front-end errors.
+
+For each item, list only the branches that item actually needs.
+An ABAP-only question must not select the fiori branch.
+```
+
+The reader is then choosing from a list it can see rather than guessing label
+strings, and the instruction to select only what is needed lives next to the
+choices. **The branches taken are the ones the reader selected, never every
+branch declared** — this is the whole point of putting the decision in a cheap
+model that reads the question first.
+
+An empty `branches` list is valid: the item skips the branch block entirely and
+goes straight to the join steps.
 
 ### Execution
 
@@ -277,38 +329,41 @@ An agent's **effective principal** is its own `run_as_principal` when set,
 otherwise the workflow's. A step whose agent has neither fails the run at
 preflight, naming the agent.
 
-1. **Preflight.** Resolve the workflow and its steps. Collect every agent the
-   workflow can reach (fixed `agent_name`s plus all `route_map` values). For
-   each, check it is built in `registry.build.specialists` and that its
+1. **Preflight.** Resolve the workflow, its branches and its steps. Collect
+   every agent the workflow can reach, on the main line and in every branch.
+   For each, check it is built in `registry.build.specialists` and that its
    effective principal has usable credentials, reusing
    `job_runner._has_usable_credentials`. Any failure fails the run before a
    single model call, naming the agent and the fix — the same
    "never-configured vs. configured-but-stale" distinction `job_runner` draws.
-2. **Pre-fan-out steps** run once, in position order, their outputs chained as
-   text. Their step runs carry `item_run_id = NULL`.
-3. **The fan-out step** runs its agent with `output_type=list[WorkItem]`. An
-   empty list is a successful run with `items_total = 0`, not an error — "no
-   mail today" is a normal outcome. A workflow with no `fan_out` step at all is
-   valid: it is a linear chain that runs once, with no item runs.
-4. **Per item**, in position order, for every step after the fan-out:
-   - Resolve the agent(s). A fixed step uses `agent_name` once. A dispatch step
-     maps each of the item's route values through `route_map_json`, in list
-     order; a value with no matching key follows `on_missing_route`.
-   - For each resolved agent in turn: build the prompt (below), run it under
-     `run_as` for that agent's **effective principal**, bounded by
-     `step_timeout_seconds`, and chain its output into the next.
-   - Record a `workflow_step_run` per agent run, tagged with its route value.
+2. **Pre-fan-out main-line steps** run once, in position order, their outputs
+   chained as text. Their step runs carry `item_run_id = NULL`.
+3. **The fan-out step** runs its agent with `output_type=list[WorkItem]`, its
+   prompt carrying the branch catalogue. An empty list is a successful run with
+   `items_total = 0`, not an error — "no mail today" is a normal outcome. A
+   workflow with no fan-out step is valid: it is a linear main line that runs
+   once, with no item runs and no branches.
+4. **Per item:**
+   - **Branches.** For each selected branch key, in declared `position` order,
+     run that branch's steps in their own position order, chaining each output
+     into the next. A key naming no declared branch follows
+     `on_unknown_branch`. Branches run one after another, not concurrently —
+     same reasoning as `max_parallel_items`: concurrent branches multiply load
+     on ARC-1 and the model quota.
+   - **Join.** The remaining main-line steps run in position order. The first
+     of them receives one `## From <agent>` block per branch taken, each
+     carrying that branch's final step output.
+   - Every agent run is bounded by `step_timeout_seconds`, executed under
+     `run_as` for that agent's effective principal, and recorded as a
+     `workflow_step_run` tagged with its `branch_key`.
 5. **Aggregate.** All items succeeded → `success`. Some failed → `partial`.
    The fan-out step itself failed, or preflight failed → `failed`.
 
 Items are processed with a semaphore of `max_parallel_items`, default 1.
-Sequential is the default because concurrent items would multiply load on ARC-1
-and the model quota; the column exists so the ceiling can be raised without a
-schema change.
 
 ### Prompt construction
 
-Step N's prompt is assembled as plain text — no structured record, by design:
+A step's prompt is assembled as plain text — no structured record, by design:
 
 ```
 ## From <previous agent name>
@@ -318,19 +373,22 @@ Step N's prompt is assembled as plain text — no structured record, by design:
 <this step's instructions>
 ```
 
-For the first step after the fan-out, the "From" block carries `item.text`. For
-pre-fan-out step 1 there is no "From" block at all. The handoff is therefore
+For the first step of a branch, the "From" block carries `item.text`. For
+main-line step 1 there is no "From" block at all. For the join step there is
+one "From" block per branch taken, in branch order. The handoff is therefore
 steered by writing each agent's instructions and each step's task text, not by
 configuration.
 
-Only the immediately preceding output is included, not the whole transcript.
-A three-step chain over many items would otherwise grow the prompt without
-bound, and each agent's job is defined by its own instructions anyway.
+Only the immediately preceding output is included, not the whole transcript —
+at the join, "immediately preceding" means each branch's final output. A long
+chain over many items would otherwise grow the prompt without bound, and each
+agent's job is defined by its own instructions anyway.
 
 ### Repeat-run safety
 
 When `skip_seen_items` is set, an item whose `item_key` already has a `success`
-item run for this workflow is recorded `skipped` and its steps are not run.
+item run for this workflow is recorded `skipped` and neither its branches nor
+its join steps run.
 
 This is the generic form of the ad-hoc idempotency each toolset invented
 separately — Gmail's label queue, Jira's already-commented filter. It makes a
@@ -365,6 +423,8 @@ directly and the scope check is the protection.
 ## Error handling
 
 - **Step timeout** → that step fails; the item fails; other items continue.
+- **A branch fails** → the item fails; remaining branches for that item are not
+  run, and the join step does not run. Other items continue.
 - **Workflow timeout** → the run is cancelled and recorded `failed`; in-flight
   item runs are recorded `interrupted`.
 - **Shutdown** (`CancelledError`) → run recorded `interrupted`, then re-raised,
@@ -383,11 +443,12 @@ directly and the scope check is the protection.
 
 - **Agent form**: a "Can consult" multi-select bound to `peers_json`, and a
   model override field bound to `model_name` (blank = use the global model).
-- **Workflows section**: list, create/edit with an ordered step editor
-  (position, agent or route map, instructions, fan-out flag), and a "Run now"
-  button.
-- **Workflow runs**: a list, and a detail view rendering the run → item → step
-  tree with each step's output.
+- **Workflows section**: list, and a create/edit view with the main-line step
+  editor (position, agent, instructions, fan-out flag), a branch editor (key,
+  description, its own ordered steps), and a "Run now" button.
+- **Workflow runs**: a list, and a detail view rendering the run → item →
+  branch → step tree with each step's output, and the branch keys the reader
+  selected for each item.
 
 `ui5-admin/` is a **follow-up increment**, not part of this design. Building the
 same CRUD twice in one pass doubles the UI work for a feature whose shape will
@@ -414,9 +475,12 @@ each green and deployable on its own:
 
 Deliberately excluded; each is a later increment if a real workflow demands it:
 
-- Parallel *steps* within an item (steps are strictly ordered).
-- Conditional steps, skips, and branching beyond `route_map` dispatch.
-- Retry-with-backoff of a failed step or item.
+- Branch blocks at arbitrary main-line positions, and more than one block per
+  workflow. The block sits after the fan-out step.
+- Nested branches (a branch containing its own fork).
+- Concurrent branches. Matched branches run sequentially.
+- Conditional steps and skips beyond branch selection.
+- Retry-with-backoff of a failed step, branch, or item.
 - Workflow versioning or run-time pinning of a definition.
 - A visual workflow editor.
 - Per-step model override (the agent already carries one).
@@ -452,21 +516,27 @@ agents and an on-disk SQLite test DB.
 
 **Workflow runner:**
 
-- Declared order is followed exactly, including when a step's agent is slower
-  than the next one's.
+- Declared order is followed exactly: main line, then branches in declared
+  order, then join.
 - Fan-out produces one item run per `WorkItem`; an empty list yields a
   successful run with zero items.
-- Route dispatch picks the agent named by the item's route;
-  `on_missing_route` `fail` and `skip` both behave as declared.
-- An item with two route values runs the dispatch step twice, in list order,
-  with the second agent receiving the first's output; both step runs are
-  recorded and tagged with their route value.
-- A fixed (`agent_name`) step runs exactly once even when the item carries
-  routes.
-- A workflow with no fan-out step runs as a linear chain with no item runs.
-- The prompt handed to step N contains step N−1's output and the step's
-  instructions, and does *not* contain step N−2's output.
+- The fan-out prompt contains the branch catalogue: every declared key and its
+  description.
+- An item selecting one branch runs only that branch's agents — the other
+  branch's agents are never invoked.
+- An item selecting two branches runs both, in declared `position` order, and
+  the join step's prompt contains one `## From` block per branch with each
+  branch's final output.
+- An item selecting no branches goes straight to the join step.
+- A multi-step branch chains its own steps: step 2 of the branch receives step
+  1's output.
+- `on_unknown_branch` `fail` and `skip` both behave as declared.
+- A workflow with no fan-out step runs as a linear main line with no item runs.
+- The prompt handed to a step contains its immediate predecessor's output and
+  its own instructions, and not the output before that.
 - One item failing leaves the others `success` and the run `partial`.
+- A failing branch fails its item without running the remaining branches or the
+  join step.
 - Step timeout fails only that item.
 - `skip_seen_items`: an item key with a prior successful run is skipped; the
   same key under a different workflow is not.
@@ -480,14 +550,16 @@ agents and an on-disk SQLite test DB.
 
 **Admin API:**
 
-- Save-time validation: more than one fan-out step, unknown agent in
-  `agent_name` or a `route_map` value, both or neither of
-  `agent_name`/`route_map_json` set, duplicate or non-contiguous positions,
-  enabling a workflow with no steps, duplicate `name` or `api_slug`.
+- Save-time validation: more than one fan-out step; branches declared without a
+  fan-out step; unknown agent on a main-line or branch step; a step naming an
+  undeclared `branch_key`; duplicate or empty branch keys; a declared branch
+  with no steps; duplicate or non-contiguous positions within the main line or
+  within a branch; enabling a workflow with no steps; duplicate `name` or
+  `api_slug`.
 - `POST /api/workflows/{slug}/run` returns 202 with a run id, 404 for unknown
   or disabled, 409 on overlap.
-- Export/import round-trips `peers_json` and `model_name` on agents and the
-  workflow definitions.
+- Export/import round-trips `peers_json` and `model_name` on agents, and
+  workflow definitions including their branches and per-branch steps.
 
 The existing suites must stay green — in particular `tests/test_job_runs.py`
 and `tests/test_admin_api.py`, both of which touch code this design changes.
