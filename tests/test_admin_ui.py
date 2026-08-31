@@ -524,6 +524,150 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 os.unlink(wf_run_harness_path)
 
             # --------------------------------------------------------------
+            # The workflow editor round trip. Opening a saved workflow for
+            # edit and saving it unchanged must produce the same definition:
+            # branches, and every step's agent, branch and position.
+            #
+            # The regression this pins down: addWorkflowStepRow marked an
+            # <option> selected only on an exact name match, so a step whose
+            # agent no longer exists matched nothing and the browser selected
+            # the FIRST option. collectWorkflowSteps submitted that
+            # substitute, validation passed (a real, enabled agent) and the
+            # save succeeded with a success toast -- leaving the step running
+            # a different agent, unattended, under a different principal.
+            #
+            # Run under jsdom, not a hand-rolled stub: <select> selectedness
+            # with a selected-but-disabled option is exactly the browser
+            # behaviour the fix relies on, so it must not be modelled by hand.
+            editor_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div id="workflow-modal"></div>
+  <span id="workflow-modal-title"></span>
+  <input id="workflow-id"><input id="workflow-name">
+  <input id="workflow-description"><input id="workflow-api-slug">
+  <input id="workflow-run-as"><input id="workflow-timeout">
+  <input id="workflow-max-parallel">
+  <select id="workflow-on-unknown-branch">
+    <option value="fail">fail</option><option value="skip">skip</option>
+  </select>
+  <input type="checkbox" id="workflow-skip-seen">
+  <input type="checkbox" id="workflow-enabled">
+  <div id="workflow-branches"></div>
+  <div id="workflow-steps"></div>
+</body></html>`);
+global.window = dom.window;
+global.document = dom.window.document;
+
+""" + js_no_autoinvoke + r"""
+
+const DEF = {
+    id: 7, name: 'mail-triage', description: 'triage', api_slug: 'mt',
+    run_as_principal: 'svc@example.com', run_timeout_seconds: 1200,
+    skip_seen_items: false, max_parallel_items: 2,
+    on_unknown_branch: 'skip', enabled: true,
+    branches: [
+        {key: 'abap', description: 'ABAP dumps', position: 1},
+        {key: 'fiori', description: 'UI issues', position: 2},
+    ],
+    steps: [
+        {branch_key: null, position: 1, agent_name: 'reader',
+         instructions: 'triage', fan_out: true, step_timeout_seconds: 300},
+        {branch_key: null, position: 2, agent_name: 'drafter',
+         instructions: 'draft', fan_out: false, step_timeout_seconds: 400},
+        {branch_key: 'abap', position: 1, agent_name: 'abap',
+         instructions: 'read the dump', fan_out: false, step_timeout_seconds: 500},
+        {branch_key: 'abap', position: 2, agent_name: 'drafter',
+         instructions: 'summarize', fan_out: false, step_timeout_seconds: 600},
+        {branch_key: 'fiori', position: 1, agent_name: 'reader',
+         instructions: 'check the UI', fan_out: false, step_timeout_seconds: 700},
+    ],
+};
+
+let saved = null;
+global.fetch = async (url, opts = {}) => {
+    if ((opts.method || 'GET') === 'GET') {
+        return { ok: true, json: async () => DEF };
+    }
+    saved = JSON.parse(opts.body);
+    return { ok: true, json: async () => ({}) };
+};
+// The save's trailing refresh would re-fetch the list; nothing here needs it.
+loadWorkflows = async () => {};
+
+const shape = steps => steps.map(s => [
+    s.branch_key, s.position, s.agent_name, s.instructions,
+    s.fan_out, s.step_timeout_seconds,
+]);
+
+async function main() {
+    // 1. Every agent still exists: an unchanged save must be a no-op.
+    allAgents = [{name: 'reader'}, {name: 'abap'}, {name: 'drafter'}];
+    saved = null;
+    await editWorkflow(7);
+    await saveWorkflow();
+    assert.ok(saved, 'an unchanged save must post a body');
+    assert.deepStrictEqual(
+        saved.branches.map(b => [b.key, b.description, b.position]),
+        DEF.branches.map(b => [b.key, b.description, b.position]),
+        'branches must survive the edit round trip',
+    );
+    assert.deepStrictEqual(
+        shape(saved.steps), shape(DEF.steps),
+        'every step must survive with its agent, branch and position',
+    );
+
+    // 2. 'reader' and 'abap' have been deleted since the workflow was saved.
+    //    Their steps must submit the missing names, so the server rejects the
+    //    save -- never a silent substitution.
+    allAgents = [{name: 'drafter'}, {name: 'zzz-other'}];
+    saved = null;
+    await editWorkflow(7);
+    await saveWorkflow();
+    assert.deepStrictEqual(
+        saved.steps.map(s => s.agent_name),
+        DEF.steps.map(s => s.agent_name),
+        'a step whose agent no longer exists must keep naming it',
+    );
+    assert.ok(
+        !saved.steps.some(s => s.agent_name === 'zzz-other'),
+        'no step may be retargeted at whatever happens to be listed first',
+    );
+
+    console.log('workflow editor round-trip scenarios passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+
+            # dir=ROOT so `require('jsdom')` resolves against the repo's
+            # node_modules; a system temp dir has none.
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, dir=str(ROOT)
+            ) as f:
+                f.write(editor_harness)
+                editor_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", editor_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                check(
+                    "the workflow editor round-trips steps, and never "
+                    "silently retargets a deleted agent",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:600],
+                )
+            finally:
+                os.unlink(editor_harness_path)
+
+            # --------------------------------------------------------------
             # A name containing a quote and a parenthesis must round-trip
             # safely through the Delete buttons on all three tables. Before
             # this fix, the name was interpolated straight into an inline
