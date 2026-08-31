@@ -957,6 +957,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     api_slug=agent.api_slug,
                     run_prompt=agent.run_prompt,
                     run_timeout_seconds=agent.run_timeout_seconds,
+                    model_name=agent.model_name,
                 )
             except ValueError as e:
                 raise HTTPException(
@@ -1052,6 +1053,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     run_as_principal=payload.run_as_principal,
                     run_prompt=payload.run_prompt,
                     run_timeout_seconds=payload.run_timeout_seconds,
+                    model_name=payload.model_name,
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
