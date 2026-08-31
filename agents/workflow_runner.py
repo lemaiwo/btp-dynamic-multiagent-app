@@ -213,7 +213,9 @@ async def _preflight(workflow: Workflow, steps) -> dict:
             row = await get_agent_by_name(session, name)
             if row is None or not row.enabled:
                 raise _WorkflowError(
-                    f"Agent {name!r} does not exist or is disabled."
+                    f"Agent {name!r} does not exist or is disabled. Enable it "
+                    "(or point this step at a different agent) in /admin and "
+                    "reload."
                 )
             if registry.build.specialists.get(name) is None:
                 raise _WorkflowError(

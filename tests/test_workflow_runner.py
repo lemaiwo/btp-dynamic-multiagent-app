@@ -175,6 +175,77 @@ async def main() -> None:
     check("step 1 had no From block", "## From" not in first.prompts[0],
           first.prompts[0][:120])
 
+    print("\n== a step failure is recorded on the step run ==")
+    failing = FakeAgent("failing", fail_with=RuntimeError("boom"))
+    install_specialists({"first": failing, "second": second})
+    run_id = await run_workflow("linear")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run failed", row.status == "failed", row.status)
+    check("run error names the step and the exception",
+          "first" in (row.error or "") and "boom" in (row.error or ""), row.error)
+    check("one step run recorded (second never ran)", len(steps) == 1, str(len(steps)))
+    check("step run recorded as failed", steps[0].status == "failed", steps[0].status)
+    check("step run error names the exception",
+          "boom" in (steps[0].error or ""), steps[0].error)
+
+    print("\n== a step timeout is recorded on the step run ==")
+    # The smallest step_timeout_seconds upsert_workflow accepts is 1 (an
+    # Integer column; 0 is treated as "unset" and falls back to 600), so the
+    # delay below just needs to comfortably outlast one second.
+    slow_timeout = FakeAgent("slow_timeout", answers=["late"], delay=1.3)
+    install_specialists({"first": slow_timeout, "second": second})
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="linear", description="d", enabled=True, branches=[],
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "first",
+                 "instructions": "start", "fan_out": False,
+                 "step_timeout_seconds": 1},
+                {"branch_key": None, "position": 2, "agent_name": "second",
+                 "instructions": "finish", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    run_id = await run_workflow("linear")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run failed on timeout", row.status == "failed", row.status)
+    check("run error mentions the timeout",
+          "timeout" in (row.error or "").lower(), row.error)
+    check("one step run recorded (second never ran)", len(steps) == 1, str(len(steps)))
+    check("step run recorded as failed", steps[0].status == "failed", steps[0].status)
+    check("step run error mentions the timeout",
+          "timeout" in (steps[0].error or "").lower(), steps[0].error)
+
+    print("\n== preflight refuses a disabled agent ==")
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="third", description="t", instructions="t",
+                           mcp_servers=SERVERS, run_as_principal="svc@example.com")
+        await upsert_workflow(
+            s, name="disabled_agent_wf", description="d", enabled=True, branches=[],
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "third",
+                 "instructions": "start", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+        # Disable the agent only after the workflow references it — save-time
+        # validation only runs when the workflow itself is (re)saved, so a
+        # workflow can end up pointing at an agent that has since been
+        # disabled without ever being re-saved itself.
+        await upsert_agent(s, name="third", description="t", instructions="t",
+                           mcp_servers=SERVERS, run_as_principal="svc@example.com",
+                           enabled=False)
+    install_specialists({"third": FakeAgent("third")})
+    run_id = await run_workflow("disabled_agent_wf")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+    check("run failed on disabled agent", row.status == "failed", row.status)
+    check("error names the disabled agent", "third" in (row.error or ""), row.error)
+
     print("\n== preflight refuses an unbuilt agent ==")
     install_specialists({"first": first})  # 'second' is missing
     run_id = await run_workflow("linear")
@@ -220,6 +291,20 @@ async def main() -> None:
           "second" in (row.error or "") and "principal" in (row.error or "").lower(),
           row.error)
 
+    print("\n== start_workflow_run refuses a disabled workflow ==")
+    async with SessionLocal() as s:
+        await upsert_workflow(
+            s, name="disabled_wf_direct", description="d", enabled=False,
+            branches=[], steps=[],
+        )
+        disabled_wf = await get_workflow_by_name(s, "disabled_wf_direct")
+    refused_disabled = False
+    try:
+        await wr.start_workflow_run(disabled_wf, trigger="manual")
+    except wr.RunRefused:
+        refused_disabled = True
+    check("disabled workflow refused", refused_disabled)
+
     print("\n== overlap is refused ==")
     async with SessionLocal() as s:
         await upsert_agent(s, name="second", description="s", instructions="s",
@@ -237,6 +322,33 @@ async def main() -> None:
     await asyncio.gather(*[t for t in wr._tasks if not t.done()],
                          return_exceptions=True)
     check("first run still completed", first_id is not None)
+
+    print("\n== overlap is refused under genuine concurrency ==")
+    # The test above awaits the first call before issuing the second, so the
+    # DB row alone (created by the first call) explains the refusal — the
+    # lock's actual job, closing the check-and-create race between two calls
+    # that observe "no active run" before either has created one, is never
+    # exercised. Fire both through asyncio.gather so they genuinely race for
+    # _lock_for's asyncio.Lock.
+    async with SessionLocal() as s:
+        wf = await get_workflow_by_name(s, "linear")
+    install_specialists({
+        "first": OrderedAgent("first", answers=["x"], delay=0.3),
+        "second": second,
+    })
+    results = await asyncio.gather(
+        wr.start_workflow_run(wf, trigger="manual"),
+        wr.start_workflow_run(wf, trigger="manual"),
+        return_exceptions=True,
+    )
+    concurrent_succeeded = [r for r in results if isinstance(r, str)]
+    concurrent_refused = [r for r in results if isinstance(r, wr.RunRefused)]
+    check("exactly one concurrent start succeeded",
+          len(concurrent_succeeded) == 1, str(results))
+    check("exactly one concurrent start was refused",
+          len(concurrent_refused) == 1, str(results))
+    await asyncio.gather(*[t for t in wr._tasks if not t.done()],
+                         return_exceptions=True)
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
