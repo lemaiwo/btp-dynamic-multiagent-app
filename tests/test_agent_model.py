@@ -33,16 +33,18 @@ from pydantic_ai.models.test import TestModel  # noqa: E402
 import agents.shared as shared  # noqa: E402
 
 
-class _FakeModel:
-    """Minimal stand-in used only to be handed to Agent()."""
+# Module-level fake_get_model that caches instances
+_fake_model_cache: dict = {}
 
-    model_name = "fake"
+def _module_fake_get_model(name: str | None = None):
+    """Fake get_model that caches TestModel instances per name."""
+    if name == "no-such-model":
+        raise RuntimeError("deployment not found")
+    if name not in _fake_model_cache:
+        _fake_model_cache[name] = TestModel()
+    return _fake_model_cache[name]
 
-    def __repr__(self) -> str:
-        return "FakeModel()"
-
-
-shared.get_model = lambda name=None: _FakeModel()  # type: ignore[assignment]
+shared.get_model = _module_fake_get_model  # type: ignore[assignment]
 
 
 class _FakeMCP:
@@ -63,9 +65,13 @@ _orig_agent_init = pydantic_ai.Agent.__init__
 
 
 def _patched_init(self, model=None, **kwargs):  # type: ignore[no-untyped-def]
-    # Drop toolsets (they may reference our fake MCP)
+    # Drop toolsets (they may reference our fake MCP). Pass the given model
+    # through unchanged — registry.py always passes a real (fake) TestModel
+    # instance built via the patched get_model, and the registry-resolution
+    # checks below depend on `is` identity against those exact instances.
+    # Only fall back to the string "test" when no model was given at all.
     kwargs.pop("toolsets", None)
-    _orig_agent_init(self, model="test", **kwargs)
+    _orig_agent_init(self, model=(model if model is not None else "test"), **kwargs)
 
 
 pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
@@ -164,27 +170,32 @@ async def main() -> None:
 
     print("\n== registry resolution ==")
     asked: list[str | None] = []
-    instances: dict[str | None, TestModel] = {}
 
-    def fake_get_model(name: str | None = None):
+    # Clear the cache before starting fresh test
+    _fake_model_cache.clear()
+
+    # Wrap the registry_module.get_model to track calls
+    real_registry_get_model = registry_module.get_model
+
+    def tracking_get_model(name: str | None = None):
         asked.append(name)
-        if name == "no-such-model":
-            raise RuntimeError("deployment not found")
-        if name not in instances:
-            instances[name] = TestModel()
-        return instances[name]
+        return real_registry_get_model(name)
 
-    real_get_model = registry_module.get_model
-    registry_module.get_model = fake_get_model
+    registry_module.get_model = tracking_get_model  # type: ignore[assignment]
     try:
         build = await registry_module.build_orchestrator()
     finally:
-        registry_module.get_model = real_get_model
+        registry_module.get_model = real_registry_get_model  # type: ignore[assignment]
 
-    default_model = instances["gpt-4o"]
+    default_model = _fake_model_cache.get("gpt-4o")
     check("override model was requested", "gpt-4o-mini" in asked, str(asked))
+
+    # Debug: show what's in the cache and what models the specialists have
+    small_model = build.specialists["small"].model
+    cached_mini = _fake_model_cache.get("gpt-4o-mini")
     check("overriding agent got its own model",
-          build.specialists["small"].model is instances["gpt-4o-mini"])
+          small_model is cached_mini,
+          f"got {small_model!r}, expected {cached_mini!r}, cache keys: {list(_fake_model_cache.keys())}")
     check("plain agent got the global model",
           build.specialists["plain"].model is default_model)
     check("orchestrator keeps the global model",
