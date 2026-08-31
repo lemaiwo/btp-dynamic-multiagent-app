@@ -100,6 +100,16 @@ async def main() -> None:
             [ABAP_BRANCH],
             [READER, ABAP_STEP, {**ABAP_STEP, "agent_name": "abap"}],
             expect="duplicate")
+    rejects("duplicate positions on the main line",
+            [], [READER, {**DRAFTER, "position": 1}], expect="duplicate")
+    rejects("non-contiguous positions inside a branch",
+            [ABAP_BRANCH],
+            [READER, ABAP_STEP, {**ABAP_STEP, "position": 3, "agent_name": "fiori"}],
+            expect="contiguous")
+    rejects("fan-out step nested in a branch",
+            [ABAP_BRANCH],
+            [{**READER, "fan_out": False}, {**ABAP_STEP, "fan_out": True}],
+            expect="main line")
     rejects("enabling a workflow with no steps", [], [], expect="no steps")
 
     print("\n== validation accepts a good definition ==")
@@ -194,6 +204,37 @@ async def main() -> None:
             check("duplicate api_slug rejected", False, "no ValueError")
         except ValueError as e:
             check("duplicate api_slug rejected", "slug" in str(e).lower(), str(e))
+
+    print("\n== a disabled agent cannot be named by a step ==")
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="retired", description="retired", instructions="retired",
+                           mcp_servers=servers, enabled=False)
+        try:
+            await upsert_workflow(
+                s, name="disabled-agent-wf", description="d", api_slug=None,
+                run_as_principal=None, run_timeout_seconds=1800,
+                skip_seen_items=True, max_parallel_items=1,
+                on_unknown_branch="fail", enabled=True,
+                branches=[], steps=[{**READER, "agent_name": "retired", "fan_out": False}],
+            )
+            check("disabled agent rejected", False, "no ValueError")
+        except ValueError as e:
+            check("disabled agent rejected", "retired" in str(e).lower(), str(e))
+
+    print("\n== an invalid on_unknown_branch value is refused ==")
+    async with SessionLocal() as s:
+        try:
+            await upsert_workflow(
+                s, name="bad-on-unknown-branch", description="d", api_slug=None,
+                run_as_principal=None, run_timeout_seconds=1800,
+                skip_seen_items=True, max_parallel_items=1,
+                on_unknown_branch="explode", enabled=True,
+                branches=[], steps=[{**READER, "fan_out": False}],
+            )
+            check("invalid on_unknown_branch rejected", False, "no ValueError")
+        except ValueError as e:
+            check("invalid on_unknown_branch rejected",
+                  "on_unknown_branch" in str(e).lower(), str(e))
 
     print("\n== delete removes the parts too ==")
     async with SessionLocal() as s:
