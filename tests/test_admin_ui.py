@@ -318,6 +318,129 @@ async def main() -> None:
             finally:
                 os.unlink(js_path)
 
+            # --------------------------------------------------------------
+            # renderAgentModelOptions() behavioral check: an unrepresented
+            # stored override (fetch failed, or the model was undeployed
+            # since the config was saved) must stay selected rather than
+            # silently reverting to "" ("use the active model"), since a
+            # save at that point would delete the override. This actually
+            # *executes* the shipped function under real <select>.value
+            # semantics, rather than just asserting the source text exists.
+            auto_invoke = re.search(
+                r"^loadSkills\(\);\nloadAgents\(\);\nloadWhoami\(\);"
+                r"\nloadOrchestrator\(\);\nloadModel\(\);\s*$",
+                js,
+                re.MULTILINE,
+            )
+            check("found the trailing auto-invoke block to strip", auto_invoke is not None)
+            js_no_autoinvoke = js[: auto_invoke.start()] if auto_invoke else js
+
+            harness = r"""
+'use strict';
+const assert = require('node:assert');
+
+// A real <select>: .value only "sticks" if a matching <option value="...">
+// is present in .innerHTML, otherwise the browser resets it to "" -- that
+// reset-to-blank is exactly the failure mode under test, so it must be
+// modeled faithfully rather than stubbed as a plain property.
+function makeSelectStub() {
+    let html = '';
+    let val = '';
+    const optionValues = () => [...html.matchAll(/<option value="([^"]*)"/g)].map(m => m[1]);
+    return {
+        get innerHTML() { return html; },
+        set innerHTML(h) {
+            html = h;
+            if (!optionValues().includes(val)) val = '';
+        },
+        get value() { return val; },
+        set value(v) { val = optionValues().includes(v) ? v : ''; },
+    };
+}
+
+const modelSelect = makeSelectStub();
+const toastEl = { textContent: '', className: '' };
+global.document = {
+    getElementById(id) {
+        if (id === 'agent-model-name') return modelSelect;
+        if (id === 'toast') return toastEl;
+        throw new Error('unstubbed getElementById: ' + id);
+    },
+};
+
+""" + js_no_autoinvoke + r"""
+
+async function main() {
+    // Scenario 1: GET /admin/api/model fails outright.
+    global.fetch = async () => ({ ok: false, json: async () => ({}) });
+    await renderAgentModelOptions('gpt-4o-mini');
+    assert.strictEqual(modelSelect.value, 'gpt-4o-mini',
+        'scenario 1: override must survive a failed model fetch');
+    assert.ok(modelSelect.innerHTML.includes('not currently available'),
+        'scenario 1: the unavailable state must be shown, not hidden');
+    assert.ok(toastEl.className.includes('error'),
+        'scenario 1: a failed fetch must surface via toast');
+
+    // Scenario 2: fetch succeeds, but the stored model isn't in the list
+    // (e.g. its deployment was removed after the agent was configured).
+    toastEl.className = '';
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ({ available: ['other-model'], model_name: null, default: null }),
+    });
+    await renderAgentModelOptions('gpt-4o-mini');
+    assert.strictEqual(modelSelect.value, 'gpt-4o-mini',
+        'scenario 2: override must survive an undeployed model');
+    assert.ok(modelSelect.innerHTML.includes('not currently available'),
+        'scenario 2: the unavailable state must be shown, not hidden');
+    assert.strictEqual(toastEl.className, '',
+        'scenario 2: a successful fetch must not toast an error');
+
+    // Scenario 3 (regression guard): a model that IS available selects
+    // normally and gets no synthetic "(not currently available)" option.
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ({ available: ['gpt-4o-mini', 'other-model'], model_name: null, default: null }),
+    });
+    await renderAgentModelOptions('gpt-4o-mini');
+    assert.strictEqual(modelSelect.value, 'gpt-4o-mini');
+    assert.ok(!modelSelect.innerHTML.includes('not currently available'),
+        'scenario 3: a deployed model must not be flagged unavailable');
+
+    // Scenario 4 (regression guard): blank override stays blank and means
+    // "use the active model" -- no sentinel value is introduced.
+    global.fetch = async () => ({
+        ok: true,
+        json: async () => ({ available: ['gpt-4o-mini'], model_name: null, default: null }),
+    });
+    await renderAgentModelOptions('');
+    assert.strictEqual(modelSelect.value, '');
+
+    console.log('all renderAgentModelOptions scenarios passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(harness)
+                harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                check(
+                    "renderAgentModelOptions preserves an unrepresented "
+                    "override instead of silently blanking it",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:500],
+                )
+            finally:
+                os.unlink(harness_path)
+
         # ------------------------------------------------------------------
         print("\n== 3. fetch() call discovery ==")
         # The JS wraps every call in `api('/path', opts)` — extract paths
