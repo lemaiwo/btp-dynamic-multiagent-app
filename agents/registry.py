@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import reprlib
+from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -47,6 +48,32 @@ _AUTH_WAIT_SECONDS = float(os.environ.get("MCP_AUTH_WAIT_SECONDS", "180"))
 _AUTH_POLL_SECONDS = float(os.environ.get("MCP_AUTH_POLL_SECONDS", "1.5"))
 # Cap auth→retry rounds so a server that keeps demanding auth can't loop forever.
 _MAX_AUTH_ROUNDS = int(os.environ.get("MCP_AUTH_MAX_ROUNDS", "2"))
+
+# Peer delegation lets an agent consult another agent, so a chain can run
+# specialist to specialist. Mutual peers (A lists B, B lists A) are a
+# legitimate configuration — two specialists that can each ask the other a
+# question — so cycles are not rejected at save time. They are bounded here
+# instead.
+_MAX_DELEGATION_DEPTH = int(os.environ.get("AGENT_DELEGATION_MAX_DEPTH", "3"))
+_delegation_stack: ContextVar[tuple[str, ...]] = ContextVar(
+    "delegation_stack", default=()
+)
+
+
+def _depth_message(agent_name: str) -> str:
+    return (
+        f"Cannot consult **{agent_name}**: the delegation chain already reached "
+        f"its depth limit of {_MAX_DELEGATION_DEPTH}. Answer with the "
+        "information you already have, and say what is still missing."
+    )
+
+
+def _reentry_message(agent_name: str) -> str:
+    return (
+        f"Cannot consult **{agent_name}**: it is already working on this "
+        "request further up the chain, so consulting it again would loop. "
+        "Answer with the information you already have."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +651,17 @@ def _attach_delegation_tool(
             report_delegation_start,
         )
 
+        stack = _delegation_stack.get()
+        if row.name in stack:
+            logger.info("[delegate] %s refused: already on the stack %s", row.name, stack)
+            return _reentry_message(row.name)
+        if len(stack) >= _MAX_DELEGATION_DEPTH:
+            logger.info(
+                "[delegate] %s refused: depth %d reached", row.name, len(stack)
+            )
+            return _depth_message(row.name)
+        stack_token = _delegation_stack.set(stack + (row.name,))
+
         logger.info("[delegate] %s START | query=%.160s", row.name, query.replace("\n", " "))
         # Phase hint for the live "working…" heartbeat while the specialist spins
         # up (MCP connect + first model call) before any tool card appears. The
@@ -743,6 +781,7 @@ def _attach_delegation_tool(
                 "above, then send your request again."
             )
         finally:
+            _delegation_stack.reset(stack_token)
             report_delegation_end(row.name)
 
     _delegate.__name__ = tool_name
