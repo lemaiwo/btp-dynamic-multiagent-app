@@ -160,6 +160,21 @@ async def main() -> None:
           p[:160])
     check("task comes last", p.rindex("## Your task") > p.rindex("## From "), p[:160])
 
+    print("\n== a work item must carry a non-empty id ==")
+    # An empty id is worse than a missing one: item_succeeded_before matches on
+    # it, so once one run records an item keyed "", every later item keyed ""
+    # is skipped forever while skip_seen_items is on. The reader is told to
+    # emit an id it cannot supply blank.
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    try:
+        wr.WorkItem(id="", title="t", branches=[], text="body")
+        check("an empty item id is rejected", False, "no ValidationError raised")
+    except ValidationError:
+        check("an empty item id is rejected", True)
+    check("a real item id is still accepted",
+          wr.WorkItem(id="m1", text="body").id == "m1")
+
     print("\n== a linear workflow runs its steps in order ==")
     CALL_ORDER.clear()
     # 'first' is deliberately slower than 'second' — order must come from the
@@ -916,6 +931,50 @@ async def main() -> None:
         check("client closed once no workflow run is in flight", client.closed)
     finally:
         registry_module.build_orchestrator = real_build_fn
+
+    print("\n== a DB failure recording success fails only its own item ==")
+    # The success-path finish_item_run used to sit OUTSIDE process()'s try. A
+    # failure there escaped process(), and asyncio.gather (deliberately without
+    # return_exceptions) propagates immediately WITHOUT cancelling the sibling
+    # item tasks -- so the run finalized `failed`, releasing the overlap lock,
+    # while orphaned tasks kept invoking agents and writing rows against a
+    # finished run.
+    real_finish_item = wr.finish_item_run
+    blown = {"done": False}
+
+    async def flaky_finish_item(session, item_run_id, *, status, error=None):
+        if status == "success" and not blown["done"]:
+            blown["done"] = True
+            raise RuntimeError("pool exhausted")
+        return await real_finish_item(session, item_run_id, status=status,
+                                      error=error)
+
+    install_specialists({
+        "reader": FakeAgent("reader", answers=[[
+            wr.WorkItem(id="f1", title="a", branches=[], text="body one"),
+            wr.WorkItem(id="f2", title="b", branches=[], text="body two"),
+            wr.WorkItem(id="f3", title="c", branches=[], text="body three"),
+        ]]),
+        "drafter": FakeAgent("drafter"),
+    })
+    wr.finish_item_run = flaky_finish_item
+    try:
+        run_id = await run_workflow("fanout")
+    finally:
+        wr.finish_item_run = real_finish_item
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = {i.item_key: i for i in await list_item_runs(s, run_id)}
+    check("the run is partial, not failed", row.status == "partial",
+          f"{row.status} / {row.error}")
+    check("the item whose success write blew up is recorded failed",
+          items["f1"].status == "failed", items["f1"].status)
+    check("the sibling items still completed",
+          items["f2"].status == "success" and items["f3"].status == "success",
+          str({k: v.status for k, v in items.items()}))
+    check("counts reflect the split",
+          (row.items_total, row.items_succeeded, row.items_failed) == (3, 2, 1),
+          f"{row.items_total}/{row.items_succeeded}/{row.items_failed}")
 
     print("\n== cancel_all_workflow_runs records interrupted ==")
     slow_reader = FakeAgent("reader", answers=[[]], delay=5)
