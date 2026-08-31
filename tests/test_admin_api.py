@@ -894,6 +894,13 @@ async def run_tests() -> None:
         sched_run_id = r.json().get("run_id")
         check("run_id returned", bool(sched_run_id), r.text)
 
+        # start_run creates the run row (the overlap lock) and returns before
+        # the background task does any work, so this second POST -- issued
+        # before draining the first's task -- lands on a run that is already
+        # `running` and must be refused.
+        r2 = await client.post("/api/agents/run-agent/run")
+        check("second concurrent scheduled run is 409", r2.status_code == 409, r2.text)
+
         # Drain the background task the run spawned so it doesn't leak a
         # "Task was destroyed but it is pending" warning at process exit
         # (same pattern as tests/test_job_runs.py).
