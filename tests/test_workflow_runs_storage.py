@@ -100,6 +100,12 @@ async def main() -> None:
               str(items[0].to_dict()["branches"]))
         check("step recorded", len(steps) == 1 and steps[0].output == "analysis")
         check("step tagged with its branch", steps[0].branch_key == "abap")
+        step_dict = steps[0].to_dict()
+        check("step dict carries its run id",
+              step_dict["workflow_run_id"] == run_id, str(step_dict))
+        check("step dict carries timing",
+              step_dict["started_at"] is not None and step_dict["finished_at"] is not None,
+              str(step_dict))
 
     print("\n== finishing the run ==")
     async with SessionLocal() as s:
@@ -122,6 +128,19 @@ async def main() -> None:
         check("unknown item is not seen",
               not await item_succeeded_before(s, workflow_id=wf_id, item_key="msg-9"))
 
+    print("\n== repeat-run safety is scoped per workflow ==")
+    async with SessionLocal() as s:
+        wf_other = await upsert_workflow(
+            s, name="wf-other", description="d", enabled=True,
+            steps=[{"branch_key": None, "position": 1, "agent_name": "reader",
+                    "instructions": "go", "fan_out": True,
+                    "step_timeout_seconds": 600}],
+        )
+        wf_other_id = wf_other.id
+        check("same item_key under a different workflow is not seen",
+              not await item_succeeded_before(
+                  s, workflow_id=wf_other_id, item_key="msg-1"))
+
     print("\n== a failed item does not count as seen ==")
     async with SessionLocal() as s:
         wf = await get_workflow(s, wf_id)
@@ -137,10 +156,41 @@ async def main() -> None:
     async with SessionLocal() as s:
         wf = await get_workflow(s, wf_id)
         stuck = await create_workflow_run(s, workflow=wf, trigger="schedule")
+        stuck_item = await create_item_run(s, run_id=stuck.id, item_key="msg-3",
+                                           title="t", branches=[])
+        stuck_step = await create_step_run(s, run_id=stuck.id, item_run_id=stuck_item.id,
+                                           branch_key=None, position=1,
+                                           agent_name="reader")
         swept = await sweep_stale_workflow_runs(s, all_running=True)
         check("stale run swept", swept == 1, str(swept))
         row = await get_workflow_run(s, stuck.id)
         check("swept run is interrupted", row.status == "interrupted", row.status)
+        items_after = await list_item_runs(s, stuck.id)
+        steps_after = await list_step_runs(s, stuck.id)
+        check("swept item run is interrupted too",
+              len(items_after) == 1 and items_after[0].status == "interrupted",
+              str([i.status for i in items_after]))
+        check("swept step run is interrupted too",
+              len(steps_after) == 1 and steps_after[0].status == "interrupted",
+              str([s_.status for s_ in steps_after]))
+
+    print("\n== defensive errors instead of silent corruption ==")
+    async with SessionLocal() as s:
+        try:
+            await create_item_run(s, run_id="no-such-run", item_key="x",
+                                  title="t", branches=[])
+            check("create_item_run rejects an unknown run_id", False,
+                  "no exception raised")
+        except ValueError:
+            check("create_item_run rejects an unknown run_id", True)
+
+        try:
+            await finish_workflow_run(s, run_id, status="partial",
+                                      counts={"items_bogus": 1})
+            check("finish_workflow_run rejects an unknown counts key", False,
+                  "no exception raised")
+        except ValueError:
+            check("finish_workflow_run rejects an unknown counts key", True)
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)

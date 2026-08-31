@@ -659,6 +659,7 @@ class WorkflowStepRun(Base):
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
+            "workflow_run_id": self.workflow_run_id,
             "item_run_id": self.item_run_id,
             "branch_key": self.branch_key,
             "position": self.position,
@@ -666,6 +667,8 @@ class WorkflowStepRun(Base):
             "status": self.status,
             "output": self.output,
             "error": self.error,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "finished_at": self.finished_at.isoformat() if self.finished_at else None,
         }
 
 
@@ -1564,6 +1567,16 @@ async def create_workflow_run(
     return row
 
 
+# The only WorkflowRun columns `finish_workflow_run`'s `counts` may set. An
+# allow-list, not a blind setattr: a typo'd key would otherwise create a
+# plain Python attribute SQLAlchemy silently drops at flush, and a key that
+# collides with a real column (e.g. "workflow_id") would silently overwrite
+# it if int-convertible.
+_WORKFLOW_RUN_COUNT_FIELDS = frozenset(
+    {"items_total", "items_succeeded", "items_failed", "items_skipped"}
+)
+
+
 async def finish_workflow_run(
     session: AsyncSession,
     run_id: str,
@@ -1576,6 +1589,9 @@ async def finish_workflow_run(
     row = await session.get(WorkflowRun, run_id)
     if row is None:
         return
+    unknown = set(counts or {}) - _WORKFLOW_RUN_COUNT_FIELDS
+    if unknown:
+        raise ValueError(f"Unknown workflow run count field(s): {sorted(unknown)}")
     row.status = status
     row.summary = summary
     row.error = error
@@ -1594,10 +1610,12 @@ async def create_item_run(
     branches: list[str],
 ) -> WorkflowItemRun:
     parent = await session.get(WorkflowRun, run_id)
+    if parent is None:
+        raise ValueError(f"No workflow run with id {run_id!r}")
     row = WorkflowItemRun(
         id=str(uuid.uuid4()),
         workflow_run_id=run_id,
-        workflow_id=parent.workflow_id if parent is not None else 0,
+        workflow_id=parent.workflow_id,
         item_key=item_key[:255],
         title=title,
         branches_json=json.dumps(branches) if branches else None,
