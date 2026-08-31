@@ -69,13 +69,23 @@ async def cancel_all_runs() -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def _has_usable_credentials(agent: AgentConfig) -> bool:
+async def _has_usable_credentials(
+    agent: AgentConfig, principal: str | None = None
+) -> bool:
     """True when every oauth2 server this agent binds has a usable token for
-    its run-as principal. Patched in tests."""
+    `principal` — by default the agent's own run-as principal.
+
+    The identity is a parameter because it is not always the agent's own: a
+    workflow step binds the workflow's fallback principal when the agent has
+    none (Workflow.run_as_principal), and the whole step — delegated peers
+    included — runs under that one identity. Reading agent.run_as_principal
+    unconditionally would fail every such agent at preflight and send the
+    operator to re-authorize an account that was never the one in question.
+    Patched in tests."""
     from agents.db import AUTH_MODE_OAUTH2
     from agents.oauth2 import has_usable_token, normalize_mcp_url
 
-    principal = agent.run_as_principal
+    principal = (principal or agent.run_as_principal or "").strip() or None
     if not principal:
         return False
     for spec in agent.mcp_servers:

@@ -85,6 +85,30 @@ class FakeAgent:
         return FakeResult(answer)
 
 
+# main() replaces this with a constant stub (the fakes have no real MCP
+# servers), so the one test that needs the genuine credential gate -- the
+# workflow-principal fallback -- has to capture it before that happens.
+REAL_HAS_CREDENTIALS = job_runner._has_usable_credentials
+
+
+def stub_credentials(result: bool = True):
+    return lambda agent, principal=None: asyncio.sleep(0, result=result)
+
+
+class PrincipalAgent(FakeAgent):
+    """Records the identity bound while it ran."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.principals: list[str | None] = []
+
+    async def run(self, prompt, **kwargs):
+        from agents.auth import current_principal  # noqa: PLC0415
+
+        self.principals.append(current_principal.get())
+        return await super().run(prompt, **kwargs)
+
+
 CALL_ORDER: list[str] = []
 
 
@@ -122,7 +146,7 @@ async def main() -> None:
     await init_db()
     # Credentials are checked by job_runner; the fake agents have no real MCP
     # servers, so approve them and test the refusal path explicitly below.
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
 
     await seed_agents(["reader", "abap", "fiori", "drafter"])
 
@@ -258,14 +282,14 @@ async def main() -> None:
 
     print("\n== preflight refuses a stale credential ==")
     install_specialists({"first": first, "second": second})
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=False)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=False)
     run_id = await run_workflow("linear")
     async with SessionLocal() as s:
         row = await get_workflow_run(s, run_id)
     check("run failed on credentials", row.status == "failed", row.status)
     check("error mentions authorization",
           "author" in (row.error or "").lower(), row.error)
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
 
     print("\n== preflight refuses a step with no principal at all ==")
     async with SessionLocal() as s:
@@ -290,6 +314,99 @@ async def main() -> None:
     check("error names the principal-less agent",
           "second" in (row.error or "") and "principal" in (row.error or "").lower(),
           row.error)
+
+    print("\n== a step falls back to the workflow's run-as principal ==")
+    # The REAL credential gate, deliberately: every other test in this file
+    # stubs it to a constant, which is exactly how the gate reading the agent's
+    # own principal -- never the workflow's fallback -- went unnoticed. An
+    # agent with a blank principal must pass preflight on the workflow's, and
+    # must actually bind it.
+    job_runner._has_usable_credentials = REAL_HAS_CREDENTIALS
+    fallback_agent = PrincipalAgent("fallback_agent", answers=["done"])
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="fallback_agent", description="f",
+                           instructions="f", mcp_servers=SERVERS,
+                           run_as_principal="")
+        await upsert_workflow(
+            s, name="fallback_wf", description="d", enabled=True, branches=[],
+            run_as_principal="svc-fallback@example.com",
+            steps=[
+                {"branch_key": None, "position": 1,
+                 "agent_name": "fallback_agent", "instructions": "go",
+                 "fan_out": False, "step_timeout_seconds": 60},
+            ],
+        )
+    install_specialists({"fallback_agent": fallback_agent})
+    run_id = await run_workflow("fallback_wf")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("preflight accepts the workflow's fallback principal",
+          row.status == "success", f"{row.status} / {row.error}")
+    check("the step actually ran",
+          len(steps) == 1 and steps[0].status == "success",
+          str([(st.status, st.error) for st in steps]))
+    check("the step bound the workflow's principal",
+          fallback_agent.principals == ["svc-fallback@example.com"],
+          str(fallback_agent.principals))
+    job_runner._has_usable_credentials = stub_credentials(True)
+
+    print("\n== preflight checks the peers a step can reach ==")
+    # A peer with no usable credential does NOT fail the delegation at run
+    # time: registry._delegate returns the sign-in prompt as its answer when
+    # there is no interactive sink, the parent reads it as content, and the
+    # step is recorded `success` -- permanently, once skip_seen_items sees it.
+    # peer_root -> peer_mid -> peer_deep, with peer_mid listing peer_root back
+    # so the walk has to survive a legitimate mutual-peer cycle.
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="peer_deep", description="d",
+                           instructions="d", mcp_servers=SERVERS,
+                           run_as_principal="svc@example.com")
+        await upsert_agent(s, name="peer_mid", description="m",
+                           instructions="m", mcp_servers=SERVERS,
+                           run_as_principal="svc@example.com",
+                           peers=["peer_root", "peer_deep"])
+        await upsert_agent(s, name="peer_root", description="r",
+                           instructions="r", mcp_servers=SERVERS,
+                           run_as_principal="svc@example.com",
+                           peers=["peer_mid"])
+        await upsert_workflow(
+            s, name="peers_wf", description="d", enabled=True, branches=[],
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "peer_root",
+                 "instructions": "go", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    peer_root_agent = FakeAgent("peer_root", answers=["done"])
+    install_specialists({"peer_root": peer_root_agent,
+                         "peer_mid": FakeAgent("peer_mid"),
+                         "peer_deep": FakeAgent("peer_deep")})
+    run_id = await run_workflow("peers_wf")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+    check("a healthy peer graph with a cycle still runs",
+          row.status == "success", f"{row.status} / {row.error}")
+
+    job_runner._has_usable_credentials = (
+        lambda agent, principal=None:
+            asyncio.sleep(0, result=agent.name != "peer_deep")
+    )
+    peer_root_agent.prompts.clear()
+    run_id = await run_workflow("peers_wf")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("a peer with no usable credential fails preflight",
+          row.status == "failed", f"{row.status} / {row.error}")
+    check("the error names the peer, not the step's agent",
+          "peer_deep" in (row.error or ""), row.error)
+    check("the error says it was reached as a peer",
+          "peer" in (row.error or "").lower(), row.error)
+    check("no step ran", steps == [], str(steps))
+    check("no model call was made", peer_root_agent.prompts == [],
+          str(peer_root_agent.prompts))
+    job_runner._has_usable_credentials = stub_credentials(True)
 
     print("\n== start_workflow_run refuses a disabled workflow ==")
     async with SessionLocal() as s:
@@ -811,6 +928,48 @@ async def main() -> None:
     async with SessionLocal() as s:
         row = await get_workflow_run(s, run_id)
     check("cancelled run is interrupted", row.status == "interrupted", row.status)
+
+    print("\n== cancelling mid-item records the item and the counts ==")
+    # Cancelling once items are in flight is the case SIGTERM and a
+    # run_timeout_seconds expiry both produce. The in-flight item's row must
+    # not be left `running` (a timeout never self-heals -- the process lives
+    # on, so no startup sweep ever clears it), and an interrupted run must
+    # report the items it did finish rather than 0/0/0/0.
+    class HangForOne(FakeAgent):
+        async def run(self, prompt, **kwargs):
+            self.prompts.append(prompt)
+            if "body two" in prompt:
+                await asyncio.sleep(5)
+            return FakeResult("drafted")
+
+    install_specialists({
+        "reader": FakeAgent("reader", answers=[[
+            wr.WorkItem(id="c-ok", title="a", branches=[], text="body one"),
+            wr.WorkItem(id="c-hang", title="b", branches=[], text="body two"),
+        ]]),
+        "drafter": HangForOne("drafter"),
+    })
+    async with SessionLocal() as s:
+        wf = await get_workflow_by_name(s, "fanout")
+    run_id = await wr.start_workflow_run(wf, trigger="manual")
+    # Long enough for the first item to finish and the second to be mid-step;
+    # max_parallel_items is 1, so they cannot overlap.
+    await asyncio.sleep(0.4)
+    await wr.cancel_all_workflow_runs()
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        items = {i.item_key: i for i in await list_item_runs(s, run_id)}
+    check("cancelled mid-item run is interrupted", row.status == "interrupted",
+          f"{row.status} / {row.error}")
+    check("the finished item is still success",
+          items["c-ok"].status == "success", items["c-ok"].status)
+    check("the in-flight item is interrupted, not left running",
+          items["c-hang"].status == "interrupted", items["c-hang"].status)
+    check("counts report the items already finished",
+          (row.items_total, row.items_succeeded, row.items_failed,
+           row.items_skipped) == (2, 1, 0, 0),
+          f"{row.items_total}/{row.items_succeeded}/{row.items_failed}/"
+          f"{row.items_skipped}")
 
     print("\n== _finalize never lets a DB failure escape ==")
     # The run row IS the overlap lock, so an exception escaping the finalizer

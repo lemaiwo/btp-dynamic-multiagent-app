@@ -234,7 +234,7 @@ async def main() -> None:
     )
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
     os.environ["PUBLIC_BASE_URL"] = "https://approuter.example.com"
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
 
     async with SessionLocal() as s:
         job = await get_agent_by_slug(s, "daily-check")
@@ -262,7 +262,7 @@ async def main() -> None:
         check("error recorded", "mcp down" in (r.error or ""))
 
     print("\n== runner: credential pre-flight ==")
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=False)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=False)
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
     async with SessionLocal() as s:
         job = await get_agent_by_slug(s, "daily-check")
@@ -274,7 +274,7 @@ async def main() -> None:
         check("re-authorization message", "re-author" in (r.error or "").lower())
 
     print("\n== runner: overlap guard ==")
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
     async with SessionLocal() as s:
         job = await get_agent_by_slug(s, "daily-check")
         await create_job_run(s, agent=job, trigger="manual")
@@ -475,7 +475,7 @@ async def main() -> None:
         )
         hanging = await get_agent_by_name(s, "Hanging Check")
     registry._build = _FakeBuild({"Hanging Check": _HangingSpecialist()})
-    job_runner._has_usable_credentials = lambda agent: asyncio.sleep(0, result=True)
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
     hang_run_id = await job_runner.start_run(hanging, trigger="schedule")
     # Wait until the task is genuinely inside the (never-returning)
     # specialist call, so the cancellation lands there and not on some

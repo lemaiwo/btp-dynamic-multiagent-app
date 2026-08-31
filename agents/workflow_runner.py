@@ -35,7 +35,7 @@ from agents.db import (
     get_workflow_parts,
     item_succeeded_before,
 )
-from agents.registry import registry
+from agents.registry import _MAX_DELEGATION_DEPTH, registry
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,13 @@ class WorkItem(BaseModel):
     unparsed, and is handed to the next agent as-is.
     """
 
-    id: str = Field(description="A stable identifier for this item, e.g. a message id.")
+    # min_length: an empty id is worse than a missing one. item_succeeded_before
+    # matches on it, so once one run records an item keyed "", every later item
+    # keyed "" is skipped forever while skip_seen_items is on.
+    id: str = Field(
+        min_length=1,
+        description="A stable identifier for this item, e.g. a message id.",
+    )
     title: str = Field(default="", description="A short human-readable label.")
     branches: list[str] = Field(
         default_factory=list,
@@ -208,6 +214,12 @@ async def _preflight(workflow: Workflow, steps) -> dict:
     """
     resolved: dict = {}
     names = sorted({s.agent_name for s in steps})
+    # (principal, agent name) -> row: everything whose credentials have to hold
+    # for this run. The pair, not the agent alone, because a peer consulted from
+    # a step runs inside *that step's* bound identity — run_as wraps the whole
+    # step, delegation included — so the same peer reached from two steps with
+    # different principals is two different questions.
+    to_check: dict[tuple[str, str], object] = {}
     async with SessionLocal() as session:
         for name in names:
             row = await get_agent_by_name(session, name)
@@ -222,7 +234,8 @@ async def _preflight(workflow: Workflow, steps) -> dict:
                     f"Agent {name!r} is not built (disabled, or no usable MCP "
                     "servers). Fix it in /admin and reload."
                 )
-            if not effective_principal(row, workflow):
+            principal = effective_principal(row, workflow)
+            if not principal:
                 raise _WorkflowError(
                     f"No run-as principal is configured for agent {name!r}, and "
                     f"workflow {workflow.name!r} sets no fallback. A scheduled "
@@ -230,12 +243,48 @@ async def _preflight(workflow: Workflow, steps) -> dict:
                     "set one in /admin."
                 )
             resolved[name] = row
-    for name, row in resolved.items():
-        if not await job_runner._has_usable_credentials(row):
+            to_check[(principal, name)] = row
+
+        # Peers are reachable from a step's agent, and a peer with no usable
+        # credential does NOT fail the delegation: registry._delegate returns
+        # the sign-in prompt as its *answer* when there is no interactive sink
+        # (correct for A2A), the parent model reads it as content, and the step
+        # is recorded `success`. With skip_seen_items on, that wrong outcome is
+        # then permanent. So the peer graph is checked here instead.
+        #
+        # Bounded by the same _MAX_DELEGATION_DEPTH that _delegate enforces at
+        # run time, and cycle-guarded via to_check: mutual peers (A lists B, B
+        # lists A) are a legitimate configuration, not an error.
+        queue = [(name, effective_principal(resolved[name], workflow), 0)
+                 for name in names]
+        while queue:
+            name, principal, depth = queue.pop(0)
+            if depth >= _MAX_DELEGATION_DEPTH:
+                continue
+            for peer in to_check[(principal, name)].peers:
+                key = (principal, peer)
+                if peer == name or key in to_check:
+                    continue
+                peer_row = await get_agent_by_name(session, peer)
+                if (peer_row is None or not peer_row.enabled
+                        or registry.build.specialists.get(peer) is None):
+                    # The registry skips an unresolvable peer with a warning
+                    # rather than wiring it, so it is not reachable at all —
+                    # nothing to check, and nothing to fail the run over.
+                    continue
+                to_check[key] = peer_row
+                queue.append((peer, principal, depth + 1))
+
+    for (principal, name), row in to_check.items():
+        if not await job_runner._has_usable_credentials(row, principal):
+            via = "" if name in resolved else (
+                " That agent is reached as a peer from one of this workflow's "
+                "steps."
+            )
             raise _WorkflowError(
-                f"The service account {effective_principal(row, workflow)!r} has "
-                f"no usable credential for agent {name!r}'s MCP servers. It must "
-                "be re-authorized interactively before scheduled runs can work."
+                f"The service account {principal!r} has no usable credential "
+                f"for agent {name!r}'s MCP servers. It must be re-authorized "
+                f"interactively before scheduled runs can work.{via}"
             )
     return resolved
 
@@ -309,6 +358,13 @@ async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
     still unwinds normally.
     """
     workflow = None
+    # Accumulated by _run_items as items finish, and shared by reference so the
+    # timeout and cancellation handlers below — which run after _run_items has
+    # been torn down — can still report what the run actually did. Without it an
+    # interrupted run records 0/0/0/0 on a run that demonstrably processed items.
+    # Keys are exactly finish_workflow_run's allow-list; it raises on any other.
+    counts = {"items_total": 0, "items_succeeded": 0,
+              "items_failed": 0, "items_skipped": 0}
     try:
         async with SessionLocal() as session:
             row = await get_workflow(session, workflow_id)
@@ -328,7 +384,7 @@ async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
             return
 
         await asyncio.wait_for(
-            _run_main_line(run_id, workflow, branches, steps, agent_rows),
+            _run_main_line(run_id, workflow, branches, steps, agent_rows, counts),
             timeout=workflow.run_timeout_seconds,
         )
     except asyncio.TimeoutError:
@@ -342,17 +398,20 @@ async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
             f"its {workflow.run_timeout_seconds}s timeout"
             if workflow is not None else "its timeout"
         )
-        await _finalize(run_id, status="failed", error=f"Run exceeded {budget}.")
+        await _finalize(run_id, status="failed", error=f"Run exceeded {budget}.",
+                        counts=counts)
     except asyncio.CancelledError:
         await _finalize(run_id, status="interrupted",
-                        error="Run was cancelled (app shutting down).")
+                        error="Run was cancelled (app shutting down).",
+                        counts=counts)
         raise
     except Exception as e:  # noqa: BLE001
         logger.exception("Workflow run %s failed", run_id)
         await _finalize(run_id, status="failed", error=f"{type(e).__name__}: {e}")
 
 
-async def _run_main_line(run_id, workflow, branches, steps, agent_rows) -> None:
+async def _run_main_line(run_id, workflow, branches, steps, agent_rows,
+                         counts) -> None:
     """Run the pre-fan-out steps once, then every item through the rest."""
     main_line = sorted(
         [s for s in steps if s.branch_key is None], key=lambda s: s.position
@@ -402,14 +461,13 @@ async def _run_main_line(run_id, workflow, branches, steps, agent_rows) -> None:
         return
 
     await _run_items(run_id, workflow, branches, branch_steps, after,
-                     agent_rows, fan_step, list(items or []))
+                     agent_rows, fan_step, list(items or []), counts)
 
 
 async def _run_items(run_id, workflow, branches, branch_steps, after,
-                     agent_rows, fan_step, items) -> None:
+                     agent_rows, fan_step, items, counts) -> None:
     """Run every discovered item through the post-fan-out steps."""
-    counts = {"items_total": len(items), "items_succeeded": 0,
-              "items_failed": 0, "items_skipped": 0}
+    counts["items_total"] = len(items)
     semaphore = asyncio.Semaphore(max(1, workflow.max_parallel_items))
     lock = asyncio.Lock()
 
@@ -421,6 +479,10 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
             # failure — never escape process() and abort sibling items via
             # asyncio.gather below, which has no return_exceptions=True.
             item_run = None
+            # Set the moment the row reaches a terminal status, so a
+            # cancellation landing between that write and the count increment
+            # below cannot rewrite a finished item as `interrupted`.
+            finished = False
             try:
                 if workflow.skip_seen_items:
                     async with SessionLocal() as session:
@@ -434,6 +496,7 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
                                 title=item.title, branches=item.branches,
                             )
                             await finish_item_run(session, item_run.id, status="skipped")
+                        finished = True
                         async with lock:
                             counts["items_skipped"] += 1
                         return
@@ -454,6 +517,28 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
                         prompt=build_prompt(step.instructions, sources),
                     )
                     sources = [(step.agent_name, str(output))]
+                # Inside the try, not after it: a DB failure while recording the
+                # success would otherwise escape process(), and the gather below
+                # (deliberately without return_exceptions) propagates it *without*
+                # cancelling the sibling item tasks — the run would finalize
+                # `failed`, releasing the overlap lock, while orphaned tasks kept
+                # invoking agents and writing rows against a finished run.
+                async with SessionLocal() as session:
+                    await finish_item_run(session, item_run.id, status="success")
+                finished = True
+                async with lock:
+                    counts["items_succeeded"] += 1
+            except asyncio.CancelledError:
+                # SIGTERM, or the run_timeout_seconds wait_for expiring. Without
+                # this the in-flight item's row stays `running` forever — and on
+                # a timeout nothing ever sweeps it, because the process lives on.
+                if item_run is not None and not finished:
+                    async with SessionLocal() as session:
+                        await finish_item_run(
+                            session, item_run.id, status="interrupted",
+                            error="Cancelled (app shutting down).",
+                        )
+                raise
             except _WorkflowError as e:
                 if item_run is not None:
                     async with SessionLocal() as session:
@@ -478,10 +563,6 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
                 async with lock:
                     counts["items_failed"] += 1
                 return
-            async with SessionLocal() as session:
-                await finish_item_run(session, item_run.id, status="success")
-            async with lock:
-                counts["items_succeeded"] += 1
 
     await asyncio.gather(*(process(i) for i in items))
 
