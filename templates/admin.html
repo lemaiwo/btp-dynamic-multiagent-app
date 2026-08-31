@@ -153,6 +153,12 @@
             border: 1px solid var(--border); padding: 4px 8px; text-align: left;
         }
         #run-detail .mermaid-error { color: var(--muted); font-size: 12px; margin-top: 4px; }
+        .wf-step-output {
+            max-height: 160px; max-width: 360px; overflow: auto;
+            white-space: pre-wrap; word-break: break-word;
+            margin: 0; font-size: 12px;
+        }
+        .wf-step-output.error { color: var(--danger); }
         #runs-list table td, #runs-list table th { cursor: default; }
         #runs-list .run-row { cursor: pointer; }
         #runs-list .run-row:hover { background: #f8f9fb; }
@@ -561,11 +567,21 @@ async function loadAgents() {
                 <td class="row-actions">
                     <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
                     ${a.expose_api ? `<button class="small secondary" onclick="runAgentNow(${a.id})">Run now</button>` : ''}
-                    <button class="small danger" onclick="deleteAgentRow(${a.id}, '${escapeHtml(a.name)}')">Delete</button>
+                    <button class="small danger delete-agent-btn" data-id="${a.id}" data-name="${escapeHtml(a.name)}">Delete</button>
                 </td>
             </tr>
         `;
     }).join('');
+    // The name is arbitrary operator-entered text; interpolating it into an
+    // inline onclick="...('...')" string is exploitable (the browser
+    // HTML-decodes the attribute before compiling it as JS, so escapeHtml's
+    // encoding of `'` does not survive) -- a workflow/agent/skill named
+    // e.g. `x'); alert(1); //` would break out and run. Reading it back via
+    // .dataset instead never re-enters JS source, so it can't break out no
+    // matter what the name contains.
+    tbody.querySelectorAll('.delete-agent-btn').forEach(btn =>
+        btn.addEventListener('click', () =>
+            deleteAgentRow(Number(btn.dataset.id), btn.dataset.name)));
 }
 
 function authLabel(mode) {
@@ -725,11 +741,17 @@ function renderSkillsTable() {
                 <td>${usedBy.length ? usedBy.join(', ') : '<span style="color:var(--muted)">—</span>'}</td>
                 <td class="row-actions">
                     <button class="small secondary" onclick="editSkill(${s.id})">Edit</button>
-                    <button class="small danger" onclick="deleteSkillRow(${s.id}, '${escapeHtml(s.name)}')">Delete</button>
+                    <button class="small danger delete-skill-btn" data-id="${s.id}" data-name="${escapeHtml(s.name)}">Delete</button>
                 </td>
             </tr>
         `;
     }).join('');
+    // See the matching comment in loadAgents(): a name interpolated into an
+    // inline onclick(...) breaks out once the browser HTML-decodes the
+    // attribute, so it is read back via .dataset instead.
+    tbody.querySelectorAll('.delete-skill-btn').forEach(btn =>
+        btn.addEventListener('click', () =>
+            deleteSkillRow(Number(btn.dataset.id), btn.dataset.name)));
 }
 
 function renderAgentSkillChecks(selected) {
@@ -895,10 +917,16 @@ function renderWorkflows() {
             <td class="row-actions">
                 <button class="small secondary" onclick="editWorkflow(${w.id})">Edit</button>
                 <button class="small secondary" onclick="runWorkflowNow(${w.id})">Run now</button>
-                <button class="small danger" onclick="deleteWorkflow(${w.id}, '${escapeHtml(w.name)}')">Delete</button>
+                <button class="small danger delete-workflow-btn" data-id="${w.id}" data-name="${escapeHtml(w.name)}">Delete</button>
             </td>
         </tr>
     `).join('');
+    // See the matching comment in loadAgents(): a name interpolated into an
+    // inline onclick(...) breaks out once the browser HTML-decodes the
+    // attribute, so it is read back via .dataset instead.
+    tbody.querySelectorAll('.delete-workflow-btn').forEach(btn =>
+        btn.addEventListener('click', () =>
+            deleteWorkflow(Number(btn.dataset.id), btn.dataset.name)));
 }
 
 function openWorkflowModal() {
@@ -1120,15 +1148,27 @@ async function showWorkflowRun(runId) {
         </tr>
     `).join('');
 
-    const stepRows = (data.steps || []).map(s => `
+    const stepRows = (data.steps || []).map(s => {
+        // output/error are agent-generated text, so escapeHtml applies here
+        // exactly as it does everywhere else user- or model-sourced text
+        // reaches the DOM. Scrollable rather than truncated -- this is the
+        // only place an operator can see what a step actually produced.
+        const body = s.error
+            ? `<pre class="wf-step-output error">${escapeHtml(s.error)}</pre>`
+            : s.output
+                ? `<pre class="wf-step-output">${escapeHtml(s.output)}</pre>`
+                : '<span style="color:var(--muted)">—</span>';
+        return `
         <tr>
             <td>${s.item_run_id ? escapeHtml(itemTitleByRunId[s.item_run_id] || s.item_run_id) : '<span style="color:var(--muted)">main line</span>'}</td>
             <td>${s.branch_key ? escapeHtml(s.branch_key) : '—'}</td>
             <td>${s.position}</td>
             <td>${escapeHtml(s.agent_name)}</td>
             <td><span class="status-badge status-${escapeHtml(s.status)}">${escapeHtml(s.status)}</span></td>
+            <td>${body}</td>
         </tr>
-    `).join('');
+    `;
+    }).join('');
 
     el.innerHTML = `
         <h3>${escapeHtml(run.workflow_name)} — <span class="status-badge status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></h3>
@@ -1139,8 +1179,8 @@ async function showWorkflowRun(runId) {
         <table><thead><tr><th>Item</th><th>Status</th><th>Branches taken</th><th>Error</th></tr></thead>
             <tbody>${itemRows || '<tr><td colspan="4" style="color:var(--muted)">No items.</td></tr>'}</tbody></table>
         <h4>Steps</h4>
-        <table><thead><tr><th>Item</th><th>Branch</th><th>#</th><th>Agent</th><th>Status</th></tr></thead>
-            <tbody>${stepRows || '<tr><td colspan="5" style="color:var(--muted)">No steps recorded.</td></tr>'}</tbody></table>
+        <table><thead><tr><th>Item</th><th>Branch</th><th>#</th><th>Agent</th><th>Status</th><th>Output</th></tr></thead>
+            <tbody>${stepRows || '<tr><td colspan="6" style="color:var(--muted)">No steps recorded.</td></tr>'}</tbody></table>
     `;
 }
 
