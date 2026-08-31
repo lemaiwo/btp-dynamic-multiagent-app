@@ -6,8 +6,10 @@ Run:  python tests/test_workflow_config.py
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -23,7 +25,9 @@ os.environ["MCP_URL_ALLOWLIST"] = ""
 
 from agents.db import (  # noqa: E402
     SessionLocal,
+    delete_agent,
     delete_workflow,
+    get_agent_by_name,
     get_workflow_by_name,
     get_workflow_by_slug,
     get_workflow_parts,
@@ -72,6 +76,58 @@ FIORI_BRANCH = {"key": "fiori", "description": "UI5 issues", "position": 2}
 
 async def main() -> None:
     await init_db()
+
+    print("\n== the seed file carries workflows ==")
+    # seed_from_file_if_empty only runs against an empty DB, so this has to be
+    # the first thing this suite does. Unlike an export, the seed file IS
+    # landscape-local, so it may carry run_as_principal -- the same
+    # distinction the agents section makes.
+    from agents.admin import seed_from_file_if_empty  # noqa: PLC0415
+
+    seed = {
+        "agents": [{
+            "name": "seeded-reader", "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": "https://s.example.com/mcp",
+                             "auth_mode": "none"}],
+        }],
+        "workflows": [{
+            "name": "seeded-wf", "description": "from the seed file",
+            "run_as_principal": "svc-seed@example.com",
+            "branches": [{"key": "abap", "description": "ABAP", "position": 1}],
+            "steps": [
+                {"branch_key": None, "position": 1,
+                 "agent_name": "seeded-reader", "instructions": "triage",
+                 "fan_out": True, "step_timeout_seconds": 600},
+                {"branch_key": "abap", "position": 1,
+                 "agent_name": "seeded-reader", "instructions": "analyze",
+                 "fan_out": False, "step_timeout_seconds": 600},
+            ],
+        }],
+    }
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(seed, f)
+        seed_path = Path(f.name)
+    try:
+        await seed_from_file_if_empty(seed_path)
+    finally:
+        seed_path.unlink()
+    async with SessionLocal() as s:
+        seeded = await get_workflow_by_name(s, "seeded-wf")
+        parts = await get_workflow_parts(s, seeded.id) if seeded else ([], [])
+    check("the seed file's workflow was created", seeded is not None)
+    check("its branches and steps came with it",
+          len(parts[0]) == 1 and len(parts[1]) == 2,
+          f"{len(parts[0])} branches, {len(parts[1])} steps")
+    check("the seed file's run_as_principal is kept",
+          seeded is not None and seeded.run_as_principal == "svc-seed@example.com",
+          str(getattr(seeded, "run_as_principal", None)))
+    # Leave the DB as the rest of this suite expects to find it.
+    async with SessionLocal() as s:
+        if seeded is not None:
+            await delete_workflow(s, seeded.id)
+        seeded_agent = await get_agent_by_name(s, "seeded-reader")
+        if seeded_agent is not None:
+            await delete_agent(s, seeded_agent.id)
 
     print("\n== validation rejects broken definitions ==")
     rejects("two fan-out steps",
