@@ -574,6 +574,30 @@ async def build_orchestrator() -> BuildResult:
         if row.expose_chat:
             _attach_delegation_tool(orchestrator, specialist, row)
 
+    # Second pass: attach peer delegation tools. This cannot be folded into the
+    # loop above, because a peer may be built after the agent that consults it
+    # — the build order follows list_agents() (alphabetical), not the peer
+    # graph. Peers are looked up by name, like skills, so a name that no longer
+    # resolves is skipped with a warning rather than failing the build.
+    rows_by_name = {r.name: r for r in enabled_rows}
+    for row in enabled_rows:
+        parent = specialists.get(row.name)
+        if parent is None:
+            continue  # agent had no usable MCP servers; already warned above
+        for peer_name in row.peers:
+            if peer_name == row.name:
+                logger.warning("Agent %s lists itself as a peer; skipping", row.name)
+                continue
+            peer_specialist = specialists.get(peer_name)
+            peer_row = rows_by_name.get(peer_name)
+            if peer_specialist is None or peer_row is None:
+                logger.warning(
+                    "Agent %s references unknown or unbuilt peer %r; skipping it",
+                    row.name, peer_name,
+                )
+                continue
+            _attach_delegation_tool(parent, peer_specialist, peer_row)
+
     return BuildResult(
         orchestrator=orchestrator,
         specialists=specialists,
