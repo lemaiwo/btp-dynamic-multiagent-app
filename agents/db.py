@@ -474,6 +474,28 @@ class Workflow(Base):
             "enabled": bool(self.enabled),
         }
 
+    def to_export(self, branches: list[Any], steps: list[Any]) -> dict[str, Any]:
+        """The landscape-portable definition, branches and steps included.
+
+        ``run_as_principal`` is deliberately absent, for the same reason
+        AgentConfig.to_export omits its own: it is a landscape-specific
+        service identity, not part of the definition being promoted. The
+        import path passes nothing for it, so the target landscape keeps
+        whatever it already has -- see the _Keep docstring.
+        """
+        return {
+            "name": self.name,
+            "description": self.description,
+            "api_slug": self.api_slug,
+            "run_timeout_seconds": self.run_timeout_seconds,
+            "skip_seen_items": bool(self.skip_seen_items),
+            "max_parallel_items": self.max_parallel_items,
+            "on_unknown_branch": self.on_unknown_branch,
+            "enabled": bool(self.enabled),
+            "branches": [b.to_dict() for b in branches],
+            "steps": [s.to_dict() for s in steps],
+        }
+
 
 class WorkflowBranch(Base):
     """A named sub-sequence of steps an item may or may not enter.
@@ -1436,7 +1458,11 @@ async def upsert_workflow(
     name: str,
     description: str = "",
     api_slug: str | None = None,
-    run_as_principal: str | None = None,
+    # KEEP, not None: an imported bundle carries no run_as_principal (it is a
+    # landscape-specific service identity, excluded from to_export), and
+    # defaulting to None would silently un-configure every workflow on the
+    # first import. See the _Keep docstring.
+    run_as_principal: str | None | _Keep = KEEP,
     run_timeout_seconds: int = 1800,
     skip_seen_items: bool = True,
     max_parallel_items: int = 1,
@@ -1481,7 +1507,8 @@ async def upsert_workflow(
         row = existing
     row.description = description
     row.api_slug = slug
-    row.run_as_principal = (run_as_principal or "").strip() or None
+    if not isinstance(run_as_principal, _Keep):
+        row.run_as_principal = (run_as_principal or "").strip() or None
     row.run_timeout_seconds = int(run_timeout_seconds)
     row.skip_seen_items = 1 if skip_seen_items else 0
     row.max_parallel_items = max(1, int(max_parallel_items))

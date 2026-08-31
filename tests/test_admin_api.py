@@ -746,6 +746,141 @@ async def run_tests() -> None:
         r = await client.delete(f"/admin/api/agents/{er_id}")
         check("export roundtrip cleanup", r.status_code == 204, r.text)
 
+        # --- Workflows survive the export -> import round trip ---------------
+        # A workflow is promoted between landscapes the same way an agent is,
+        # so the bundle has to carry its branches and its per-branch steps --
+        # otherwise the target landscape gets a workflow that either does not
+        # exist or exists with no definition. run_as_principal is the same
+        # deliberate exception as for agents.
+        print("\n== workflows survive the export -> import round trip ==")
+        for wf_agent, host in (("WF Reader", "wfreader"), ("WF Abap", "wfabap"),
+                               ("WF Drafter", "wfdrafter")):
+            r = await client.post("/admin/api/agents", json={
+                "name": wf_agent, "description": "d", "instructions": "i",
+                "mcp_servers": [{"url": f"https://{host}.example.com/mcp",
+                                 "auth_mode": "none"}],
+            })
+            check(f"{wf_agent} created for the workflow", r.status_code == 201,
+                  r.text[:200])
+
+        WF_DEF = {
+            "name": "Export Workflow",
+            "description": "Triage and draft.",
+            "api_slug": "export-workflow",
+            "run_as_principal": "svc-wf@example.com",
+            "run_timeout_seconds": 1200,
+            "skip_seen_items": False,
+            "max_parallel_items": 3,
+            "on_unknown_branch": "skip",
+            "enabled": True,
+            "branches": [
+                {"key": "abap", "description": "ABAP dumps", "position": 1},
+                {"key": "fiori", "description": "UI issues", "position": 2},
+            ],
+            "steps": [
+                {"branch_key": None, "position": 1, "agent_name": "WF Reader",
+                 "instructions": "triage", "fan_out": True,
+                 "step_timeout_seconds": 300},
+                {"branch_key": None, "position": 2, "agent_name": "WF Drafter",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 400},
+                # A multi-step branch: order inside a branch is exactly what a
+                # flattened export loses.
+                {"branch_key": "abap", "position": 1, "agent_name": "WF Abap",
+                 "instructions": "read the dump", "fan_out": False,
+                 "step_timeout_seconds": 500},
+                {"branch_key": "abap", "position": 2, "agent_name": "WF Drafter",
+                 "instructions": "summarize the dump", "fan_out": False,
+                 "step_timeout_seconds": 600},
+                {"branch_key": "fiori", "position": 1, "agent_name": "WF Reader",
+                 "instructions": "check the UI", "fan_out": False,
+                 "step_timeout_seconds": 700},
+            ],
+        }
+        r = await client.post("/admin/api/workflows", json=WF_DEF)
+        check("export workflow created", r.status_code == 201, r.text[:300])
+        wf_id = r.json()["id"]
+
+        r = await client.get("/admin/api/export")
+        check("export 200", r.status_code == 200, r.text[:200])
+        bundle = r.json()
+        wf_exported = next(
+            (w for w in bundle.get("workflows", []) if w["name"] == "Export Workflow"),
+            None,
+        )
+        check("workflow present in the export", wf_exported is not None,
+              str(bundle.get("workflows"))[:300])
+        check("export carries the branches",
+              [b["key"] for b in (wf_exported or {}).get("branches", [])]
+              == ["abap", "fiori"], str((wf_exported or {}).get("branches")))
+        check("export carries every step",
+              len((wf_exported or {}).get("steps", [])) == 5,
+              str((wf_exported or {}).get("steps")))
+        check("workflow export omits run_as_principal (landscape-specific)",
+              "run_as_principal" not in (wf_exported or {}), str(wf_exported))
+
+        # Drift the target landscape: the definition is gutted down to a single
+        # main-line step, so a no-op import cannot produce a false pass.
+        # run_as_principal stays -- this landscape owns it.
+        r = await client.put(f"/admin/api/workflows/{wf_id}", json={
+            "name": "Export Workflow",
+            "description": "gutted",
+            "api_slug": "",
+            "run_as_principal": "svc-wf@example.com",
+            "run_timeout_seconds": 1800,
+            "skip_seen_items": True,
+            "max_parallel_items": 1,
+            "on_unknown_branch": "fail",
+            "enabled": False,
+            "branches": [],
+            "steps": [
+                {"branch_key": None, "position": 1, "agent_name": "WF Reader",
+                 "instructions": "nothing", "fan_out": False,
+                 "step_timeout_seconds": 600},
+            ],
+        })
+        check("workflow gutted before import", r.status_code == 200, r.text[:300])
+
+        # The whole export body, posted verbatim -- the promotion an operator
+        # actually performs, not a hand-built subset of it.
+        r = await client.post("/admin/api/import", json=bundle)
+        check("import of the export bundle succeeds", r.status_code == 200,
+              r.text[:300])
+        check("import reports the workflows it carried",
+              r.json().get("imported_workflows", 0) >= 1, r.text[:200])
+
+        r = await client.get(f"/admin/api/workflows/{wf_id}")
+        restored = r.json()
+        for field in ("description", "api_slug", "run_timeout_seconds",
+                      "skip_seen_items", "max_parallel_items",
+                      "on_unknown_branch", "enabled"):
+            check(f"import restores {field}",
+                  restored.get(field) == WF_DEF[field],
+                  f"got {restored.get(field)!r}, want {WF_DEF[field]!r}")
+        check("import preserves this landscape's run_as_principal",
+              restored.get("run_as_principal") == "svc-wf@example.com",
+              f"got {restored.get('run_as_principal')!r}")
+        check("import restores the branches",
+              [(b["key"], b["description"], b["position"])
+               for b in restored.get("branches", [])]
+              == [("abap", "ABAP dumps", 1), ("fiori", "UI issues", 2)],
+              str(restored.get("branches")))
+        want_steps = sorted(
+            (str(s["branch_key"]), s["position"], s["agent_name"],
+             s["instructions"], s["fan_out"], s["step_timeout_seconds"])
+            for s in WF_DEF["steps"]
+        )
+        got_steps = sorted(
+            (str(s["branch_key"]), s["position"], s["agent_name"],
+             s["instructions"], s["fan_out"], s["step_timeout_seconds"])
+            for s in restored.get("steps", [])
+        )
+        check("import restores every step, branch and position intact",
+              got_steps == want_steps, f"got {got_steps}\nwant {want_steps}")
+
+        r = await client.delete(f"/admin/api/workflows/{wf_id}")
+        check("workflow roundtrip cleanup", r.status_code in (200, 204), r.text)
+
         # --- Writers that do not carry peers/model_name must not wipe them --
         # The UI5 admin builds its PUT body from an explicit field list that
         # has neither key, and any bundle exported before those fields existed

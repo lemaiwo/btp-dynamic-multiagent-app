@@ -482,13 +482,6 @@ class ModelPayload(BaseModel):
         return v
 
 
-class ImportPayload(BaseModel):
-    orchestrator_instructions: str | None = None
-    skills: list[SkillPayload] = Field(default_factory=list)
-    agents: list[AgentPayload] = Field(default_factory=list)
-    replace: bool = False  # if true, delete agents/skills not in the import
-
-
 class WorkflowBranchPayload(BaseModel):
     key: str = Field(min_length=1, max_length=64)
     description: str = ""
@@ -501,7 +494,10 @@ class WorkflowStepPayload(BaseModel):
     agent_name: str = Field(min_length=1, max_length=64)
     instructions: str = ""
     fan_out: bool = False
-    step_timeout_seconds: int = 600
+    # Bounded like the workflow's own timeout below: 0 would make every run of
+    # this step fail instantly at asyncio.wait_for, and a step outliving the
+    # whole run's budget can only ever be killed by the run timeout.
+    step_timeout_seconds: int = Field(default=600, ge=10, le=1800)
 
 
 class WorkflowPayload(BaseModel):
@@ -509,13 +505,40 @@ class WorkflowPayload(BaseModel):
     description: str = ""
     api_slug: str = ""
     run_as_principal: str = ""
-    run_timeout_seconds: int = 1800
+    # Bounds mirror AgentPayload.run_timeout_seconds, except for the ceiling:
+    # the BTP scheduler's async timeout defaults to 30 minutes, so a run
+    # allowed to exceed 1800s would be reported failed by the scheduler while
+    # it was still working. 0 (or any value below the floor) would make every
+    # run fail instantly at asyncio.wait_for.
+    run_timeout_seconds: int = Field(default=1800, ge=60, le=1800)
     skip_seen_items: bool = True
-    max_parallel_items: int = 1
+    # Each parallel item invokes agents against the same target systems and
+    # the same model quota; an unbounded value is a self-inflicted overload.
+    max_parallel_items: int = Field(default=1, ge=1, le=20)
     on_unknown_branch: str = "fail"
     enabled: bool = True
     branches: list[WorkflowBranchPayload] = Field(default_factory=list)
     steps: list[WorkflowStepPayload] = Field(default_factory=list)
+
+    @field_validator("api_slug", mode="before")
+    @classmethod
+    def _slug_null_is_blank(cls, v: Any) -> Any:
+        """Accept an explicit ``null`` slug as "no slug".
+
+        Same reason as AgentPayload's: ``Workflow.to_export`` emits
+        ``"api_slug": null`` for every workflow without one, so without this
+        an exported bundle re-imported verbatim 422s on the type.
+        """
+        return "" if v is None else v
+
+
+class ImportPayload(BaseModel):
+    orchestrator_instructions: str | None = None
+    skills: list[SkillPayload] = Field(default_factory=list)
+    agents: list[AgentPayload] = Field(default_factory=list)
+    workflows: list[WorkflowPayload] = Field(default_factory=list)
+    # if true, delete agents/skills/workflows not in the import
+    replace: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1158,11 +1181,19 @@ async def api_export() -> dict[str, Any]:
         rows = await list_agents(session)
         skills = await list_skills(session)
         orch = await get_orchestrator_instructions(session)
+        # A workflow's branches and steps are the definition; exporting the
+        # scalar row alone would produce a bundle that imports as an empty
+        # workflow, which validate_workflow_parts rejects anyway.
+        workflows = []
+        for w in await list_workflows(session):
+            branches, steps = await get_workflow_parts(session, w.id)
+            workflows.append(w.to_export(branches, steps))
         return {
             "version": 1,
             "orchestrator_instructions": orch,
             "skills": [s.to_export() for s in skills],
             "agents": [r.to_export() for r in rows],
+            "workflows": workflows,
         }
 
 
@@ -1219,8 +1250,37 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 warnings.append(note)
             imported_names.add(agent.name)
 
+        # Workflows last: validate_workflow_parts resolves every step's agent
+        # by name against the enabled agents in this session, so the agents
+        # above must already be in place.
+        imported_workflow_names = set()
+        for workflow in payload.workflows:
+            try:
+                # run_as_principal omitted for the same reason as the agents
+                # above: exports do not carry it, and passing the payload's
+                # default "" would wipe this landscape's service identity.
+                await upsert_workflow(
+                    session,
+                    name=workflow.name,
+                    description=workflow.description,
+                    api_slug=workflow.api_slug,
+                    run_timeout_seconds=workflow.run_timeout_seconds,
+                    skip_seen_items=workflow.skip_seen_items,
+                    max_parallel_items=workflow.max_parallel_items,
+                    on_unknown_branch=workflow.on_unknown_branch,
+                    enabled=workflow.enabled,
+                    branches=[b.model_dump() for b in workflow.branches],
+                    steps=[s.model_dump() for s in workflow.steps],
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=422, detail=f"Workflow '{workflow.name}': {e}"
+                ) from e
+            imported_workflow_names.add(workflow.name)
+
         removed = 0
         removed_skills = 0
+        removed_workflows = 0
         if payload.replace:
             existing = await list_agents(session)
             for row in existing:
@@ -1235,14 +1295,26 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         await rename_skill_references(session, srow.name, None)
                         await session.delete(srow)
                         removed_skills += 1
+            # Same rule for workflows: only a bundle that actually carries a
+            # workflows section may remove the ones it does not name.
+            if payload.workflows:
+                for wrow in await list_workflows(session):
+                    if wrow.name not in imported_workflow_names:
+                        # delete_workflow, not session.delete: the branch and
+                        # step rows are not ORM-related to the workflow and
+                        # would otherwise be orphaned.
+                        await delete_workflow(session, wrow.id)
+                        removed_workflows += 1
             await session.commit()
 
     return {
         "status": "imported",
         "imported": len(payload.agents),
         "imported_skills": len(payload.skills),
+        "imported_workflows": len(payload.workflows),
         "removed": removed,
         "removed_skills": removed_skills,
+        "removed_workflows": removed_workflows,
         # Model overrides this landscape cannot currently serve are imported
         # rather than rejected, so the operator is told about them here.
         "warnings": warnings,
@@ -1317,4 +1389,37 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
                 continue
             count += 1
-        logger.info("Seeded %d skills and %d agents from %s", skill_count, count, seed_path)
+
+        # Workflows last: every step names an agent that must already exist
+        # and be enabled, or validate_workflow_parts rejects the definition.
+        # Unlike the import path, the seed file IS landscape-local, so it may
+        # carry run_as_principal -- same distinction the agents above make.
+        workflow_count = 0
+        for entry in data.get("workflows", []):
+            try:
+                wpayload = WorkflowPayload.model_validate(entry)
+            except Exception as e:
+                logger.warning("Skipping invalid seed workflow %r: %s", entry, e)
+                continue
+            try:
+                await upsert_workflow(
+                    session,
+                    name=wpayload.name,
+                    description=wpayload.description,
+                    api_slug=wpayload.api_slug,
+                    run_as_principal=wpayload.run_as_principal,
+                    run_timeout_seconds=wpayload.run_timeout_seconds,
+                    skip_seen_items=wpayload.skip_seen_items,
+                    max_parallel_items=wpayload.max_parallel_items,
+                    on_unknown_branch=wpayload.on_unknown_branch,
+                    enabled=wpayload.enabled,
+                    branches=[b.model_dump() for b in wpayload.branches],
+                    steps=[s.model_dump() for s in wpayload.steps],
+                )
+            except ValueError as e:
+                logger.warning("Skipping invalid seed workflow %r: %s",
+                               entry.get("name"), e)
+                continue
+            workflow_count += 1
+        logger.info("Seeded %d skills, %d agents and %d workflows from %s",
+                    skill_count, count, workflow_count, seed_path)
