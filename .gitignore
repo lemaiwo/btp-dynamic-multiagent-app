@@ -17,3 +17,14 @@ tests/_*.db
 ui5-admin/node_modules/
 ui5-admin/dist/
 resources/
+
+# --- Landscape-specific, do not commit ---
+# MTA extension descriptors pin one landscape's routes, AI Core resource
+# group and PUBLIC_BASE_URL (e.g. elia.mtaext). Every landscape needs its
+# own; committing one invites deploying another landscape's values.
+*.mtaext
+
+# Exported agent/workflow bundles. These carry landscape hostnames, OAuth
+# client ids and identity-provider tenant ids, and are meant to be imported
+# through the admin UI rather than tracked.
+docs/*.config.json

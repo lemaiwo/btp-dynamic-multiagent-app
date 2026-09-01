@@ -100,7 +100,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `docs/UI5_ADMIN.md`
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
-  A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …)
+  A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
+  AI Core resource group the `aicore-resource-group` parameter (override
+  per landscape in an `.mtaext`) and adds a `before-start` hook running
+  `scripts/ensure_aicore_setup.py`. Needs `_schema-version: "3.2"` for
+  `hooks`
+- `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
+  resource group if missing, idempotent, no-op for `default`. Creates the
+  group only; model deployments stay in `scripts/deploy_claude.py` because
+  they bill and take minutes. Deployments are per group, so a fresh group
+  has no models until that script runs against it. See
+  `docs/AICORE_RESOURCE_GROUP.md`
 - `xs-security.json` — `admin`, `user`, and `a2a` scopes with matching
   role templates and role collections
 - `approuter/xs-app.json` — `/admin` requires admin scope, `/a2a`

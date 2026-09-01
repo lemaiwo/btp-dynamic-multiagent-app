@@ -1,10 +1,22 @@
-_schema-version: "3.1"
+# Schema 3.2 is the minimum for `hooks` (see the ensure-aicore-resource-group
+# hook below). Older deploy services reject the element outright.
+_schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.6.0
+version: 2.7.0
 
 parameters:
   enable-parallel-deployments: true
+  # AI Core bills consumption per resource group, so a landscape that needs its
+  # own line in the bill overrides this in an extension descriptor
+  # (cf deploy ... -e elia.mtaext) rather than by editing this file.
+  # "default" is the tenant-wide group: it always exists, and the deploy hook
+  # treats it as "nothing to provision".
+  #
+  # Deployments are scoped per group. Pointing a landscape at a fresh group
+  # gives it an AI Core with no models until scripts/deploy_claude.py has run
+  # against that group -- the hook creates the group, nothing more.
+  aicore-resource-group: default
 
 modules:
   - name: pydantic-agent
@@ -35,7 +47,7 @@ modules:
       buildpack: python_buildpack
       command: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
     properties:
-      AICORE_RESOURCE_GROUP: "default"
+      AICORE_RESOURCE_GROUP: "${aicore-resource-group}"
       # Optional: restrict the set of MCP URLs admins can register.
       # Comma-separated list of URL prefixes. If empty, any BTP URL is allowed.
       MCP_URL_ALLOWLIST: ""
@@ -67,6 +79,26 @@ modules:
       - name: ui5-cdn
         properties:
           url: "https://ui5.sap.com"
+    hooks:
+      # Create the AI Core resource group named above before the app starts,
+      # so a landscape pointed at a dedicated group deploys without a manual
+      # step in the AI Core cockpit. Idempotent, and a no-op for "default".
+      #
+      # The task runs on this module, so it inherits the aicore binding and
+      # AICORE_RESOURCE_GROUP. Creating a group needs an aicore key with admin
+      # scope: without one the task fails and takes the deploy with it, which
+      # is the loud outcome we want. Set AICORE_ENSURE_STRICT=false to downgrade
+      # that to a warning when the key is deliberately restricted.
+      - name: ensure-aicore-resource-group
+        type: task
+        phases:
+          - deploy.application.before-start
+          - blue-green.application.before-start.idle
+        parameters:
+          name: ensure-aicore-resource-group
+          command: python scripts/ensure_aicore_setup.py
+          memory: 512M
+          disk-quota: 1G
 
   - name: pydantic-agent-approuter
     type: nodejs
