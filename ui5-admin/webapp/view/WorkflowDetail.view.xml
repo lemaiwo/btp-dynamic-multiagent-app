@@ -1,0 +1,173 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.WorkflowDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="workflowDetailPage"
+        title="{workflow>/title}"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <content>
+            <VBox class="sapUiSmallMargin">
+
+                <Panel headerText="{i18n>workflowSettings}" expandable="false">
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>colName}" required="true" />
+                        <Input
+                            id="workflowName"
+                            value="{workflow>/data/name}"
+                            valueState="{workflow>/errors/nameState}"
+                            valueStateText="{workflow>/errors/name}"
+                            maxLength="64" />
+
+                        <Label text="{i18n>workflowDescription}" />
+                        <TextArea
+                            id="workflowDescription"
+                            value="{workflow>/data/description}"
+                            valueState="{workflow>/errors/descriptionState}"
+                            valueStateText="{workflow>/errors/description}"
+                            rows="3"
+                            width="100%" />
+
+                        <Label text="{i18n>enabled}" />
+                        <Switch id="workflowEnabled" state="{workflow>/data/enabled}" />
+
+                        <Label text="{i18n>apiSlug}" />
+                        <Input
+                            id="workflowApiSlug"
+                            value="{workflow>/data/api_slug}"
+                            valueState="{workflow>/errors/api_slugState}"
+                            valueStateText="{workflow>/errors/api_slug}"
+                            maxLength="64" />
+
+                        <Label text="{i18n>runAsPrincipal}" />
+                        <Input
+                            id="workflowRunAsPrincipal"
+                            value="{workflow>/data/run_as_principal}"
+                            valueState="{workflow>/errors/run_as_principalState}"
+                            valueStateText="{workflow>/errors/run_as_principal}"
+                            placeholder="{i18n>runAsHint}"
+                            width="24rem" />
+
+                        <Label text="{i18n>runTimeout}" />
+                        <StepInput
+                            id="workflowRunTimeout"
+                            value="{workflow>/data/run_timeout_seconds}"
+                            min="60"
+                            max="1800"
+                            step="60" />
+
+                        <Label text="{i18n>maxParallelItems}" />
+                        <StepInput
+                            id="workflowMaxParallelItems"
+                            value="{workflow>/data/max_parallel_items}"
+                            min="1"
+                            max="20"
+                            step="1" />
+
+                        <Label text="{i18n>skipSeenItems}" />
+                        <VBox>
+                            <Switch id="workflowSkipSeenItems" state="{workflow>/data/skip_seen_items}" />
+                            <Text text="{i18n>skipSeenItemsHint}" class="sapUiTinyMarginTop" />
+                        </VBox>
+
+                        <Label text="{i18n>onUnknownBranch}" />
+                        <Select id="workflowOnUnknownBranch" selectedKey="{workflow>/data/on_unknown_branch}">
+                            <core:Item key="fail" text="{i18n>onUnknownBranchFail}" />
+                            <core:Item key="skip" text="{i18n>onUnknownBranchSkip}" />
+                        </Select>
+                    </f:SimpleForm>
+                </Panel>
+
+                <Panel headerText="{i18n>branchesPanel}" expandable="false" class="sapUiSmallMarginTop">
+                    <Table
+                        id="branchesTable"
+                        items="{workflow>/data/branches}"
+                        noDataText="{i18n>noBranches}">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <ToolbarSpacer />
+                                <Button id="addBranchButton" icon="sap-icon://add" text="{i18n>addBranch}" press=".onAddBranch" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>branchKey}" /></Column>
+                            <Column><Text text="{i18n>branchDescription}" /></Column>
+                            <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem>
+                                <cells>
+                                    <Input
+                                        value="{workflow>key}"
+                                        placeholder="{i18n>branchKeyHint}"
+                                        liveChange=".onBranchKeyChange" />
+                                    <Input value="{workflow>description}" />
+                                    <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeBranch}" press=".onRemoveBranch" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                </Panel>
+
+                <Panel headerText="{i18n>stepsPanel}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>stepFanOutHint}" />
+                    <Table
+                        id="stepsTable"
+                        class="sapUiTinyMarginTop"
+                        items="{workflow>/data/steps}"
+                        noDataText="{i18n>noSteps}">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <ToolbarSpacer />
+                                <Button id="addStepButton" icon="sap-icon://add" text="{i18n>addStep}" press=".onAddStep" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>stepBranch}" /></Column>
+                            <Column><Text text="{i18n>stepAgent}" /></Column>
+                            <Column><Text text="{i18n>stepInstructions}" /></Column>
+                            <Column><Text text="{i18n>stepFanOut}" /></Column>
+                            <Column><Text text="{i18n>stepTimeout}" /></Column>
+                            <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem>
+                                <cells>
+                                    <Select
+                                        selectedKey="{workflow>branch_key}"
+                                        items="{workflow>branchOptions}"
+                                        forceSelection="false"
+                                        width="9rem">
+                                        <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
+                                    </Select>
+                                    <Select
+                                        selectedKey="{workflow>agent_name}"
+                                        items="{workflow>agentOptions}"
+                                        forceSelection="false"
+                                        width="10rem">
+                                        <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
+                                    </Select>
+                                    <TextArea value="{workflow>instructions}" rows="2" width="100%" />
+                                    <CheckBox selected="{workflow>fan_out}" />
+                                    <StepInput value="{workflow>step_timeout_seconds}" min="10" max="1800" step="10" width="7rem" />
+                                    <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                </Panel>
+
+            </VBox>
+        </content>
+        <footer>
+            <OverflowToolbar>
+                <ToolbarSpacer />
+                <Button id="saveWorkflowButton" text="{i18n>save}" type="Emphasized" press=".onSave" />
+                <Button id="cancelWorkflowButton" text="{i18n>cancel}" press=".onBack" />
+            </OverflowToolbar>
+        </footer>
+    </Page>
+</mvc:View>
