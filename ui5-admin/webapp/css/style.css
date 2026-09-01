@@ -21,3 +21,9 @@
     color: var(--sapContent_LabelColor);
     font-size: 0.75rem;
 }
+/* Step output is agent-drafted plain text (bound, never raw HTML -- see
+   WorkflowRunDetail.view.xml), so line breaks need CSS to stay visible;
+   sap.m.Text collapses them like any normal inline element by default. */
+.workflowStepOutput {
+    white-space: pre-wrap;
+}

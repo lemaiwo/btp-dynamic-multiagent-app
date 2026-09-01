@@ -1,0 +1,123 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.WorkflowRunDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:f="sap.ui.layout.form">
+    <Page
+        id="workflowRunDetailPage"
+        title="{run>/data/workflow_name}"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <content>
+            <VBox class="sapUiSmallMargin">
+                <f:SimpleForm layout="ResponsiveGridLayout" editable="false">
+                    <Label text="{i18n>colStatus}" />
+                    <ObjectStatus
+                        id="runStatus"
+                        text="{run>/data/status}"
+                        state="{ path: 'run>/data/status', formatter: '.formatter.workflowRunStatusState' }" />
+
+                    <Label text="{i18n>colTrigger}" />
+                    <Text text="{run>/data/trigger}" />
+
+                    <Label text="{i18n>colStarted}" />
+                    <Text text="{ path: 'run>/data/started_at', formatter: '.formatter.timestamp' }" />
+
+                    <Label text="{i18n>colFinished}" />
+                    <Text text="{ path: 'run>/data/finished_at', formatter: '.formatter.timestamp' }" />
+
+                    <Label text="{i18n>colItems}" />
+                    <HBox>
+                        <ObjectNumber number="{run>/data/items_total}" unit="{i18n>itemsTotal}" class="sapUiTinyMarginEnd" />
+                        <ObjectNumber number="{run>/data/items_succeeded}" unit="{i18n>itemsSucceeded}" state="Success" class="sapUiTinyMarginEnd" />
+                        <ObjectNumber number="{run>/data/items_failed}" unit="{i18n>itemsFailed}" state="Error" class="sapUiTinyMarginEnd" />
+                        <ObjectNumber number="{run>/data/items_skipped}" unit="{i18n>itemsSkipped}" />
+                    </HBox>
+
+                    <Label text="{i18n>colSummary}" />
+                    <Text text="{run>/data/summary}" />
+                </f:SimpleForm>
+
+                <MessageStrip
+                    id="runError"
+                    text="{run>/data/error}"
+                    type="Error"
+                    visible="{= !!${run>/data/error} }"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop" />
+
+                <!-- Steps that ran once for the whole run, before the fan-out
+                     step produced any items, kept out of the items list
+                     below rather than attributed to one of them. -->
+                <Title text="{i18n>stepRunsPanel}" level="H3" class="sapUiSmallMarginTop" />
+                <List id="preFanOutStepsList" items="{run>/preFanOutSteps}" noDataText="{i18n>noStepRuns}">
+                    <CustomListItem>
+                        <VBox class="sapUiSmallMargin">
+                            <HBox alignItems="Center">
+                                <ObjectStatus
+                                    text="{run>status}"
+                                    state="{ path: 'run>status', formatter: '.formatter.runStatusState' }"
+                                    class="sapUiTinyMarginEnd" />
+                                <Text text="{run>agent_name}" />
+                            </HBox>
+                            <Text text="{run>output}" class="workflowStepOutput sapUiTinyMarginTop" />
+                            <MessageStrip
+                                text="{run>error}"
+                                type="Error"
+                                showIcon="true"
+                                visible="{= !!${run>error} }"
+                                class="sapUiTinyMarginTop" />
+                        </VBox>
+                    </CustomListItem>
+                </List>
+
+                <Title text="{i18n>itemsPanel}" level="H3" class="sapUiSmallMarginTop" />
+                <List id="itemsList" items="{run>/items}" noDataText="{i18n>noItems}">
+                    <CustomListItem>
+                        <VBox class="sapUiSmallMargin">
+                            <HBox alignItems="Center">
+                                <ObjectIdentifier title="{run>title}" text="{run>item_key}" />
+                                <ObjectStatus
+                                    text="{run>status}"
+                                    state="{ path: 'run>status', formatter: '.formatter.workflowItemStatusState' }"
+                                    class="sapUiTinyMarginBegin" />
+                            </HBox>
+                            <HBox class="sapUiTinyMarginTop">
+                                <Label text="{i18n>colBranchesEntered}" class="sapUiTinyMarginEnd" />
+                                <Text text="{ path: 'run>branches', formatter: '.formatter.joinList' }" class="workflowItemBranches" />
+                            </HBox>
+                            <MessageStrip
+                                text="{run>error}"
+                                type="Error"
+                                showIcon="true"
+                                visible="{= !!${run>error} }"
+                                class="sapUiTinyMarginTop" />
+
+                            <List items="{run>steps}" noDataText="{i18n>noStepRuns}" class="sapUiTinyMarginTop">
+                                <CustomListItem>
+                                    <VBox class="sapUiSmallMargin">
+                                        <HBox alignItems="Center">
+                                            <ObjectStatus
+                                                text="{run>status}"
+                                                state="{ path: 'run>status', formatter: '.formatter.runStatusState' }"
+                                                class="sapUiTinyMarginEnd" />
+                                            <Text text="{run>agent_name}" class="sapUiTinyMarginEnd" />
+                                            <Text text="{= ${run>branch_key} ? ${run>branch_key} : ${i18n>stepMainLine} }" />
+                                        </HBox>
+                                        <Text text="{run>output}" class="workflowStepOutput sapUiTinyMarginTop" />
+                                        <MessageStrip
+                                            text="{run>error}"
+                                            type="Error"
+                                            showIcon="true"
+                                            visible="{= !!${run>error} }"
+                                            class="sapUiTinyMarginTop" />
+                                    </VBox>
+                                </CustomListItem>
+                            </List>
+                        </VBox>
+                    </CustomListItem>
+                </List>
+            </VBox>
+        </content>
+    </Page>
+</mvc:View>

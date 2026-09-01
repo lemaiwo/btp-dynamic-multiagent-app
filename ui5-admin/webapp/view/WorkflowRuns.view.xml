@@ -1,0 +1,48 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.WorkflowRuns"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="workflowRunsPage" title="{i18n>navWorkflowRuns}">
+        <headerContent>
+            <Button id="refreshWorkflowRunsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefresh" />
+        </headerContent>
+        <content>
+            <Table
+                id="workflowRunsTable"
+                items="{workflowRuns>/items}"
+                growing="true"
+                growingThreshold="50"
+                noDataText="{i18n>noWorkflowRuns}">
+                <columns>
+                    <Column><Text text="{i18n>colWorkflow}" /></Column>
+                    <Column><Text text="{i18n>colStatus}" /></Column>
+                    <Column><Text text="{i18n>colTrigger}" /></Column>
+                    <Column><Text text="{i18n>colItems}" /></Column>
+                    <Column><Text text="{i18n>colStarted}" /></Column>
+                    <Column><Text text="{i18n>colFinished}" /></Column>
+                    <Column><Text text="{i18n>colSummary}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectIdentifier title="{workflowRuns>workflow_name}" text="{workflowRuns>id}" />
+                            <ObjectStatus
+                                text="{workflowRuns>status}"
+                                state="{ path: 'workflowRuns>status', formatter: '.formatter.workflowRunStatusState' }" />
+                            <Text text="{workflowRuns>trigger}" />
+                            <HBox>
+                                <ObjectNumber number="{workflowRuns>items_total}" unit="{i18n>itemsTotal}" class="sapUiTinyMarginEnd" />
+                                <ObjectNumber number="{workflowRuns>items_succeeded}" unit="{i18n>itemsSucceeded}" state="Success" class="sapUiTinyMarginEnd" />
+                                <ObjectNumber number="{workflowRuns>items_failed}" unit="{i18n>itemsFailed}" state="Error" class="sapUiTinyMarginEnd" />
+                                <ObjectNumber number="{workflowRuns>items_skipped}" unit="{i18n>itemsSkipped}" />
+                            </HBox>
+                            <Text text="{ path: 'workflowRuns>started_at', formatter: '.formatter.timestamp' }" />
+                            <Text text="{ path: 'workflowRuns>finished_at', formatter: '.formatter.timestamp' }" />
+                            <Text text="{workflowRuns>summary}" maxLines="2" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
+    </Page>
+</mvc:View>
