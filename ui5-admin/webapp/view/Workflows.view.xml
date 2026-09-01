@@ -1,0 +1,69 @@
+<mvc:View
+    controllerName="com.infrabel.agentadmin.controller.Workflows"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="workflowsPage" title="{i18n>navWorkflows}">
+        <headerContent>
+            <Button id="addWorkflowButton" icon="sap-icon://add" text="{i18n>newWorkflow}" press=".onCreate" />
+        </headerContent>
+        <content>
+            <Table
+                id="workflowsTable"
+                items="{workflows>/items}"
+                growing="true"
+                growingThreshold="50"
+                noDataText="{i18n>noWorkflows}">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <SearchField
+                            id="workflowSearch"
+                            width="18rem"
+                            placeholder="{i18n>searchWorkflows}"
+                            liveChange=".onSearch" />
+                        <ToolbarSpacer />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <Column><Text text="{i18n>colName}" /></Column>
+                    <Column><Text text="{i18n>colDescription}" /></Column>
+                    <Column><Text text="{i18n>colStatus}" /></Column>
+                    <Column><Text text="{i18n>maxParallelItems}" /></Column>
+                    <Column><Text text="{i18n>skipSeenItems}" /></Column>
+                    <Column><Text text="{i18n>onUnknownBranch}" /></Column>
+                    <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                </columns>
+                <items>
+                    <!-- Cell order is load-bearing: WorkflowJourney.ts reaches the
+                         run-now/delete buttons by drilling into getCells()[6], since
+                         neither Button carries an id that survives being cloned once
+                         per row (see Agents.view.xml/Skills.view.xml, which face the
+                         same constraint and are not id'd either). -->
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectIdentifier title="{workflows>name}" text="{workflows>api_slug}" />
+                            <Text text="{workflows>description}" maxLines="2" />
+                            <ObjectStatus
+                                text="{= ${workflows>enabled} ? ${i18n>enabled} : ${i18n>disabled} }"
+                                state="{= ${workflows>enabled} ? 'Success' : 'None' }" />
+                            <Text text="{workflows>max_parallel_items}" />
+                            <CheckBox selected="{workflows>skip_seen_items}" editable="false" />
+                            <Text text="{= ${workflows>on_unknown_branch} === 'fail' ? ${i18n>onUnknownBranchFail} : ${i18n>onUnknownBranchSkip} }" />
+                            <HBox>
+                                <Button
+                                    icon="sap-icon://play"
+                                    type="Transparent"
+                                    tooltip="{i18n>runNow}"
+                                    press=".onRunNow" />
+                                <Button
+                                    icon="sap-icon://delete"
+                                    type="Transparent"
+                                    tooltip="{i18n>delete}"
+                                    press=".onDelete" />
+                            </HBox>
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
+    </Page>
+</mvc:View>
