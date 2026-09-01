@@ -133,3 +133,103 @@ QUnit.test("a failed delete still rejects", async function (assert) {
         assert.strictEqual((e as AdminError).status, 404, "rejects so runOk returns false");
     }
 });
+
+QUnit.test("listWorkflows calls the relative backend path", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, [{ id: 1, name: "a" }], calls);
+
+    const workflows = await new AdminService().listWorkflows();
+
+    assert.strictEqual(calls[0][0], "backend/workflows", "relative path, no leading slash");
+    assert.strictEqual(calls[0][1], "GET", "uses GET");
+    assert.strictEqual(workflows.length, 1, "returns the parsed body");
+});
+
+QUnit.test("getWorkflow calls the id path", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, { id: 3, name: "a", branches: [], steps: [] }, calls);
+
+    await new AdminService().getWorkflow(3);
+
+    assert.strictEqual(calls[0][0], "backend/workflows/3", "targets the id");
+    assert.strictEqual(calls[0][1], "GET", "uses GET");
+});
+
+QUnit.test("upsertWorkflow PUTs to the id path when the workflow has one", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, { id: 7, name: "a" }, calls);
+
+    await new AdminService().upsertWorkflow({ name: "a" } as never, 7);
+
+    assert.strictEqual(calls[0][0], "backend/workflows/7", "targets the id");
+    assert.strictEqual(calls[0][1], "PUT", "uses PUT for an existing workflow");
+});
+
+QUnit.test("upsertWorkflow POSTs to the collection when there is no id", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(201, { id: 8, name: "a" }, calls);
+
+    await new AdminService().upsertWorkflow({ name: "a" } as never);
+
+    assert.strictEqual(calls[0][0], "backend/workflows", "targets the collection");
+    assert.strictEqual(calls[0][1], "POST", "uses POST for a new workflow");
+});
+
+QUnit.test("deleteWorkflow resolves on a 204", async function (assert) {
+    window.fetch = (() => Promise.resolve(new Response(null, { status: 204 }))) as unknown as typeof fetch;
+
+    await new AdminService().deleteWorkflow(5);
+    assert.ok(true, "deleteWorkflow resolves on a 204 instead of throwing");
+});
+
+QUnit.test("runWorkflowNow posts to the run path", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, { run_id: "wf-run-1" }, calls);
+
+    const result = await new AdminService().runWorkflowNow(9);
+
+    assert.strictEqual(calls[0][0], "backend/workflows/9/run", "targets the run path");
+    assert.strictEqual(calls[0][1], "POST", "uses POST");
+    assert.strictEqual(result.run_id, "wf-run-1", "returns the parsed body");
+});
+
+QUnit.test("a 409 from runWorkflowNow carries the conflict detail", async function (assert) {
+    stubFetch(409, { detail: "a run is already in progress" }, []);
+
+    try {
+        await new AdminService().runWorkflowNow(9);
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        const err = e as AdminError;
+        assert.strictEqual(err.status, 409, "carries 409");
+        assert.strictEqual(err.detail, "a run is already in progress", "carries the detail string");
+    }
+});
+
+QUnit.test("listWorkflowRuns builds the query string", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, [], calls);
+
+    await new AdminService().listWorkflowRuns({ workflowId: 4, limit: 10 });
+
+    assert.strictEqual(calls[0][0], "backend/workflow-runs?workflow_id=4&limit=10", "workflow_id and limit");
+});
+
+QUnit.test("listWorkflowRuns defaults the limit when omitted", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, [], calls);
+
+    await new AdminService().listWorkflowRuns();
+
+    assert.strictEqual(calls[0][0], "backend/workflow-runs?limit=50", "no workflow_id, default limit");
+});
+
+QUnit.test("getWorkflowRun calls the run id path", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, { run: {}, items: [], steps: [] }, calls);
+
+    await new AdminService().getWorkflowRun("wf-run-1");
+
+    assert.strictEqual(calls[0][0], "backend/workflow-runs/wf-run-1", "targets the run id");
+    assert.strictEqual(calls[0][1], "GET", "uses GET");
+});

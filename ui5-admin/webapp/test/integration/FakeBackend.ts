@@ -1,4 +1,6 @@
-import type { Agent, JobRunDetail, Skill } from "com/infrabel/agentadmin/service/types";
+import type {
+    Agent, JobRunDetail, Skill, WorkflowDetail, WorkflowRunDetail
+} from "com/infrabel/agentadmin/service/types";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext { path: string; status: number; body: unknown }
@@ -15,6 +17,8 @@ export default class FakeBackend {
     public agents: Agent[] = [];
     public skills: Skill[] = [];
     public runs: JobRunDetail[] = [];
+    public workflows: WorkflowDetail[] = [];
+    public workflowRuns: WorkflowRunDetail[] = [];
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
 
@@ -74,6 +78,68 @@ export default class FakeBackend {
             notified: false, created_by: "tester",
             report: { body_md: "# Report\n\n| a | b |\n|---|---|\n| 1 | 2 |" }
         }];
+        // One main-line fan-out step, plus two branches -- "support" has two
+        // steps, "billing" has one -- so a journey can assert against a
+        // branch with more than one step without inventing its own fixture.
+        this.workflows = [this.makeWorkflow("triage-inbox")];
+        this.workflows[0].description = "Triages inbound mail and routes it by topic.";
+        this.workflows[0].branches = [
+            { key: "billing", description: "Billing questions", position: 1 },
+            { key: "support", description: "Support requests", position: 2 }
+        ];
+        this.workflows[0].steps = [
+            {
+                branch_key: null, position: 1, agent_name: "gmail-agent",
+                instructions: "Read new mail.", fan_out: true, step_timeout_seconds: 600
+            },
+            {
+                branch_key: "billing", position: 1, agent_name: "btp-agent",
+                instructions: "Draft a billing reply.", fan_out: false, step_timeout_seconds: 600
+            },
+            {
+                branch_key: "support", position: 1, agent_name: "btp-agent",
+                instructions: "Draft a support reply.", fan_out: false, step_timeout_seconds: 600
+            },
+            {
+                branch_key: "support", position: 2, agent_name: "btp-agent",
+                instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600
+            }
+        ];
+        this.workflowRuns = [{
+            run: {
+                id: "wf-run-1", workflow_id: this.workflows[0].id, workflow_name: "triage-inbox",
+                trigger: "manual", status: "success",
+                started_at: "2026-08-24T10:00:00", finished_at: "2026-08-24T10:05:00",
+                items_total: 2, items_succeeded: 1, items_failed: 0, items_skipped: 1,
+                summary: "Processed 2 items.", error: null, created_by: "tester"
+            },
+            items: [
+                {
+                    id: "item-1", workflow_run_id: "wf-run-1", item_key: "msg-1",
+                    title: "Invoice question", branches: ["billing"], status: "success",
+                    error: null, started_at: "2026-08-24T10:00:05", finished_at: "2026-08-24T10:02:00"
+                },
+                {
+                    id: "item-2", workflow_run_id: "wf-run-1", item_key: "msg-2",
+                    title: "Already handled", branches: [], status: "skipped",
+                    error: null, started_at: "2026-08-24T10:00:05", finished_at: "2026-08-24T10:00:05"
+                }
+            ],
+            steps: [
+                {
+                    id: "step-1", workflow_run_id: "wf-run-1", item_run_id: null, branch_key: null,
+                    position: 1, agent_name: "gmail-agent", status: "success",
+                    output: "Found 2 items.", error: null,
+                    started_at: "2026-08-24T10:00:00", finished_at: "2026-08-24T10:00:05"
+                },
+                {
+                    id: "step-2", workflow_run_id: "wf-run-1", item_run_id: "item-1",
+                    branch_key: "billing", position: 1, agent_name: "btp-agent", status: "success",
+                    output: "Drafted a billing reply.", error: null,
+                    started_at: "2026-08-24T10:00:05", finished_at: "2026-08-24T10:02:00"
+                }
+            ]
+        }];
         this.failNext = undefined;
     }
 
@@ -87,6 +153,15 @@ export default class FakeBackend {
             run_timeout_seconds: 1800, peers: [], model_name: "",
             created_at: null, updated_at: null,
             mcp_url: "", auth_mode: "jwt"
+        };
+    }
+
+    private makeWorkflow(name: string): WorkflowDetail {
+        return {
+            id: this.nextId++, name, description: `${name} description`,
+            api_slug: "", run_as_principal: "", run_timeout_seconds: 1800,
+            skip_seen_items: true, max_parallel_items: 1, on_unknown_branch: "fail",
+            enabled: true, branches: [], steps: []
         };
     }
 
@@ -173,6 +248,42 @@ export default class FakeBackend {
         }
         if (/^runs\/[^/]+$/.test(path)) {
             return this.json(this.runs[0]);
+        }
+        if (path === "workflows" && method === "GET") {
+            // Mirrors Workflow.to_dict(): the list carries no branches/steps.
+            return this.json(this.workflows.map(({ branches, steps, ...rest }) => rest));
+        }
+        if (path === "workflows" && method === "POST") {
+            const created = {
+                ...this.makeWorkflow(String(body?.name)), ...body, id: this.nextId++
+            } as WorkflowDetail;
+            this.workflows.push(created);
+            return this.json(created, 201);
+        }
+        if (/^workflows\/\d+$/.test(path)) {
+            const id = Number(path.split("/")[1]);
+            const index = this.workflows.findIndex((w) => w.id === id);
+            if (method === "GET") {
+                return this.json(this.workflows[index]);
+            }
+            if (method === "PUT") {
+                this.workflows[index] = { ...this.workflows[index], ...body } as WorkflowDetail;
+                return this.json(this.workflows[index]);
+            }
+            if (method === "DELETE") {
+                this.workflows.splice(index, 1);
+                return this.noContent();
+            }
+        }
+        if (/^workflows\/\d+\/run$/.test(path)) {
+            return this.json({ run_id: `wf-run-${this.nextId++}` });
+        }
+        if (path === "workflow-runs" && method === "GET") {
+            return this.json(this.workflowRuns.map((r) => r.run));
+        }
+        if (/^workflow-runs\/[^/]+$/.test(path)) {
+            const id = path.split("/")[1];
+            return this.json(this.workflowRuns.find((r) => r.run.id === id) ?? this.workflowRuns[0]);
         }
         if (path === "reload" || path === "restart") {
             return this.json({ status: "ok" });

@@ -1,6 +1,7 @@
 import type {
     Agent, AgentInput, AdminConfig, CredentialStatus, ImportPayload,
-    JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI
+    JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
+    Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
 
 /**
@@ -194,5 +195,42 @@ export default class AdminService {
 
     public getConfig(): Promise<AdminConfig> {
         return this.request<AdminConfig>("config");
+    }
+
+    // --- Workflows ---------------------------------------------------------
+    public listWorkflows(): Promise<Workflow[]> {
+        return this.request<Workflow[]>("workflows");
+    }
+
+    public getWorkflow(id: number): Promise<WorkflowDetail> {
+        return this.request<WorkflowDetail>(`workflows/${id}`);
+    }
+
+    /** POSTs when `id` is omitted, PUTs when it is supplied. */
+    public upsertWorkflow(workflow: WorkflowInput, id?: number): Promise<WorkflowDetail> {
+        return id === undefined
+            ? this.request<WorkflowDetail>("workflows", { method: "POST", ...AdminService.json(workflow) })
+            : this.request<WorkflowDetail>(`workflows/${id}`, { method: "PUT", ...AdminService.json(workflow) });
+    }
+
+    public deleteWorkflow(id: number): Promise<void> {
+        return this.request<void>(`workflows/${id}`, { method: "DELETE" });
+    }
+
+    public runWorkflowNow(id: number): Promise<{ run_id: string }> {
+        return this.request<{ run_id: string }>(`workflows/${id}/run`, { method: "POST" });
+    }
+
+    public listWorkflowRuns(opts: { workflowId?: number; limit?: number } = {}): Promise<WorkflowRun[]> {
+        const params = new URLSearchParams();
+        if (opts.workflowId !== undefined) {
+            params.set("workflow_id", String(opts.workflowId));
+        }
+        params.set("limit", String(opts.limit ?? 50));
+        return this.request<WorkflowRun[]>(`workflow-runs?${params.toString()}`);
+    }
+
+    public getWorkflowRun(runId: string): Promise<WorkflowRunDetail> {
+        return this.request<WorkflowRunDetail>(`workflow-runs/${encodeURIComponent(runId)}`);
     }
 }

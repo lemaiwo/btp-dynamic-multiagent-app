@@ -215,3 +215,140 @@ export interface ReloadResult {
     agents: number;
     enabled: number;
 }
+
+// --- Workflows -------------------------------------------------------------
+
+/**
+ * A named sub-sequence of steps a work item may or may not enter.
+ *
+ * `key` is what the fan-out step emits to select this branch; `description`
+ * is shown to it in the branch catalogue so it chooses from a list it can
+ * see rather than guessing label strings.
+ */
+export interface WorkflowBranch {
+    key: string;
+    description: string;
+    position: number;
+}
+
+/**
+ * One agent invocation in a workflow.
+ *
+ * `branch_key` is `null` for a main-line step; otherwise the step belongs to
+ * that branch. `fan_out` marks the single step (main line only) that returns
+ * work items for every later main-line step to run once per item.
+ */
+export interface WorkflowStep {
+    branch_key: string | null;
+    position: number;
+    agent_name: string;
+    instructions: string;
+    fan_out: boolean;
+    step_timeout_seconds: number;
+}
+
+/** Fields shared by `Workflow` and `WorkflowInput`; see each for what each
+ * one adds. */
+export interface WorkflowBase {
+    name: string;
+    description: string;
+    api_slug: string;
+    /** Fallback identity for steps whose agent has no run_as_principal of
+     * its own. A scheduled run has no interactive user to borrow one from. */
+    run_as_principal: string;
+    run_timeout_seconds: number;
+    /** Repeat-run safety: an item already completed by an earlier run is
+     * skipped, so a retry after a crash resumes rather than re-drafting. */
+    skip_seen_items: boolean;
+    max_parallel_items: number;
+    /** "fail" or "skip". Mirrors VALID_ON_UNKNOWN_BRANCH in agents/db.py. */
+    on_unknown_branch: string;
+    enabled: boolean;
+}
+
+/** What POST/PUT /admin/api/workflows accepts. */
+export interface WorkflowInput extends WorkflowBase {
+    branches: WorkflowBranch[];
+    steps: WorkflowStep[];
+}
+
+/** GET /admin/api/workflows list entry. `Workflow.to_dict()` carries no
+ * `branches`/`steps` — the detail routes add them alongside, see
+ * `WorkflowDetail`. */
+export interface Workflow extends WorkflowBase {
+    id: number;
+}
+
+/** What GET/POST/PUT /admin/api/workflows/{id} return: the list shape plus
+ * its branches and steps. */
+export interface WorkflowDetail extends Workflow {
+    branches: WorkflowBranch[];
+    steps: WorkflowStep[];
+}
+
+/** Statuses `agents/workflow_runner.py` assigns to a `WorkflowRun`.
+ * `"partial"` means at least one item succeeded or was skipped while at
+ * least one other failed. */
+export type WorkflowRunStatus = "running" | "success" | "failed" | "interrupted" | "partial";
+
+export interface WorkflowRun {
+    id: string;
+    workflow_id: number;
+    workflow_name: string;
+    trigger: string;
+    status: WorkflowRunStatus;
+    started_at: string | null;
+    finished_at: string | null;
+    items_total: number;
+    items_succeeded: number;
+    items_failed: number;
+    items_skipped: number;
+    summary: string | null;
+    error: string | null;
+    created_by: string | null;
+}
+
+/** Statuses `agents/workflow_runner.py` assigns to a `WorkflowItemRun`.
+ * `"skipped"` is `skip_seen_items` refusing an item already completed by an
+ * earlier run. */
+export type WorkflowItemStatus = "running" | "success" | "failed" | "interrupted" | "skipped";
+
+/** One work item flowing through a workflow run. */
+export interface WorkflowItemRun {
+    id: string;
+    workflow_run_id: string;
+    item_key: string;
+    title: string;
+    /** Which branches the reader selected, for this item. */
+    branches: string[];
+    status: WorkflowItemStatus;
+    error: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+}
+
+export type WorkflowStepStatus = "running" | "success" | "failed" | "interrupted";
+
+/** One agent invocation inside a workflow run. `item_run_id` is `null` for
+ * steps that ran before the fan-out, i.e. once per run. */
+export interface WorkflowStepRun {
+    id: string;
+    workflow_run_id: string;
+    item_run_id: string | null;
+    branch_key: string | null;
+    position: number;
+    agent_name: string;
+    status: WorkflowStepStatus;
+    output: string | null;
+    error: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+}
+
+/** GET /admin/api/workflow-runs/{run_id}: the run plus every item and step
+ * that ran within it. */
+export interface WorkflowRunDetail {
+    run: WorkflowRun;
+    items: WorkflowItemRun[];
+    steps: WorkflowStepRun[];
+}
