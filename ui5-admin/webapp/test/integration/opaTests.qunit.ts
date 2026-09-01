@@ -18,3 +18,4 @@ import "./RunReportJourney";
 import "./ReloadJourney";
 import "./ImportJourney";
 import "./SessionExpiredJourney";
+import "./WorkflowJourney";
