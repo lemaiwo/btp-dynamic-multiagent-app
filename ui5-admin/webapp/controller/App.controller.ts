@@ -16,6 +16,10 @@ const NAV_KEY_BY_ROUTE: Record<string, string> = {
     skillDetail: "skills",
     runs: "runs",
     runDetail: "runs",
+    workflows: "workflows",
+    workflowDetail: "workflows",
+    workflowRuns: "workflowRuns",
+    workflowRunDetail: "workflowRuns",
     settings: "settings"
 };
 

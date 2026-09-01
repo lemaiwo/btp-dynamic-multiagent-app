@@ -29,6 +29,8 @@
                     <tnt:NavigationListItem text="{i18n>navAgents}" icon="sap-icon://person-placeholder" key="agents" />
                     <tnt:NavigationListItem text="{i18n>navSkills}" icon="sap-icon://learning-assistant" key="skills" />
                     <tnt:NavigationListItem text="{i18n>navRuns}" icon="sap-icon://history" key="runs" />
+                    <tnt:NavigationListItem text="{i18n>navWorkflows}" icon="sap-icon://process" key="workflows" />
+                    <tnt:NavigationListItem text="{i18n>navWorkflowRuns}" icon="sap-icon://workflow-tasks" key="workflowRuns" />
                     <tnt:NavigationListItem text="{i18n>navSettings}" icon="sap-icon://action-settings" key="settings" />
                 </tnt:NavigationList>
             </tnt:SideNavigation>
