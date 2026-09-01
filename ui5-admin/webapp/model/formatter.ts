@@ -1,5 +1,5 @@
 import { ValueState } from "sap/ui/core/library";
-import type { McpServer, RunStatus } from "../service/types";
+import type { McpServer, RunStatus, WorkflowItemStatus, WorkflowRunStatus } from "../service/types";
 
 const EM_DASH = "—";
 
@@ -13,11 +13,44 @@ const STATUS_STATES: Record<string, ValueState> = {
     degraded: ValueState.Warning
 };
 
+const WORKFLOW_RUN_STATUS_STATES: Record<WorkflowRunStatus, ValueState> = {
+    success: ValueState.Success,
+    failed: ValueState.Error,
+    interrupted: ValueState.Warning,
+    running: ValueState.Information,
+    // Some items succeeded while at least one other failed -- the most
+    // common real outcome. Warning rather than Error keeps it from reading
+    // as a generic failure.
+    partial: ValueState.Warning
+};
+
+const WORKFLOW_ITEM_STATUS_STATES: Record<WorkflowItemStatus, ValueState> = {
+    success: ValueState.Success,
+    failed: ValueState.Error,
+    interrupted: ValueState.Warning,
+    running: ValueState.Information,
+    // skip_seen_items refusing an item already completed by an earlier run
+    // -- not a failure, so neither Error nor Warning.
+    skipped: ValueState.None
+};
+
 export default {
 
     /** Maps a run status onto a semantic colour. Unknown values stay neutral. */
     runStatusState(status: RunStatus): ValueState {
         return STATUS_STATES[status] ?? ValueState.None;
+    },
+
+    /** Maps a workflow run status onto a semantic colour, `"partial"`
+     * included -- see WORKFLOW_RUN_STATUS_STATES. */
+    workflowRunStatusState(status: WorkflowRunStatus): ValueState {
+        return WORKFLOW_RUN_STATUS_STATES[status] ?? ValueState.None;
+    },
+
+    /** Maps a workflow item status onto a semantic colour, `"skipped"`
+     * included. */
+    workflowItemStatusState(status: WorkflowItemStatus): ValueState {
+        return WORKFLOW_ITEM_STATUS_STATES[status] ?? ValueState.None;
     },
 
     /** Empty while a run is still in flight — there is no duration yet. */
@@ -54,5 +87,15 @@ export default {
             return url.toLowerCase().startsWith("builtin:") ? url : "1 MCP server";
         }
         return `${servers.length} MCP servers`;
+    },
+
+    /** Renders a workflow item's selected branches as a comma list. Empty
+     * means the item entered no branch (main line only, or skipped before
+     * the fan-out step could select one). */
+    joinList(items: string[] | null | undefined): string {
+        if (!items || items.length === 0) {
+            return EM_DASH;
+        }
+        return items.join(", ");
     }
 };
