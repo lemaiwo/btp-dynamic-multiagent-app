@@ -10,6 +10,7 @@ import type Button from "sap/m/Button";
 import type Input from "sap/m/Input";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
+import type Text from "sap/m/Text";
 import type UI5Element from "sap/ui/core/Element";
 import type { WorkflowStep } from "com/infrabel/agentadmin/service/types";
 import Common, { backend } from "./pages/Common";
@@ -86,7 +87,48 @@ opaTest(
 );
 
 opaTest(
-    "a round trip preserves every step's agent, branch and per-group position, and every branch",
+    "the API slug field shows a live scheduler-endpoint hint",
+    function (Given: Common, When: Common, Then: Common) {
+        // The seeded workflow's api_slug is "" (FakeBackend.makeWorkflow's
+        // default, never overridden for triage-inbox), so the hint starts on
+        // the placeholder rather than a real path -- an operator must not be
+        // shown a path that would 404.
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        Then.waitFor({
+            id: "workflowApiSlugHint",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Text).getText(false), "The scheduler posts to POST /api/workflows/<slug>/run.",
+                    "with no slug entered yet, the hint falls back to a placeholder rather than an empty path"
+                );
+            }
+        });
+
+        When.waitFor({
+            id: "workflowApiSlug",
+            viewName: "WorkflowDetail",
+            actions: new EnterText({ text: "triage-inbox" })
+        });
+
+        Then.waitFor({
+            id: "workflowApiSlugHint",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Text).getText(false), "The scheduler posts to POST /api/workflows/triage-inbox/run.",
+                    "the hint updates live as the slug is typed, not only after the field loses focus"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "a round trip preserves every step's agent, branch and per-group position, every branch, and every scalar field",
     function (Given: Common, When: Common, Then: Common) {
         // The single most valuable assertion in this task: if positions were
         // ever computed globally across the workflow instead of per group
@@ -97,6 +139,39 @@ opaTest(
         // the server for a reason the operator did nothing to cause.
         Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
 
+        // Every scalar field is set to a value distinguishable from its seed
+        // default before saving -- deliberately not re-saved unchanged, only
+        // for these fields. Steps and branches are left untouched, so the
+        // per-group position assertion below still exercises exactly the
+        // "unchanged" path it always has. This matters because FakeBackend's
+        // PUT merges `{...existing, ...body}`: a field the controller's
+        // payload stopped sending would keep whatever the record already
+        // had, and an *unchanged* round trip of that same field could never
+        // tell the difference -- it would show the right value either way.
+        // Changing it first means a dropped field comes back stale instead.
+        //
+        // Set directly on the model, the same way the step-row tests in this
+        // file set branch_key/agent_name: a <Select>'s or <Switch>'s bound
+        // property does not write back through two-way binding from a
+        // programmatic control change, only a genuine user gesture does, and
+        // onSave() reads only the model, never the controls themselves.
+        When.waitFor({
+            id: "workflowName",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const model = (element as Input).getModel("workflow") as JSONModel;
+                model.setProperty("/data/name", "triage-inbox-edited");
+                model.setProperty("/data/description", "Updated description.");
+                model.setProperty("/data/api_slug", "triage-v2");
+                model.setProperty("/data/run_as_principal", "svc-triage");
+                model.setProperty("/data/run_timeout_seconds", 900);
+                model.setProperty("/data/skip_seen_items", false);
+                model.setProperty("/data/max_parallel_items", 3);
+                model.setProperty("/data/on_unknown_branch", "skip");
+                model.setProperty("/data/enabled", false);
+            }
+        });
+
         When.waitFor({ id: "saveWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
 
         Then.waitFor({
@@ -104,6 +179,31 @@ opaTest(
             viewName: "Workflows",
             success: function () {
                 const saved = backend.workflows.find((w) => w.id === WORKFLOW_ID);
+                Opa5.assert.deepEqual(
+                    saved && {
+                        name: saved.name,
+                        description: saved.description,
+                        api_slug: saved.api_slug,
+                        run_as_principal: saved.run_as_principal,
+                        run_timeout_seconds: saved.run_timeout_seconds,
+                        skip_seen_items: saved.skip_seen_items,
+                        max_parallel_items: saved.max_parallel_items,
+                        on_unknown_branch: saved.on_unknown_branch,
+                        enabled: saved.enabled
+                    },
+                    {
+                        name: "triage-inbox-edited",
+                        description: "Updated description.",
+                        api_slug: "triage-v2",
+                        run_as_principal: "svc-triage",
+                        run_timeout_seconds: 900,
+                        skip_seen_items: false,
+                        max_parallel_items: 3,
+                        on_unknown_branch: "skip",
+                        enabled: false
+                    },
+                    "every scalar field reaches the server -- one collectPayload() stopped sending would come back with its stale fixture value instead of this one"
+                );
                 Opa5.assert.deepEqual(
                     saved?.steps,
                     [
@@ -124,7 +224,7 @@ opaTest(
                             instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600
                         }
                     ],
-                    "every step's branch, agent, instructions and per-group position survive an unchanged save"
+                    "every step's branch, agent, instructions and per-group position survive the save, unchanged"
                 );
                 Opa5.assert.deepEqual(
                     saved?.branches,
@@ -132,7 +232,7 @@ opaTest(
                         { key: "billing", description: "Billing questions", position: 1 },
                         { key: "support", description: "Support requests", position: 2 }
                     ],
-                    "every branch survives an unchanged save"
+                    "every branch survives the save, unchanged"
                 );
             }
         });
@@ -360,6 +460,14 @@ opaTest(
             actions: new EnterText({ text: "abap" })
         });
 
+        // A second row added and then abandoned without ever naming it --
+        // exactly what an operator who adds a row, then changes their mind,
+        // leaves behind. Left in the payload it would 400 against
+        // validate_workflow_parts' "A branch key must not be empty."; the
+        // assertion below instead expects collectBranches() to have dropped
+        // it, matching the classic admin's own collect step.
+        When.waitFor({ id: "addBranchButton", viewName: "WorkflowDetail", actions: new Press() });
+
         // The step row's branch/agent are set directly on the model (see the
         // StepRow comment above): EnterText only drives text inputs, and a
         // <Select>'s selectedKey does not write back through its two-way
@@ -396,7 +504,7 @@ opaTest(
                 );
                 Opa5.assert.deepEqual(
                     created?.branches, [{ key: "abap", description: "", position: 1 }],
-                    "the branch added on the 'new' form was submitted"
+                    "the named branch was submitted, and the second, abandoned blank-key row was dropped rather than sent"
                 );
                 Opa5.assert.deepEqual(
                     created?.steps,
