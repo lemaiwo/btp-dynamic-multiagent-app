@@ -2,6 +2,8 @@ import opaTest from "sap/ui/test/opaQunit";
 import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
+import HashChanger from "sap/ui/core/routing/HashChanger";
+import type JSONModel from "sap/ui/model/json/JSONModel";
 import type Table from "sap/m/Table";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Button from "sap/m/Button";
@@ -9,7 +11,15 @@ import type Input from "sap/m/Input";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
 import type UI5Element from "sap/ui/core/Element";
+import type { WorkflowStep } from "com/infrabel/agentadmin/service/types";
 import Common, { backend } from "./pages/Common";
+
+/** The subset of a step-row model entry this file manipulates directly
+ * (arrange only -- never asserted on) to set a freshly `onAddStep`'d row's
+ * branch/agent without driving the row's `<Select>` controls, which do not
+ * write back through their two-way binding when set programmatically
+ * (only a genuine `change` event does). */
+type StepRow = WorkflowStep & { agentOptions: unknown; branchOptions: unknown };
 
 Opa5.extendConfig({ viewNamespace: "com.infrabel.agentadmin.view.", autoWait: true });
 
@@ -176,6 +186,60 @@ opaTest(
             }
         });
 
+        // The end-to-end guarantee that actually matters: the disabled
+        // placeholder is what forces the save itself to fail rather than
+        // quietly substituting a different agent -- not just that the
+        // control renders correctly. FakeBackend doesn't run
+        // validate_workflow_parts, so the rejection is modelled the same
+        // way the "rejected by validation" test below models it: via
+        // failNext carrying the server's own message shape.
+        When.waitFor({
+            success: function () {
+                backend.failNext = {
+                    path: `workflows/${WORKFLOW_ID}`,
+                    status: 400,
+                    body: { detail: "Step 2 names agent 'ghost-agent', which does not exist or is disabled." }
+                };
+            }
+        });
+
+        When.waitFor({ id: "saveWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        Then.waitFor({
+            controlType: "sap.m.Dialog",
+            searchOpenDialogs: true,
+            matchers: function (element: UI5Element) {
+                const dialog = element as Dialog;
+                const text = dialog.getDomRef()?.textContent ?? "";
+                return dialog.getTitle() === "Error" && text.indexOf("ghost-agent") !== -1;
+            },
+            success: function () {
+                Opa5.assert.ok(true, "the save was rejected with the server's message naming the missing agent");
+            },
+            errorMessage: "No 'Error' dialog naming 'ghost-agent' appeared -- the save was not rejected"
+        });
+
+        When.waitFor({
+            controlType: "sap.m.Button",
+            searchOpenDialogs: true,
+            matchers: function (element: UI5Element) { return (element as Button).getVisible(); },
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const table = element as Table;
+                const rows = table.getItems() as ColumnListItem[];
+                const ghostRow = rows[rows.length - 1];
+                Opa5.assert.strictEqual(
+                    (ghostRow.getCells()[1] as Select).getSelectedKey(), "ghost-agent",
+                    "after the rejected save, the step still names the missing agent -- it was never silently substituted"
+                );
+            }
+        });
+
         Then.iStopTheApp();
     }
 );
@@ -253,6 +317,169 @@ opaTest(
                 Opa5.assert.strictEqual(
                     input.getValue(), "triage-inbox-renamed",
                     "the rejected save left the operator's unsaved edit in place instead of clearing or reloading the form"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "creating a workflow from 'new', after the same route previously showed an existing one, does not carry over the old id",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        // sap.m.routing.Router caches a target's view/controller instance and
+        // reuses it across every match of the same route -- "workflows/102"
+        // and "workflows/new" both resolve to the "workflowDetail" target, so
+        // this is the SAME WorkflowDetail controller instance load() runs
+        // against twice. That is exactly the scenario a stale `workflowId`
+        // field left over from the first load would break: if the "new"
+        // branch of load() failed to reset it, the save below would PUT over
+        // workflow 102 instead of POSTing a genuinely new workflow. Setting
+        // the hash directly (rather than clicking back to the list and
+        // pressing "New workflow") exercises the same patternMatched
+        // re-fire a real navigation would, without depending on the nav-back
+        // button's id.
+        When.waitFor({
+            success: function () { HashChanger.getInstance().setHash("workflows/new"); }
+        });
+
+        When.waitFor({
+            id: "workflowName", viewName: "WorkflowDetail", actions: new EnterText({ text: "brand-new-flow" })
+        });
+
+        When.waitFor({ id: "addBranchButton", viewName: "WorkflowDetail", actions: new Press() });
+        When.waitFor({
+            id: "branchesTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) {
+                return ((element as Table).getItems()[0] as ColumnListItem).getCells()[0];
+            },
+            actions: new EnterText({ text: "abap" })
+        });
+
+        // The step row's branch/agent are set directly on the model (see the
+        // StepRow comment above): EnterText only drives text inputs, and a
+        // <Select>'s selectedKey does not write back through its two-way
+        // binding when set from code, only from a genuine user "change".
+        When.waitFor({ id: "addStepButton", viewName: "WorkflowDetail", actions: new Press() });
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const model = (element as Table).getModel("workflow") as JSONModel;
+                const steps = model.getProperty("/data/steps") as StepRow[];
+                steps[steps.length - 1].branch_key = "abap";
+                steps[steps.length - 1].agent_name = "gmail-agent";
+                model.setProperty("/data/steps", steps);
+            }
+        });
+
+        When.waitFor({ id: "saveWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        Then.waitFor({
+            id: "workflowsTable",
+            viewName: "Workflows",
+            success: function () {
+                const original = backend.workflows.find((w) => w.id === WORKFLOW_ID);
+                Opa5.assert.strictEqual(
+                    original?.name, "triage-inbox",
+                    "the previously-viewed workflow (102) was not overwritten"
+                );
+
+                const created = backend.workflows.find((w) => w.name === "brand-new-flow");
+                Opa5.assert.ok(
+                    created !== undefined && created.id !== WORKFLOW_ID,
+                    "a genuinely new workflow was POSTed with its own id, not PUT over the stale id 102"
+                );
+                Opa5.assert.deepEqual(
+                    created?.branches, [{ key: "abap", description: "", position: 1 }],
+                    "the branch added on the 'new' form was submitted"
+                );
+                Opa5.assert.deepEqual(
+                    created?.steps,
+                    [{
+                        branch_key: "abap", position: 1, agent_name: "gmail-agent",
+                        instructions: "", fan_out: false, step_timeout_seconds: 600
+                    }],
+                    "the step added on the 'new' form was submitted"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "adding a step to a branch that already has steps, and removing the fan-out step, submits contiguous per-group positions",
+    function (Given: Common, When: Common, Then: Common) {
+        // Break-tested: temporarily changing WorkflowDetail.controller.ts's
+        // collectSteps() to a single running counter (instead of one counter
+        // per branch_key group) makes this fail -- the new support-branch
+        // step comes back positioned 5th overall instead of 3rd within
+        // "support". See task-3-report.md's Fix round 1 section for the
+        // verbatim RED output.
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        // Remove the fan-out step (the sole main-line row, index 0): proves
+        // a removed row does not leave a gap in another group's numbering.
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) {
+                return ((element as Table).getItems()[0] as ColumnListItem).getCells()[5];
+            },
+            actions: new Press()
+        });
+
+        // Add a third step to "support", which already has two (positions 1
+        // and 2 -- "Draft a support reply." / "Send the reply.").
+        When.waitFor({ id: "addStepButton", viewName: "WorkflowDetail", actions: new Press() });
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const model = (element as Table).getModel("workflow") as JSONModel;
+                const steps = model.getProperty("/data/steps") as StepRow[];
+                const newStep = steps[steps.length - 1];
+                newStep.branch_key = "support";
+                newStep.agent_name = "btp-agent";
+                newStep.instructions = "Escalate to a human.";
+                model.setProperty("/data/steps", steps);
+            }
+        });
+
+        When.waitFor({ id: "saveWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        Then.waitFor({
+            id: "workflowsTable",
+            viewName: "Workflows",
+            success: function () {
+                const saved = backend.workflows.find((w) => w.id === WORKFLOW_ID);
+                Opa5.assert.deepEqual(
+                    saved?.steps,
+                    [
+                        {
+                            branch_key: "billing", position: 1, agent_name: "btp-agent",
+                            instructions: "Draft a billing reply.", fan_out: false, step_timeout_seconds: 600
+                        },
+                        {
+                            branch_key: "support", position: 1, agent_name: "btp-agent",
+                            instructions: "Draft a support reply.", fan_out: false, step_timeout_seconds: 600
+                        },
+                        {
+                            branch_key: "support", position: 2, agent_name: "btp-agent",
+                            instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600
+                        },
+                        {
+                            branch_key: "support", position: 3, agent_name: "btp-agent",
+                            instructions: "Escalate to a human.", fan_out: false, step_timeout_seconds: 600
+                        }
+                    ],
+                    "the main line is gone with no gap left behind, and 'support' is numbered 1..3 on its own, not 2..4 following 'billing'"
                 );
             }
         });
