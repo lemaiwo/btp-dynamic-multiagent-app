@@ -248,13 +248,23 @@ export default class WorkflowDetail extends BaseController {
 
     /** Branch rows in table order, positioned 1..n within that one group --
      * never globally: `validate_workflow_parts` requires branch positions to
-     * be contiguous from 1 on their own. */
+     * be contiguous from 1 on their own.
+     *
+     * Blank-keyed rows (added, then abandoned before being named) are dropped
+     * rather than submitted, matching the classic admin's collect step. Left
+     * in, one would reach `validate_workflow_parts`, which 400s on "A branch
+     * key must not be empty." -- an operator who adds a row and changes their
+     * mind would have to find and delete it themselves instead of the save
+     * just working. That server-side rule stays as the backstop for a blank
+     * key that reaches it some other way. */
     private static collectBranches(branches: WorkflowBranch[]): WorkflowBranch[] {
-        return branches.map((b, index) => ({
-            key: (b.key || "").trim(),
-            description: b.description || "",
-            position: index + 1
-        }));
+        return branches
+            .filter((b) => (b.key || "").trim())
+            .map((b, index) => ({
+                key: b.key.trim(),
+                description: b.description || "",
+                position: index + 1
+            }));
     }
 
     /**
@@ -343,6 +353,18 @@ export default class WorkflowDetail extends BaseController {
 
     public onBack(): void {
         this.getRouter().navTo("workflows");
+    }
+
+    /** The scheduler endpoint hint under the API slug field, kept live by
+     * `valueLiveUpdate` on the `<Input>` it is bound from. The classic admin
+     * shows this only as a static parenthetical next to the label; this
+     * fills in the entered slug the way its own agent-endpoint hint does
+     * (`updateEndpointHint()` in templates/admin.html), since an operator
+     * copying the shown path is less likely to typo it than one filling in
+     * a placeholder by hand. */
+    public endpointHint(apiSlug: string): string {
+        const slug = (apiSlug || "").trim() || this.text("apiSlugPlaceholder");
+        return this.text("apiSlugRunHint", [slug]);
     }
 
     // text(key) is inherited from BaseController -- do not redeclare it.

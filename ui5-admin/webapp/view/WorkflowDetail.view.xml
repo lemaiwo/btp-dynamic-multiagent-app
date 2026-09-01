@@ -38,9 +38,14 @@
                         <Input
                             id="workflowApiSlug"
                             value="{workflow>/data/api_slug}"
+                            valueLiveUpdate="true"
                             valueState="{workflow>/errors/api_slugState}"
                             valueStateText="{workflow>/errors/api_slug}"
                             maxLength="64" />
+                        <Text
+                            id="workflowApiSlugHint"
+                            text="{ path: 'workflow>/data/api_slug', formatter: '.endpointHint' }"
+                            class="sapUiTinyMarginTop" />
 
                         <Label text="{i18n>runAsPrincipal}" />
                         <Input
