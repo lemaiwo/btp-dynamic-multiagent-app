@@ -991,7 +991,7 @@ def _clean_client_credentials(
 
 # A destination server stores no credential: the destination itself holds the
 # target's URL and its secret. `destination` names it; the rest is filtering.
-_DEST_KEYS = ("destination", "project", "status", "lookback", "api_base")
+_DEST_KEYS = ("destination", "project", "status", "lookback", "api_base", "labels")
 
 
 def _clean_destination(oauth: Any) -> dict[str, Any]:
@@ -1007,6 +1007,13 @@ def _clean_destination(oauth: Any) -> dict[str, Any]:
     cleaned: dict[str, Any] = {}
     for k in _DEST_KEYS:
         v = src.get(k)
+        if isinstance(v, (list, tuple)):
+            # `status` and `labels` are multi-value and stored comma-separated,
+            # which is also what both admin UIs post. A JSON list is a
+            # legitimate thing for an API client or an imported bundle to send,
+            # and str() on it would store "['a', 'b']" -- which then parses back
+            # as the two values "['a'" and "'b']" and quietly matches nothing.
+            v = ", ".join(str(x).strip() for x in v if str(x).strip())
         if v is not None and str(v).strip() != "":
             cleaned[k] = str(v).strip()
     if not cleaned.get("destination"):

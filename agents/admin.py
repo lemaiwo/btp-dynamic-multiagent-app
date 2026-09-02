@@ -126,12 +126,43 @@ class OAuthClientPayload(BaseModel):
     # agent the ability to write.
     destination: str = Field(default="", max_length=256)
     project: str = Field(default="", max_length=64)
-    status: str = Field(default="", max_length=64)
+    # Multi-value, comma-separated. Wider than `project` because several
+    # statuses ("Open, In Progress, In Analysis") do not fit in 64.
+    status: str = Field(default="", max_length=256)
     allow_comment: bool = False
     # The REST prefix under the destination's URL. Blank means Jira's own
     # `/rest/api/2`; a proxy that already contributes part of that path needs
     # the remainder here instead. See agents/jira_tools.normalize_api_base.
     api_base: str = Field(default="", max_length=64)
+    # Multi-value, comma-separated, and ANDed -- "carries all of these
+    # labels", not "any of them". See agents/jira_tools.build_jql for why
+    # this is the opposite of how `status` combines.
+    labels: str = Field(default="", max_length=256)
+
+    @field_validator("status", "labels", mode="before")
+    @classmethod
+    def _csv_list_is_a_string(cls, v: Any) -> Any:
+        """Accept a JSON list for a multi-value field, store it as CSV.
+
+        Both admin UIs post a plain string, but an API client or an exported
+        bundle can legitimately carry a list. Without this, the list is a 422
+        on a field the caller filled in correctly.
+        """
+        if isinstance(v, (list, tuple)):
+            return ", ".join(str(x).strip() for x in v if str(x).strip())
+        return v
+
+    @field_validator("status", "labels")
+    @classmethod
+    def _validate_csv_list(cls, v: str) -> str:
+        # A bounded number of values: the cap is not about Jira's limits but
+        # about a paste accident becoming a query nobody can read in a run
+        # record. 20 is far above any real pin.
+        from agents.jira_tools import normalize_csv_list
+
+        if len(normalize_csv_list(v)) > 20:
+            raise ValueError("at most 20 comma-separated values")
+        return (v or "").strip()
 
     @field_validator("api_base")
     @classmethod
@@ -172,6 +203,7 @@ class OAuthClientPayload(BaseModel):
             "project": self.project.strip(),
             "status": self.status.strip(),
             "api_base": self.api_base.strip(),
+            "labels": self.labels.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:

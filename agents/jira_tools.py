@@ -92,19 +92,76 @@ def _jql_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def build_jql(project: str, status: str, lookback_minutes: int | None) -> str:
-    """The search query for a project, a status and a window.
+def normalize_csv_list(value: Any) -> list[str]:
+    """A configured multi-value field, as an ordered list of distinct values.
+
+    Accepts either a real list or a comma-separated string, so a single value
+    with no comma is still exactly one value and existing configs keep working
+    untouched. Blanks are dropped rather than rejected: a trailing comma is a
+    typing artefact, not an instruction to match the empty string -- and an
+    empty value would otherwise build ``labels = ""``, which silently matches
+    nothing.
+
+    Duplicates are removed because a repeated label would emit the same clause
+    twice; order is preserved so the generated JQL is stable across saves and
+    a diff of two configs stays readable.
+    """
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value]
+    else:
+        parts = str(value or "").split(",")
+    out: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def build_jql(
+    project: str,
+    status: str,
+    lookback_minutes: int | None,
+    labels: Any = None,
+) -> str:
+    """The search query for a project, statuses, labels and a window.
 
     Built here rather than accepted from the agent. Raw JQL from a model is
     both a correctness problem -- there is no way to enforce the configured
     project -- and a reach problem, since JQL can address every issue the
     credential can see.
+
+    ``status`` and ``labels`` are both multi-value, and they combine in
+    OPPOSITE ways, which is the whole reason they are built here:
+
+    * an issue has exactly one status, so several statuses can only mean
+      "any of these" -- ``status IN (...)``. ANDing them matches nothing.
+    * an issue has many labels, so several labels mean "carries all of
+      these" -- a separate ``labels = ...`` clause each. ``labels IN (...)``
+      would be the union instead, a strictly larger set.
+
+    Against live Jira that difference is 0 issues versus 20, so the two are
+    not interchangeable and neither is a safe default for the other.
+
+    A single value renders as ``= "x"`` rather than a one-element ``IN``, so
+    configurations written before this was multi-value produce byte-identical
+    JQL.
     """
     clauses: list[str] = []
     if project:
         clauses.append(f"project = {_jql_quote(project)}")
-    if status:
-        clauses.append(f"status = {_jql_quote(status)}")
+
+    statuses = normalize_csv_list(status)
+    if len(statuses) == 1:
+        clauses.append(f"status = {_jql_quote(statuses[0])}")
+    elif statuses:
+        joined = ", ".join(_jql_quote(s) for s in statuses)
+        clauses.append(f"status IN ({joined})")
+
+    # One clause per label, ANDed: "all of these", not "any of these".
+    for label in normalize_csv_list(labels):
+        clauses.append(f"labels = {_jql_quote(label)}")
+
     if lookback_minutes:
         clauses.append(f"updated >= {_jql_quote(f'-{int(lookback_minutes)}m')}")
     order = "ORDER BY updated ASC"
@@ -204,9 +261,15 @@ class JiraClient:
     Authorization header come from the destination, and both change under us
     when its token is refreshed.
 
-    ``project``, ``status`` and ``lookback_minutes`` are the configured values.
-    The first two are pinned: a call cannot override them. The last is a
-    ceiling: a call can narrow the window but never widen it.
+    ``project``, ``status``, ``labels`` and ``lookback_minutes`` are the
+    configured values. The first three are pinned: a call cannot override
+    them. The last is a ceiling: a call can narrow the window but never
+    widen it.
+
+    ``labels`` has no tool argument at all, deliberately. ``status`` accepts
+    one only because it already did, and a caller can merely re-state the
+    pinned value; letting a model widen the label set would undo the point
+    of pinning it.
 
     ``api_base`` is the REST prefix these endpoints hang off, normally Jira's
     own ``/rest/api/2``. It is configuration, not a constant, because the
@@ -222,11 +285,13 @@ class JiraClient:
         status: str = "",
         lookback_minutes: int | None = None,
         api_base: str = "",
+        labels: Any = None,
     ) -> None:
         self._resolver = resolver
         self._http = http
         self.project = (project or "").strip()
         self.status = (status or "").strip()
+        self.labels = normalize_csv_list(labels)
         self.lookback_minutes = lookback_minutes
         self.api_base = normalize_api_base(api_base)
         self._account: str | None = None
@@ -305,6 +370,7 @@ class JiraClient:
             self.project or (project or "").strip(),
             self.status or (status or "").strip(),
             self._window(lookback_minutes),
+            self.labels,
         )
         try:
             data = await self._req(
@@ -413,6 +479,7 @@ def jira_toolset(
     allow_comment: bool | None = None,
     lookback: str | None = None,
     api_base: str | None = None,
+    labels: Any = None,
 ) -> FunctionToolset:
     """The Jira toolset for one agent, ready for ``Agent(toolsets=...)``.
 
@@ -436,6 +503,9 @@ def jira_toolset(
     resolved_status = (
         status if status is not None else str(oauth.get("status") or "")
     ).strip()
+    resolved_labels = normalize_csv_list(
+        labels if labels is not None else oauth.get("labels")
+    )
     # `is True`, not bool(): every truthy value would otherwise open the write
     # capability, and the JSON string "false" is truthy. The storage cleaner
     # normalises this to a real bool today, so nothing supported reaches here
@@ -461,6 +531,7 @@ def jira_toolset(
         status=resolved_status,
         lookback_minutes=window,
         api_base=resolved_api_base,
+        labels=resolved_labels,
     )
     toolset = FunctionToolset()
     # Exposed for `agents.registry`, which closes `http_client` on the old

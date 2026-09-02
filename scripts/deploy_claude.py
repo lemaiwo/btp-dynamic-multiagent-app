@@ -178,8 +178,21 @@ def main() -> None:
         for n in names:
             print(f"  {n}")
 
-        target = names[0]
-        print(f"\nPicking most recent: {target}")
+        # Default to the newest Claude, but allow pinning an explicit model:
+        #   python scripts/deploy_claude.py anthropic--claude-4.6-opus
+        # A landscape usually wants one specific version -- the app's static
+        # model list names one -- and silently deploying a different, billed
+        # model because a newer one appeared upstream is the wrong default
+        # for a script that costs money every time it creates something.
+        if len(sys.argv) > 1:
+            target = sys.argv[1].strip()
+            if target not in names:
+                print(f"\nRequested model {target!r} is not available here.")
+                sys.exit(1)
+            print(f"\nUsing requested model: {target}")
+        else:
+            target = names[0]
+            print(f"\nPicking most recent: {target}")
 
         existing = existing_deployment(s, target)
         if existing:

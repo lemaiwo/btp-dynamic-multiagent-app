@@ -123,6 +123,47 @@ QUnit.test("destination mode refuses a relative API base path", (assert) => {
     assert.ok(error.indexOf("must start with") > -1, error);
 });
 
+QUnit.test("destination mode accepts comma-separated labels and statuses", (assert) => {
+    assert.strictEqual(
+        validators.validateOAuth(
+            {
+                destination: "BC_ELIAGROUP_APIHUB_JIRA",
+                status: "Open, In Progress, In Analysis",
+                labels: "NEXUSFORGE, agent"
+            },
+            "destination",
+            "builtin:jira"
+        ),
+        ""
+    );
+});
+
+QUnit.test("destination mode caps the number of labels", (assert) => {
+    // Not a Jira limit: a pasted list becomes a query nobody can read back
+    // out of a run record.
+    const many = Array.from({ length: 21 }, (_, i) => `l${i}`).join(",");
+    const error = validators.validateOAuth(
+        { destination: "BC_ELIAGROUP_APIHUB_JIRA", labels: many },
+        "destination",
+        "builtin:jira"
+    );
+    assert.ok(error.indexOf("at most 20") > -1 || error.indexOf("At most 20") > -1, error);
+});
+
+QUnit.test("duplicate labels do not count towards the cap", (assert) => {
+    // The server dedupes before building clauses, so the dialog must agree —
+    // otherwise a harmless repeated label is rejected here and accepted there.
+    const dupes = Array.from({ length: 30 }, () => "same").join(",");
+    assert.strictEqual(
+        validators.validateOAuth(
+            { destination: "BC_ELIAGROUP_APIHUB_JIRA", labels: dupes },
+            "destination",
+            "builtin:jira"
+        ),
+        ""
+    );
+});
+
 QUnit.test("destination mode refuses credentials", (assert) => {
     const error = validators.validateOAuth(
         { destination: "BC_ELIAGROUP_APIHUB_JIRA", client_id: "x" },
