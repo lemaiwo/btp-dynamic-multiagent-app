@@ -93,6 +93,23 @@ export default {
             if (apiBase && !apiBase.startsWith("/")) {
                 return "The API base path must start with '/', e.g. /rest/api/2.";
             }
+            // Same cap as the server, said while the field is still on screen.
+            // The limit is about a paste accident becoming a query nobody can
+            // read in a run record, not about anything Jira refuses.
+            const countValues = (v: string): number => {
+                const seen = new Set<string>();
+                v.split(",").forEach((p) => {
+                    const t = p.trim();
+                    if (t) { seen.add(t); }
+                });
+                return seen.size;
+            };
+            if (countValues(dest.labels || "") > 20) {
+                return "At most 20 comma-separated labels.";
+            }
+            if (countValues(dest.status || "") > 20) {
+                return "At most 20 comma-separated statuses.";
+            }
             return "";
         }
         if (authMode !== "oauth2") {

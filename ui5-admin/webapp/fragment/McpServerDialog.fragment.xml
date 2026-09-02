@@ -115,7 +115,14 @@
             <Input
                 id="oauthStatus"
                 value="{server>/oauth/status}"
-                placeholder="Open"
+                placeholder="{i18n>jiraStatusHint}"
+                visible="{= ${server>/auth_mode} === 'destination' }" />
+
+            <Label text="{i18n>jiraLabels}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Input
+                id="oauthLabels"
+                value="{server>/oauth/labels}"
+                placeholder="{i18n>jiraLabelsHint}"
                 visible="{= ${server>/auth_mode} === 'destination' }" />
 
             <Label text="{i18n>jiraApiBase}" visible="{= ${server>/auth_mode} === 'destination' }" />

@@ -72,6 +72,13 @@ export type OAuthClient =
            */
           api_base?: string;
           /**
+           * `destination` only. Comma-separated Jira labels, combined with
+           * AND — an issue must carry every one of them. That is the opposite
+           * of how `status` combines, because an issue has many labels but
+           * only one status. Sent as a string; the server parses it.
+           */
+          labels?: string;
+          /**
            * `destination` only. Whether the agent gets a comment tool.
            * Separate from what the destination's credential permits, for the
            * same reason `allow_send` is.

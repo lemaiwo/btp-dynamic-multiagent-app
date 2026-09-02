@@ -46,6 +46,7 @@ from agents.jira_tools import (  # noqa: E402
     DEFAULT_MAX_ISSUES,
     JiraClient,
     build_jql,
+    normalize_csv_list,
     confine_key,
     jira_toolset,
     normalize_api_base,
@@ -162,6 +163,70 @@ def test_jql() -> None:
     check("an embedded backslash is escaped",
           build_jql("AB\\C", "", None) == 'project = "AB\\\\C" ORDER BY updated ASC',
           detail=build_jql("AB\\C", "", None))
+
+
+def test_multi_value_filters() -> None:
+    print("\n-- multi-value status and labels --")
+
+    # An issue has one status, so several statuses can only mean "any of".
+    check("several statuses become IN",
+          build_jql("ABC", "Open, In Progress", None)
+          == 'project = "ABC" AND status IN ("Open", "In Progress") '
+             "ORDER BY updated ASC",
+          detail=build_jql("ABC", "Open, In Progress", None))
+    # One value must not silently become a one-element IN: every config
+    # written before this was multi-value has to render byte-identically.
+    check("one status still renders as =",
+          build_jql("ABC", "Open", None)
+          == 'project = "ABC" AND status = "Open" ORDER BY updated ASC')
+    check("duplicate statuses collapse back to =",
+          build_jql("ABC", "Open, Open", None)
+          == 'project = "ABC" AND status = "Open" ORDER BY updated ASC',
+          detail=build_jql("ABC", "Open, Open", None))
+
+    # An issue has many labels, so several labels mean "carries all of them".
+    # Against live Jira, IN vs AND here was 20 issues vs 0 -- the two are not
+    # interchangeable, and this is the assertion that pins it.
+    check("several labels are ANDed, not INed",
+          build_jql("ABC", "", None, "NEXUSFORGE, agent")
+          == 'project = "ABC" AND labels = "NEXUSFORGE" AND labels = "agent" '
+             "ORDER BY updated ASC",
+          detail=build_jql("ABC", "", None, "NEXUSFORGE, agent"))
+    check("labels IN(...) is never emitted",
+          "labels IN" not in build_jql("ABC", "", None, "a, b"),
+          detail=build_jql("ABC", "", None, "a, b"))
+    check("a JSON list is accepted for labels",
+          build_jql("ABC", "", None, ["a", "b"])
+          == build_jql("ABC", "", None, "a, b"))
+
+    # A trailing comma is a typing artefact. Kept, it would build labels = "",
+    # which matches nothing and looks like "no issues today".
+    check("blank entries are dropped, not matched",
+          build_jql("ABC", "", None, "a, , b,")
+          == 'project = "ABC" AND labels = "a" AND labels = "b" '
+             "ORDER BY updated ASC",
+          detail=build_jql("ABC", "", None, "a, , b,"))
+    check("an all-blank label list contributes nothing",
+          build_jql("ABC", "", None, " , ,") == 'project = "ABC" ORDER BY updated ASC',
+          detail=build_jql("ABC", "", None, " , ,"))
+
+    # Same reasoning as the single-value case: a value that closed the quote
+    # could append clauses of its own, and multi-value gives it more places.
+    check("a quote inside a label is escaped",
+          build_jql("", "", None, 'x" OR project = "Y')
+          == 'labels = "x\\" OR project = \\"Y" ORDER BY updated ASC',
+          detail=build_jql("", "", None, 'x" OR project = "Y'))
+    check("a quote inside one of several statuses is escaped",
+          '\\"' in build_jql("", 'Open, Done" OR project = "Y', None),
+          detail=build_jql("", 'Open, Done" OR project = "Y', None))
+
+    check("labels order is preserved",
+          build_jql("", "", None, "b, a").index('"b"')
+          < build_jql("", "", None, "b, a").index('"a"'))
+    check("normalize_csv_list dedupes and preserves order",
+          normalize_csv_list("b, a,, b ") == ["b", "a"],
+          detail=str(normalize_csv_list("b, a,, b ")))
+    check("normalize_csv_list on empty input", normalize_csv_list(None) == [])
 
 
 async def test_filters() -> None:
@@ -745,6 +810,7 @@ def test_storage_and_validation() -> None:
 
 async def main() -> None:
     test_jql()
+    test_multi_value_filters()
     test_api_base()
     await test_api_base_transport()
     await test_filters()
