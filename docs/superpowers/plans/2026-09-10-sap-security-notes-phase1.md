@@ -43,7 +43,7 @@ Pure parsing plus one HTTP call. No registration, no admin wiring — this task 
     `async list_critical_notes(limit: int) -> dict[str, Any]`
   - `sapnotes_toolset(oauth, *, http=None, server_key=..., auth_mode=None, min_score=None, lookback=None) -> FunctionToolset`
 
-- [ ] **Step 1: Create the test fixture**
+- [x] **Step 1: Create the test fixture**
 
 Capture a trimmed NVD response covering every parsing branch. Create `tests/fixtures/nvd_sap_sample.json`:
 
@@ -105,7 +105,7 @@ Capture a trimmed NVD response covering every parsing branch. Create `tests/fixt
 }
 ```
 
-- [ ] **Step 2: Write the failing parsing tests**
+- [x] **Step 2: Write the failing parsing tests**
 
 Create `tests/test_sapnotes_tools.py`:
 
@@ -174,12 +174,12 @@ def test_builtin_url_is_stable():
     assert BUILTIN_SAPNOTES_URL == "builtin:sapnotes"
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `pytest tests/test_sapnotes_tools.py -v`
 Expected: FAIL — `ModuleNotFoundError: No module named 'agents.sapnotes_tools'`
 
-- [ ] **Step 4: Write the parsing helpers**
+- [x] **Step 4: Write the parsing helpers**
 
 Create `agents/sapnotes_tools.py`:
 
@@ -279,12 +279,12 @@ def extract_description(descriptions: Any) -> str:
     return str(entries[0].get("value") or "").strip() if entries else ""
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `pytest tests/test_sapnotes_tools.py -v`
 Expected: PASS — 8 tests
 
-- [ ] **Step 6: Write the failing client tests**
+- [x] **Step 6: Write the failing client tests**
 
 Append to `tests/test_sapnotes_tools.py`:
 
@@ -355,12 +355,12 @@ async def test_min_score_is_respected_when_lowered():
     assert "3792978" in numbers
 ```
 
-- [ ] **Step 7: Run the client tests to verify they fail**
+- [x] **Step 7: Run the client tests to verify they fail**
 
 Run: `pytest tests/test_sapnotes_tools.py -v -k "list_critical or min_score"`
 Expected: FAIL — `ImportError: cannot import name 'SapNotesClient'`
 
-- [ ] **Step 8: Implement the client**
+- [x] **Step 8: Implement the client**
 
 Append to `agents/sapnotes_tools.py`:
 
@@ -458,12 +458,12 @@ class SapNotesClient:
         }
 ```
 
-- [ ] **Step 9: Run all tests to verify they pass**
+- [x] **Step 9: Run all tests to verify they pass**
 
 Run: `pytest tests/test_sapnotes_tools.py -v`
 Expected: PASS — 13 tests
 
-- [ ] **Step 10: Write the failing toolset test**
+- [x] **Step 10: Write the failing toolset test**
 
 Append to `tests/test_sapnotes_tools.py`:
 
@@ -498,12 +498,12 @@ def test_toolset_rejects_an_unparsable_lookback_at_build_time():
         sapnotes_toolset({"lookback": "banana"})
 ```
 
-- [ ] **Step 11: Run to verify failure**
+- [x] **Step 11: Run to verify failure**
 
 Run: `pytest tests/test_sapnotes_tools.py -v -k toolset`
 Expected: FAIL — `ImportError: cannot import name 'sapnotes_toolset'`
 
-- [ ] **Step 12: Implement the toolset factory**
+- [x] **Step 12: Implement the toolset factory**
 
 Append to `agents/sapnotes_tools.py`:
 
@@ -567,12 +567,12 @@ def sapnotes_toolset(
     return toolset
 ```
 
-- [ ] **Step 13: Run the full test file**
+- [x] **Step 13: Run the full test file**
 
 Run: `pytest tests/test_sapnotes_tools.py -v`
 Expected: PASS — 16 tests
 
-- [ ] **Step 14: Commit**
+- [x] **Step 14: Commit**
 
 ```bash
 git add agents/sapnotes_tools.py tests/test_sapnotes_tools.py tests/fixtures/nvd_sap_sample.json
@@ -594,7 +594,7 @@ git commit -m "feat(sapnotes): NVD-backed SAP security note discovery toolset"
 - Consumes: `agents.builtins.is_builtin_url` (Task 3 adds the new URL to that set; this task must not import from `sapnotes_tools`)
 - Produces: `_BUILTIN_PUBLIC_KEYS: tuple[str, ...]`; `_clean_oauth(oauth, mode, fallback, url=None)`
 
-- [ ] **Step 1: Write the failing storage tests**
+- [x] **Step 1: Write the failing storage tests**
 
 Create or append to `tests/test_db_config.py`:
 
@@ -640,12 +640,12 @@ def test_jwt_mode_carries_no_config():
     assert _clean_oauth({"min_score": "9.0"}, "jwt", None, url="builtin:sapnotes") is None
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `pytest tests/test_db_config.py -v`
 Expected: FAIL — `TypeError: _clean_oauth() got an unexpected keyword argument 'url'`
 
-- [ ] **Step 3: Add the whitelist and the branch**
+- [x] **Step 3: Add the whitelist and the branch**
 
 In `agents/db.py`, immediately after `_DEST_KEYS` (around line 994), add:
 
@@ -697,23 +697,23 @@ Add to the docstring, after the `client_credentials` paragraph:
     Public data source, no credential, filtering knobs only.
 ```
 
-- [ ] **Step 4: Pass the URL through `prepare_servers`**
+- [x] **Step 4: Pass the URL through `prepare_servers`**
 
 In `agents/db.py`, `prepare_servers` iterates the submitted servers and already holds each entry's URL. Every `_clean_oauth(...)` call inside it must pass `url=<that entry's url>`. Find each call site and add the keyword argument — do not change call order or any other argument.
 
 Run `grep -n "_clean_oauth(" agents/db.py` and update every call inside `prepare_servers`.
 
-- [ ] **Step 5: Run the storage tests**
+- [x] **Step 5: Run the storage tests**
 
 Run: `pytest tests/test_db_config.py -v`
 Expected: PASS — 5 tests
 
-- [ ] **Step 6: Run the existing suite for regressions**
+- [x] **Step 6: Run the existing suite for regressions**
 
 Run: `pytest tests/ -v -k "db or admin or agent_bundles"`
 Expected: PASS — no regressions. `_clean_oauth`'s new parameter is optional, so existing callers are unaffected.
 
-- [ ] **Step 7: Add `min_score` to the admin payload**
+- [x] **Step 7: Add `min_score` to the admin payload**
 
 In `agents/admin.py`, add to `OAuthClientPayload` after `labels` (line 140):
 
@@ -746,7 +746,7 @@ And add to the `fields` dict in `to_config` (after `"labels"`, line 206):
             "min_score": self.min_score.strip(),
 ```
 
-- [ ] **Step 8: Write and run the payload test**
+- [x] **Step 8: Write and run the payload test**
 
 Append to `tests/test_admin_api.py`:
 
@@ -769,7 +769,7 @@ def test_oauth_payload_carries_min_score_into_config():
 Run: `pytest tests/test_admin_api.py -v -k min_score`
 Expected: PASS — 2 tests
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add agents/db.py agents/admin.py tests/test_db_config.py tests/test_admin_api.py
@@ -790,7 +790,7 @@ git commit -m "feat(admin): allow public built-ins to carry a whitelisted config
 - Consumes: `agents.sapnotes_tools.BUILTIN_SAPNOTES_URL`, `agents.sapnotes_tools.sapnotes_toolset` (Task 1)
 - Produces: `builtin:sapnotes` present in `BUILTIN_URLS` server-side and client-side
 
-- [ ] **Step 1: Write the failing registration test**
+- [x] **Step 1: Write the failing registration test**
 
 Append to `tests/test_builtins.py`:
 
@@ -819,12 +819,12 @@ def test_unknown_builtin_still_rejected():
         build_builtin_toolset("builtin:teams", {}, "none")
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `pytest tests/test_builtins.py -v -k sapnotes`
 Expected: FAIL — `assert 'builtin:sapnotes' in BUILTIN_URLS`
 
-- [ ] **Step 3: Register the factory**
+- [x] **Step 3: Register the factory**
 
 In `agents/builtins.py`, add the import after line 24:
 
@@ -845,12 +845,12 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
 
 **Import-cycle check:** `db.py` now imports `is_builtin_url` from `builtins.py` (Task 2), and `builtins.py` imports `sapnotes_tools`, which imports only `agents.lookback`. No cycle. The `db.py` import is function-local for exactly this reason — leave it that way.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `pytest tests/test_builtins.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Mirror in the UI5 validator**
+- [x] **Step 5: Mirror in the UI5 validator**
 
 In `ui5-admin/webapp/model/validators.ts`, line 15:
 
@@ -863,7 +863,7 @@ const BUILTIN_URLS = [
 ] as const;
 ```
 
-- [ ] **Step 6: Add the QUnit case**
+- [x] **Step 6: Add the QUnit case**
 
 Append to `ui5-admin/webapp/test/unit/validators.qunit.ts`, in the `validateServerUrl` module:
 
@@ -873,7 +873,7 @@ QUnit.test("accepts builtin:sapnotes", function (assert) {
 });
 ```
 
-- [ ] **Step 7: Add the i18n label**
+- [x] **Step 7: Add the i18n label**
 
 In `ui5-admin/webapp/i18n/i18n.properties`, next to the other server-config labels (around line 80):
 
@@ -884,7 +884,7 @@ minScorePlaceholder=9.0
 
 Add the matching `Input` to the server-config dialog fragment, bound like the existing `lookback` field and visible only when the server URL is `builtin:sapnotes`. Follow the visibility pattern the fragment already uses for the Jira-only fields.
 
-- [ ] **Step 8: Run both suites**
+- [x] **Step 8: Run both suites**
 
 Run: `pytest tests/ -v -k "builtin or admin"`
 Expected: PASS
@@ -892,7 +892,7 @@ Expected: PASS
 Run: `cd ui5-admin && npm test`
 Expected: PASS — all existing tests plus the new case
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add agents/builtins.py tests/test_builtins.py ui5-admin/webapp/model/validators.ts ui5-admin/webapp/test/unit/validators.qunit.ts ui5-admin/webapp/i18n/i18n.properties ui5-admin/webapp/view/
@@ -915,7 +915,7 @@ Neither email built-in can send to an address of its own choosing. This adds tha
 - Consumes: `agents.outlook_tools._text_to_html`, `OutlookClient._req`, `OutlookClient._root`
 - Produces: `OutlookClient.send_mail(subject, body)`, `OutlookClient.create_mail_draft(subject, body)`; toolset tools `send_mail(subject, body)` and `create_mail_draft(subject, body)`; config key `recipients`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `tests/test_outlook_tools.py`:
 
@@ -1008,12 +1008,12 @@ async def test_recipients_cannot_be_overridden_by_a_tool_argument():
     assert sorted(params) == ["body", "subject"]
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `pytest tests/test_outlook_tools.py -v -k "mail_draft or send_mail or recipients"`
 Expected: FAIL — `TypeError: OutlookClient.__init__() got an unexpected keyword argument 'recipients'`
 
-- [ ] **Step 3: Accept recipients on the client**
+- [x] **Step 3: Accept recipients on the client**
 
 In `agents/outlook_tools.py`, extend `OutlookClient.__init__` (line 151-161):
 
@@ -1045,7 +1045,7 @@ Add to the class docstring, after the `lookback_minutes` paragraph:
     redirect it.
 ```
 
-- [ ] **Step 4: Implement the two methods**
+- [x] **Step 4: Implement the two methods**
 
 In `agents/outlook_tools.py`, after `send_reply` (line 314), add:
 
@@ -1091,7 +1091,7 @@ In `agents/outlook_tools.py`, after `send_reply` (line 314), add:
         return {"sent": True, "recipients": list(self.recipients), "subject": subject}
 ```
 
-- [ ] **Step 5: Wire recipients and the tools into the factory**
+- [x] **Step 5: Wire recipients and the tools into the factory**
 
 In `agents/outlook_tools.py`, `outlook_toolset`: add a `recipients: Any = None` keyword parameter alongside `allow_send`, then after the `window` line (382):
 
@@ -1149,12 +1149,12 @@ and `send_mail` inside the existing `if can_send:` block, after `send_reply`:
             return await client.send_mail(subject, body)
 ```
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `pytest tests/test_outlook_tools.py -v`
 Expected: PASS — existing tests plus 6 new
 
-- [ ] **Step 7: Store `recipients`**
+- [x] **Step 7: Store `recipients`**
 
 In `agents/db.py`, add to `_CC_KEYS` (line 958-959):
 
@@ -1180,7 +1180,7 @@ Add `"recipients"` to the `_csv_list_is_a_string` and `_validate_csv_list` valid
             "recipients": self.recipients.strip(),
 ```
 
-- [ ] **Step 8: Write and run the storage test**
+- [x] **Step 8: Write and run the storage test**
 
 Append to `tests/test_db_config.py`:
 
@@ -1200,7 +1200,7 @@ def test_client_credentials_stores_recipients():
 Run: `pytest tests/test_db_config.py tests/test_outlook_tools.py tests/test_admin_api.py -v`
 Expected: PASS
 
-- [ ] **Step 9: Add the UI field**
+- [x] **Step 9: Add the UI field**
 
 In `ui5-admin/webapp/i18n/i18n.properties`:
 
@@ -1211,7 +1211,7 @@ recipientsPlaceholder=team@example.com, basis@example.com
 
 Add the `Input` to the server-config dialog fragment next to the `mailbox` field, visible when the URL is `builtin:outlook`.
 
-- [ ] **Step 10: Run everything**
+- [x] **Step 10: Run everything**
 
 Run: `pytest tests/ -v`
 Expected: PASS — full suite green
@@ -1219,7 +1219,7 @@ Expected: PASS — full suite green
 Run: `cd ui5-admin && npm test`
 Expected: PASS
 
-- [ ] **Step 11: Commit**
+- [x] **Step 11: Commit**
 
 ```bash
 git add agents/outlook_tools.py agents/db.py agents/admin.py tests/ ui5-admin/
@@ -1241,7 +1241,7 @@ No new Python. This produces the importable bundle and the operator documentatio
 - Consumes: `builtin:sapnotes` (Task 3), `create_mail_draft` (Task 4)
 - Produces: an `ImportPayload` bundle loadable with `scripts/import_bundle.py`
 
-- [ ] **Step 1: Write the bundle**
+- [x] **Step 1: Write the bundle**
 
 Create `docs/sap-security-notes-workflow.config.json`. Replace `<ARC1_URL>` and `<MAILBOX>` before importing; `run_as_principal` is deliberately blank because it is landscape-specific.
 
@@ -1306,7 +1306,7 @@ Create `docs/sap-security-notes-workflow.config.json`. Replace `<ARC1_URL>` and 
 
 **Note on `skip_seen_items: false`** — the run has no fan-out and therefore no items, but the field is explicit because `true` would be actively wrong here: this workflow re-reports the same notes every month on purpose.
 
-- [ ] **Step 2: Write the operator guide**
+- [x] **Step 2: Write the operator guide**
 
 Create `docs/SAP_SECURITY_NOTES.md` covering, in this order:
 
@@ -1320,7 +1320,7 @@ Create `docs/SAP_SECURITY_NOTES.md` covering, in this order:
 8. **Known limits:** roughly half of critical notes are not ABAP-stack and land in UNKNOWN until Phase 2; `allow_send` is off so nothing is sent; NVD lags SAP Patch Day by several days.
 9. **Optional:** set `NVD_API_KEY` to raise the rate limit from 5 to 50 requests per 30 seconds.
 
-- [ ] **Step 3: Update CLAUDE.md**
+- [x] **Step 3: Update CLAUDE.md**
 
 Add to the key-files list, after the `agents/lookback.py` entry:
 
@@ -1332,7 +1332,7 @@ Add to the key-files list, after the `agents/lookback.py` entry:
   re-publishing the CVE. See `docs/SAP_SECURITY_NOTES.md`
 ```
 
-- [ ] **Step 4: Validate the bundle round-trips**
+- [x] **Step 4: Validate the bundle round-trips**
 
 Append to `tests/test_agent_bundles.py`:
 
@@ -1359,12 +1359,12 @@ def test_sap_security_notes_bundle_is_importable():
 Run: `pytest tests/test_agent_bundles.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Run the full suite**
+- [x] **Step 5: Run the full suite**
 
 Run: `pytest tests/ -v`
 Expected: PASS — full suite green
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 **`docs/*.config.json` is gitignored** (`.gitignore:30`) — exported bundles
 carry landscape hostnames and OAuth client ids and are deliberately not
@@ -1404,3 +1404,64 @@ Phase 1 is done when, against one configured ARC-1 system:
 2. The bundle imports without validation errors.
 3. A manual run produces a draft in the configured mailbox.
 4. That draft names every system it checked, and reports nothing as MISSING that the analyst classified UNKNOWN.
+
+---
+
+## Execution notes (2026-09-10)
+
+All five tasks are implemented on `feat/sap-security-notes`. Where the plan
+and the codebase disagreed, the codebase won; each deviation below.
+
+**Task 1**
+- Step 5 cannot pass in isolation: the test file's import block names
+  `SapNotesClient`, so the parsing tests only go green once Step 8 lands.
+- `await toolset.get_tools(None)` is not valid in the installed pydantic-ai
+  (`RunContext` is dereferenced). Tool-surface assertions read `toolset.tools`,
+  which is what `tests/test_outlook_tools.py` already does.
+
+**Tasks 2 and 3 are interleaved.** Task 2's tests assert on
+`is_builtin_url("builtin:sapnotes")`, which is false until Task 3 registers the
+factory, so the registration moved ahead of Task 2's Step 5.
+
+**Task 3 was under-specified for the UI5 admin.** The dialog could not carry a
+config block on `auth_mode="none"` at all — `onConfirmServer`'s `carriesOAuth`
+excluded it, `cleanOAuth` had no branch, and `validateOAuth` rejected one
+outright. All three were extended, whitelisted to built-ins, plus `types.ts`.
+`min_score` and `recipients` key their visibility on the **URL**, not the auth
+mode: the Jira fields the plan pointed at are `auth_mode === 'destination'`
+fields, which is the wrong axis here.
+
+**A fifth gate the plan missed:** `McpServerPayload._validate_oauth` in
+`agents/admin.py` also refused an oauth block on `none`, so the bundle was a
+422 on import even with `db.py` and both UIs fixed. `BUILTIN_PUBLIC_KEYS` was
+made public in `db.py` and is now enforced at both boundaries.
+
+**Task 5's bundle needed three corrections** before it round-tripped:
+`system_prompt` is not a field (it is `instructions`); `<ARC1_URL>` must be a
+real `*.hana.ondemand.com` URL to clear `MCP_URL_ALLOWLIST`; and `app_only`
+requires `client_id`/`token_url`. The Outlook `client_secret` is deliberately
+absent — `tests/test_agent_bundles.py` refuses any bundle under `docs/`
+carrying one. Each agent also gained a `run_prompt`, which that harness
+requires.
+
+**Two test files did not exist** and were created rather than appended to:
+`tests/test_builtins.py`, `tests/test_db_config.py`.
+
+**Verification runner.** `pytest tests/` is not this project's suite runner —
+most files are script-style (`python tests/test_x.py`) and their bare
+`async def test_*` functions fail under pytest collection for want of
+`@pytest.mark.asyncio`. Both runners were used: every file as a script, and
+pytest over the pytest-style ones.
+
+### Known-failing, pre-existing, untouched
+
+`tests/test_agent_bundles.py` reports 9 failures — every agent in the other
+`docs/` bundles lacks a `run_prompt`. Present before this branch and unrelated
+to it. The three new `sapnotes-*` agents do carry one.
+
+### Still open
+
+Steps 3, 4, 6 and 7 of the guide (`run_as_principal`, the ARC-1 sign-in, the
+manual run, reading the draft) are landscape actions and have not been
+performed. Verification items 3 and 4 — "a manual run produces a draft" and
+"that draft names every system it checked" — are therefore unverified.
