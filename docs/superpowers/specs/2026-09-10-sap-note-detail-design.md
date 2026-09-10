@@ -124,15 +124,27 @@ and returns a compact table.
 
 **Per-note result:**
 
+Revised against the captured response — see "Confirmed API shape" below. There
+is no component or priority field to lift, and the fixing level comes from
+`SupportPackagePatch`:
+
 ```python
 {
-  "note": "3771065",
+  "note": "2538856",
   "status": "ok",                    # ok | unavailable
-  "component": "SAP_BASIS",
-  "component_text": "...",
-  "priority": "HotNews",
-  "validity": [{"software_component": "SAP_BASIS", "from": "740", "to": "757"}],
-  "support_packages": [{"software_component": "SAP_BASIS", "level": "SAPKB74012"}],
+  "title": "2538856 - [CVE-2018-2424] Cross-Site Scripting (XSS) vulnerability in SAPUI5",
+  "note_type": "SAP Security Note",
+  "version": "11",
+  # The components the note applies to, and their release range. This is the
+  # only place a software component appears -- there is no top-level one.
+  "validity": [{"software_component": "UISAPUI5", "from": "100", "to": "100"}],
+  # The fixing level. `SupportPackagePatch`, NOT `SupportPackage`, which was
+  # empty on every note sampled.
+  "support_packages": [{
+      "component_version": "SAPUI5 CLIENT RT AS JAVA 7.40",
+      "support_package": "SP010",
+      "patch": "000014",
+  }],
 }
 ```
 
@@ -284,16 +296,10 @@ project's runner.
 
 ## Risks and open questions
 
-1. **`Detail`'s request AND response shapes are unconfirmed.** The upstream
-   repo pins `Search` as `?q=<note>&t=E&maxResults=<n>`; `Detail`'s query
-   parameters are inferred. The *field names* are equally inferred: the
-   TypeScript interfaces confirm `validity`, `supportPackages`,
-   `supportPackagePatches` and `correctionsSummary` exist and that each
-   carries a `softwareComponent`, but not what the remaining keys are called
-   in the raw JSON. The per-note result shown above is therefore a target,
-   not a contract. **First implementation step is to capture one real
-   response to a fixture and pin both shapes**; everything else builds on
-   that, so it must not be guessed.
+1. ~~`Detail`'s request and response shapes are unconfirmed.~~ **RESOLVED
+   2026-09-10 by capture** — see "Confirmed API shape" below. Four of the
+   guesses in the original design were wrong; the section below is now
+   authoritative and the plan's Task 2 was rewritten against it.
 2. **Session lifetime is unmeasured.** 12h is the upstream *cache* TTL, not a
    measured SAP session lifetime. If the real session is shorter, the attended
    window tightens. The TTL is therefore a parameter of the refresh script,
@@ -304,3 +310,63 @@ project's runner.
 4. **ToS.** Restated here because it does not stop being true: this is a
    private API behind authentication, and whether to use it is the operator's
    call.
+
+---
+
+## Confirmed API shape (captured 2026-09-10)
+
+Verified against two live responses: note 3771065 (Commerce Cloud) and note
+2538856 (SAPUI5), captured with `scripts/sap_session.py`. Fixture:
+`tests/fixtures/sapnote_detail.json`.
+
+**Request.** `GET https://me.sap.com/backend/raw/sapnotes/Detail?q=<note>&t=E`.
+`t=E` is optional — omitting it returned the identical body. A wrong parameter
+name (`number=`, `sapNoteNumber=`) yields a timeout or a 500, so the name
+matters and `q` is it.
+
+**Response.** `{"Request": {...}, "Response": {"_elapsedTime", "Error",
+"SAPNote": {...}}}`. Everything of interest is under `Response.SAPNote`:
+
+| Path (under `Response.SAPNote`) | Shape | Use |
+|---|---|---|
+| `Header.Number.value` | str | the note number |
+| `Header.Type.value` | str | e.g. `"SAP Security Note"` |
+| `Header.Version.value` | int | note version |
+| `Title.value` | str | includes the CVE, e.g. `"2538856 - [CVE-2018-2424] …"` |
+| `Validity.Items[]` | `{SoftwareComponent, From, To}` | which components and releases the note applies to |
+| `SupportPackagePatch.Items[]` | `{SoftwareComponentVersion, SupportPackage, SupportPackagePatch, URL}` | **the fixing level** |
+| `SupportPackage.Items[]` | same minus the patch field | see below — empty in practice |
+| `CVSS.CVSS_Score.value` | str | unreliable, see below |
+
+### Four corrections to the original design
+
+1. **The fixing level lives in `SupportPackagePatch`, not `SupportPackage`.**
+   Across ten sampled notes `SupportPackage.Items` was empty *every time*,
+   while `SupportPackagePatch.Items` carried 1-30 entries. A parser that reads
+   only `SupportPackage` would return nothing for every note and the feature
+   would look like it worked.
+2. **There is no top-level component or priority field.** The design assumed
+   `SAPComponentKey` and `Priority`. Neither exists. The software component
+   comes from `Validity.Items[].SoftwareComponent`, and `Attributes.Items[]`
+   is a generic `{Key, Value}` list (e.g. `Externally Reported`,
+   `Planned Release Date`) — not the component.
+3. **`Validity` / `SupportPackage` / `SupportPackagePatch` are objects with an
+   `Items` list**, not bare lists. Each also carries `_columnNames`, which
+   names its own columns and is a useful self-check if SAP renames a field.
+4. **`CVSS.CVSS_Score.value` is not dependable.** It was `"10.0"` for note
+   3771065 but `"0"` for note 2538856. NVD remains the discovery *and* scoring
+   source; the CVSS here is at best corroboration.
+
+### Confirmed by the same capture
+
+- **A scoped cookie header IS enough for a plain server-side httpx client** —
+  the assumption the whole toolset rests on. It failed at first only because
+  the cookie jar holds two cookies named `JSESSIONID`, one for `me.sap.com`
+  and one for `accounts.sap.com`; sending every `*.sap.com` cookie handed
+  me.sap.com the identity provider's session and silently produced the
+  anonymous bootstrap page. Cookies must be filtered to the target host.
+- **One session serves many sequential requests.** Ten note lookups ran on a
+  single login with no re-authentication, which is what the batched
+  `get_note_details(notes)` tool depends on.
+- **No MFA was challenged** for this S-user, so the login automated cleanly.
+  That is a property of the account, not a guarantee.

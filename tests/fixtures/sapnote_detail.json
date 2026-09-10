@@ -1,0 +1,646 @@
+{
+  "Request": {
+    "Number": "2538856",
+    "LanguageSource": "EN",
+    "LanguageTarget": "EN"
+  },
+  "Response": {
+    "_elapsedTime": 641,
+    "Error": {},
+    "SAPNote": {
+      "_type": "00200720410000000532",
+      "_requestedLanguage": "E",
+      "_masterLanguage": "E",
+      "_loadedLanguage": "E",
+      "_machineTranslationLanguage": "",
+      "Header": {
+        "_label": "Header Data",
+        "Number": {
+          "_label": "SAP Note/KBA",
+          "value": "2538856"
+        },
+        "Type": {
+          "_label": "Type",
+          "value": "SAP Security Note"
+        },
+        "Version": {
+          "_label": "Version",
+          "value": 11
+        },
+        "Recency": {
+          "_label": "Recency",
+          "key": "NEW",
+          "value": "New"
+        },
+        "Language": {
+          "_label": "Language",
+          "value": "English"
+        },
+        "MasterLanguage": {
+          "_label": "Master Language",
+          "value": "English"
+        },
+        "Category": {
+          "_label": "Category",
+          "value": "Program error"
+        },
+        "Priority": {
+          "_label": "Priority",
+          "value": "Correction with medium priority"
+        },
+        "Status": {
+          "_label": "Release Status",
+          "value": "Released for Customer"
+        },
+        "ReleasedOn": {
+          "_label": "Released On",
+          "value": "12.06.2018"
+        },
+        "SAPComponentKey": {
+          "_label": "Component",
+          "value": "CA-UI5-CTR-ROD"
+        },
+        "SAPComponentKeyText": {
+          "_label": "Component",
+          "value": "Cross-Application Components > SAPUI5 > SAP UI5 Controls > SAP UI5 Controls Rodopi team"
+        },
+        "SAPComponentPath": [
+          {
+            "_label": "Services & Support",
+            "value": "servicessupport",
+            "_url": "/servicessupport"
+          },
+          {
+            "_label": "KBAs & Notes",
+            "value": "knowledge",
+            "_url": "/servicessupport/knowledge"
+          },
+          {
+            "_label": "Cross-Application Components",
+            "value": "CA",
+            "_url": "/mynotes/search/%7B%22componentsStartWith%22%3A%5B%22CA%22%5D%7D"
+          },
+          {
+            "_label": "SAPUI5",
+            "value": "CA-UI5",
+            "_url": "/mynotes/search/%7B%22componentsStartWith%22%3A%5B%22CA-UI5%22%5D%7D"
+          },
+          {
+            "_label": "SAP UI5 Controls",
+            "value": "CA-UI5-CTR",
+            "_url": "/mynotes/search/%7B%22componentsStartWith%22%3A%5B%22CA-UI5-CTR%22%5D%7D"
+          },
+          {
+            "_label": "SAP UI5 Controls Rodopi team (CA-UI5-CTR-ROD)",
+            "value": "CA-UI5-CTR-ROD",
+            "_url": "/mynotes/search/%7B%22componentsStartWith%22%3A%5B%22CA-UI5-CTR-ROD%22%5D%7D"
+          }
+        ]
+      },
+      "Title": {
+        "_label": "Title",
+        "value": "2538856 - [CVE-2018-2424] Cross-Site Scripting (XSS) vulnerability in SAPUI5"
+      },
+      "LongText": {
+        "_label": "Description",
+        "value": "<h3 data-toc-skip class=\"section\" id=\"Symptom\">Symptom</h3>\r\n<p>The issue is classified as Cross-Site Scripting (XSS) vulnerability:</p>\r\n<p>The UI5 code did not have the required protection before adding untrusted input to the DOM. This may lead to malicious user-provided JavaScript code being added to the DOM that could steal user information etc.</p>\r\n<p>Some well-known impacts of <span class=\"SNO_DNT\" translate=\"no\" style=\"float: none;\">XSS</span> vulnerability are -</p>\r\n<ul>\r\n<li>non-permanently deface or modify displayed content from a Web site</li>\r\n<li>steal authentication information of the user, such as data relating to his or her current session</li>\r\n<li>impersonate the user and access all information with the same rights as the target user&#160;</li>\r\n</ul>\r\n<div class=\"longtext\">\r\n<p><strong>CVSS Information</strong></p>\r\n<p>CVSS v3 Base Score: 6.1 / 10<br />CVSS v3 Base Vector:</p>\r\n<div class=\"table-responsive\"><table class=\"table table-bordered table-striped col-resizeable\" border=\"1\" cellspacing=\"1\" dir=\"ltr\">\r\n<tbody>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p>AV : Attack Vector (Related exploit range)</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">Network (N)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p>AC : Attack Complexity (Required attack complexity)</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">Low (L)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p>PR : Privileges Required (Level of privileges needed to exploit)</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">None (N)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p>UI : User Interaction (Required user participation)</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">Required (R)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p>S : Scope (Change in scope due to impact caused to components beyond the vulnerable component)</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">Changed (C)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p dir=\"ltr\">C : Impact to Confidentiality</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">Low (L)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p dir=\"ltr\">I : Impact to Integrity</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">Low (L)</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"middle\" width=\"85%\">\r\n<p dir=\"ltr\">A : Impact to Availability</p>\r\n</td>\r\n<td valign=\"middle\" width=\"15%\">\r\n<p dir=\"ltr\">None (N)</p>\r\n</td>\r\n</tr>\r\n</tbody>\r\n</table></div>\r\n<p>SAP provides this CVSS v3 base score as an estimate of the risk posed by the issue reported in this note. This estimate does not take into account your own system configuration or operational environment. It is not intended to replace any risk assessments you are advised to conduct when deciding on the applicability or priority of this SAP security note. For more information, see the FAQ section at&#160;<a target=\"_blank\" href=\"https://support.sap.com/securitynotes\">https://support.sap.com/securitynotes</a>.</p>\r\n</div>\r\n<h3 data-toc-skip class=\"section\" id=\"Other Terms\">Other Terms</h3>\r\n<p><span class=\"SNO_DNT\" translate=\"no\" style=\"float: none;\">&#65279;XSS</span>, stored <span class=\"SNO_DNT\" translate=\"no\" style=\"float: none;\">XSS</span>, reflected <span class=\"SNO_DNT\" translate=\"no\" style=\"float: none;\">XSS</span>,&#160;<a target=\"_blank\" href=\"http://cve.mitre.org/cgi-bin/cvename.cgi?name=2018-2424\">CVE-2018-2424</a><span class=\"SNO_DNT\" translate=\"no\" style=\"float: none;\"><br /></span></p>\r\n<h3 data-toc-skip class=\"section\" id=\"Reason and Prerequisites\">Reason and Prerequisites</h3>\r\n<p>The UI5 code in question appends, to the DOM, a string that comes from untrusted source.</p>\r\n<h3 data-toc-skip class=\"section\" id=\"Solution\">Solution</h3>\r\n<p><em style=\"font-size: 14px;\"><em><strong><br /></strong></em></em>The solution is to output encode any untrusted string that is appended to the DOM, using the provided function from the framework.</p>\r\n<p>Please update all requested SAPUI5 versions in your systems.</p>\r\n<p>Kindly note that this security note contains solutions for HANA, Java and ABAP. For</p>\r\n<ul>\r\n<li><span style=\"font-size: 14px;\">HANA solutions, kindly refer below</span></li>\r\n<li>Java solutions, kindly refer to the \"Support Packages &amp; Pactches\" section</li>\r\n<li>For ABAP solutions, kindly refer to the manual activities provided below&#160;</li>\r\n</ul>\r\n<p><strong>For SAP HANA platform:</strong></p>\r\n<p>SAP UI5 versions in SAP HANA platform components have been updated with the following versions. Update to these or later versions.</p>\r\n<p>SAP HANA PLATFORM EDITION 2.0 SPS 03:</p>\r\n<div class=\"table-responsive\"><table class=\"table table-bordered table-striped col-resizeable\" border=\"1\" cellpadding=\"0\" cellspacing=\"0\">\r\n<tbody>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA DATABASE 2.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Maintenance Revision 003.00</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP EXTENDED APP SERVICES 1 / XS&#160; &#160;RUNTIME 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Build 1.0.82 / Patch 82</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS SERVICES 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP06 Patch 5</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XSA WEB IDE 2</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP03 Patch 0</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS MONITORING 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP06 Patch 3</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XSAC FILEPROCESSOR 1.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP00 Patch 22</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA COCKPIT 2.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 5</p>\r\n</td>\r\n</tr>\r\n</tbody>\r\n</table></div>\r\n<p>SAP HANA PLATFORM EDITION 2.0 SPS 02:</p>\r\n<div class=\"table-responsive\"><table class=\"table table-bordered table-striped col-resizeable\" border=\"1\" cellpadding=\"0\" cellspacing=\"0\">\r\n<tbody>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA DATABASE 2.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Maintenance Revision 024.00</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP EXTENDED APP SERVICES 1 / XS&#160; &#160;RUNTIME 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Build 1.0.71 / Patch 71</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS SERVICES 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 21</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XSA WEB IDE 2</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP02 Patch 7</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS MONITORING 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 9</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XSAC FILEPROCESSOR 1.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP00 Patch 22</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA COCKPIT 2.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP04 Patch 13</p>\r\n</td>\r\n</tr>\r\n</tbody>\r\n</table></div>\r\n<p>SAP HANA PLATFORM EDITION 2.0 SPS 01:</p>\r\n<div class=\"table-responsive\"><table class=\"table table-bordered table-striped col-resizeable\" border=\"1\" cellpadding=\"0\" cellspacing=\"0\">\r\n<tbody>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA DATABASE 2.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Maintenance Revision 012.04</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP EXTENDED APP SERVICES 1 / XS&#160; &#160;RUNTIME 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Build 1.0.71 / Patch 71</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS SERVICES 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 21</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XSA WEB IDE 2</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP02 Patch 7</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS MONITORING 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 9</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XSAC FILEPROCESSOR 1.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP00 Patch 22</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA COCKPIT 2.0</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP04 Patch 13</p>\r\n</td>\r\n</tr>\r\n</tbody>\r\n</table></div>\r\n<p>SAP HANA PLATFORM EDITION 1.0 SP 12:</p>\r\n<div class=\"table-responsive\"><table class=\"table table-bordered table-striped col-resizeable\" border=\"1\" cellpadding=\"0\" cellspacing=\"0\">\r\n<tbody>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SAP HANA DATABASE 1.00</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Maintenance Revision 122.16</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS ADVANCED RUNTIME / SAP EXTENDED&#160; &#160;APP SERVICES 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;Build 1.0.71 / Patch 71</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS ADVANCED SERVICES / XS SERVICES 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 21</p>\r\n</td>\r\n</tr>\r\n<tr>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;XS ADVANCED MONITORING / XS&#160; &#160;MONITORING 1</p>\r\n</td>\r\n<td valign=\"top\" width=\"312\">\r\n<p>&#160;SP05 Patch 9</p>\r\n</td>\r\n</tr>\r\n</tbody>\r\n</table></div>\r\n<p><strong>&#160;</strong></p>"
+      },
+      "Attributes": {
+        "_label": "Attributes",
+        "_columnNames": {
+          "Key": "Key",
+          "Value": "Value"
+        },
+        "Items": [
+          {
+            "Key": "Other Components",
+            "Value": "Cross-Application Components > SAPUI5 > Core and Runtime (CA-UI5-COR)"
+          },
+          {
+            "Key": "Externally Reported",
+            "Value": "Yes"
+          }
+        ]
+      },
+      "Translations": {
+        "_label": "Available Languages",
+        "Items": [
+          {
+            "TranslationLanguageCode": "D",
+            "TranslationLanguage": "Deutsch",
+            "TranslationLabel": "",
+            "TranslationIsHuman": true,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/D"
+          },
+          {
+            "TranslationLanguageCode": "J",
+            "TranslationLanguage": "日本語 (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/J"
+          },
+          {
+            "TranslationLanguageCode": "P",
+            "TranslationLanguage": "Português (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/P"
+          },
+          {
+            "TranslationLanguageCode": "S",
+            "TranslationLanguage": "Español (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/S"
+          },
+          {
+            "TranslationLanguageCode": "F",
+            "TranslationLanguage": "Français (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/F"
+          },
+          {
+            "TranslationLanguageCode": "I",
+            "TranslationLanguage": "Italiano (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/I"
+          },
+          {
+            "TranslationLanguageCode": "R",
+            "TranslationLanguage": "Русский (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/R"
+          },
+          {
+            "TranslationLanguageCode": "1",
+            "TranslationLanguage": "中文 (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/1"
+          },
+          {
+            "TranslationLanguageCode": "3",
+            "TranslationLanguage": "한국어 (Machine Translation)",
+            "TranslationLabel": "Machine Translation",
+            "TranslationIsHuman": false,
+            "TranslationIsOutdated": false,
+            "URL": "/notes/0002538856/3"
+          }
+        ]
+      },
+      "Attachments": {
+        "_label": "Attachments",
+        "_columnNames": {
+          "FileName": "File Name",
+          "FileSize": "File Size",
+          "MimeType": "Mime Type",
+          "URL": "Url"
+        },
+        "Items": []
+      },
+      "References": {
+        "_label": "References",
+        "RefTo": {
+          "_label": "This document refers to",
+          "_columnNames": {
+            "RefNumber": "SAP Note/KBA",
+            "RefComponent": "Component",
+            "RefTitle": "Title",
+            "RefUrl": "Url"
+          },
+          "Items": []
+        },
+        "RefBy": {
+          "_label": "This document is referenced by",
+          "_columnNames": {
+            "RefNumber": "SAP Note/KBA",
+            "RefComponent": "Component",
+            "RefTitle": "Title",
+            "RefUrl": "Url"
+          },
+          "Items": []
+        }
+      },
+      "Validity": {
+        "_label": "Software Components",
+        "_columnNames": {
+          "SoftwareComponent": "Software Component",
+          "From": "From",
+          "To": "To"
+        },
+        "Items": [
+          {
+            "SoftwareComponent": "HDB",
+            "From": "1.00",
+            "To": "1.00"
+          },
+          {
+            "SoftwareComponent": "HDB",
+            "From": "2.00",
+            "To": "2.00"
+          },
+          {
+            "SoftwareComponent": "UISAPUI5",
+            "From": "100",
+            "To": "100"
+          },
+          {
+            "SoftwareComponent": "UISAPUI5_JAVA",
+            "From": "7.31",
+            "To": "7.31"
+          },
+          {
+            "SoftwareComponent": "UISAPUI5_JAVA",
+            "From": "7.40",
+            "To": "7.40"
+          },
+          {
+            "SoftwareComponent": "UISAPUI5_JAVA",
+            "From": "7.30",
+            "To": "7.30"
+          },
+          {
+            "SoftwareComponent": "UISAPUI5_JAVA",
+            "From": "7.50",
+            "To": "7.50"
+          },
+          {
+            "SoftwareComponent": "SAP_UI",
+            "From": "740",
+            "To": "740"
+          },
+          {
+            "SoftwareComponent": "SAP_UI",
+            "From": "750",
+            "To": "750"
+          },
+          {
+            "SoftwareComponent": "SAP_UI",
+            "From": "751",
+            "To": "751"
+          },
+          {
+            "SoftwareComponent": "SAP_UI",
+            "From": "752",
+            "To": "752"
+          },
+          {
+            "SoftwareComponent": "UI_700",
+            "From": "200",
+            "To": "200"
+          }
+        ]
+      },
+      "SupportPackage": {
+        "_label": "Support Package",
+        "_columnNames": {
+          "SoftwareComponentVersion": "Software Component Version",
+          "SupportPackage": "Support Package",
+          "URL": "Url"
+        },
+        "Items": []
+      },
+      "SupportPackagePatch": {
+        "_label": "Support Package Patches",
+        "_columnNames": {
+          "SoftwareComponentVersion": "Software Component Version",
+          "SupportPackage": "Support Packages",
+          "SupportPackagePatch": "Patch Level",
+          "URL": "Url"
+        },
+        "Items": [
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP010",
+            "SupportPackagePatch": "000014",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP010&patch_level=000014"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP011",
+            "SupportPackagePatch": "000013",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP011&patch_level=000013"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP012",
+            "SupportPackagePatch": "000027",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP012&patch_level=000027"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP013",
+            "SupportPackagePatch": "000016",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP013&patch_level=000016"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP014",
+            "SupportPackagePatch": "000008",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP014&patch_level=000008"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP015",
+            "SupportPackagePatch": "000008",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP015&patch_level=000008"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP016",
+            "SupportPackagePatch": "000000",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP016&patch_level=000000"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.40",
+            "SupportPackage": "SP017",
+            "SupportPackagePatch": "000000",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67837800100200022573&support_package=SP017&patch_level=000000"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP015",
+            "SupportPackagePatch": "000012",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP015&patch_level=000012"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP016",
+            "SupportPackagePatch": "000013",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP016&patch_level=000013"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP017",
+            "SupportPackagePatch": "000029",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP017&patch_level=000029"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP018",
+            "SupportPackagePatch": "000016",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP018&patch_level=000016"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP019",
+            "SupportPackagePatch": "000008",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP019&patch_level=000008"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP020",
+            "SupportPackagePatch": "000008",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP020&patch_level=000008"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP021",
+            "SupportPackagePatch": "000000",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP021&patch_level=000000"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.31",
+            "SupportPackage": "SP022",
+            "SupportPackagePatch": "000000",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200019353&support_package=SP022&patch_level=000000"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.30",
+            "SupportPackage": "SP013",
+            "SupportPackagePatch": "000017",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200020462&support_package=SP013&patch_level=000017"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.30",
+            "SupportPackage": "SP014",
+            "SupportPackagePatch": "000020",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200020462&support_package=SP014&patch_level=000020"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.30",
+            "SupportPackage": "SP015",
+            "SupportPackagePatch": "000015",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200020462&support_package=SP015&patch_level=000015"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.30",
+            "SupportPackage": "SP016",
+            "SupportPackagePatch": "000013",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200020462&support_package=SP016&patch_level=000013"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.30",
+            "SupportPackage": "SP017",
+            "SupportPackagePatch": "000008",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200020462&support_package=SP017&patch_level=000008"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.30",
+            "SupportPackage": "SP018",
+            "SupportPackagePatch": "000000",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=67838200100200020462&support_package=SP018&patch_level=000000"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP004",
+            "SupportPackagePatch": "000030",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP004&patch_level=000030"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP005",
+            "SupportPackagePatch": "000023",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP005&patch_level=000023"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP006",
+            "SupportPackagePatch": "000015",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP006&patch_level=000015"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP007",
+            "SupportPackagePatch": "000019",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP007&patch_level=000019"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP008",
+            "SupportPackagePatch": "000011",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP008&patch_level=000011"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP008",
+            "SupportPackagePatch": "000013",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP008&patch_level=000013"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP009",
+            "SupportPackagePatch": "000003",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP009&patch_level=000003"
+          },
+          {
+            "SoftwareComponentVersion": "SAPUI5 CLIENT RT AS JAVA 7.50",
+            "SupportPackage": "SP010",
+            "SupportPackagePatch": "000000",
+            "URL": "https://userapps.support.sap.com/sap/support/swdc/notes?cvnr=73554900100200001631&support_package=SP010&patch_level=000000"
+          }
+        ]
+      },
+      "CorrectionInstructions": {
+        "_label": "Correction Instructions",
+        "_columnNames": {
+          "SoftwareComponent": "Software Component",
+          "NumberOfCorrin": "Number of Correction Instructions",
+          "URL": "Url"
+        },
+        "Items": []
+      },
+      "ManualActions": {
+        "_label": "Manual Activities",
+        "value": "  <code style=\"color:unset;\">   <P><br/><br/>------------------------------------------------------------------------<br/>|Manual Activity&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/>|VALID FOR&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>|Software Component&nbsp;&nbsp; SAP_UI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>| Release 751&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SAPK-75101INSAPUI - SAPK-75104INSAPUI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/><br/>Please implement note 2493450 to get the newest UI5 version<br/><br/><br/><br/>------------------------------------------------------------------------<br/>|Manual Activity&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/>|VALID FOR&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>|Software Component&nbsp;&nbsp; SAP_UI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>| Release 752&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Until SAPK-75201INSAPUI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/><br/>Please implement note 2468634 to get the newest UI5 version<br/><br/><br/><br/>------------------------------------------------------------------------<br/>|Manual Activity&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/>|VALID FOR&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>|Software Component&nbsp;&nbsp; UISAPUI5&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SAP UI5 CLIENT... |<br/>| Release 100&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SAPK-10012INUISAPUI5 - SAPK-10019INUISAPUI5&nbsp;&nbsp;&nbsp;&nbsp; |<br/>|Software Component&nbsp;&nbsp; SAP_UI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>| Release 740&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SAPK-74012INSAPUI - SAPK-74019INSAPUI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/><br/>Please implement note 2547009 to get the newest UI5 version.<br/><br/><br/><br/>------------------------------------------------------------------------<br/>|Manual Activity&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/>|VALID FOR&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>|Software Component&nbsp;&nbsp; SAP_UI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>| Release 750&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SAPK-75004INSAPUI - SAPK-75009INSAPUI&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>|Software Component&nbsp;&nbsp; UI_700&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>| Release 200&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;SAPK-20004INUI700 - SAPK-20009INUI700&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |<br/>------------------------------------------------------------------------<br/><br/>Please implement note 2482210 to get the newest UI5 version.<br/><br/></P> <br/>   </code> "
+      },
+      "CorrectionsInfo": {
+        "_label": "Information about Correction Instructions",
+        "Corrections": {
+          "_label": "Correction",
+          "value": 0,
+          "state": "None"
+        },
+        "ManualActivities": {
+          "_label": "Manual Activities",
+          "value": 4,
+          "state": "Error"
+        },
+        "Prerequisites": {
+          "_label": "Prerequisites",
+          "value": 0,
+          "state": "None"
+        }
+      },
+      "Preconditions": {
+        "_label": "Prerequisites",
+        "_columnNames": {
+          "SoftwareComponent": "Software Component",
+          "ValidFrom": "From",
+          "ValidTo": "To",
+          "Number": "SAP Note/KBA",
+          "URL": "Url",
+          "Title": "Title",
+          "Component": "Component"
+        },
+        "Items": []
+      },
+      "CVSS": {
+        "_label": "CVSS",
+        "CVSS_Score": {
+          "_label": "CVSS Score                                        ",
+          "value": "0"
+        },
+        "CVSS_Vector": {
+          "_label": "CVSS Vector                                       ",
+          "vectorValue": "",
+          "vectorVersion": "3.0",
+          "_columnNames": {
+            "Key": "Key",
+            "Value": "Value"
+          },
+          "Items": [
+            {
+              "Key": "Attack Vector (AV)",
+              "Value": ""
+            },
+            {
+              "Key": "Attack Complexity (AC)",
+              "Value": ""
+            },
+            {
+              "Key": "Privileges Required (PR)",
+              "Value": ""
+            },
+            {
+              "Key": "User Interaction (UI)",
+              "Value": ""
+            },
+            {
+              "Key": "Scope (S)",
+              "Value": ""
+            },
+            {
+              "Key": "Confidentiality Impact (C)",
+              "Value": ""
+            },
+            {
+              "Key": "Integrity Impact (I)",
+              "Value": ""
+            },
+            {
+              "Key": "Availability Impact (A)",
+              "Value": ""
+            }
+          ]
+        }
+      },
+      "Rating": {
+        "_label": "Rate this document",
+        "RatingHelpful": {
+          "_label": "Rated Helpful",
+          "Helpful-Yes": "0 people"
+        },
+        "RatingQuality": {
+          "_label": "Quality Rating"
+        },
+        "Quality-AVG": 0.0,
+        "Quality-Votes": 0,
+        "RatingQualityDetails": {
+          "Stars-1": 0,
+          "Stars-2": 0,
+          "Stars-3": 0,
+          "Stars-4": 0,
+          "Stars-5": 0
+        },
+        "RatingQuestions": []
+      },
+      "SideEffects": {
+        "_label": "Side Effects",
+        "SideEffectsCausing": {
+          "_label": "This document solves side effects",
+          "_columnNames": {
+            "RefNumber": "SAP Note/KBA",
+            "RefTitle": "Title",
+            "RefUrl": "Url"
+          },
+          "Items": []
+        },
+        "SideEffectsSolving": {
+          "_label": "This document is causing side effects",
+          "_columnNames": {
+            "RefNumber": "SAP Note/KBA",
+            "RefTitle": "Title",
+            "RefUrl": "Url"
+          },
+          "Items": []
+        }
+      },
+      "MessageForUnReleasedNotes": {
+        "visible": false,
+        "value": ""
+      }
+    }
+  }
+}

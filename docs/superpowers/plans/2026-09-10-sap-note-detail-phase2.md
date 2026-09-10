@@ -68,7 +68,7 @@ the fixture this produces, though Tasks 4-6 could proceed independently.
     returning `(status, content_type, body)`
   - `tests/fixtures/sapnote_detail.json` — one real response body
 
-- [ ] **Step 1: Add the dialog credential to `.env.example`**
+- [x] **Step 1: Add the dialog credential to `.env.example`**
 
 Append:
 
@@ -82,7 +82,7 @@ SAP_DIALOG_USER=
 SAP_DIALOG_PWD=
 ```
 
-- [ ] **Step 2: Install Playwright locally (ops only)**
+- [x] **Step 2: Install Playwright locally (ops only)**
 
 Run:
 
@@ -94,164 +94,27 @@ Run:
 Do NOT add `playwright` to `requirements.txt`. It is an operator tool; adding
 it would pull Chromium into the Cloud Foundry buildpack.
 
-- [ ] **Step 3: Write the session helper**
+- [x] **Step 3: Write the session helper**
 
-Create `scripts/sap_session.py`:
+**SUPERSEDED — see `scripts/sap_session.py` as committed.** The listing that
+stood here was written before the flow had ever been run and carried three
+defects, all found by running it:
 
-```python
-"""Obtain a me.sap.com browser session, and fetch one note with it.
-
-me.sap.com sits behind XSUAA/SAML and ignores HTTP Basic outright: the
-`Detail` endpoint returns a byte-identical JS bootstrap page with Basic
-credentials and anonymously. The only way in is to complete the
-accounts.sap.com login in a real browser and reuse the resulting cookies,
-which is what `mcp-sap-notes` does and why it ships Playwright.
-
-This script exists so Chromium stays on an operator machine. The platform
-only ever receives the cookie string this produces.
-
-Run:
-    python scripts/sap_session.py capture 3771065
-    python scripts/sap_session.py capture 3771065 --headful   # MFA expected
-"""
-
-from __future__ import annotations
-
-import argparse
-import asyncio
-import os
-import sys
-from pathlib import Path
-
-import httpx
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv(ROOT / ".env")
-except ImportError:  # pragma: no cover
-    pass
-
-DETAIL_URL = "https://me.sap.com/backend/raw/sapnotes/Detail"
-# Any me.sap.com page forces the SAML round trip; the notes page is the one
-# whose session we actually want.
-LOGIN_TARGET = "https://me.sap.com/notes"
-
-
-async def login(
-    user: str, pwd: str, *, headful: bool = False, timeout_s: int = 180
-) -> str:
-    """Complete the accounts.sap.com login and return a Cookie header.
-
-    Every cookie on a *.sap.com domain is kept and serialized, rather than
-    naming specific ones: which cookies carry the session is undocumented and
-    has changed before, and sending all of them is what the upstream package
-    does.
-    """
-    from playwright.async_api import async_playwright
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=not headful)
-        page = await (await browser.new_context()).new_page()
-        await page.goto(LOGIN_TARGET, wait_until="commit", timeout=45_000)
-
-        # Best-effort form fill. When MFA or an unexpected screen appears the
-        # fill silently does nothing and the wait below hands over to the
-        # human -- which is the whole reason --headful exists.
-        await _try_fill(page, ["input[name='j_username']", "input[type='email']", "#j_username"], user)
-        await _try_fill(page, ["input[name='j_password']", "input[type='password']", "#j_password"], pwd)
-        await _try_click(page, ["button[type='submit']", "#logOnFormSubmit", "input[type='submit']"])
-
-        # Wait until we are back on me.sap.com, however long the human needs.
-        try:
-            await page.wait_for_url(lambda u: "me.sap.com" in u and "accounts.sap.com" not in u,
-                                    timeout=timeout_s * 1000)
-        except Exception:
-            raise SystemExit(
-                "Did not reach me.sap.com. Re-run with --headful and finish the "
-                "login (MFA, passcode) by hand."
-            ) from None
-
-        cookies = await page.context.cookies()
-        await browser.close()
-
-    kept = [c for c in cookies if "sap.com" in c.get("domain", "")]
-    if not kept:
-        raise SystemExit("Logged in but captured no sap.com cookies.")
-    return "; ".join(f"{c['name']}={c['value']}" for c in kept)
-
-
-async def _try_fill(page, selectors: list[str], value: str) -> bool:
-    for selector in selectors:
-        field = await page.query_selector(selector)
-        if field:
-            await field.fill(value)
-            return True
-    return False
-
-
-async def _try_click(page, selectors: list[str]) -> bool:
-    for selector in selectors:
-        button = await page.query_selector(selector)
-        if button:
-            await button.click()
-            return True
-    return False
-
-
-async def fetch_detail_raw(cookie: str, note: str) -> tuple[int, str, bytes]:
-    """One raw `Detail` request. Returns (status, content_type, body)."""
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.get(
-            DETAIL_URL,
-            params={"q": note, "t": "E"},
-            headers={"Cookie": cookie, "Accept": "application/json"},
-            follow_redirects=False,
-        )
-    return r.status_code, r.headers.get("content-type", ""), r.content
-
-
-async def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["capture"])
-    parser.add_argument("note")
-    parser.add_argument("--headful", action="store_true")
-    parser.add_argument(
-        "--out", default=str(ROOT / "tests" / "fixtures" / "sapnote_detail.json")
-    )
-    args = parser.parse_args()
-
-    user = os.environ.get("SAP_DIALOG_USER", "").strip()
-    pwd = os.environ.get("SAP_DIALOG_PWD", "").strip()
-    if not user or not pwd:
-        sys.exit("SAP_DIALOG_USER / SAP_DIALOG_PWD are not set in .env")
-
-    cookie = await login(user, pwd, headful=args.headful)
-    print(f"captured {cookie.count('=')} cookies")  # never print the value
-
-    status, ctype, body = await fetch_detail_raw(cookie, args.note)
-    print(f"status {status}  type {ctype}  bytes {len(body)}")
-    if status != 200 or "json" not in ctype.lower():
-        preview = "".join(chr(b) if 32 <= b < 127 else "." for b in body[:200])
-        sys.exit(f"Not JSON -- the session did not take. Body head: {preview}")
-
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_bytes(body)
-    print(f"wrote {out}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
+1. `wait_until="commit"` returned before me.sap.com finished redirecting
+   through XSUAA, so DOM queries raced the navigation and died with
+   "Execution context was destroyed".
+2. accounts.sap.com is a **two-step** form: page one has only `#j_username`
+   and a Continue button. Filling a password there did nothing, and submitting
+   the username alone parked on step two forever.
+3. Cookies were filtered by `"sap.com" in domain`, but the jar holds two
+   cookies named `JSESSIONID` — one for me.sap.com, one for accounts.sap.com.
+   Sending both handed me.sap.com the identity provider's session, which
+   returned the anonymous bootstrap page and looked like an auth failure.
 
 Verify the file imports cleanly before running it:
 `.venv/Scripts/python.exe -c "import ast,pathlib;ast.parse(pathlib.Path('scripts/sap_session.py').read_text())"`
 
-- [ ] **Step 4: Capture the fixture**
+- [x] **Step 4: Capture the fixture**
 
 Run:
 
@@ -265,7 +128,7 @@ Expected: `status 200  type application/json`, and
 If it exits with "Not JSON — the session did not take", the login did not
 complete. Re-run with `--headful` and finish any MFA challenge by hand.
 
-- [ ] **Step 5: Record the real shape**
+- [x] **Step 5: Record the real shape**
 
 Run:
 
@@ -284,7 +147,7 @@ replacing risk 1:
 
 Every later task depends on these answers being written down.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 The fixture is a real SAP response. Check it carries no personal data (an
 S-user id, a name, an email) before committing; if it does, redact those values
@@ -361,27 +224,32 @@ def test_parse_detail_reports_ok_and_echoes_the_note():
     assert parsed["status"] == "ok"
 
 
-def test_parse_detail_extracts_the_component():
+def test_parse_detail_extracts_the_header():
     parsed = parse_detail(load_fixture(), NOTE)
-    # <-- replace with the component the fixture actually carries
-    assert parsed["component"] == "SAP_BASIS"
-
-
-def test_parse_detail_extracts_support_packages():
-    parsed = parse_detail(load_fixture(), NOTE)
-    packages = parsed["support_packages"]
-    assert packages, "the fixture note must carry at least one support package"
-    first = packages[0]
-    assert set(first) == {"software_component", "level"}
-    # <-- replace both with values read from the fixture
-    assert first["software_component"] == "SAP_BASIS"
-    assert first["level"].startswith("SAPKB")
+    assert parsed["note_type"] == "SAP Security Note"
+    assert "CVE-2018-2424" in parsed["title"]
 
 
 def test_parse_detail_extracts_validity():
     parsed = parse_detail(load_fixture(), NOTE)
     entry = parsed["validity"][0]
     assert set(entry) == {"software_component", "from", "to"}
+    assert entry["software_component"] == "HDB"
+    assert entry["from"] == "1.00"
+
+
+def test_parse_detail_reads_support_packages_from_the_patch_list():
+    """`SupportPackage` is empty on every note sampled; the level is in
+    `SupportPackagePatch`. Reading the wrong one returns nothing for every
+    note while looking like it works."""
+    parsed = parse_detail(load_fixture(), NOTE)
+    packages = parsed["support_packages"]
+    assert packages, "the fixture note must carry at least one fixing level"
+    first = packages[0]
+    assert set(first) == {"component_version", "support_package", "patch"}
+    assert first["component_version"] == "SAPUI5 CLIENT RT AS JAVA 7.40"
+    assert first["support_package"] == "SP010"
+    assert first["patch"] == "000014"
 
 
 def test_parse_detail_degrades_on_an_unexpected_shape():
@@ -447,15 +315,15 @@ DETAIL_URL = "https://me.sap.com/backend/raw/sapnotes/Detail"
 
 DEFAULT_MAX_CONCURRENCY = 5
 
-# Raw JSON key -> our field. CORRECT THESE AGAINST tests/fixtures/
-# sapnote_detail.json before relying on them; they are the upstream
-# TypeScript model's names and the raw payload may differ.
-_KEY_COMPONENT = "SAPComponentKey"
-_KEY_COMPONENT_TEXT = "SAPComponentKeyText"
-_KEY_PRIORITY = "Priority"
-_KEY_VALIDITY = "validity"
-_KEY_SUPPORT_PACKAGES = "supportPackages"
-_KEY_SUPPORT_PACKAGE_PATCHES = "supportPackagePatches"
+# Confirmed against two live responses on 2026-09-10; see the spec's
+# "Confirmed API shape". Everything of interest hangs off Response.SAPNote,
+# and each table is an object with an `Items` list, not a bare list.
+_KEY_HEADER = "Header"
+_KEY_TITLE = "Title"
+_KEY_VALIDITY = "Validity"
+# The fixing level lives here, NOT in `SupportPackage`, which was empty on
+# every one of ten sampled notes.
+_KEY_SUPPORT_PACKAGE_PATCH = "SupportPackagePatch"
 
 
 def _text(value: Any) -> str:
@@ -473,35 +341,48 @@ def unavailable(note: str, reason: str) -> dict[str, Any]:
         "note": note,
         "status": "unavailable",
         "reason": reason,
-        "component": "",
-        "component_text": "",
-        "priority": "",
+        "title": "",
+        "note_type": "",
+        "version": "",
         "validity": [],
         "support_packages": [],
     }
 
 
+def _items(node: Any) -> list[dict[str, Any]]:
+    """The `Items` list of a SAP table node, or empty."""
+    if not isinstance(node, dict):
+        return []
+    items = node.get("Items")
+    return [i for i in items if isinstance(i, dict)] if isinstance(items, list) else []
+
+
 def _packages(node: Any) -> list[dict[str, str]]:
+    """The fixing support-package levels."""
     out: list[dict[str, str]] = []
-    for entry in node or []:
-        if not isinstance(entry, dict):
-            continue
-        component = _text(entry.get("softwareComponent") or entry.get("Name"))
-        level = _text(entry.get("supportPackage") or entry.get("level") or entry.get("SP"))
-        if component or level:
-            out.append({"software_component": component, "level": level})
+    for entry in _items(node):
+        row = {
+            "component_version": _text(entry.get("SoftwareComponentVersion")),
+            "support_package": _text(entry.get("SupportPackage")),
+            "patch": _text(entry.get("SupportPackagePatch")),
+        }
+        if any(row.values()):
+            out.append(row)
     return out
 
 
 def _validity(node: Any) -> list[dict[str, str]]:
+    """Which components and release ranges the note applies to.
+
+    The only place a software component appears: the response carries no
+    top-level component or priority field.
+    """
     out: list[dict[str, str]] = []
-    for entry in node or []:
-        if not isinstance(entry, dict):
-            continue
+    for entry in _items(node):
         out.append({
-            "software_component": _text(entry.get("softwareComponent") or entry.get("Name")),
-            "from": _text(entry.get("versionFrom") or entry.get("from")),
-            "to": _text(entry.get("versionTo") or entry.get("to")),
+            "software_component": _text(entry.get("SoftwareComponent")),
+            "from": _text(entry.get("From")),
+            "to": _text(entry.get("To")),
         })
     return out
 
@@ -511,30 +392,26 @@ def parse_detail(raw: Any, note: str) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return unavailable(note, "response was not a JSON object")
 
-    # The record may be at the top level or nested; try the known wrappers
-    # before giving up, because a bare dict with none of our keys is a shape
-    # change rather than a missing note.
-    record = raw
-    for wrapper in ("Detail", "d", "results", "data"):
-        inner = record.get(wrapper) if isinstance(record, dict) else None
-        if isinstance(inner, dict):
-            record = inner
+    # Confirmed envelope: {"Request": {...}, "Response": {"SAPNote": {...}}}.
+    record = raw.get("Response")
+    record = record.get("SAPNote") if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return unavailable(note, "response carried no Response.SAPNote")
 
-    known = {_KEY_COMPONENT, _KEY_PRIORITY, _KEY_VALIDITY, _KEY_SUPPORT_PACKAGES}
+    known = {_KEY_HEADER, _KEY_TITLE, _KEY_VALIDITY, _KEY_SUPPORT_PACKAGE_PATCH}
     if not known & set(record):
         return unavailable(note, "response carried none of the expected fields")
 
+    header = record.get(_KEY_HEADER) or {}
+    header = header if isinstance(header, dict) else {}
     return {
         "note": note,
         "status": "ok",
-        "component": _text(record.get(_KEY_COMPONENT)),
-        "component_text": _text(record.get(_KEY_COMPONENT_TEXT)),
-        "priority": _text(record.get(_KEY_PRIORITY)),
+        "title": _text(record.get(_KEY_TITLE)),
+        "note_type": _text(header.get("Type")),
+        "version": _text(header.get("Version")),
         "validity": _validity(record.get(_KEY_VALIDITY)),
-        "support_packages": (
-            _packages(record.get(_KEY_SUPPORT_PACKAGES))
-            + _packages(record.get(_KEY_SUPPORT_PACKAGE_PATCHES))
-        ),
+        "support_packages": _packages(record.get(_KEY_SUPPORT_PACKAGE_PATCH)),
     }
 
 
