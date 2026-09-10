@@ -179,6 +179,7 @@
                         <columns>
                             <Column><Text text="{i18n>serverUrl}" /></Column>
                             <Column><Text text="{i18n>colStatus}" /></Column>
+                            <Column><Text text="{i18n>colValidUntil}" /></Column>
                             <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
                         </columns>
                         <items>
@@ -186,12 +187,18 @@
                                 <cells>
                                     <Text text="{agent>url}" />
                                     <ObjectStatus
-                                        text="{= !${agent>needs_token} ? ${i18n>credNotNeeded} : (${agent>has_token} ? ${i18n>credSignedIn} : ${i18n>credMissing}) }"
-                                        state="{= !${agent>needs_token} ? 'None' : (${agent>has_token} ? 'Success' : 'Warning') }" />
+                                        text="{= !${agent>needs_token} ? ${i18n>credNotNeeded} : (${agent>token_state} === 'valid' ? ${i18n>credSignedIn} : (${agent>token_state} === 'refreshable' ? ${i18n>credRefreshable} : (${agent>token_state} === 'expired' ? ${i18n>credExpired} : ${i18n>credMissing}))) }"
+                                        state="{ parts: ['agent>needs_token', 'agent>token_state'], formatter: '.formatter.credentialState' }" />
+                                    <Text text="{ path: 'agent>expires_at', formatter: '.formatter.timestamp' }" />
+                                    <!-- Offered for every server that takes a user token, connected or
+                                         not: signing in authenticates YOU, while the status above is
+                                         the run-as identity's, and a live token can still be revoked
+                                         upstream. Hiding it once a token existed left no way to do
+                                         either. -->
                                     <Button
-                                        text="{i18n>signIn}"
+                                        text="{= ${agent>has_token} ? ${i18n>signInAgain} : ${i18n>signIn} }"
                                         type="Transparent"
-                                        visible="{= ${agent>needs_token} &amp;&amp; !${agent>has_token} }"
+                                        visible="{agent>needs_token}"
                                         press=".onSignIn" />
                                 </cells>
                             </ColumnListItem>

@@ -11,6 +11,7 @@ framework:
     - name: sap.f
     - name: sap.tnt
     - name: sap.ui.layout
+    - name: sap.suite.ui.commons
     - name: themelib_sap_horizon
 builder:
   resources:

@@ -2,9 +2,14 @@ import opaTest from "sap/ui/test/opaQunit";
 import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
+import type Button from "sap/m/Button";
+import type ColumnListItem from "sap/m/ColumnListItem";
 import type Input from "sap/m/Input";
 import type MultiComboBox from "sap/m/MultiComboBox";
+import type ObjectStatus from "sap/m/ObjectStatus";
 import type Select from "sap/m/Select";
+import type Table from "sap/m/Table";
+import type Text from "sap/m/Text";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
 
@@ -145,6 +150,57 @@ opaTest("a stored model override missing from the available list stays selected 
             Opa5.assert.strictEqual(
                 saved?.model_name, "retired-model",
                 "the unavailable override reached the backend unchanged, not blanked out"
+            );
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("every OAuth2 server offers sign-in, including one that is already connected", function (Given: Common, When: Common, Then: Common) {
+    // The button used to be hidden once a token existed, which left no way to
+    // connect as yourself when the run-as identity was someone else, and no way
+    // to re-connect a revoked token before it failed a scheduled run.
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "credentialsTable",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const rows = (element as Table).getItems() as ColumnListItem[];
+            const signInVisible = rows.map(
+                (row) => (row.getCells()[3] as Button).getVisible()
+            );
+            Opa5.assert.deepEqual(
+                signInVisible, [true, true, false],
+                "both oauth2 servers offer sign-in; the destination server, which needs no user token, does not"
+            );
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the credential column reports validity, not just presence", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "credentialsTable",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const rows = (element as Table).getItems() as ColumnListItem[];
+            const states = rows.map((row) => (row.getCells()[1] as ObjectStatus).getState());
+            Opa5.assert.deepEqual(
+                states, ["Success", "Error", "None"],
+                "a live token reads as success, an expired one as an error, and a server needing none stays neutral"
+            );
+            Opa5.assert.ok(
+                (rows[0].getCells()[2] as Text).getText(false).length > 0,
+                "the live token shows when it expires"
+            );
+            Opa5.assert.strictEqual(
+                (rows[2].getCells()[2] as Text).getText(false), "—",
+                "a server with no expiry shows an em dash rather than a bogus date"
             );
         }
     });

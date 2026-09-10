@@ -791,7 +791,7 @@ async def api_agent_credentials(
     """
     from urllib.parse import quote
 
-    from agents.oauth2 import has_usable_token, normalize_mcp_url
+    from agents.oauth2 import normalize_mcp_url, token_status
 
     async with SessionLocal() as session:
         row = await get_agent(session, agent_id)
@@ -809,6 +809,10 @@ async def api_agent_credentials(
         needs_token = auth_mode == AUTH_MODE_OAUTH2
         has_token = False
         login_url = ""
+        # "none" both for a server that needs no token and for one nobody has
+        # signed into yet — the UI tells those apart by needs_token.
+        state = "none"
+        expires_at: str | None = None
         if needs_token:
             server_key = normalize_mcp_url(url)
             login_url = (
@@ -817,7 +821,12 @@ async def api_agent_credentials(
             )
             if who:
                 try:
-                    has_token = await has_usable_token(who, server_key)
+                    state, expiry = await token_status(who, server_key)
+                    expires_at = expiry.isoformat() if expiry else None
+                    # Both states the live connection can use without an
+                    # interactive sign-in — the same rule has_usable_token
+                    # applies, kept in one place by deriving it here.
+                    has_token = state in ("valid", "refreshable")
                 except Exception:  # noqa: BLE001 — status display must not 500
                     logger.warning(
                         "Could not read token status for %s on %s",
@@ -835,6 +844,8 @@ async def api_agent_credentials(
             "has_token": has_token or no_user_token,
             "login_url": login_url,
             "no_user_token": no_user_token,
+            "token_state": "valid" if no_user_token else state,
+            "expires_at": expires_at,
         })
     return out
 

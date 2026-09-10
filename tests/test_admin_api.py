@@ -1202,6 +1202,63 @@ async def run_tests() -> None:
             r.text,
         )
 
+        # --- token validity ------------------------------------------------
+        # The UI shows not just whether a token exists but whether it still
+        # works: valid, refreshable (expired access token + refresh token),
+        # expired (no refresh token), or none.
+        from datetime import datetime, timedelta, timezone
+
+        from agents.db import SessionLocal, upsert_user_token
+        from agents.oauth2 import normalize_mcp_url
+
+        check("no token -> token_state none", srv.get("token_state") == "none", r.text)
+        check("no token -> expires_at null", srv.get("expires_at") is None, r.text)
+
+        cred_key = normalize_mcp_url("https://cred.cfapps.eu20-001.hana.ondemand.com/mcp")
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        past = datetime.now(timezone.utc) - timedelta(hours=1)
+        async with SessionLocal() as s:
+            await upsert_user_token(
+                s, user_id="cred-valid", server_key=cred_key,
+                access_token="a", refresh_token=None, expires_at=future,
+            )
+            await upsert_user_token(
+                s, user_id="cred-refresh", server_key=cred_key,
+                access_token="a", refresh_token="r", expires_at=past,
+            )
+            await upsert_user_token(
+                s, user_id="cred-expired", server_key=cred_key,
+                access_token="a", refresh_token=None, expires_at=past,
+            )
+
+        r = await client.get(
+            f"/admin/api/agents/{cred_id}/credentials", params={"principal": "cred-valid"}
+        )
+        srv = r.json()[0]
+        check("valid token -> token_state valid", srv.get("token_state") == "valid", r.text)
+        check("valid token -> expires_at reported", bool(srv.get("expires_at")), r.text)
+        check("valid token -> has_token True", srv["has_token"] is True, r.text)
+
+        r = await client.get(
+            f"/admin/api/agents/{cred_id}/credentials", params={"principal": "cred-refresh"}
+        )
+        srv = r.json()[0]
+        check(
+            "expired+refresh -> token_state refreshable",
+            srv.get("token_state") == "refreshable", r.text,
+        )
+        check("expired+refresh -> has_token stays True", srv["has_token"] is True, r.text)
+
+        r = await client.get(
+            f"/admin/api/agents/{cred_id}/credentials", params={"principal": "cred-expired"}
+        )
+        srv = r.json()[0]
+        check(
+            "expired without refresh -> token_state expired",
+            srv.get("token_state") == "expired", r.text,
+        )
+        check("expired without refresh -> has_token False", srv["has_token"] is False, r.text)
+
         # --- Lifespan shutdown ---------------------------------------------
         received.append({"type": "lifespan.shutdown"})
         try:

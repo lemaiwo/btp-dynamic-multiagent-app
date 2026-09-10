@@ -53,3 +53,31 @@ QUnit.test("server summary counts servers and names the builtins", function (ass
     );
     assert.strictEqual(formatter.serverSummary([]), "—");
 });
+
+QUnit.test("a server needing no token is neutral, whatever its token state", function (assert) {
+    // app_only and destination servers are connected by configuration. Colouring
+    // them would suggest an action nobody can take from this screen.
+    assert.strictEqual(formatter.credentialState(false, "none"), "None");
+    assert.strictEqual(formatter.credentialState(false, "valid"), "None");
+});
+
+QUnit.test("a live token reads as success, an expired one as an error", function (assert) {
+    assert.strictEqual(formatter.credentialState(true, "valid"), "Success");
+    assert.strictEqual(formatter.credentialState(true, "expired"), "Error");
+});
+
+QUnit.test("a refreshable token is success, not a warning", function (assert) {
+    // The access token has expired but PerUserOAuth2Auth renews it silently, so
+    // the connection works and nobody needs to do anything. Flagging it would
+    // train admins to ignore the column.
+    assert.strictEqual(formatter.credentialState(true, "refreshable"), "Success");
+});
+
+QUnit.test("never signing in is a warning, not an error", function (assert) {
+    // Nothing is broken yet — the agent has simply not been connected.
+    assert.strictEqual(formatter.credentialState(true, "none"), "Warning");
+});
+
+QUnit.test("an unknown token state degrades to a warning", function (assert) {
+    assert.strictEqual(formatter.credentialState(true, "bogus" as never), "Warning");
+});

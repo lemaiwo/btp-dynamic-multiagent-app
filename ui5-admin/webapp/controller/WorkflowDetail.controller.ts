@@ -4,6 +4,7 @@ import { ValueState } from "sap/ui/core/library";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
+import { buildDefinitionGraph } from "../model/processFlowGraph";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
@@ -63,11 +64,36 @@ export default class WorkflowDetail extends BaseController {
             availableAgents: [],
             errors: {}
         }), "workflow");
+        // Its own model, so redrawing the graph cannot feed back into the
+        // editor state it was drawn from.
+        this.setModel(new JSONModel({ lanes: [], nodes: [] }), "flow");
 
         this.getRouter().getRoute("workflowDetail")?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const id = (event.getParameter("arguments") as { workflowId: string }).workflowId;
             void this.load(id);
         });
+    }
+
+    /**
+     * Redraws the preview from the current editor state, saved or not.
+     *
+     * Called from each handler that can change the graph's shape rather than
+     * from a model listener: `JSONModel.setProperty` fires no `propertyChange`,
+     * so a model-level listener would never run. The rows' free-text fields
+     * (instructions, timeout) are deliberately not wired up — they cannot
+     * change the shape.
+     */
+    private refreshFlow(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const data = model.getProperty("/data") as UiWorkflowData;
+        // Positions are recomputed the way collectBranches/collectSteps will
+        // on save (1..n within each group), so the preview shows the order the
+        // rows are actually in rather than whatever positions were loaded.
+        const graph = buildDefinitionGraph(
+            WorkflowDetail.collectBranches(data.branches),
+            WorkflowDetail.collectSteps(data.steps)
+        );
+        (this.getModel("flow") as JSONModel).setData(graph);
     }
 
     private async load(id: string): Promise<void> {
@@ -185,6 +211,7 @@ export default class WorkflowDetail extends BaseController {
             branchOptions: this.buildBranchOptionsForStep(s.branch_key)
         }));
         model.setProperty("/data/steps", steps);
+        this.refreshFlow();
     }
 
     // --- Branches -----------------------------------------------------------
@@ -226,6 +253,7 @@ export default class WorkflowDetail extends BaseController {
             branchOptions: this.buildBranchOptionsForStep(null)
         });
         model.setProperty("/data/steps", steps);
+        this.refreshFlow();
     }
 
     public onRemoveStep(event: Event): void {
@@ -234,6 +262,13 @@ export default class WorkflowDetail extends BaseController {
         const steps = (model.getProperty("/data/steps") as UiStep[]).slice();
         steps.splice(index, 1);
         model.setProperty("/data/steps", steps);
+        this.refreshFlow();
+    }
+
+    /** A step row's branch, agent or fan-out changed. The two-way binding has
+     * already written it; this only redraws the preview. */
+    public onStepRowChange(): void {
+        this.refreshFlow();
     }
 
     /** The row index of a press event's binding context, for tables whose
