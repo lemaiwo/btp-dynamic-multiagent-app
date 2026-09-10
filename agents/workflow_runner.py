@@ -192,6 +192,22 @@ class _WorkflowError(Exception):
     """
 
 
+class _PreflightError(_WorkflowError):
+    """A preflight refusal, tagged with the step agent it should be blamed on.
+
+    Preflight checks agents, not steps, and runs before anything executes — so
+    without this the run records a message and no step run at all, and a
+    reader (the run detail flow diagram, most visibly) cannot see where the run
+    stopped. `step_agent` is the agent some step actually names: for a peer
+    that fails its credential check, that is the agent which would have
+    consulted it, since the peer has no step of its own.
+    """
+
+    def __init__(self, message: str, *, step_agent: str | None = None):
+        super().__init__(message)
+        self.step_agent = step_agent
+
+
 def _snapshot(rows) -> list:
     """Detach ORM rows into plain namespaces before their session closes.
 
@@ -220,30 +236,37 @@ async def _preflight(workflow: Workflow, steps) -> dict:
     # step, delegation included — so the same peer reached from two steps with
     # different principals is two different questions.
     to_check: dict[tuple[str, str], object] = {}
+    roots: dict[tuple[str, str], str] = {}
     async with SessionLocal() as session:
         for name in names:
             row = await get_agent_by_name(session, name)
             if row is None or not row.enabled:
-                raise _WorkflowError(
+                raise _PreflightError(
                     f"Agent {name!r} does not exist or is disabled. Enable it "
                     "(or point this step at a different agent) in /admin and "
-                    "reload."
+                    "reload.",
+                    step_agent=name,
                 )
             if registry.build.specialists.get(name) is None:
-                raise _WorkflowError(
+                raise _PreflightError(
                     f"Agent {name!r} is not built (disabled, or no usable MCP "
-                    "servers). Fix it in /admin and reload."
+                    "servers). Fix it in /admin and reload.",
+                    step_agent=name,
                 )
             principal = effective_principal(row, workflow)
             if not principal:
-                raise _WorkflowError(
+                raise _PreflightError(
                     f"No run-as principal is configured for agent {name!r}, and "
                     f"workflow {workflow.name!r} sets no fallback. A scheduled "
                     "run has no interactive user to borrow an identity from; "
-                    "set one in /admin."
+                    "set one in /admin.",
+                    step_agent=name,
                 )
             resolved[name] = row
             to_check[(principal, name)] = row
+            # Every entry remembers which step-level agent put it there, so a
+            # failure deep in the peer graph can still be blamed on a real step.
+            roots[(principal, name)] = name
 
         # Peers are reachable from a step's agent, and a peer with no usable
         # credential does NOT fail the delegation: registry._delegate returns
@@ -273,6 +296,7 @@ async def _preflight(workflow: Workflow, steps) -> dict:
                     # nothing to check, and nothing to fail the run over.
                     continue
                 to_check[key] = peer_row
+                roots[key] = roots[(principal, name)]
                 queue.append((peer, principal, depth + 1))
 
     for (principal, name), row in to_check.items():
@@ -281,12 +305,78 @@ async def _preflight(workflow: Workflow, steps) -> dict:
                 " That agent is reached as a peer from one of this workflow's "
                 "steps."
             )
-            raise _WorkflowError(
+            raise _PreflightError(
                 f"The service account {principal!r} has no usable credential "
                 f"for agent {name!r}'s MCP servers. It must be re-authorized "
-                f"interactively before scheduled runs can work.{via}"
+                f"interactively before scheduled runs can work.{via}",
+                step_agent=roots.get((principal, name), name),
             )
     return resolved
+
+
+def _execution_order(steps, branches) -> list:
+    """Steps in the order a run reaches them.
+
+    Not simply "main line first": the main-line steps after the fan-out are the
+    join, and they run once per item *after* that item's branches. Sorting them
+    with the rest of the main line would blame a join step for a block that a
+    branch step would have hit first.
+    """
+    branch_position = {b.key: b.position for b in branches}
+    main_line = sorted(
+        [s for s in steps if s.branch_key is None], key=lambda s: s.position
+    )
+    fan_index = next((i for i, s in enumerate(main_line) if s.fan_out), None)
+    if fan_index is None:
+        return main_line + sorted(
+            [s for s in steps if s.branch_key is not None],
+            key=lambda s: (branch_position.get(s.branch_key, 10**6), s.position),
+        )
+    branch_steps = sorted(
+        [s for s in steps if s.branch_key is not None],
+        key=lambda s: (branch_position.get(s.branch_key, 10**6), s.position),
+    )
+    return main_line[:fan_index + 1] + branch_steps + main_line[fan_index + 1:]
+
+
+async def _record_blocked_step(run_id: str, steps, branches, error) -> None:
+    """Mark the step a preflight refusal stopped the run at.
+
+    Preflight fails before anything executes, so without this the run carries a
+    message and not one step run — and the run detail's flow diagram has no way
+    to show where it stopped. Only the *first* step that would have used the
+    offending agent is marked: the ones after it were never reached, and
+    colouring them too would claim failures that never happened.
+
+    Best-effort, like _finalize: this is reporting detail, and losing it must
+    not stop the run from being recorded as failed.
+    """
+    agent_name = getattr(error, "step_agent", None)
+    if not agent_name:
+        return
+    blocked = next(
+        (s for s in _execution_order(steps, branches) if s.agent_name == agent_name),
+        None,
+    )
+    if blocked is None:
+        # The agent is reachable only as a peer of a peer, with no step of its
+        # own to blame. The run-level error still explains it.
+        return
+    try:
+        async with SessionLocal() as session:
+            step_run = await create_step_run(
+                session, run_id=run_id, item_run_id=None,
+                branch_key=blocked.branch_key, position=blocked.position,
+                agent_name=blocked.agent_name,
+            )
+        async with SessionLocal() as session:
+            await finish_step_run(
+                session, step_run.id, status="failed", error=str(error)
+            )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Could not record the blocked step for workflow run %s", run_id
+        )
 
 
 async def _run_step(
@@ -380,6 +470,7 @@ async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
         try:
             agent_rows = await _preflight(workflow, steps)
         except _WorkflowError as e:
+            await _record_blocked_step(run_id, steps, branches, e)
             await _finalize(run_id, status="failed", error=str(e))
             return
 

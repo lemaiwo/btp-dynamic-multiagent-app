@@ -4,8 +4,13 @@ import Press from "sap/ui/test/actions/Press";
 import HashChanger from "sap/ui/core/routing/HashChanger";
 import type Table from "sap/m/Table";
 import type List from "sap/m/List";
+import type Select from "sap/m/Select";
+import type HBox from "sap/m/HBox";
+import type ObjectStatus from "sap/m/ObjectStatus";
+import type Item from "sap/ui/core/Item";
 import type JSONModel from "sap/ui/model/json/JSONModel";
 import type UI5Element from "sap/ui/core/Element";
+import type ProcessFlow from "sap/suite/ui/commons/ProcessFlow";
 import type { WorkflowStepRun } from "com/infrabel/agentadmin/service/types";
 import Common from "./pages/Common";
 
@@ -117,6 +122,90 @@ opaTest(
             },
             success: function () {
                 Opa5.assert.ok(true, "the pre-fan-out step's output text is rendered in the DOM too");
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "the run flow highlights the path the selected item took, and switching items switches the path",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflow-runs/${RUN_ID}`);
+
+        Then.waitFor({
+            id: "runFlow",
+            viewName: "WorkflowRunDetail",
+            // The flow needs both the run and the workflow definition, which
+            // are two round trips -- poll rather than assert on first match.
+            check: function (element: UI5Element) {
+                return (element as ProcessFlow).getNodes().length > 0;
+            },
+            success: function (element: UI5Element) {
+                const byId = new Map((element as ProcessFlow).getNodes().map((n) => [n.getNodeId(), n]));
+                Opa5.assert.strictEqual(byId.size, 4, "every step of the definition is drawn, not only the ones that ran");
+                Opa5.assert.strictEqual(
+                    byId.get("main-0")?.getState(), "Positive",
+                    "the pre-fan-out step took its state from the run-level step run"
+                );
+                Opa5.assert.strictEqual(
+                    byId.get("billing-0")?.getState(), "Positive",
+                    "item-1's billing step succeeded"
+                );
+                Opa5.assert.ok(byId.get("billing-0")?.getHighlighted(), "and is on the highlighted path");
+                Opa5.assert.strictEqual(
+                    byId.get("support-0")?.getState(), "Planned",
+                    "the branch this item never entered stays planned"
+                );
+                Opa5.assert.notOk(byId.get("support-0")?.getHighlighted(), "and off the highlighted path");
+            }
+        });
+
+        // Driven through a real change event rather than the dropdown: a
+        // programmatic setSelectedKey alone does not write back through the
+        // two-way binding -- same reason WorkflowDetailJourney arranges its
+        // step rows through the model.
+        When.waitFor({
+            id: "runItemSelect",
+            viewName: "WorkflowRunDetail",
+            success: function (element: UI5Element) {
+                const select = element as Select;
+                select.setSelectedKey("item-2");
+                select.fireChange({ selectedItem: select.getSelectedItem() as Item });
+            }
+        });
+
+        Then.waitFor({
+            id: "runFlow",
+            viewName: "WorkflowRunDetail",
+            check: function (element: UI5Element) {
+                const byId = new Map((element as ProcessFlow).getNodes().map((n) => [n.getNodeId(), n]));
+                return byId.get("billing-0")?.getState() === "Planned";
+            },
+            success: function (element: UI5Element) {
+                const byId = new Map((element as ProcessFlow).getNodes().map((n) => [n.getNodeId(), n]));
+                Opa5.assert.notOk(
+                    byId.get("billing-0")?.getHighlighted(),
+                    "item-2 was skipped before any branch ran, so no branch is highlighted for it"
+                );
+                Opa5.assert.strictEqual(
+                    byId.get("main-0")?.getState(), "Positive",
+                    "the step that ran once for the whole run keeps its state whichever item is selected"
+                );
+            }
+        });
+
+        Then.waitFor({
+            id: "runFlowLegend",
+            viewName: "WorkflowRunDetail",
+            success: function (element: UI5Element) {
+                const labels = (element as HBox).getItems()
+                    .map((item) => (item as ObjectStatus).getText());
+                Opa5.assert.deepEqual(
+                    labels, ["Succeeded", "Failed", "Running", "Not run"],
+                    "the legend names every state the diagram can draw"
+                );
             }
         });
 

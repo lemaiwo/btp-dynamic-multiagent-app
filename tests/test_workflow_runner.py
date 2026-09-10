@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -54,6 +55,19 @@ def check(label: str, condition: bool, detail: str = "") -> None:
 
 
 SERVERS = [{"url": "https://x.example.com/mcp", "auth_mode": "none"}]
+
+
+def only_step(steps):
+    """The single step run a blocked preflight records, or a blank stand-in.
+
+    Without this, one missing row raises IndexError and takes the rest of the
+    file's checks down with it -- a missing row should fail its own checks and
+    nothing else.
+    """
+    if steps:
+        return steps[0]
+    return SimpleNamespace(agent_name=None, position=None, branch_key=None,
+                           status=None, error=None, item_run_id=None)
 
 
 class FakeResult:
@@ -293,7 +307,21 @@ async def main() -> None:
         steps = await list_step_runs(s, run_id)
     check("run failed", row.status == "failed", row.status)
     check("error names the missing agent", "second" in (row.error or ""), row.error)
-    check("nothing ran", steps == [], str(steps))
+    # A preflight failure blocks the run before any step executes, but leaving
+    # no step run at all makes the flow diagram a uniform grey -- it cannot say
+    # where the run stopped. One failed step run is recorded against the step
+    # that would have used the offending agent, so the stopping point is
+    # visible without overstating what ran.
+    st = only_step(steps)
+    check("the blocked step is recorded as failed", len(steps) == 1, str(len(steps)))
+    check("it is the step that names the unbuilt agent",
+          st.agent_name == "second" and st.position == 2,
+          f"{st.agent_name} pos={st.position}")
+    check("recorded as failed", st.status == "failed", str(st.status))
+    check("carrying the preflight message",
+          "second" in (st.error or ""), str(st.error))
+    check("and nothing is attributed to the step that never got a turn",
+          all(st.position != 1 for st in steps), str([st.position for st in steps]))
 
     print("\n== preflight refuses a stale credential ==")
     install_specialists({"first": first, "second": second})
@@ -301,9 +329,17 @@ async def main() -> None:
     run_id = await run_workflow("linear")
     async with SessionLocal() as s:
         row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
     check("run failed on credentials", row.status == "failed", row.status)
     check("error mentions authorization",
           "author" in (row.error or "").lower(), row.error)
+    # Both agents fail the gate here; only the earliest blocked step is marked,
+    # because that is where the run actually stopped.
+    st = only_step(steps)
+    check("only the first blocked step is marked", len(steps) == 1, str(len(steps)))
+    check("and it is the earliest one in execution order",
+          st.position == 1 and st.agent_name == "first",
+          f"{st.agent_name} pos={st.position}")
     job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
 
     print("\n== preflight refuses a step with no principal at all ==")
@@ -329,6 +365,78 @@ async def main() -> None:
     check("error names the principal-less agent",
           "second" in (row.error or "") and "principal" in (row.error or "").lower(),
           row.error)
+
+    print("\n== a blocked branch step is attributed to its own branch ==")
+    # The diagram locates a node by branch_key + position, not by agent name:
+    # two branches routinely share one agent. Recording the blocked step
+    # without its branch would light up the wrong node.
+    fan = FakeAgent("fan", answers=["[]"])
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="fan", description="f", instructions="f",
+                           mcp_servers=SERVERS, run_as_principal="svc@example.com")
+        await upsert_agent(s, name="brancher", description="b", instructions="b",
+                           mcp_servers=SERVERS, run_as_principal="svc@example.com")
+        await upsert_workflow(
+            s, name="branch_blocked", description="d", enabled=True,
+            branches=[{"key": "billing", "description": "b", "position": 1}],
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "fan",
+                 "instructions": "read", "fan_out": True,
+                 "step_timeout_seconds": 60},
+                {"branch_key": "billing", "position": 1, "agent_name": "brancher",
+                 "instructions": "draft", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    install_specialists({"fan": fan})  # 'brancher' is missing
+    run_id = await run_workflow("branch_blocked")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run failed", row.status == "failed", row.status)
+    st = only_step(steps)
+    check("one blocked step recorded", len(steps) == 1, str(len(steps)))
+    check("it carries the branch it belongs to",
+          st.branch_key == "billing" and st.position == 1,
+          f"{st.branch_key} pos={st.position}")
+    check("with no item, because none were discovered",
+          st.item_run_id is None, str(st.item_run_id))
+
+    print("\n== a blocked peer is attributed to the step that would consult it ==")
+    # The peer itself has no step of its own, so the only honest place to mark
+    # is the step whose agent would have delegated to it.
+    consulter = FakeAgent("consulter", answers=["ok"])
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="peerless", description="p", instructions="p",
+                           mcp_servers=SERVERS, run_as_principal="svc@example.com")
+        await upsert_agent(s, name="consulter", description="c", instructions="c",
+                           mcp_servers=SERVERS, run_as_principal="svc@example.com",
+                           peers=["peerless"])
+        await upsert_workflow(
+            s, name="peer_blocked", description="d", enabled=True, branches=[],
+            steps=[
+                {"branch_key": None, "position": 1, "agent_name": "consulter",
+                 "instructions": "ask the peer", "fan_out": False,
+                 "step_timeout_seconds": 60},
+            ],
+        )
+    install_specialists({"consulter": consulter, "peerless": FakeAgent("peerless")})
+    job_runner._has_usable_credentials = (
+        lambda agent, principal=None: asyncio.sleep(0, result=agent.name != "peerless")
+    )
+    run_id = await run_workflow("peer_blocked")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    check("run failed on the peer's credential", row.status == "failed", row.status)
+    check("run error names the peer", "peerless" in (row.error or ""), row.error)
+    st = only_step(steps)
+    check("one step recorded", len(steps) == 1, str(len(steps)))
+    check("it is the consulting step, not the peer",
+          st.agent_name == "consulter", str(st.agent_name))
+    check("its error still names the peer that is actually broken",
+          "peerless" in (st.error or ""), str(st.error))
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
 
     print("\n== a step falls back to the workflow's run-as principal ==")
     # The REAL credential gate, deliberately: every other test in this file
@@ -418,7 +526,14 @@ async def main() -> None:
           "peer_deep" in (row.error or ""), row.error)
     check("the error says it was reached as a peer",
           "peer" in (row.error or "").lower(), row.error)
-    check("no step ran", steps == [], str(steps))
+    # Nothing executed, but the run still records *where* it was stopped, on
+    # the step whose agent would have consulted the broken peer -- see
+    # _record_blocked_step.
+    blocked = only_step(steps)
+    check("only the blocked step is recorded", len(steps) == 1, str(len(steps)))
+    check("recorded as failed, with no output",
+          blocked.status == "failed" and getattr(blocked, "output", None) is None,
+          f"{blocked.status} / {getattr(blocked, 'output', None)!r}")
     check("no model call was made", peer_root_agent.prompts == [],
           str(peer_root_agent.prompts))
     job_runner._has_usable_credentials = stub_credentials(True)

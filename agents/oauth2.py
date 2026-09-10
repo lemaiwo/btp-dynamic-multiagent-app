@@ -630,6 +630,41 @@ async def has_usable_token(user_id: str, server_key: str) -> bool:
     return (not _is_expired(row.expires_at)) or bool(row.refresh_token)
 
 
+async def token_status(user_id: str, server_key: str) -> tuple[str, datetime | None]:
+    """How usable the user's stored credential for a server is, and until when.
+
+    Returns one of:
+
+    ``none``
+        No token is stored at all — the user has never signed in.
+    ``valid``
+        The access token has not expired; the connection works right now.
+    ``refreshable``
+        The access token has expired, but a refresh token is stored, so
+        :class:`PerUserOAuth2Auth` renews it without an interactive sign-in.
+    ``expired``
+        The access token has expired and there is nothing to refresh with —
+        the user must sign in again.
+
+    The admin UI shows this so an expiring or already-dead credential is
+    visible *before* a scheduled run fails on it. ``has_usable_token`` answers
+    the yes/no gate; this answers "and how healthy is it".
+
+    The second element is the access token's expiry (``None`` when the server
+    issued no ``expires_in``, which means it does not expire on its own).
+    """
+    async with SessionLocal() as session:
+        row = await get_user_token(session, user_id, server_key)
+    if row is None:
+        return "none", None
+    expires_at = row.expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if not _is_expired(row.expires_at):
+        return "valid", expires_at
+    return ("refreshable" if row.refresh_token else "expired"), expires_at
+
+
 async def complete_authorization(*, code: str, state: str, principal: str | None) -> str:
     """Exchange an authorization code for tokens and persist them.
 

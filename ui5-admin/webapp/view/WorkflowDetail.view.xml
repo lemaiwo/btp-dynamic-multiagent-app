@@ -3,7 +3,8 @@
     xmlns="sap.m"
     xmlns:mvc="sap.ui.core.mvc"
     xmlns:core="sap.ui.core"
-    xmlns:f="sap.ui.layout.form">
+    xmlns:f="sap.ui.layout.form"
+    xmlns:pf="sap.suite.ui.commons">
     <Page
         id="workflowDetailPage"
         title="{workflow>/title}"
@@ -86,6 +87,49 @@
                     </f:SimpleForm>
                 </Panel>
 
+                <Panel
+                    id="flowPreviewPanel"
+                    headerText="{i18n>flowPreviewPanel}"
+                    expandable="true"
+                    expanded="true"
+                    class="sapUiSmallMarginTop">
+                    <VBox>
+                        <Text text="{i18n>flowPreviewHint}" class="sapUiTinyMarginBottom" />
+                        <Text
+                            id="workflowFlowEmpty"
+                            text="{i18n>noFlow}"
+                            visible="{= ${flow>/nodes}.length === 0 }" />
+                        <!-- scrollable=false: the control would otherwise
+                             claim a fixed height and scroll internally, which
+                             inside this form page reads as a broken panel. -->
+                        <pf:ProcessFlow
+                            id="workflowFlow"
+                            nodes="{flow>/nodes}"
+                            lanes="{flow>/lanes}"
+                            scrollable="false"
+                            foldedCorners="true"
+                            visible="{= ${flow>/nodes}.length > 0 }">
+                            <pf:nodes>
+                                <pf:ProcessFlowNode
+                                    nodeId="{flow>nodeId}"
+                                    laneId="{flow>laneId}"
+                                    title="{flow>title}"
+                                    children="{flow>children}"
+                                    texts="{flow>texts}"
+                                    state="{flow>state}"
+                                    stateText="{flow>stateText}"
+                                    highlighted="{flow>highlighted}" />
+                            </pf:nodes>
+                            <pf:lanes>
+                                <pf:ProcessFlowLaneHeader
+                                    laneId="{flow>laneId}"
+                                    text="{flow>label}"
+                                    position="{flow>position}" />
+                            </pf:lanes>
+                        </pf:ProcessFlow>
+                    </VBox>
+                </Panel>
+
                 <Panel headerText="{i18n>branchesPanel}" expandable="false" class="sapUiSmallMarginTop">
                     <Table
                         id="branchesTable"
@@ -145,6 +189,7 @@
                                         selectedKey="{workflow>branch_key}"
                                         items="{workflow>branchOptions}"
                                         forceSelection="false"
+                                        change=".onStepRowChange"
                                         width="9rem">
                                         <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
                                     </Select>
@@ -152,11 +197,12 @@
                                         selectedKey="{workflow>agent_name}"
                                         items="{workflow>agentOptions}"
                                         forceSelection="false"
+                                        change=".onStepRowChange"
                                         width="10rem">
                                         <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
                                     </Select>
                                     <TextArea value="{workflow>instructions}" rows="2" width="100%" />
-                                    <CheckBox selected="{workflow>fan_out}" />
+                                    <CheckBox selected="{workflow>fan_out}" select=".onStepRowChange" />
                                     <StepInput value="{workflow>step_timeout_seconds}" min="10" max="1800" step="10" width="7rem" />
                                     <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
                                 </cells>

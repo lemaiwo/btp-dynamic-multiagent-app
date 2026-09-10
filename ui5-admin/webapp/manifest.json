@@ -19,7 +19,8 @@
         "sap.ui.core": {},
         "sap.f": {},
         "sap.tnt": {},
-        "sap.ui.layout": {}
+        "sap.ui.layout": {},
+        "sap.suite.ui.commons": {}
       }
     },
     "rootView": {

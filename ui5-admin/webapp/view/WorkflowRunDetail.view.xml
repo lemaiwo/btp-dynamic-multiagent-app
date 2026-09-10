@@ -2,7 +2,9 @@
     controllerName="com.infrabel.agentadmin.controller.WorkflowRunDetail"
     xmlns="sap.m"
     xmlns:mvc="sap.ui.core.mvc"
-    xmlns:f="sap.ui.layout.form">
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form"
+    xmlns:pf="sap.suite.ui.commons">
     <Page
         id="workflowRunDetailPage"
         title="{run>/data/workflow_name}"
@@ -45,6 +47,73 @@
                     visible="{= !!${run>/data/error} }"
                     showIcon="true"
                     class="sapUiSmallMarginTop" />
+
+                <Panel
+                    id="runFlowPanel"
+                    headerText="{i18n>runFlowPanel}"
+                    expandable="true"
+                    expanded="true"
+                    class="sapUiSmallMarginTop">
+                    <VBox>
+                        <MessageStrip
+                            id="runFlowUnavailable"
+                            text="{i18n>runFlowUnavailable}"
+                            type="Information"
+                            showIcon="true"
+                            visible="{= !${flow>/available} }" />
+                        <HBox
+                            alignItems="Center"
+                            visible="{= ${flow>/itemOptions}.length > 0 }"
+                            class="sapUiTinyMarginBottom">
+                            <Label text="{i18n>runFlowItem}" labelFor="runItemSelect" class="sapUiTinyMarginEnd" />
+                            <Select
+                                id="runItemSelect"
+                                items="{flow>/itemOptions}"
+                                selectedKey="{flow>/selectedItem}"
+                                change=".onSelectItem"
+                                width="20rem">
+                                <core:Item key="{flow>key}" text="{flow>text}" />
+                            </Select>
+                        </HBox>
+                        <pf:ProcessFlow
+                            id="runFlow"
+                            nodes="{flow>/nodes}"
+                            lanes="{flow>/lanes}"
+                            scrollable="false"
+                            foldedCorners="true"
+                            visible="{flow>/available}">
+                            <pf:nodes>
+                                <pf:ProcessFlowNode
+                                    nodeId="{flow>nodeId}"
+                                    laneId="{flow>laneId}"
+                                    title="{flow>title}"
+                                    children="{flow>children}"
+                                    texts="{flow>texts}"
+                                    state="{flow>state}"
+                                    stateText="{flow>stateText}"
+                                    highlighted="{flow>highlighted}" />
+                            </pf:nodes>
+                            <pf:lanes>
+                                <pf:ProcessFlowLaneHeader
+                                    laneId="{flow>laneId}"
+                                    text="{flow>label}"
+                                    position="{flow>position}" />
+                            </pf:lanes>
+                        </pf:ProcessFlow>
+                        <!-- "Not run" is a dashed grey node, which nothing on
+                             the diagram itself explains. -->
+                        <HBox
+                            id="runFlowLegend"
+                            wrap="Wrap"
+                            visible="{flow>/available}"
+                            class="sapUiTinyMarginTop">
+                            <ObjectStatus text="{i18n>flowLegendSucceeded}" state="Success" class="sapUiMediumMarginEnd" />
+                            <ObjectStatus text="{i18n>flowLegendFailed}" state="Error" class="sapUiMediumMarginEnd" />
+                            <ObjectStatus text="{i18n>flowLegendRunning}" state="Warning" class="sapUiMediumMarginEnd" />
+                            <ObjectStatus text="{i18n>flowLegendNotRun}" state="None" />
+                        </HBox>
+                    </VBox>
+                </Panel>
 
                 <!-- Steps that ran once for the whole run, before the fan-out
                      step produced any items, kept out of the items list

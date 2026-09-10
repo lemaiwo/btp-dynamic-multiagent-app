@@ -12,6 +12,7 @@ import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
 import type Text from "sap/m/Text";
 import type UI5Element from "sap/ui/core/Element";
+import type ProcessFlow from "sap/suite/ui/commons/ProcessFlow";
 import type { WorkflowStep } from "com/infrabel/agentadmin/service/types";
 import Common, { backend } from "./pages/Common";
 
@@ -78,6 +79,67 @@ opaTest(
                 Opa5.assert.strictEqual(
                     (billingRow.getCells()[1] as Select).getSelectedKey(), "btp-agent",
                     "a branch step's agent is preselected"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "the flow preview draws the saved workflow and redraws as steps are added",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        Then.waitFor({
+            id: "workflowFlow",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const nodes = (element as ProcessFlow).getNodes();
+                Opa5.assert.strictEqual(nodes.length, 4, "one node per seeded step");
+                const fanOut = nodes.find((n) => n.getNodeId() === "main-0");
+                Opa5.assert.strictEqual(fanOut?.getTitle(), "gmail-agent", "the fan-out node is titled by its agent");
+                Opa5.assert.deepEqual(
+                    fanOut?.getChildren(), ["billing-0", "support-0"],
+                    "the fan-out node forks to the head of each declared branch"
+                );
+                Opa5.assert.deepEqual(
+                    nodes.find((n) => n.getNodeId() === "support-0")?.getChildren(), ["support-1"],
+                    "the two-step branch chains internally"
+                );
+                Opa5.assert.deepEqual(
+                    nodes.find((n) => n.getNodeId() === "billing-0")?.getChildren(), [],
+                    "with no step after the fan-out there is nothing to join back into yet"
+                );
+            }
+        });
+
+        When.waitFor({
+            id: "addStepButton",
+            viewName: "WorkflowDetail",
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "workflowFlow",
+            viewName: "WorkflowDetail",
+            // Polled, because the preview is redrawn from the model change the
+            // press causes rather than by the press itself.
+            check: function (element: UI5Element) {
+                return (element as ProcessFlow).getNodes().length === 5;
+            },
+            success: function (element: UI5Element) {
+                const nodes = (element as ProcessFlow).getNodes();
+                const added = nodes.find((n) => n.getNodeId() === "main-1");
+                Opa5.assert.ok(added, "the new row appears in the preview immediately, unsaved");
+                Opa5.assert.strictEqual(
+                    added?.getState(), "Planned",
+                    "a step with no agent chosen yet is drawn as planned rather than dropped"
+                );
+                Opa5.assert.deepEqual(
+                    nodes.find((n) => n.getNodeId() === "billing-0")?.getChildren(), ["main-1"],
+                    "adding a main-line step after the fan-out gives the branches a join to reconnect to"
                 );
             }
         });

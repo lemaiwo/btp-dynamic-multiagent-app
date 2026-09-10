@@ -22,7 +22,8 @@ gains a field on the backend, add it to *both* admins in the same change.
   HTTP), `types.ts` (mirrors of the Pydantic payloads), `ErrorHandler`,
   `ReportRenderer`
 - `ui5-admin/webapp/controller/`, `view/`, `fragment/` — one controller per view
-- `ui5-admin/webapp/model/` — formatters and client-side validators
+- `ui5-admin/webapp/model/` — formatters, client-side validators, and
+  `processFlowGraph.ts` (workflow definition → ProcessFlow lanes/nodes)
 - `ui5-admin/webapp/test/` — QUnit unit tests and OPA5 journeys
 - `ui5-admin/e2e/` — Playwright specs against a live backend
 
@@ -43,6 +44,40 @@ admin API is open.
 npm test              # repo root: Node report tests + UI5 unit + OPA5
 npm run test:e2e      # Playwright; boots both servers itself
 ```
+
+## Workflow flow diagrams
+
+Both workflow screens draw a `sap.suite.ui.commons.ProcessFlow` from the same
+pure builder, `webapp/model/processFlowGraph.ts`:
+
+- **Workflow detail** — a read-only preview above the branches table, redrawn
+  from the editor's current state (unsaved rows included) whenever something
+  that changes the graph's shape changes: a branch added, removed or renamed, a
+  step added or removed, or a step's branch, agent or fan-out flag. It is
+  redrawn from the explicit handlers rather than a model listener, because
+  `JSONModel.setProperty` fires no `propertyChange`.
+- **Workflow run detail** — the same graph coloured by one run, with a picker
+  choosing which work item's path is highlighted, and a legend naming the four
+  states. Steps that ran once for the whole run take their state from the
+  run-level step runs; per-item steps take theirs from the selected item, so
+  branches another item entered stay "Planned". The definition is fetched
+  fresh, so a workflow edited since the run draws its *current* shape; if it
+  has been deleted the panel says so and the step lists below still carry the
+  whole run.
+
+A run refused by preflight never executes a step, so it used to draw as a
+uniform grey diagram that could not say where it stopped.
+`_record_blocked_step` in `agents/workflow_runner.py` now records one failed
+step run against the first step that would have used the offending agent
+(for an agent reached only as a peer, the step that would have consulted it),
+and the diagram matches it: with no item selected, a per-item node accepts a
+step run that carries no item. Only the first blocked step is marked — the
+steps after it were never reached.
+
+Adding the library meant listing `sap.suite.ui.commons` in `manifest.json`,
+`ui5.yaml` and `ui5-local.yaml`. It is served from the version-pinned
+`/resources/` route like every other library — see the `resolve: false` note in
+`ui5.yaml`.
 
 ## How routing works in both hosts
 

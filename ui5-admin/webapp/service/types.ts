@@ -176,6 +176,16 @@ export interface JobRunDetail extends JobRun {
 }
 
 /** Per-MCP-server credential status for a principal. */
+/**
+ * How usable a stored credential is. Mirrors `token_status` in
+ * `agents/oauth2.py`.
+ *
+ * `refreshable` means the access token has expired but a refresh token is
+ * stored, so the connection renews itself without an interactive sign-in —
+ * working, not broken. `expired` has nothing left to refresh with.
+ */
+export type TokenState = "none" | "valid" | "refreshable" | "expired";
+
 export interface CredentialStatus {
     url: string;
     auth_mode: AuthMode;
@@ -183,6 +193,10 @@ export interface CredentialStatus {
     has_token: boolean;
     /** Relative to the backend host, e.g. "/oauth/login?agent=...&server=...". */
     login_url: string;
+    token_state: TokenState;
+    /** ISO expiry of the access token, or null when the server issued no
+     * `expires_in` (the token does not expire on its own). */
+    expires_at: string | null;
 }
 
 export interface WhoAmI {

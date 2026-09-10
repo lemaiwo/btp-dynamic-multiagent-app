@@ -7,6 +7,7 @@ import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import validators from "../model/validators";
+import formatter from "../model/formatter";
 import type Dialog from "sap/m/Dialog";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
@@ -42,6 +43,8 @@ interface ModelOption {
  * @namespace com.infrabel.agentadmin.controller
  */
 export default class AgentDetail extends BaseController {
+
+    public formatter = formatter;
 
     private agentId?: number;
     private serverDialog?: Dialog;

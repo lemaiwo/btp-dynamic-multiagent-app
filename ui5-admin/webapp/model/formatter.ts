@@ -1,5 +1,7 @@
 import { ValueState } from "sap/ui/core/library";
-import type { McpServer, RunStatus, WorkflowItemStatus, WorkflowRunStatus } from "../service/types";
+import type {
+    McpServer, RunStatus, TokenState, WorkflowItemStatus, WorkflowRunStatus
+} from "../service/types";
 
 const EM_DASH = "—";
 
@@ -22,6 +24,17 @@ const WORKFLOW_RUN_STATUS_STATES: Record<WorkflowRunStatus, ValueState> = {
     // common real outcome. Warning rather than Error keeps it from reading
     // as a generic failure.
     partial: ValueState.Warning
+};
+
+const TOKEN_STATES: Record<TokenState, ValueState> = {
+    valid: ValueState.Success,
+    // The access token has expired, but PerUserOAuth2Auth renews it from the
+    // refresh token without anyone signing in — the connection works, so this
+    // is not something to flag.
+    refreshable: ValueState.Success,
+    // Nothing is broken yet: the agent has simply never been connected.
+    none: ValueState.Warning,
+    expired: ValueState.Error
 };
 
 const WORKFLOW_ITEM_STATUS_STATES: Record<WorkflowItemStatus, ValueState> = {
@@ -75,6 +88,17 @@ export default {
         }
         const parsed = new Date(iso);
         return isNaN(parsed.getTime()) ? EM_DASH : parsed.toLocaleString();
+    },
+
+    /** Colour for a server's credential. Servers that need no user token
+     * (app_only, destination, none) stay neutral: they are connected by
+     * configuration, and colouring them would suggest an action nobody can
+     * take from this screen. */
+    credentialState(needsToken: boolean, tokenState: TokenState): ValueState {
+        if (!needsToken) {
+            return ValueState.None;
+        }
+        return TOKEN_STATES[tokenState] ?? ValueState.Warning;
     },
 
     /** One-line description of an agent's toolsets for the list view. */

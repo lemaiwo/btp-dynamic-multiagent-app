@@ -1,5 +1,5 @@
 import type {
-    Agent, JobRunDetail, Skill, WorkflowDetail, WorkflowRunDetail
+    Agent, CredentialStatus, JobRunDetail, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/infrabel/agentadmin/service/types";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
@@ -19,6 +19,8 @@ export default class FakeBackend {
     public runs: JobRunDetail[] = [];
     public workflows: WorkflowDetail[] = [];
     public workflowRuns: WorkflowRunDetail[] = [];
+    /** Credential rows served for agent 100 — one server per token state. */
+    public credentials: CredentialStatus[] = [];
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
 
@@ -67,6 +69,27 @@ export default class FakeBackend {
         this.agents[0].peers = ["gmail-agent"];
         this.agents[0].model_name = "gpt-4o";
         this.agents[1].model_name = "retired-model";
+        // One row per token state, so a journey can assert that the sign-in
+        // button is offered for a working credential as well as a dead one.
+        this.credentials = [
+            {
+                url: "https://a.hana.ondemand.com/mcp", auth_mode: "oauth2",
+                needs_token: true, has_token: true, token_state: "valid",
+                expires_at: "2099-01-01T00:00:00+00:00",
+                login_url: "/oauth/login?agent=btp-agent&server=a"
+            },
+            {
+                url: "https://b.hana.ondemand.com/mcp", auth_mode: "oauth2",
+                needs_token: true, has_token: false, token_state: "expired",
+                expires_at: "2020-01-01T00:00:00+00:00",
+                login_url: "/oauth/login?agent=btp-agent&server=b"
+            },
+            {
+                url: "builtin:jira", auth_mode: "destination",
+                needs_token: false, has_token: true, token_state: "valid",
+                expires_at: null, login_url: ""
+            }
+        ];
         this.skills = [{
             id: 1, name: "sap-notes", description: "How to read SAP notes",
             content: "Full instructions here.", created_at: null, updated_at: null
@@ -218,7 +241,7 @@ export default class FakeBackend {
             }
         }
         if (/^agents\/\d+\/credentials$/.test(path)) {
-            return this.json([]);
+            return this.json(Number(path.split("/")[1]) === 100 ? this.credentials : []);
         }
         if (path === "skills" && method === "GET") {
             return this.json(this.skills);
