@@ -952,11 +952,12 @@ async def get_agent_by_slug(session: AsyncSession, slug: str) -> AgentConfig | N
 
 _OAUTH_KEYS = ("client_id", "client_secret", "uaa_url", "authorize_url", "token_url", "scope")
 # client_credentials has no browser leg, so no authorize_url. It gains a target
-# (`mailbox`) because an app-only token names no user, and `allow_send`, which
-# is deliberately separate from the token's permissions: holding Mail.Send must
-# not be enough to give an agent a send tool.
+# (`mailbox`) because an app-only token names no user, `recipients` because mail
+# the agent originates has no incoming message to reply to and so no audience of
+# its own, and `allow_send`, which is deliberately separate from the token's
+# permissions: holding Mail.Send must not be enough to give an agent a send tool.
 _CC_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope", "mailbox",
-            "lookback")
+            "lookback", "recipients")
 
 
 def _clean_client_credentials(

@@ -48,3 +48,15 @@ def test_none_mode_without_a_url_carries_no_config():
 
 def test_jwt_mode_carries_no_config():
     assert _clean_oauth({"min_score": "9.0"}, "jwt", None, url="builtin:sapnotes") is None
+
+
+def test_client_credentials_stores_recipients():
+    cleaned = _clean_oauth(
+        {"client_id": "a", "client_secret": "b", "token_url": "https://t.example",
+         "mailbox": "agent@example.com", "recipients": "team@example.com, basis@example.com"},
+        "app_only",
+        None,
+        url="builtin:outlook",
+    )
+    assert cleaned["recipients"] == "team@example.com, basis@example.com"
+    assert cleaned["allow_send"] is False

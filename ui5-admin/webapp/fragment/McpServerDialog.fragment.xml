@@ -82,6 +82,14 @@
                 placeholder="{i18n>mailboxHint}"
                 visible="{= ${server>/auth_mode} === 'app_only' }" />
 
+            <Label text="{i18n>recipientsLabel}"
+                   visible="{= ${server>/url} === 'builtin:outlook' }" />
+            <Input
+                id="oauthRecipients"
+                value="{server>/oauth/recipients}"
+                placeholder="{i18n>recipientsPlaceholder}"
+                visible="{= ${server>/url} === 'builtin:outlook' }" />
+
             <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' }" />
             <Input
                 id="oauthLookback"
