@@ -242,6 +242,27 @@ class OAuthClientPayload(BaseModel):
         return config
 
 
+class SessionPayload(BaseModel):
+    """A browser session cookie for a `session`-mode server."""
+
+    cookie: str = Field(min_length=1, max_length=16384)
+    # 12h matches the upstream project's cache TTL. Bounded because an
+    # over-long TTL makes the credentials panel claim a session is healthy
+    # long after SAP dropped it, which is worse than showing nothing.
+    expires_in_hours: int = Field(default=12, ge=1, le=48)
+    # Defaults to the caller. Set it when connecting a service identity that
+    # is not you -- the same value the "Use my principal" button fills in.
+    principal: str = Field(default="", max_length=255)
+
+    @field_validator("cookie")
+    @classmethod
+    def _cookie_is_not_blank(cls, v: str) -> str:
+        text = (v or "").strip()
+        if not text:
+            raise ValueError("cookie must not be blank")
+        return text
+
+
 class McpServerPayload(BaseModel):
     url: str = Field(min_length=1)
     auth_mode: str = Field(default=AUTH_MODE_JWT)
@@ -869,7 +890,7 @@ async def api_agent_credentials(
     for spec in servers:
         url = str(spec.get("url") or "")
         auth_mode = str(spec.get("auth_mode") or "")
-        needs_token = auth_mode == AUTH_MODE_OAUTH2
+        needs_token = auth_mode in (AUTH_MODE_OAUTH2, AUTH_MODE_SESSION)
         has_token = False
         login_url = ""
         # "none" both for a server that needs no token and for one nobody has
@@ -911,6 +932,36 @@ async def api_agent_credentials(
             "expires_at": expires_at,
         })
     return out
+
+
+@router.post("/api/sessions/{server_key:path}", dependencies=[Depends(require_admin)])
+async def api_store_session(server_key: str, payload: SessionPayload) -> dict[str, Any]:
+    """Store a browser session cookie for a `session`-mode server.
+
+    The response never echoes the cookie: it is a live credential, and an
+    admin API that reflects one back has widened where it can leak to.
+    """
+    from agents.oauth2 import store_session_cookie
+    from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+
+    key = server_key.strip().lower()
+    if key != BUILTIN_SAPNOTEDETAIL_URL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{server_key!r} does not use a browser session",
+        )
+
+    who = (payload.principal or "").strip() or (current_principal.get() or "")
+    if not who:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="no principal: pass one, or call this with a user token",
+        )
+
+    expires_at = await store_session_cookie(
+        who, key, payload.cookie, payload.expires_in_hours
+    )
+    return {"server_key": key, "principal": who, "expires_at": expires_at.isoformat()}
 
 
 # ---------------------------------------------------------------------------
