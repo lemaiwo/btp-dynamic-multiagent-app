@@ -60,3 +60,8 @@ def test_client_credentials_stores_recipients():
     )
     assert cleaned["recipients"] == "team@example.com, basis@example.com"
     assert cleaned["allow_send"] is False
+
+
+def test_session_mode_carries_no_config_block():
+    """The cookie is a credential and lives in mcp_oauth_tokens, not here."""
+    assert _clean_oauth({"cookie": "x"}, "session", None, url="builtin:sapnotedetail") is None

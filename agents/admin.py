@@ -39,12 +39,14 @@ from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
+from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
+    AUTH_MODE_SESSION,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
     OAUTH_CONFIG_MODES,
@@ -272,6 +274,25 @@ class McpServerPayload(BaseModel):
                 f"{BUILTIN_JIRA_URL} requires auth_mode=destination: it holds "
                 "no credential of its own and reaches Jira only through the "
                 "BTP destination named in oauth.destination"
+            )
+        is_note_detail = (
+            str(self.url or "").strip().rstrip("/").lower() == BUILTIN_SAPNOTEDETAIL_URL
+        )
+        if is_note_detail and self.auth_mode != AUTH_MODE_SESSION:
+            # Caught here rather than at reload for the same reason the Jira
+            # rule is: the toolset has no other way to authenticate, so a
+            # server saved under another mode builds fine and then fails
+            # mid-run, with the agent still looking configured in the UI.
+            raise ValueError(
+                f"{BUILTIN_SAPNOTEDETAIL_URL} requires auth_mode=session: it "
+                "authenticates with a browser session cookie refreshed by a "
+                "human, and holds no credential of its own"
+            )
+        if self.auth_mode == AUTH_MODE_SESSION and not is_note_detail:
+            raise ValueError(
+                "auth_mode=session is only supported for "
+                f"{BUILTIN_SAPNOTEDETAIL_URL}; no other server reads a "
+                "browser session cookie"
             )
         if self.auth_mode == AUTH_MODE_OAUTH2:
             cfg = self.oauth.to_config() if self.oauth else {}

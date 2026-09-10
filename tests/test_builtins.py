@@ -38,3 +38,44 @@ def test_unknown_builtin_still_rejected():
 
     with pytest.raises(ValueError, match="unknown built-in toolset"):
         build_builtin_toolset("builtin:teams", {}, "none")
+
+
+def test_sapnotedetail_is_a_known_builtin():
+    from agents.builtins import BUILTIN_URLS, is_builtin_url
+
+    assert "builtin:sapnotedetail" in BUILTIN_URLS
+    assert is_builtin_url("builtin:sapnotedetail")
+
+
+def test_build_builtin_toolset_constructs_sapnotedetail():
+    from pydantic_ai.toolsets import FunctionToolset
+
+    from agents.builtins import build_builtin_toolset
+
+    toolset = build_builtin_toolset("builtin:sapnotedetail", {}, "session")
+    assert isinstance(toolset, FunctionToolset)
+
+
+def test_session_mode_is_rejected_on_any_other_url():
+    from pydantic import ValidationError
+
+    from agents.admin import McpServerPayload
+
+    with pytest.raises(ValidationError, match="builtin:sapnotedetail"):
+        McpServerPayload(url="builtin:gmail", auth_mode="session")
+
+
+def test_sapnotedetail_is_rejected_under_any_other_mode():
+    from pydantic import ValidationError
+
+    from agents.admin import McpServerPayload
+
+    with pytest.raises(ValidationError, match="auth_mode=session"):
+        McpServerPayload(url="builtin:sapnotedetail", auth_mode="none")
+
+
+def test_sapnotedetail_accepts_session_mode():
+    from agents.admin import McpServerPayload
+
+    payload = McpServerPayload(url="builtin:sapnotedetail", auth_mode="session")
+    assert payload.auth_mode == "session"
