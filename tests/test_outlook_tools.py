@@ -145,8 +145,11 @@ def _client(rec: Recorder) -> OutlookClient:
 async def main() -> None:
     # --- dispatch and validation -------------------------------------------
     print("\n== builtin registry ==")
-    check("all three built-ins registered",
-          BUILTIN_URLS == {BUILTIN_GMAIL_URL, BUILTIN_OUTLOOK_URL, BUILTIN_JIRA_URL},
+    # A subset, not an equality: the set is closed but it grows, and pinning
+    # it here made adding a built-in fail a mail test for no reason. What the
+    # whole set contains is `tests/test_builtins.py`.
+    check("the three mail/issue built-ins are registered",
+          {BUILTIN_GMAIL_URL, BUILTIN_OUTLOOK_URL, BUILTIN_JIRA_URL} <= BUILTIN_URLS,
           f"got {sorted(BUILTIN_URLS)}")
     check("recognises builtin:outlook", is_builtin_url(BUILTIN_OUTLOOK_URL))
     check("still recognises builtin:gmail", is_builtin_url(BUILTIN_GMAIL_URL))

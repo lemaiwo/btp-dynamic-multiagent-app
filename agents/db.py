@@ -994,6 +994,27 @@ def _clean_client_credentials(
 _DEST_KEYS = ("destination", "project", "status", "lookback", "api_base", "labels")
 
 
+# A public built-in stores no credential either -- NVD needs none. These are
+# filtering knobs only, and the whitelist is what keeps this from becoming a
+# general-purpose place to stash settings on any 'none' server.
+_BUILTIN_PUBLIC_KEYS = ("min_score", "lookback")
+
+
+def _clean_builtin_public(oauth: Any) -> dict[str, Any] | None:
+    """Normalize the config block of a built-in on ``auth_mode='none'``.
+
+    Returns None when nothing survives, so an unconfigured server stores no
+    block at all rather than an empty dict.
+    """
+    src = oauth if isinstance(oauth, dict) else {}
+    cleaned: dict[str, Any] = {}
+    for k in _BUILTIN_PUBLIC_KEYS:
+        v = src.get(k)
+        if v is not None and str(v).strip() != "":
+            cleaned[k] = str(v).strip()
+    return cleaned or None
+
+
 def _clean_destination(oauth: Any) -> dict[str, Any]:
     """Normalize a ``destination`` oauth block for storage.
 
@@ -1023,7 +1044,7 @@ def _clean_destination(oauth: Any) -> dict[str, Any]:
 
 
 def _clean_oauth(
-    oauth: Any, mode: str, fallback: dict[str, Any] | None
+    oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
     """Normalize an OAuth config dict for storage.
 
@@ -1041,8 +1062,15 @@ def _clean_oauth(
     token_url|uaa_url, scope?, mailbox?, allow_send?}``. No authorize_url,
     because nobody visits a browser.
 
+    A built-in on ``none`` takes a fourth shape: ``{min_score?, lookback?}``.
+    Public data source, no credential, filtering knobs only.
+
     Returns None for modes that carry no oauth block.
     """
+    if mode == AUTH_MODE_NONE:
+        from agents.builtins import is_builtin_url
+
+        return _clean_builtin_public(oauth) if is_builtin_url(url) else None
     if mode == AUTH_MODE_DESTINATION:
         return _clean_destination(oauth)
     if mode == AUTH_MODE_APP_ONLY:
@@ -1097,7 +1125,7 @@ def prepare_servers(
             raise ValueError("MCP server url is required")
         if mode not in VALID_AUTH_MODES:
             raise ValueError(f"invalid auth_mode {mode!r}")
-        oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url))
+        oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
             entry["oauth"] = oauth
