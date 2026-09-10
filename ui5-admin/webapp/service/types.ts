@@ -84,6 +84,16 @@ export type OAuthClient =
            * same reason `allow_send` is.
            */
           allow_comment?: boolean;
+          /**
+           * `builtin:sapnotes` only, on `auth_mode: "none"`. The CVSS floor a
+           * note must reach to be reported; 9.0 is what SAP calls HotNews.
+           * Sent as a string like every other field here; the server parses it.
+           *
+           * The CVE source is deliberately NOT configurable — it is pinned to
+           * SAP's own CNA id in `agents/sapnotes_tools.py`, because a
+           * different value does not narrow the toolset, it breaks it.
+           */
+          min_score?: string;
       };
 
 export interface McpServer {

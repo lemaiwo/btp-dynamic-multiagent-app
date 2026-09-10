@@ -30,6 +30,10 @@ QUnit.test("builtin:jira is a known toolset URL", (assert) => {
     assert.strictEqual(validators.validateServerUrl("builtin:jira", "destination"), "");
 });
 
+QUnit.test("accepts builtin:sapnotes", function (assert) {
+    assert.strictEqual(validators.validateServerUrl("builtin:sapnotes", "none"), "");
+});
+
 QUnit.module("validators.validateOAuth");
 
 QUnit.test("dcr needs no manual credentials", function (assert) {
@@ -256,4 +260,35 @@ QUnit.test("app-only rejects dynamic registration", function (assert) {
         { dcr: true }, "app_only", "builtin:outlook"
     );
     assert.ok(error.indexOf("dynamic registration") > -1, error);
+});
+
+QUnit.module("validators.validateOAuth on a public builtin");
+
+QUnit.test("a public builtin may carry min_score on 'none'", function (assert) {
+    assert.strictEqual(
+        validators.validateOAuth({ min_score: "9.0" }, "none", "builtin:sapnotes"), ""
+    );
+});
+
+QUnit.test("a real MCP server on 'none' still carries no config", function (assert) {
+    assert.notStrictEqual(
+        validators.validateOAuth({ min_score: "9.0" }, "none", "https://x.example/mcp"), ""
+    );
+});
+
+QUnit.test("a credential key is rejected even on a public builtin", function (assert) {
+    const msg = validators.validateOAuth(
+        { min_score: "9.0", client_secret: "hunter2" }, "none", "builtin:sapnotes"
+    );
+    assert.ok(msg.indexOf("client_secret") > -1, "names the offending key");
+});
+
+QUnit.test("an out-of-range min_score is rejected", function (assert) {
+    assert.notStrictEqual(
+        validators.validateOAuth({ min_score: "42" }, "none", "builtin:sapnotes"), ""
+    );
+});
+
+QUnit.test("an empty block on 'none' is still fine", function (assert) {
+    assert.strictEqual(validators.validateOAuth(undefined, "none", "builtin:sapnotes"), "");
 });

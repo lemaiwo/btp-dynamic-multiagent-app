@@ -96,6 +96,14 @@
                 text="{i18n>allowSendHint}"
                 visible="{= ${server>/auth_mode} === 'app_only' }" />
 
+            <Label text="{i18n>minScoreLabel}"
+                   visible="{= ${server>/url} === 'builtin:sapnotes' }" />
+            <Input
+                id="oauthMinScore"
+                value="{server>/oauth/min_score}"
+                placeholder="{i18n>minScorePlaceholder}"
+                visible="{= ${server>/url} === 'builtin:sapnotes' }" />
+
             <Label text="{i18n>destinationName}" required="true"
                    visible="{= ${server>/auth_mode} === 'destination' }" />
             <Input
