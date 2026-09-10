@@ -899,10 +899,16 @@ async def api_agent_credentials(
         expires_at: str | None = None
         if needs_token:
             server_key = normalize_mcp_url(url)
-            login_url = (
-                f"/oauth/login?agent={quote(agent_name)}"
-                f"&server={quote(server_key, safe='')}"
-            )
+            # Session mode has no authorization-code flow to send anyone
+            # through: the cookie is written by POST /admin/api/sessions and
+            # refreshed by scripts/sap_session.py, not by signing in here.
+            # Advertising a login link for it would send an operator into a
+            # flow that does not exist for this server.
+            if auth_mode == AUTH_MODE_OAUTH2:
+                login_url = (
+                    f"/oauth/login?agent={quote(agent_name)}"
+                    f"&server={quote(server_key, safe='')}"
+                )
             if who:
                 try:
                     state, expiry = await token_status(who, server_key)

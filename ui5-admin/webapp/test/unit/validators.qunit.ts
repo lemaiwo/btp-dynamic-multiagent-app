@@ -292,3 +292,19 @@ QUnit.test("an out-of-range min_score is rejected", function (assert) {
 QUnit.test("an empty block on 'none' is still fine", function (assert) {
     assert.strictEqual(validators.validateOAuth(undefined, "none", "builtin:sapnotes"), "");
 });
+
+QUnit.test("accepts builtin:sapnotedetail", function (assert) {
+    assert.strictEqual(validators.validateServerUrl("builtin:sapnotedetail", "session"), "");
+});
+
+QUnit.test("session mode carries no oauth config", function (assert) {
+    assert.strictEqual(
+        validators.validateOAuth(undefined, "session", "builtin:sapnotedetail"), ""
+    );
+});
+
+QUnit.test("session mode rejects an oauth config block", function (assert) {
+    assert.notStrictEqual(
+        validators.validateOAuth({ client_id: "x" }, "session", "builtin:sapnotedetail"), ""
+    );
+});

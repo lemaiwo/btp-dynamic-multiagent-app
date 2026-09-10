@@ -17,6 +17,7 @@ const BUILTIN_URLS = [
     "builtin:outlook",
     "builtin:jira",
     "builtin:sapnotes",
+    "builtin:sapnotedetail",
 ] as const;
 
 /**
