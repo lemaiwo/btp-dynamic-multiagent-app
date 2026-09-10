@@ -1052,8 +1052,11 @@ git commit -m "feat(sapnotedetail): add auth_mode=session and register the built
 **Files:**
 - Modify: `agents/oauth2.py` (a setter next to the existing token helpers)
 - Modify: `agents/admin.py` (new endpoint; credential-status recognition)
-- Modify: `agents/registry.py` (pass the cookie into the toolset)
+- Modify: `agents/sapnotedetail_tools.py` (resolve the cookie per call — Step 6)
 - Test: `tests/test_admin_api.py`
+
+`agents/registry.py` is deliberately NOT modified: resolving the cookie at
+call time rather than at build time is what avoids touching it.
 
 **Interfaces:**
 - Consumes: `AUTH_MODE_SESSION` (Task 4), `sapnotedetail_toolset(cookie=...)` (Task 3)
