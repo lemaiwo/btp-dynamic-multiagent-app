@@ -1213,7 +1213,7 @@ In `ui5-admin/webapp/i18n/i18n.properties`, next to the other auth-mode labels:
 #XSEL: Browser session cookie auth mode
 authSession=Browser session (refreshed by hand)
 #XFLD: Explains that this credential is not entered in this dialog
-sessionHint=This server uses a session cookie refreshed with scripts/refresh_sapnotes_session.py. There is nothing to enter here.
+sessionHint=This server uses a session cookie refreshed with scripts/sap_session.py. There is nothing to enter here.
 ```
 
 In `ui5-admin/webapp/fragment/McpServerDialog.fragment.xml`, add the option to

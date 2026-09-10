@@ -78,7 +78,7 @@ operator, and the operator guide must repeat the warning.
 ## Architecture
 
 ```
-scripts/refresh_sapnotes_session.py   (operator's machine, Playwright)
+scripts/sap_session.py refresh        (operator's machine, Playwright)
         │  login at accounts.sap.com, capture *.sap.com cookies
         ▼
 POST /admin/api/sessions/{server_key}   (admin-only)
@@ -211,7 +211,7 @@ footgun of typing an email address that matches no token row.
 
 The endpoint never logs the cookie value.
 
-### 5. `scripts/refresh_sapnotes_session.py`
+### 5. `scripts/sap_session.py` (the `refresh` subcommand)
 
 Runs on the operator's machine, not on the platform:
 
