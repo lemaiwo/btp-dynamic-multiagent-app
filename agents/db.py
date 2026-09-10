@@ -997,8 +997,11 @@ _DEST_KEYS = ("destination", "project", "status", "lookback", "api_base", "label
 
 # A public built-in stores no credential either -- NVD needs none. These are
 # filtering knobs only, and the whitelist is what keeps this from becoming a
-# general-purpose place to stash settings on any 'none' server.
-_BUILTIN_PUBLIC_KEYS = ("min_score", "lookback")
+# general-purpose place to stash settings on any 'none' server. Public rather
+# than private because `agents.admin` refuses the same set at the payload
+# boundary, and the two lists drifting apart would mean an admin could save a
+# key that is then silently dropped on the way to storage.
+BUILTIN_PUBLIC_KEYS = ("min_score", "lookback")
 
 
 def _clean_builtin_public(oauth: Any) -> dict[str, Any] | None:
@@ -1009,7 +1012,7 @@ def _clean_builtin_public(oauth: Any) -> dict[str, Any] | None:
     """
     src = oauth if isinstance(oauth, dict) else {}
     cleaned: dict[str, Any] = {}
-    for k in _BUILTIN_PUBLIC_KEYS:
+    for k in BUILTIN_PUBLIC_KEYS:
         v = src.get(k)
         if v is not None and str(v).strip() != "":
             cleaned[k] = str(v).strip()
