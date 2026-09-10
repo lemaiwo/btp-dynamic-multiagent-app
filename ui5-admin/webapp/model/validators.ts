@@ -12,11 +12,34 @@ import type { AuthMode, McpServer, OAuthClient } from "../service/types";
  */
 
 /** Closed set; an unknown `builtin:` value is a typo, not an extension point. */
-const BUILTIN_URLS = ["builtin:gmail", "builtin:outlook", "builtin:jira"] as const;
+const BUILTIN_URLS = [
+    "builtin:gmail",
+    "builtin:outlook",
+    "builtin:jira",
+    "builtin:sapnotes",
+] as const;
+
+/**
+ * Config keys a built-in may carry on `auth_mode: "none"`.
+ *
+ * Mirrors `_BUILTIN_PUBLIC_KEYS` in `agents/db.py`. A public data source needs
+ * no credential, so the only thing worth storing is how to narrow it — and the
+ * whitelist is what stops `none` becoming a general-purpose place to stash
+ * settings on any server.
+ */
+const BUILTIN_PUBLIC_KEYS = ["min_score", "lookback"] as const;
 
 export default {
 
     BUILTIN_URLS,
+
+    BUILTIN_PUBLIC_KEYS,
+
+    /** True when this url may carry a public config block on `none`. */
+    carriesPublicConfig(url: string): boolean {
+        return (BUILTIN_URLS as readonly string[])
+            .indexOf((url || "").trim().toLowerCase()) > -1;
+    },
 
     /** Returns an error message, or an empty string when the url is valid. */
     validateServerUrl(url: string, authMode: AuthMode): string {
@@ -113,13 +136,32 @@ export default {
             return "";
         }
         if (authMode !== "oauth2") {
-            const hasConfig = !!oauth && Object.keys(oauth).some((k) => {
+            // A built-in on `none` is the one case where a config block is
+            // legitimate without a credential: the source is public and the
+            // only settings are how to narrow it. Anything outside the
+            // whitelist is still an error, and still says so.
+            const publicBuiltin = authMode === "none" && this.carriesPublicConfig(url);
+            const set = Object.keys(oauth || {}).filter((k) => {
                 const v = (oauth as Record<string, unknown>)[k];
                 return k !== "has_client_secret" && v !== "" && v !== undefined && v !== false;
             });
-            return hasConfig
-                ? "OAuth configuration is only valid when auth mode is 'oauth2'."
-                : "";
+            if (!set.length) {
+                return "";
+            }
+            if (!publicBuiltin) {
+                return "OAuth configuration is only valid when auth mode is 'oauth2'.";
+            }
+            const stray = set.filter(
+                (k) => (BUILTIN_PUBLIC_KEYS as readonly string[]).indexOf(k) === -1
+            );
+            if (stray.length) {
+                return `A public built-in stores no credential. Remove: ${stray.join(", ")}.`;
+            }
+            const score = String((oauth as Record<string, unknown>).min_score ?? "").trim();
+            if (score && !(Number(score) >= 0 && Number(score) <= 10)) {
+                return "The minimum CVSS score must be a number between 0 and 10.";
+            }
+            return "";
         }
         if (!oauth) {
             return "An oauth2 server requires a client ID, or enable dynamic registration.";

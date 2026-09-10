@@ -187,7 +187,7 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "" },
             builtins: validators.BUILTIN_URLS.slice(),
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
@@ -231,7 +231,13 @@ export default class AgentDetail extends BaseController {
             return;
         }
 
-        const carriesOAuth = authMode === "oauth2" || authMode === "app_only" || authMode === "destination";
+        // `none` joins the list only for a built-in: those carry a public
+        // config block (a CVSS floor, a window) with no credential in it.
+        // For any other url on `none` there is nothing to configure, and
+        // sending a block would be rejected server-side anyway.
+        const publicBuiltin = authMode === "none" && validators.carriesPublicConfig(url);
+        const carriesOAuth = authMode === "oauth2" || authMode === "app_only"
+            || authMode === "destination" || publicBuiltin;
         const oauth = carriesOAuth
             ? AgentDetail.cleanOAuth(oauthRaw, authMode)
             : undefined;
@@ -249,7 +255,7 @@ export default class AgentDetail extends BaseController {
             // openServerDialog reads has_client_secret to decide whether to
             // show the "stored" placeholder. Carry it forward or that hint
             // silently disappears the second time round.
-            if (oauth.dcr !== true) {
+            if (oauth.dcr !== true && !publicBuiltin) {
                 oauth.has_client_secret = !!oauth.client_secret
                     || !!(oauthRaw as { has_client_secret?: boolean }).has_client_secret;
             }
@@ -272,6 +278,19 @@ export default class AgentDetail extends BaseController {
     private static cleanOAuth(
         raw: Record<string, unknown>, authMode: AuthMode = "oauth2"
     ): McpServer["oauth"] {
+        if (authMode === "none") {
+            // Whitelisted, not "everything that isn't blank": this block goes
+            // to a server with no credential in it, and it must stay that way
+            // even if the dialog model still holds fields from another mode.
+            const out: Record<string, unknown> = {};
+            validators.BUILTIN_PUBLIC_KEYS.forEach((key) => {
+                const value = String(raw[key] ?? "").trim();
+                if (value) {
+                    out[key] = value;
+                }
+            });
+            return (Object.keys(out).length ? out : undefined) as McpServer["oauth"];
+        }
         if (authMode === "destination") {
             return {
                 destination: String(raw.destination ?? "").trim(),
