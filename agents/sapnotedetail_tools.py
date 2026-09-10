@@ -64,6 +64,9 @@ def unavailable(note: str, reason: str) -> dict[str, Any]:
         "title": "",
         "note_type": "",
         "version": "",
+        "component": "",
+        "component_text": "",
+        "priority": "",
         "validity": [],
         "support_packages": [],
     }
@@ -92,10 +95,11 @@ def _packages(node: Any) -> list[dict[str, str]]:
 
 
 def _validity(node: Any) -> list[dict[str, str]]:
-    """Which components and release ranges the note applies to.
+    """Which software components and release ranges the note applies to.
 
-    The only place a software component appears: the response carries no
-    top-level component or priority field.
+    A different thing from the note's own `component` (`Header.
+    SAPComponentKey`): this is the per-row software component each validity
+    entry names, e.g. "HDB" or "SAP_UI".
     """
     out: list[dict[str, str]] = []
     for entry in _items(node):
@@ -130,6 +134,9 @@ def parse_detail(raw: Any, note: str) -> dict[str, Any]:
         "title": _text(record.get(_KEY_TITLE)),
         "note_type": _text(header.get("Type")),
         "version": _text(header.get("Version")),
+        "component": _text(header.get("SAPComponentKey")),
+        "component_text": _text(header.get("SAPComponentKeyText")),
+        "priority": _text(header.get("Priority")),
         "validity": _validity(record.get(_KEY_VALIDITY)),
         "support_packages": _packages(record.get(_KEY_SUPPORT_PACKAGE_PATCH)),
     }

@@ -29,10 +29,14 @@ That field lives in SAP's backbone. Three routes were investigated on
 does serve a plain HTTP client presenting Basic credentials, and returns a
 SAPCAR archive (`CAR 2.01`) holding `<note>_00.ZIP` and `SIGNATURE.SMF`. Two
 things kill it: the archive needs SAPCAR's proprietary decompressor, and no
-note-number → download-key mapping was found (SAP's documented example key
+note-number → download-key mapping was found *from the note number alone,
+without an authenticated session* (SAP's documented example key
 `0040000000874972019` returns an archive named for note 2755640, which the key
-does not encode). Without addressing arbitrary notes the service is useless
-here.
+does not encode). The `me.sap.com` capture itself later returned a working
+download URL for the requested note under `Actions.Download` — but only
+because it rode along on an authenticated session, which is the credential
+this route was meant to avoid needing. Without a mapping usable from the note
+number alone the service is useless here.
 
 **Rejected — a supported API.** There is none. SAP Community asks 12793379
 (2023) and 14450559 (2026) both went unanswered, and the latter reports the
@@ -124,8 +128,8 @@ and returns a compact table.
 
 **Per-note result:**
 
-Revised against the captured response — see "Confirmed API shape" below. There
-is no component or priority field to lift, and the fixing level comes from
+Revised against the captured response — see "Confirmed API shape" below. The
+component and priority come from `Header`, and the fixing level comes from
 `SupportPackagePatch`:
 
 ```python
@@ -135,8 +139,12 @@ is no component or priority field to lift, and the fixing level comes from
   "title": "2538856 - [CVE-2018-2424] Cross-Site Scripting (XSS) vulnerability in SAPUI5",
   "note_type": "SAP Security Note",
   "version": "11",
-  # The components the note applies to, and their release range. This is the
-  # only place a software component appears -- there is no top-level one.
+  # From Header.SAPComponentKey / .SAPComponentKeyText / .Priority.
+  "component": "CA-UI5-CTR-ROD",
+  "component_text": "Cross-Application Components > SAPUI5 > SAP UI5 Controls > SAP UI5 Controls Rodopi team",
+  "priority": "Correction with medium priority",
+  # The software components the note applies to, and their release range.
+  # A different, per-row list from the note's own top-level `component`.
   "validity": [{"software_component": "UISAPUI5", "from": "100", "to": "100"}],
   # The fixing level. `SupportPackagePatch`, NOT `SupportPackage`, which was
   # empty on every note sampled.
@@ -219,9 +227,14 @@ Runs on the operator's machine, not on the platform:
 2. Navigate to a me.sap.com URL that forces the SAML flow.
 3. Fill the `accounts.sap.com` form from `SAP_DIALOG_USER` / `SAP_DIALOG_PWD`,
    or let the operator complete it by hand.
-4. Capture every cookie whose domain contains `sap.com` and serialize them as
-   `name=value; name=value` — the upstream package takes all of them rather
-   than naming specific cookies, so this does the same.
+4. Capture only the cookies scoped to `me.sap.com` — the target host — and
+   serialize them as `name=value; name=value`. Concatenating every cookie
+   whose domain merely *contains* `sap.com` sends two different
+   `JSESSIONID` cookies (one for `me.sap.com`, one for the `accounts.sap.com`
+   identity provider) under the same name, and `me.sap.com` ends up reading
+   the identity provider's session — see "Confirmed by the same capture"
+   below. `cookies_for_host()` in `scripts/sap_session.py` does this
+   filtering.
 5. POST to the admin endpoint.
 
 Playwright is an ops dependency: documented in the operator guide, kept out of
@@ -332,6 +345,9 @@ matters and `q` is it.
 | `Header.Number.value` | str | the note number |
 | `Header.Type.value` | str | e.g. `"SAP Security Note"` |
 | `Header.Version.value` | int | note version |
+| `Header.SAPComponentKey.value` | str | the note's own component, e.g. `"CA-UI5-CTR-ROD"` |
+| `Header.SAPComponentKeyText.value` | str | that component's display name |
+| `Header.Priority.value` | str | e.g. `"Correction with medium priority"` |
 | `Title.value` | str | includes the CVE, e.g. `"2538856 - [CVE-2018-2424] …"` |
 | `Validity.Items[]` | `{SoftwareComponent, From, To}` | which components and releases the note applies to |
 | `SupportPackagePatch.Items[]` | `{SoftwareComponentVersion, SupportPackage, SupportPackagePatch, URL}` | **the fixing level** |
@@ -345,11 +361,16 @@ matters and `q` is it.
    while `SupportPackagePatch.Items` carried 1-30 entries. A parser that reads
    only `SupportPackage` would return nothing for every note and the feature
    would look like it worked.
-2. **There is no top-level component or priority field.** The design assumed
-   `SAPComponentKey` and `Priority`. Neither exists. The software component
-   comes from `Validity.Items[].SoftwareComponent`, and `Attributes.Items[]`
-   is a generic `{Key, Value}` list (e.g. `Externally Reported`,
-   `Planned Release Date`) — not the component.
+2. **The note's own component and priority live under `Header`, not
+   top-level.** The design assumed `SAPComponentKey` and `Priority` would be
+   directly under `Response.SAPNote`; instead they are
+   `Header.SAPComponentKey` / `Header.SAPComponentKeyText` /
+   `Header.Priority` — the same object `parse_detail` already reads for
+   `Type` and `Version`. That component is a different thing from
+   `Validity.Items[].SoftwareComponent`, which lists the *software
+   components the note applies to*, not the note's own component.
+   `Attributes.Items[]` is unrelated: a generic `{Key, Value}` list (e.g.
+   `Externally Reported`, `Planned Release Date`).
 3. **`Validity` / `SupportPackage` / `SupportPackagePatch` are objects with an
    `Items` list**, not bare lists. Each also carries `_columnNames`, which
    names its own columns and is a useful self-check if SAP renames a field.

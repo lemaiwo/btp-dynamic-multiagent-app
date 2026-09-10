@@ -90,6 +90,23 @@ session cookie, and POSTs it straight to the running app's
 to the console and never written to disk — it goes over HTTPS to the app and
 nowhere else.
 
+`--ttl-hours` (default 12, must be 1-48) controls how long the app treats the
+stored session as valid. It exists because that default is the **upstream
+project's cache TTL**, not a measured SAP session lifetime — nobody has
+established how long a real `me.sap.com` session actually survives. If real
+sessions die sooner than the TTL says, the credentials panel reports `valid`
+and the workflow's preflight check passes for a window after SAP has already
+dropped the session — the exact failure both mechanisms exist to prevent.
+Lower it if you observe sessions going dead before the reported expiry.
+
+`capture` (used to obtain a note for local testing, not part of the
+operator's monthly refresh) writes its raw response under `tmp/` by default
+— gitignored, because it is a live SAP session's output. Promoting a capture
+to the tracked fixture (`tests/fixtures/sapnote_detail.json`) is a deliberate
+step, never automatic: scrub it first — drop `Actions` entirely, and check
+for any `token=`/`auth=`/`key=`/`sid=` query parameter, any `*.sap.corp`
+host, any email address, and any S-user id — before it is committed.
+
 ## 6. Checking it took
 
 Open `/admin`, find the agent using `builtin:sapnotedetail`, and look at its
