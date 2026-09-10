@@ -45,6 +45,7 @@ from agents.db import (
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
+    BUILTIN_PUBLIC_KEYS,
     KEEP,
     OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
@@ -339,6 +340,21 @@ class McpServerPayload(BaseModel):
                     "remove oauth.client_id and oauth.client_secret and keep the "
                     "secret in the destination, where it can be rotated without "
                     "touching this app"
+                )
+        elif self.auth_mode == AUTH_MODE_NONE and is_builtin_url(self.url):
+            # The one credential-free config block. A public built-in reaches
+            # a source that needs no token, so the only thing worth storing is
+            # how to narrow it -- and the whitelist is what keeps 'none' from
+            # becoming a place to stash settings on any server. Mirrors
+            # BUILTIN_PUBLIC_KEYS in agents/db.py, which drops the rest on
+            # the way to storage; refusing here is what tells the caller why.
+            cfg = self.oauth.to_config() if self.oauth else {}
+            stray = sorted(set(cfg) - set(BUILTIN_PUBLIC_KEYS))
+            if stray:
+                raise ValueError(
+                    f"a public built-in on auth_mode=none stores no credential; "
+                    f"remove oauth.{', oauth.'.join(stray)} "
+                    f"(allowed: {', '.join(BUILTIN_PUBLIC_KEYS)})"
                 )
         elif self.oauth is not None and self.oauth.to_config():
             raise ValueError(

@@ -100,3 +100,26 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def test_sap_security_notes_bundle_is_importable():
+    """The shipped bundle must satisfy the same validation as an API import."""
+    import json
+    from pathlib import Path
+
+    import pytest
+
+    from agents.admin import ImportPayload
+
+    path = Path("docs/sap-security-notes-workflow.config.json")
+    if not path.exists():
+        pytest.skip("landscape bundle is gitignored; present only locally")
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    payload = ImportPayload.model_validate(raw)
+    names = {a.name for a in payload.agents}
+    assert names == {"sapnotes-fetcher", "sapnotes-system-analyst", "sapnotes-digest-writer"}
+    workflow = payload.workflows[0]
+    assert workflow.api_slug == "sap-security-notes"
+    # No fan-out: a digest step after one would fire per item, not per run.
+    assert all(not s.fan_out for s in workflow.steps)

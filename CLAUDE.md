@@ -68,6 +68,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `add_comment` is registered only when `allow_comment` is set.
   See `docs/JIRA_SETUP.md`
 - `agents/lookback.py` — the shared `parse_lookback` window parser
+- `agents/sapnotes_tools.py` — SAP security notes discovered through the
+  public NVD API (`builtin:sapnotes`). `sourceIdentifier=cna@sap.com` is
+  pinned in code; the CVSS floor is the one configurable knob. Returns the
+  whole backlog by default, because SAP re-releases notes without NVD
+  re-publishing the CVE. See `docs/SAP_SECURITY_NOTES.md`
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps. Attached skills are listed

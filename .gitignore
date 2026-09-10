@@ -4,6 +4,14 @@
 client_secret_*.json
 .tokens.json
 .tokens-*.json
+
+# Client certificates and keys. An SAP Passport (.pfx) authenticates as a
+# named S-user; committing one hands over that identity. These belong in a
+# CF secure environment variable or a mounted volume, never the repo.
+*.pfx
+*.p12
+*.pem
+*.key
 __pycache__/
 *.pyc
 .venv/
