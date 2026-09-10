@@ -1273,3 +1273,24 @@ async def run_tests() -> None:
 
 if __name__ == "__main__":
     asyncio.run(run_tests())
+
+
+# --- pytest-collected payload rules ----------------------------------------
+# The script harness above needs a running app; these are pure model checks
+# and are cheaper to express as plain pytest cases.
+
+
+def test_oauth_payload_rejects_an_out_of_range_min_score():
+    import pytest
+    from pydantic import ValidationError
+
+    from agents.admin import OAuthClientPayload
+
+    with pytest.raises(ValidationError, match="between 0 and 10"):
+        OAuthClientPayload(min_score="42")
+
+
+def test_oauth_payload_carries_min_score_into_config():
+    from agents.admin import OAuthClientPayload
+
+    assert OAuthClientPayload(min_score="9.0").to_config()["min_score"] == "9.0"

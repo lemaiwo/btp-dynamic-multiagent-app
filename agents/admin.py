@@ -138,6 +138,26 @@ class OAuthClientPayload(BaseModel):
     # labels", not "any of them". See agents/jira_tools.build_jql for why
     # this is the opposite of how `status` combines.
     labels: str = Field(default="", max_length=256)
+    # builtin:sapnotes only. The CVSS floor; 9.0 is what SAP calls HotNews.
+    # A string, not a float, because every other field here is one and the
+    # storage cleaner stringifies anyway.
+    min_score: str = Field(default="", max_length=8)
+
+    @field_validator("min_score")
+    @classmethod
+    def _validate_min_score(cls, v: str) -> str:
+        # Validated here so a typo is a 422 naming the field rather than a
+        # registry rebuild failure with no hint where it came from.
+        text = (v or "").strip()
+        if not text:
+            return ""
+        try:
+            score = float(text)
+        except ValueError:
+            raise ValueError("min_score must be a number between 0 and 10") from None
+        if not 0.0 <= score <= 10.0:
+            raise ValueError("min_score must be between 0 and 10")
+        return text
 
     @field_validator("status", "labels", mode="before")
     @classmethod
@@ -204,6 +224,7 @@ class OAuthClientPayload(BaseModel):
             "status": self.status.strip(),
             "api_base": self.api_base.strip(),
             "labels": self.labels.strip(),
+            "min_score": self.min_score.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:
