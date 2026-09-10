@@ -115,8 +115,10 @@ Nothing is sent — see the limits below.
 
 - **Roughly half of critical notes are not ABAP-stack** — Commerce Cloud,
   SAP GUI, NPM packages, NetWeaver Java, BusinessObjects, Business One,
-  SuccessFactors — and land in `UNKNOWN` until Phase 2 adds note-detail
-  lookup. The digest names them rather than guessing.
+  SuccessFactors — and land in `UNKNOWN`. `builtin:sapnotedetail` (see
+  [`docs/SAP_NOTE_DETAIL.md`](SAP_NOTE_DETAIL.md)) now narrows this by
+  resolving the fixing support-package level per note; the digest still
+  names anything it can't place rather than guessing.
 - **A note absent from `CWBNTHEAD` is not missing.** That table holds only
   notes downloaded through SNOTE; a note delivered in a support package was
   never downloaded and is simply absent. The analyst prompt says so
@@ -138,10 +140,10 @@ never stored in the database.
 
 ## Not in Phase 1
 
-- **Phase 2 — note detail.** Deploying the SAP notes MCP server and adding
-  `builtin:sapnotedetail`, which resolves the fixing support-package level and
-  should move most of the `UNKNOWN` bucket into a real answer. Gated on an
-  MFA-exempt S-user.
+- **Phase 2 — note detail.** Delivered as the `builtin:sapnotedetail` toolset
+  — see [`docs/SAP_NOTE_DETAIL.md`](SAP_NOTE_DETAIL.md). Rewiring the digest
+  workflow to consume `support_packages` and reshape the report is still
+  separate follow-up work.
 - **Phase 3 — scheduling.** The `jobscheduler` MTA resource, the
   `JOBSCHEDULER` scope, the monthly cron, a weekly keep-alive run for the
   30-day token, the remaining ARC-1 systems, and turning `allow_send` on.

@@ -24,12 +24,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/db.py` — SQLAlchemy models (`AgentConfig`, `SkillConfig`,
   `OrchestratorConfig`), `init_db`, CRUD helpers, VCAP/ENV postgres URL
   resolver. `AgentConfig.auth_mode` is one of `jwt`, `none`, `oauth2`,
-  `app_only`, `destination`. Skills are reusable instruction blocks attached
-  to agents by name (`AgentConfig.skills_json`). Six more tables back the
-  workflow engine: `Workflow`, `WorkflowBranch`, `WorkflowStep` (the
-  definition), and `WorkflowRun`, `WorkflowItemRun`, `WorkflowStepRun` (what
-  happened on a run). `validate_workflow_parts` is the save-time gate that
-  rejects a definition that cannot run
+  `app_only`, `destination`, `session`. Skills are reusable instruction
+  blocks attached to agents by name (`AgentConfig.skills_json`). Six more
+  tables back the workflow engine: `Workflow`, `WorkflowBranch`,
+  `WorkflowStep` (the definition), and `WorkflowRun`, `WorkflowItemRun`,
+  `WorkflowStepRun` (what happened on a run). `validate_workflow_parts` is
+  the save-time gate that rejects a definition that cannot run
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin` FastAPI dependencies
@@ -73,6 +73,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   pinned in code; the CVSS floor is the one configurable knob. Returns the
   whole backlog by default, because SAP re-releases notes without NVD
   re-publishing the CVE. See `docs/SAP_SECURITY_NOTES.md`
+- `agents/sapnotedetail_tools.py` — SAP note detail from the private
+  `me.sap.com` backend (`builtin:sapnotedetail`), giving the support-package
+  level that fixes each note. Authenticates with a browser session cookie
+  under `auth_mode="session"`, stored in `mcp_oauth_tokens` and refreshed by
+  hand with `scripts/sap_session.py`; Playwright stays off the platform.
+  See `docs/SAP_NOTE_DETAIL.md`
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps. Attached skills are listed
