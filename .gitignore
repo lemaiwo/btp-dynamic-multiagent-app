@@ -36,3 +36,7 @@ resources/
 # client ids and identity-provider tenant ids, and are meant to be imported
 # through the admin UI rather than tracked.
 docs/*.config.json
+
+# Fetched SAP note payloads and other scratch artifacts. Note content is
+# SAP-licensed material and support-backbone output; it is not ours to commit.
+tmp/
