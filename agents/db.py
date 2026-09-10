@@ -50,9 +50,14 @@ AUTH_MODE_APP_ONLY = "app_only"
 # and credential, so nothing secret is stored here at all. 11 characters --
 # see AUTH_MODE_MAX_LENGTH below, and what happened to "client_credentials".
 AUTH_MODE_DESTINATION = "destination"
+# A browser session cookie a human obtained and pasted in. Distinct from
+# oauth2 because there is no authorize endpoint and nothing to refresh with:
+# only a person with a browser can renew it, which is exactly what the
+# credentials panel needs to be able to say.
+AUTH_MODE_SESSION = "session"
 VALID_AUTH_MODES = frozenset({
     AUTH_MODE_JWT, AUTH_MODE_NONE, AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY,
-    AUTH_MODE_DESTINATION,
+    AUTH_MODE_DESTINATION, AUTH_MODE_SESSION,
 })
 # Modes carrying an `oauth` config block.
 OAUTH_CONFIG_MODES = frozenset({

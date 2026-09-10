@@ -23,6 +23,7 @@ from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
 from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
 from agents.sapnotes_tools import BUILTIN_SAPNOTES_URL, sapnotes_toolset
+from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL, sapnotedetail_toolset
 
 # url -> factory(oauth, server_key) -> AbstractToolset
 _FACTORIES: dict[str, Callable[..., Any]] = {
@@ -30,6 +31,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_OUTLOOK_URL: outlook_toolset,
     BUILTIN_JIRA_URL: jira_toolset,
     BUILTIN_SAPNOTES_URL: sapnotes_toolset,
+    BUILTIN_SAPNOTEDETAIL_URL: sapnotedetail_toolset,
 }
 
 BUILTIN_URLS = frozenset(_FACTORIES)
