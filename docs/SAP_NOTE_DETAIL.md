@@ -67,7 +67,20 @@ SAP_DIALOG_PWD=
 python scripts/sap_session.py refresh --base-url https://your-app-url --token <admin-token>
 ```
 
-`--token` defaults to `ADMIN_TOKEN` in `.env` when omitted. Add `--headful` if
+`--token` defaults to `ADMIN_TOKEN` in `.env` when omitted, but that variable
+is not pre-declared in `.env.example` — set it yourself. It is just a bearer
+token carrying the `$XSAPPNAME.admin` scope, the same kind any other
+`/admin/api/...` call needs. Locally, with no `VCAP_SERVICES` binding, admin
+routes are open and everyone is treated as an admin (see the README's "Local
+auth" note), so any non-blank string satisfies the flag. On a deployed BTP
+instance there is no shortcut through the browser: the approuter authenticates
+`/admin` by session cookie and attaches the XSUAA JWT only on its own hop to
+the backend, so it never appears in the browser's own dev tools. What you
+need instead is a real XSUAA access token for a user in the **Agent
+Administrator** role collection, obtained through your landscape's normal
+XSUAA token-issuance path against the app's bound `uaa-service` (the same
+authorization_code exchange that powers interactive `/admin` sign-in) — this
+project ships no separate script to mint one standalone. Add `--headful` if
 the account is expected to hit MFA — a visible browser window lets you finish
 the challenge by hand; see Known limits for when this applies.
 
@@ -85,8 +98,31 @@ credentials panel. `valid` with an expiry timestamp means the refresh landed;
 start — the workflow's preflight check names the agent and says its
 credential needs re-authorizing before the run proceeds.
 
-## 7. Known limits
+## 7. Known limits and troubleshooting
 
+- **The login is a two-step form, not one.** `accounts.sap.com` shows the
+  username field and a `Continue` button first, with **no password field on
+  that page at all** — filling one in there does nothing, and the password
+  step only appears after `Continue` is submitted. This is a code comment in
+  `scripts/sap_session.py` (`login()`), not enforced anywhere else. If SAP
+  changes this form, `refresh`/`capture` will hang until `--timeout` expires
+  with no clearer symptom than "did not reach me.sap.com" — that is the two-
+  step assumption breaking, and the fix is to update the selectors in
+  `login()`, not to suspect the credential.
+- **Symptom: login appears to succeed but every note comes back
+  `unavailable` / the raw `Detail` call returns ~723 bytes of HTML instead of
+  JSON.** This looks exactly like a bad password, but is almost always the
+  cookie-scoping trap: the captured browser session holds **two different
+  cookies both named `JSESSIONID`** — one for `me.sap.com`, one for
+  `accounts.sap.com` (the identity provider). Concatenating every `sap.com`
+  cookie into one header sends the name twice, and `me.sap.com` reads the
+  identity provider's session instead of its own, returning an anonymous
+  bootstrap page indistinguishable from an auth failure. The fix already
+  lives in code — `cookies_for_host()` in `scripts/sap_session.py` filters to
+  cookies actually scoped to `me.sap.com` before serializing the header — so
+  this should not recur through the shipped script, but it is the first
+  thing to suspect if a *hand-rolled* cookie capture (e.g. copied by hand
+  from browser dev tools) produces the same symptom.
 - **Private API.** `me.sap.com/backend/raw/sapnotes/Detail` has no public
   contract, is not documented by SAP, and can change shape without notice.
   The upstream project this approach is based on warns explicitly to check
