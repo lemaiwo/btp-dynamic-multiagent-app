@@ -302,7 +302,8 @@ async def main() -> None:
         transport=httpx.MockTransport(Recorder().handler),
     ))
     names = set(ts.tools.keys())
-    expected = {"list_pending", "get_message", "create_reply_draft", "move_message"}
+    expected = {"list_pending", "get_message", "create_reply_draft", "move_message",
+                "create_mail_draft"}
     check("exposes exactly the agreed tools", names == expected, f"got {sorted(names)}")
     check("exposes no send tool", not any("send" in n for n in names))
     check("exposes its http client for reload cleanup",
@@ -329,3 +330,95 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+# --- pytest-collected: originating mail ------------------------------------
+# Appended as pytest cases rather than folded into the script harness above:
+# these assert on the registered tool surface and on refusals, which read
+# better as isolated cases than as entries in one long recorder run.
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_create_mail_draft_posts_to_messages_with_pinned_recipients():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(201, json={"id": "draft-1"})
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                             transport=httpx.MockTransport(handler))
+    client = OutlookClient(http, mailbox="agent@example.com",
+                           recipients=["team@example.com", "basis@example.com"])
+    result = await client.create_mail_draft("Monthly report", "Body text")
+
+    assert result["draft_id"] == "draft-1"
+    assert seen["url"].endswith("/users/agent@example.com/messages")
+    addresses = [r["emailAddress"]["address"] for r in seen["json"]["toRecipients"]]
+    assert addresses == ["team@example.com", "basis@example.com"]
+    assert seen["json"]["subject"] == "Monthly report"
+
+
+@pytest.mark.asyncio
+async def test_send_mail_posts_to_sendmail():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content)
+        return httpx.Response(202)
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                             transport=httpx.MockTransport(handler))
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"])
+    result = await client.send_mail("Subject", "Body")
+
+    assert result["sent"] is True
+    assert seen["url"].endswith("/users/agent@example.com/sendMail")
+    assert seen["json"]["message"]["subject"] == "Subject"
+
+
+@pytest.mark.asyncio
+async def test_originating_mail_refuses_without_configured_recipients():
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=[])
+    with pytest.raises(ValueError, match="no recipients"):
+        await client.create_mail_draft("Subject", "Body")
+
+
+def test_send_mail_tool_absent_when_allow_send_is_off():
+    toolset = outlook_toolset(
+        {"mailbox": "agent@example.com", "recipients": "team@example.com"},
+        http=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        allow_send=False,
+    )
+    assert "send_mail" not in toolset.tools
+    # Drafting is always available; it never leaves the mailbox.
+    assert "create_mail_draft" in toolset.tools
+
+
+def test_send_mail_tool_present_when_allow_send_is_on():
+    toolset = outlook_toolset(
+        {"mailbox": "agent@example.com", "recipients": "team@example.com"},
+        http=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        allow_send=True,
+    )
+    assert "send_mail" in toolset.tools
+
+
+def test_recipients_cannot_be_overridden_by_a_tool_argument():
+    """The model chooses the text, never the audience."""
+    import inspect
+
+    toolset = outlook_toolset(
+        {"mailbox": "agent@example.com", "recipients": "team@example.com"},
+        http=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        allow_send=True,
+    )
+    params = inspect.signature(toolset.tools["send_mail"].function).parameters
+    assert "to" not in params
+    assert "recipients" not in params
+    assert sorted(params) == ["body", "subject"]

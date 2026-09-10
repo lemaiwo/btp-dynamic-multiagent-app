@@ -142,6 +142,10 @@ class OAuthClientPayload(BaseModel):
     # A string, not a float, because every other field here is one and the
     # storage cleaner stringifies anyway.
     min_score: str = Field(default="", max_length=8)
+    # builtin:outlook only. Multi-value, comma-separated: the fixed audience
+    # for mail the agent originates. Deliberately not a tool argument -- see
+    # OutlookClient.recipients.
+    recipients: str = Field(default="", max_length=512)
 
     @field_validator("min_score")
     @classmethod
@@ -159,7 +163,7 @@ class OAuthClientPayload(BaseModel):
             raise ValueError("min_score must be between 0 and 10")
         return text
 
-    @field_validator("status", "labels", mode="before")
+    @field_validator("status", "labels", "recipients", mode="before")
     @classmethod
     def _csv_list_is_a_string(cls, v: Any) -> Any:
         """Accept a JSON list for a multi-value field, store it as CSV.
@@ -172,7 +176,7 @@ class OAuthClientPayload(BaseModel):
             return ", ".join(str(x).strip() for x in v if str(x).strip())
         return v
 
-    @field_validator("status", "labels")
+    @field_validator("status", "labels", "recipients")
     @classmethod
     def _validate_csv_list(cls, v: str) -> str:
         # A bounded number of values: the cap is not about Jira's limits but
@@ -225,6 +229,7 @@ class OAuthClientPayload(BaseModel):
             "api_base": self.api_base.strip(),
             "labels": self.labels.strip(),
             "min_score": self.min_score.strip(),
+            "recipients": self.recipients.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:

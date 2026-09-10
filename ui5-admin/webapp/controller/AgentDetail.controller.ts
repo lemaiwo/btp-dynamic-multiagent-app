@@ -187,7 +187,7 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "" },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "" },
             builtins: validators.BUILTIN_URLS.slice(),
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
@@ -311,7 +311,8 @@ export default class AgentDetail extends BaseController {
         }
         const out: Record<string, unknown> = { client_id: String(raw.client_id ?? "").trim() };
         const keys = appOnly
-            ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox", "lookback"]
+            ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox", "lookback",
+                "recipients"]
             : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"];
         keys.forEach((key) => {
             const value = String(raw[key] ?? "").trim();

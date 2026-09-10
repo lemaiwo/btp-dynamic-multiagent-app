@@ -94,6 +94,14 @@ export type OAuthClient =
            * different value does not narrow the toolset, it breaks it.
            */
           min_score?: string;
+          /**
+           * `builtin:outlook` only. Comma-separated fixed audience for mail
+           * the agent originates. Not a tool argument by design: every other
+           * mail tool acts on a message that already exists, so the audience
+           * is whoever wrote in — originating mail has no such anchor, and
+           * the choice must not be one an injected instruction can make.
+           */
+          recipients?: string;
       };
 
 export interface McpServer {
