@@ -83,7 +83,7 @@ operator, and the operator guide must repeat the warning.
 
 ```
 scripts/sap_session.py refresh        (operator's machine, Playwright)
-        │  login at accounts.sap.com, capture *.sap.com cookies
+        │  login at accounts.sap.com, capture me.sap.com-scoped cookies
         ▼
 POST /admin/api/sessions/{server_key}   (admin-only)
         │  upsert
