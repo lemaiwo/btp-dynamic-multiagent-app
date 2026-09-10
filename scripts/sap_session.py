@@ -12,6 +12,9 @@ only ever receives the cookie string this produces.
 Run:
     python scripts/sap_session.py capture 3771065
     python scripts/sap_session.py capture 3771065 --headful   # MFA expected
+    python scripts/sap_session.py refresh --base-url https://... --token ...
+
+See docs/SAP_NOTE_DETAIL.md for the operator-facing walkthrough.
 """
 
 from __future__ import annotations
@@ -218,10 +221,39 @@ async def fetch_detail_raw(cookie: str, note: str) -> tuple[int, str, bytes]:
     return r.status_code, r.headers.get("content-type", ""), r.content
 
 
+async def refresh(base_url: str, token: str, *, headful: bool = False, timeout_s: int = 180) -> None:
+    """Log in and hand the resulting cookie to a running app.
+
+    This is the operator's monthly step: the stored session is always stale
+    by the time the scheduled run is due, so `refresh` then a run-now is the
+    normal sequence, not a fallback. The cookie is written to the app over
+    HTTPS via `POST /admin/api/sessions/builtin:sapnotedetail` and never
+    printed or written to disk here.
+    """
+    user = os.environ.get("SAP_DIALOG_USER", "").strip()
+    pwd = os.environ.get("SAP_DIALOG_PWD", "").strip()
+    if not user or not pwd:
+        raise SystemExit("SAP_DIALOG_USER / SAP_DIALOG_PWD are not set in .env")
+
+    cookie = await login(user, pwd, headful=headful, timeout_s=timeout_s)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(
+            f"{base_url.rstrip('/')}/admin/api/sessions/builtin:sapnotedetail",
+            json={"cookie": cookie, "expires_in_hours": 12},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    if r.status_code >= 400:
+        raise SystemExit(f"app refused the session: {r.status_code} {r.text[:200]}")
+    print(f"session stored, valid until {r.json().get('expires_at')}")
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["capture"])
-    parser.add_argument("note")
+    parser.add_argument("command", choices=["capture", "refresh"])
+    # Only "capture" needs a note; argparse can't make positionals
+    # conditional on another argument's value, so it stays optional here and
+    # is validated by hand below.
+    parser.add_argument("note", nargs="?")
     parser.add_argument("--headful", action="store_true")
     # The default suits an unattended-ish run; a login needing MFA and a
     # human walking to the keyboard needs considerably longer.
@@ -230,7 +262,27 @@ async def main() -> None:
     parser.add_argument(
         "--out", default=str(ROOT / "tests" / "fixtures" / "sapnote_detail.json")
     )
+    parser.add_argument(
+        "--base-url", help="refresh only: base URL of the running app"
+    )
+    parser.add_argument(
+        "--token",
+        help="refresh only: admin bearer token; defaults to $ADMIN_TOKEN",
+    )
     args = parser.parse_args()
+
+    if args.command == "refresh":
+        base_url = args.base_url
+        if not base_url:
+            sys.exit("refresh needs --base-url")
+        token = args.token or os.environ.get("ADMIN_TOKEN", "").strip()
+        if not token:
+            sys.exit("refresh needs --token or ADMIN_TOKEN in .env")
+        await refresh(base_url, token, headful=args.headful, timeout_s=args.timeout)
+        return
+
+    if not args.note:
+        sys.exit("capture needs a note number")
 
     user = os.environ.get("SAP_DIALOG_USER", "").strip()
     pwd = os.environ.get("SAP_DIALOG_PWD", "").strip()
