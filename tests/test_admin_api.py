@@ -1294,3 +1294,31 @@ def test_oauth_payload_carries_min_score_into_config():
     from agents.admin import OAuthClientPayload
 
     assert OAuthClientPayload(min_score="9.0").to_config()["min_score"] == "9.0"
+
+
+def test_session_payload_rejects_a_blank_cookie():
+    import pytest
+    from pydantic import ValidationError
+
+    from agents.admin import SessionPayload
+
+    with pytest.raises(ValidationError):
+        SessionPayload(cookie="   ")
+
+
+def test_session_payload_bounds_the_ttl():
+    import pytest
+    from pydantic import ValidationError
+
+    from agents.admin import SessionPayload
+
+    # A week-long TTL would claim a session is healthy long after SAP dropped
+    # it, which is worse than no status at all.
+    with pytest.raises(ValidationError):
+        SessionPayload(cookie="SESSION=x", expires_in_hours=999)
+
+
+def test_session_payload_defaults_to_twelve_hours():
+    from agents.admin import SessionPayload
+
+    assert SessionPayload(cookie="SESSION=x").expires_in_hours == 12

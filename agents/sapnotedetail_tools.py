@@ -265,12 +265,27 @@ def sapnotedetail_toolset(
 
     The cookie is NOT read from ``oauth``: it is a credential, and credentials
     live in ``mcp_oauth_tokens``, never in a server config block. Passing it
-    explicitly is the test path; Task 5 replaces the default with a resolver
-    that reads the current principal's stored session at call time, because
-    the registry has no principal to resolve one for at build time.
+    explicitly is the test path; the default is a resolver that reads the
+    current principal's stored session at call time, because
+    ``build_builtin_toolset`` has no principal to resolve one for at build
+    time -- only ``(oauth, server_key, auth_mode)`` are known then.
     """
     session = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0))
-    client = SapNoteDetailClient(session, cookie or "")
+
+    async def _stored_cookie() -> str:
+        """The current principal's stored session, read at call time."""
+        from agents.auth import current_principal
+        from agents.db import SessionLocal
+        from agents.oauth2 import get_user_token
+
+        who = current_principal.get() or ""
+        if not who:
+            return ""
+        async with SessionLocal() as db:
+            row = await get_user_token(db, who, server_key)
+        return (row.access_token if row else "") or ""
+
+    client = SapNoteDetailClient(session, cookie if cookie is not None else _stored_cookie)
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.
     toolset.http_client = session  # type: ignore[attr-defined]

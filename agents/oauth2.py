@@ -665,6 +665,40 @@ async def token_status(user_id: str, server_key: str) -> tuple[str, datetime | N
     return ("refreshable" if row.refresh_token else "expired"), expires_at
 
 
+async def store_session_cookie(
+    user_id: str, server_key: str, cookie: str, ttl_hours: int = 12
+) -> datetime:
+    """Persist a browser session cookie as this principal's credential.
+
+    Stored in ``mcp_oauth_tokens`` rather than a table of its own: it is the
+    same kind of thing as an access token, and reusing the row means
+    ``token_status`` and the admin credentials panel report it with no changes.
+
+    ``refresh_token`` stays NULL on purpose. There is nothing to refresh with,
+    so the status goes straight from `valid` to `expired` -- which is the
+    truth, because only a human with a browser can renew it.
+    """
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
+    async with SessionLocal() as session:
+        await upsert_user_token(
+            session,
+            user_id=user_id,
+            server_key=server_key,
+            access_token=cookie,
+            refresh_token=None,
+            token_type="Cookie",
+            scope=None,
+            expires_at=expires_at,
+        )
+        await session.commit()
+    # The cookie itself is never logged.
+    logger.info(
+        "stored a session cookie for %s on %s, valid until %s",
+        user_id, server_key, expires_at.isoformat(),
+    )
+    return expires_at
+
+
 async def complete_authorization(*, code: str, state: str, principal: str | None) -> str:
     """Exchange an authorization code for tokens and persist them.
 

@@ -82,14 +82,17 @@ async def _has_usable_credentials(
     unconditionally would fail every such agent at preflight and send the
     operator to re-authorize an account that was never the one in question.
     Patched in tests."""
-    from agents.db import AUTH_MODE_OAUTH2
+    from agents.db import AUTH_MODE_OAUTH2, AUTH_MODE_SESSION
     from agents.oauth2 import has_usable_token, normalize_mcp_url
 
     principal = (principal or agent.run_as_principal or "").strip() or None
     if not principal:
         return False
     for spec in agent.mcp_servers:
-        if spec.get("auth_mode") != AUTH_MODE_OAUTH2:
+        # session (a browser cookie) needs the same "someone signed in and it
+        # has not expired" check as oauth2 -- both are per-principal
+        # credentials nobody but a human can renew.
+        if spec.get("auth_mode") not in (AUTH_MODE_OAUTH2, AUTH_MODE_SESSION):
             continue
         if not await has_usable_token(principal, normalize_mcp_url(str(spec["url"]))):
             return False
