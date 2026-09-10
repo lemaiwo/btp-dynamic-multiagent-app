@@ -203,3 +203,97 @@ class SapNoteDetailClient:
             return parse_detail(r.json(), note)
         except ValueError:
             return unavailable(note, "response was not valid JSON")
+
+    async def get_details(self, notes: list[str]) -> dict[str, Any]:
+        """Many notes, fetched concurrently behind a cap.
+
+        One call per note would be one LLM turn per note -- ~129 for a monthly
+        run -- so the whole list is fetched here instead.
+
+        A dead session stops further fetching: retrying a hundred times
+        against a corpse is noise, and the answer will not change until a
+        human opens a browser. Notes already fetched are kept, and the ones
+        never attempted are reported as unavailable rather than dropped, so
+        the count always matches what was asked for.
+        """
+        wanted = [str(n).strip() for n in (notes or []) if str(n).strip()]
+        if not wanted:
+            return {"notes": [], "count": 0, "unavailable": 0, "session_expired": False}
+
+        results: dict[str, dict[str, Any]] = {}
+        session_expired = False
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+
+        async def one(note: str) -> None:
+            nonlocal session_expired
+            if session_expired:
+                return
+            async with semaphore:
+                if session_expired:
+                    return
+                try:
+                    results[note] = await self.get_detail(note)
+                except SessionExpired as e:
+                    logger.warning("me.sap.com session is dead: %s", e)
+                    session_expired = True
+
+        await asyncio.gather(*(one(n) for n in wanted))
+
+        ordered = [
+            results.get(n) or unavailable(
+                n, "session expired" if session_expired else "not fetched"
+            )
+            for n in wanted
+        ]
+        return {
+            "notes": ordered,
+            "count": len(ordered),
+            "unavailable": sum(1 for n in ordered if n["status"] != "ok"),
+            "session_expired": session_expired,
+        }
+
+
+def sapnotedetail_toolset(
+    oauth: dict[str, Any],
+    *,
+    http: httpx.AsyncClient | None = None,
+    cookie: str | None = None,
+    server_key: str = BUILTIN_SAPNOTEDETAIL_URL,
+    auth_mode: str | None = None,
+) -> FunctionToolset:
+    """The note-detail toolset for one agent.
+
+    The cookie is NOT read from ``oauth``: it is a credential, and credentials
+    live in ``mcp_oauth_tokens``, never in a server config block. Passing it
+    explicitly is the test path; Task 5 replaces the default with a resolver
+    that reads the current principal's stored session at call time, because
+    the registry has no principal to resolve one for at build time.
+    """
+    session = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0))
+    client = SapNoteDetailClient(session, cookie or "")
+    toolset = FunctionToolset()
+    # The registry closes `http_client` on old toolsets when it swaps a build.
+    toolset.http_client = session  # type: ignore[attr-defined]
+
+    @toolset.tool
+    async def get_note_details(notes: list[str]) -> dict[str, Any]:
+        """Look up SAP note detail, including which support package fixes each.
+
+        Pass every note number you need in ONE call — the list is fetched
+        concurrently. Do not call this once per note.
+
+        Each entry carries `support_packages` (the fixing level per software
+        component) and `validity` (which releases the note applies to). An
+        entry with `status` of `unavailable` could not be read; report it as
+        unknown, never as "not affected".
+
+        If `session_expired` is true, the SAP session died and the remaining
+        notes were never checked. Say so prominently — the report is
+        incomplete, not clean.
+
+        Args:
+            notes: SAP note numbers, e.g. ["3771065", "3747649"].
+        """
+        return await client.get_details(notes)
+
+    return toolset
