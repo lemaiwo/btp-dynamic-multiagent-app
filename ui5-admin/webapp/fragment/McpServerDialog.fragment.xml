@@ -26,7 +26,12 @@
                 <core:Item key="oauth2" text="{i18n>authOauth2}" />
                 <core:Item key="app_only" text="{i18n>authAppOnly}" />
                 <core:Item key="destination" text="{i18n>authModeDestination}" />
+                <core:Item key="session" text="{i18n>authSession}" />
             </Select>
+
+            <Label text="" visible="{= ${server>/auth_mode} === 'session' }" />
+            <Text text="{i18n>sessionHint}"
+                  visible="{= ${server>/auth_mode} === 'session' }" />
 
             <Label text="{i18n>oauthDcr}" visible="{= ${server>/auth_mode} === 'oauth2' }" />
             <CheckBox

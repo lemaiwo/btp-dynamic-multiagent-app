@@ -8,7 +8,7 @@
  */
 
 /** MCP transport auth. Mirrors VALID_AUTH_MODES in agents/db.py. */
-export type AuthMode = "jwt" | "none" | "oauth2" | "app_only" | "destination";
+export type AuthMode = "jwt" | "none" | "oauth2" | "app_only" | "destination" | "session";
 
 /**
  * OAuth2 client config for an `auth_mode: "oauth2"` server.

@@ -614,6 +614,7 @@ function addMcpServerRow(server) {
                 <option value="jwt">JWT forward (BTP)</option>
                 <option value="oauth2">OAuth2 (per-user)</option>
                 <option value="none">None (public)</option>
+                <option value="session">Browser session (refreshed by hand)</option>
             </select>
             <button type="button" class="small danger" title="Remove"
                     onclick="this.closest('.mcp-server-row').remove(); updateEndpointHint()">×</button>
@@ -1296,8 +1297,14 @@ async function refreshCredentials() {
                     ? '<span style="color:var(--ok,green)">connected</span>'
                     : '<span style="color:var(--warn)">not connected</span>')
                 + ' <code>' + esc(s.url) + '</code> '
-                + '<button type="button" class="secondary" '
-                + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                // Session mode has no authorization-code flow: login_url is
+                // always empty for it (see api_agent_credentials). Showing a
+                // Connect button that goes nowhere is worse than showing
+                // nothing, so point at the refresh script instead.
+                + (s.login_url
+                    ? '<button type="button" class="secondary" '
+                      + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                    : '<span class="hint">refreshed with scripts/sap_session.py</span>')
                 + '</p>').join('');
     } catch (e) { box.innerHTML = ''; }
 }

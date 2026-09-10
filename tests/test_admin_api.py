@@ -1259,6 +1259,30 @@ async def run_tests() -> None:
         )
         check("expired without refresh -> has_token False", srv["has_token"] is False, r.text)
 
+        # A session-mode server needs a token like oauth2 does (so its state
+        # and expiry are worth showing), but it has no authorization-code
+        # flow to send anyone through -- the cookie comes from
+        # POST /admin/api/sessions, refreshed by scripts/sap_session.py.
+        # login_url must therefore stay empty, unlike oauth2 above.
+        from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+
+        r = await client.put(f"/admin/api/agents/{cred_id}", json={
+            "name": "Cred Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{
+                "url": BUILTIN_SAPNOTEDETAIL_URL,
+                "auth_mode": "session",
+            }],
+            "expose_api": True, "api_slug": "cred-agent",
+        })
+        check("switch server to session mode", r.status_code == 200, r.text)
+        r = await client.get(
+            f"/admin/api/agents/{cred_id}/credentials", params={"principal": "nobody"}
+        )
+        srv = r.json()[0]
+        check("session server needs a token", srv["needs_token"] is True, r.text)
+        check("session server reports no login_url", srv.get("login_url") == "", r.text)
+        check("session server with no cookie -> token_state none", srv.get("token_state") == "none", r.text)
+
         # --- session cookie endpoint -----------------------------------------
         print("\n== session cookie endpoint ==")
         from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL

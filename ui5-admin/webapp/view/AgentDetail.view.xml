@@ -194,12 +194,17 @@
                                          not: signing in authenticates YOU, while the status above is
                                          the run-as identity's, and a live token can still be revoked
                                          upstream. Hiding it once a token existed left no way to do
-                                         either. -->
+                                         either. Keyed off login_url rather than needs_token: a
+                                         session-mode server also needs a token, but has no
+                                         authorization-code flow to send anyone through — its
+                                         login_url is always empty, see api_agent_credentials. -->
                                     <Button
                                         text="{= ${agent>has_token} ? ${i18n>signInAgain} : ${i18n>signIn} }"
                                         type="Transparent"
-                                        visible="{agent>needs_token}"
+                                        visible="{= !!${agent>login_url} }"
                                         press=".onSignIn" />
+                                    <Text text="{i18n>sessionHint}"
+                                          visible="{= ${agent>auth_mode} === 'session' }" />
                                 </cells>
                             </ColumnListItem>
                         </items>
