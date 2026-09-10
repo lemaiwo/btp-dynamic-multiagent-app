@@ -1259,6 +1259,53 @@ async def run_tests() -> None:
         )
         check("expired without refresh -> has_token False", srv["has_token"] is False, r.text)
 
+        # --- session cookie endpoint -----------------------------------------
+        print("\n== session cookie endpoint ==")
+        from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+
+        r = await client.post(
+            f"/admin/api/sessions/{BUILTIN_SAPNOTEDETAIL_URL}",
+            json={"cookie": "SESSION=abc123", "principal": "cookie-tester"},
+        )
+        check("store session -> 200", r.status_code == 200, r.text)
+        check(
+            "store session response has no cookie value",
+            "abc123" not in r.text and "SESSION=" not in r.text,
+            r.text,
+        )
+        check(
+            "store session response shape",
+            r.json().get("server_key") == BUILTIN_SAPNOTEDETAIL_URL
+            and r.json().get("principal") == "cookie-tester"
+            and bool(r.json().get("expires_at")),
+            r.text,
+        )
+
+        r = await client.post(
+            "/admin/api/sessions/builtin:not-a-real-server",
+            json={"cookie": "SESSION=abc123", "principal": "cookie-tester"},
+        )
+        check("store session on wrong server key -> 400", r.status_code == 400, r.text)
+
+        # Regression: a validation failure must not echo the cookie back. A
+        # SessionPayload request parameter would have let FastAPI's default
+        # 422 handler serialize ValidationError.errors(), whose `input` key
+        # holds the raw field value verbatim -- this drives the real endpoint,
+        # not just the model, because only the endpoint exercises that path.
+        oversized_cookie = "X" * 20000
+        r = await client.post(
+            f"/admin/api/sessions/{BUILTIN_SAPNOTEDETAIL_URL}",
+            json={"cookie": oversized_cookie, "principal": "cookie-tester"},
+        )
+        check(
+            "oversized cookie is rejected, not stored",
+            r.status_code == 400, r.text,
+        )
+        check(
+            "oversized cookie is never echoed back",
+            oversized_cookie not in r.text, "cookie value leaked in response body",
+        )
+
         # --- Lifespan shutdown ---------------------------------------------
         received.append({"type": "lifespan.shutdown"})
         try:

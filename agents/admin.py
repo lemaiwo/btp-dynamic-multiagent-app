@@ -33,7 +33,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
+from pydantic import BaseModel, Field, HttpUrl, ValidationError, field_validator, model_validator
 
 from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
@@ -935,14 +935,48 @@ async def api_agent_credentials(
 
 
 @router.post("/api/sessions/{server_key:path}", dependencies=[Depends(require_admin)])
-async def api_store_session(server_key: str, payload: SessionPayload) -> dict[str, Any]:
+async def api_store_session(server_key: str, request: Request) -> dict[str, Any]:
     """Store a browser session cookie for a `session`-mode server.
 
     The response never echoes the cookie: it is a live credential, and an
     admin API that reflects one back has widened where it can leak to.
+
+    The body is parsed by hand rather than declared as a ``SessionPayload``
+    parameter: FastAPI's default 422 handler serializes
+    ``pydantic.ValidationError.errors()`` verbatim, and that includes an
+    ``input`` key holding the raw field value on a core-validation failure
+    (e.g. a cookie over ``max_length`` -- entirely plausible for a real
+    concatenated SAP session header). A ``SessionPayload`` parameter would
+    reflect the cookie straight back in the error body, which is exactly the
+    leak this docstring promises never happens. Reported errors carry only
+    ``loc``/``msg``/``type``, never ``input``.
     """
     from agents.oauth2 import store_session_cookie
     from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+
+    try:
+        body = await request.json()
+    except Exception as e:  # noqa: BLE001 - malformed JSON, not our business
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="body must be JSON",
+        ) from e
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="body must be a JSON object",
+        )
+    try:
+        payload = SessionPayload(**body)
+    except ValidationError as e:
+        # loc/msg/type only -- never `input`, which pydantic populates with
+        # the raw field value (the cookie itself, on a length failure).
+        detail = "; ".join(
+            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}"
+            for err in e.errors()
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=detail,
+        ) from e
 
     key = server_key.strip().lower()
     if key != BUILTIN_SAPNOTEDETAIL_URL:
