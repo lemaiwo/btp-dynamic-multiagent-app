@@ -1,0 +1,55 @@
+{
+  "resultsPerPage": 5,
+  "totalResults": 5,
+  "vulnerabilities": [
+    {"cve": {
+      "id": "CVE-2026-44756",
+      "published": "2026-09-08T12:15:00.000",
+      "lastModified": "2026-09-08T12:15:00.000",
+      "sourceIdentifier": "cna@sap.com",
+      "descriptions": [{"lang": "en", "value": "A memory safety vulnerability exists in SAP Extended Passport processing."}],
+      "metrics": {"cvssMetricV31": [{"source": "cna@sap.com", "type": "Primary",
+        "cvssData": {"baseScore": 10.0, "baseSeverity": "CRITICAL"}}]},
+      "references": [{"url": "https://me.sap.com/notes/3747649"}]
+    }},
+    {"cve": {
+      "id": "CVE-2026-58240",
+      "published": "2026-09-08T12:15:00.000",
+      "lastModified": "2026-09-09T08:00:00.000",
+      "sourceIdentifier": "cna@sap.com",
+      "descriptions": [{"lang": "en", "value": "SAP NetWeaver Message Server does not sufficiently validate authenticity."}],
+      "metrics": {"cvssMetricV30": [{"source": "nvd@nist.gov", "type": "Primary",
+        "cvssData": {"baseScore": 9.8, "baseSeverity": "CRITICAL"}}]},
+      "references": [{"url": "https://launchpad.support.sap.com/#/notes/3759472"}]
+    }},
+    {"cve": {
+      "id": "CVE-2026-76958",
+      "published": "2026-09-08T12:15:00.000",
+      "lastModified": "2026-09-08T12:15:00.000",
+      "sourceIdentifier": "cna@sap.com",
+      "descriptions": [{"lang": "en", "value": "SAP Commerce Cloud allows information disclosure."}],
+      "metrics": {"cvssMetricV40": [{"source": "cna@sap.com", "type": "Primary",
+        "cvssData": {"baseScore": 8.5, "baseSeverity": "HIGH"}}]},
+      "references": [{"url": "https://me.sap.com/notes/3792978"}]
+    }},
+    {"cve": {
+      "id": "CVE-2026-00001",
+      "published": "2026-09-08T12:15:00.000",
+      "lastModified": "2026-09-08T12:15:00.000",
+      "sourceIdentifier": "cna@sap.com",
+      "descriptions": [{"lang": "en", "value": "Critical issue with no note reference."}],
+      "metrics": {"cvssMetricV31": [{"source": "cna@sap.com", "type": "Primary",
+        "cvssData": {"baseScore": 9.9, "baseSeverity": "CRITICAL"}}]},
+      "references": [{"url": "https://example.invalid/advisory"}]
+    }},
+    {"cve": {
+      "id": "CVE-2026-00002",
+      "published": "2026-09-08T12:15:00.000",
+      "lastModified": "2026-09-08T12:15:00.000",
+      "sourceIdentifier": "cna@sap.com",
+      "descriptions": [{"lang": "en", "value": "Unscored issue."}],
+      "metrics": {},
+      "references": [{"url": "https://me.sap.com/notes/3999999"}]
+    }}
+  ]
+}
