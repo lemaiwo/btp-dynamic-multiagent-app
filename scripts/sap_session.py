@@ -1,0 +1,147 @@
+"""Obtain a me.sap.com browser session, and fetch one note with it.
+
+me.sap.com sits behind XSUAA/SAML and ignores HTTP Basic outright: the
+`Detail` endpoint returns a byte-identical JS bootstrap page with Basic
+credentials and anonymously. The only way in is to complete the
+accounts.sap.com login in a real browser and reuse the resulting cookies,
+which is what `mcp-sap-notes` does and why it ships Playwright.
+
+This script exists so Chromium stays on an operator machine. The platform
+only ever receives the cookie string this produces.
+
+Run:
+    python scripts/sap_session.py capture 3771065
+    python scripts/sap_session.py capture 3771065 --headful   # MFA expected
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+import httpx
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:  # pragma: no cover
+    pass
+
+DETAIL_URL = "https://me.sap.com/backend/raw/sapnotes/Detail"
+# Any me.sap.com page forces the SAML round trip; the notes page is the one
+# whose session we actually want.
+LOGIN_TARGET = "https://me.sap.com/notes"
+
+
+async def login(
+    user: str, pwd: str, *, headful: bool = False, timeout_s: int = 180
+) -> str:
+    """Complete the accounts.sap.com login and return a Cookie header.
+
+    Every cookie on a *.sap.com domain is kept and serialized, rather than
+    naming specific ones: which cookies carry the session is undocumented and
+    has changed before, and sending all of them is what the upstream package
+    does.
+    """
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=not headful)
+        page = await (await browser.new_context()).new_page()
+        await page.goto(LOGIN_TARGET, wait_until="commit", timeout=45_000)
+
+        # Best-effort form fill. When MFA or an unexpected screen appears the
+        # fill silently does nothing and the wait below hands over to the
+        # human -- which is the whole reason --headful exists.
+        await _try_fill(page, ["input[name='j_username']", "input[type='email']", "#j_username"], user)
+        await _try_fill(page, ["input[name='j_password']", "input[type='password']", "#j_password"], pwd)
+        await _try_click(page, ["button[type='submit']", "#logOnFormSubmit", "input[type='submit']"])
+
+        # Wait until we are back on me.sap.com, however long the human needs.
+        try:
+            await page.wait_for_url(lambda u: "me.sap.com" in u and "accounts.sap.com" not in u,
+                                    timeout=timeout_s * 1000)
+        except Exception:
+            raise SystemExit(
+                "Did not reach me.sap.com. Re-run with --headful and finish the "
+                "login (MFA, passcode) by hand."
+            ) from None
+
+        cookies = await page.context.cookies()
+        await browser.close()
+
+    kept = [c for c in cookies if "sap.com" in c.get("domain", "")]
+    if not kept:
+        raise SystemExit("Logged in but captured no sap.com cookies.")
+    return "; ".join(f"{c['name']}={c['value']}" for c in kept)
+
+
+async def _try_fill(page, selectors: list[str], value: str) -> bool:
+    for selector in selectors:
+        field = await page.query_selector(selector)
+        if field:
+            await field.fill(value)
+            return True
+    return False
+
+
+async def _try_click(page, selectors: list[str]) -> bool:
+    for selector in selectors:
+        button = await page.query_selector(selector)
+        if button:
+            await button.click()
+            return True
+    return False
+
+
+async def fetch_detail_raw(cookie: str, note: str) -> tuple[int, str, bytes]:
+    """One raw `Detail` request. Returns (status, content_type, body)."""
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        r = await client.get(
+            DETAIL_URL,
+            params={"q": note, "t": "E"},
+            headers={"Cookie": cookie, "Accept": "application/json"},
+            follow_redirects=False,
+        )
+    return r.status_code, r.headers.get("content-type", ""), r.content
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=["capture"])
+    parser.add_argument("note")
+    parser.add_argument("--headful", action="store_true")
+    parser.add_argument(
+        "--out", default=str(ROOT / "tests" / "fixtures" / "sapnote_detail.json")
+    )
+    args = parser.parse_args()
+
+    user = os.environ.get("SAP_DIALOG_USER", "").strip()
+    pwd = os.environ.get("SAP_DIALOG_PWD", "").strip()
+    if not user or not pwd:
+        sys.exit("SAP_DIALOG_USER / SAP_DIALOG_PWD are not set in .env")
+
+    cookie = await login(user, pwd, headful=args.headful)
+    print(f"captured {cookie.count('=')} cookies")  # never print the value
+
+    status, ctype, body = await fetch_detail_raw(cookie, args.note)
+    print(f"status {status}  type {ctype}  bytes {len(body)}")
+    if status != 200 or "json" not in ctype.lower():
+        preview = "".join(chr(b) if 32 <= b < 127 else "." for b in body[:200])
+        sys.exit(f"Not JSON -- the session did not take. Body head: {preview}")
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(body)
+    print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
