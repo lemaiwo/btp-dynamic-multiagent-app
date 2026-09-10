@@ -25,7 +25,7 @@ from agents.sapnotedetail_tools import (
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "sapnote_detail.json"
-NOTE = "3771065"
+NOTE = "2538856"  # matches the note actually captured in the fixture
 
 
 def load_fixture() -> dict:
@@ -54,6 +54,15 @@ def test_parse_detail_extracts_validity():
     assert set(entry) == {"software_component", "from", "to"}
     assert entry["software_component"] == "HDB"
     assert entry["from"] == "1.00"
+
+
+def test_parse_detail_extracts_component_and_priority_from_the_header():
+    """`Header` also carries the note's own component and priority -- a
+    different thing from the per-row `validity` software components."""
+    parsed = parse_detail(load_fixture(), NOTE)
+    assert parsed["component"] == "CA-UI5-CTR-ROD"
+    assert "SAPUI5" in parsed["component_text"]
+    assert parsed["priority"] == "Correction with medium priority"
 
 
 def test_parse_detail_reads_support_packages_from_the_patch_list():

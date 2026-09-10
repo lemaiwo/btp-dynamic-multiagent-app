@@ -14,7 +14,12 @@ Run:
     python scripts/sap_session.py capture 3771065 --headful   # MFA expected
     python scripts/sap_session.py refresh --base-url https://... --token ...
 
-See docs/SAP_NOTE_DETAIL.md for the operator-facing walkthrough.
+`capture` writes under `tmp/` by default (gitignored) -- a captured response
+is a live SAP session's output and must never land in a tracked path
+unreviewed. Promoting a capture to `tests/fixtures/sapnote_detail.json` is a
+deliberate, manual step: scrub it first (drop `Actions`, any `token=`/`sid=`
+query parameter, any `*.sap.corp` host, any email or S-user id) before it is
+committed. See docs/SAP_NOTE_DETAIL.md for the operator-facing walkthrough.
 """
 
 from __future__ import annotations
@@ -221,7 +226,14 @@ async def fetch_detail_raw(cookie: str, note: str) -> tuple[int, str, bytes]:
     return r.status_code, r.headers.get("content-type", ""), r.content
 
 
-async def refresh(base_url: str, token: str, *, headful: bool = False, timeout_s: int = 180) -> None:
+async def refresh(
+    base_url: str,
+    token: str,
+    *,
+    headful: bool = False,
+    timeout_s: int = 180,
+    ttl_hours: int = 12,
+) -> None:
     """Log in and hand the resulting cookie to a running app.
 
     This is the operator's monthly step: the stored session is always stale
@@ -229,6 +241,13 @@ async def refresh(base_url: str, token: str, *, headful: bool = False, timeout_s
     normal sequence, not a fallback. The cookie is written to the app over
     HTTPS via `POST /admin/api/sessions/builtin:sapnotedetail` and never
     printed or written to disk here.
+
+    `ttl_hours` is NOT a measured SAP session lifetime -- it is the upstream
+    project's cache TTL, carried over as a default. If the real session is
+    shorter-lived than this, the credentials panel keeps reporting `valid`
+    and preflight keeps passing for a window after SAP has already dropped
+    the session, which is exactly the failure this parameter exists to let
+    an operator correct.
     """
     user = os.environ.get("SAP_DIALOG_USER", "").strip()
     pwd = os.environ.get("SAP_DIALOG_PWD", "").strip()
@@ -239,7 +258,7 @@ async def refresh(base_url: str, token: str, *, headful: bool = False, timeout_s
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(
             f"{base_url.rstrip('/')}/admin/api/sessions/builtin:sapnotedetail",
-            json={"cookie": cookie, "expires_in_hours": 12},
+            json={"cookie": cookie, "expires_in_hours": ttl_hours},
             headers={"Authorization": f"Bearer {token}"},
         )
     if r.status_code >= 400:
@@ -260,7 +279,11 @@ async def main() -> None:
     parser.add_argument("--timeout", type=int, default=180,
                         help="seconds to wait for the login to complete")
     parser.add_argument(
-        "--out", default=str(ROOT / "tests" / "fixtures" / "sapnote_detail.json")
+        # A capture is a live SAP session's raw response. It defaults under
+        # tmp/ (gitignored), never at the tracked fixture path -- promoting
+        # one to the fixture is a deliberate, separate step that requires
+        # scrubbing first (see the module docstring).
+        "--out", default=str(ROOT / "tmp" / "sapnote_detail.json")
     )
     parser.add_argument(
         "--base-url", help="refresh only: base URL of the running app"
@@ -268,6 +291,18 @@ async def main() -> None:
     parser.add_argument(
         "--token",
         help="refresh only: admin bearer token; defaults to $ADMIN_TOKEN",
+    )
+    parser.add_argument(
+        "--ttl-hours",
+        type=int,
+        default=12,
+        help=(
+            "refresh only: how long the app should treat the stored session "
+            "as valid (1-48). This is NOT a measured SAP session lifetime -- "
+            "it is the upstream project's cache TTL, kept as the default. "
+            "Lower it if sessions are dying sooner than the credentials "
+            "panel reports."
+        ),
     )
     args = parser.parse_args()
 
@@ -278,7 +313,15 @@ async def main() -> None:
         token = args.token or os.environ.get("ADMIN_TOKEN", "").strip()
         if not token:
             sys.exit("refresh needs --token or ADMIN_TOKEN in .env")
-        await refresh(base_url, token, headful=args.headful, timeout_s=args.timeout)
+        if not 1 <= args.ttl_hours <= 48:
+            sys.exit(f"--ttl-hours must be between 1 and 48, got {args.ttl_hours}")
+        await refresh(
+            base_url,
+            token,
+            headful=args.headful,
+            timeout_s=args.timeout,
+            ttl_hours=args.ttl_hours,
+        )
         return
 
     if not args.note:
