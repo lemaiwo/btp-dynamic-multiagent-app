@@ -38,6 +38,9 @@ DETAIL_URL = "https://me.sap.com/backend/raw/sapnotes/Detail"
 # Any me.sap.com page forces the SAML round trip; the notes page is the one
 # whose session we actually want.
 LOGIN_TARGET = "https://me.sap.com/notes"
+# The host the captured session is FOR. Cookies are scoped to it, because the
+# jar also holds same-named cookies belonging to the identity provider.
+TARGET_HOST = "me.sap.com"
 
 
 async def login(
@@ -45,10 +48,11 @@ async def login(
 ) -> str:
     """Complete the accounts.sap.com login and return a Cookie header.
 
-    Every cookie on a *.sap.com domain is kept and serialized, rather than
-    naming specific ones: which cookies carry the session is undocumented and
-    has changed before, and sending all of them is what the upstream package
-    does.
+    Cookies are scoped to :data:`TARGET_HOST` rather than to "anything on
+    sap.com". Specific names are still not hard-coded -- which cookie carries
+    the session is undocumented and has changed before -- but the host filter
+    is not optional: see :func:`cookies_for_host` for the duplicate-name
+    collision that silently produced an unauthenticated session.
     """
     from playwright.async_api import async_playwright
 
@@ -69,12 +73,24 @@ async def login(
                 flush=True,
             )
 
-        # Best-effort only. The selectors are a guess at a form that SAP owns
-        # and changes, so every failure here is silent by design: the wait
-        # below hands over to the human, which is what --headful is for.
-        await _try_fill(page, ["input[name='j_username']", "input[type='email']", "#j_username"], user)
-        await _try_fill(page, ["input[name='j_password']", "input[type='password']", "#j_password"], pwd)
-        await _try_click(page, ["button[type='submit']", "#logOnFormSubmit", "input[type='submit']"])
+        # accounts.sap.com is a TWO-STEP form and getting this wrong is why an
+        # earlier version hung: page one carries only #j_username and a
+        # Continue button, with no password field at all. Filling a password
+        # there silently does nothing, and submitting the username alone then
+        # parks on step two forever.
+        SUBMIT = ["#logOnFormSubmit", "button[type='submit']", "input[type='submit']"]
+
+        await _try_fill(page, ["#j_username", "input[name='j_username']"], user)
+        await _try_click(page, SUBMIT)
+        await _settle(page)
+
+        # Step two: the password field appears next to the now-prefilled
+        # username. Waited for rather than assumed, because a session SAP
+        # still remembers can skip straight past this.
+        if await _wait_visible(page, "#j_password", timeout_ms=20_000):
+            await _try_fill(page, ["#j_password", "input[name='j_password']"], pwd)
+            await _try_click(page, SUBMIT)
+            await _settle(page)
 
         # Wait until we are back on me.sap.com, however long the human needs.
         try:
@@ -109,10 +125,36 @@ async def login(
         cookies = await page.context.cookies()
         await browser.close()
 
-    kept = [c for c in cookies if "sap.com" in c.get("domain", "")]
+    kept = cookies_for_host(cookies, TARGET_HOST)
     if not kept:
-        raise SystemExit("Logged in but captured no sap.com cookies.")
+        raise SystemExit(f"Logged in but captured no cookies for {TARGET_HOST}.")
     return "; ".join(f"{c['name']}={c['value']}" for c in kept)
+
+
+def cookies_for_host(cookies: list[dict], host: str) -> list[dict]:
+    """The cookies a browser would actually send to ``host``.
+
+    Filtering on "sap.com appears in the domain" is wrong and was the reason
+    an authenticated session still got the anonymous bootstrap page: the login
+    leaves TWO cookies named ``JSESSIONID`` in the jar, one for me.sap.com and
+    one for accounts.sap.com. Serializing every sap.com cookie into one header
+    sends the name twice, and me.sap.com reads the identity provider's session
+    instead of its own.
+
+    Standard cookie-domain matching: an exact host match, or a dot-prefixed
+    domain that the host is a subdomain of.
+    """
+    out: list[dict] = []
+    for cookie in cookies:
+        domain = str(cookie.get("domain") or "").lower()
+        if not domain:
+            continue
+        if domain.startswith("."):
+            if host == domain[1:] or host.endswith(domain):
+                out.append(cookie)
+        elif host == domain:
+            out.append(cookie)
+    return out
 
 
 async def _settle(page) -> None:
@@ -126,6 +168,15 @@ async def _settle(page) -> None:
             await page.wait_for_load_state(state, timeout=15_000)
         except Exception:  # noqa: BLE001 - best effort by design
             return
+
+
+async def _wait_visible(page, selector: str, *, timeout_ms: int = 15_000) -> bool:
+    """True when the selector becomes visible. Never raises."""
+    try:
+        await page.locator(selector).first.wait_for(state="visible", timeout=timeout_ms)
+        return True
+    except Exception:  # noqa: BLE001 - absence is an answer, not an error
+        return False
 
 
 async def _try_fill(page, selectors: list[str], value: str) -> bool:
