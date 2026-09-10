@@ -55,11 +55,23 @@ async def login(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not headful)
         page = await (await browser.new_context()).new_page()
-        await page.goto(LOGIN_TARGET, wait_until="commit", timeout=45_000)
+        # NOT wait_until="commit": me.sap.com bounces through XSUAA to
+        # accounts.sap.com, and returning as soon as the first navigation
+        # commits means every later query races a redirect and dies with
+        # "Execution context was destroyed".
+        await page.goto(LOGIN_TARGET, wait_until="domcontentloaded", timeout=60_000)
+        await _settle(page)
 
-        # Best-effort form fill. When MFA or an unexpected screen appears the
-        # fill silently does nothing and the wait below hands over to the
-        # human -- which is the whole reason --headful exists.
+        if headful:
+            print(
+                "A browser window is open. Sign in there if it does not fill "
+                "itself in; this waits for you.",
+                flush=True,
+            )
+
+        # Best-effort only. The selectors are a guess at a form that SAP owns
+        # and changes, so every failure here is silent by design: the wait
+        # below hands over to the human, which is what --headful is for.
         await _try_fill(page, ["input[name='j_username']", "input[type='email']", "#j_username"], user)
         await _try_fill(page, ["input[name='j_password']", "input[type='password']", "#j_password"], pwd)
         await _try_click(page, ["button[type='submit']", "#logOnFormSubmit", "input[type='submit']"])
@@ -69,9 +81,29 @@ async def login(
             await page.wait_for_url(lambda u: "me.sap.com" in u and "accounts.sap.com" not in u,
                                     timeout=timeout_s * 1000)
         except Exception:
+            # Say WHERE it got stuck. "Did not reach me.sap.com" alone sends
+            # the operator back for another blind ten-minute wait; the URL and
+            # a screenshot say whether the form was never filled, whether MFA
+            # is sitting there, or whether SAP changed the page entirely.
+            where, title = page.url, ""
+            try:
+                title = await page.title()
+            except Exception:  # noqa: BLE001 - diagnostics must not mask the real error
+                pass
+            shot = ROOT / "tmp" / "sap-login-stuck.png"
+            try:
+                shot.parent.mkdir(parents=True, exist_ok=True)
+                await page.screenshot(path=str(shot), full_page=True)
+                shot_note = f"\n  screenshot: {shot}"
+            except Exception:  # noqa: BLE001
+                shot_note = ""
+            await browser.close()
             raise SystemExit(
-                "Did not reach me.sap.com. Re-run with --headful and finish the "
-                "login (MFA, passcode) by hand."
+                f"Login did not complete within {timeout_s}s.\n"
+                f"  stuck at: {where}\n"
+                f"  page title: {title!r}{shot_note}\n"
+                "Re-run with --headful and finish the login by hand while "
+                "watching the window."
             ) from None
 
         cookies = await page.context.cookies()
@@ -83,21 +115,43 @@ async def login(
     return "; ".join(f"{c['name']}={c['value']}" for c in kept)
 
 
+async def _settle(page) -> None:
+    """Let a redirect chain finish before touching the DOM.
+
+    Never raises: a page that is still busy is a reason to fall back to the
+    human, not to abandon the run.
+    """
+    for state in ("domcontentloaded", "networkidle"):
+        try:
+            await page.wait_for_load_state(state, timeout=15_000)
+        except Exception:  # noqa: BLE001 - best effort by design
+            return
+
+
 async def _try_fill(page, selectors: list[str], value: str) -> bool:
+    """Fill the first selector that resolves. Never raises.
+
+    Uses a locator rather than `query_selector`: locators auto-wait and
+    re-resolve, so a redirect landing mid-call retries instead of blowing up
+    with "Execution context was destroyed".
+    """
     for selector in selectors:
-        field = await page.query_selector(selector)
-        if field:
-            await field.fill(value)
+        try:
+            await page.locator(selector).first.fill(value, timeout=5_000)
             return True
+        except Exception:  # noqa: BLE001 - the human completes it instead
+            continue
     return False
 
 
 async def _try_click(page, selectors: list[str]) -> bool:
+    """Click the first selector that resolves. Never raises."""
     for selector in selectors:
-        button = await page.query_selector(selector)
-        if button:
-            await button.click()
+        try:
+            await page.locator(selector).first.click(timeout=5_000)
             return True
+        except Exception:  # noqa: BLE001 - the human completes it instead
+            continue
     return False
 
 
@@ -118,6 +172,10 @@ async def main() -> None:
     parser.add_argument("command", choices=["capture"])
     parser.add_argument("note")
     parser.add_argument("--headful", action="store_true")
+    # The default suits an unattended-ish run; a login needing MFA and a
+    # human walking to the keyboard needs considerably longer.
+    parser.add_argument("--timeout", type=int, default=180,
+                        help="seconds to wait for the login to complete")
     parser.add_argument(
         "--out", default=str(ROOT / "tests" / "fixtures" / "sapnote_detail.json")
     )
@@ -128,7 +186,7 @@ async def main() -> None:
     if not user or not pwd:
         sys.exit("SAP_DIALOG_USER / SAP_DIALOG_PWD are not set in .env")
 
-    cookie = await login(user, pwd, headful=args.headful)
+    cookie = await login(user, pwd, headful=args.headful, timeout_s=args.timeout)
     print(f"captured {cookie.count('=')} cookies")  # never print the value
 
     status, ctype, body = await fetch_detail_raw(cookie, args.note)
