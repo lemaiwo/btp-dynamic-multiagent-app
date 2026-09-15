@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.7.0
+version: 2.8.0
 
 parameters:
   enable-parallel-deployments: true
