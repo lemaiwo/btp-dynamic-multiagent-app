@@ -30,14 +30,16 @@ export default class Agents extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const agents = await this.run(
-            this.getAdminService().listAgents(),
-            "Could not load the agents."
-        );
-        if (agents) {
-            (this.getModel("agents") as JSONModel).setProperty("/items", agents);
-        }
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const agents = await this.run(
+                this.getAdminService().listAgents(),
+                "Could not load the agents."
+            );
+            if (agents) {
+                (this.getModel("agents") as JSONModel).setProperty("/items", agents);
+            }
+        });
     }
 
     public onSearch(event: SearchField$LiveChangeEvent): void {

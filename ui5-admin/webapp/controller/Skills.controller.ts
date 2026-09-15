@@ -19,14 +19,16 @@ export default class Skills extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const skills = await this.run(
-            this.getAdminService().listSkills(),
-            "Could not load the skills."
-        );
-        if (skills) {
-            (this.getModel("skills") as JSONModel).setProperty("/items", skills);
-        }
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const skills = await this.run(
+                this.getAdminService().listSkills(),
+                "Could not load the skills."
+            );
+            if (skills) {
+                (this.getModel("skills") as JSONModel).setProperty("/items", skills);
+            }
+        });
     }
 
     public onCreate(): void {

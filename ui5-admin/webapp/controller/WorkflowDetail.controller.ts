@@ -102,56 +102,58 @@ export default class WorkflowDetail extends BaseController {
         (this.getModel("flow") as JSONModel).setData(graph);
     }
 
-    private async load(id: string): Promise<void> {
-        const model = this.getModel("workflow") as JSONModel;
-        model.setProperty("/errors", {});
+    private load(id: string): Promise<void> {
+        return this.withBusy(async () => {
+            const model = this.getModel("workflow") as JSONModel;
+            model.setProperty("/errors", {});
 
-        // Fetched before either branch below returns: a step's agent <Select>
-        // needs the full agent list (disabled agents included -- a disabled
-        // agent is still a real, nameable choice that the server alone
-        // rejects, exactly as the missing-agent case below is left to the
-        // server) whether the workflow is new or existing.
-        const agents = await this.run(
-            this.getAdminService().listAgents(),
-            this.text("workflowLoadAgentsFailed")
-        );
-        model.setProperty("/availableAgents", agents ?? []);
+            // Fetched before either branch below returns: a step's agent <Select>
+            // needs the full agent list (disabled agents included -- a disabled
+            // agent is still a real, nameable choice that the server alone
+            // rejects, exactly as the missing-agent case below is left to the
+            // server) whether the workflow is new or existing.
+            const agents = await this.run(
+                this.getAdminService().listAgents(),
+                this.text("workflowLoadAgentsFailed")
+            );
+            model.setProperty("/availableAgents", agents ?? []);
 
-        if (id === "new") {
-            this.workflowId = undefined;
-            model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData);
-            model.setProperty("/title", this.text("newWorkflow"));
+            if (id === "new") {
+                this.workflowId = undefined;
+                model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData);
+                model.setProperty("/title", this.text("newWorkflow"));
+                this.refreshStepOptions();
+                return;
+            }
+
+            this.workflowId = Number(id);
+            const workflow = await this.run(
+                this.getAdminService().getWorkflow(this.workflowId),
+                this.text("workflowLoadFailed")
+            );
+            if (!workflow) {
+                return;
+            }
+            // Copy only the input fields; id/created_at/updated_at must not be
+            // POSTed back. branches/steps are copied as plain objects -- their
+            // per-row option lists are filled in by refreshStepOptions() below,
+            // not carried from the server.
+            model.setProperty("/data", {
+                name: workflow.name,
+                description: workflow.description,
+                api_slug: workflow.api_slug ?? "",
+                run_as_principal: workflow.run_as_principal ?? "",
+                run_timeout_seconds: workflow.run_timeout_seconds ?? 1800,
+                skip_seen_items: workflow.skip_seen_items,
+                max_parallel_items: workflow.max_parallel_items,
+                on_unknown_branch: workflow.on_unknown_branch,
+                enabled: workflow.enabled,
+                branches: (workflow.branches ?? []).map((b) => ({ ...b })),
+                steps: (workflow.steps ?? []).map((s) => ({ ...s }))
+            } as UiWorkflowData);
+            model.setProperty("/title", workflow.name);
             this.refreshStepOptions();
-            return;
-        }
-
-        this.workflowId = Number(id);
-        const workflow = await this.run(
-            this.getAdminService().getWorkflow(this.workflowId),
-            this.text("workflowLoadFailed")
-        );
-        if (!workflow) {
-            return;
-        }
-        // Copy only the input fields; id/created_at/updated_at must not be
-        // POSTed back. branches/steps are copied as plain objects -- their
-        // per-row option lists are filled in by refreshStepOptions() below,
-        // not carried from the server.
-        model.setProperty("/data", {
-            name: workflow.name,
-            description: workflow.description,
-            api_slug: workflow.api_slug ?? "",
-            run_as_principal: workflow.run_as_principal ?? "",
-            run_timeout_seconds: workflow.run_timeout_seconds ?? 1800,
-            skip_seen_items: workflow.skip_seen_items,
-            max_parallel_items: workflow.max_parallel_items,
-            on_unknown_branch: workflow.on_unknown_branch,
-            enabled: workflow.enabled,
-            branches: (workflow.branches ?? []).map((b) => ({ ...b })),
-            steps: (workflow.steps ?? []).map((s) => ({ ...s }))
-        } as UiWorkflowData);
-        model.setProperty("/title", workflow.name);
-        this.refreshStepOptions();
+        });
     }
 
     // --- Per-row option lists ----------------------------------------------

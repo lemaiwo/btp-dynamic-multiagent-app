@@ -33,24 +33,26 @@ export default class Settings extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const model = this.getModel("settings") as JSONModel;
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const model = this.getModel("settings") as JSONModel;
 
-        const modelInfo = await this.run(
-            this.getAdminService().getModel(),
-            "Could not load the LLM model configuration."
-        );
-        if (modelInfo) {
-            model.setProperty("/model", modelInfo);
-        }
+            const modelInfo = await this.run(
+                this.getAdminService().getModel(),
+                "Could not load the LLM model configuration."
+            );
+            if (modelInfo) {
+                model.setProperty("/model", modelInfo);
+            }
 
-        const orchestrator = await this.run(
-            this.getAdminService().getOrchestrator(),
-            "Could not load the orchestrator instructions."
-        );
-        if (orchestrator) {
-            model.setProperty("/orchestrator", orchestrator);
-        }
+            const orchestrator = await this.run(
+                this.getAdminService().getOrchestrator(),
+                "Could not load the orchestrator instructions."
+            );
+            if (orchestrator) {
+                model.setProperty("/orchestrator", orchestrator);
+            }
+        });
     }
 
     public async onSaveModel(): Promise<void> {

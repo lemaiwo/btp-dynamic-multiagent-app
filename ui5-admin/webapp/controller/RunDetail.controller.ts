@@ -23,40 +23,42 @@ export default class RunDetail extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const model = this.getModel("run") as JSONModel;
-        model.setData({ data: {}, reportHtml: "", hasReport: false });
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const model = this.getModel("run") as JSONModel;
+            model.setData({ data: {}, reportHtml: "", hasReport: false });
 
-        const run = await this.run(
-            this.getAdminService().getRun(this.runId),
-            "Could not load the run."
-        );
-        if (!run) {
-            return;
-        }
-        model.setProperty("/data", run);
-
-        const bodyMd = run.report?.body_md ?? "";
-        if (!bodyMd) {
-            return;
-        }
-        try {
-            await ReportRenderer.ensureLibraries();
-            model.setProperty("/reportHtml", `<div class="agentAdminReport">${ReportRenderer.renderMarkdown(bodyMd)}</div>`);
-            model.setProperty("/hasReport", true);
-        } catch (error) {
-            ErrorHandler.handle(error, "Could not render the run report.");
-            return;
-        }
-
-        // Diagrams are replaced after the HTML control has rendered, so the
-        // fences exist in the DOM to be swapped.
-        const html = this.byId("reportHtml") as HTML;
-        html.attachEventOnce("afterRendering", () => {
-            const dom = html.getDomRef();
-            if (dom) {
-                void ReportRenderer.renderMermaid(dom as HTMLElement, this.runId);
+            const run = await this.run(
+                this.getAdminService().getRun(this.runId),
+                "Could not load the run."
+            );
+            if (!run) {
+                return;
             }
+            model.setProperty("/data", run);
+
+            const bodyMd = run.report?.body_md ?? "";
+            if (!bodyMd) {
+                return;
+            }
+            try {
+                await ReportRenderer.ensureLibraries();
+                model.setProperty("/reportHtml", `<div class="agentAdminReport">${ReportRenderer.renderMarkdown(bodyMd)}</div>`);
+                model.setProperty("/hasReport", true);
+            } catch (error) {
+                ErrorHandler.handle(error, "Could not render the run report.");
+                return;
+            }
+
+            // Diagrams are replaced after the HTML control has rendered, so the
+            // fences exist in the DOM to be swapped.
+            const html = this.byId("reportHtml") as HTML;
+            html.attachEventOnce("afterRendering", () => {
+                const dom = html.getDomRef();
+                if (dom) {
+                    void ReportRenderer.renderMermaid(dom as HTMLElement, this.runId);
+                }
+            });
         });
     }
 

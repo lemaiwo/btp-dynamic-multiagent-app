@@ -24,30 +24,32 @@ export default class SkillDetail extends BaseController {
         });
     }
 
-    private async load(id: string): Promise<void> {
-        const model = this.getModel("skill") as JSONModel;
-        model.setProperty("/errors", {});
+    private load(id: string): Promise<void> {
+        return this.withBusy(async () => {
+            const model = this.getModel("skill") as JSONModel;
+            model.setProperty("/errors", {});
 
-        if (id === "new") {
-            this.skillId = undefined;
-            model.setProperty("/data", { ...EMPTY });
-            model.setProperty("/title", this.text("newSkill"));
-            return;
-        }
+            if (id === "new") {
+                this.skillId = undefined;
+                model.setProperty("/data", { ...EMPTY });
+                model.setProperty("/title", this.text("newSkill"));
+                return;
+            }
 
-        this.skillId = Number(id);
-        const skill = await this.run(
-            this.getAdminService().getSkill(this.skillId),
-            "Could not load the skill."
-        );
-        if (skill) {
-            model.setProperty("/data", {
-                name: skill.name,
-                description: skill.description,
-                content: skill.content
-            });
-            model.setProperty("/title", skill.name);
-        }
+            this.skillId = Number(id);
+            const skill = await this.run(
+                this.getAdminService().getSkill(this.skillId),
+                "Could not load the skill."
+            );
+            if (skill) {
+                model.setProperty("/data", {
+                    name: skill.name,
+                    description: skill.description,
+                    content: skill.content
+                });
+                model.setProperty("/title", skill.name);
+            }
+        });
     }
 
     public async onSave(): Promise<void> {

@@ -24,14 +24,16 @@ export default class Workflows extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const workflows = await this.run(
-            this.getAdminService().listWorkflows(),
-            "Could not load the workflows."
-        );
-        if (workflows) {
-            (this.getModel("workflows") as JSONModel).setProperty("/items", workflows);
-        }
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const workflows = await this.run(
+                this.getAdminService().listWorkflows(),
+                "Could not load the workflows."
+            );
+            if (workflows) {
+                (this.getModel("workflows") as JSONModel).setProperty("/items", workflows);
+            }
+        });
     }
 
     public onSearch(event: SearchField$LiveChangeEvent): void {

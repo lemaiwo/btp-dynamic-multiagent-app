@@ -19,14 +19,16 @@ export default class Runs extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const runs = await this.run(
-            this.getAdminService().listRuns({ limit: 50 }),
-            "Could not load the job runs."
-        );
-        if (runs) {
-            (this.getModel("runs") as JSONModel).setProperty("/items", runs);
-        }
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const runs = await this.run(
+                this.getAdminService().listRuns({ limit: 50 }),
+                "Could not load the job runs."
+            );
+            if (runs) {
+                (this.getModel("runs") as JSONModel).setProperty("/items", runs);
+            }
+        });
     }
 
     public onRefresh(): void {

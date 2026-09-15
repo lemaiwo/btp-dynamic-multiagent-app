@@ -38,29 +38,31 @@ export default class WorkflowRunDetail extends BaseController {
         });
     }
 
-    private async load(): Promise<void> {
-        const model = this.getModel("run") as JSONModel;
-        model.setData({ data: {}, preFanOutSteps: [], items: [] });
+    private load(): Promise<void> {
+        return this.withBusy(async () => {
+            const model = this.getModel("run") as JSONModel;
+            model.setData({ data: {}, preFanOutSteps: [], items: [] });
 
-        const detail = await this.run(
-            this.getAdminService().getWorkflowRun(this.runId),
-            "Could not load the workflow run."
-        );
-        if (!detail) {
-            return;
-        }
+            const detail = await this.run(
+                this.getAdminService().getWorkflowRun(this.runId),
+                "Could not load the workflow run."
+            );
+            if (!detail) {
+                return;
+            }
 
-        // The tree is implied by foreign keys, not nesting: a step run's
-        // item_run_id is null when it ran before the fan-out step (once for
-        // the whole run), otherwise it belongs to the item it names.
-        const preFanOutSteps = detail.steps.filter((step) => step.item_run_id === null);
-        const items: ItemRunDisplay[] = detail.items.map((item) => ({
-            ...item,
-            steps: detail.steps.filter((step) => step.item_run_id === item.id)
-        }));
+            // The tree is implied by foreign keys, not nesting: a step run's
+            // item_run_id is null when it ran before the fan-out step (once for
+            // the whole run), otherwise it belongs to the item it names.
+            const preFanOutSteps = detail.steps.filter((step) => step.item_run_id === null);
+            const items: ItemRunDisplay[] = detail.items.map((item) => ({
+                ...item,
+                steps: detail.steps.filter((step) => step.item_run_id === item.id)
+            }));
 
-        model.setData({ data: detail.run, preFanOutSteps, items });
-        await this.loadFlow(detail.run.workflow_id, detail.items, detail.steps);
+            model.setData({ data: detail.run, preFanOutSteps, items });
+            await this.loadFlow(detail.run.workflow_id, detail.items, detail.steps);
+        });
     }
 
     /**

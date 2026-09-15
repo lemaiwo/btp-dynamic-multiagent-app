@@ -17,6 +17,18 @@ import ErrorHandler from "../service/ErrorHandler";
  */
 export default abstract class BaseController extends Controller {
 
+    /**
+     * How long a load may take before the indicator appears.
+     *
+     * A warm backend answers in well under this, so routine navigation stays
+     * visually quiet; a cold one — the first call after the connection pool
+     * has gone idle takes a second or more — shows the indicator promptly.
+     */
+    private static readonly BUSY_DELAY_MS = 200;
+
+    /** Number of `withBusy` calls currently in flight on this controller. */
+    private busyDepth = 0;
+
     public getOwnerComponentTyped(): Component {
         return this.getOwnerComponent() as Component;
     }
@@ -70,6 +82,32 @@ export default abstract class BaseController extends Controller {
         } catch (error) {
             ErrorHandler.handle(error, fallback);
             return false;
+        }
+    }
+
+    /**
+     * Marks the view busy for as long as `work` is running.
+     *
+     * Takes the whole load as a thunk rather than a single promise so that a
+     * page fetching several things in sequence shows one indicator instead of
+     * flickering between calls. Nested and overlapping calls are ref-counted,
+     * so the indicator only clears once the last one has finished — including
+     * when the work fails, which still propagates to the caller.
+     */
+    protected async withBusy<T>(work: () => Promise<T>): Promise<T> {
+        const view = this.getView();
+        if (this.busyDepth === 0 && view) {
+            view.setBusyIndicatorDelay(BaseController.BUSY_DELAY_MS);
+            view.setBusy(true);
+        }
+        this.busyDepth++;
+        try {
+            return await work();
+        } finally {
+            this.busyDepth--;
+            if (this.busyDepth === 0 && view) {
+                view.setBusy(false);
+            }
         }
     }
 
