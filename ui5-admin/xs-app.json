@@ -21,7 +21,9 @@
       "target": "$1",
       "service": "html5-apps-repo-rt",
       "authenticationType": "xsuaa",
-      "scope": "$XSAPPNAME.admin"
+      "scope": "$XSAPPNAME.admin",
+      "_comment": "Component-preload.js and manifest.json keep the same names on every deploy, and the repo sends no Cache-Control of its own -- so browsers fall back to heuristic caching and a returning admin boots a build that can be weeks old. no-cache asks for revalidation rather than forbidding storage: with the repo's ETag an unchanged file still answers 304, so this costs a conditional request, not a re-download.",
+      "cacheControl": "no-cache, must-revalidate"
     }
   ]
 }
