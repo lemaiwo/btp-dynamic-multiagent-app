@@ -28,14 +28,20 @@ resources/
 
 # --- Landscape-specific, do not commit ---
 # MTA extension descriptors pin one landscape's routes, AI Core resource
-# group and PUBLIC_BASE_URL (e.g. landscape.mtaext). Every landscape needs its
-# own; committing one invites deploying another landscape's values.
+# group and PUBLIC_BASE_URL (e.g. <landscape>.mtaext). Every landscape needs
+# its own; committing one invites deploying another landscape's values.
 *.mtaext
 
-# Exported agent/workflow bundles. These carry landscape hostnames, OAuth
-# client ids and identity-provider tenant ids, and are meant to be imported
-# through the admin UI rather than tracked.
-docs/*.config.json
+# Documentation and exported agent/workflow bundles. Both name real
+# landscapes -- CF orgs and spaces, approuter hosts, destination names, OAuth
+# client ids and identity-provider tenant ids. This is a public repo, so they
+# stay local; docs/ was purged from history for the same reason.
+docs/
+
+# Tests whose fixtures name a real landscape (destination URLs, ARC-1 hosts,
+# AI Core resource groups). They still run locally -- they sit under tests/,
+# so pytest finds them -- but they are not ours to publish.
+tests/local/
 
 # Fetched SAP note payloads and other scratch artifacts. Note content is
 # SAP-licensed material and support-backbone output; it is not ours to commit.

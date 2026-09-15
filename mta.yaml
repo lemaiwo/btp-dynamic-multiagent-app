@@ -9,7 +9,7 @@ parameters:
   enable-parallel-deployments: true
   # AI Core bills consumption per resource group, so a landscape that needs its
   # own line in the bill overrides this in an extension descriptor
-  # (cf deploy ... -e landscape.mtaext) rather than by editing this file.
+  # (cf deploy ... -e <landscape>.mtaext) rather than by editing this file.
   # "default" is the tenant-wide group: it always exists, and the deploy hook
   # treats it as "nothing to provision".
   #
@@ -64,7 +64,12 @@ modules:
       # API-triggered (scheduled) runs have no request to read headers from,
       # so they need one of PUBLIC_BASE_URL / A2A_PUBLIC_URL to be set: with
       # both empty, every run fails immediately in run_as.
-      PUBLIC_BASE_URL: "https://approuter-replace-me.hana.ondemand.com"
+      #
+      # The value is the approuter route, which differs per landscape, so it
+      # is left empty here and pinned in an extension descriptor
+      # (cf deploy ... -e <landscape>.mtaext). A landscape that runs scheduled
+      # agents MUST set it there.
+      PUBLIC_BASE_URL: ""
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
     requires:
