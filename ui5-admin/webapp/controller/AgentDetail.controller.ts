@@ -69,84 +69,99 @@ export default class AgentDetail extends BaseController {
         });
     }
 
-    private async load(id: string): Promise<void> {
-        const model = this.getModel("agent") as JSONModel;
-        model.setProperty("/errors", {});
+    private load(id: string): Promise<void> {
+        return this.withBusy(async () => {
+            const model = this.getModel("agent") as JSONModel;
+            model.setProperty("/errors", {});
 
-        const skills = await this.run(
-            this.getAdminService().listSkills(),
-            "Could not load the skill list."
-        );
-        model.setProperty("/availableSkills", skills ?? []);
+            // Issued together, not one after another: none of the three reads
+            // the others' result, so awaiting them in sequence made opening an
+            // agent cost three round trips instead of one. `run()` still
+            // reports each failure on its own, and resolves undefined for it,
+            // so one failing call no longer decides whether the others are
+            // even attempted.
+            //
+            // Neither list blocks the form from opening: a peer picker with no
+            // options, or a model list that fell back to just the stored
+            // override, still leaves the agent editable. See the model
+            // control's "not currently available" handling below.
+            const [skills, agents, modelInfo] = await Promise.all([
+                this.run(
+                    this.getAdminService().listSkills(),
+                    "Could not load the skill list."
+                ),
+                this.run(
+                    this.getAdminService().listAgents(),
+                    "Could not load the agent list."
+                ),
+                this.run(
+                    this.getAdminService().getModel(),
+                    "Could not load the LLM model list."
+                )
+            ]);
+            model.setProperty("/availableSkills", skills ?? []);
+            const availableModelNames = modelInfo?.available ?? [];
 
-        // Both calls must not block the form from opening: a peer picker
-        // with no options, or a model list that fell back to just the
-        // stored override, still leaves the agent editable. See the model
-        // control's "not currently available" handling below.
-        const agents = await this.run(
-            this.getAdminService().listAgents(),
-            "Could not load the agent list."
-        );
-        const modelInfo = await this.run(
-            this.getAdminService().getModel(),
-            "Could not load the LLM model list."
-        );
-        const availableModelNames = modelInfo?.available ?? [];
+            if (id === "new") {
+                this.agentId = undefined;
+                model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
+                model.setProperty("/title", this.text("newAgent"));
+                // Otherwise a credential table left over from whichever agent was
+                // open before navigating here would still be showing.
+                model.setProperty("/credentials", []);
+                // A new agent has no name yet, so it excludes nothing from its
+                // own peer list — every existing agent is offered.
+                model.setProperty("/availableAgents", agents ?? []);
+                model.setProperty("/availableModels", this.buildModelOptions(availableModelNames, ""));
+                return;
+            }
 
-        if (id === "new") {
-            this.agentId = undefined;
-            model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
-            model.setProperty("/title", this.text("newAgent"));
-            // Otherwise a credential table left over from whichever agent was
-            // open before navigating here would still be showing.
-            model.setProperty("/credentials", []);
-            // A new agent has no name yet, so it excludes nothing from its
-            // own peer list — every existing agent is offered.
-            model.setProperty("/availableAgents", agents ?? []);
-            model.setProperty("/availableModels", this.buildModelOptions(availableModelNames, ""));
-            return;
-        }
+            this.agentId = Number(id);
+            // Also independent of each other, so also issued together. The
+            // base URL is only read further down, and fetching it for an agent
+            // that turns out not to exist costs nothing.
+            const [agent, config] = await Promise.all([
+                this.run(
+                    this.getAdminService().getAgent(this.agentId),
+                    "Could not load the agent."
+                ),
+                this.run(
+                    this.getAdminService().getConfig(),
+                    "Could not read the public base URL."
+                )
+            ]);
+            if (!agent) {
+                return;
+            }
+            // Copy only the input fields; id/created_at/updated_at and the legacy
+            // mcp_url/auth_mode pair must not be POSTed back.
+            model.setProperty("/data", {
+                name: agent.name,
+                description: agent.description,
+                instructions: agent.instructions,
+                mcp_servers: agent.mcp_servers ?? [],
+                skills: agent.skills ?? [],
+                enabled: agent.enabled,
+                expose_chat: agent.expose_chat,
+                expose_api: agent.expose_api,
+                api_slug: agent.api_slug ?? "",
+                run_as_principal: agent.run_as_principal ?? "",
+                run_prompt: agent.run_prompt ?? "",
+                run_timeout_seconds: agent.run_timeout_seconds ?? 1800,
+                peers: agent.peers ?? [],
+                model_name: agent.model_name ?? ""
+            } as AgentInput);
+            model.setProperty("/title", agent.name);
+            // An agent must never be offered itself as a peer.
+            model.setProperty("/availableAgents", (agents ?? []).filter((a) => a.name !== agent.name));
+            model.setProperty(
+                "/availableModels",
+                this.buildModelOptions(availableModelNames, agent.model_name ?? "")
+            );
 
-        this.agentId = Number(id);
-        const agent = await this.run(
-            this.getAdminService().getAgent(this.agentId),
-            "Could not load the agent."
-        );
-        if (!agent) {
-            return;
-        }
-        // Copy only the input fields; id/created_at/updated_at and the legacy
-        // mcp_url/auth_mode pair must not be POSTed back.
-        model.setProperty("/data", {
-            name: agent.name,
-            description: agent.description,
-            instructions: agent.instructions,
-            mcp_servers: agent.mcp_servers ?? [],
-            skills: agent.skills ?? [],
-            enabled: agent.enabled,
-            expose_chat: agent.expose_chat,
-            expose_api: agent.expose_api,
-            api_slug: agent.api_slug ?? "",
-            run_as_principal: agent.run_as_principal ?? "",
-            run_prompt: agent.run_prompt ?? "",
-            run_timeout_seconds: agent.run_timeout_seconds ?? 1800,
-            peers: agent.peers ?? [],
-            model_name: agent.model_name ?? ""
-        } as AgentInput);
-        model.setProperty("/title", agent.name);
-        // An agent must never be offered itself as a peer.
-        model.setProperty("/availableAgents", (agents ?? []).filter((a) => a.name !== agent.name));
-        model.setProperty(
-            "/availableModels",
-            this.buildModelOptions(availableModelNames, agent.model_name ?? "")
-        );
-
-        const config = await this.run(
-            this.getAdminService().getConfig(),
-            "Could not read the public base URL."
-        );
-        this.publicBaseUrl = config?.public_base_url ?? "";
-        void this.loadCredentials();
+            this.publicBaseUrl = config?.public_base_url ?? "";
+            void this.loadCredentials();
+        });
     }
 
     /**

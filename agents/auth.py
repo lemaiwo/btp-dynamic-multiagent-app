@@ -122,7 +122,18 @@ class XsuaaValidator:
         self.xsappname = credentials.get("xsappname", "pydantic-agent")
         uaa_url = credentials.get("url", "").rstrip("/")
         self.uaa_url = uaa_url
-        self.jwks_client = PyJWKClient(f"{uaa_url}/token_keys")
+        # lifespan: how long the fetched JWK set is reused before another
+        # blocking HTTPS round trip to XSUAA. PyJWT's default is 300s, which
+        # buys nothing here: rotation is handled by `get_signing_key`, which
+        # force-refreshes whenever a token names a `kid` the cached set does
+        # not contain. An hour simply means 12x fewer refetches.
+        # timeout: PyJWT defaults to 30s, long enough that an unreachable
+        # XSUAA would stall the request rather than fail it. Five seconds is
+        # past the point where the `verificationkey` fallback below is the
+        # better answer.
+        self.jwks_client = PyJWKClient(
+            f"{uaa_url}/token_keys", lifespan=3600, timeout=5
+        )
         verification_key = credentials.get("verificationkey")
         self._verification_key = verification_key
 
@@ -197,8 +208,15 @@ def _extract_token(request: Request) -> str | None:
 
 # ---------------------------------------------------------------------------
 # FastAPI dependencies
+#
+# Deliberately `def`, not `async def`. Nothing in them awaits, but
+# `validator.validate()` reaches PyJWKClient, which fetches the JWK set with
+# a *blocking* urllib call. Declared async, that call runs on the event loop
+# and stalls every other request in flight — one JWKS refresh delaying an
+# unrelated page load. Declared sync, FastAPI runs them in a threadpool and
+# a slow refresh costs only the request that triggered it.
 # ---------------------------------------------------------------------------
-async def require_user(request: Request) -> dict[str, Any]:
+def require_user(request: Request) -> dict[str, Any]:
     """Ensure a valid JWT is present (any authenticated user)."""
     validator = get_validator()
     token = _extract_token(request)
@@ -214,7 +232,7 @@ async def require_user(request: Request) -> dict[str, Any]:
     return validator.validate(token)
 
 
-async def require_admin(request: Request) -> dict[str, Any]:
+def require_admin(request: Request) -> dict[str, Any]:
     """Ensure caller holds the `<xsappname>.admin` scope."""
     validator = get_validator()
     token = _extract_token(request)
@@ -235,7 +253,7 @@ async def require_admin(request: Request) -> dict[str, Any]:
     return payload
 
 
-async def require_jobscheduler(request: Request) -> dict[str, Any]:
+def require_jobscheduler(request: Request) -> dict[str, Any]:
     """Ensure the caller holds the `<xsappname>.JOBSCHEDULER` scope.
 
     Granted to the jobscheduler service instance via `grant-as-authority-to-apps`
