@@ -71,7 +71,10 @@ function byPosition<T extends { position: number }>(items: T[]): T[] {
  * first, in declared order, then any key only a step mentions. A step naming
  * an undeclared branch cannot be saved, but during editing it is a normal
  * intermediate state and hiding it would be worse than showing it. */
-function branchOrder(branches: WorkflowBranch[], steps: WorkflowStep[]): string[] {
+export function branchOrder(
+    branches: WorkflowBranch[],
+    steps: { branch_key: string | null }[]
+): string[] {
     const keys = byPosition(branches).map((b) => b.key);
     const seen = new Set(keys);
     for (const step of steps) {

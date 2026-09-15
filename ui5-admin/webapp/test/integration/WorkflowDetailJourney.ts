@@ -7,6 +7,7 @@ import type JSONModel from "sap/ui/model/json/JSONModel";
 import type Table from "sap/m/Table";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Button from "sap/m/Button";
+import type HBox from "sap/m/HBox";
 import type Input from "sap/m/Input";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
@@ -31,6 +32,16 @@ QUnit.module("Workflow detail journey");
 // one seeded workflow, so the workflow always lands on id 102 -- see
 // FakeBackend.ts's reset() and WorkflowJourney.ts's own copy of this constant.
 const WORKFLOW_ID = 102;
+
+/** The step row carrying `needle` in its instructions. The steps table groups
+ * main-line rows ahead of branch rows, so a row's position in the table no
+ * longer follows the order steps were appended in -- find rows by content. */
+function stepRowMatching(table: Table, needle: string): ColumnListItem {
+    return (table.getItems() as ColumnListItem[]).filter((row) =>
+        String(row.getBindingContext("workflow")?.getProperty("instructions") ?? "")
+            .indexOf(needle) !== -1
+    )[0];
+}
 
 opaTest(
     "editing an existing workflow shows its branches and steps populated, with each step's branch and agent preselected",
@@ -333,8 +344,7 @@ opaTest(
             viewName: "WorkflowDetail",
             success: function (element: UI5Element) {
                 const table = element as Table;
-                const rows = table.getItems() as ColumnListItem[];
-                const ghostRow = rows[rows.length - 1];
+                const ghostRow = stepRowMatching(table, "Whoever last ran this agent");
                 const agentSelect = ghostRow.getCells()[1] as Select;
                 Opa5.assert.strictEqual(
                     agentSelect.getSelectedKey(), "ghost-agent",
@@ -393,8 +403,7 @@ opaTest(
             viewName: "WorkflowDetail",
             success: function (element: UI5Element) {
                 const table = element as Table;
-                const rows = table.getItems() as ColumnListItem[];
-                const ghostRow = rows[rows.length - 1];
+                const ghostRow = stepRowMatching(table, "Whoever last ran this agent");
                 Opa5.assert.strictEqual(
                     (ghostRow.getCells()[1] as Select).getSelectedKey(), "ghost-agent",
                     "after the rejected save, the step still names the missing agent -- it was never silently substituted"
@@ -600,7 +609,11 @@ opaTest(
             id: "stepsTable",
             viewName: "WorkflowDetail",
             matchers: function (element: UI5Element) {
-                return ((element as Table).getItems()[0] as ColumnListItem).getCells()[5];
+                // The Actions cell holds move-up / move-down / delete, so the
+                // delete button is the last item inside it rather than the
+                // cell itself.
+                const actions = ((element as Table).getItems()[0] as ColumnListItem).getCells()[5] as HBox;
+                return actions.getItems()[2];
             },
             actions: new Press()
         });
@@ -614,7 +627,9 @@ opaTest(
             success: function (element: UI5Element) {
                 const model = (element as Table).getModel("workflow") as JSONModel;
                 const steps = model.getProperty("/data/steps") as StepRow[];
-                const newStep = steps[steps.length - 1];
+                // Grouped ahead of the branch rows, so not steps[length-1]:
+                // the new row is the one still carrying no agent.
+                const newStep = steps.filter((row) => !row.agent_name)[0];
                 newStep.branch_key = "support";
                 newStep.agent_name = "btp-agent";
                 newStep.instructions = "Escalate to a human.";

@@ -15,6 +15,7 @@ sap.ui.define(function () {
             "unit/validators": { title: "Unit: validators" },
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },
+            "unit/workflowOrder": { title: "Unit: workflowOrder" },
             "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }
     };

@@ -5,6 +5,7 @@ import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import { buildDefinitionGraph } from "../model/processFlowGraph";
+import { canMoveWithinGroup, groupSteps, swap } from "../model/workflowOrder";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
@@ -44,6 +45,11 @@ interface RowOption {
 interface UiStep extends WorkflowStep {
     agentOptions: RowOption[];
     branchOptions: RowOption[];
+    /** Whether the move buttons are live for this row; see `workflowOrder`.
+     * Precomputed per row because the table binding has no row index to
+     * hand a formatter. */
+    canUp?: boolean;
+    canDown?: boolean;
 }
 
 interface UiWorkflowData extends Omit<WorkflowInput, "steps"> {
@@ -201,8 +207,14 @@ export default class WorkflowDetail extends BaseController {
     }
 
     /** Recomputes every step's `agentOptions`/`branchOptions` from the
-     * current agent list and branch rows. Called after load, and after any
-     * change to the branches table (add, remove, or a key edited in place). */
+     * current agent list and branch rows, regroups the rows so each branch
+     * sits together, and marks which move buttons are live.
+     *
+     * Grouping happens here rather than only on load because a step's branch
+     * can change at any moment, and a row that has just left the main line
+     * belongs with its new group before the operator can move it. It is also
+     * what makes the move buttons meaningful: neighbours always share a
+     * group, so a swap always changes a position. */
     private refreshStepOptions(): void {
         const model = this.getModel("workflow") as JSONModel;
         const steps = (model.getProperty("/data/steps") as UiStep[]).map((s) => ({
@@ -211,7 +223,98 @@ export default class WorkflowDetail extends BaseController {
             branchOptions: this.buildBranchOptionsForStep(s.branch_key)
         }));
         model.setProperty("/data/steps", steps);
+        this.regroupSteps();
+    }
+
+    /**
+     * Regroups the rows and recomputes which move buttons are live.
+     *
+     * Deliberately separate from `refreshStepOptions`: rebuilding a row's
+     * `agentOptions` re-creates the item list behind its `<Select>`, and a
+     * `<Select>` whose key is a *placeholder* for an agent that no longer
+     * exists loses that key when its items are replaced -- silently turning a
+     * missing agent into a real one. So an agent or fan-out change, which
+     * cannot move a row between groups anyway, must never rebuild options.
+     */
+    private regroupSteps(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const branches = model.getProperty("/data/branches") as WorkflowBranch[];
+        const steps = model.getProperty("/data/steps") as UiStep[];
+        model.setProperty("/data/steps", groupSteps(steps, branches));
+        this.applyMoveFlags();
+    }
+
+    /**
+     * Marks which move buttons are live, leaving row order alone.
+     *
+     * Used wherever the order is already right: adding a row (it belongs at
+     * the bottom until its branch says otherwise), removing one, and moving
+     * one. Grouping on *add* would be actively wrong -- the row would be
+     * pulled up into the main-line block the moment it appeared, away from
+     * the button that created it, and when its branch was then chosen, stable
+     * grouping would drop it at the *front* of that branch instead of the end
+     * an operator expects. Left at the bottom, it lands where it should.
+     */
+    private applyMoveFlags(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const steps = model.getProperty("/data/steps") as UiStep[];
+        const branches = model.getProperty("/data/branches") as WorkflowBranch[];
+
+        model.setProperty("/data/steps", steps.map((s, index) => ({
+            ...s,
+            canUp: canMoveWithinGroup(steps, index, -1),
+            canDown: canMoveWithinGroup(steps, index, 1)
+        })));
+        // Branches are one flat list, so their bounds are the whole table.
+        model.setProperty("/data/branches", branches.map((b, index) => ({
+            ...b,
+            canUp: index > 0,
+            canDown: index < branches.length - 1
+        })));
         this.refreshFlow();
+    }
+
+    /** Swap a step with its neighbour in the same group. `position` is derived
+     * from row order on save, so moving the row *is* the reordering. */
+    private moveStep(event: Event, delta: number): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const steps = model.getProperty("/data/steps") as UiStep[];
+        const index = WorkflowDetail.rowIndex(event);
+        if (!canMoveWithinGroup(steps, index, delta)) {
+            return;
+        }
+        model.setProperty("/data/steps", swap(steps, index, delta));
+        this.applyMoveFlags();
+    }
+
+    public onMoveStepUp(event: Event): void {
+        this.moveStep(event, -1);
+    }
+
+    public onMoveStepDown(event: Event): void {
+        this.moveStep(event, 1);
+    }
+
+    /** Branch order decides the order of the branch blocks in the steps table
+     * and of the lanes in the preview, so moving one regroups the steps. */
+    private moveBranch(event: Event, delta: number): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const branches = model.getProperty("/data/branches") as WorkflowBranch[];
+        const index = WorkflowDetail.rowIndex(event);
+        const target = index + delta;
+        if (index < 0 || target < 0 || target >= branches.length) {
+            return;
+        }
+        model.setProperty("/data/branches", swap(branches, index, delta));
+        this.refreshStepOptions();
+    }
+
+    public onMoveBranchUp(event: Event): void {
+        this.moveBranch(event, -1);
+    }
+
+    public onMoveBranchDown(event: Event): void {
+        this.moveBranch(event, 1);
     }
 
     // --- Branches -----------------------------------------------------------
@@ -253,7 +356,7 @@ export default class WorkflowDetail extends BaseController {
             branchOptions: this.buildBranchOptionsForStep(null)
         });
         model.setProperty("/data/steps", steps);
-        this.refreshFlow();
+        this.applyMoveFlags();
     }
 
     public onRemoveStep(event: Event): void {
@@ -262,13 +365,18 @@ export default class WorkflowDetail extends BaseController {
         const steps = (model.getProperty("/data/steps") as UiStep[]).slice();
         steps.splice(index, 1);
         model.setProperty("/data/steps", steps);
-        this.refreshFlow();
+        this.applyMoveFlags();
     }
 
     /** A step row's branch, agent or fan-out changed. The two-way binding has
      * already written it; this only redraws the preview. */
     public onStepRowChange(): void {
         this.refreshFlow();
+    }
+
+    /** A step's branch changed, so the row belongs to another group now. */
+    public onStepBranchChange(): void {
+        this.regroupSteps();
     }
 
     /** The row index of a press event's binding context, for tables whose

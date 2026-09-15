@@ -154,7 +154,13 @@
                                         placeholder="{i18n>branchKeyHint}"
                                         liveChange=".onBranchKeyChange" />
                                     <Input value="{workflow>description}" />
-                                    <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeBranch}" press=".onRemoveBranch" />
+                                    <HBox justifyContent="End" alignItems="Center">
+                                        <Button icon="sap-icon://navigation-up-arrow" type="Transparent"
+                                            enabled="{workflow>canUp}" tooltip="{i18n>moveBranchUp}" press=".onMoveBranchUp" />
+                                        <Button icon="sap-icon://navigation-down-arrow" type="Transparent"
+                                            enabled="{workflow>canDown}" tooltip="{i18n>moveBranchDown}" press=".onMoveBranchDown" />
+                                        <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeBranch}" press=".onRemoveBranch" />
+                                    </HBox>
                                 </cells>
                             </ColumnListItem>
                         </items>
@@ -189,7 +195,7 @@
                                         selectedKey="{workflow>branch_key}"
                                         items="{workflow>branchOptions}"
                                         forceSelection="false"
-                                        change=".onStepRowChange"
+                                        change=".onStepBranchChange"
                                         width="9rem">
                                         <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
                                     </Select>
@@ -204,7 +210,13 @@
                                     <TextArea value="{workflow>instructions}" rows="2" width="100%" />
                                     <CheckBox selected="{workflow>fan_out}" select=".onStepRowChange" />
                                     <StepInput value="{workflow>step_timeout_seconds}" min="10" max="1800" step="10" width="7rem" />
-                                    <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
+                                    <HBox justifyContent="End" alignItems="Center">
+                                        <Button icon="sap-icon://navigation-up-arrow" type="Transparent"
+                                            enabled="{workflow>canUp}" tooltip="{i18n>moveStepUp}" press=".onMoveStepUp" />
+                                        <Button icon="sap-icon://navigation-down-arrow" type="Transparent"
+                                            enabled="{workflow>canDown}" tooltip="{i18n>moveStepDown}" press=".onMoveStepDown" />
+                                        <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
+                                    </HBox>
                                 </cells>
                             </ColumnListItem>
                         </items>
