@@ -176,7 +176,16 @@ class GmailClient:
         messages = thread.get("messages") or []
         if not messages:
             raise ValueError(f"thread {thread_id!r} has no messages to reply to")
-        head = _headers((messages[-1] or {}).get("payload") or {})
+        # Answer the newest message that did NOT come from this mailbox. Gmail
+        # flags the owner's own messages with SENT, and messages arrive
+        # oldest-first, so taking the last one outright addresses the draft
+        # back at the owner the moment they have written in the thread once --
+        # the normal case for a queue a human also works, not an edge case.
+        # Falling back to the whole list keeps a thread of only-sent messages
+        # working rather than raising.
+        inbound = [m for m in messages if "SENT" not in ((m or {}).get("labelIds") or [])]
+        target = (inbound or messages)[-1]
+        head = _headers((target or {}).get("payload") or {})
 
         subject = head.get("subject", "")
         if not subject.lower().startswith("re:"):

@@ -99,6 +99,45 @@ THREAD_FULL = {
 }
 
 
+# A thread the mailbox owner has already answered once. Gmail flags the
+# owner's own messages with the SENT label, and thread messages come back
+# oldest-first -- so here the *last* message is the owner's, not the person
+# waiting for a reply.
+THREAD_REPLIED = {
+    "id": "t2",
+    "messages": [
+        {
+            "id": "m1",
+            "threadId": "t2",
+            "labelIds": ["INBOX", "Label_8458"],
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "Subject", "value": "question workzone"},
+                    {"name": "From", "value": "Customer <customer@example.com>"},
+                    {"name": "Message-ID", "value": "<cust@mail.gmail.com>"},
+                ],
+                "body": {"data": _b64("how do I configure btp workzone?")},
+            },
+        },
+        {
+            "id": "m2",
+            "threadId": "t2",
+            "labelIds": ["SENT"],
+            "payload": {
+                "mimeType": "text/plain",
+                "headers": [
+                    {"name": "Subject", "value": "Re: question workzone"},
+                    {"name": "From", "value": "Wouter <wouter@lemaire.tech>"},
+                    {"name": "Message-ID", "value": "<mine@mail.gmail.com>"},
+                ],
+                "body": {"data": _b64("looking into it, will come back to you")},
+            },
+        },
+    ],
+}
+
+
 class Recorder:
     """Records every request the toolset makes and serves canned responses."""
 
@@ -123,6 +162,8 @@ class Recorder:
             )
         if path.endswith("/threads/t1/modify"):
             return httpx.Response(200, json={"id": "t1"})
+        if path.endswith("/threads/t2"):
+            return httpx.Response(200, json=THREAD_REPLIED)
         if path.endswith("/threads/t1"):
             return httpx.Response(200, json=THREAD_FULL)
         if path.endswith("/drafts"):
@@ -218,6 +259,25 @@ async def main() -> None:
           f"got {msg.get('Subject') if msg else None}")
     check("carries the body", "Here is the answer." in mime)
     check("never calls send", not any("/send" in p for p in rec.paths()), f"{rec.paths()}")
+
+    # The agent is handed the thread's opening sender by search_threads, so a
+    # draft must answer that correspondent. Replying to whatever message is
+    # newest addresses the draft back at the mailbox owner as soon as the owner
+    # has written in the thread once -- which is the normal case, not an edge.
+    rec_r = Recorder()
+    res_r = await _client(rec_r).create_draft("t2", "Here is the answer.")
+    draft_r = [c for c in rec_r.calls if c[1].endswith("/drafts")]
+    raw_r = draft_r[0][2].get("message", {}).get("raw", "") if draft_r else ""
+    mime_r = base64.urlsafe_b64decode(raw_r.encode()).decode() if raw_r else ""
+    msg_r = email.message_from_string(mime_r) if mime_r else None
+    check("answers the correspondent, not the mailbox owner",
+          bool(msg_r and "customer@example.com" in (msg_r.get("To") or "")),
+          f"got {msg_r.get('To') if msg_r else None}")
+    check("reports that correspondent back to the agent",
+          res_r.get("to") == "customer@example.com", f"got {res_r.get('to')}")
+    check("threads onto the message it answers",
+          bool(msg_r and msg_r.get("In-Reply-To") == "<cust@mail.gmail.com>"),
+          f"got {msg_r.get('In-Reply-To') if msg_r else None}")
 
     # --- list_labels / modify_labels ---------------------------------------
     # The REST API modifies by label ID, so names must be resolved first. This
