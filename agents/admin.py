@@ -844,6 +844,58 @@ async def api_whoami(payload: dict[str, Any] = Depends(require_admin)) -> dict[s
     return {"principal": current_principal.get() or "", "label": str(label)}
 
 
+@router.get("/api/credential-health", dependencies=[Depends(require_admin)])
+async def api_credential_health() -> dict[str, Any]:
+    """Whether the credentials scheduled runs depend on are still usable.
+
+    Scheduled runs act as an agent's ``run_as_principal`` using a token that
+    principal authorized once by hand. Refresh is lazy, so a token can lapse
+    quietly between runs and the failure only shows up as a job that produced
+    nothing at 03:00. The admin UI reads this to say so out loud instead.
+
+    ``valid`` and ``refreshable`` are both healthy: the second only means the
+    access token has expired and the stored refresh token will renew it on the
+    next call, which is the normal steady state between runs.
+    """
+    from agents.oauth2 import scheduled_credentials, token_status_many
+
+    entries = await scheduled_credentials()
+    by_principal: dict[str, list[str]] = {}
+    for e in entries:
+        by_principal.setdefault(e["principal"], []).append(e["server_key"])
+
+    statuses: dict[str, dict[str, tuple[str, Any]]] = {}
+    for principal, keys in by_principal.items():
+        try:
+            statuses[principal] = await token_status_many(principal, keys)
+        except Exception:  # noqa: BLE001 — a health check must not 500
+            logger.warning(
+                "Could not read token status for principal %s", principal, exc_info=True
+            )
+            statuses[principal] = {}
+
+    problems: list[dict[str, Any]] = []
+    for e in entries:
+        state, expiry = statuses.get(e["principal"], {}).get(
+            e["server_key"], ("unknown", None)
+        )
+        if state in ("valid", "refreshable"):
+            continue
+        problems.append({
+            "agent": e["agent"],
+            "server_key": e["server_key"],
+            "principal": e["principal"],
+            "token_state": state,
+            "expires_at": expiry.isoformat() if expiry else None,
+        })
+
+    return {
+        "checked": len(entries),
+        "healthy": len(entries) - len(problems),
+        "problems": problems,
+    }
+
+
 @router.get("/api/config", dependencies=[Depends(require_admin)])
 async def api_config() -> dict[str, Any]:
     """Public host the UI5 admin needs for absolute OAuth sign-in links.

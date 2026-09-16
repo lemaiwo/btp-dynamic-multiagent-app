@@ -1,5 +1,5 @@
 import type {
-    Agent, AgentInput, AdminConfig, CredentialStatus, ImportPayload,
+    Agent, AgentInput, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
     JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
@@ -108,6 +108,16 @@ export default class AdminService {
     public agentCredentials(id: number, principal = ""): Promise<CredentialStatus[]> {
         const query = principal ? `?principal=${encodeURIComponent(principal)}` : "";
         return this.request<CredentialStatus[]>(`agents/${id}/credentials${query}`);
+    }
+
+    /**
+     * Health of the credentials scheduled runs depend on.
+     *
+     * Cheap enough to call on every Agents list load: one query per distinct
+     * run-as principal, not one per agent.
+     */
+    public credentialHealth(): Promise<CredentialHealth> {
+        return this.request<CredentialHealth>("credential-health");
     }
 
     public runNow(id: number): Promise<{ run_id: string }> {

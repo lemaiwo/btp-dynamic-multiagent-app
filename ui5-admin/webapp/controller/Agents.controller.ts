@@ -22,6 +22,7 @@ export default class Agents extends BaseController {
 
     public onInit(): void {
         this.setModel(new JSONModel({ items: [] }), "agents");
+        this.setModel(new JSONModel({ problems: [], summary: "" }), "credhealth");
         this.getRouter().getRoute("agents")?.attachPatternMatched(() => {
             void this.load();
         });
@@ -39,7 +40,67 @@ export default class Agents extends BaseController {
             if (agents) {
                 (this.getModel("agents") as JSONModel).setProperty("/items", agents);
             }
+            await this.loadCredentialHealth();
         });
+    }
+
+    /**
+     * Refresh the credential warning strip.
+     *
+     * Deliberately silent on failure: this is a health indicator, not the
+     * page's purpose. Raising a dialog because the *check* failed would be
+     * more disruptive than the thing it warns about, and it would fire on
+     * every transient blip. A failed check leaves the strip hidden.
+     */
+    private async loadCredentialHealth(): Promise<void> {
+        const model = this.getModel("credhealth") as JSONModel;
+        try {
+            const health = await this.getAdminService().credentialHealth();
+            const problems = health.problems ?? [];
+            model.setProperty("/problems", problems);
+            model.setProperty("/summary", Agents.summarise(problems));
+        } catch {
+            model.setProperty("/problems", []);
+            model.setProperty("/summary", "");
+        }
+    }
+
+    /**
+     * One sentence naming what is broken and what it costs.
+     *
+     * Names the agents rather than counting them: "1 agent" sends the reader
+     * hunting, and there are rarely enough of these to be worth truncating.
+     */
+    private static summarise(problems: { agent: string; token_state: string }[]): string {
+        if (problems.length === 0) {
+            return "";
+        }
+        const names = [...new Set(problems.map((p) => p.agent))];
+        const list = names.length === 1
+            ? `"${names[0]}"`
+            : names.map((n) => `"${n}"`).join(", ");
+        const expired = problems.some((p) => p.token_state === "expired");
+        const why = expired
+            ? "its stored credential has expired and cannot be refreshed"
+            : "no credential is stored for its run-as principal";
+        return `Scheduled runs of ${list} will fail: ${why}. `
+            + "Someone must sign in again for that principal.";
+    }
+
+    /** Open the first affected agent, where the credential panel lives. */
+    public onOpenCredentialProblem(): void {
+        const problems = (this.getModel("credhealth") as JSONModel)
+            .getProperty("/problems") as { agent: string }[];
+        const first = problems?.[0];
+        if (!first) {
+            return;
+        }
+        const agents = (this.getModel("agents") as JSONModel)
+            .getProperty("/items") as Agent[];
+        const match = agents?.find((a) => a.name === first.agent);
+        if (match) {
+            this.getRouter().navTo("agentDetail", { agentId: String(match.id) });
+        }
     }
 
     public onSearch(event: SearchField$LiveChangeEvent): void {

@@ -8,6 +8,24 @@
             <Button id="addAgentButton" icon="sap-icon://add" text="{i18n>newAgent}" press=".onCreate" />
         </headerContent>
         <content>
+            <!--
+              Credential alert. A scheduled run acts as an agent's run-as
+              principal and refreshes nothing until it needs to, so a lapsed
+              token is invisible until a nightly job quietly produces nothing.
+              This is the one place an operator reliably looks, so it says so
+              here rather than only in a log nobody reads.
+            -->
+            <MessageStrip
+                id="credentialAlert"
+                visible="{= ${credhealth>/problems}.length &gt; 0 }"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBottom"
+                text="{credhealth>/summary}">
+                <link>
+                    <Link id="credentialAlertLink" text="{i18n>credAlertFix}" press=".onOpenCredentialProblem" />
+                </link>
+            </MessageStrip>
             <Table
                 id="agentsTable"
                 items="{agents>/items}"

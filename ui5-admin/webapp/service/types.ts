@@ -217,6 +217,28 @@ export interface CredentialStatus {
     expires_at: string | null;
 }
 
+/** One agent/server whose scheduled runs will fail for want of a credential. */
+export interface CredentialProblem {
+    agent: string;
+    server_key: string;
+    principal: string;
+    token_state: TokenState | "unknown";
+    expires_at: string | null;
+}
+
+/**
+ * Health of the credentials scheduled runs depend on.
+ *
+ * `refreshable` counts as healthy: it only means the access token has lapsed
+ * and the stored refresh token will renew it on the next call, which is the
+ * normal state between nightly runs. Only `expired`/`none` reach `problems`.
+ */
+export interface CredentialHealth {
+    checked: number;
+    healthy: number;
+    problems: CredentialProblem[];
+}
+
 export interface WhoAmI {
     principal: string;
     label: string;

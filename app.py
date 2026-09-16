@@ -50,6 +50,7 @@ from agents.db import (  # noqa: E402
     sweep_stale_workflow_runs,
 )
 from agents.job_runner import cancel_all_runs  # noqa: E402
+from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
@@ -91,6 +92,39 @@ async def _db_heartbeat(interval: float) -> None:
             logger.warning("Database heartbeat failed", exc_info=True)
 
 
+TOKEN_KEEPWARM_SECONDS = float(os.environ.get("TOKEN_KEEPWARM_SECONDS", "21600"))
+
+
+async def _token_keepwarm(interval: float) -> None:
+    """Refresh the tokens scheduled runs need, before a run needs them.
+
+    OAuth refresh is otherwise lazy: it happens only when an outbound MCP call
+    finds an expired access token. Between nightly runs nothing calls anything,
+    so the stored token simply ages -- and the first thing to notice is the
+    03:12 run failing with nobody watching.
+
+    Six hours by default: comfortably inside any sane access-token lifetime,
+    and frequent enough that a refresh-rotating authorization server keeps
+    re-issuing the refresh token. Set TOKEN_KEEPWARM_SECONDS=0 to disable.
+
+    This cannot rescue a refresh token with a fixed absolute lifetime -- see
+    refresh_scheduled_tokens. GET /admin/api/credential-health is what surfaces
+    that case, and the admin UI raises it to the operator.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            counts = await refresh_scheduled_tokens()
+            if counts["failed"]:
+                logger.warning("Token keep-warm: %s", counts)
+            elif counts["checked"]:
+                logger.info("Token keep-warm: %s", counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning("Token keep-warm pass failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -110,14 +144,18 @@ async def lifespan(app: FastAPI):
     heartbeat: asyncio.Task | None = None
     if DB_HEARTBEAT_SECONDS > 0:
         heartbeat = asyncio.create_task(_db_heartbeat(DB_HEARTBEAT_SECONDS))
+    keepwarm: asyncio.Task | None = None
+    if TOKEN_KEEPWARM_SECONDS > 0:
+        keepwarm = asyncio.create_task(_token_keepwarm(TOKEN_KEEPWARM_SECONDS))
     logger.info("Application startup complete")
     yield
     # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
     # rather than being killed mid-await and leaving its row `running`.
-    if heartbeat is not None:
-        heartbeat.cancel()
-        with suppress(asyncio.CancelledError):
-            await heartbeat
+    for task in (heartbeat, keepwarm):
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
     await cancel_all_runs()
     await cancel_all_workflow_runs()
     logger.info("Application shutdown complete")

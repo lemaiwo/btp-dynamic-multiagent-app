@@ -1259,6 +1259,60 @@ async def run_tests() -> None:
         )
         check("expired without refresh -> has_token False", srv["has_token"] is False, r.text)
 
+        # --- credential health (scheduled runs) ----------------------------
+        # A scheduled run acts as the agent's run_as_principal and refreshes
+        # nothing until it needs to, so a lapsed token only shows up as a job
+        # that produced nothing overnight. This endpoint is what the admin UI
+        # reads to say so out loud beforehand.
+        print("\n== credential health ==")
+        r = await client.get("/admin/api/credential-health")
+        check("credential-health returns JSON", r.status_code == 200, r.text[:120])
+        body = r.json()
+        check(
+            "agent without run_as_principal is not reported",
+            all(p["agent"] != "Cred Agent" for p in body["problems"]),
+            r.text[:300],
+        )
+
+        # Point the agent at a principal that holds no token at all.
+        async def _set_principal(principal: str) -> None:
+            await client.put(f"/admin/api/agents/{cred_id}", json={
+                "name": "Cred Agent", "description": "d", "instructions": "i",
+                "mcp_servers": [{
+                    "url": "https://cred.cfapps.eu20-001.hana.ondemand.com/mcp",
+                    "auth_mode": "oauth2", "oauth": {"dcr": True},
+                }],
+                "expose_api": True, "api_slug": "cred-agent",
+                "run_as_principal": principal,
+            })
+
+        await _set_principal("cred-expired")
+        body = (await client.get("/admin/api/credential-health")).json()
+        mine = [p for p in body["problems"] if p["agent"] == "Cred Agent"]
+        check("expired principal is reported as a problem", len(mine) == 1, str(body)[:300])
+        check("problem carries the token_state", mine and mine[0]["token_state"] == "expired", str(mine))
+        check("problem names the principal", mine and mine[0]["principal"] == "cred-expired", str(mine))
+
+        await _set_principal("cred-valid")
+        body = (await client.get("/admin/api/credential-health")).json()
+        check(
+            "valid principal is not a problem",
+            all(p["agent"] != "Cred Agent" for p in body["problems"]),
+            str(body)[:300],
+        )
+
+        # refreshable is the normal steady state between scheduled runs: the
+        # access token has lapsed and the refresh token will renew it on the
+        # next call. Reporting it as a problem would cry wolf every morning.
+        await _set_principal("cred-refresh")
+        body = (await client.get("/admin/api/credential-health")).json()
+        check(
+            "refreshable principal is healthy, not a problem",
+            all(p["agent"] != "Cred Agent" for p in body["problems"]),
+            str(body)[:300],
+        )
+        check("health counts what it checked", body["checked"] >= 1, str(body)[:200])
+
         # A session-mode server needs a token like oauth2 does (so its state
         # and expiry are worth showing), but it has no authorization-code
         # flow to send anyone through -- the cookie comes from

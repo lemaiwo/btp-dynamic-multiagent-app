@@ -672,6 +672,84 @@ def _classify_token(row: McpOAuthToken | None) -> tuple[str, datetime | None]:
     return ("refreshable" if row.refresh_token else "expired"), expires_at
 
 
+async def scheduled_credentials() -> list[dict[str, Any]]:
+    """Every (agent, oauth2 server, principal) triple a scheduled run depends on.
+
+    A run triggered by the job scheduler has no logged-in user: it acts as the
+    agent's ``run_as_principal``, using a token that principal authorized once
+    by hand. If that token dies, the run fails at 03:12 with nobody watching --
+    so this is the set worth refreshing ahead of time and worth alerting on.
+
+    Agents with no ``run_as_principal`` are skipped: nothing schedules them, so
+    a missing token is not a fault, just an unused agent.
+    """
+    async with SessionLocal() as session:
+        rows = await list_agents(session)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not row.enabled:
+            continue
+        principal = (row.run_as_principal or "").strip()
+        if not principal:
+            continue
+        for srv in row.mcp_servers:
+            if srv.get("auth_mode") != AUTH_MODE_OAUTH2:
+                continue
+            if not isinstance(srv.get("oauth"), dict):
+                continue
+            out.append({
+                "agent": row.name,
+                "server_key": normalize_mcp_url(str(srv["url"])),
+                "spec_oauth": srv["oauth"],
+                "principal": principal,
+            })
+    return out
+
+
+async def refresh_scheduled_tokens() -> dict[str, int]:
+    """Refresh every token a scheduled run will need, ahead of needing it.
+
+    Refresh is otherwise entirely lazy -- it happens only when an outbound MCP
+    request finds an expired access token. An app nobody touches between
+    nightly runs therefore never refreshes, and the stored token just ages.
+    Calling this on a timer keeps the access token current and, where the
+    authorization server rotates refresh tokens on use, keeps the refresh
+    token renewed too.
+
+    It cannot save a refresh token whose lifetime is absolute rather than
+    rotating -- that one dies on schedule no matter how often it is used, and
+    only re-authorization revives it. `scheduled_credentials` plus the admin
+    credential panel are what surface that case; this only prevents the
+    avoidable half.
+
+    Never raises: this runs on a background timer, and one unreachable
+    authorization server must not take the timer down with it.
+    """
+    counts = {"checked": 0, "refreshed": 0, "failed": 0}
+    for entry in await scheduled_credentials():
+        counts["checked"] += 1
+        try:
+            config = await resolve_config(entry["server_key"], entry["spec_oauth"])
+            auth = PerUserOAuth2Auth(entry["server_key"], entry["spec_oauth"])
+            access, _ = await auth._force_refresh(entry["principal"], config)
+            if access:
+                counts["refreshed"] += 1
+            else:
+                counts["failed"] += 1
+                logger.warning(
+                    "Keep-warm refresh returned no token for %s on %s; "
+                    "the stored credential may need re-authorization",
+                    entry["agent"], entry["server_key"],
+                )
+        except Exception:  # noqa: BLE001
+            counts["failed"] += 1
+            logger.warning(
+                "Keep-warm refresh failed for %s on %s",
+                entry["agent"], entry["server_key"], exc_info=True,
+            )
+    return counts
+
+
 async def token_status_many(
     user_id: str, server_keys: list[str]
 ) -> dict[str, tuple[str, datetime | None]]:
