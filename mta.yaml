@@ -3,10 +3,16 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.11.0
+version: 2.12.0
 
 parameters:
-  enable-parallel-deployments: true
+  # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
+  # $XSSERVICENAME(agent-jobscheduler), which XSUAA resolves against the live
+  # space at create time -- so the jobscheduler instance has to exist before
+  # uaa-service is processed. In parallel that ordering is a coin toss, and
+  # losing it fails the deploy with "Could not find app for XSUAA instance
+  # with name 'agent-jobscheduler'". Resource order below does the rest.
+  enable-parallel-deployments: false
   # AI Core bills consumption per resource group, so a landscape that needs its
   # own line in the bill overrides this in an extension descriptor
   # (cf deploy ... -e <landscape>.mtaext) rather than by editing this file.
@@ -77,6 +83,10 @@ modules:
       - name: uaa-service
       - name: agent-registry-db
       - name: agent-destination
+      # Listed after uaa-service on purpose: the Job Scheduling Service reads
+      # the app's XSUAA binding to mint the token it calls the action endpoint
+      # with, so binding it first leaves it with nothing to grant against.
+      - name: agent-jobscheduler
     provides:
       - name: pydantic-agent-api
         properties:
@@ -160,6 +170,21 @@ resources:
     parameters:
       service: aicore
       service-plan: extended
+
+  # Declared before uaa-service, and deliberately so: with parallel deploys
+  # off, resources are processed in this order, and xs-security.json's
+  # JOBSCHEDULER scope references $XSSERVICENAME(agent-jobscheduler). XSUAA
+  # resolves that name against the space as it creates the instance, so this
+  # one has to be there first or the whole deploy fails.
+  #
+  # The jobs themselves are not declared here: they live in the service
+  # instance and are managed through its REST API, so a redeploy never
+  # silently rewrites a schedule someone tuned by hand.
+  - name: agent-jobscheduler
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: jobscheduler
+      service-plan: standard
 
   - name: uaa-service
     type: org.cloudfoundry.managed-service

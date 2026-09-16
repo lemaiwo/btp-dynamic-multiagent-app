@@ -28,6 +28,11 @@
       "name": "$XSAPPNAME.a2a",
       "description": "Invoke the orchestrator over the A2A protocol (Joule Agent Hub)",
       "grant-as-authority-to-apps": ["$XSAPPNAME(application,sap-provisioning,tenant-onboarding)"]
+    },
+    {
+      "name": "$XSAPPNAME.JOBSCHEDULER",
+      "description": "Trigger scheduled agent and workflow runs (Job Scheduling Service)",
+      "grant-as-authority-to-apps": ["$XSSERVICENAME(agent-jobscheduler)"]
     }
   ],
   "role-templates": [
