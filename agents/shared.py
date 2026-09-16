@@ -209,6 +209,28 @@ async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
         )
 
 
+class PerRunMCPServer(MCPServerStreamableHTTP):
+    """An MCP server connection that opens a session of its own for every run.
+
+    The registry builds each server once and every user's runs share it. A plain
+    ``MCPServerStreamableHTTP`` reuses an open session while any run holds it,
+    and the mcp transport sends each request from a task spawned by whoever
+    opened that session -- so the auth reads *that* run's ``current_principal``
+    / ``current_jwt``. While Alice's run held the session, Bob's tool calls went
+    out with Alice's token, and ARC-1 ran them in SAP as Alice.
+
+    ``for_run`` gives each run a fresh copy, entered in the run's own context.
+    The copies share this object's httpx client and connection pool: the auth
+    resolves the caller per request, so the client itself holds nobody's
+    identity.
+    """
+
+    async def for_run(self, ctx):
+        run = copy.copy(self)
+        run.__post_init__()  # its own session: lock, running count, caches
+        return run
+
+
 def mcp_endpoint_url(base_url: str) -> str:
     """The MCP endpoint for a configured base URL.
 
@@ -294,7 +316,7 @@ def create_mcp_server(
             callback_handler=_callback_handler,
         )
 
-    return MCPServerStreamableHTTP(
+    return PerRunMCPServer(
         url=mcp_url,
         tool_prefix=tool_prefix,
         max_retries=max_retries,

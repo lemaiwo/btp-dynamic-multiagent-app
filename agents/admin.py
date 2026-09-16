@@ -875,7 +875,7 @@ async def api_agent_credentials(
     """
     from urllib.parse import quote
 
-    from agents.oauth2 import normalize_mcp_url, token_status
+    from agents.oauth2 import normalize_mcp_url, token_status_many
 
     async with SessionLocal() as session:
         row = await get_agent(session, agent_id)
@@ -886,6 +886,29 @@ async def api_agent_credentials(
         stored_principal = row.run_as_principal
 
     who = (principal or "").strip() or (stored_principal or "")
+
+    # One query for every server's token rather than one per server: the old
+    # per-server `token_status` made opening an agent cost N sequential round
+    # trips, which showed up as ~0.8-3.8s on this endpoint even with a warm
+    # pool. A failure here is a database failure, which would have taken every
+    # server's lookup down individually anyway, so the panel degrades to
+    # "no token known" as a whole instead of per row.
+    statuses: dict[str, tuple[str, Any]] = {}
+    if who:
+        keys = [
+            normalize_mcp_url(str(spec.get("url") or ""))
+            for spec in servers
+            if str(spec.get("auth_mode") or "")
+            in (AUTH_MODE_OAUTH2, AUTH_MODE_SESSION)
+        ]
+        try:
+            statuses = await token_status_many(who, keys)
+        except Exception:  # noqa: BLE001 — status display must not 500
+            logger.warning(
+                "Could not read token status for %s on %d server(s)",
+                who, len(keys), exc_info=True,
+            )
+
     out: list[dict[str, Any]] = []
     for spec in servers:
         url = str(spec.get("url") or "")
@@ -909,19 +932,13 @@ async def api_agent_credentials(
                     f"/oauth/login?agent={quote(agent_name)}"
                     f"&server={quote(server_key, safe='')}"
                 )
-            if who:
-                try:
-                    state, expiry = await token_status(who, server_key)
-                    expires_at = expiry.isoformat() if expiry else None
-                    # Both states the live connection can use without an
-                    # interactive sign-in — the same rule has_usable_token
-                    # applies, kept in one place by deriving it here.
-                    has_token = state in ("valid", "refreshable")
-                except Exception:  # noqa: BLE001 — status display must not 500
-                    logger.warning(
-                        "Could not read token status for %s on %s",
-                        who, server_key, exc_info=True,
-                    )
+            if who and server_key in statuses:
+                state, expiry = statuses[server_key]
+                expires_at = expiry.isoformat() if expiry else None
+                # Both states the live connection can use without an
+                # interactive sign-in — the same rule has_usable_token
+                # applies, kept in one place by deriving it here.
+                has_token = state in ("valid", "refreshable")
         # An app-only or destination-backed server needs no user token, and
         # reporting has_token=False for it would render as "not connected"
         # forever with no way to fix it. It is connected by configuration, not

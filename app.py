@@ -14,9 +14,10 @@ Start with:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,6 +30,7 @@ logger = logging.getLogger("app")
 # Import after load_dotenv so SAP AI Core & XSUAA env vars are available.
 from fastapi import FastAPI  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 
 from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
@@ -58,6 +60,37 @@ SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
 # ---------------------------------------------------------------------------
 # Lifespan: init DB, seed if empty, build initial registry
 # ---------------------------------------------------------------------------
+DB_HEARTBEAT_SECONDS = float(os.environ.get("DB_HEARTBEAT_SECONDS", "60"))
+
+
+async def _db_heartbeat(interval: float) -> None:
+    """Touch Postgres on a timer so no user pays for the pool going cold.
+
+    `/healthz` answers from memory and the admin UI is idle most of the day,
+    so without this the pool sits untouched for hours. Measured on ACC, the
+    first DB-backed request after such a gap cost 8s (10 minutes idle) to 18s
+    (overnight) while a concurrent request that opened no session answered in
+    20ms. A `SELECT 1` a minute keeps a connection established, so that cost
+    lands here instead of on whoever opens the admin UI next.
+
+    QueuePool hands out connections FIFO, so successive beats rotate through
+    the pool rather than refreshing one connection and letting the rest die.
+
+    Never raises: a failed beat is logged and the next one retries. The pool
+    is self-healing via `pool_pre_ping` regardless, so a heartbeat that cannot
+    reach the database is a warning, not a reason to take the app down.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with SessionLocal() as session:
+                await session.execute(text("SELECT 1"))
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning("Database heartbeat failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -74,10 +107,17 @@ async def lifespan(app: FastAPI):
     await seed_from_file_if_empty(SEED_FILE)
     await registry.reload()
     dynamic_chat_app.refresh()
+    heartbeat: asyncio.Task | None = None
+    if DB_HEARTBEAT_SECONDS > 0:
+        heartbeat = asyncio.create_task(_db_heartbeat(DB_HEARTBEAT_SECONDS))
     logger.info("Application startup complete")
     yield
     # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
     # rather than being killed mid-await and leaving its row `running`.
+    if heartbeat is not None:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
     await cancel_all_runs()
     await cancel_all_workflow_runs()
     logger.info("Application shutdown complete")

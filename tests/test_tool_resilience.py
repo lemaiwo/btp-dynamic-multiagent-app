@@ -116,21 +116,21 @@ async def main() -> None:
     print("\n== create_mcp_server wires the retry budget ==")
     import agents.shared as shared
 
-    captured: dict = {}
+    server = shared.create_mcp_server("docs", "https://docs.example.com/mcp", "none")
 
-    class _FakeMCP:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
+    check("max_retries passed through", server.max_retries > 1, str(server.max_retries))
+    check(
+        "process_tool_call wired",
+        server.process_tool_call is shared._resilient_tool_call,
+        repr(server.process_tool_call),
+    )
 
-    real = shared.MCPServerStreamableHTTP
-    shared.MCPServerStreamableHTTP = _FakeMCP  # type: ignore[assignment]
-    try:
-        shared.create_mcp_server("docs", "https://docs.example.com/mcp", "none")
-    finally:
-        shared.MCPServerStreamableHTTP = real  # type: ignore[assignment]
-
-    check("max_retries passed through", captured.get("max_retries", 1) > 1, str(captured.get("max_retries")))
-    check("process_tool_call wired", captured.get("process_tool_call") is not None)
+    # Each agent run gets its own copy of the server (see PerRunMCPServer);
+    # the copy is what actually handles the tool calls.
+    run = await server.for_run(None)
+    check("each run gets its own server copy", run is not server)
+    check("run copy keeps max_retries", run.max_retries == server.max_retries, str(run.max_retries))
+    check("run copy keeps process_tool_call", run.process_tool_call is shared._resilient_tool_call)
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)

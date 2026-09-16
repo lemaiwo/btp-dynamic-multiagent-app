@@ -331,6 +331,28 @@ async def main() -> None:
     check("expired+no-refresh -> not usable", (await oauth2.has_usable_token(UUSER, K_EXPIRED)) is False)
     check("valid access -> usable", (await oauth2.has_usable_token(UUSER, K_VALID)) is True)
 
+    # --- token_status_many: one query, same verdicts as one-at-a-time -----
+    # The admin credentials panel calls this once per agent instead of once
+    # per server. It has to agree with token_status on every row, and it has
+    # to answer for keys with no stored token rather than omitting them --
+    # the caller keys straight off the result to decide what to render.
+    print("\n== token_status_many (batched credential panel) ==")
+    KEYS = [K_NONE, K_REFRESH, K_EXPIRED, K_VALID]
+    many = await oauth2.token_status_many(UUSER, KEYS)
+    check("returns every requested key", sorted(many) == sorted(KEYS))
+    check("no token -> none", many[K_NONE] == ("none", None))
+    check("expired+refresh -> refreshable", many[K_REFRESH][0] == "refreshable")
+    check("expired+no-refresh -> expired", many[K_EXPIRED][0] == "expired")
+    check("valid access -> valid", many[K_VALID][0] == "valid")
+    for k in KEYS:
+        single = await oauth2.token_status(UUSER, k)
+        check(f"agrees with token_status for {k.split('//')[1][:8]}", many[k] == single)
+    check("empty key list -> empty dict", (await oauth2.token_status_many(UUSER, [])) == {})
+    check(
+        "unknown principal -> all none",
+        set((await oauth2.token_status_many("nobody", KEYS)).values()) == {("none", None)},
+    )
+
     # --- DCR: auto-discover + register ------------------------------------
     print("\n== DCR (auto-discover + register) ==")
     reg_calls = {"n": 0}

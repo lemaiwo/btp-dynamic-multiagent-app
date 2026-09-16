@@ -45,11 +45,13 @@ from mcp.shared.auth import OAuthClientMetadata
 from agents.auth import current_base_url, current_principal
 from agents.db import (
     AUTH_MODE_OAUTH2,
+    McpOAuthToken,
     SessionLocal,
     delete_oauth_client,
     delete_user_token,
     get_oauth_client,
     get_user_token,
+    get_user_tokens,
     list_agents,
     pop_oauth_state,
     save_oauth_client,
@@ -655,6 +657,11 @@ async def token_status(user_id: str, server_key: str) -> tuple[str, datetime | N
     """
     async with SessionLocal() as session:
         row = await get_user_token(session, user_id, server_key)
+    return _classify_token(row)
+
+
+def _classify_token(row: McpOAuthToken | None) -> tuple[str, datetime | None]:
+    """The `token_status` verdict for one row, shared with the batch variant."""
     if row is None:
         return "none", None
     expires_at = row.expires_at
@@ -663,6 +670,21 @@ async def token_status(user_id: str, server_key: str) -> tuple[str, datetime | N
     if not _is_expired(row.expires_at):
         return "valid", expires_at
     return ("refreshable" if row.refresh_token else "expired"), expires_at
+
+
+async def token_status_many(
+    user_id: str, server_keys: list[str]
+) -> dict[str, tuple[str, datetime | None]]:
+    """`token_status` for several servers in one query instead of N.
+
+    Every requested key appears in the result; one with no stored token gets
+    the same ``("none", None)`` the single-key call returns for it.
+    """
+    if not server_keys:
+        return {}
+    async with SessionLocal() as session:
+        rows = await get_user_tokens(session, user_id, server_keys)
+    return {key: _classify_token(rows.get(key)) for key in server_keys}
 
 
 async def store_session_cookie(

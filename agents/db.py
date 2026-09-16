@@ -163,7 +163,27 @@ if DATABASE_URL.startswith("postgresql+asyncpg") and "ssl=" in DATABASE_URL:
     DATABASE_URL = base
     _connect_args["ssl"] = _build_ssl_context(_vcap_ssl_ca)
 
-engine = create_async_engine(DATABASE_URL, connect_args=_connect_args, future=True)
+# Nothing touches Postgres between admin clicks, and CF's health check hits
+# /healthz, which answers from memory — so a pooled connection can sit idle
+# for hours. Measured on ACC: the first DB-backed request after an idle gap
+# cost 8s after ~10 minutes and 18s overnight, while a request issued 20ms
+# later that opened no session answered in 20ms.
+#
+# pool_pre_ping issues a `SELECT 1` on checkout, so a connection the network
+# has already dropped is replaced there and then instead of stalling whichever
+# request happened to draw it. pool_recycle retires a connection before the
+# path in front of Postgres times it out, so replacement happens on our
+# schedule rather than mid-request.
+#
+# Neither keeps the pool *warm* — they only make going cold cheap to recover
+# from. `_db_heartbeat` in app.py is what stops it going cold at all.
+engine = create_async_engine(
+    DATABASE_URL,
+    connect_args=_connect_args,
+    future=True,
+    pool_pre_ping=True,
+    pool_recycle=1800,
+)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
@@ -1897,6 +1917,26 @@ async def get_user_token(
         )
     )
     return result.scalar_one_or_none()
+
+
+async def get_user_tokens(
+    session: AsyncSession, user_id: str, server_keys: list[str]
+) -> dict[str, McpOAuthToken]:
+    """Every stored token this principal holds for `server_keys`, keyed by key.
+
+    The one-at-a-time `get_user_token` turned the admin credentials panel into
+    N sequential round trips for an agent with N servers. Keys absent from the
+    result simply have no token stored.
+    """
+    if not server_keys:
+        return {}
+    result = await session.execute(
+        select(McpOAuthToken).where(
+            McpOAuthToken.user_id == user_id,
+            McpOAuthToken.server_key.in_(server_keys),
+        )
+    )
+    return {row.server_key: row for row in result.scalars().all()}
 
 
 async def upsert_user_token(

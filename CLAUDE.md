@@ -34,7 +34,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin` FastAPI dependencies
 - `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
-  on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`
+  on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`.
+  `create_mcp_server` returns a `PerRunMCPServer`: the registry shares one
+  server object across all users, so each agent run must open its own MCP
+  session, or overlapping runs send requests with whichever user opened the
+  shared session (`tests/test_mcp_user_isolation.py`)
 - `agents/oauth2.py` — per-user OAuth2 authorization_code for
   `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
   refreshes the user's token, raises `OAuthAuthorizationRequired`),
