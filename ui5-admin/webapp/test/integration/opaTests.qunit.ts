@@ -21,3 +21,4 @@ import "./SessionExpiredJourney";
 import "./WorkflowJourney";
 import "./WorkflowDetailJourney";
 import "./WorkflowRunJourney";
+import "./UserMenuJourney";
