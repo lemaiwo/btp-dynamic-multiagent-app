@@ -5,28 +5,36 @@
     <Dialog id="serverDialog" title="{i18n>mcpServer}" contentWidth="42rem">
         <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
 
-            <Label text="{i18n>serverUrl}" required="true" />
+            <Label text="{i18n>toolsetKind}" />
+            <Select
+                id="serverKind"
+                selectedKey="{server>/kind}"
+                change=".onServerKindChange"
+                items="{server>/kinds}">
+                <core:Item key="{server>key}" text="{server>text}" />
+            </Select>
+
+            <Label text="" visible="{= ${server>/kind} !== 'mcp' }" />
+            <Text id="serverKindDescription" text="{server>/kindDescription}"
+                  visible="{= ${server>/kind} !== 'mcp' }" />
+
+            <Label text="{i18n>serverUrl}" required="true" visible="{= ${server>/kind} === 'mcp' }" />
             <Input
                 id="serverUrl"
                 value="{server>/url}"
                 valueState="{server>/errors/urlState}"
                 valueStateText="{server>/errors/url}"
                 placeholder="{i18n>serverUrlPlaceholder}"
-                showSuggestion="true"
-                suggestionItems="{server>/builtins}">
-                <suggestionItems>
-                    <core:Item text="{server>}" />
-                </suggestionItems>
-            </Input>
+                change=".onServerUrlChange"
+                visible="{= ${server>/kind} === 'mcp' }" />
 
             <Label text="{i18n>authMode}" />
-            <Select id="serverAuthMode" selectedKey="{server>/auth_mode}" change=".onAuthModeChange">
-                <core:Item key="jwt" text="{i18n>authJwt}" />
-                <core:Item key="none" text="{i18n>authNone}" />
-                <core:Item key="oauth2" text="{i18n>authOauth2}" />
-                <core:Item key="app_only" text="{i18n>authAppOnly}" />
-                <core:Item key="destination" text="{i18n>authModeDestination}" />
-                <core:Item key="session" text="{i18n>authSession}" />
+            <Select
+                id="serverAuthMode"
+                selectedKey="{server>/auth_mode}"
+                change=".onAuthModeChange"
+                items="{server>/authModes}">
+                <core:Item key="{server>key}" text="{server>text}" />
             </Select>
 
             <Label text="" visible="{= ${server>/auth_mode} === 'session' }" />

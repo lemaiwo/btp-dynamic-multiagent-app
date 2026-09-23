@@ -117,7 +117,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is unchanged and still the supported admin at
   `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
-  `docs/UI5_ADMIN.md`
+  `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
+  `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
+  auth modes the server accepts per built-in
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the

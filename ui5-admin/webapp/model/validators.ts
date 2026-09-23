@@ -1,4 +1,5 @@
 import type { AuthMode, McpServer, OAuthClient } from "../service/types";
+import { BUILTINS } from "./builtins";
 
 /**
  * Client-side mirrors of the Pydantic rules in `agents/admin.py`.
@@ -11,15 +12,12 @@ import type { AuthMode, McpServer, OAuthClient } from "../service/types";
  * environment at request time and belongs to the server alone.
  */
 
-/** Closed set; an unknown `builtin:` value is a typo, not an extension point. */
-const BUILTIN_URLS = [
-    "builtin:gmail",
-    "builtin:outlook",
-    "builtin:teams",
-    "builtin:jira",
-    "builtin:sapnotes",
-    "builtin:sapnotedetail",
-] as const;
+/**
+ * Closed set; an unknown `builtin:` value is a typo, not an extension point.
+ * Taken from the catalog in `./builtins` so the dropdown and the validator
+ * cannot disagree about what exists.
+ */
+const BUILTIN_URLS: readonly string[] = BUILTINS.map((b) => b.url);
 
 /**
  * Config keys a built-in may carry on `auth_mode: "none"`.

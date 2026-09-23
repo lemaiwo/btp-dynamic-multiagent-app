@@ -7,6 +7,7 @@ import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import validators from "../model/validators";
+import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
 import type Dialog from "sap/m/Dialog";
 import type Event from "sap/ui/base/Event";
@@ -203,7 +204,13 @@ export default class AgentDetail extends BaseController {
             url: server.url,
             auth_mode: server.auth_mode,
             oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", team: "", channels: "" },
-            builtins: validators.BUILTIN_URLS.slice(),
+            // "mcp" for a remote server, otherwise the built-in's url.
+            kind: findBuiltin(server.url)?.url ?? "mcp",
+            kinds: [{ key: "mcp", text: this.text("toolsetRemoteMcp") }].concat(
+                BUILTINS.map((b) => ({ key: b.url, text: this.text(b.titleKey) }))
+            ),
+            kindDescription: "",
+            authModes: [],
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
@@ -215,6 +222,8 @@ export default class AgentDetail extends BaseController {
             errors: {}
         });
 
+        this.syncServerKind();
+
         if (!this.serverDialog) {
             this.serverDialog = await Fragment.load({
                 id: this.getView()!.getId(),
@@ -224,6 +233,52 @@ export default class AgentDetail extends BaseController {
             this.getView()!.addDependent(this.serverDialog);
         }
         this.serverDialog.open();
+    }
+
+    /** The toolset dropdown: a built-in fills in its url and a working auth mode. */
+    public onServerKindChange(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const kind = serverModel.getProperty("/kind") as string;
+        const builtin = findBuiltin(kind);
+        if (builtin) {
+            serverModel.setProperty("/url", builtin.url);
+            serverModel.setProperty("/auth_mode", builtin.defaultAuthMode);
+        } else if (findBuiltin(serverModel.getProperty("/url") as string)) {
+            // Back to a remote server: the built-in's pseudo-url is no
+            // starting point for a real one.
+            serverModel.setProperty("/url", "");
+        }
+        serverModel.setProperty("/errors", {});
+        this.syncServerKind();
+    }
+
+    /** A url typed by hand may itself name a built-in; keep the dropdown in step. */
+    public onServerUrlChange(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const url = serverModel.getProperty("/url") as string;
+        serverModel.setProperty("/kind", findBuiltin(url)?.url ?? "mcp");
+        this.syncServerKind();
+    }
+
+    /**
+     * Derives what the dialog shows from the url: the built-in's description
+     * and the auth modes the server accepts for it. An auth mode that is not
+     * among them is replaced by the first that is, rather than left for the
+     * server to refuse on save.
+     */
+    private syncServerKind(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const url = serverModel.getProperty("/url") as string;
+        const builtin = findBuiltin(url);
+        serverModel.setProperty("/kindDescription", builtin ? this.text(builtin.descriptionKey) : "");
+        const modes = authModesFor(url);
+        serverModel.setProperty("/authModes", modes.map((m) => ({
+            key: m, text: this.text(AUTH_MODE_TEXT_KEYS[m])
+        })));
+        const current = serverModel.getProperty("/auth_mode") as AuthMode;
+        if (modes.indexOf(current) === -1) {
+            serverModel.setProperty("/auth_mode", builtin?.defaultAuthMode ?? modes[0]);
+        }
     }
 
     public onAuthModeChange(): void {

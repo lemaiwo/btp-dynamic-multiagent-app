@@ -5,6 +5,7 @@ import EnterText from "sap/ui/test/actions/EnterText";
 import type Button from "sap/m/Button";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Input from "sap/m/Input";
+import type JSONModel from "sap/ui/model/json/JSONModel";
 import type MultiComboBox from "sap/m/MultiComboBox";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type Select from "sap/m/Select";
@@ -205,6 +206,37 @@ opaTest("the credential column reports validity, not just presence", function (G
         }
     });
 
+    Then.iStopTheApp();
+});
+
+opaTest("picking a built-in from the toolset dropdown fills in its url and auth mode", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+
+    When.waitFor({ id: "addAgentButton", viewName: "Agents", actions: new Press() });
+    When.waitFor({ id: "addServerButton", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({
+        id: "serverKind",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            select.setSelectedKey("builtin:jira");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+
+    Then.waitFor({
+        id: "serverAuthMode",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const select = element as Select;
+            Opa5.assert.strictEqual(select.getSelectedKey(), "destination", "Jira's only auth mode is selected");
+            Opa5.assert.strictEqual(select.getItems().length, 1, "no other auth mode is offered");
+            const server = select.getModel("server") as JSONModel;
+            Opa5.assert.strictEqual(server.getProperty("/url"), "builtin:jira", "the url is the built-in's");
+        }
+    });
     Then.iStopTheApp();
 });
 
