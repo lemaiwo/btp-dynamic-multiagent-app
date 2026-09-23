@@ -27,6 +27,10 @@ export const BUILTINS: BuiltinToolset[] = [
         defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only"]
     },
     {
+        url: "builtin:slack", titleKey: "builtinSlack", descriptionKey: "builtinSlackDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
+    },
+    {
         url: "builtin:jira", titleKey: "builtinJira", descriptionKey: "builtinJiraDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },

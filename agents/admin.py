@@ -40,6 +40,7 @@ from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.slack_tools import BUILTIN_SLACK_URL
 from agents.teams_tools import BUILTIN_TEAMS_URL
 from agents.db import (
     AUTH_MODE_JWT,
@@ -349,6 +350,17 @@ class McpServerPayload(BaseModel):
             )
         if str(self.url or "").strip().rstrip("/").lower() == BUILTIN_TEAMS_URL:
             self._validate_teams()
+        if (
+            str(self.url or "").strip().rstrip("/").lower() == BUILTIN_SLACK_URL
+            and self.auth_mode != AUTH_MODE_DESTINATION
+        ):
+            # Same reason as the Jira rule above. Slack has no
+            # client-credentials grant, so the bot token lives in a destination.
+            raise ValueError(
+                f"{BUILTIN_SLACK_URL} requires auth_mode=destination: the Slack "
+                "bot token lives in the BTP destination named in "
+                "oauth.destination, as URL.headers.Authorization"
+            )
         if self.auth_mode == AUTH_MODE_SESSION and not is_note_detail:
             raise ValueError(
                 "auth_mode=session is only supported for "
