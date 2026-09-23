@@ -7,6 +7,7 @@ import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import validators from "../model/validators";
+import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
 import type Dialog from "sap/m/Dialog";
 import type Event from "sap/ui/base/Event";
@@ -202,8 +203,14 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "" },
-            builtins: validators.BUILTIN_URLS.slice(),
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", team: "", channels: "" },
+            // "mcp" for a remote server, otherwise the built-in's url.
+            kind: findBuiltin(server.url)?.url ?? "mcp",
+            kinds: [{ key: "mcp", text: this.text("toolsetRemoteMcp") }].concat(
+                BUILTINS.map((b) => ({ key: b.url, text: this.text(b.titleKey) }))
+            ),
+            kindDescription: "",
+            authModes: [],
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
@@ -215,6 +222,8 @@ export default class AgentDetail extends BaseController {
             errors: {}
         });
 
+        this.syncServerKind();
+
         if (!this.serverDialog) {
             this.serverDialog = await Fragment.load({
                 id: this.getView()!.getId(),
@@ -224,6 +233,52 @@ export default class AgentDetail extends BaseController {
             this.getView()!.addDependent(this.serverDialog);
         }
         this.serverDialog.open();
+    }
+
+    /** The toolset dropdown: a built-in fills in its url and a working auth mode. */
+    public onServerKindChange(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const kind = serverModel.getProperty("/kind") as string;
+        const builtin = findBuiltin(kind);
+        if (builtin) {
+            serverModel.setProperty("/url", builtin.url);
+            serverModel.setProperty("/auth_mode", builtin.defaultAuthMode);
+        } else if (findBuiltin(serverModel.getProperty("/url") as string)) {
+            // Back to a remote server: the built-in's pseudo-url is no
+            // starting point for a real one.
+            serverModel.setProperty("/url", "");
+        }
+        serverModel.setProperty("/errors", {});
+        this.syncServerKind();
+    }
+
+    /** A url typed by hand may itself name a built-in; keep the dropdown in step. */
+    public onServerUrlChange(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const url = serverModel.getProperty("/url") as string;
+        serverModel.setProperty("/kind", findBuiltin(url)?.url ?? "mcp");
+        this.syncServerKind();
+    }
+
+    /**
+     * Derives what the dialog shows from the url: the built-in's description
+     * and the auth modes the server accepts for it. An auth mode that is not
+     * among them is replaced by the first that is, rather than left for the
+     * server to refuse on save.
+     */
+    private syncServerKind(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const url = serverModel.getProperty("/url") as string;
+        const builtin = findBuiltin(url);
+        serverModel.setProperty("/kindDescription", builtin ? this.text(builtin.descriptionKey) : "");
+        const modes = authModesFor(url);
+        serverModel.setProperty("/authModes", modes.map((m) => ({
+            key: m, text: this.text(AUTH_MODE_TEXT_KEYS[m])
+        })));
+        const current = serverModel.getProperty("/auth_mode") as AuthMode;
+        if (modes.indexOf(current) === -1) {
+            serverModel.setProperty("/auth_mode", builtin?.defaultAuthMode ?? modes[0]);
+        }
     }
 
     public onAuthModeChange(): void {
@@ -254,7 +309,7 @@ export default class AgentDetail extends BaseController {
         const carriesOAuth = authMode === "oauth2" || authMode === "app_only"
             || authMode === "destination" || publicBuiltin;
         const oauth = carriesOAuth
-            ? AgentDetail.cleanOAuth(oauthRaw, authMode)
+            ? AgentDetail.cleanOAuth(oauthRaw, authMode, url)
             : undefined;
         const oauthError = validators.validateOAuth(oauth, authMode, url);
         if (oauthError) {
@@ -291,7 +346,7 @@ export default class AgentDetail extends BaseController {
 
     /** Drops blank fields so the server sees the same shape `to_config()` builds. */
     private static cleanOAuth(
-        raw: Record<string, unknown>, authMode: AuthMode = "oauth2"
+        raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
     ): McpServer["oauth"] {
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes
@@ -324,11 +379,15 @@ export default class AgentDetail extends BaseController {
             const scope = String(raw.scope ?? "").trim();
             return scope ? { dcr: true, scope } : { dcr: true };
         }
+        // builtin:teams pins its team and channels on either mode, and keeps
+        // its window and send switch on oauth2 too -- see agents/teams_tools.py.
+        const teams = validators.isTeams(url);
         const out: Record<string, unknown> = { client_id: String(raw.client_id ?? "").trim() };
         const keys = appOnly
             ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox", "lookback",
-                "recipients"]
-            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"];
+                "recipients", "team", "channels"]
+            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"]
+                .concat(teams ? ["team", "channels", "lookback"] : []);
         keys.forEach((key) => {
             const value = String(raw[key] ?? "").trim();
             if (value) {
@@ -338,7 +397,7 @@ export default class AgentDetail extends BaseController {
         // Only ever sent as `true`. Omitting it when off keeps the stored
         // config identical to what a config file would carry, so an exported
         // agent does not gain a field it never asked for.
-        if (appOnly && raw.allow_send === true) {
+        if ((appOnly || teams) && raw.allow_send === true) {
             out.allow_send = true;
         }
         return out as McpServer["oauth"];

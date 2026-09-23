@@ -37,7 +37,7 @@ def test_unknown_builtin_still_rejected():
     from agents.builtins import build_builtin_toolset
 
     with pytest.raises(ValueError, match="unknown built-in toolset"):
-        build_builtin_toolset("builtin:teams", {}, "none")
+        build_builtin_toolset("builtin:slack", {}, "none")
 
 
 def test_sapnotedetail_is_a_known_builtin():

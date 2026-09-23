@@ -61,6 +61,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   label. Built and unit-tested but **never run against a real mailbox**:
   `docs/OUTLOOK_SETUP.md` and `scripts/probe_outlook.py` cover the tenant
   gates that have to clear first
+- `agents/teams_tools.py` — Teams channels over Microsoft Graph
+  (`builtin:teams`). One `team` (and optionally `channels`) is pinned in
+  config, never a tool argument. `oauth2` reads and, with `allow_send`,
+  posts as the signed-in user; `app_only` is read-only because Graph refuses
+  application posts. Unit-tested only; setup notes are in the module docstring
 - `agents/destination.py` — resolves a BTP destination (URL + ready
   `Authorization` header) from the destination service, cached until its
   token nears expiry. Stores no credential for the target: the destination
@@ -112,7 +117,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is unchanged and still the supported admin at
   `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
-  `docs/UI5_ADMIN.md`
+  `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
+  `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
+  auth modes the server accepts per built-in
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
