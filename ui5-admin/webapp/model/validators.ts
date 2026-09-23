@@ -15,6 +15,7 @@ import type { AuthMode, McpServer, OAuthClient } from "../service/types";
 const BUILTIN_URLS = [
     "builtin:gmail",
     "builtin:outlook",
+    "builtin:teams",
     "builtin:jira",
     "builtin:sapnotes",
     "builtin:sapnotedetail",
@@ -35,6 +36,33 @@ export default {
     BUILTIN_URLS,
 
     BUILTIN_PUBLIC_KEYS,
+
+    /** True for `builtin:teams`, whose target is a pinned team, not a mailbox. */
+    isTeams(url: string): boolean {
+        return (url || "").trim().replace(/\/+$/, "").toLowerCase() === "builtin:teams";
+    },
+
+    /** Returns an error message, or an empty string when the config is valid. */
+    validateTeams(oauth: OAuthClient | undefined, authMode: AuthMode): string {
+        if (authMode !== "oauth2" && authMode !== "app_only") {
+            return "Teams requires auth mode 'oauth2' (as the signed-in user) or "
+                + "'app_only' (read-only, as the application).";
+        }
+        if (oauth && "dcr" in oauth && oauth.dcr === true) {
+            return "Teams cannot use dynamic registration: Microsoft Entra ID does "
+                + "not offer it.";
+        }
+        const cfg = (oauth || {}) as Exclude<OAuthClient, { dcr: true }>;
+        if (!(cfg.team || "").trim()) {
+            return "Teams requires a team ID: the one team this agent may read is "
+                + "pinned here, never chosen by the agent.";
+        }
+        if (authMode === "app_only" && cfg.allow_send === true) {
+            return "Teams cannot post as the application: Graph does not allow it. "
+                + "Use oauth2 to post as the signed-in user, or turn sending off.";
+        }
+        return "";
+    },
 
     /** True when this url may carry a public config block on `none`. */
     carriesPublicConfig(url: string): boolean {
@@ -65,6 +93,12 @@ export default {
 
     /** Returns an error message, or an empty string when the config is valid. */
     validateOAuth(oauth: OAuthClient | undefined, authMode: AuthMode, url = ""): string {
+        if (this.isTeams(url)) {
+            const teamsError = this.validateTeams(oauth, authMode);
+            if (teamsError) {
+                return teamsError;
+            }
+        }
         if (authMode === "app_only") {
             if (!oauth || ("dcr" in oauth && oauth.dcr === true)) {
                 return oauth
@@ -81,7 +115,7 @@ export default {
                     + "nobody signs in).";
             }
             const isBuiltin = (url || "").trim().toLowerCase().startsWith("builtin:");
-            if (isBuiltin && !(app.mailbox || "").trim()) {
+            if (isBuiltin && !this.isTeams(url) && !(app.mailbox || "").trim()) {
                 return "App-only auth requires a mailbox: the token identifies no "
                     + "user, so there is no 'me' to fall back to.";
             }

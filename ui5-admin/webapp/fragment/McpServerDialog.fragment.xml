@@ -80,12 +80,28 @@
                 placeholder="{server>/scopeHint}"
                 visible="{= (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only') &amp;&amp; ${server>/auth_mode} !== 'destination' }" />
 
-            <Label text="{i18n>mailbox}" required="true" visible="{= ${server>/auth_mode} === 'app_only' }" />
+            <Label text="{i18n>mailbox}" required="true" visible="{= ${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams' }" />
             <Input
                 id="oauthMailbox"
                 value="{server>/oauth/mailbox}"
                 placeholder="{i18n>mailboxHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' }" />
+                visible="{= ${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams' }" />
+
+            <Label text="{i18n>teamLabel}" required="true"
+                   visible="{= ${server>/url} === 'builtin:teams' }" />
+            <Input
+                id="oauthTeam"
+                value="{server>/oauth/team}"
+                placeholder="{i18n>teamHint}"
+                visible="{= ${server>/url} === 'builtin:teams' }" />
+
+            <Label text="{i18n>channelsLabel}"
+                   visible="{= ${server>/url} === 'builtin:teams' }" />
+            <Input
+                id="oauthChannels"
+                value="{server>/oauth/channels}"
+                placeholder="{i18n>channelsHint}"
+                visible="{= ${server>/url} === 'builtin:teams' }" />
 
             <Label text="{i18n>recipientsLabel}"
                    visible="{= ${server>/url} === 'builtin:outlook' }" />
@@ -95,19 +111,19 @@
                 placeholder="{i18n>recipientsPlaceholder}"
                 visible="{= ${server>/url} === 'builtin:outlook' }" />
 
-            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' }" />
+            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' }" />
 
-            <Label text="{i18n>allowSend}" visible="{= ${server>/auth_mode} === 'app_only' }" />
+            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') }" />
             <CheckBox
                 id="oauthAllowSend"
                 selected="{server>/oauth/allow_send}"
-                text="{i18n>allowSendHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' }" />
+                text="{= ${server>/url} === 'builtin:teams' ? ${i18n>allowPostHint} : ${i18n>allowSendHint} }"
+                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') }" />
 
             <Label text="{i18n>minScoreLabel}"
                    visible="{= ${server>/url} === 'builtin:sapnotes' }" />

@@ -17,7 +17,7 @@ QUnit.test("a known builtin is accepted regardless of auth mode", function (asse
 });
 
 QUnit.test("an unknown builtin is rejected as a typo", function (assert) {
-    const msg = validators.validateServerUrl("builtin:teams", "none");
+    const msg = validators.validateServerUrl("builtin:slack", "none");
     assert.ok(msg.length > 0, "returns a message");
     assert.ok(msg.indexOf("builtin:gmail") > -1, "lists the known builtins");
 });
@@ -307,4 +307,49 @@ QUnit.test("session mode rejects an oauth config block", function (assert) {
     assert.notStrictEqual(
         validators.validateOAuth({ client_id: "x" }, "session", "builtin:sapnotedetail"), ""
     );
+});
+
+QUnit.module("validators.validateOAuth — builtin:teams");
+
+const TEAMS_OAUTH2 = {
+    client_id: "c",
+    client_secret: "s",
+    authorize_url: "https://login.microsoftonline.com/t/oauth2/v2.0/authorize",
+    token_url: "https://login.microsoftonline.com/t/oauth2/v2.0/token",
+    team: "team-guid"
+};
+
+QUnit.test("teams is a known builtin", function (assert) {
+    assert.strictEqual(validators.validateServerUrl("builtin:teams", "oauth2"), "");
+});
+
+QUnit.test("teams on oauth2 with a team passes, and may post", function (assert) {
+    assert.strictEqual(validators.validateOAuth(TEAMS_OAUTH2, "oauth2", "builtin:teams"), "");
+    assert.strictEqual(
+        validators.validateOAuth({ ...TEAMS_OAUTH2, allow_send: true }, "oauth2", "builtin:teams"),
+        ""
+    );
+});
+
+QUnit.test("teams on app-only needs a team, not a mailbox", function (assert) {
+    const { authorize_url: _unused, ...appOnly } = TEAMS_OAUTH2;
+    assert.strictEqual(validators.validateOAuth(appOnly, "app_only", "builtin:teams"), "");
+});
+
+QUnit.test("teams without a team is rejected", function (assert) {
+    const msg = validators.validateOAuth({ ...TEAMS_OAUTH2, team: "" }, "oauth2", "builtin:teams");
+    assert.ok(msg.indexOf("team ID") > -1, msg);
+});
+
+QUnit.test("teams cannot post as the application", function (assert) {
+    const { authorize_url: _unused, ...appOnly } = TEAMS_OAUTH2;
+    const msg = validators.validateOAuth(
+        { ...appOnly, allow_send: true }, "app_only", "builtin:teams"
+    );
+    assert.ok(msg.indexOf("cannot post") > -1, msg);
+});
+
+QUnit.test("teams rejects modes it cannot authenticate with", function (assert) {
+    assert.notStrictEqual(validators.validateOAuth(undefined, "jwt", "builtin:teams"), "");
+    assert.notStrictEqual(validators.validateOAuth({ dcr: true }, "oauth2", "builtin:teams"), "");
 });

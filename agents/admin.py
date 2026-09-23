@@ -40,6 +40,7 @@ from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.teams_tools import BUILTIN_TEAMS_URL
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -149,6 +150,11 @@ class OAuthClientPayload(BaseModel):
     # for mail the agent originates. Deliberately not a tool argument -- see
     # OutlookClient.recipients.
     recipients: str = Field(default="", max_length=512)
+    # builtin:teams only. `team` is the one team's id the toolset may touch;
+    # `channels` (comma-separated names or ids) narrows it further. Both are
+    # pinned here rather than tool arguments -- see agents/teams_tools.py.
+    team: str = Field(default="", max_length=128)
+    channels: str = Field(default="", max_length=512)
 
     @field_validator("min_score")
     @classmethod
@@ -166,7 +172,7 @@ class OAuthClientPayload(BaseModel):
             raise ValueError("min_score must be between 0 and 10")
         return text
 
-    @field_validator("status", "labels", "recipients", mode="before")
+    @field_validator("status", "labels", "recipients", "channels", mode="before")
     @classmethod
     def _csv_list_is_a_string(cls, v: Any) -> Any:
         """Accept a JSON list for a multi-value field, store it as CSV.
@@ -179,7 +185,7 @@ class OAuthClientPayload(BaseModel):
             return ", ".join(str(x).strip() for x in v if str(x).strip())
         return v
 
-    @field_validator("status", "labels", "recipients")
+    @field_validator("status", "labels", "recipients", "channels")
     @classmethod
     def _validate_csv_list(cls, v: str) -> str:
         # A bounded number of values: the cap is not about Jira's limits but
@@ -233,6 +239,8 @@ class OAuthClientPayload(BaseModel):
             "labels": self.labels.strip(),
             "min_score": self.min_score.strip(),
             "recipients": self.recipients.strip(),
+            "team": self.team.strip(),
+            "channels": self.channels.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:
@@ -278,6 +286,36 @@ class McpServerPayload(BaseModel):
             )
         return v
 
+    def _validate_teams(self) -> None:
+        """Rules only builtin:teams has, checked before the per-mode ones.
+
+        Each is caught here rather than at reload, where the registry would log
+        the failure and drop the agent while the UI still showed it configured.
+        """
+        if self.auth_mode not in (AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY):
+            raise ValueError(
+                f"{BUILTIN_TEAMS_URL} requires auth_mode=oauth2 (as the signed-in "
+                "user) or app_only (read-only, as the application)"
+            )
+        cfg = self.oauth.to_config() if self.oauth else {}
+        if cfg.get("dcr"):
+            raise ValueError(
+                f"{BUILTIN_TEAMS_URL} cannot use DCR: Microsoft Entra ID does not "
+                "offer dynamic client registration, and a DCR config has nowhere "
+                "to keep the pinned oauth.team"
+            )
+        if not cfg.get("team"):
+            raise ValueError(
+                f"{BUILTIN_TEAMS_URL} requires oauth.team: the id of the one team "
+                "this agent may read, pinned here rather than chosen by the agent"
+            )
+        if self.auth_mode == AUTH_MODE_APP_ONLY and cfg.get("allow_send"):
+            raise ValueError(
+                f"{BUILTIN_TEAMS_URL} cannot post under auth_mode=app_only: Graph "
+                "does not let an application send channel messages. Use oauth2 "
+                "to post as the signed-in user, or turn allow_send off"
+            )
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         # Before the per-mode rules, because the oauth2 branch below returns
@@ -309,6 +347,8 @@ class McpServerPayload(BaseModel):
                 "authenticates with a browser session cookie refreshed by a "
                 "human, and holds no credential of its own"
             )
+        if str(self.url or "").strip().rstrip("/").lower() == BUILTIN_TEAMS_URL:
+            self._validate_teams()
         if self.auth_mode == AUTH_MODE_SESSION and not is_note_detail:
             raise ValueError(
                 "auth_mode=session is only supported for "
@@ -346,7 +386,11 @@ class McpServerPayload(BaseModel):
                     "client_credentials server requires oauth.token_url or "
                     "oauth.uaa_url (there is no authorize_url: no browser is involved)"
                 )
-            if is_builtin_url(self.url) and not cfg.get("mailbox"):
+            if (
+                is_builtin_url(self.url)
+                and str(self.url).strip().rstrip("/").lower() != BUILTIN_TEAMS_URL
+                and not cfg.get("mailbox")
+            ):
                 raise ValueError(
                     f"{self.url} with auth_mode=client_credentials requires "
                     "oauth.mailbox: an app-only token identifies no user, so the "

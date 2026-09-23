@@ -982,7 +982,11 @@ _OAUTH_KEYS = ("client_id", "client_secret", "uaa_url", "authorize_url", "token_
 # its own, and `allow_send`, which is deliberately separate from the token's
 # permissions: holding Mail.Send must not be enough to give an agent a send tool.
 _CC_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope", "mailbox",
-            "lookback", "recipients")
+            "lookback", "recipients", "team", "channels")
+# builtin:teams on oauth2 keeps its pinned scope and window next to the client
+# credentials. Scoped to that one URL so every other oauth2 server stores
+# exactly what it stored before.
+_TEAMS_OAUTH2_KEYS = ("team", "channels", "lookback")
 
 
 def _clean_client_credentials(
@@ -1119,6 +1123,14 @@ def _clean_oauth(
             cleaned[k] = str(v).strip()
     if not cleaned.get("client_secret") and fallback and fallback.get("client_secret"):
         cleaned["client_secret"] = fallback["client_secret"]
+    if str(url or "").strip().rstrip("/").lower() == "builtin:teams":
+        for k in _TEAMS_OAUTH2_KEYS:
+            v = src.get(k)
+            if isinstance(v, (list, tuple)):
+                v = ", ".join(str(x).strip() for x in v if str(x).strip())
+            if v is not None and str(v).strip() != "":
+                cleaned[k] = str(v).strip()
+        cleaned["allow_send"] = bool(src.get("allow_send"))
     if not cleaned.get("client_id"):
         raise ValueError("oauth2 server requires a client_id")
     if not cleaned.get("client_secret"):

@@ -8,8 +8,8 @@ https/allow-list rules, which have nothing to check when there is no host.
 
 They exist because a vendor's own hosted MCP server is not always reachable by a
 self-registered OAuth client -- Google's Gmail MCP server refuses every
-``tools/call`` from one, and Microsoft's Outlook MCP server is gated behind a
-Copilot licence. The REST APIs underneath have no such problem.
+``tools/call`` from one, and Microsoft's Outlook and Teams MCP servers are
+gated behind a Copilot licence. The REST APIs underneath have no such problem.
 
 The set is closed. An unrecognised ``builtin:`` URL is a typo, not an extension
 point, and is rejected at admin validation rather than silently ignored.
@@ -24,11 +24,13 @@ from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
 from agents.sapnotes_tools import BUILTIN_SAPNOTES_URL, sapnotes_toolset
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL, sapnotedetail_toolset
+from agents.teams_tools import BUILTIN_TEAMS_URL, teams_toolset
 
 # url -> factory(oauth, server_key) -> AbstractToolset
 _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_GMAIL_URL: gmail_toolset,
     BUILTIN_OUTLOOK_URL: outlook_toolset,
+    BUILTIN_TEAMS_URL: teams_toolset,
     BUILTIN_JIRA_URL: jira_toolset,
     BUILTIN_SAPNOTES_URL: sapnotes_toolset,
     BUILTIN_SAPNOTEDETAIL_URL: sapnotedetail_toolset,

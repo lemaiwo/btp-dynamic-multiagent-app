@@ -202,7 +202,7 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "" },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", team: "", channels: "" },
             builtins: validators.BUILTIN_URLS.slice(),
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
@@ -254,7 +254,7 @@ export default class AgentDetail extends BaseController {
         const carriesOAuth = authMode === "oauth2" || authMode === "app_only"
             || authMode === "destination" || publicBuiltin;
         const oauth = carriesOAuth
-            ? AgentDetail.cleanOAuth(oauthRaw, authMode)
+            ? AgentDetail.cleanOAuth(oauthRaw, authMode, url)
             : undefined;
         const oauthError = validators.validateOAuth(oauth, authMode, url);
         if (oauthError) {
@@ -291,7 +291,7 @@ export default class AgentDetail extends BaseController {
 
     /** Drops blank fields so the server sees the same shape `to_config()` builds. */
     private static cleanOAuth(
-        raw: Record<string, unknown>, authMode: AuthMode = "oauth2"
+        raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
     ): McpServer["oauth"] {
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes
@@ -324,11 +324,15 @@ export default class AgentDetail extends BaseController {
             const scope = String(raw.scope ?? "").trim();
             return scope ? { dcr: true, scope } : { dcr: true };
         }
+        // builtin:teams pins its team and channels on either mode, and keeps
+        // its window and send switch on oauth2 too -- see agents/teams_tools.py.
+        const teams = validators.isTeams(url);
         const out: Record<string, unknown> = { client_id: String(raw.client_id ?? "").trim() };
         const keys = appOnly
             ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox", "lookback",
-                "recipients"]
-            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"];
+                "recipients", "team", "channels"]
+            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"]
+                .concat(teams ? ["team", "channels", "lookback"] : []);
         keys.forEach((key) => {
             const value = String(raw[key] ?? "").trim();
             if (value) {
@@ -338,7 +342,7 @@ export default class AgentDetail extends BaseController {
         // Only ever sent as `true`. Omitting it when off keeps the stored
         // config identical to what a config file would carry, so an exported
         // agent does not gain a field it never asked for.
-        if (appOnly && raw.allow_send === true) {
+        if ((appOnly || teams) && raw.allow_send === true) {
             out.allow_send = true;
         }
         return out as McpServer["oauth"];
