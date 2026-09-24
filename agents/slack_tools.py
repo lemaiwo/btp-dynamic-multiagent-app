@@ -2,6 +2,7 @@
 
 An agent opts in with the pseudo-URL ``builtin:slack``; ``agents/builtins.py``
 dispatches to it. The agent acts as a **Slack bot**, never as a person.
+Step-by-step setup in Slack and BTP: ``SLACK_SETUP.md``.
 
 **Auth is a BTP destination, as for Jira.** Slack has no client-credentials
 grant: a bot token (``xoxb-...``) is issued once, when the Slack app is

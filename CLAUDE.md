@@ -72,7 +72,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `agents/destination.py` sends as a static header). Scope is the channels the
   bot is in, or a pinned `channels` list; posting needs `allow_send`, and
   posted text is escaped so it cannot `<!channel>` or mention anyone.
-  Unit-tested only; setup notes are in the module docstring
+  Unit-tested only; Slack + BTP setup guide in `SLACK_SETUP.md`
 - `agents/destination.py` — resolves a BTP destination (URL + ready
   `Authorization` header) from the destination service, cached until its
   token nears expiry. Stores no credential for the target: the destination
