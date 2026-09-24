@@ -66,6 +66,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   config, never a tool argument. `oauth2` reads and, with `allow_send`,
   posts as the signed-in user; `app_only` is read-only because Graph refuses
   application posts. Unit-tested only; setup notes are in the module docstring
+- `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
+  bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
+  BTP destination (NoAuthentication + `URL.headers.Authorization`, which
+  `agents/destination.py` sends as a static header). Scope is the channels the
+  bot is in, or a pinned `channels` list; posting needs `allow_send`, and
+  posted text is escaped so it cannot `<!channel>` or mention anyone.
+  Unit-tested only; Slack + BTP setup guide in `SLACK_SETUP.md`
 - `agents/destination.py` — resolves a BTP destination (URL + ready
   `Authorization` header) from the destination service, cached until its
   token nears expiry. Stores no credential for the target: the destination

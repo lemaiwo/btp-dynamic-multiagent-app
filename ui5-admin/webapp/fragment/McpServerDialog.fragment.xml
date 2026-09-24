@@ -104,12 +104,12 @@
                 visible="{= ${server>/url} === 'builtin:teams' }" />
 
             <Label text="{i18n>channelsLabel}"
-                   visible="{= ${server>/url} === 'builtin:teams' }" />
+                   visible="{= ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:slack' }" />
             <Input
                 id="oauthChannels"
                 value="{server>/oauth/channels}"
-                placeholder="{i18n>channelsHint}"
-                visible="{= ${server>/url} === 'builtin:teams' }" />
+                placeholder="{= ${server>/url} === 'builtin:slack' ? ${i18n>slackChannelsHint} : ${i18n>channelsHint} }"
+                visible="{= ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:slack' }" />
 
             <Label text="{i18n>recipientsLabel}"
                    visible="{= ${server>/url} === 'builtin:outlook' }" />
@@ -126,12 +126,12 @@
                 placeholder="{i18n>lookbackHint}"
                 visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' }" />
 
-            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') }" />
+            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') || ${server>/url} === 'builtin:slack' }" />
             <CheckBox
                 id="oauthAllowSend"
                 selected="{server>/oauth/allow_send}"
-                text="{= ${server>/url} === 'builtin:teams' ? ${i18n>allowPostHint} : ${i18n>allowSendHint} }"
-                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') }" />
+                text="{= ${server>/url} === 'builtin:teams' ? ${i18n>allowPostHint} : ${server>/url} === 'builtin:slack' ? ${i18n>allowSlackPostHint} : ${i18n>allowSendHint} }"
+                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') || ${server>/url} === 'builtin:slack' }" />
 
             <Label text="{i18n>minScoreLabel}"
                    visible="{= ${server>/url} === 'builtin:sapnotes' }" />
@@ -146,43 +146,43 @@
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
-                placeholder="MY_JIRA_DESTINATION"
+                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : 'MY_JIRA_DESTINATION' }"
                 visible="{= ${server>/auth_mode} === 'destination' }" />
 
-            <Label text="{i18n>jiraProject}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Label text="{i18n>jiraProject}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
             <Input
                 id="oauthProject"
                 value="{server>/oauth/project}"
                 placeholder="ABC"
-                visible="{= ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
 
-            <Label text="{i18n>jiraStatus}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Label text="{i18n>jiraStatus}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
             <Input
                 id="oauthStatus"
                 value="{server>/oauth/status}"
                 placeholder="{i18n>jiraStatusHint}"
-                visible="{= ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
 
-            <Label text="{i18n>jiraLabels}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Label text="{i18n>jiraLabels}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
             <Input
                 id="oauthLabels"
                 value="{server>/oauth/labels}"
                 placeholder="{i18n>jiraLabelsHint}"
-                visible="{= ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
 
-            <Label text="{i18n>jiraApiBase}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Label text="{i18n>jiraApiBase}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
             <Input
                 id="oauthApiBase"
                 value="{server>/oauth/api_base}"
                 placeholder="{i18n>jiraApiBaseHint}"
-                visible="{= ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
 
-            <Label text="{i18n>allowComment}" visible="{= ${server>/auth_mode} === 'destination' }" />
+            <Label text="{i18n>allowComment}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
             <CheckBox
                 id="oauthAllowComment"
                 selected="{server>/oauth/allow_comment}"
                 text="{i18n>allowCommentHint}"
-                visible="{= ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:slack' }" />
 
         </f:SimpleForm>
         <beginButton>

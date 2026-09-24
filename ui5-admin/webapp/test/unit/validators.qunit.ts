@@ -17,7 +17,7 @@ QUnit.test("a known builtin is accepted regardless of auth mode", function (asse
 });
 
 QUnit.test("an unknown builtin is rejected as a typo", function (assert) {
-    const msg = validators.validateServerUrl("builtin:slack", "none");
+    const msg = validators.validateServerUrl("builtin:discord", "none");
     assert.ok(msg.length > 0, "returns a message");
     assert.ok(msg.indexOf("builtin:gmail") > -1, "lists the known builtins");
 });

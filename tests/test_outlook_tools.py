@@ -153,12 +153,12 @@ async def main() -> None:
           f"got {sorted(BUILTIN_URLS)}")
     check("recognises builtin:outlook", is_builtin_url(BUILTIN_OUTLOOK_URL))
     check("still recognises builtin:gmail", is_builtin_url(BUILTIN_GMAIL_URL))
-    check("rejects unknown builtins", not is_builtin_url("builtin:slack"))
+    check("rejects unknown builtins", not is_builtin_url("builtin:discord"))
     try:
-        build_builtin_toolset("builtin:slack", {})
+        build_builtin_toolset("builtin:discord", {})
         check("dispatch rejects unknown", False, "no exception")
     except ValueError as e:
-        check("dispatch rejects unknown", "builtin:slack" in str(e))
+        check("dispatch rejects unknown", "builtin:discord" in str(e))
 
     # --- list_pending -------------------------------------------------------
     # The folder IS the queue: no search query, so no query-syntax to get wrong.
@@ -319,10 +319,10 @@ async def main() -> None:
                                  "scope": "s"})
     check("accepts builtin:outlook", ok.url == BUILTIN_OUTLOOK_URL)
     try:
-        McpServerPayload(url="builtin:slack", auth_mode="none")
-        check("rejects builtin:slack", False, "accepted")
+        McpServerPayload(url="builtin:discord", auth_mode="none")
+        check("rejects builtin:discord", False, "accepted")
     except Exception:
-        check("rejects builtin:slack", True)
+        check("rejects builtin:discord", True)
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)

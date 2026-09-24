@@ -361,6 +361,19 @@ export default class AgentDetail extends BaseController {
             });
             return (Object.keys(out).length ? out : undefined) as McpServer["oauth"];
         }
+        if (authMode === "destination" && findBuiltin(url)?.url === "builtin:slack") {
+            // Slack keeps a channel pin and a posting switch instead of
+            // Jira's filters. Only ever sent as `true`, as for app-only.
+            const slack: Record<string, unknown> = {
+                destination: String(raw.destination ?? "").trim(),
+                channels: String(raw.channels ?? "").trim(),
+                lookback: String(raw.lookback ?? "").trim()
+            };
+            if (raw.allow_send === true) {
+                slack.allow_send = true;
+            }
+            return slack as McpServer["oauth"];
+        }
         if (authMode === "destination") {
             return {
                 destination: String(raw.destination ?? "").trim(),

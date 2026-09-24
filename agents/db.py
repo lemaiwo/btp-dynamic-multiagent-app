@@ -1022,6 +1022,10 @@ def _clean_client_credentials(
 # A destination server stores no credential: the destination itself holds the
 # target's URL and its secret. `destination` names it; the rest is filtering.
 _DEST_KEYS = ("destination", "project", "status", "lookback", "api_base", "labels")
+# builtin:slack on a destination keeps a channel pin instead of Jira's filters,
+# and a posting switch. Scoped to that URL so a Jira server stores exactly
+# what it stored before.
+_SLACK_DEST_KEYS = ("destination", "channels", "lookback")
 
 
 # A public built-in stores no credential either -- NVD needs none. These are
@@ -1048,7 +1052,7 @@ def _clean_builtin_public(oauth: Any) -> dict[str, Any] | None:
     return cleaned or None
 
 
-def _clean_destination(oauth: Any) -> dict[str, Any]:
+def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     """Normalize a ``destination`` oauth block for storage.
 
     Credential keys are dropped rather than rejected here: an admin editing a
@@ -1059,7 +1063,8 @@ def _clean_destination(oauth: Any) -> dict[str, Any]:
     """
     src = oauth if isinstance(oauth, dict) else {}
     cleaned: dict[str, Any] = {}
-    for k in _DEST_KEYS:
+    slack = str(url or "").strip().rstrip("/").lower() == "builtin:slack"
+    for k in _SLACK_DEST_KEYS if slack else _DEST_KEYS:
         v = src.get(k)
         if isinstance(v, (list, tuple)):
             # `status` and `labels` are multi-value and stored comma-separated,
@@ -1072,7 +1077,10 @@ def _clean_destination(oauth: Any) -> dict[str, Any]:
             cleaned[k] = str(v).strip()
     if not cleaned.get("destination"):
         raise ValueError("destination server requires a destination name")
-    cleaned["allow_comment"] = bool(src.get("allow_comment"))
+    if slack:
+        cleaned["allow_send"] = src.get("allow_send") is True
+    else:
+        cleaned["allow_comment"] = bool(src.get("allow_comment"))
     return cleaned
 
 
@@ -1105,7 +1113,7 @@ def _clean_oauth(
 
         return _clean_builtin_public(oauth) if is_builtin_url(url) else None
     if mode == AUTH_MODE_DESTINATION:
-        return _clean_destination(oauth)
+        return _clean_destination(oauth, url)
     if mode == AUTH_MODE_APP_ONLY:
         return _clean_client_credentials(oauth, fallback)
     if mode != AUTH_MODE_OAUTH2:
