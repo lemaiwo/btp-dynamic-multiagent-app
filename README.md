@@ -149,6 +149,34 @@ You can also re-import this file at any time via the admin UI's
    config** to load a saved configuration (merge or replace). Skills
    are included in exports and imported before agents.
 
+#### Deep agents
+
+The agent form has a collapsible **Deep agent** section (UI5 admin: the
+*Deep agent* panel). Enabling it gives that specialist the
+[deepagents](https://github.com/langchain-ai/deepagents)-style working
+method on top of its MCP servers, built-ins, skills and peers, each part
+switchable on its own:
+
+- **Planning** — `write_todos` / `read_todos`. The prompt tells the
+  agent to plan before non-trivial work and keep the list updated.
+- **Scratchpad** — `ls` / `read_file` / `write_file` / `edit_file` on
+  an in-memory file tree that exists only for that run (200 files,
+  256 KB per file, 4 MB in total), so long tool outputs and drafts stay
+  out of the context window. Nothing in it is shown to the user.
+- **Sub-agents** — `task(description, instructions="")` runs an
+  ephemeral pydantic-ai agent with the same model and toolsets and a
+  fresh context, and returns its final text. Sub-agents share the
+  parent's plan and scratchpad; **Max concurrent sub-agents** (1–20)
+  bounds how many run at once and **Max sub-agent depth** (1–3) says
+  whether they may spawn sub-agents of their own. **Sub-agent
+  instructions** replaces the default sub-agent system prompt.
+
+Sub-agents are not specialists: they are created on the fly, never
+registered, and invisible to the orchestrator and to peers. The config
+round-trips through export/import and the seed file as `"deep": {...}`;
+a bundle without the key keeps whatever is stored, like `peers` and
+`model_name`. Implementation: `agents/deep.py`.
+
 ### 5. Running the tests
 
 None of the suites needs an external service: the Python ones boot the
@@ -348,6 +376,7 @@ automatically; on a refresh failure the user is re-prompted.
 │   ├── sapnotedetail_tools.py  # builtin:sapnotedetail (me.sap.com session cookie)
 │   ├── lookback.py             # shared look-back window parser
 │   ├── registry.py             # Dynamic orchestrator builder, peers, reload
+│   ├── deep.py                 # Deep agents: plan, per-run scratchpad, ephemeral sub-agents
 │   ├── chat_app.py             # Dynamic ASGI wrapper around Agent.to_web()
 │   ├── admin.py                # FastAPI /admin router (agent/skill/workflow CRUD, reload, import/export)
 │   ├── api_runs.py             # Scheduler entry points: POST /api/agents|workflows/{slug}/run

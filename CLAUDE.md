@@ -116,6 +116,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   instead of through the orchestrator. Recursion is bounded by
   `AGENT_DELEGATION_MAX_DEPTH` and a re-entry guard. `AgentConfig.model_name`
   overrides the globally active model per agent
+- `agents/deep.py` — opt-in "deep agent" tools per specialist
+  (`AgentConfig.deep_json`, parsed by `DeepConfig`): `write_todos`/
+  `read_todos`, an in-memory per-run scratchpad (`ls`/`read_file`/
+  `write_file`/`edit_file`, capped at 200 files / 256 KB / 4 MB) and a
+  `task` tool that runs an ephemeral sub-agent with the parent's toolsets.
+  State is one `DeepState` per `RunContext.run_id` in a TTL table; a
+  sub-agent gets the parent's state as `deps`, so the two share a plan and
+  scratchpad while a peer reached by delegation does not. `task` is omitted
+  once `depth >= subagent_max_depth`; concurrency is a semaphore per state
+  and depth. `registry.build_orchestrator` appends `deep_instructions` and
+  the `deep_toolset` when the row's config is enabled; sub-agents are never
+  registered as specialists or peers
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
