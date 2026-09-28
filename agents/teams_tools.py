@@ -15,7 +15,7 @@ message is text anyone in the team can write, so it is untrusted input, and an
 instruction smuggled into one must not be able to point the agent at another
 team.
 
-Two auth modes:
+Three auth modes:
 
 * ``oauth2`` -- the signed-in user, via ``PerUserOAuth2Auth``. Reads what that
   user can read, and posts under their name.
@@ -23,6 +23,10 @@ Two auth modes:
   an application post an ordinary channel message (application permissions for
   sending exist only for data migration), so ``allow_send`` is refused at build
   time rather than surfacing as a 403 mid-run.
+* ``destination`` -- through a BTP destination, via ``DestinationAuth``. With
+  ``user_context`` it behaves like ``oauth2`` (the destination service exchanges
+  the user's JWT for a Graph token, and posting is allowed); without it, like
+  ``app_only`` (read-only).
 
 **On posting.** Teams has no drafts, so unlike Outlook there is no safe
 "prepare it for a human" step: a post is live the moment it is made. Both
@@ -68,7 +72,8 @@ CHANNEL_CACHE_MAX_PRINCIPALS = 64
 
 AUTH_MODE_OAUTH2 = "oauth2"
 AUTH_MODE_APP_ONLY = "app_only"
-SUPPORTED_AUTH_MODES = (AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY)
+AUTH_MODE_DESTINATION = "destination"
+SUPPORTED_AUTH_MODES = (AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY, AUTH_MODE_DESTINATION)
 
 MAX_MESSAGES = 50
 DEFAULT_MAX_MESSAGES = 20
@@ -380,6 +385,20 @@ def teams_toolset(
             "let an application send channel messages. Use oauth2 to post as a "
             "signed-in user, or turn allow_send off"
         )
+    if can_send and mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import user_context_of
+
+        # The same Graph rule seen through a destination: an app-level
+        # destination credential is an application token, and Graph refuses
+        # its channel posts. Only a destination resolved as the signed-in
+        # user (user_context) can post.
+        if not user_context_of(oauth):
+            raise ValueError(
+                "builtin:teams cannot post through a destination without user "
+                "context: the destination's app-level credential is an application "
+                "token, and Graph does not let an application send channel "
+                "messages. Turn 'Act as signed-in user' on, or turn allow_send off"
+            )
     window = parse_lookback(lookback if lookback is not None else oauth.get("lookback"))
 
     from agents.jira_tools import normalize_csv_list
