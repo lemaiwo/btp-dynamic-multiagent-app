@@ -8,6 +8,7 @@ exercises the A2A endpoints over an ASGI transport:
 - POST /a2a  message/send
 - POST /a2a  tasks/get, tasks/cancel
 - POST /a2a  unknown method returns JSON-RPC error
+- contexts and tasks are keyed by the calling principal
 
 Run:  python tests/test_a2a.py
 """
@@ -69,15 +70,22 @@ pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
 
 
 class _FakeRunResult:
-    def __init__(self, text: str):
+    def __init__(self, text: str, history: list):
         self.output = text
+        self._history = history
 
     def all_messages(self):
-        return []
+        return self._history
 
 
 async def _fake_run(self, prompt, message_history=None, **kwargs):  # noqa: ARG001
-    return _FakeRunResult(f"echo: {prompt}")
+    # Echo how much history the orchestrator was handed, so the tests can see
+    # whether a follow-up turn found its context -- and whether another
+    # principal presenting the same contextId does not.
+    prior = list(message_history or [])
+    return _FakeRunResult(
+        f"echo: {prompt} (history={len(prior)})", prior + [f"user:{prompt}"]
+    )
 
 
 pydantic_ai.Agent.run = _fake_run  # type: ignore[method-assign]
@@ -199,6 +207,70 @@ async def _run_tests(c):
     })
     check(r.status_code == 200, "follow-up 200")
     check(r.json()["result"]["contextId"] == context_id, "same contextId returned")
+    follow_text = r.json()["result"]["status"]["message"]["parts"][0]["text"]
+    check(follow_text.endswith("(history=1)"), f"follow-up saw prior turn (got {follow_text!r})")
+
+    print("\nContexts and tasks are keyed by principal")
+    # Without an XSUAA binding the middleware reads the claims unverified, so
+    # an unsigned token is enough to act as a distinct principal locally.
+    import jwt as _jwt
+
+    def as_user(sub: str) -> dict[str, str]:
+        return {"Authorization": "Bearer " + _jwt.encode({"sub": sub}, "k", algorithm="HS256")}
+
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "a-1", "method": "message/send",
+        "params": {"message": {
+            "role": "user", "parts": [{"kind": "text", "text": "alice"}],
+            "messageId": "m-a1", "contextId": "shared-ctx",
+        }},
+    }, headers=as_user("alice"))
+    alice_task = r.json()["result"]
+    check(alice_task["status"]["message"]["parts"][0]["text"].endswith("(history=0)"),
+          "alice starts a fresh context")
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "a-2", "method": "message/send",
+        "params": {"message": {
+            "role": "user", "parts": [{"kind": "text", "text": "alice again"}],
+            "messageId": "m-a2", "contextId": "shared-ctx",
+        }},
+    }, headers=as_user("alice"))
+    check(r.json()["result"]["status"]["message"]["parts"][0]["text"].endswith("(history=1)"),
+          "alice's follow-up sees her own history")
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "b-1", "method": "message/send",
+        "params": {"message": {
+            "role": "user", "parts": [{"kind": "text", "text": "bob"}],
+            "messageId": "m-b1", "contextId": "shared-ctx",
+        }},
+    }, headers=as_user("bob"))
+    bob_text = r.json()["result"]["status"]["message"]["parts"][0]["text"]
+    check(bob_text.endswith("(history=0)"),
+          f"bob presenting alice's contextId gets an empty context (got {bob_text!r})")
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "a-3", "method": "message/send",
+        "params": {"message": {
+            "role": "user", "parts": [{"kind": "text", "text": "alice third"}],
+            "messageId": "m-a3", "contextId": "shared-ctx",
+        }},
+    }, headers=as_user("alice"))
+    check(r.json()["result"]["status"]["message"]["parts"][0]["text"].endswith("(history=2)"),
+          "bob's turn did not clobber alice's context")
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "b-2", "method": "tasks/get",
+        "params": {"id": alice_task["id"]},
+    }, headers=as_user("bob"))
+    check(r.json().get("error", {}).get("code") == -32001, "bob cannot read alice's task")
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "b-3", "method": "tasks/cancel",
+        "params": {"id": alice_task["id"]},
+    }, headers=as_user("bob"))
+    check(r.json().get("error", {}).get("code") == -32001, "bob cannot cancel alice's task")
+    r = await c.post("/a2a", json={
+        "jsonrpc": "2.0", "id": "a-4", "method": "tasks/get",
+        "params": {"id": alice_task["id"]},
+    }, headers=as_user("alice"))
+    check(r.json()["result"]["id"] == alice_task["id"], "alice still reads her task")
 
     print("\nUnknown method")
     r = await c.post("/a2a", json={
