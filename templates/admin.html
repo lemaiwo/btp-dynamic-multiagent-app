@@ -1302,10 +1302,15 @@ async function refreshCredentials() {
                 // Connect button that goes nowhere is worse than showing
                 // nothing, so point at the refresh script instead.
                 + (s.login_url
-                    ? '<button type="button" class="secondary" '
-                      + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                    // data-attribute + .dataset, like the delete buttons: the
+                    // value never re-enters JS source, so nothing in a
+                    // response body can break out of a string literal.
+                    ? '<button type="button" class="secondary connect-server-btn" '
+                      + 'data-login-url="' + esc(s.login_url) + '">Connect</button>'
                     : '<span class="hint">refreshed with scripts/sap_session.py</span>')
                 + '</p>').join('');
+        box.querySelectorAll('.connect-server-btn').forEach(btn =>
+            btn.addEventListener('click', () => connectServer(btn.dataset.loginUrl)));
     } catch (e) { box.innerHTML = ''; }
 }
 

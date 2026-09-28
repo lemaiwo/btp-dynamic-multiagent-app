@@ -29,6 +29,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+from urllib.parse import SplitResult, urlsplit
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -54,9 +55,12 @@ from agents.db import (
     OAUTH_CONFIG_MODES,
     VALID_AUTH_MODES,
     SessionLocal,
+    agent_referrers,
+    check_delegation_name_collision,
     delete_agent,
     delete_skill,
     delete_workflow,
+    describe_referrers,
     get_active_model_name,
     get_agent,
     get_agent_by_slug,
@@ -75,12 +79,14 @@ from agents.db import (
     list_workflows,
     normalize_skills_json,
     prepare_servers,
+    rename_agent_references,
     rename_skill_references,
     set_active_model_name,
     set_orchestrator_instructions,
     upsert_agent,
     upsert_skill,
     upsert_workflow,
+    validate_api_slug,
 )
 from agents.registry import registry
 from agents.shared import available_models, default_model_name
@@ -88,6 +94,99 @@ from agents.workflow_runner import RunRefused as WorkflowRunRefused
 from agents.workflow_runner import start_workflow_run
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# URL rules
+# ---------------------------------------------------------------------------
+_BTP_HOST_SUFFIX = "hana.ondemand.com"
+
+
+def _split_endpoint_url(
+    value: str, *, field: str = "url", allow_http: bool = False
+) -> SplitResult:
+    """Parse a configured endpoint and reject the shapes that fool a host check.
+
+    Everything here is decided by ``urlsplit``, the same parser httpx uses to
+    pick the host it connects to, so what is checked is what is dialled.
+    Userinfo (``allowed.host@evil.com``), a fragment (``evil.com#.allowed``)
+    and an empty host are refused outright: none has a legitimate use in a
+    server URL, and each one made a suffix check pass for the wrong host.
+    """
+    v = (value or "").strip()
+    try:
+        parts = urlsplit(v)
+    except ValueError as e:
+        raise ValueError(f"{field}: invalid URL: {e}") from e
+    schemes = ("https", "http") if allow_http else ("https",)
+    if parts.scheme not in schemes:
+        if allow_http:
+            raise ValueError(f"{field} must be http:// or https://")
+        raise ValueError(f"{field} must use https://")
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        raise ValueError(f"{field} must not carry credentials (user@host)")
+    if "#" in v:
+        raise ValueError(f"{field} must not carry a #fragment")
+    if not parts.hostname:
+        raise ValueError(f"{field} must name a host")
+    try:
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as e:
+        raise ValueError(f"{field}: invalid port") from e
+    return parts
+
+
+def _host_matches(hostname: str, pattern: str) -> bool:
+    """Exact hostname match, or a DNS-label suffix match for ``.suffix``."""
+    hostname = hostname.lower()
+    pattern = pattern.lower()
+    if pattern.startswith("."):
+        suffix = pattern.lstrip(".")
+        return hostname == suffix or hostname.endswith("." + suffix)
+    return hostname == pattern
+
+
+def _effective_port(parts: SplitResult) -> int | None:
+    if parts.port is not None:
+        return parts.port
+    return {"https": 443, "http": 80}.get(parts.scheme)
+
+
+def _allowlist_permits(parts: SplitResult, allowlist: str) -> bool:
+    """Whether MCP_URL_ALLOWLIST admits this URL.
+
+    Each comma-separated entry is a URL (``https://host[:port][/path]``) or a
+    bare host; a host starting with a dot admits its subdomains. Scheme,
+    hostname and port must match exactly, and the entry's path must be a
+    prefix of the URL's path on a segment boundary -- ``/mcp`` admits
+    ``/mcp/v1`` but not ``/mcp-evil``, and ``allowed.example`` never admits
+    ``allowed.example.evil.com``.
+    """
+    for raw in allowlist.split(","):
+        entry = raw.strip().rstrip("/")
+        if not entry:
+            continue
+        if "://" not in entry:
+            entry = "https://" + entry
+        try:
+            ep = urlsplit(entry)
+            ep.port  # noqa: B018
+        except ValueError:
+            continue
+        if ep.scheme != parts.scheme or not ep.hostname:
+            continue
+        if not _host_matches(parts.hostname or "", ep.hostname):
+            continue
+        if _effective_port(ep) != _effective_port(parts):
+            continue
+        entry_path = ep.path.rstrip("/")
+        url_path = parts.path.rstrip("/")
+        if entry_path and not (
+            url_path == entry_path or url_path.startswith(entry_path + "/")
+        ):
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +416,15 @@ class McpServerPayload(BaseModel):
                 "to post as the signed-in user, or turn allow_send off"
             )
 
+    @staticmethod
+    def _validate_oauth_urls(cfg: dict[str, Any]) -> None:
+        """The authorization server's endpoints get the same structural rules
+        as the MCP URL: https only, no userinfo, no fragment. A client secret
+        and every user's authorization code travel to these hosts."""
+        for key in ("uaa_url", "authorize_url", "token_url"):
+            if cfg.get(key):
+                _split_endpoint_url(str(cfg[key]), field=f"oauth.{key}")
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         # Before the per-mode rules, because the oauth2 branch below returns
@@ -371,6 +479,7 @@ class McpServerPayload(BaseModel):
             cfg = self.oauth.to_config() if self.oauth else {}
             if cfg.get("dcr"):
                 return self  # auto-discovery: no manual credentials needed
+            self._validate_oauth_urls(cfg)
             if not cfg.get("client_id"):
                 raise ValueError(
                     "oauth2 server requires oauth.client_id (or enable oauth.dcr "
@@ -391,6 +500,7 @@ class McpServerPayload(BaseModel):
                     "produces a client with no admin-consented application "
                     "permissions, so its tokens can reach nothing"
                 )
+            self._validate_oauth_urls(cfg)
             if not cfg.get("client_id"):
                 raise ValueError("client_credentials server requires oauth.client_id")
             if not (cfg.get("token_url") or cfg.get("uaa_url")):
@@ -477,37 +587,37 @@ class McpServerPayload(BaseModel):
         public = self.auth_mode == AUTH_MODE_NONE
         # Public servers may use http; authenticated servers must use https
         # so forwarded JWTs are not exposed on the wire.
-        if public:
-            if not (v.startswith("http://") or v.startswith("https://")):
-                raise ValueError("url must be http:// or https://")
-        else:
-            if not v.startswith("https://"):
-                raise ValueError("url must use https:// (set auth_mode=none for public servers)")
+        try:
+            parts = _split_endpoint_url(v, allow_http=public)
+        except ValueError as e:
+            if not public and "https://" in str(e):
+                raise ValueError(
+                    "url must use https:// (set auth_mode=none for public servers)"
+                ) from None
+            raise
         try:
             HttpUrl(v)
         except Exception as e:
             raise ValueError(f"invalid URL: {e}") from e
         # Host allow-list applies to authenticated (JWT-forwarding) servers
-        # only. Public servers are unrestricted by design.
+        # only. Public servers are unrestricted by design. The decision is
+        # made on the parsed hostname by DNS label, never on the raw string:
+        # `https://evil.com#.hana.ondemand.com` and
+        # `https://allowed.hana.ondemand.com.evil.com` both used to pass, and
+        # a jwt server sends every chat user's XSUAA token to that host.
         if not public:
             allowlist = os.environ.get("MCP_URL_ALLOWLIST", "").strip()
             if allowlist:
-                allowed = [a.strip() for a in allowlist.split(",") if a.strip()]
-                if not any(v.startswith(a.rstrip("/")) for a in allowed):
+                if not _allowlist_permits(parts, allowlist):
                     raise ValueError(
                         f"url is not in MCP_URL_ALLOWLIST ({allowlist})"
                     )
-            else:
-                host = v.split("/", 3)[2]
-                if not (
-                    host.endswith(".hana.ondemand.com")
-                    or host.endswith(".cfapps.sap.hana.ondemand.com")
-                ):
-                    raise ValueError(
-                        "url must be a BTP-hosted URL (*.hana.ondemand.com). "
-                        "Set MCP_URL_ALLOWLIST to override, or set auth_mode=none "
-                        "for public MCP servers."
-                    )
+            elif not _host_matches(parts.hostname or "", "." + _BTP_HOST_SUFFIX):
+                raise ValueError(
+                    "url must be a BTP-hosted URL (*.hana.ondemand.com). "
+                    "Set MCP_URL_ALLOWLIST to override, or set auth_mode=none "
+                    "for public MCP servers."
+                )
         self.url = v
         return self
 
@@ -551,6 +661,22 @@ class AgentPayload(BaseModel):
     run_as_principal: str = Field(default="", max_length=255)
     run_prompt: str = ""
     run_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, v: str) -> str:
+        # " Foo Bar" and "Foo Bar" are one delegation tool to the registry
+        # but two rows to the unique constraint; strip before either sees it.
+        v = v.strip()
+        if not v:
+            raise ValueError("name must not be blank")
+        return v
+
+    @field_validator("api_slug")
+    @classmethod
+    def _validate_slug(cls, v: str) -> str:
+        # A 422 naming the field, rather than an unreachable run endpoint.
+        return validate_api_slug(v) or ""
 
     @field_validator("skills")
     @classmethod
@@ -703,6 +829,11 @@ class WorkflowPayload(BaseModel):
         """
         return "" if v is None else v
 
+    @field_validator("api_slug")
+    @classmethod
+    def _validate_slug(cls, v: str) -> str:
+        return validate_api_slug(v) or ""
+
 
 class ImportPayload(BaseModel):
     orchestrator_instructions: str | None = None
@@ -818,7 +949,9 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row = await get_agent(session, agent_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Agent not found")
-        if row.name != payload.name:
+        old_name = row.name
+        renamed = old_name != payload.name
+        if renamed:
             # Check uniqueness of new name
             from agents.db import get_agent_by_name
 
@@ -833,7 +966,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
-            slug = payload.api_slug.strip() or None
+            slug = validate_api_slug(payload.api_slug)
             if slug:
                 clash = await get_agent_by_slug(session, slug)
                 if clash is not None and clash.id != agent_id:
@@ -842,8 +975,26 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                     )
             if payload.expose_api and not slug:
                 raise ValueError("expose_api requires an api_slug")
+            if payload.enabled:
+                await check_delegation_name_collision(
+                    session, payload.name, exclude_id=agent_id
+                )
+            if row.enabled and not payload.enabled:
+                # Disabling drops the agent from the build: peer tools vanish
+                # with a log line and workflow steps fail at trigger time.
+                # Refuse while anything enabled still depends on it.
+                peers, wfs = await agent_referrers(session, old_name)
+                if peers or wfs:
+                    raise ValueError(
+                        f"cannot disable agent {old_name!r}: it is "
+                        f"{describe_referrers(peers, wfs)}. Remove those "
+                        "references first."
+                    )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
+        if renamed:
+            # Keep peer lists and workflow steps pointing at the renamed agent
+            await rename_agent_references(session, old_name, payload.name)
         row.name = payload.name
         row.description = payload.description
         row.instructions = payload.instructions
@@ -859,8 +1010,8 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         row.run_as_principal = payload.run_as_principal.strip() or None
         row.run_prompt = payload.run_prompt.strip() or None
         row.run_timeout_seconds = payload.run_timeout_seconds
-        # None means the client carries no such field (the UI5 admin form
-        # does not), so the stored value stays; "" / [] still clear it.
+        # None means the client carries no such field (an older client or
+        # bundle), so the stored value stays; "" / [] still clear it.
         if payload.model_name is not None:
             row.model_name = payload.model_name.strip() or None
         if payload.peers is not None:
@@ -876,11 +1027,43 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_admin)],
 )
-async def api_delete_agent(agent_id: int) -> None:
+async def api_delete_agent(
+    agent_id: int,
+    force: bool = Query(
+        default=False,
+        description="Also strip the agent from other agents' peer lists. A "
+        "workflow step naming it still blocks the delete.",
+    ),
+) -> None:
+    """Delete an agent nothing depends on.
+
+    409 while an enabled agent lists it as a peer or an enabled workflow step
+    names it, because deleting anyway would break those quietly (the registry
+    logs and drops the peer tool; the workflow fails its preflight at
+    trigger time). ``?force=true`` removes the peer references in the same
+    transaction; a workflow step is never edited behind the operator's back,
+    so it has to be changed first.
+    """
     async with SessionLocal() as session:
-        ok = await delete_agent(session, agent_id)
-        if not ok:
+        row = await get_agent(session, agent_id)
+        if row is None:
             raise HTTPException(status_code=404, detail="Agent not found")
+        peers, wfs = await agent_referrers(session, row.name)
+        if wfs or (peers and not force):
+            hint = (
+                " Edit those workflow steps first."
+                if wfs
+                else " Repeat with ?force=true to remove the peer references."
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"Agent {row.name!r} is still referenced: "
+                f"{describe_referrers(peers, wfs)}.{hint}",
+            )
+        # Strip stale peer entries (including those on disabled agents) in
+        # the same transaction as the delete; delete_agent commits.
+        await rename_agent_references(session, row.name, None)
+        await delete_agent(session, agent_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1519,115 +1702,186 @@ async def api_export() -> dict[str, Any]:
         }
 
 
+def _missing_secret_errors(agent: AgentPayload, existing: Any) -> list[str]:
+    """Servers whose secret is neither in the bundle nor already stored.
+
+    ``to_export`` redacts ``client_secret``, so a bundle promoted to another
+    landscape carries none. Re-importing onto the same landscape is fine:
+    prepare_servers keeps the stored secret for a server with the same URL on
+    the same agent. Anywhere else the DB layer would refuse with a message
+    that names neither the agent nor the server; this names both.
+    """
+    stored: dict[str, dict[str, Any]] = {}
+    if existing is not None:
+        for s in existing.mcp_servers:
+            if isinstance(s.get("oauth"), dict):
+                stored[s["url"]] = s["oauth"]
+    errors: list[str] = []
+    for server in agent.mcp_servers:
+        if server.auth_mode not in (AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY):
+            continue
+        cfg = server.oauth.to_config() if server.oauth else {}
+        if cfg.get("dcr") or cfg.get("client_secret"):
+            continue
+        if (stored.get(server.url) or {}).get("client_secret"):
+            continue
+        errors.append(
+            f"Agent '{agent.name}': server {server.url} ({server.auth_mode}) has "
+            "no oauth.client_secret. Exports redact secrets, so add it to the "
+            "bundle or save this server once in the admin UI before importing."
+        )
+    return errors
+
+
 @router.post("/api/import", dependencies=[Depends(require_admin)])
 async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
+    """Import a bundle as one transaction.
+
+    Every write below flushes rather than commits; the single commit at the
+    end happens only when nothing was rejected, so a 422 leaves the database
+    exactly as it was -- no half-imported agents and no skipped ``replace``
+    deletions. Errors are collected across the whole bundle rather than
+    stopping at the first, so the operator fixes them in one round.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    removed = removed_skills = removed_workflows = 0
     async with SessionLocal() as session:
-        if payload.orchestrator_instructions:
-            await set_orchestrator_instructions(session, payload.orchestrator_instructions)
+        try:
+            existing_agents = {r.name: r for r in await list_agents(session)}
+            imported_names = {a.name for a in payload.agents}
+            # Agents a replace import removes: they neither count as
+            # delegation-tool collisions nor as referrers of what remains.
+            doomed = set(existing_agents) - imported_names if payload.replace else set()
 
-        # Skills first, so imported agents can reference them.
-        imported_skill_names = set()
-        for skill in payload.skills:
-            await upsert_skill(
-                session,
-                name=skill.name,
-                description=skill.description,
-                content=skill.content,
-            )
-            imported_skill_names.add(skill.name)
-
-        imported_names = set()
-        warnings: list[str] = []
-        for agent in payload.agents:
-            try:
-                # run_as_principal is deliberately not carried by exports
-                # (it is a landscape-specific service identity), and is
-                # therefore omitted here so upsert_agent preserves whatever
-                # this landscape already has rather than wiping it.
-                # peers/model_name use the same KEEP semantics via _or_keep:
-                # a bundle exported before those fields existed carries
-                # neither key, and must not wipe what is configured here.
-                await upsert_agent(
-                    session,
-                    name=agent.name,
-                    description=agent.description,
-                    instructions=agent.instructions,
-                    mcp_servers=agent.to_servers_list(),
-                    skills=agent.skills,
-                    peers=_or_keep(agent.peers),
-                    enabled=agent.enabled,
-                    expose_chat=agent.expose_chat,
-                    expose_api=agent.expose_api,
-                    api_slug=agent.api_slug,
-                    run_prompt=agent.run_prompt,
-                    run_timeout_seconds=agent.run_timeout_seconds,
-                    model_name=_or_keep(agent.model_name),
+            if payload.orchestrator_instructions:
+                await set_orchestrator_instructions(
+                    session, payload.orchestrator_instructions, commit=False
                 )
-            except ValueError as e:
-                raise HTTPException(
-                    status_code=422, detail=f"Agent '{agent.name}': {e}"
-                ) from e
-            note = _unknown_model_note(agent.name, agent.model_name)
-            if note:
-                warnings.append(note)
-            imported_names.add(agent.name)
 
-        # Workflows last: validate_workflow_parts resolves every step's agent
-        # by name against the enabled agents in this session, so the agents
-        # above must already be in place.
-        imported_workflow_names = set()
-        for workflow in payload.workflows:
-            try:
-                # run_as_principal omitted for the same reason as the agents
-                # above: exports do not carry it, and passing the payload's
-                # default "" would wipe this landscape's service identity.
-                await upsert_workflow(
+            # Skills first, so imported agents can reference them.
+            imported_skill_names = set()
+            for skill in payload.skills:
+                await upsert_skill(
                     session,
-                    name=workflow.name,
-                    description=workflow.description,
-                    api_slug=workflow.api_slug,
-                    run_timeout_seconds=workflow.run_timeout_seconds,
-                    skip_seen_items=workflow.skip_seen_items,
-                    max_parallel_items=workflow.max_parallel_items,
-                    on_unknown_branch=workflow.on_unknown_branch,
-                    enabled=workflow.enabled,
-                    branches=[b.model_dump() for b in workflow.branches],
-                    steps=[s.model_dump() for s in workflow.steps],
+                    name=skill.name,
+                    description=skill.description,
+                    content=skill.content,
+                    commit=False,
                 )
-            except ValueError as e:
-                raise HTTPException(
-                    status_code=422, detail=f"Workflow '{workflow.name}': {e}"
-                ) from e
-            imported_workflow_names.add(workflow.name)
+                imported_skill_names.add(skill.name)
 
-        removed = 0
-        removed_skills = 0
-        removed_workflows = 0
-        if payload.replace:
-            existing = await list_agents(session)
-            for row in existing:
-                if row.name not in imported_names:
-                    await session.delete(row)
+            for agent in payload.agents:
+                secret_errors = _missing_secret_errors(agent, existing_agents.get(agent.name))
+                if secret_errors:
+                    errors.extend(secret_errors)
+                    continue
+                try:
+                    # run_as_principal is deliberately not carried by exports
+                    # (it is a landscape-specific service identity), and is
+                    # therefore omitted here so upsert_agent preserves whatever
+                    # this landscape already has rather than wiping it.
+                    # peers/model_name use the same KEEP semantics via _or_keep:
+                    # a bundle exported before those fields existed carries
+                    # neither key, and must not wipe what is configured here.
+                    await upsert_agent(
+                        session,
+                        name=agent.name,
+                        description=agent.description,
+                        instructions=agent.instructions,
+                        mcp_servers=agent.to_servers_list(),
+                        skills=agent.skills,
+                        peers=_or_keep(agent.peers),
+                        enabled=agent.enabled,
+                        expose_chat=agent.expose_chat,
+                        expose_api=agent.expose_api,
+                        api_slug=agent.api_slug,
+                        run_prompt=agent.run_prompt,
+                        run_timeout_seconds=agent.run_timeout_seconds,
+                        model_name=_or_keep(agent.model_name),
+                        commit=False,
+                        ignore_collisions_with=doomed,
+                    )
+                except ValueError as e:
+                    errors.append(f"Agent '{agent.name}': {e}")
+                    continue
+                note = _unknown_model_note(agent.name, agent.model_name)
+                if note:
+                    warnings.append(note)
+
+            # Workflows last: validate_workflow_parts resolves every step's
+            # agent by name against the enabled agents in this session, so
+            # the agents above must already be in place.
+            imported_workflow_names = set()
+            for workflow in payload.workflows:
+                try:
+                    # run_as_principal omitted for the same reason as the
+                    # agents above: exports do not carry it, and passing the
+                    # payload's default "" would wipe this landscape's
+                    # service identity.
+                    await upsert_workflow(
+                        session,
+                        name=workflow.name,
+                        description=workflow.description,
+                        api_slug=workflow.api_slug,
+                        run_timeout_seconds=workflow.run_timeout_seconds,
+                        skip_seen_items=workflow.skip_seen_items,
+                        max_parallel_items=workflow.max_parallel_items,
+                        on_unknown_branch=workflow.on_unknown_branch,
+                        enabled=workflow.enabled,
+                        branches=[b.model_dump() for b in workflow.branches],
+                        steps=[s.model_dump() for s in workflow.steps],
+                        commit=False,
+                    )
+                except ValueError as e:
+                    errors.append(f"Workflow '{workflow.name}': {e}")
+                    continue
+                imported_workflow_names.add(workflow.name)
+
+            if payload.replace:
+                # Workflows go first so a removed workflow's steps no longer
+                # count as referrers of an agent removed below. Only a bundle
+                # that carries a workflows section may remove the ones it
+                # does not name.
+                if payload.workflows:
+                    for wrow in await list_workflows(session):
+                        if wrow.name not in imported_workflow_names:
+                            # delete_workflow, not session.delete: the branch
+                            # and step rows are not ORM-related to the
+                            # workflow and would otherwise be orphaned.
+                            await delete_workflow(session, wrow.id, commit=False)
+                            removed_workflows += 1
+                for name in sorted(doomed):
+                    peers, wfs = await agent_referrers(
+                        session, name, exclude_agent_names=doomed
+                    )
+                    if peers or wfs:
+                        errors.append(
+                            f"Agent '{name}' cannot be removed by replace: it is "
+                            f"{describe_referrers(peers, wfs)}"
+                        )
+                        continue
+                    await session.delete(existing_agents[name])
                     removed += 1
-            # Replace applies to skills only when the import carries a skills
-            # section, so older exports (without one) don't wipe the library.
-            if payload.skills:
-                for srow in await list_skills(session):
-                    if srow.name not in imported_skill_names:
-                        await rename_skill_references(session, srow.name, None)
-                        await session.delete(srow)
-                        removed_skills += 1
-            # Same rule for workflows: only a bundle that actually carries a
-            # workflows section may remove the ones it does not name.
-            if payload.workflows:
-                for wrow in await list_workflows(session):
-                    if wrow.name not in imported_workflow_names:
-                        # delete_workflow, not session.delete: the branch and
-                        # step rows are not ORM-related to the workflow and
-                        # would otherwise be orphaned.
-                        await delete_workflow(session, wrow.id)
-                        removed_workflows += 1
+                # Replace applies to skills only when the import carries a
+                # skills section, so older exports (without one) don't wipe
+                # the library.
+                if payload.skills:
+                    for srow in await list_skills(session):
+                        if srow.name not in imported_skill_names:
+                            await rename_skill_references(session, srow.name, None)
+                            await session.delete(srow)
+                            removed_skills += 1
+
+            if errors:
+                await session.rollback()
+                raise HTTPException(status_code=422, detail="\n".join(errors))
             await session.commit()
+        except HTTPException:
+            raise
+        except Exception:
+            await session.rollback()
+            raise
 
     return {
         "status": "imported",
@@ -1662,8 +1916,15 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             logger.exception("Failed to read seed file %s", seed_path)
             return
 
+        # One transaction, committed only once an agent has actually seeded.
+        # Committing the orchestrator instructions (or skills) alone would
+        # leave a half-seeded database that still counts as empty by the
+        # rule above, so the next start would seed on top of it -- and if
+        # every agent is rejected there is nothing worth keeping anyway.
         if "orchestrator_instructions" in data and data["orchestrator_instructions"]:
-            await set_orchestrator_instructions(session, data["orchestrator_instructions"])
+            await set_orchestrator_instructions(
+                session, data["orchestrator_instructions"], commit=False
+            )
 
         # Skills first, so seeded agents can reference them.
         skill_count = 0
@@ -1678,6 +1939,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                 name=skill.name,
                 description=skill.description,
                 content=skill.content,
+                commit=False,
             )
             skill_count += 1
 
@@ -1706,11 +1968,20 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     run_prompt=payload.run_prompt,
                     run_timeout_seconds=payload.run_timeout_seconds,
                     model_name=_or_keep(payload.model_name),
+                    commit=False,
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
                 continue
             count += 1
+
+        if count == 0:
+            await session.rollback()
+            logger.warning(
+                "No agent from %s could be seeded; nothing was written, so the "
+                "seed is retried on the next start", seed_path,
+            )
+            return
 
         # Workflows last: every step names an agent that must already exist
         # and be enabled, or validate_workflow_parts rejects the definition.
@@ -1737,11 +2008,13 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     enabled=wpayload.enabled,
                     branches=[b.model_dump() for b in wpayload.branches],
                     steps=[s.model_dump() for s in wpayload.steps],
+                    commit=False,
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed workflow %r: %s",
                                entry.get("name"), e)
                 continue
             workflow_count += 1
+        await session.commit()
         logger.info("Seeded %d skills, %d agents and %d workflows from %s",
                     skill_count, count, workflow_count, seed_path)

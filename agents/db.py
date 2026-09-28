@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import ssl
 import uuid
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from typing import Any
 
 from sqlalchemy import (
     DateTime,
+    Index,
     Integer,
     String,
     Text,
@@ -196,7 +198,18 @@ class Base(DeclarativeBase):
 
 class AgentConfig(Base):
     __tablename__ = "agent_configs"
-    __table_args__ = (UniqueConstraint("name", name="uq_agent_configs_name"),)
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_agent_configs_name"),
+        # Partial: many agents have no slug, and NULLs must not collide. The
+        # check in upsert_agent stays as the friendly 422; this closes the
+        # check-then-write race that could otherwise yield two rows for one
+        # slug and a MultipleResultsFound 500 on the scheduler endpoint.
+        Index(
+            "uq_agent_configs_api_slug", "api_slug", unique=True,
+            postgresql_where=text("api_slug IS NOT NULL"),
+            sqlite_where=text("api_slug IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -232,8 +245,9 @@ class AgentConfig(Base):
     expose_api: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
-    # URL segment for POST /api/agents/{api_slug}/run. Uniqueness is enforced
-    # in upsert_agent, not by a DB constraint (see plan Global Constraints).
+    # URL segment for POST /api/agents/{api_slug}/run. Uniqueness is checked
+    # in upsert_agent (for the readable error) and enforced by the partial
+    # unique index in __table_args__ (for the race).
     api_slug: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Identity API-triggered runs bind via run_as(). No interactive user
     # exists at 03:00, so this names the technical account whose stored
@@ -454,7 +468,14 @@ class Workflow(Base):
     """
 
     __tablename__ = "workflows"
-    __table_args__ = (UniqueConstraint("name", name="uq_workflows_name"),)
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_workflows_name"),
+        Index(
+            "uq_workflows_api_slug", "api_slug", unique=True,
+            postgresql_where=text("api_slug IS NOT NULL"),
+            sqlite_where=text("api_slug IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -918,6 +939,10 @@ async def init_db() -> None:
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
         )
+        # create_all only creates indexes together with a new table; an
+        # existing deployment needs them added here.
+        await _ensure_index(conn, "uq_agent_configs_api_slug", "agent_configs", "api_slug")
+        await _ensure_index(conn, "uq_workflows_api_slug", "workflows", "api_slug")
 
     async with SessionLocal() as session:
         existing = await session.get(OrchestratorConfig, 1)
@@ -951,6 +976,28 @@ async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> None:
             logger.exception("Failed to add %s column to %s", column, table)
 
 
+async def _ensure_index(conn, name: str, table: str, column: str) -> None:
+    """Idempotently add the partial unique index on a nullable slug column.
+
+    ``CREATE UNIQUE INDEX IF NOT EXISTS ... WHERE col IS NOT NULL`` is the
+    same statement on SQLite and Postgres. A pre-existing duplicate makes the
+    statement fail; that is logged rather than raised, because refusing to
+    start would take the whole app down over two rows an operator can fix in
+    the admin UI (get_agent_by_slug tolerates the duplicate meanwhile).
+    """
+    try:
+        await conn.execute(text(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({column}) "
+            f"WHERE {column} IS NOT NULL"
+        ))
+    except Exception:
+        logger.warning(
+            "Could not create index %s on %s(%s); duplicate slugs may exist. "
+            "Fix them in the admin UI and restart.",
+            name, table, column, exc_info=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # CRUD helpers
 # ---------------------------------------------------------------------------
@@ -969,10 +1016,89 @@ async def get_agent_by_name(session: AsyncSession, name: str) -> AgentConfig | N
 
 
 async def get_agent_by_slug(session: AsyncSession, slug: str) -> AgentConfig | None:
+    # first(), not scalar_one_or_none(): a database from before the partial
+    # unique index may still hold two rows for one slug, and the scheduler
+    # endpoint must not 500 on that. The lowest id wins, deterministically.
     result = await session.execute(
-        select(AgentConfig).where(AgentConfig.api_slug == slug)
+        select(AgentConfig).where(AgentConfig.api_slug == slug).order_by(AgentConfig.id)
     )
-    return result.scalar_one_or_none()
+    rows = list(result.scalars().all())
+    if len(rows) > 1:
+        logger.warning(
+            "api_slug %r is used by %d agents (%s); using %r. Give the others "
+            "a different slug.",
+            slug, len(rows), ", ".join(r.name for r in rows), rows[0].name,
+        )
+    return rows[0] if rows else None
+
+
+# What POST /api/agents/{api_slug}/run accepts as a path segment. Lower-case
+# so a slug is typed the same way it is stored; no `/`, so it cannot be a
+# segment nobody can route to.
+API_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+
+def validate_api_slug(slug: str | None) -> str | None:
+    """Return the trimmed slug (None when blank); ValueError when malformed."""
+    text_ = (slug or "").strip()
+    if not text_:
+        return None
+    if not API_SLUG_RE.match(text_):
+        raise ValueError(
+            f"api_slug {text_!r} is invalid: use lower-case letters, digits and "
+            "hyphens, starting with a letter or digit (max 64 characters)"
+        )
+    return text_
+
+
+# `delegate_` plus the slug has to fit OpenAI/Azure's 64-character function
+# name limit; agent names may be 64 characters themselves.
+_DELEGATION_TOOL_PREFIX = "delegate_"
+_DELEGATION_SLUG_MAX = 64 - len(_DELEGATION_TOOL_PREFIX)
+_TOOL_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
+
+
+def delegation_tool_name(name: str) -> str:
+    """The delegation tool an agent of this name registers on its callers.
+
+    Lives here rather than in the registry because the save path has to know
+    it: two enabled agents whose names sanitize to the same tool ("Foo Bar"
+    and "foo_bar") make pydantic-ai refuse the duplicate tool at build time,
+    which freezes the registry on the last good build. Truncation is
+    deterministic so the collision check sees exactly the name the build
+    will use.
+    """
+    slug = _TOOL_NAME_RE.sub("_", name.strip().lower())
+    slug = re.sub(r"_+", "_", slug).strip("_")
+    slug = slug[:_DELEGATION_SLUG_MAX].rstrip("_")
+    return f"{_DELEGATION_TOOL_PREFIX}{slug}" if slug else f"{_DELEGATION_TOOL_PREFIX}agent"
+
+
+async def check_delegation_name_collision(
+    session: AsyncSession,
+    name: str,
+    *,
+    exclude_id: int | None = None,
+    ignore_names: set[str] | None = None,
+) -> None:
+    """ValueError when another enabled agent maps to the same delegation tool.
+
+    ``exclude_id`` is the row being saved; ``ignore_names`` are agents about to
+    be removed in the same transaction (a replace import), which cannot
+    collide with anything once it commits.
+    """
+    tool = delegation_tool_name(name)
+    for r in await list_agents(session):
+        if r.id == exclude_id or not r.enabled or r.name == name:
+            continue
+        if ignore_names and r.name in ignore_names:
+            continue
+        if delegation_tool_name(r.name) == tool:
+            raise ValueError(
+                f"name {name!r} would register the same delegation tool "
+                f"({tool}) as the enabled agent {r.name!r}; pick a name that "
+                "differs in more than case, spacing or punctuation"
+            )
 
 
 _OAUTH_KEYS = ("client_id", "client_secret", "uaa_url", "authorize_url", "token_url", "scope")
@@ -987,6 +1113,12 @@ _CC_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope", "mail
 # credentials. Scoped to that one URL so every other oauth2 server stores
 # exactly what it stored before.
 _TEAMS_OAUTH2_KEYS = ("team", "channels", "lookback")
+# builtin:outlook under oauth2 (as the signed-in user) carries the same send
+# settings as its app_only shape: `recipients` pins the audience of mail the
+# agent originates and `lookback` bounds the listing window. outlook_tools
+# reads them from the oauth block whatever the mode, so dropping them here
+# silently took the send tool away from every oauth2 Outlook agent.
+_OUTLOOK_OAUTH2_KEYS = ("lookback", "recipients")
 
 
 def _clean_client_credentials(
@@ -1131,8 +1263,13 @@ def _clean_oauth(
             cleaned[k] = str(v).strip()
     if not cleaned.get("client_secret") and fallback and fallback.get("client_secret"):
         cleaned["client_secret"] = fallback["client_secret"]
-    if str(url or "").strip().rstrip("/").lower() == "builtin:teams":
-        for k in _TEAMS_OAUTH2_KEYS:
+    builtin = str(url or "").strip().rstrip("/").lower()
+    extra_keys = {
+        "builtin:teams": _TEAMS_OAUTH2_KEYS,
+        "builtin:outlook": _OUTLOOK_OAUTH2_KEYS,
+    }.get(builtin)
+    if extra_keys:
+        for k in extra_keys:
             v = src.get(k)
             if isinstance(v, (list, tuple)):
                 v = ", ".join(str(x).strip() for x in v if str(x).strip())
@@ -1253,7 +1390,17 @@ async def upsert_agent(
     run_timeout_seconds: int = 1800,
     model_name: str | None | _Keep = KEEP,
     peers: list[str] | None | _Keep = KEEP,
+    commit: bool = True,
+    ignore_collisions_with: set[str] | None = None,
 ) -> AgentConfig:
+    """Create or update the agent named ``name``.
+
+    ``commit=False`` flushes instead, so a caller writing a whole bundle can
+    keep every row in one transaction and commit (or roll back) once.
+    ``ignore_collisions_with`` names agents that same caller is about to
+    delete, so they do not count as delegation-tool collisions.
+    """
+    name = name.strip()
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     extras_json = json.dumps(extras) if extras else None
@@ -1272,13 +1419,19 @@ async def upsert_agent(
                 cleaned_peers.append(p)
         peers_json = json.dumps(cleaned_peers) if cleaned_peers else None
 
-    slug = (api_slug or "").strip() or None
+    slug = validate_api_slug(api_slug)
     if slug:
         clash = await get_agent_by_slug(session, slug)
         if clash is not None and (existing is None or clash.id != existing.id):
             raise ValueError(f"api_slug {slug!r} is already used by agent {clash.name!r}")
     if expose_api and not slug:
         raise ValueError("expose_api requires an api_slug")
+    if enabled:
+        await check_delegation_name_collision(
+            session, name,
+            exclude_id=existing.id if existing is not None else None,
+            ignore_names=ignore_collisions_with,
+        )
 
     if existing is None:
         row = AgentConfig(
@@ -1334,7 +1487,10 @@ async def upsert_agent(
         if not isinstance(peers, _Keep):
             existing.peers_json = peers_json
         row = existing
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(row)
     return row
 
@@ -1346,6 +1502,77 @@ async def delete_agent(session: AsyncSession, agent_id: int) -> bool:
     await session.delete(row)
     await session.commit()
     return True
+
+
+async def agent_referrers(
+    session: AsyncSession,
+    name: str,
+    *,
+    exclude_agent_names: set[str] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Who depends on the agent called ``name``.
+
+    Returns ``(peer_agents, workflows)``: the enabled agents listing it as a
+    peer, and the enabled workflows with a step that names it. Both are what
+    breaks when the agent is renamed, disabled or deleted: the registry drops
+    the peer tool with only a log line, and the workflow fails its preflight
+    at trigger time. ``exclude_agent_names`` are agents leaving in the same
+    transaction (a replace import), whose peer lists no longer matter.
+    """
+    peers: list[str] = []
+    for r in await list_agents(session):
+        if r.name == name or not r.enabled:
+            continue
+        if exclude_agent_names and r.name in exclude_agent_names:
+            continue
+        if name in r.peers:
+            peers.append(r.name)
+    result = await session.execute(
+        select(Workflow.name)
+        .join(WorkflowStep, WorkflowStep.workflow_id == Workflow.id)
+        .where(WorkflowStep.agent_name == name, Workflow.enabled == 1)
+        .distinct()
+        .order_by(Workflow.name)
+    )
+    workflows = [n for (n,) in result.all()]
+    return peers, workflows
+
+
+def describe_referrers(peers: list[str], workflows: list[str]) -> str:
+    parts = []
+    if peers:
+        parts.append("peer of agent(s) " + ", ".join(repr(p) for p in peers))
+    if workflows:
+        parts.append("named by a step of workflow(s) " + ", ".join(repr(w) for w in workflows))
+    return "; ".join(parts)
+
+
+async def rename_agent_references(
+    session: AsyncSession, old_name: str, new_name: str | None
+) -> None:
+    """Update every peer list and workflow step after an agent rename.
+
+    ``new_name=None`` strips the agent from peer lists instead (the forced
+    delete); workflow steps are left alone in that case, because a step with
+    no agent is a workflow that cannot run, and the caller refuses the delete
+    while such a step exists. Caller commits, like rename_skill_references.
+    """
+    result = await session.execute(
+        select(AgentConfig).where(AgentConfig.peers_json.is_not(None))
+    )
+    for agent in result.scalars().all():
+        peers = agent.peers
+        if old_name not in peers:
+            continue
+        mapped = [new_name if p == old_name else p for p in peers]
+        deduped = list(dict.fromkeys(p for p in mapped if p and p != agent.name))
+        agent.peers_json = json.dumps(deduped) if deduped else None
+    if new_name is not None:
+        steps = await session.execute(
+            select(WorkflowStep).where(WorkflowStep.agent_name == old_name)
+        )
+        for step in steps.scalars().all():
+            step.agent_name = new_name
 
 
 # ---------------------------------------------------------------------------
@@ -1366,7 +1593,8 @@ async def get_skill_by_name(session: AsyncSession, name: str) -> SkillConfig | N
 
 
 async def upsert_skill(
-    session: AsyncSession, *, name: str, description: str, content: str
+    session: AsyncSession, *, name: str, description: str, content: str,
+    commit: bool = True,
 ) -> SkillConfig:
     row = await get_skill_by_name(session, name)
     if row is None:
@@ -1375,7 +1603,10 @@ async def upsert_skill(
     else:
         row.description = description
         row.content = content
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(row)
     return row
 
@@ -1515,8 +1746,17 @@ async def get_workflow_by_name(session: AsyncSession, name: str) -> Workflow | N
 
 
 async def get_workflow_by_slug(session: AsyncSession, slug: str) -> Workflow | None:
-    result = await session.execute(select(Workflow).where(Workflow.api_slug == slug))
-    return result.scalar_one_or_none()
+    # first(): same pre-index duplicate tolerance as get_agent_by_slug.
+    result = await session.execute(
+        select(Workflow).where(Workflow.api_slug == slug).order_by(Workflow.id)
+    )
+    rows = list(result.scalars().all())
+    if len(rows) > 1:
+        logger.warning(
+            "api_slug %r is used by %d workflows (%s); using %r.",
+            slug, len(rows), ", ".join(r.name for r in rows), rows[0].name,
+        )
+    return rows[0] if rows else None
 
 
 async def get_workflow_parts(
@@ -1554,12 +1794,14 @@ async def upsert_workflow(
     enabled: bool = True,
     branches: list[dict[str, Any]] | None = None,
     steps: list[dict[str, Any]] | None = None,
+    commit: bool = True,
 ) -> Workflow:
     """Create or replace a workflow and its parts.
 
     Branches and steps are replaced wholesale rather than diffed: a definition
     is small and edited as a unit, so reconciliation would add bugs and buy
-    nothing.
+    nothing. ``commit=False`` flushes instead, for callers writing a bundle
+    in one transaction.
     """
     branches = branches or []
     steps = steps or []
@@ -1576,7 +1818,7 @@ async def upsert_workflow(
     validate_workflow_parts(branches, steps, known_agents, enabled=enabled)
 
     existing = await get_workflow_by_name(session, name)
-    slug = (api_slug or "").strip() or None
+    slug = validate_api_slug(api_slug)
     if slug:
         clash = await get_workflow_by_slug(session, slug)
         if clash is not None and (existing is None or clash.id != existing.id):
@@ -1628,12 +1870,17 @@ async def upsert_workflow(
             fan_out=1 if s.get("fan_out") else 0,
             step_timeout_seconds=int(s.get("step_timeout_seconds") or 600),
         ))
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(row)
     return row
 
 
-async def delete_workflow(session: AsyncSession, workflow_id: int) -> bool:
+async def delete_workflow(
+    session: AsyncSession, workflow_id: int, *, commit: bool = True
+) -> bool:
     row = await session.get(Workflow, workflow_id)
     if row is None:
         return False
@@ -1644,7 +1891,10 @@ async def delete_workflow(session: AsyncSession, workflow_id: int) -> bool:
         delete(WorkflowStep).where(WorkflowStep.workflow_id == workflow_id)
     )
     await session.delete(row)
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     return True
 
 
@@ -1863,31 +2113,64 @@ async def sweep_stale_workflow_runs(
 
     A run row is the overlap lock, so a row left `running` by a hard crash
     would wedge the workflow until someone noticed.
+
+    ``all_running=True`` sweeps every running row (startup: a fresh process
+    owns none of them). Otherwise only runs older than their workflow's
+    ``run_timeout_seconds`` are swept -- a young row may be one of our own --
+    mirroring sweep_stale_runs. A run whose workflow no longer exists gets
+    the 1800s ceiling every workflow is bounded by.
     """
     result = await session.execute(
         select(WorkflowRun).where(WorkflowRun.status == ACTIVE_RUN_STATUS)
     )
-    rows = list(result.scalars().all())
-    if not all_running:
-        return len(rows)
-    for row in rows:
+    now = datetime.now(timezone.utc)
+    swept: list[WorkflowRun] = []
+    timeouts: dict[int, int] = {}
+    for row in result.scalars().all():
+        if not all_running:
+            started = row.started_at
+            if started is None:
+                continue
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if row.workflow_id not in timeouts:
+                wf = await session.get(Workflow, row.workflow_id)
+                timeouts[row.workflow_id] = (
+                    int(wf.run_timeout_seconds) if wf is not None else 1800
+                )
+            if (now - started).total_seconds() <= timeouts[row.workflow_id]:
+                continue
         row.status = "interrupted"
-        row.error = "Run was still marked running at startup; marked interrupted."
-        row.finished_at = datetime.now(timezone.utc)
+        row.error = (
+            "Run was still marked running at startup; marked interrupted."
+            if all_running
+            else "Run did not finish within its timeout (app restart or crash)."
+        )
+        row.finished_at = now
+        swept.append(row)
+    if not swept:
+        return 0
+    run_ids = [r.id for r in swept]
     items = await session.execute(
-        select(WorkflowItemRun).where(WorkflowItemRun.status == ACTIVE_RUN_STATUS)
+        select(WorkflowItemRun).where(
+            WorkflowItemRun.status == ACTIVE_RUN_STATUS,
+            WorkflowItemRun.workflow_run_id.in_(run_ids),
+        )
     )
     for item in items.scalars().all():
         item.status = "interrupted"
-        item.finished_at = datetime.now(timezone.utc)
+        item.finished_at = now
     steps = await session.execute(
-        select(WorkflowStepRun).where(WorkflowStepRun.status == ACTIVE_RUN_STATUS)
+        select(WorkflowStepRun).where(
+            WorkflowStepRun.status == ACTIVE_RUN_STATUS,
+            WorkflowStepRun.workflow_run_id.in_(run_ids),
+        )
     )
     for step in steps.scalars().all():
         step.status = "interrupted"
-        step.finished_at = datetime.now(timezone.utc)
+        step.finished_at = now
     await session.commit()
-    return len(rows)
+    return len(swept)
 
 
 async def get_orchestrator_instructions(session: AsyncSession) -> str:
@@ -1895,14 +2178,19 @@ async def get_orchestrator_instructions(session: AsyncSession) -> str:
     return row.instructions if row else DEFAULT_ORCHESTRATOR_INSTRUCTIONS
 
 
-async def set_orchestrator_instructions(session: AsyncSession, instructions: str) -> None:
+async def set_orchestrator_instructions(
+    session: AsyncSession, instructions: str, *, commit: bool = True
+) -> None:
     row = await session.get(OrchestratorConfig, 1)
     if row is None:
         row = OrchestratorConfig(id=1, instructions=instructions)
         session.add(row)
     else:
         row.instructions = instructions
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
 
 
 async def get_active_model_name(session: AsyncSession) -> str | None:

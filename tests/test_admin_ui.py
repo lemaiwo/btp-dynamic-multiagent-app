@@ -891,10 +891,14 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                              return_exceptions=True)
 
         # We need the fixture agent to survive until the DELETE call, so
-        # sort with DELETE last.
+        # sort with DELETE last -- and the agent DELETE after the workflow
+        # DELETE, because an agent a workflow step names cannot be deleted.
         def _order(item: tuple[str, str]) -> tuple[int, str, str]:
             method, path = item
-            return (1 if method == "DELETE" else 0, method, path)
+            rank = 0
+            if method == "DELETE":
+                rank = 2 if "/agents/" in path else 1
+            return (rank, method, path)
 
         for method, path in sorted(discovered, key=_order):
             test_path = path.replace("/agents/1", f"/agents/{uitest_id}")
@@ -973,6 +977,14 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                     ],
                     "replace": False,
                 }
+
+            if method == "DELETE" and "/agents/" in test_path:
+                # Deleting an agent a workflow step names is refused (409)
+                # by design, so the fixture workflows go first -- the same
+                # order an operator has to follow.
+                wr = await client.get("/admin/api/workflows")
+                for w in wr.json():
+                    await client.delete(f"/admin/api/workflows/{w['id']}")
 
             resp = await client.request(method, test_path, json=body)
             ok = resp.status_code in (200, 201, 204)

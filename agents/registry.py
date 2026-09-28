@@ -13,7 +13,7 @@ import os
 import re
 import reprlib
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 from pydantic_ai import Agent, ModelRetry, RunContext
@@ -21,6 +21,7 @@ from pydantic_ai import Agent, ModelRetry, RunContext
 from agents.db import (
     AgentConfig,
     SessionLocal,
+    delegation_tool_name,
     get_active_model_name,
     get_orchestrator_instructions,
     list_agents,
@@ -79,13 +80,14 @@ def _reentry_message(agent_name: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-_TOOL_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
-
-
 def _sanitize_tool_name(name: str) -> str:
-    slug = _TOOL_NAME_RE.sub("_", name.strip().lower())
-    slug = re.sub(r"_+", "_", slug).strip("_")
-    return f"delegate_{slug}" if slug else "delegate_agent"
+    """The delegation tool name for an agent; see agents.db.delegation_tool_name.
+
+    The mapping lives in the DB layer so the save path can refuse two enabled
+    agents that would register the same tool. This alias keeps the registry's
+    vocabulary (and its tests) unchanged.
+    """
+    return delegation_tool_name(name)
 
 
 # Tool prefixes must stay short: prefixed tool names (`{prefix}_{tool}`) have
@@ -403,12 +405,29 @@ def _attach_skills_tool(specialist: Agent, agent_name: str, attached: list[dict]
 # ---------------------------------------------------------------------------
 # Build result
 # ---------------------------------------------------------------------------
+class RunCounter:
+    """How many delegated specialist runs of one build are still executing.
+
+    Every ``PerRunMCPServer`` copy shares its build's httpx client, so the
+    build's transports may only be closed once this reaches zero -- a chat
+    turn, an A2A call or a peer chain that started on the old build would
+    otherwise fail its next tool call the moment an admin clicks Reload.
+    Mutated only from the event loop, so a plain int is enough.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = 0
+
+
 @dataclass
 class BuildResult:
     orchestrator: Agent
     specialists: dict[str, Agent]
     mcp_clients: list  # httpx.AsyncClient owned by MCP servers, for cleanup
     configs: list[dict]  # snapshot of AgentConfig.to_dict()
+    in_flight: RunCounter = field(default_factory=RunCounter)
 
 
 def _model_for(row: AgentConfig, *, default_model, default_name: str, cache: dict):
@@ -474,6 +493,7 @@ async def build_orchestrator() -> BuildResult:
     specialists: dict[str, Agent] = {}
     mcp_clients: list = []
     model_cache: dict = {}
+    in_flight = RunCounter()
 
     # Build the orchestrator instructions, listing only chat-visible specialists.
     # Run-only agents (expose_chat=False) are still built into `specialists`
@@ -599,7 +619,7 @@ async def build_orchestrator() -> BuildResult:
         # Run-only agents are built (the runner needs them) but must not be
         # reachable from chat.
         if row.expose_chat:
-            _attach_delegation_tool(orchestrator, specialist, row)
+            _attach_delegation_tool(orchestrator, specialist, row, counter=in_flight)
 
     # Second pass: attach peer delegation tools. This cannot be folded into the
     # loop above, because a peer may be built after the agent that consults it
@@ -623,18 +643,20 @@ async def build_orchestrator() -> BuildResult:
                     row.name, peer_name,
                 )
                 continue
-            _attach_delegation_tool(parent, peer_specialist, peer_row)
+            _attach_delegation_tool(parent, peer_specialist, peer_row, counter=in_flight)
 
     return BuildResult(
         orchestrator=orchestrator,
         specialists=specialists,
         mcp_clients=mcp_clients,
         configs=configs,
+        in_flight=in_flight,
     )
 
 
 def _attach_delegation_tool(
-    orchestrator: Agent, specialist: Agent, row: AgentConfig
+    orchestrator: Agent, specialist: Agent, row: AgentConfig,
+    counter: RunCounter | None = None,
 ) -> None:
     """Register a per-specialist delegation tool on the orchestrator."""
     tool_name = _sanitize_tool_name(row.name)
@@ -661,6 +683,8 @@ def _attach_delegation_tool(
             )
             return _depth_message(row.name)
         stack_token = _delegation_stack.set(stack + (row.name,))
+        if counter is not None:
+            counter.value += 1
 
         logger.info("[delegate] %s START | query=%.160s", row.name, query.replace("\n", " "))
         # Phase hint for the live "working…" heartbeat while the specialist spins
@@ -782,6 +806,8 @@ def _attach_delegation_tool(
             )
         finally:
             _delegation_stack.reset(stack_token)
+            if counter is not None:
+                counter.value -= 1
             report_delegation_end(row.name)
 
     _delegate.__name__ = tool_name
@@ -797,6 +823,10 @@ class Registry:
 
     def __init__(self) -> None:
         self._build: BuildResult | None = None
+        # Builds replaced by a reload whose MCP clients could not be closed
+        # yet because a run was still using them. Re-checked on every reload,
+        # so a build kept once is closed later rather than leaked for good.
+        self._retired: list[BuildResult] = []
         self._lock = asyncio.Lock()
 
     @property
@@ -824,39 +854,53 @@ class Registry:
                 len(new.configs),
             )
 
-            # Best-effort cleanup of the previous MCP clients — but only
-            # when nothing is still using them. An API-triggered run captured
+            # Best-effort cleanup of retired MCP clients — but only of
+            # builds nothing is still using. An API-triggered run captured
             # its specialist from the old build and may run for up to its
-            # timeout (30 min by default); closing that build's transports
-            # would kill the run mid-flight with an opaque closed-client
-            # error. Since the admin UI asks the operator to reload after
-            # every save, that is an easy accident to cause. Leaking the
-            # clients until the next reload is the cheaper failure.
+            # timeout (30 min by default), and a chat or A2A turn holds a
+            # delegation open for up to _SPECIALIST_TIMEOUT; closing that
+            # build's transports would kill the run mid-flight with an
+            # opaque closed-client error. Since the admin UI asks the
+            # operator to reload after every save, that is an easy accident
+            # to cause. A busy build stays on the retired list and is
+            # re-checked on the next reload.
             if old is not None:
-                # Deferred import: both runners import this module at load
-                # time, so a top-level import here would be circular.
-                from agents.job_runner import _tasks as in_flight_runs
-                from agents.workflow_runner import _tasks as in_flight_workflows
-
-                busy = len(in_flight_runs) + len(in_flight_workflows)
-                if busy:
-                    logger.info(
-                        "Keeping %d MCP client(s) from the previous build open: "
-                        "%d run(s) still in flight are using them.",
-                        len(old.mcp_clients), busy,
-                    )
-                else:
-                    for server in old.mcp_clients:
-                        try:
-                            client = getattr(server, "_http_client", None) or getattr(
-                                server, "http_client", None
-                            )
-                            if client is not None:
-                                await client.aclose()
-                        except Exception:
-                            logger.debug("Failed to close old MCP client", exc_info=True)
+                self._retired.append(old)
+            await self._close_idle_retired()
 
             return new
+
+    async def _close_idle_retired(self) -> None:
+        # Deferred import: both runners import this module at load time, so
+        # a top-level import here would be circular. Their task sets are
+        # global rather than per build, so while any job or workflow run is
+        # in flight every retired build is kept; the per-build counter
+        # covers chat, A2A and peer delegations.
+        from agents.job_runner import _tasks as in_flight_runs
+        from agents.workflow_runner import _tasks as in_flight_workflows
+
+        background = len(in_flight_runs) + len(in_flight_workflows)
+        still_busy: list[BuildResult] = []
+        for build in self._retired:
+            busy = background + build.in_flight.value
+            if busy:
+                logger.info(
+                    "Keeping %d MCP client(s) from a retired build open: "
+                    "%d run(s) still in flight are using them.",
+                    len(build.mcp_clients), busy,
+                )
+                still_busy.append(build)
+                continue
+            for server in build.mcp_clients:
+                try:
+                    client = getattr(server, "_http_client", None) or getattr(
+                        server, "http_client", None
+                    )
+                    if client is not None:
+                        await client.aclose()
+                except Exception:
+                    logger.debug("Failed to close old MCP client", exc_info=True)
+        self._retired = still_busy
 
 
 registry = Registry()
