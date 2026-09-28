@@ -130,3 +130,64 @@ QUnit.test("agrees with where the dialog shows the switch", function (assert) {
         assert.strictEqual(oauthConfig.keepsAllowSend(url, mode), expected, `${url} on ${mode}`);
     });
 });
+
+// --- destinations ---
+QUnit.module("oauthConfig.cleanOAuth on a destination, per built-in");
+
+QUnit.test("outlook keeps mailbox, lookback, recipients and both switches", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", "builtin:outlook") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(out).sort(),
+        ["allow_send", "destination", "lookback", "mailbox", "recipients", "user_context"]);
+    assert.strictEqual(out.user_context, true);
+    assert.notOk("client_id" in out, "a destination server stores no credential");
+    assert.notOk("project" in out, "Jira's filters are not Outlook keys");
+});
+
+QUnit.test("gmail keeps only the mailbox and the user-context switch", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", "builtin:gmail") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(out).sort(), ["destination", "mailbox", "user_context"]);
+    assert.notOk("allow_send" in out, "Gmail has no send tool to switch on");
+});
+
+QUnit.test("teams keeps its pins, and allow_send only as the signed-in user", function (assert) {
+    const app = oauthConfig.cleanOAuth(fullForm(), "destination", "builtin:teams") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(app).sort(), ["channels", "destination", "lookback", "team"]);
+    assert.notOk("allow_send" in app, "an app-level destination credential cannot post");
+    const user = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", "builtin:teams") as Record<string, unknown>;
+    assert.strictEqual(user.allow_send, true);
+    assert.strictEqual(user.user_context, true);
+});
+
+QUnit.test("sapnotes keeps its public knobs; sapnotedetail only the name", function (assert) {
+    const notes = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", "builtin:sapnotes") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(notes).sort(), ["destination", "lookback", "min_score"]);
+    assert.notOk("user_context" in notes, "NVD has no user to act as");
+    const detail = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", "builtin:sapnotedetail");
+    assert.deepEqual(detail, { destination: "DEST" });
+});
+
+QUnit.test("the switches are only ever sent as true", function (assert) {
+    const out = oauthConfig.cleanOAuth(
+        fullForm({ user_context: false, allow_send: false }), "destination", "builtin:outlook"
+    ) as Record<string, unknown>;
+    assert.notOk("user_context" in out);
+    assert.notOk("allow_send" in out);
+});
+
+QUnit.test("keepsAllowSend on a destination follows the user-context switch for Teams", function (assert) {
+    assert.strictEqual(oauthConfig.keepsAllowSend("builtin:teams", "destination", false), false);
+    assert.strictEqual(oauthConfig.keepsAllowSend("builtin:teams", "destination", true), true);
+    assert.strictEqual(oauthConfig.keepsAllowSend("builtin:outlook", "destination", false), true);
+    assert.strictEqual(oauthConfig.keepsAllowSend("builtin:gmail", "destination", true), false);
+    assert.strictEqual(oauthConfig.keepsAllowSend("builtin:slack", "destination"), true);
+});
+
+QUnit.test("supportsUserContext names the built-ins that act as a user", function (assert) {
+    ["builtin:gmail", "builtin:outlook", "builtin:teams"].forEach((url) => {
+        assert.ok(oauthConfig.supportsUserContext(url), url);
+    });
+    ["builtin:jira", "builtin:slack", "builtin:sapnotes", "builtin:sapnotedetail",
+        "https://mcp.example.hana.ondemand.com/mcp"].forEach((url) => {
+        assert.notOk(oauthConfig.supportsUserContext(url), url);
+    });
+});

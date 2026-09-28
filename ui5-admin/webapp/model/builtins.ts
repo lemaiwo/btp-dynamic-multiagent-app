@@ -22,23 +22,28 @@ export interface BuiltinToolset {
     authModes?: AuthMode[];
 }
 
+// --- destinations ---
+// Every built-in can also run through a BTP destination (`destination`): the
+// destination holds the URL and credential, and with "Act as signed-in user"
+// (`user_context`) it is resolved with the user's JWT and acts as that user.
+// See agents/destination_auth.py and the table in agents/builtins.py.
 export const BUILTINS: BuiltinToolset[] = [
     // gmail_toolset refuses app_only (Google app-only access needs domain-wide
-    // delegation) and reads nothing but a per-user token, so oauth2 is the
-    // one mode that builds -- see agents/gmail_tools.py.
+    // delegation) and reads a per-user token, or a destination -- see
+    // agents/gmail_tools.py.
     {
         url: "builtin:gmail", titleKey: "builtinGmail", descriptionKey: "builtinGmailDesc",
-        defaultAuthMode: "oauth2", authModes: ["oauth2"]
+        defaultAuthMode: "oauth2", authModes: ["oauth2", "destination"]
     },
-    // outlook_toolset builds a per-user or an app-only Graph client and
-    // nothing else -- see build_http_client in agents/outlook_tools.py.
+    // outlook_toolset builds a per-user, an app-only or a destination-backed
+    // Graph client -- see build_http_client in agents/outlook_tools.py.
     {
         url: "builtin:outlook", titleKey: "builtinOutlook", descriptionKey: "builtinOutlookDesc",
-        defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only"]
+        defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only", "destination"]
     },
     {
         url: "builtin:teams", titleKey: "builtinTeams", descriptionKey: "builtinTeamsDesc",
-        defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only"]
+        defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only", "destination"]
     },
     {
         url: "builtin:slack", titleKey: "builtinSlack", descriptionKey: "builtinSlackDesc",
@@ -48,17 +53,28 @@ export const BUILTINS: BuiltinToolset[] = [
         url: "builtin:jira", titleKey: "builtinJira", descriptionKey: "builtinJiraDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },
-    // NVD is public: sapnotes_toolset ignores auth_mode and its config block
-    // is the credential-free `none` shape (min_score, lookback) only.
+    // NVD is public: sapnotes_toolset's config block is the credential-free
+    // `none` shape (min_score, lookback); a destination only adds a proxy URL
+    // and an apiKey header.
     {
         url: "builtin:sapnotes", titleKey: "builtinSapNotes", descriptionKey: "builtinSapNotesDesc",
-        defaultAuthMode: "none", authModes: ["none"]
+        defaultAuthMode: "none", authModes: ["none", "destination"]
     },
+    // The session cookie is stored here (`session`) or carried by a
+    // destination as URL.headers.Cookie (`destination`).
     {
         url: "builtin:sapnotedetail", titleKey: "builtinSapNoteDetail", descriptionKey: "builtinSapNoteDetailDesc",
-        defaultAuthMode: "session", authModes: ["session"]
+        defaultAuthMode: "session", authModes: ["session", "destination"]
     }
 ];
+
+/** Built-ins whose destination may act as the signed-in user. Mirrors
+ * `_DEST_USER_CONTEXT_URLS` in agents/db.py. */
+export const DESTINATION_USER_CONTEXT_URLS = ["builtin:gmail", "builtin:outlook", "builtin:teams"];
+
+/** Built-ins that read a mailbox and therefore need one named when the
+ * destination's credential is app-level (no user context). */
+export const DESTINATION_MAILBOX_URLS = ["builtin:gmail", "builtin:outlook"];
 
 /** Every auth mode, in the order the dialog lists them. */
 export const ALL_AUTH_MODES: AuthMode[] = ["jwt", "none", "oauth2", "app_only", "destination", "session"];

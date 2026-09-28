@@ -30,11 +30,22 @@ QUnit.test("a remote server is offered neither destination nor session", functio
 QUnit.test("restricted built-ins offer only what the server accepts", function (assert) {
     assert.deepEqual(authModesFor("builtin:jira"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:slack"), ["destination"]);
-    assert.deepEqual(authModesFor("builtin:sapnotedetail"), ["session"]);
-    assert.deepEqual(authModesFor("builtin:teams"), ["oauth2", "app_only"]);
-    assert.deepEqual(authModesFor("builtin:gmail"), ["oauth2"]);
-    assert.deepEqual(authModesFor("builtin:outlook"), ["oauth2", "app_only"]);
-    assert.deepEqual(authModesFor("builtin:sapnotes"), ["none"]);
+    assert.deepEqual(authModesFor("builtin:sapnotedetail"), ["session", "destination"]);
+    assert.deepEqual(authModesFor("builtin:teams"), ["oauth2", "app_only", "destination"]);
+    assert.deepEqual(authModesFor("builtin:gmail"), ["oauth2", "destination"]);
+    assert.deepEqual(authModesFor("builtin:outlook"), ["oauth2", "app_only", "destination"]);
+    assert.deepEqual(authModesFor("builtin:sapnotes"), ["none", "destination"]);
+});
+
+// --- destinations ---
+QUnit.test("every built-in can run through a BTP destination", function (assert) {
+    BUILTINS.forEach((b) => {
+        assert.ok(authModesFor(b.url).indexOf("destination") > -1, `${b.url} offers destination`);
+    });
+    // The default stays what it was: a destination is an option, not the
+    // first thing an admin is steered to.
+    assert.strictEqual(findBuiltin("builtin:outlook")?.defaultAuthMode, "oauth2");
+    assert.strictEqual(findBuiltin("builtin:sapnotes")?.defaultAuthMode, "none");
 });
 
 QUnit.test("every built-in restricts its auth modes to what its factory builds", function (assert) {
