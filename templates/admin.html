@@ -133,6 +133,12 @@
         fieldset.exposure legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
         fieldset.exposure label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
         fieldset.exposure label input[type="checkbox"] { margin-right: 6px; font-weight: normal; }
+        /* --- deep agents --- collapsible section in the agent form */
+        details.deep { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; grid-column: 1 / -1; }
+        details.deep summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+        details.deep label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
+        details.deep label input[type="checkbox"] { margin-right: 6px; }
+        details.deep .deep-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
         .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
         .tab-btn {
             background: none; color: var(--muted); border: none; border-bottom: 2px solid transparent;
@@ -368,6 +374,33 @@
                     <option value="">Use the active model</option>
                 </select>
             </label>
+            <!-- --- deep agents --- -->
+            <details class="deep" id="agent-deep-section">
+                <summary>Deep agent <span style="color:var(--muted);font-weight:normal">(optional — planning tool, per-run scratchpad and ephemeral sub-agents)</span></summary>
+                <label><input type="checkbox" id="agent-deep-enabled" onchange="updateDeepHint()"> Enable deep-agent tools for this specialist</label>
+                <p class="hint" id="agent-deep-hint">
+                    The specialist is told to plan first, keep long intermediate results in a scratchpad
+                    that lives only for the run, and hand isolated sub-tasks to ephemeral sub-agents that
+                    get the same MCP servers and built-ins. Sub-agents are not specialists: the orchestrator
+                    and peers never see them.
+                </p>
+                <div class="deep-grid">
+                    <label><input type="checkbox" id="agent-deep-planning" checked> Planning (<code>write_todos</code>, <code>read_todos</code>)</label>
+                    <label><input type="checkbox" id="agent-deep-scratchpad" checked> Scratchpad (<code>ls</code>, <code>read_file</code>, <code>write_file</code>, <code>edit_file</code>)</label>
+                    <label><input type="checkbox" id="agent-deep-subagents" checked> Sub-agents (<code>task</code>)</label>
+                    <span></span>
+                    <label>Max concurrent sub-agents
+                        <input type="number" id="agent-deep-max-subagents" value="5" min="1" max="20">
+                    </label>
+                    <label>Max sub-agent depth <span style="color:var(--muted);font-weight:normal">(1 = sub-agents cannot spawn their own)</span>
+                        <input type="number" id="agent-deep-max-depth" value="1" min="1" max="3">
+                    </label>
+                </div>
+                <label>Sub-agent instructions <span style="color:var(--muted);font-weight:normal">(optional — replaces the default sub-agent system prompt)</span>
+                    <textarea id="agent-deep-instructions" rows="3"
+                              placeholder="You are a sub-agent. Complete the task and return a concise result…"></textarea>
+                </label>
+            </details>
             <label class="full">
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
@@ -802,6 +835,52 @@ function collectAgentPeers() {
         .map(cb => cb.value);
 }
 
+// --- deep agents ------------------------------------------------------------
+// Mirrors agents.deep.DeepConfig; the server validates the ranges again.
+const DEEP_DEFAULTS = {
+    enabled: false, planning: true, scratchpad: true, subagents: true,
+    max_subagents: 5, subagent_max_depth: 1, subagent_instructions: '',
+};
+
+function setDeepForm(deep) {
+    const d = Object.assign({}, DEEP_DEFAULTS, deep || {});
+    document.getElementById('agent-deep-enabled').checked = !!d.enabled;
+    document.getElementById('agent-deep-planning').checked = !!d.planning;
+    document.getElementById('agent-deep-scratchpad').checked = !!d.scratchpad;
+    document.getElementById('agent-deep-subagents').checked = !!d.subagents;
+    document.getElementById('agent-deep-max-subagents').value = d.max_subagents;
+    document.getElementById('agent-deep-max-depth').value = d.subagent_max_depth;
+    document.getElementById('agent-deep-instructions').value = d.subagent_instructions || '';
+    // Open the section when it is in use, so an enabled config is visible at a glance.
+    document.getElementById('agent-deep-section').open = !!d.enabled;
+    updateDeepHint();
+}
+
+function clampInt(value, min, max, fallback) {
+    const n = parseInt(value, 10);
+    if (Number.isNaN(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+function collectDeep() {
+    return {
+        enabled: document.getElementById('agent-deep-enabled').checked,
+        planning: document.getElementById('agent-deep-planning').checked,
+        scratchpad: document.getElementById('agent-deep-scratchpad').checked,
+        subagents: document.getElementById('agent-deep-subagents').checked,
+        max_subagents: clampInt(document.getElementById('agent-deep-max-subagents').value, 1, 20, 5),
+        subagent_max_depth: clampInt(document.getElementById('agent-deep-max-depth').value, 1, 3, 1),
+        subagent_instructions: document.getElementById('agent-deep-instructions').value.trim(),
+    };
+}
+
+function updateDeepHint() {
+    const on = document.getElementById('agent-deep-enabled').checked;
+    ['agent-deep-planning', 'agent-deep-scratchpad', 'agent-deep-subagents',
+     'agent-deep-max-subagents', 'agent-deep-max-depth', 'agent-deep-instructions']
+        .forEach(id => { document.getElementById(id).disabled = !on; });
+}
+
 async function renderAgentModelOptions(selected) {
     const sel = document.getElementById('agent-model-name');
     const res = await api('/model');
@@ -1216,6 +1295,7 @@ async function openAgentModal() {
     renderAgentSkillChecks([]);
     renderAgentPeerChecks([], '');
     await renderAgentModelOptions('');
+    setDeepForm(null);
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-expose-api').checked = false;
@@ -1345,6 +1425,7 @@ async function editAgent(id) {
     renderAgentSkillChecks(a.skills || []);
     renderAgentPeerChecks(a.peers || [], a.name);
     await renderAgentModelOptions(a.model_name || '');
+    setDeepForm(a.deep || null);
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
@@ -1372,6 +1453,7 @@ async function saveAgent() {
         skills: collectAgentSkills(),
         peers: collectAgentPeers(),
         model_name: document.getElementById('agent-model-name').value,
+        deep: collectDeep(),
         enabled: document.getElementById('agent-enabled').checked,
         expose_chat: document.getElementById('agent-expose-chat').checked,
         expose_api: document.getElementById('agent-expose-api').checked,

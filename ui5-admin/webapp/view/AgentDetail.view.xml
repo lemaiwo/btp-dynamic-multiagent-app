@@ -118,6 +118,63 @@
                     </Select>
                 </Panel>
 
+                <!-- deep agents -->
+                <Panel id="deepPanel" headerText="{i18n>deepPanel}" expandable="true"
+                       expanded="true" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>deepHint}" class="sapUiTinyMarginBottom" />
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>deepEnabled}" />
+                        <Switch id="agentDeepEnabled" state="{agent>/data/deep/enabled}" />
+
+                        <Label text="" />
+                        <VBox>
+                            <CheckBox id="agentDeepPlanning" text="{i18n>deepPlanning}"
+                                      selected="{agent>/data/deep/planning}"
+                                      enabled="{agent>/data/deep/enabled}" />
+                            <CheckBox id="agentDeepScratchpad" text="{i18n>deepScratchpad}"
+                                      selected="{agent>/data/deep/scratchpad}"
+                                      enabled="{agent>/data/deep/enabled}" />
+                            <CheckBox id="agentDeepSubagents" text="{i18n>deepSubagents}"
+                                      selected="{agent>/data/deep/subagents}"
+                                      enabled="{agent>/data/deep/enabled}" />
+                        </VBox>
+
+                        <Label text="{i18n>deepMaxSubagents}" />
+                        <StepInput
+                            id="agentDeepMaxSubagents"
+                            value="{agent>/data/deep/max_subagents}"
+                            min="1"
+                            max="20"
+                            step="1"
+                            enabled="{= ${agent>/data/deep/enabled} &amp;&amp; ${agent>/data/deep/subagents} }"
+                            valueState="{agent>/errors/deep_max_subagentsState}"
+                            valueStateText="{agent>/errors/deep_max_subagents}" />
+
+                        <Label text="{i18n>deepMaxDepth}" />
+                        <VBox>
+                            <StepInput
+                                id="agentDeepMaxDepth"
+                                value="{agent>/data/deep/subagent_max_depth}"
+                                min="1"
+                                max="3"
+                                step="1"
+                                enabled="{= ${agent>/data/deep/enabled} &amp;&amp; ${agent>/data/deep/subagents} }"
+                                valueState="{agent>/errors/deep_subagent_max_depthState}"
+                                valueStateText="{agent>/errors/deep_subagent_max_depth}" />
+                            <Text text="{i18n>deepMaxDepthHint}" class="sapUiTinyMarginTop" />
+                        </VBox>
+
+                        <Label text="{i18n>deepInstructions}" />
+                        <TextArea
+                            id="agentDeepInstructions"
+                            value="{agent>/data/deep/subagent_instructions}"
+                            placeholder="{i18n>deepInstructionsPlaceholder}"
+                            enabled="{= ${agent>/data/deep/enabled} &amp;&amp; ${agent>/data/deep/subagents} }"
+                            rows="4"
+                            width="100%" />
+                    </f:SimpleForm>
+                </Panel>
+
                 <Panel headerText="{i18n>jobSettings}" expandable="false" class="sapUiSmallMarginTop">
                     <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
                         <Label text="{i18n>exposeApi}" />

@@ -141,6 +141,10 @@ export interface AgentInput {
     /** Overrides the globally-active LLM for this agent only. Blank means
      * "use the active model" (see `ModelInfo`, `GET /admin/api/model`). */
     model_name: string;
+    /** Deep-agent tools (planning, scratchpad, sub-agents). Optional on the
+     * wire: an absent key keeps what is stored, like `peers`. See the
+     * `--- deep agents ---` section at the end of this file. */
+    deep?: DeepConfig;
 }
 
 /** What GET /admin/api/agents returns. Servers are redacted. */
@@ -432,3 +436,33 @@ export interface WorkflowRunDetail {
     items: WorkflowItemRun[];
     steps: WorkflowStepRun[];
 }
+
+// --- deep agents -------------------------------------------------------------
+
+/** Mirrors `agents.deep.DeepConfig`. `GET` always returns it (defaults when
+ * nothing is stored); `POST`/`PUT` may omit it to keep the stored value. */
+export interface DeepConfig {
+    enabled: boolean;
+    /** `write_todos` / `read_todos` */
+    planning: boolean;
+    /** `ls` / `read_file` / `write_file` / `edit_file` on a per-run scratchpad */
+    scratchpad: boolean;
+    /** the `task` tool that runs an ephemeral sub-agent */
+    subagents: boolean;
+    /** 1..20 concurrent sub-agents per run */
+    max_subagents: number;
+    /** 1..3; 1 means sub-agents cannot spawn sub-agents of their own */
+    subagent_max_depth: number;
+    /** replaces the default sub-agent system prompt when non-blank */
+    subagent_instructions: string;
+}
+
+export const DEEP_DEFAULTS: Readonly<DeepConfig> = Object.freeze({
+    enabled: false,
+    planning: true,
+    scratchpad: true,
+    subagents: true,
+    max_subagents: 5,
+    subagent_max_depth: 1,
+    subagent_instructions: ""
+});

@@ -1221,6 +1221,41 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 f"{field}: not found as an object key in saveAgent()",
             )
 
+        # --- deep agents ---
+        # Same contract for `deep`: the backend keeps the stored config when
+        # the key is absent, so the HTML admin must always send the object,
+        # or unticking "enable" could never reach the server.
+        print("\n== deep agent section: controls and save contract ==")
+        for fid in ("agent-deep-enabled", "agent-deep-planning", "agent-deep-scratchpad",
+                    "agent-deep-subagents", "agent-deep-max-subagents",
+                    "agent-deep-max-depth", "agent-deep-instructions"):
+            found = any(
+                e[1].get("id") == fid for e in coll.elements
+                if e[0] in ("input", "textarea", "select")
+            )
+            check(f"deep form field #{fid}", found)
+        check("deep section is collapsible (<details>)",
+              any(e[0] == "details" and e[1].get("id") == "agent-deep-section"
+                  for e in coll.elements))
+        for fid, lo, hi in (("agent-deep-max-subagents", "1", "20"),
+                            ("agent-deep-max-depth", "1", "3")):
+            el = next((e for e in coll.elements
+                       if e[0] == "input" and e[1].get("id") == fid), None)
+            check(f"#{fid} is a bounded number input",
+                  el is not None and el[1].get("type") == "number"
+                  and el[1].get("min") == lo and el[1].get("max") == hi,
+                  str(el))
+        check("saveAgent() sends deep",
+              re.search(r"\bdeep\s*:", save_agent_body) is not None)
+        check("deep is collected from the form", "function collectDeep(" in js)
+        check("editAgent() fills the deep section", "setDeepForm(a.deep" in js)
+        check("openAgentModal() resets the deep section", "setDeepForm(null)" in js)
+        collect_deep_body = js[js.index("function collectDeep("):]
+        for key in ("enabled", "planning", "scratchpad", "subagents",
+                    "max_subagents", "subagent_max_depth", "subagent_instructions"):
+            check(f"collectDeep() sends {key}",
+                  re.search(rf"\b{key}\s*:", collect_deep_body) is not None)
+
         # FastAPI returns `detail` as a plain string for the HTTPExceptions we
         # raise, but as a list of {loc, msg} objects for any pydantic body
         # validation error. Concatenating that into a toast yields

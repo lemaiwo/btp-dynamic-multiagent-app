@@ -1,6 +1,7 @@
 import type {
     Agent, CredentialStatus, JobRunDetail, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
+import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext { path: string; status: number; body: unknown }
@@ -69,6 +70,13 @@ export default class FakeBackend {
         this.agents[0].peers = ["gmail-agent"];
         this.agents[0].model_name = "gpt-4o";
         this.agents[1].model_name = "retired-model";
+        // --- deep agents --- btp-agent carries a non-default config so a
+        // journey can check it is shown and resent unchanged; gmail-agent
+        // keeps the defaults (GET always returns the object).
+        this.agents[0].deep = {
+            enabled: true, planning: true, scratchpad: false, subagents: true,
+            max_subagents: 3, subagent_max_depth: 2, subagent_instructions: "Be brief."
+        };
         // One row per token state, so a journey can assert that the sign-in
         // button is offered for a working credential as well as a dead one.
         this.credentials = [
@@ -174,6 +182,7 @@ export default class FakeBackend {
             skills: [], enabled: true, expose_chat: true, expose_api: false,
             api_slug: "", run_as_principal: "", run_prompt: "",
             run_timeout_seconds: 1800, peers: [], model_name: "",
+            deep: { ...DEEP_DEFAULTS },
             created_at: null, updated_at: null,
             mcp_url: "", auth_mode: "jwt"
         };

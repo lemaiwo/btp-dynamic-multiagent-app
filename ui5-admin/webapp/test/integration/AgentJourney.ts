@@ -12,6 +12,8 @@ import type Select from "sap/m/Select";
 import type Table from "sap/m/Table";
 import type Text from "sap/m/Text";
 import type UI5Element from "sap/ui/core/Element";
+import type StepInput from "sap/m/StepInput";
+import type Switch from "sap/m/Switch";
 import Common, { backend } from "./pages/Common";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
@@ -258,6 +260,91 @@ opaTest("an invalid server url is refused inline and the dialog stays open", fun
         success: function (element: UI5Element) {
             const input = element as Input;
             Opa5.assert.strictEqual(input.getValueState(), "Error", "the url field is flagged");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- deep agents -------------------------------------------------------------
+// FakeBackend.reset() gives btp-agent (id 100) deep = { enabled, scratchpad
+// off, 3 sub-agents, depth 2, "Be brief." }; gmail-agent (id 101) has the
+// defaults (disabled).
+
+opaTest("the deep agent panel shows the stored config and resends it changed on save", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentDeepEnabled",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Switch).getState(), true, "the stored config is shown as enabled");
+        }
+    });
+    Then.waitFor({
+        id: "agentDeepMaxSubagents",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as StepInput).getValue(), 3, "the stored sub-agent cap is shown");
+        }
+    });
+
+    // Raise the cap through the control, then save.
+    When.waitFor({
+        id: "agentDeepMaxSubagents",
+        viewName: "AgentDetail",
+        actions: function (element: UI5Element | null) {
+            const input = element as StepInput;
+            input.setValue(4);
+            input.fireChange({ value: "4" });
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const saved = backend.agents.find((a) => a.id === 100);
+            Opa5.assert.deepEqual(
+                saved?.deep,
+                {
+                    enabled: true, planning: true, scratchpad: false, subagents: true,
+                    max_subagents: 4, subagent_max_depth: 2, subagent_instructions: "Be brief."
+                },
+                "the whole deep config reached the backend, with only the cap changed"
+            );
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("an agent without a deep config saves the defaults, not nothing", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    Then.waitFor({
+        id: "agentDeepEnabled",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Switch).getState(), false, "the panel starts disabled");
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const saved = backend.agents.find((a) => a.id === 101);
+            Opa5.assert.deepEqual(
+                saved?.deep,
+                {
+                    enabled: false, planning: true, scratchpad: true, subagents: true,
+                    max_subagents: 5, subagent_max_depth: 1, subagent_instructions: ""
+                },
+                "the defaults are sent explicitly, so the backend can tell 'off' from 'not sent'"
+            );
         }
     });
 
