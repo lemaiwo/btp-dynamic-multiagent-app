@@ -31,7 +31,11 @@ logger = logging.getLogger(__name__)
 
 BUILTIN_SAPNOTEDETAIL_URL = "builtin:sapnotedetail"
 
-DETAIL_URL = "https://me.sap.com/backend/raw/sapnotes/Detail"
+DETAIL_HOST = "me.sap.com"
+DETAIL_PATH = "/backend/raw/sapnotes/Detail"
+DETAIL_URL = f"https://{DETAIL_HOST}{DETAIL_PATH}"
+
+AUTH_MODE_DESTINATION = "destination"
 
 DEFAULT_MAX_CONCURRENCY = 5
 
@@ -167,10 +171,14 @@ class SapNoteDetailClient:
         cookie: str | Callable[[], Awaitable[str]] = "",
         *,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        url: str = DETAIL_URL,
     ) -> None:
         self._http = http
         self._cookie = cookie
         self.max_concurrency = max(1, int(max_concurrency))
+        # me.sap.com's endpoint, or the placeholder a destination-backed
+        # client rewrites onto the destination's URL.
+        self._url = url
 
     async def _cookie_header(self) -> str:
         value = self._cookie
@@ -187,7 +195,7 @@ class SapNoteDetailClient:
             raise SessionExpired(f"note {note}: no session cookie is stored")
         try:
             r = await self._http.get(
-                DETAIL_URL,
+                self._url,
                 params={"q": note, "t": "E"},
                 headers={"Cookie": cookie, "Accept": "application/json"},
                 follow_redirects=False,
@@ -267,6 +275,7 @@ def sapnotedetail_toolset(
     cookie: str | None = None,
     server_key: str = BUILTIN_SAPNOTEDETAIL_URL,
     auth_mode: str | None = None,
+    resolver: Any = None,
 ) -> FunctionToolset:
     """The note-detail toolset for one agent.
 
@@ -276,7 +285,53 @@ def sapnotedetail_toolset(
     current principal's stored session at call time, because
     ``build_builtin_toolset`` has no principal to resolve one for at build
     time -- only ``(oauth, server_key, auth_mode)`` are known then.
+
+    Under ``auth_mode="destination"`` the cookie moves out of this app
+    altogether: a BTP destination (NoAuthentication, URL ``https://me.sap.com``)
+    carries it as the additional property ``URL.headers.Cookie``, and the
+    destination's owner refreshes it there instead of through
+    ``scripts/sap_session.py``. The URL comes from the destination too, so a
+    proxy in front of me.sap.com works. ``resolver`` is the test seam for it.
     """
+    url = DETAIL_URL
+    if auth_mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import (
+            PLACEHOLDER_BASE,
+            destination_http_client,
+            resolver_for,
+        )
+
+        # The cookie is the credential, and it arrives as a static header
+        # rather than an authToken, so the resolver must not insist on one.
+        dest_resolver = resolver or resolver_for(oauth, server_key, require_credential=False)
+        url = f"{PLACEHOLDER_BASE}{DETAIL_PATH}"
+        if http is None:
+            http = destination_http_client(
+                dest_resolver,
+                expected_hosts=(DETAIL_HOST,),
+                server_key=server_key,
+                timeout=60.0,
+            )
+
+        async def _destination_cookie() -> str:
+            """The destination's ``URL.headers.Cookie``, read at call time.
+
+            Raised as SessionExpired rather than returned empty: the batch
+            already stops on that, and the message then names what to fix
+            (the destination property) instead of the token store nobody
+            writes in this mode.
+            """
+            destination = await dest_resolver.resolve()
+            for key, value in destination.headers.items():
+                if key.lower() == "cookie" and value.strip():
+                    return value.strip()
+            raise SessionExpired(
+                f"destination {dest_resolver.name!r} carries no URL.headers.Cookie "
+                f"property; add one holding the me.sap.com session cookie"
+            )
+
+        if cookie is None:
+            cookie = _destination_cookie  # type: ignore[assignment]
     session = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0))
 
     async def _stored_cookie() -> str:
@@ -292,7 +347,9 @@ def sapnotedetail_toolset(
             row = await get_user_token(db, who, server_key)
         return (row.access_token if row else "") or ""
 
-    client = SapNoteDetailClient(session, cookie if cookie is not None else _stored_cookie)
+    client = SapNoteDetailClient(
+        session, cookie if cookie is not None else _stored_cookie, url=url
+    )
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.
     toolset.http_client = session  # type: ignore[attr-defined]

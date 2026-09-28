@@ -25,9 +25,10 @@ import base64
 import hashlib
 import logging
 import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlencode, urlparse
 
 import httpx
@@ -366,16 +367,27 @@ async def resolve_config(server_key: str, spec_oauth: dict[str, Any] | None) -> 
     return Oauth2Config.from_spec(spec)
 
 
-# Serialize concurrent refreshes for the same (user, server).
-_refresh_locks: dict[str, asyncio.Lock] = {}
+# Serialize concurrent refreshes for the same (user, server). Each entry is
+# (lock, holders): the count of coroutines inside `_lock_for` for that key,
+# waiting or holding. The last one out drops the entry, so the table is
+# bounded by concurrency rather than by the number of users ever seen.
+_refresh_locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
 
-def _lock_for(key: str) -> asyncio.Lock:
-    lock = _refresh_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _refresh_locks[key] = lock
-    return lock
+@asynccontextmanager
+async def _lock_for(key: str) -> AsyncIterator[None]:
+    entry = _refresh_locks.get(key)
+    lock = entry[0] if entry else asyncio.Lock()
+    _refresh_locks[key] = (lock, (entry[1] if entry else 0) + 1)
+    try:
+        async with lock:
+            yield
+    finally:
+        lock, holders = _refresh_locks[key]
+        if holders <= 1:
+            del _refresh_locks[key]
+        else:
+            _refresh_locks[key] = (lock, holders - 1)
 
 
 # ---------------------------------------------------------------------------

@@ -212,7 +212,15 @@ def test_toolset_refuses_misconfiguration():
             {"team": TEAM, "allow_send": True}, http=graph.client(), auth_mode="app_only"
         )
     with pytest.raises(ValueError, match="supports auth_mode"):
-        teams_toolset({"team": TEAM}, http=graph.client(), auth_mode="destination")
+        teams_toolset({"team": TEAM}, http=graph.client(), auth_mode="jwt")
+    # Through a destination without user context the credential is an
+    # application token, and Graph refuses application posts -- same rule as
+    # app_only, said at build time.
+    with pytest.raises(ValueError, match="without user context"):
+        teams_toolset(
+            {"team": TEAM, "allow_send": True, "destination": "D"},
+            http=graph.client(), auth_mode="destination",
+        )
 
 
 def test_teams_is_a_known_builtin():
@@ -289,3 +297,45 @@ def test_other_oauth2_servers_store_what_they_did_before():
         "oauth2", None, url="https://mcp.example.com/mcp",
     )
     assert "team" not in stored and "lookback" not in stored and "allow_send" not in stored
+
+
+def test_channel_cache_is_per_principal_and_refreshes_on_a_miss():
+    from agents.auth import current_principal
+
+    fetches: list[str | None] = []
+    extra: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/channels"):
+            fetches.append(current_principal.get())
+            return httpx.Response(200, json={"value": CHANNELS["value"] + extra})
+        return httpx.Response(200, json={"value": []})
+
+    client = TeamsClient(httpx.AsyncClient(
+        base_url="https://graph.microsoft.com", transport=httpx.MockTransport(handler)), TEAM)
+
+    async def as_user(user: str, coro_fn):
+        token = current_principal.set(user)
+        try:
+            return await coro_fn()
+        finally:
+            current_principal.reset(token)
+
+    run(as_user("ann@example.com", lambda: client._channel_id("Support")))
+    run(as_user("ann@example.com", lambda: client._channel_id("General")))
+    run(as_user("bob@example.com", lambda: client._channel_id("Support")))
+    assert fetches == ["ann@example.com", "bob@example.com"]
+
+    extra.append({"id": "19:new@thread.tacv2", "displayName": "New", "description": ""})
+    found = run(as_user("ann@example.com", lambda: client._channel_id("New")))
+    assert found == "19:new@thread.tacv2"
+    assert fetches.count("ann@example.com") == 2
+    with pytest.raises(ValueError, match="no channel 'Nope'"):
+        run(as_user("ann@example.com", lambda: client._channel_id("Nope")))
+    assert fetches.count("ann@example.com") == 3
+
+
+def test_allow_send_must_be_the_boolean_true():
+    for junk in ("true", "yes", 1):
+        toolset = teams_toolset({"team": TEAM, "allow_send": junk}, http=Graph().client())
+        assert _tool_names(toolset) == {"list_channels", "list_messages", "get_thread"}, junk

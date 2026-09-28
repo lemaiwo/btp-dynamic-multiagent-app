@@ -40,6 +40,7 @@ from typing import Any
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
+from agents.http_retry import retry_once
 from agents.lookback import parse_lookback
 
 __all__ = ["slack_toolset", "SlackClient", "SlackError", "BUILTIN_SLACK_URL"]
@@ -141,7 +142,12 @@ class SlackClient:
         status code alone says little. An auth error re-resolves the
         destination once, as ``JiraClient`` does on a 401.
         """
-        response = await self._send(method, params, body)
+        # One retry on 429, waiting what Retry-After asks (bounded). Slack's
+        # tier-3 methods allow ~50 calls a minute and users.info is called
+        # per message, so a listing can cross that on its own.
+        response = await retry_once(
+            lambda: self._send(method, params, body), what=f"Slack {method}"
+        )
         if response.status_code == 429:
             raise SlackError(
                 f"{method}: rate limited by Slack; retry after "

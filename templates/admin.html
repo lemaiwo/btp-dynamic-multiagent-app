@@ -133,6 +133,12 @@
         fieldset.exposure legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
         fieldset.exposure label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
         fieldset.exposure label input[type="checkbox"] { margin-right: 6px; font-weight: normal; }
+        /* --- deep agents --- collapsible section in the agent form */
+        details.deep { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; grid-column: 1 / -1; }
+        details.deep summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+        details.deep label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
+        details.deep label input[type="checkbox"] { margin-right: 6px; }
+        details.deep .deep-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
         .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
         .tab-btn {
             background: none; color: var(--muted); border: none; border-bottom: 2px solid transparent;
@@ -331,6 +337,8 @@
     <div class="modal">
         <h3 id="modal-title">New agent</h3>
         <input type="hidden" id="agent-id">
+        <!-- where used: filled by loadAgentWhereUsed() when an existing agent is opened -->
+        <div id="agent-where-used" style="font-size:.85em;margin:-6px 0 12px"></div>
         <div class="form-grid">
             <label class="full">
                 Name
@@ -368,6 +376,33 @@
                     <option value="">Use the active model</option>
                 </select>
             </label>
+            <!-- --- deep agents --- -->
+            <details class="deep" id="agent-deep-section">
+                <summary>Deep agent <span style="color:var(--muted);font-weight:normal">(optional — planning tool, per-run scratchpad and ephemeral sub-agents)</span></summary>
+                <label><input type="checkbox" id="agent-deep-enabled" onchange="updateDeepHint()"> Enable deep-agent tools for this specialist</label>
+                <p class="hint" id="agent-deep-hint">
+                    The specialist is told to plan first, keep long intermediate results in a scratchpad
+                    that lives only for the run, and hand isolated sub-tasks to ephemeral sub-agents that
+                    get the same MCP servers and built-ins. Sub-agents are not specialists: the orchestrator
+                    and peers never see them.
+                </p>
+                <div class="deep-grid">
+                    <label><input type="checkbox" id="agent-deep-planning" checked> Planning (<code>write_todos</code>, <code>read_todos</code>)</label>
+                    <label><input type="checkbox" id="agent-deep-scratchpad" checked> Scratchpad (<code>ls</code>, <code>read_file</code>, <code>write_file</code>, <code>edit_file</code>)</label>
+                    <label><input type="checkbox" id="agent-deep-subagents" checked> Sub-agents (<code>task</code>)</label>
+                    <span></span>
+                    <label>Max concurrent sub-agents
+                        <input type="number" id="agent-deep-max-subagents" value="5" min="1" max="20">
+                    </label>
+                    <label>Max sub-agent depth <span style="color:var(--muted);font-weight:normal">(1 = sub-agents cannot spawn their own)</span>
+                        <input type="number" id="agent-deep-max-depth" value="1" min="1" max="3">
+                    </label>
+                </div>
+                <label>Sub-agent instructions <span style="color:var(--muted);font-weight:normal">(optional — replaces the default sub-agent system prompt)</span>
+                    <textarea id="agent-deep-instructions" rows="3"
+                              placeholder="You are a sub-agent. Complete the task and return a concise result…"></textarea>
+                </label>
+            </details>
             <label class="full">
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
@@ -609,11 +644,12 @@ function addMcpServerRow(server) {
     row.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px';
     row.innerHTML = `
         <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
-            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
+            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com" oninput="syncDestinationFields(this.closest('.mcp-server-row'))">
             <select class="mcp-auth-mode" onchange="toggleOauthFields(this); updateEndpointHint()">
                 <option value="jwt">JWT forward (BTP)</option>
                 <option value="oauth2">OAuth2 (per-user)</option>
                 <option value="none">None (public)</option>
+                <option value="destination">BTP destination</option>
                 <option value="session">Browser session (refreshed by hand)</option>
             </select>
             <button type="button" class="small danger" title="Remove"
@@ -660,6 +696,7 @@ function addMcpServerRow(server) {
                 <code class="oauth-redirect"></code>
             </p>
         </div>
+        ${destinationFieldsHtml()}
     `;
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
@@ -672,6 +709,7 @@ function addMcpServerRow(server) {
     const secret = row.querySelector('.oauth-client-secret');
     secret.placeholder = oauth.has_client_secret ? '•••••• (stored — leave blank to keep)' : '';
     row.querySelector('.oauth-redirect').textContent = location.origin + '/oauth/callback';
+    fillDestinationFields(row, oauth);
     container.appendChild(row);
     toggleOauthFields(row.querySelector('.mcp-auth-mode'));
     updateEndpointHint();
@@ -680,7 +718,9 @@ function addMcpServerRow(server) {
 function toggleOauthFields(select) {
     const row = select.closest('.mcp-server-row');
     row.querySelector('.mcp-oauth').style.display = select.value === 'oauth2' ? 'block' : 'none';
+    row.querySelector('.mcp-destination').style.display = select.value === 'destination' ? 'block' : 'none';
     toggleDcr(row.querySelector('.oauth-dcr'));
+    syncDestinationFields(row);
 }
 
 function toggleDcr(cb) {
@@ -712,6 +752,8 @@ function collectMcpServers() {
                 if (secret) oauth.client_secret = secret;
                 server.oauth = oauth;
             }
+        } else if (mode === 'destination') {
+            server.oauth = collectDestinationConfig(r);
         }
         out.push(server);
     });
@@ -800,6 +842,52 @@ function collectAgentPeers() {
     return Array.from(document.querySelectorAll('#agent-peers .agent-peer-check'))
         .filter(cb => cb.checked)
         .map(cb => cb.value);
+}
+
+// --- deep agents ------------------------------------------------------------
+// Mirrors agents.deep.DeepConfig; the server validates the ranges again.
+const DEEP_DEFAULTS = {
+    enabled: false, planning: true, scratchpad: true, subagents: true,
+    max_subagents: 5, subagent_max_depth: 1, subagent_instructions: '',
+};
+
+function setDeepForm(deep) {
+    const d = Object.assign({}, DEEP_DEFAULTS, deep || {});
+    document.getElementById('agent-deep-enabled').checked = !!d.enabled;
+    document.getElementById('agent-deep-planning').checked = !!d.planning;
+    document.getElementById('agent-deep-scratchpad').checked = !!d.scratchpad;
+    document.getElementById('agent-deep-subagents').checked = !!d.subagents;
+    document.getElementById('agent-deep-max-subagents').value = d.max_subagents;
+    document.getElementById('agent-deep-max-depth').value = d.subagent_max_depth;
+    document.getElementById('agent-deep-instructions').value = d.subagent_instructions || '';
+    // Open the section when it is in use, so an enabled config is visible at a glance.
+    document.getElementById('agent-deep-section').open = !!d.enabled;
+    updateDeepHint();
+}
+
+function clampInt(value, min, max, fallback) {
+    const n = parseInt(value, 10);
+    if (Number.isNaN(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+function collectDeep() {
+    return {
+        enabled: document.getElementById('agent-deep-enabled').checked,
+        planning: document.getElementById('agent-deep-planning').checked,
+        scratchpad: document.getElementById('agent-deep-scratchpad').checked,
+        subagents: document.getElementById('agent-deep-subagents').checked,
+        max_subagents: clampInt(document.getElementById('agent-deep-max-subagents').value, 1, 20, 5),
+        subagent_max_depth: clampInt(document.getElementById('agent-deep-max-depth').value, 1, 3, 1),
+        subagent_instructions: document.getElementById('agent-deep-instructions').value.trim(),
+    };
+}
+
+function updateDeepHint() {
+    const on = document.getElementById('agent-deep-enabled').checked;
+    ['agent-deep-planning', 'agent-deep-scratchpad', 'agent-deep-subagents',
+     'agent-deep-max-subagents', 'agent-deep-max-depth', 'agent-deep-instructions']
+        .forEach(id => { document.getElementById(id).disabled = !on; });
 }
 
 async function renderAgentModelOptions(selected) {
@@ -1092,6 +1180,7 @@ function addWorkflowStepRow(step) {
              style="margin:4px 0 0 136px;${isAgent ? 'display:none' : ''}">${isAgent ? '' : stepConfigEditorHtml(kind, step.config || {})}</div>
     `;
     document.getElementById('workflow-steps').appendChild(row);
+    attachStepAgentLink(row);
 }
 
 function collectWorkflowSteps() {
@@ -1307,6 +1396,9 @@ function onWorkflowStepKindChange(select) {
     show('wf-step-instructions', isAgent);
     show('wf-step-fanout-label', isAgent);
     show('wf-step-kind-hint', !isAgent);
+    // The "open agent" link (attachStepAgentLink) follows the agent select.
+    const openLink = row.querySelector('.wf-step-open-agent');
+    if (openLink) openLink.hidden = !isAgent || openLink.getAttribute('href') === '#';
     const hint = row.querySelector('.wf-step-kind-hint');
     if (hint) hint.textContent = STEP_KIND_HINTS[kind] || '';
     if (isAgent) row.querySelector('.wf-step-fanout').checked = false;
@@ -1434,7 +1526,9 @@ async function openAgentModal() {
     renderMcpServers([]);
     renderAgentSkillChecks([]);
     renderAgentPeerChecks([], '');
+    renderAgentWhereUsed(null);
     await renderAgentModelOptions('');
+    setDeepForm(null);
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-expose-api').checked = false;
@@ -1521,10 +1615,15 @@ async function refreshCredentials() {
                 // Connect button that goes nowhere is worse than showing
                 // nothing, so point at the refresh script instead.
                 + (s.login_url
-                    ? '<button type="button" class="secondary" '
-                      + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                    // data-attribute + .dataset, like the delete buttons: the
+                    // value never re-enters JS source, so nothing in a
+                    // response body can break out of a string literal.
+                    ? '<button type="button" class="secondary connect-server-btn" '
+                      + 'data-login-url="' + esc(s.login_url) + '">Connect</button>'
                     : '<span class="hint">refreshed with scripts/sap_session.py</span>')
                 + '</p>').join('');
+        box.querySelectorAll('.connect-server-btn').forEach(btn =>
+            btn.addEventListener('click', () => connectServer(btn.dataset.loginUrl)));
     } catch (e) { box.innerHTML = ''; }
 }
 
@@ -1558,7 +1657,9 @@ async function editAgent(id) {
     renderMcpServers(servers);
     renderAgentSkillChecks(a.skills || []);
     renderAgentPeerChecks(a.peers || [], a.name);
+    loadAgentWhereUsed(a.id);
     await renderAgentModelOptions(a.model_name || '');
+    setDeepForm(a.deep || null);
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
@@ -1586,6 +1687,7 @@ async function saveAgent() {
         skills: collectAgentSkills(),
         peers: collectAgentPeers(),
         model_name: document.getElementById('agent-model-name').value,
+        deep: collectDeep(),
         enabled: document.getElementById('agent-enabled').checked,
         expose_chat: document.getElementById('agent-expose-chat').checked,
         expose_api: document.getElementById('agent-expose-api').checked,
@@ -1866,6 +1968,243 @@ async function runAgentNow(agentId) {
     switchTab('runs');
 }
 
+// --- where used ---
+// Cross-links between the two editors. Both are modals over one page, so a
+// link that switched editors in place would drop whatever is half-edited in
+// the one being left. Instead every link is a deep link (`#agent=<id>`,
+// `#workflow=<id>`) opened in a new tab, and openFromHash() turns that hash
+// into the matching editor once the lists it depends on are loaded.
+function editorLink(kind, id, name, cls) {
+    return `<a href="#${kind}=${Number(id)}" target="_blank" rel="noopener" class="${cls}">${escapeHtml(name)}</a>`;
+}
+
+function renderAgentWhereUsed(data) {
+    const el = document.getElementById('agent-where-used');
+    if (!data) { el.innerHTML = ''; return; }
+    const off = ' <span class="status-badge off">disabled</span>';
+    const workflows = (data.workflows || []).map(w => {
+        const steps = (w.steps || []).map(s =>
+            `${s.branch_key ? escapeHtml(s.branch_key) : 'main'} #${Number(s.position)}`).join(', ');
+        return editorLink('workflow', w.id, w.name, 'wu-workflow') + (w.enabled ? '' : off)
+            + ` <span style="color:var(--muted)">(${steps})</span>`;
+    });
+    const peers = (data.peers || []).map(p =>
+        editorLink('agent', p.id, p.name, 'wu-peer') + (p.enabled ? '' : off));
+    if (!workflows.length && !peers.length) {
+        el.innerHTML = '<strong>Used in:</strong> <span style="color:var(--muted)">no workflow or peer agent.</span>';
+        return;
+    }
+    const parts = [];
+    if (workflows.length) parts.push('workflows ' + workflows.join(', '));
+    if (peers.length) parts.push('consulted by ' + peers.join(', '));
+    el.innerHTML = '<strong>Used in:</strong> ' + parts.join(' &middot; ');
+}
+
+async function loadAgentWhereUsed(id) {
+    renderAgentWhereUsed(null);
+    let data = null;
+    try {
+        const res = await api(`/agents/${id}/where-used`);
+        if (res.ok) data = await res.json();
+    } catch (e) { /* reported below */ }
+    // Opening another agent while this request was in flight: its answer is
+    // not about the agent now in the form.
+    if (String(document.getElementById('agent-id').value) !== String(id)) return;
+    if (!data) { toast('Failed to load where this agent is used', 'error'); return; }
+    renderAgentWhereUsed(data);
+}
+
+// The "open" link after a step row's agent select, kept pointing at whichever
+// agent the select currently names, hidden while it names none (or one that
+// no longer exists -- see the missingAgent option in addWorkflowStepRow).
+function attachStepAgentLink(row) {
+    const select = row.querySelector('.wf-step-agent');
+    if (!select) return;
+    const link = document.createElement('a');
+    link.className = 'wf-step-open-agent';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.title = 'Open this agent in the agent editor (new tab)';
+    link.style.cssText = 'flex:0 0 auto;align-self:center;font-size:.85em;white-space:nowrap';
+    link.textContent = 'open';
+    const sync = () => {
+        const agent = allAgents.find(a => a.name === select.value);
+        // --- step kinds --- a non-agent row (condition/transform/http/python)
+        // has its agent select hidden, and the link goes with it.
+        const kindSelect = row.querySelector('.wf-step-kind');
+        const isAgent = !kindSelect || kindSelect.value === 'agent';
+        link.hidden = !agent || !isAgent;
+        link.href = agent ? `#agent=${Number(agent.id)}` : '#';
+    };
+    select.addEventListener('change', sync);
+    const kindSelect = row.querySelector('.wf-step-kind');
+    if (kindSelect) kindSelect.addEventListener('change', sync);
+    sync();
+    select.insertAdjacentElement('afterend', link);
+}
+
+function openFromHash() {
+    const match = /^#(agent|workflow)=(\d+)$/.exec(window.location.hash || '');
+    if (!match) return Promise.resolve();
+    // editAgent/editWorkflow read allAgents/allSkills/allWorkflows for their
+    // checkbox and dropdown lists; opened before those are in, the form would
+    // show the agent with no peers ticked and save it that way.
+    return Promise.all([loadSkills(), loadAgents(), loadWorkflows()]).then(() =>
+        match[1] === 'agent' ? editAgent(Number(match[2])) : editWorkflow(Number(match[2])));
+}
+
+// --- destinations ------------------------------------------------------------
+// A server on auth mode "BTP destination" stores no credential here: the
+// destination holds the target's URL and credential. The config block is the
+// destination's name, whether to resolve it as the signed-in user
+// (`user_context`, mail and Teams only), and the built-in's own pinned keys.
+// Mirrors `_DEST_KEYS`, `_SLACK_DEST_KEYS` and `_DEST_KEYS_BY_URL` in
+// agents/db.py: a field shown here and not listed there is dropped on save.
+const DESTINATION_FIELDS = {
+    'builtin:jira':          ['project', 'status', 'labels', 'api_base', 'lookback', 'allow_comment'],
+    'builtin:slack':         ['channels', 'lookback', 'allow_send'],
+    'builtin:gmail':         ['user_context', 'mailbox'],
+    'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send'],
+    'builtin:teams':         ['user_context', 'team', 'channels', 'lookback', 'allow_send'],
+    'builtin:sapnotes':      ['min_score', 'lookback'],
+    'builtin:sapnotedetail': [],
+};
+// Text fields, in the order they appear; the two switches are checkboxes.
+const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients',
+    'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
+
+function destinationFieldsHtml() {
+    return `
+        <div class="mcp-destination" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+            <div class="form-grid">
+                <label class="full">Destination name
+                    <input type="text" class="dest-destination" placeholder="MY_DESTINATION">
+                </label>
+                <label class="full dest-field-user_context" style="font-weight:600">
+                    <input type="checkbox" class="dest-user_context" onchange="syncDestinationFields(this.closest('.mcp-server-row'))">
+                    Act as signed-in user
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        Resolve the destination with the user's token (OAuth2UserTokenExchange,
+                        OAuth2JWTBearer, OAuth2SAMLBearerAssertion) and act as that user.
+                        Off means the destination's own app-level credential; scheduled runs need it off.
+                    </span>
+                </label>
+                <label class="dest-field-mailbox">Mailbox
+                    <input type="text" class="dest-mailbox" placeholder="service.mailbox@example.com">
+                </label>
+                <label class="dest-field-team">Team ID
+                    <input type="text" class="dest-team" placeholder="the team's group ID">
+                </label>
+                <label class="dest-field-channels">Channels
+                    <input type="text" class="dest-channels" placeholder="comma-separated; blank means all">
+                </label>
+                <label class="full dest-field-recipients">Recipients
+                    <input type="text" class="dest-recipients" placeholder="team@example.com, basis@example.com">
+                </label>
+                <label class="dest-field-lookback">Look back
+                    <input type="text" class="dest-lookback" placeholder="e.g. 5h, 2d, 1w">
+                </label>
+                <label class="dest-field-project">Project
+                    <input type="text" class="dest-project" placeholder="ABC">
+                </label>
+                <label class="dest-field-status">Status
+                    <input type="text" class="dest-status" placeholder="Open, In Progress">
+                </label>
+                <label class="dest-field-labels">Labels
+                    <input type="text" class="dest-labels" placeholder="comma-separated; ALL must match">
+                </label>
+                <label class="dest-field-api_base">API base path
+                    <input type="text" class="dest-api_base" placeholder="blank means /rest/api/2">
+                </label>
+                <label class="dest-field-min_score">Minimum CVSS score
+                    <input type="text" class="dest-min_score" placeholder="9.0">
+                </label>
+                <label class="full dest-field-allow_send">
+                    <input type="checkbox" class="dest-allow_send"> Allow sending / posting
+                </label>
+                <label class="full dest-field-allow_comment">
+                    <input type="checkbox" class="dest-allow_comment"> Allow commenting
+                </label>
+            </div>
+            <p class="hint dest-hint" style="margin:8px 0 0"></p>
+        </div>
+    `;
+}
+
+function destinationBuiltinOf(row) {
+    return row.querySelector('.mcp-url').value.trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function fillDestinationFields(row, oauth) {
+    oauth = oauth || {};
+    DESTINATION_TEXT_KEYS.forEach(k => {
+        const el = row.querySelector('.dest-' + k);
+        if (el) el.value = oauth[k] == null ? '' : String(oauth[k]);
+    });
+    row.querySelector('.dest-user_context').checked = oauth.user_context === true;
+    row.querySelector('.dest-allow_send').checked = oauth.allow_send === true;
+    row.querySelector('.dest-allow_comment').checked = oauth.allow_comment === true;
+}
+
+/** Shows the fields the current built-in stores on a destination. */
+function syncDestinationFields(row) {
+    const box = row.querySelector('.mcp-destination');
+    if (!box) return;
+    const builtin = destinationBuiltinOf(row);
+    const known = Object.prototype.hasOwnProperty.call(DESTINATION_FIELDS, builtin);
+    const wanted = known ? DESTINATION_FIELDS[builtin] : [];
+    const userContext = row.querySelector('.dest-user_context').checked;
+    box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
+        const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
+        let show = wanted.includes(key);
+        // A destination resolved as the user reads /me: no mailbox to name.
+        if (key === 'mailbox' && userContext) show = false;
+        // Graph refuses application posts, so Teams posts only as the user.
+        if (key === 'allow_send' && builtin === 'builtin:teams' && !userContext) show = false;
+        label.style.display = show ? '' : 'none';
+    });
+    let hint = '';
+    if (!known) {
+        hint = 'A destination works with built-in toolsets only (builtin:gmail, builtin:outlook, '
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:sapnotes, builtin:sapnotedetail).';
+    } else if (builtin === 'builtin:sapnotedetail') {
+        hint = 'The me.sap.com session cookie is read from the destination\'s URL.headers.Cookie property.';
+    } else if (builtin === 'builtin:sapnotes') {
+        hint = 'The destination names NVD or a proxy (NoAuthentication); URL.headers.apiKey carries the API key.';
+    } else if (wanted.includes('user_context')) {
+        hint = userContext
+            ? 'The destination\'s Authentication must be a user-propagating type (OAuth2UserTokenExchange, OAuth2JWTBearer, OAuth2SAMLBearerAssertion).'
+            : 'The destination holds an app-level credential (OAuth2ClientCredentials or a static URL.headers.Authorization).';
+    }
+    row.querySelector('.dest-hint').textContent = hint;
+}
+
+/** The config block for a destination server, shaped as the API stores it. */
+function collectDestinationConfig(row) {
+    const builtin = destinationBuiltinOf(row);
+    const wanted = DESTINATION_FIELDS[builtin] || [];
+    const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
+    DESTINATION_TEXT_KEYS.forEach(k => {
+        if (k === 'destination' || !wanted.includes(k)) return;
+        const v = row.querySelector('.dest-' + k).value.trim();
+        if (v) oauth[k] = v;
+    });
+    const userContext = wanted.includes('user_context') && row.querySelector('.dest-user_context').checked;
+    if (userContext) {
+        oauth.user_context = true;
+        delete oauth.mailbox;
+    }
+    // Only ever sent as true, so a stored config gains no field it never asked for.
+    if (wanted.includes('allow_send') && row.querySelector('.dest-allow_send').checked
+        && !(builtin === 'builtin:teams' && !userContext)) {
+        oauth.allow_send = true;
+    }
+    if (wanted.includes('allow_comment') && row.querySelector('.dest-allow_comment').checked) {
+        oauth.allow_comment = true;
+    }
+    return oauth;
+}
+
 loadSkills();
 loadAgents();
 loadWhoami();
@@ -1873,6 +2212,7 @@ loadOrchestrator();
 loadModel();
 loadWorkflows();
 loadWorkflowRuns();
+openFromHash();
 </script>
 </body>
 </html>

@@ -4,7 +4,7 @@ metadata:
 type: application
 framework:
   name: SAPUI5
-  version: "1.120.20"
+  version: "1.120.50"
   libraries:
     - name: sap.m
     - name: sap.ui.core
@@ -43,7 +43,9 @@ builder:
   # `.sapTntNL` after 1.120, and the deployed admin's side navigation collapsed
   # into an unstyled bulleted list. Keep the framework out of the bundle and let
   # the version-pinned /resources/ route in xs-app.json supply all of it.
-  # Guarded by tests/test_ui5_asset_versioning.mjs.
+  # Nothing guards this automatically: keep `resolve: false` and the framework
+  # `version` above equal to the one served by the /resources/ route in
+  # xs-app.json (and approuter/xs-app.json) whenever either changes.
   bundles:
     - bundleDefinition:
         name: com/agent/admin/Component-preload.js

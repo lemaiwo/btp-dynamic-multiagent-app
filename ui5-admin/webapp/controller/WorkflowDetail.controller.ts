@@ -15,6 +15,8 @@ import { validateWorkflowSteps } from "../model/validators";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
+import type ProcessFlowNode from "sap/suite/ui/commons/ProcessFlowNode";
+import type { FlowNode } from "../model/processFlowGraph";
 import type {
     Agent, WorkflowBranch, WorkflowInput, WorkflowStep
 } from "../service/types";
@@ -617,6 +619,75 @@ export default class WorkflowDetail extends BaseController {
     public endpointHint(apiSlug: string): string {
         const slug = (apiSlug || "").trim() || this.text("apiSlugPlaceholder");
         return this.text("apiSlugRunHint", [slug]);
+    }
+
+    // --- where used ---
+
+    /** The link text on a step row: "Open <agent>", blank while the row
+     * names no agent (the link is hidden then anyway). */
+    public openStepAgentText(agentName: string): string {
+        return agentName ? this.text("openStepAgent", [agentName]) : "";
+    }
+
+    public onOpenStepAgent(event: Event): void {
+        const step = (event.getSource() as Control)
+            .getBindingContext("workflow")?.getObject() as WorkflowStep | undefined;
+        void this.openAgentByName(step?.agent_name ?? "");
+    }
+
+    /**
+     * A click on a preview node opens its agent.
+     *
+     * The runtime hands the pressed `ProcessFlowNode` itself as the event's
+     * parameter object (`fireNodePress(this)` in ProcessFlowNode's click
+     * handler), and that control is bound to the `FlowNode` it was drawn
+     * from. The node is matched back to a step by group and position -- the
+     * same recomputed positions `refreshFlow` drew it with -- rather than by
+     * its title, which is a display string ("(no agent)" for an empty row).
+     */
+    public onFlowNodePress(event: Event): void {
+        const node = event.getParameters() as unknown as ProcessFlowNode | undefined;
+        const flowNode = node?.getBindingContext?.("flow")?.getObject() as FlowNode | undefined;
+        if (!flowNode) {
+            return;
+        }
+        const data = (this.getModel("workflow") as JSONModel).getProperty("/data") as UiWorkflowData;
+        const step = WorkflowDetail.collectSteps(data.steps).find(
+            (s) => s.branch_key === flowNode.branchKey && s.position === flowNode.position
+        );
+        void this.openAgentByName(step?.agent_name ?? "");
+    }
+
+    /**
+     * Resolves an agent name to its id through the list the step selects
+     * already use, refetching once in case the agent was created after this
+     * page loaded, then navigates to it. A name that still matches nothing
+     * is a step the server will refuse to save; say so instead of opening
+     * a blank page.
+     */
+    private async openAgentByName(name: string): Promise<void> {
+        if (!name) {
+            return;
+        }
+        const model = this.getModel("workflow") as JSONModel;
+        let agents = model.getProperty("/availableAgents") as Agent[];
+        let match = agents.find((a) => a.name === name);
+        if (!match) {
+            const fresh = await this.run(
+                this.getAdminService().listAgents(),
+                this.text("workflowLoadAgentsFailed")
+            );
+            if (fresh) {
+                agents = fresh;
+                model.setProperty("/availableAgents", agents);
+                match = agents.find((a) => a.name === name);
+            }
+        }
+        if (!match) {
+            MessageToast.show(this.text("stepAgentNotFound", [name]));
+            return;
+        }
+        this.getRouter().navTo("agentDetail", { agentId: String(match.id) });
     }
 
     // text(key) is inherited from BaseController -- do not redeclare it.

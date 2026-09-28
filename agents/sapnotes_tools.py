@@ -19,21 +19,28 @@ Two things this module does NOT do, both deliberate:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
+from agents.http_retry import retry_once
 from agents.lookback import parse_lookback
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_SAPNOTES_URL = "builtin:sapnotes"
 
-NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_HOST = "services.nvd.nist.gov"
+NVD_PATH = "/rest/json/cves/2.0"
+NVD_URL = f"https://{NVD_HOST}{NVD_PATH}"
+
+AUTH_MODE_DESTINATION = "destination"
 
 # Pinned, never configurable. This is the definition of "an SAP-assigned
 # CVE", not a preference -- a different value makes the toolset meaningless,
@@ -41,9 +48,20 @@ NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 SAP_CNA_SOURCE = "cna@sap.com"
 
 DEFAULT_MIN_SCORE = 9.0
-# NVD's own ceiling for this endpoint. The full SAP set is ~1696 records, so
-# one request covers it.
+# NVD's own ceiling for one page of this endpoint. The SAP set is ~1700
+# records today, so one page usually covers it -- but the walk reads
+# ``totalResults`` and pages with ``startIndex`` rather than assuming so.
 NVD_MAX_PAGE = 2000
+# A hard stop on the page walk, well past anything the SAP set can need, so a
+# server that misreports totalResults cannot keep the tool polling forever.
+NVD_MAX_PAGES = 50
+# NVD asks for 6 seconds between requests without an API key (5 per 30s).
+# 0.6s between pages is what its own best-practice page recommends as the
+# pause; the single retry below waits the full window.
+NVD_PAGE_DELAY_SECONDS = 0.6
+NVD_RATE_LIMIT_BACKOFF_SECONDS = 6.0
+# NVD answers a blown rate limit with 403, not only 429.
+NVD_RETRY_STATUSES = (403, 429)
 DEFAULT_MAX_NOTES = 500
 
 # Both URL forms SAP has used. The 6-digit floor rejects incidental numbers
@@ -102,6 +120,11 @@ class SapNotesClient:
     HotNews. ``lookback_minutes`` is an optional ceiling and is normally
     unset -- see the module docstring for why a publication window loses
     notes.
+
+    Every page of the result set is read: NVD caps a page at 2000 records and
+    ``totalResults`` says how many there are, so the client walks
+    ``startIndex`` until the two meet. ``sleep`` is injectable so tests do not
+    wait out the inter-page pause NVD asks for.
     """
 
     def __init__(
@@ -109,15 +132,22 @@ class SapNotesClient:
         http: httpx.AsyncClient,
         min_score: float = DEFAULT_MIN_SCORE,
         lookback_minutes: int | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        url: str = NVD_URL,
     ) -> None:
         self._http = http
         self.min_score = float(min_score)
         self.lookback_minutes = lookback_minutes
+        self._sleep = sleep
+        # NVD's endpoint, or the placeholder a destination-backed client
+        # rewrites onto the destination's URL (agents/destination_auth.py).
+        self._url = url
 
-    def _params(self, limit: int) -> dict[str, Any]:
+    def _params(self, start_index: int = 0) -> dict[str, Any]:
         params: dict[str, Any] = {
             "sourceIdentifier": SAP_CNA_SOURCE,
-            "resultsPerPage": min(max(limit, 1), NVD_MAX_PAGE),
+            "resultsPerPage": NVD_MAX_PAGE,
+            "startIndex": max(0, int(start_index)),
         }
         if self.lookback_minutes:
             # Imported here so the module has no import-time clock dependency.
@@ -130,12 +160,42 @@ class SapNotesClient:
             params["pubEndDate"] = end.strftime(fmt)
         return params
 
+    async def _fetch_page(self, start_index: int, headers: dict[str, str]) -> dict[str, Any]:
+        """One page, with a single retry when NVD says "not now".
+
+        NVD answers a blown rate limit with 403 (and sometimes 429). One
+        retry after the header's wait, or the documented 6s window, covers
+        the ordinary case; a second refusal is reported as what it is rather
+        than as an opaque HTTP error.
+        """
+        params = self._params(start_index)
+        response = await retry_once(
+            lambda: self._http.get(self._url, params=params, headers=headers),
+            statuses=NVD_RETRY_STATUSES,
+            backoff=NVD_RATE_LIMIT_BACKOFF_SECONDS,
+            what="NVD",
+            sleep=self._sleep,
+        )
+        if response.status_code in NVD_RETRY_STATUSES:
+            hint = "" if headers.get("apiKey") else (
+                " Set NVD_API_KEY to raise the limit from 5 to 50 requests per "
+                "30 seconds."
+            )
+            raise RuntimeError(
+                f"NVD refused the request twice with HTTP {response.status_code} "
+                f"(rate limited); try again in a minute.{hint}"
+            )
+        response.raise_for_status()
+        return response.json()
+
     async def list_critical_notes(self, limit: int = DEFAULT_MAX_NOTES) -> dict[str, Any]:
         """Notes at or above the score threshold, highest score first.
 
         Returns the notes plus counts of what was skipped. The counts are
         part of the contract, not diagnostics: a digest that silently drops
-        records reads as complete when it is not.
+        records reads as complete when it is not. ``limit`` applies to the
+        *filtered* notes; every record NVD holds is scanned, and
+        ``total_scanned`` / ``truncated`` say so.
         """
         headers = {}
         api_key = os.environ.get("NVD_API_KEY", "").strip()
@@ -143,43 +203,69 @@ class SapNotesClient:
             # Raises the anonymous rate limit from 5 to 50 requests/30s.
             headers["apiKey"] = api_key
 
-        response = await self._http.get(NVD_URL, params=self._params(limit), headers=headers)
-        response.raise_for_status()
-        payload = response.json()
-
         by_note: dict[str, dict[str, Any]] = {}
         skipped_no_score = 0
         skipped_no_note = 0
+        scanned = 0
+        pages = 0
+        start_index = 0
+        total_results = 0
 
-        for item in payload.get("vulnerabilities") or []:
-            cve = (item or {}).get("cve") or {}
-            score = extract_score(cve.get("metrics"))
-            if score is None:
-                skipped_no_score += 1
-                continue
-            if score < self.min_score:
-                continue
-            note = extract_note_number(cve.get("references"))
-            if not note:
-                skipped_no_note += 1
-                continue
-            entry = {
-                "note": note,
-                "cve": str(cve.get("id") or ""),
-                "score": score,
-                "published": str(cve.get("published") or "")[:10],
-                "description": extract_description(cve.get("descriptions")),
-            }
-            # One note can carry several CVEs. Keep the worst score: the
-            # digest ranks by severity and the lower one would understate it.
-            existing = by_note.get(note)
-            if existing is None or score > existing["score"]:
-                by_note[note] = entry
+        while True:
+            payload = await self._fetch_page(start_index, headers)
+            pages += 1
+            records = payload.get("vulnerabilities") or []
+            try:
+                total_results = int(payload.get("totalResults") or 0)
+            except (TypeError, ValueError):
+                total_results = 0
+
+            for item in records:
+                scanned += 1
+                cve = (item or {}).get("cve") or {}
+                score = extract_score(cve.get("metrics"))
+                if score is None:
+                    skipped_no_score += 1
+                    continue
+                if score < self.min_score:
+                    continue
+                note = extract_note_number(cve.get("references"))
+                if not note:
+                    skipped_no_note += 1
+                    continue
+                entry = {
+                    "note": note,
+                    "cve": str(cve.get("id") or ""),
+                    "score": score,
+                    "published": str(cve.get("published") or "")[:10],
+                    "description": extract_description(cve.get("descriptions")),
+                }
+                # One note can carry several CVEs. Keep the worst score: the
+                # digest ranks by severity and the lower one would understate it.
+                existing = by_note.get(note)
+                if existing is None or score > existing["score"]:
+                    by_note[note] = entry
+
+            # An empty page ends the walk whatever totalResults says, so a
+            # server that ignores startIndex cannot loop this forever: the
+            # index still advances by what came back, and an empty page or a
+            # page count past the theoretical maximum stops it.
+            start_index += len(records)
+            if not records or start_index >= total_results or pages >= NVD_MAX_PAGES:
+                break
+            await self._sleep(NVD_PAGE_DELAY_SECONDS)
 
         notes = sorted(by_note.values(), key=lambda n: (-n["score"], n["note"]))
+        cap = max(1, int(limit or DEFAULT_MAX_NOTES))
+        truncated = len(notes) > cap
         return {
-            "notes": notes,
-            "count": len(notes),
+            "notes": notes[:cap],
+            "count": min(len(notes), cap),
+            "matching": len(notes),
+            "truncated": truncated,
+            "total_scanned": scanned,
+            "total_results": total_results,
+            "pages": pages,
             "min_score": self.min_score,
             "skipped_no_score": skipped_no_score,
             "skipped_no_note": skipped_no_note,
@@ -198,10 +284,14 @@ def sapnotes_toolset(
     """The SAP notes toolset for one agent, ready for ``Agent(toolsets=...)``.
 
     ``server_key`` and ``auth_mode`` come from
-    :func:`agents.builtins.build_builtin_toolset` in production; ``auth_mode``
-    is accepted and ignored because NVD is public and there is no caller
-    identity to act as. The rest default to the matching values in ``oauth``
-    and are overridable so tests can set them without a config block.
+    :func:`agents.builtins.build_builtin_toolset` in production. NVD is public
+    and there is no caller identity to act as, so ``none`` is the default and
+    every other mode is treated the same -- except ``destination``, which
+    routes the calls through a BTP destination: its URL (NVD itself, or a
+    proxy in front of it) replaces the host, and a ``URL.headers.apiKey``
+    property carries the API key in place of ``NVD_API_KEY``. The rest default
+    to the matching values in ``oauth`` and are overridable so tests can set
+    them without a config block.
     """
     raw_score = min_score if min_score is not None else oauth.get("min_score")
     try:
@@ -217,8 +307,28 @@ def sapnotes_toolset(
     # message rather than surfacing mid-run as an empty note list.
     window = parse_lookback(lookback if lookback is not None else oauth.get("lookback"))
 
+    url = NVD_URL
+    if auth_mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import (
+            PLACEHOLDER_BASE,
+            destination_http_client,
+            resolver_for,
+        )
+
+        # No credential is required of the destination: NVD answers anonymous
+        # calls, and the destination may exist only to name a proxy.
+        url = f"{PLACEHOLDER_BASE}{NVD_PATH}"
+        if http is None:
+            http = destination_http_client(
+                resolver_for(oauth, server_key, require_credential=False),
+                expected_hosts=(NVD_HOST,),
+                server_key=server_key,
+                timeout=60.0,
+            )
     session = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0))
-    client = SapNotesClient(session, min_score=resolved_score, lookback_minutes=window)
+    client = SapNotesClient(
+        session, min_score=resolved_score, lookback_minutes=window, url=url
+    )
     toolset = FunctionToolset()
     # Exposed for `agents.registry`, which closes `http_client` on the old
     # build's servers after a reload.
@@ -233,12 +343,14 @@ def sapnotes_toolset(
         later patch days without the underlying CVE being re-published, so a
         month-scoped list silently misses them.
 
-        The result carries `skipped_no_score` and `skipped_no_note` counts.
+        Every record NVD holds is scanned (`total_scanned`); `limit` caps only
+        the matching notes returned, and `truncated` says whether it did. The
+        result also carries `skipped_no_score` and `skipped_no_note` counts.
         Report them; they are the difference between "no other notes exist"
         and "some could not be read".
 
         Args:
-            limit: Maximum notes to return.
+            limit: Maximum matching notes to return.
         """
         return await client.list_critical_notes(limit)
 

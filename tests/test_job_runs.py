@@ -273,6 +273,83 @@ async def main() -> None:
         check("no credential fails fast", r.status == "failed")
         check("re-authorization message", "re-author" in (r.error or "").lower())
 
+    print("\n== runner: credential pre-flight walks the peer graph ==")
+    # A peer whose token was revoked does not fail the delegation: _delegate
+    # returns the sign-in prompt as its answer and the model writes a report
+    # around it. So the peer must be checked before the run, like the
+    # workflow runner already did.
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="Peer Tool", description="d", instructions="i",
+            mcp_servers=SERVERS, run_as_principal="svc@example.com",
+        )
+        await upsert_agent(
+            s, name="Daily Check", description="d", instructions="i",
+            mcp_servers=SERVERS, expose_chat=False, expose_api=True,
+            api_slug="daily-check", run_as_principal="svc@example.com",
+            run_prompt="Run the daily check.", run_timeout_seconds=900,
+            peers=["Peer Tool"],
+        )
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good),
+                                  "Peer Tool": _FakeSpecialist(good)})
+    job_runner._has_usable_credentials = (
+        lambda agent, principal=None: asyncio.sleep(0, result=agent.name != "Peer Tool")
+    )
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_peer = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_peer, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_peer)
+        check("a peer without credentials fails the run", r.status == "failed", r.status)
+        check("the error names the peer", "Peer Tool" in (r.error or ""), r.error)
+        check("and says it is reached as a peer", "peer" in (r.error or "").lower(), r.error)
+
+    # An unbuilt peer is unreachable (the registry never wires it), so it must
+    # not block the run.
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_unbuilt = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_unbuilt, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_unbuilt)
+        check("an unbuilt peer does not block the run", r.status == "success",
+              f"{r.status} / {r.error}")
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="Daily Check", description="d", instructions="i",
+            mcp_servers=SERVERS, expose_chat=False, expose_api=True,
+            api_slug="daily-check", run_as_principal="svc@example.com",
+            run_prompt="Run the daily check.", run_timeout_seconds=900,
+            peers=[],
+        )
+
+    print("\n== runner: a report that is really a sign-in prompt is a failure ==")
+    job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
+    prompt_report = RunReport(
+        summary="Could not complete: sign-in needed",
+        body_md=(
+            "🔐 **Peer Tool** needs you to sign in first.\n\n"
+            "**[Click here to sign in to Peer Tool]"
+            "(https://approuter.example.com/oauth/login?agent=Peer%20Tool)**\n"
+        ),
+    )
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(prompt_report)})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_prompt = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_prompt, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_prompt)
+        check("sign-in prompt in the report fails the run", r.status == "failed", r.status)
+        check("the error explains it", "sign-in" in (r.error or "").lower(), r.error)
+        check("the report is still kept for the operator",
+              r.report is not None and "needs you to sign in" in r.report.get("body_md", ""),
+              str(r.report)[:100])
+    check("a normal report carries no marker", job_runner.signin_prompt_in(good) is None)
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})
+
     print("\n== runner: overlap guard ==")
     job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=True)
     async with SessionLocal() as s:

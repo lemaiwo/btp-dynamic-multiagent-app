@@ -23,7 +23,8 @@ export default class Component extends UIComponent {
         this.adminService = new AdminService();
         this.setModel(new JSONModel(Device), "device");
 
-        // Routing is added in Task 8; guard so the app still boots until then.
+        // Guarded so a manifest without a routing section (a stripped-down
+        // test host) still boots the component.
         if (this.getManifestEntry("/sap.ui5/routing")) {
             this.getRouter().initialize();
         }

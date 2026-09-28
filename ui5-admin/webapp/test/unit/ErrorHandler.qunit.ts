@@ -3,9 +3,14 @@ import { AdminError } from "com/agent/admin/service/AdminService";
 
 QUnit.module("ErrorHandler.classify");
 
-QUnit.test("401 and 403 are session problems", function (assert) {
+QUnit.test("401 is a session problem", function (assert) {
     assert.strictEqual(ErrorHandler.classify(new AdminError(401, "no token")), "session");
-    assert.strictEqual(ErrorHandler.classify(new AdminError(403, "forbidden")), "session");
+});
+
+QUnit.test("403 is a missing role, not a lapsed session", function (assert) {
+    // Reloading on 403 re-authenticates the same user to the same 403: a
+    // non-admin would be stuck in a reload loop.
+    assert.strictEqual(ErrorHandler.classify(new AdminError(403, "forbidden")), "forbidden");
 });
 
 QUnit.test("409 is a conflict, not a failure", function (assert) {

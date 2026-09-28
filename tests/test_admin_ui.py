@@ -1056,10 +1056,14 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                              return_exceptions=True)
 
         # We need the fixture agent to survive until the DELETE call, so
-        # sort with DELETE last.
+        # sort with DELETE last -- and the agent DELETE after the workflow
+        # DELETE, because an agent a workflow step names cannot be deleted.
         def _order(item: tuple[str, str]) -> tuple[int, str, str]:
             method, path = item
-            return (1 if method == "DELETE" else 0, method, path)
+            rank = 0
+            if method == "DELETE":
+                rank = 2 if "/agents/" in path else 1
+            return (rank, method, path)
 
         for method, path in sorted(discovered, key=_order):
             test_path = path.replace("/agents/1", f"/agents/{uitest_id}")
@@ -1138,6 +1142,14 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                     ],
                     "replace": False,
                 }
+
+            if method == "DELETE" and "/agents/" in test_path:
+                # Deleting an agent a workflow step names is refused (409)
+                # by design, so the fixture workflows go first -- the same
+                # order an operator has to follow.
+                wr = await client.get("/admin/api/workflows")
+                for w in wr.json():
+                    await client.delete(f"/admin/api/workflows/{w['id']}")
 
             resp = await client.request(method, test_path, json=body)
             ok = resp.status_code in (200, 201, 204)
@@ -1334,6 +1346,135 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             "toggleOauthFields(this); updateEndpointHint()" in html,
         )
 
+        # --- destinations ---------------------------------------------------
+        # Every built-in can run through a BTP destination. The server row
+        # must offer the mode, carry the destination sub-form, and round-trip
+        # each built-in's config block the way agents/db.py stores it.
+        print("\n== destination servers ==")
+        check("auth mode offers a BTP destination", '<option value="destination">' in html)
+        check("destination name field", 'class="dest-destination"' in html)
+        check("act-as-user switch", 'class="dest-user_context"' in html)
+        check("destination config collected on save", "function collectDestinationConfig" in html)
+        check("destination fields follow the built-in", "function syncDestinationFields" in html)
+        check("collectMcpServers handles destination mode",
+              "mode === 'destination'" in html and "collectDestinationConfig(r)" in html)
+
+        if shutil.which("node") is not None:
+            dest_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div id="agent-mcp-servers"></div>
+  <input id="agent-api-slug" value="">
+  <input type="checkbox" id="agent-expose-api">
+  <p id="agent-endpoint-hint"></p>
+</body></html>`, { url: 'https://admin.example/admin' });
+global.window = dom.window;
+global.document = dom.window.document;
+global.location = dom.window.location;
+
+""" + js_no_autoinvoke + r"""
+
+function addAndCollect(server) {
+    document.getElementById('agent-mcp-servers').innerHTML = '';
+    addMcpServerRow(server);
+    const row = document.querySelector('.mcp-server-row');
+    return { row, out: collectMcpServers()[0] };
+}
+
+// 1. Outlook as the signed-in user: mailbox is dropped (/me), send kept.
+let { row, out } = addAndCollect({
+    url: 'builtin:outlook', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', user_context: true, mailbox: 'svc@example.com',
+             lookback: '2d', recipients: 'a@x, b@x', allow_send: true },
+});
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block',
+    'the destination sub-form is shown for the mode');
+assert.strictEqual(row.querySelector('.dest-field-mailbox').style.display, 'none',
+    'no mailbox to name when acting as the user');
+assert.deepStrictEqual(out, {
+    url: 'builtin:outlook', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', lookback: '2d', recipients: 'a@x, b@x',
+             user_context: true, allow_send: true },
+});
+
+// 2. Outlook app-level: the mailbox is kept and user_context is absent.
+({ row, out } = addAndCollect({
+    url: 'builtin:outlook', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', mailbox: 'svc@example.com' },
+}));
+assert.strictEqual(row.querySelector('.dest-field-mailbox').style.display, '');
+assert.deepStrictEqual(out.oauth, { destination: 'GRAPH', mailbox: 'svc@example.com' });
+
+// 3. Teams without user context: allow_send is neither shown nor sent.
+({ row, out } = addAndCollect({
+    url: 'builtin:teams', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', team: 't1', channels: 'General', allow_send: true },
+}));
+assert.strictEqual(row.querySelector('.dest-field-allow_send').style.display, 'none');
+assert.deepStrictEqual(out.oauth, { destination: 'GRAPH', team: 't1', channels: 'General' });
+row.querySelector('.dest-user_context').checked = true;
+syncDestinationFields(row);
+assert.strictEqual(row.querySelector('.dest-field-allow_send').style.display, '',
+    'as the signed-in user Teams may post');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { destination: 'GRAPH', team: 't1', channels: 'General', user_context: true, allow_send: true });
+
+// 4. Jira keeps its filters and ignores the user switch it never shows.
+({ row, out } = addAndCollect({
+    url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', status: 'Open', api_base: '/api/2',
+             allow_comment: true, user_context: true },
+}));
+assert.strictEqual(row.querySelector('.dest-field-user_context').style.display, 'none');
+assert.deepStrictEqual(out.oauth,
+    { destination: 'JIRA', project: 'ABC', status: 'Open', api_base: '/api/2', allow_comment: true });
+
+// 5. Gmail as the user, sapnotes and sapnotedetail: only what each stores.
+({ out } = addAndCollect({ url: 'builtin:gmail', auth_mode: 'destination',
+    oauth: { destination: 'G', user_context: true, mailbox: 'x@y', lookback: '1d' } }));
+assert.deepStrictEqual(out.oauth, { destination: 'G', user_context: true });
+({ out } = addAndCollect({ url: 'builtin:sapnotes', auth_mode: 'destination',
+    oauth: { destination: 'NVD', min_score: '9.0', user_context: true } }));
+assert.deepStrictEqual(out.oauth, { destination: 'NVD', min_score: '9.0' });
+({ row, out } = addAndCollect({ url: 'builtin:sapnotedetail', auth_mode: 'destination',
+    oauth: { destination: 'MESAP' } }));
+assert.deepStrictEqual(out.oauth, { destination: 'MESAP' });
+assert.ok(row.querySelector('.dest-hint').textContent.includes('URL.headers.Cookie'),
+    'the sapnotedetail hint says where the cookie now lives');
+
+// 6. Editing an oauth2 server is untouched: no destination block is sent.
+({ row, out } = addAndCollect({ url: 'https://x.hana.ondemand.com/mcp', auth_mode: 'oauth2',
+    oauth: { dcr: true } }));
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'none');
+assert.deepStrictEqual(out.oauth, { dcr: true });
+
+console.log('destination server round-trip scenarios passed');
+"""
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, dir=str(ROOT)
+            ) as f:
+                f.write(dest_harness)
+                dest_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", dest_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                check(
+                    "destination servers round-trip through the row per built-in",
+                    result.returncode == 0
+                    and "destination server round-trip scenarios passed" in result.stdout,
+                    (result.stderr or result.stdout)[-1500:],
+                )
+            finally:
+                os.unlink(dest_harness_path)
+
         # ------------------------------------------------------------------
         # saveAgent() must actually SEND all six exposure fields, not just
         # have form elements for them. AgentPayload defaults + whole-object
@@ -1374,6 +1515,41 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 f"{field}: not found as an object key in saveAgent()",
             )
 
+        # --- deep agents ---
+        # Same contract for `deep`: the backend keeps the stored config when
+        # the key is absent, so the HTML admin must always send the object,
+        # or unticking "enable" could never reach the server.
+        print("\n== deep agent section: controls and save contract ==")
+        for fid in ("agent-deep-enabled", "agent-deep-planning", "agent-deep-scratchpad",
+                    "agent-deep-subagents", "agent-deep-max-subagents",
+                    "agent-deep-max-depth", "agent-deep-instructions"):
+            found = any(
+                e[1].get("id") == fid for e in coll.elements
+                if e[0] in ("input", "textarea", "select")
+            )
+            check(f"deep form field #{fid}", found)
+        check("deep section is collapsible (<details>)",
+              any(e[0] == "details" and e[1].get("id") == "agent-deep-section"
+                  for e in coll.elements))
+        for fid, lo, hi in (("agent-deep-max-subagents", "1", "20"),
+                            ("agent-deep-max-depth", "1", "3")):
+            el = next((e for e in coll.elements
+                       if e[0] == "input" and e[1].get("id") == fid), None)
+            check(f"#{fid} is a bounded number input",
+                  el is not None and el[1].get("type") == "number"
+                  and el[1].get("min") == lo and el[1].get("max") == hi,
+                  str(el))
+        check("saveAgent() sends deep",
+              re.search(r"\bdeep\s*:", save_agent_body) is not None)
+        check("deep is collected from the form", "function collectDeep(" in js)
+        check("editAgent() fills the deep section", "setDeepForm(a.deep" in js)
+        check("openAgentModal() resets the deep section", "setDeepForm(null)" in js)
+        collect_deep_body = js[js.index("function collectDeep("):]
+        for key in ("enabled", "planning", "scratchpad", "subagents",
+                    "max_subagents", "subagent_max_depth", "subagent_instructions"):
+            check(f"collectDeep() sends {key}",
+                  re.search(rf"\b{key}\s*:", collect_deep_body) is not None)
+
         # FastAPI returns `detail` as a plain string for the HTTPExceptions we
         # raise, but as a list of {loc, msg} objects for any pydantic body
         # validation error. Concatenating that into a toast yields
@@ -1399,6 +1575,86 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 "err.detail" not in body,
                 body[-300:],
             )
+
+        # ------------------------------------------------------------------
+        # --- where used ---
+        # Cross-links between the two editors: the agent modal says which
+        # workflows and peers refer to the agent, and every workflow step row
+        # links to its agent. Both editors are modals over the same page, so
+        # the links are deep links opened in a new tab rather than in-place
+        # switches that would drop the edits in the editor being left.
+        print("\n== where used ==")
+        check("where-used container in the agent modal", 'id="agent-where-used"' in html)
+        check("where-used api used", "/where-used" in js)
+        edit_agent = re.search(r"async function editAgent\(id\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("editAgent() found in JS", edit_agent is not None)
+        check(
+            "editAgent() loads where-used",
+            "loadAgentWhereUsed(a.id)" in (edit_agent.group(1) if edit_agent else ""),
+        )
+        open_agent = re.search(r"async function openAgentModal\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check(
+            "openAgentModal() clears where-used",
+            "renderAgentWhereUsed(null)" in (open_agent.group(1) if open_agent else ""),
+        )
+        step_row = re.search(r"function addWorkflowStepRow\(step\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("addWorkflowStepRow() found in JS", step_row is not None)
+        check(
+            "step rows get an open-agent link",
+            "attachStepAgentLink(row)" in (step_row.group(1) if step_row else ""),
+        )
+        check("deep links are handled on load", "function openFromHash" in js
+              and re.search(r"^openFromHash\(\);\s*$", js, re.MULTILINE) is not None)
+        check("editor links open in a new tab", 'target="_blank"' in js
+              and "link.target = '_blank'" in js)
+
+        if shutil.which("node") is not None:
+            # renderAgentWhereUsed() under a DOM stub: names are operator
+            # text and must land escaped; ids must become numeric deep links.
+            wu_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const el = { innerHTML: '' };
+global.document = {
+    getElementById(id) {
+        if (id === 'agent-where-used') return el;
+        throw new Error('unstubbed getElementById: ' + id);
+    },
+};
+""" + js_no_autoinvoke + r"""
+renderAgentWhereUsed({
+    agent: { id: 1, name: 'x' },
+    peers: [{ id: 5, name: 'peer <b>', enabled: false }],
+    workflows: [{ id: 7, name: 'wf & co', api_slug: null, enabled: true,
+                  steps: [{ position: 1, branch_key: null }, { position: 2, branch_key: 'abap' }] }],
+});
+assert.ok(el.innerHTML.includes('href="#workflow=7"'), 'workflow deep link');
+assert.ok(el.innerHTML.includes('href="#agent=5"'), 'peer deep link');
+assert.ok(el.innerHTML.includes('wf &amp; co'), 'workflow name escaped');
+assert.ok(el.innerHTML.includes('peer &lt;b&gt;'), 'peer name escaped');
+assert.ok(!el.innerHTML.includes('peer <b>'), 'peer name not injected raw');
+assert.ok(el.innerHTML.includes('main #1, abap #2'), 'positions listed per branch');
+assert.ok(el.innerHTML.includes('disabled'), 'a disabled referrer is flagged');
+renderAgentWhereUsed({ agent: { id: 1, name: 'x' }, peers: [], workflows: [] });
+assert.ok(el.innerHTML.includes('no workflow or peer agent'), 'empty state');
+renderAgentWhereUsed(null);
+assert.strictEqual(el.innerHTML, '', 'cleared for a new agent');
+console.log('renderAgentWhereUsed scenarios passed');
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(wu_harness)
+                wu_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", wu_harness_path], capture_output=True, text=True, timeout=10,
+                )
+                check(
+                    "renderAgentWhereUsed() links, escapes and flags referrers",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:500],
+                )
+            finally:
+                os.unlink(wu_harness_path)
 
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})

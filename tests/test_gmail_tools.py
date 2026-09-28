@@ -221,6 +221,33 @@ async def main() -> None:
           f"got {capped}")
 
     # --- get_thread --------------------------------------------------------
+    # A listing makes one threads.get per thread; a 429 on one of them used to
+    # fail the whole listing. One retry after Retry-After, then the error.
+    print("\n== search_threads: rate limit ==")
+    rec = Recorder()
+    throttle = {"left": 1}
+    real_handler = rec.handler
+
+    def throttled(request: httpx.Request) -> httpx.Response:
+        if "/threads/t1" in request.url.path and throttle["left"]:
+            throttle["left"] -= 1
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return real_handler(request)
+
+    http = httpx.AsyncClient(base_url="https://gmail.googleapis.com",
+                             transport=httpx.MockTransport(throttled))
+    rows = await GmailClient(http).search_threads("label:agent")
+    check("a throttled threads.get is retried once", len(rows) == 1 and rows[0]["thread_id"] == "t1",
+          str(rows))
+    always = httpx.AsyncClient(
+        base_url="https://gmail.googleapis.com",
+        transport=httpx.MockTransport(lambda r: httpx.Response(429, headers={"Retry-After": "0"})))
+    try:
+        await GmailClient(always).search_threads("label:agent")
+        check("a persistent 429 still raises", False, "no exception")
+    except httpx.HTTPStatusError as e:
+        check("a persistent 429 still raises", e.response.status_code == 429, str(e))
+
     print("\n== get_thread ==")
     rec = Recorder()
     got = await _client(rec).get_thread("t1")

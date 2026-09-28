@@ -118,6 +118,63 @@
                     </Select>
                 </Panel>
 
+                <!-- deep agents -->
+                <Panel id="deepPanel" headerText="{i18n>deepPanel}" expandable="true"
+                       expanded="true" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>deepHint}" class="sapUiTinyMarginBottom" />
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>deepEnabled}" />
+                        <Switch id="agentDeepEnabled" state="{agent>/data/deep/enabled}" />
+
+                        <Label text="" />
+                        <VBox>
+                            <CheckBox id="agentDeepPlanning" text="{i18n>deepPlanning}"
+                                      selected="{agent>/data/deep/planning}"
+                                      enabled="{agent>/data/deep/enabled}" />
+                            <CheckBox id="agentDeepScratchpad" text="{i18n>deepScratchpad}"
+                                      selected="{agent>/data/deep/scratchpad}"
+                                      enabled="{agent>/data/deep/enabled}" />
+                            <CheckBox id="agentDeepSubagents" text="{i18n>deepSubagents}"
+                                      selected="{agent>/data/deep/subagents}"
+                                      enabled="{agent>/data/deep/enabled}" />
+                        </VBox>
+
+                        <Label text="{i18n>deepMaxSubagents}" />
+                        <StepInput
+                            id="agentDeepMaxSubagents"
+                            value="{agent>/data/deep/max_subagents}"
+                            min="1"
+                            max="20"
+                            step="1"
+                            enabled="{= ${agent>/data/deep/enabled} &amp;&amp; ${agent>/data/deep/subagents} }"
+                            valueState="{agent>/errors/deep_max_subagentsState}"
+                            valueStateText="{agent>/errors/deep_max_subagents}" />
+
+                        <Label text="{i18n>deepMaxDepth}" />
+                        <VBox>
+                            <StepInput
+                                id="agentDeepMaxDepth"
+                                value="{agent>/data/deep/subagent_max_depth}"
+                                min="1"
+                                max="3"
+                                step="1"
+                                enabled="{= ${agent>/data/deep/enabled} &amp;&amp; ${agent>/data/deep/subagents} }"
+                                valueState="{agent>/errors/deep_subagent_max_depthState}"
+                                valueStateText="{agent>/errors/deep_subagent_max_depth}" />
+                            <Text text="{i18n>deepMaxDepthHint}" class="sapUiTinyMarginTop" />
+                        </VBox>
+
+                        <Label text="{i18n>deepInstructions}" />
+                        <TextArea
+                            id="agentDeepInstructions"
+                            value="{agent>/data/deep/subagent_instructions}"
+                            placeholder="{i18n>deepInstructionsPlaceholder}"
+                            enabled="{= ${agent>/data/deep/enabled} &amp;&amp; ${agent>/data/deep/subagents} }"
+                            rows="4"
+                            width="100%" />
+                    </f:SimpleForm>
+                </Panel>
+
                 <Panel headerText="{i18n>jobSettings}" expandable="false" class="sapUiSmallMarginTop">
                     <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
                         <Label text="{i18n>exposeApi}" />
@@ -209,6 +266,61 @@
                             </ColumnListItem>
                         </items>
                     </Table>
+                </Panel>
+
+                <!-- where used: filled by loadWhereUsed() for an existing agent;
+                     hidden for a new one, which nothing can refer to yet. The
+                     flags it binds to are computed in the controller, so no
+                     binding here takes .length of a list not loaded yet. -->
+                <Panel
+                    id="whereUsedPanel"
+                    headerText="{i18n>whereUsedPanel}"
+                    expandable="false"
+                    class="sapUiSmallMarginTop"
+                    visible="{= !!${agent>/whereUsed} }">
+                    <Text text="{i18n>whereUsedHint}" />
+                    <Text
+                        id="whereUsedEmpty"
+                        text="{i18n>whereUsedNone}"
+                        class="sapUiSmallMarginTop"
+                        visible="{= !!${agent>/whereUsed/empty} }" />
+                    <List
+                        id="whereUsedWorkflows"
+                        headerText="{i18n>whereUsedWorkflows}"
+                        items="{agent>/whereUsed/workflows}"
+                        visible="{= !!${agent>/whereUsed/hasWorkflows} }"
+                        class="sapUiSmallMarginTop">
+                        <CustomListItem>
+                            <HBox alignItems="Center" class="sapUiSmallMarginBegin sapUiTinyMarginTopBottom">
+                                <Link text="{agent>name}" press=".onOpenWhereUsedWorkflow" />
+                                <ObjectStatus
+                                    text="{i18n>whereUsedDisabled}"
+                                    state="Warning"
+                                    visible="{= !${agent>enabled} }"
+                                    class="sapUiTinyMarginBegin" />
+                                <Text
+                                    text="{ path: 'agent>steps', formatter: '.whereUsedSteps' }"
+                                    class="sapUiSmallMarginBegin" />
+                            </HBox>
+                        </CustomListItem>
+                    </List>
+                    <List
+                        id="whereUsedPeers"
+                        headerText="{i18n>whereUsedPeers}"
+                        items="{agent>/whereUsed/peers}"
+                        visible="{= !!${agent>/whereUsed/hasPeers} }"
+                        class="sapUiSmallMarginTop">
+                        <CustomListItem>
+                            <HBox alignItems="Center" class="sapUiSmallMarginBegin sapUiTinyMarginTopBottom">
+                                <Link text="{agent>name}" press=".onOpenWhereUsedPeer" />
+                                <ObjectStatus
+                                    text="{i18n>whereUsedDisabled}"
+                                    state="Warning"
+                                    visible="{= !${agent>enabled} }"
+                                    class="sapUiTinyMarginBegin" />
+                            </HBox>
+                        </CustomListItem>
+                    </List>
                 </Panel>
 
             </VBox>

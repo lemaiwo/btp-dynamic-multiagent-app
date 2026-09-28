@@ -1,0 +1,11 @@
+# Lint only, no formatter: existing code is not reformatted wholesale.
+# `ruff check` is advisory today (CI runs it without failing the build) until
+# the pre-existing findings are worked off; new code should be clean.
+line-length = 100
+# runtime.txt pins 3.13 on CF; 3.11 is the floor the README states, and the
+# floor is what decides which builtins (BaseExceptionGroup) ruff may assume.
+target-version = "py311"
+extend-exclude = ["node_modules", "ui5-admin", "mta_archives", "dist", "tmp", "docs"]
+
+[lint]
+select = ["E", "F", "I"]

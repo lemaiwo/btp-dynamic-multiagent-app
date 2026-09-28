@@ -12,14 +12,19 @@ Endpoints (mounted by ``app.py``):
                                            methods: message/send, message/stream,
                                                     tasks/get, tasks/cancel
 
-The JSON-RPC endpoint is protected by XSUAA (``require_user`` dependency)
-so that Joule's outbound call carries a valid bearer token. Because the
-existing ``JWTBindingMiddleware`` binds that token to ``current_jwt``,
-downstream MCP servers still see the calling identity transparently.
+The JSON-RPC endpoint is protected by XSUAA (``require_a2a`` dependency:
+the caller must hold the ``<xsappname>.a2a`` scope, the same scope the
+approuter enforces on its route, checked again here because the backend
+has a public CF route of its own). Because the existing
+``JWTBindingMiddleware`` binds that token to ``current_jwt``, downstream MCP
+servers still see the calling identity transparently.
 
 Multi-turn conversations are supported via the A2A ``contextId``: each
 context keeps an in-memory copy of the pydantic-ai message history so
-follow-up calls keep the orchestrator's working memory.
+follow-up calls keep the orchestrator's working memory. ``contextId`` is
+client-chosen, so contexts and tasks are keyed by the calling principal as
+well: another caller presenting the same id sees an empty context and an
+unknown task, never someone else's conversation.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from agents.auth import require_user
+from agents.auth import current_principal, require_a2a
 from agents.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -63,10 +68,18 @@ def _base_url(request: Request) -> str:
     override = os.environ.get("A2A_PUBLIC_URL")
     if override:
         return override.rstrip("/")
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-    if host:
-        return f"{scheme}://{host}"
+    from agents.auth import public_base_url
+
+    configured = public_base_url()
+    if configured:
+        return configured
+    if "VCAP_APPLICATION" not in os.environ:
+        # Local development only: on CF a client-supplied X-Forwarded-Host
+        # must not decide what URL the card advertises.
+        scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        if host:
+            return f"{scheme}://{host}"
     return str(request.base_url).rstrip("/")
 
 
@@ -196,38 +209,52 @@ _TASK_TTL_SECONDS = int(os.environ.get("A2A_TASK_TTL", "900"))
 
 
 class _ConversationStore:
+    """Per-principal context + task store.
+
+    Keys carry the owning principal: a ``contextId`` or task id only resolves
+    for the caller that created it. A second principal presenting the same
+    ``contextId`` gets a context of its own under that id, so neither side
+    reads or clobbers the other's history.
+    """
+
     def __init__(self) -> None:
-        self._contexts: dict[str, dict[str, Any]] = {}
+        self._contexts: dict[tuple[str, str], dict[str, Any]] = {}
         self._tasks: dict[str, dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
-    async def get_history(self, context_id: str) -> list[Any]:
+    async def get_history(self, principal: str, context_id: str) -> list[Any]:
         async with self._lock:
             self._gc()
-            entry = self._contexts.get(context_id)
+            entry = self._contexts.get((principal, context_id))
             return list(entry["history"]) if entry else []
 
-    async def set_history(self, context_id: str, history: list[Any]) -> None:
+    async def set_history(self, principal: str, context_id: str, history: list[Any]) -> None:
         async with self._lock:
-            self._contexts[context_id] = {
+            self._contexts[(principal, context_id)] = {
                 "history": history,
                 "touched": time.time(),
             }
 
-    async def save_task(self, task: dict[str, Any]) -> None:
+    async def save_task(self, principal: str, task: dict[str, Any]) -> None:
         async with self._lock:
-            self._tasks[task["id"]] = {"task": task, "touched": time.time()}
+            self._tasks[task["id"]] = {
+                "task": task,
+                "principal": principal,
+                "touched": time.time(),
+            }
 
-    async def get_task(self, task_id: str) -> dict[str, Any] | None:
+    async def get_task(self, principal: str, task_id: str) -> dict[str, Any] | None:
         async with self._lock:
             self._gc()
             entry = self._tasks.get(task_id)
-            return entry["task"] if entry else None
+            if entry is None or entry["principal"] != principal:
+                return None
+            return entry["task"]
 
-    async def cancel_task(self, task_id: str) -> dict[str, Any] | None:
+    async def cancel_task(self, principal: str, task_id: str) -> dict[str, Any] | None:
         async with self._lock:
             entry = self._tasks.get(task_id)
-            if entry is None:
+            if entry is None or entry["principal"] != principal:
                 return None
             task = entry["task"]
             # Only cancel in-flight tasks; completed/failed are terminal.
@@ -237,15 +264,27 @@ class _ConversationStore:
 
     def _gc(self) -> None:
         now = time.time()
-        for cid in list(self._contexts):
-            if now - self._contexts[cid]["touched"] > _CONTEXT_TTL_SECONDS:
-                del self._contexts[cid]
+        for key in list(self._contexts):
+            if now - self._contexts[key]["touched"] > _CONTEXT_TTL_SECONDS:
+                del self._contexts[key]
         for tid in list(self._tasks):
             if now - self._tasks[tid]["touched"] > _TASK_TTL_SECONDS:
                 del self._tasks[tid]
 
 
 store = _ConversationStore()
+
+
+def _caller() -> str:
+    """The principal every context and task is keyed under.
+
+    Set by ``JWTBindingMiddleware`` from the validated token (``local-dev``
+    without an XSUAA binding). ``require_a2a`` has already rejected a request
+    with no usable token, so an empty value here means the router is being
+    driven without the middleware; keying those under one anonymous bucket is
+    still no worse than sharing.
+    """
+    return current_principal.get() or "anonymous"
 
 
 # ---------------------------------------------------------------------------
@@ -312,11 +351,17 @@ def _iso_now() -> str:
 # ---------------------------------------------------------------------------
 async def _run_orchestrator(text: str, context_id: str) -> str:
     """Execute one orchestrator turn and persist the updated history."""
-    history = await store.get_history(context_id)
+    principal = _caller()
+    history = await store.get_history(principal, context_id)
     agent = registry.orchestrator
     try:
         result = await agent.run(text, message_history=history or None)
-    except BaseException as exc:  # noqa: BLE001
+    except asyncio.CancelledError:
+        # The client disconnected or the app is shutting down: let it unwind
+        # so the run actually stops instead of being recorded as a failure
+        # while the coroutine keeps going.
+        raise
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Orchestrator run failed (context=%s)", context_id)
         raise _OrchestratorError(str(exc)) from exc
 
@@ -325,7 +370,7 @@ async def _run_orchestrator(text: str, context_id: str) -> str:
         new_history = list(result.all_messages())
     except Exception:
         new_history = history
-    await store.set_history(context_id, new_history)
+    await store.set_history(principal, context_id, new_history)
 
     return str(result.output)
 
@@ -356,7 +401,7 @@ async def _handle_message_send(req_id: Any, params: dict[str, Any]) -> dict[str,
     }
     task_id = str(uuid.uuid4())
     task = _initial_task(task_id, context_id, user_message, state="working")
-    await store.save_task(task)
+    await store.save_task(_caller(), task)
 
     try:
         output = await _run_orchestrator(text, context_id)
@@ -366,7 +411,7 @@ async def _handle_message_send(req_id: Any, params: dict[str, Any]) -> dict[str,
             "message": _make_agent_message(f"Orchestrator error: {exc}", context_id),
             "timestamp": _iso_now(),
         }
-        await store.save_task(task)
+        await store.save_task(_caller(), task)
         return _rpc_result(req_id, task)
 
     agent_message = _make_agent_message(output, context_id)
@@ -383,7 +428,7 @@ async def _handle_message_send(req_id: Any, params: dict[str, Any]) -> dict[str,
             "parts": [{"kind": "text", "text": output}],
         }
     )
-    await store.save_task(task)
+    await store.save_task(_caller(), task)
     return _rpc_result(req_id, task)
 
 
@@ -391,7 +436,7 @@ async def _handle_tasks_get(req_id: Any, params: dict[str, Any]) -> dict[str, An
     task_id = params.get("id")
     if not task_id:
         return _rpc_error(req_id, -32602, "Invalid params: 'id' required")
-    task = await store.get_task(task_id)
+    task = await store.get_task(_caller(), task_id)
     if task is None:
         return _rpc_error(req_id, -32001, f"Task not found: {task_id}")
     return _rpc_result(req_id, task)
@@ -401,7 +446,7 @@ async def _handle_tasks_cancel(req_id: Any, params: dict[str, Any]) -> dict[str,
     task_id = params.get("id")
     if not task_id:
         return _rpc_error(req_id, -32602, "Invalid params: 'id' required")
-    task = await store.cancel_task(task_id)
+    task = await store.cancel_task(_caller(), task_id)
     if task is None:
         return _rpc_error(req_id, -32001, f"Task not found: {task_id}")
     return _rpc_result(req_id, task)
@@ -427,7 +472,7 @@ async def _stream_message(req_id: Any, params: dict[str, Any]) -> AsyncIterator[
     }
     task_id = str(uuid.uuid4())
     task = _initial_task(task_id, context_id, user_message, state="submitted")
-    await store.save_task(task)
+    await store.save_task(_caller(), task)
 
     # Emit the initial Task with state=submitted
     yield _sse(_rpc_result(req_id, task))
@@ -491,7 +536,7 @@ async def _stream_message(req_id: Any, params: dict[str, Any]) -> AsyncIterator[
     task["status"] = done["status"]
     task["history"].append(agent_message)
     task["artifacts"].append(artifact_event["artifact"])
-    await store.save_task(task)
+    await store.save_task(_caller(), task)
 
     yield _sse(_rpc_result(req_id, done))
 
@@ -519,7 +564,7 @@ async def get_agent_card_legacy(request: Request) -> JSONResponse:
     return JSONResponse(card)
 
 
-@router.post("/a2a", dependencies=[Depends(require_user)])
+@router.post("/a2a", dependencies=[Depends(require_a2a)])
 async def a2a_jsonrpc(
     request: Request,
     accept: str | None = Header(default=None),

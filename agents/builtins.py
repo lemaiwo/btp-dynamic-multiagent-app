@@ -13,6 +13,28 @@ gated behind a Copilot licence. The REST APIs underneath have no such problem.
 
 The set is closed. An unrecognised ``builtin:`` URL is a typo, not an extension
 point, and is rejected at admin validation rather than silently ignored.
+
+Auth modes per built-in (``agents.admin.McpServerPayload`` refuses the rest at
+save time; ``ui5-admin/webapp/model/builtins.ts`` mirrors this table):
+
+================== ========= ========= ============= ======== ========
+built-in           oauth2    app_only  destination   none     session
+================== ========= ========= ============= ======== ========
+builtin:gmail      user      --        user / app*   --       --
+builtin:outlook    user      app*      user / app*   --       --
+builtin:teams      user      app (ro)  user / app(ro)--       --
+builtin:slack      --        --        app           --       --
+builtin:jira       --        --        app           --       --
+builtin:sapnotes   --        --        app (public)  default  --
+builtin:sapnotedetail --     --        app (cookie)  --       default
+================== ========= ========= ============= ======== ========
+
+``destination`` reaches the API through a BTP destination. The config block's
+``user_context`` picks between the two columns: on, the destination is resolved
+with the signed-in user's JWT (``X-user-token``) and the tools act as that
+user; off, the destination's own credential is used and the app-only rules
+apply (``*`` = ``mailbox`` required, ``ro`` = read-only). See
+:mod:`agents.destination_auth`.
 """
 
 from __future__ import annotations

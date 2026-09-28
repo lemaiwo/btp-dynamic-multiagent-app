@@ -1,6 +1,7 @@
 import type {
     Agent, CredentialStatus, JobRunDetail, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
+import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext { path: string; status: number; body: unknown }
@@ -69,6 +70,13 @@ export default class FakeBackend {
         this.agents[0].peers = ["gmail-agent"];
         this.agents[0].model_name = "gpt-4o";
         this.agents[1].model_name = "retired-model";
+        // --- deep agents --- btp-agent carries a non-default config so a
+        // journey can check it is shown and resent unchanged; gmail-agent
+        // keeps the defaults (GET always returns the object).
+        this.agents[0].deep = {
+            enabled: true, planning: true, scratchpad: false, subagents: true,
+            max_subagents: 3, subagent_max_depth: 2, subagent_instructions: "Be brief."
+        };
         // One row per token state, so a journey can assert that the sign-in
         // button is offered for a working credential as well as a dead one.
         this.credentials = [
@@ -76,18 +84,18 @@ export default class FakeBackend {
                 url: "https://a.hana.ondemand.com/mcp", auth_mode: "oauth2",
                 needs_token: true, has_token: true, token_state: "valid",
                 expires_at: "2099-01-01T00:00:00+00:00",
-                login_url: "/oauth/login?agent=btp-agent&server=a"
+                login_url: "/oauth/login?agent=btp-agent&server=a", no_user_token: false
             },
             {
                 url: "https://b.hana.ondemand.com/mcp", auth_mode: "oauth2",
                 needs_token: true, has_token: false, token_state: "expired",
                 expires_at: "2020-01-01T00:00:00+00:00",
-                login_url: "/oauth/login?agent=btp-agent&server=b"
+                login_url: "/oauth/login?agent=btp-agent&server=b", no_user_token: false
             },
             {
                 url: "builtin:jira", auth_mode: "destination",
                 needs_token: false, has_token: true, token_state: "valid",
-                expires_at: null, login_url: ""
+                expires_at: null, login_url: "", no_user_token: true
             }
         ];
         this.skills = [{
@@ -174,6 +182,7 @@ export default class FakeBackend {
             skills: [], enabled: true, expose_chat: true, expose_api: false,
             api_slug: "", run_as_principal: "", run_prompt: "",
             run_timeout_seconds: 1800, peers: [], model_name: "",
+            deep: { ...DEEP_DEFAULTS },
             created_at: null, updated_at: null,
             mcp_url: "", auth_mode: "jwt"
         };
@@ -328,6 +337,31 @@ export default class FakeBackend {
         }
         if (path === "import") {
             return this.json({ status: "ok" });
+        }
+        // --- where used ---
+        // Derived from the agents and workflows above the way the server
+        // derives it from its tables, so a journey that edits a peer list or
+        // a step sees the change reflected here without a second fixture.
+        if (/^agents\/\d+\/where-used$/.test(path)) {
+            const id = Number(path.split("/")[1]);
+            const agent = this.agents.find((a) => a.id === id);
+            if (!agent) {
+                return this.json({ detail: "Agent not found" }, 404);
+            }
+            return this.json({
+                agent: { id: agent.id, name: agent.name },
+                peers: this.agents
+                    .filter((a) => a.id !== agent.id && (a.peers ?? []).indexOf(agent.name) !== -1)
+                    .map((a) => ({ id: a.id, name: a.name, enabled: a.enabled })),
+                workflows: this.workflows
+                    .filter((w) => w.steps.some((s) => s.agent_name === agent.name))
+                    .map((w) => ({
+                        id: w.id, name: w.name, api_slug: w.api_slug || null, enabled: w.enabled,
+                        steps: w.steps
+                            .filter((s) => s.agent_name === agent.name)
+                            .map((s) => ({ position: s.position, branch_key: s.branch_key }))
+                    }))
+            });
         }
         return this.json({ detail: `unhandled ${method} ${path}` }, 404);
     }

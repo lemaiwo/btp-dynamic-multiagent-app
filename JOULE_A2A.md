@@ -40,14 +40,15 @@ reflects the change after a reload.
 
 ### 2.1 Deploy (or re-deploy) the app
 
-Bump to the new MTA version and redeploy:
+Build and deploy the MTA (the archive name carries the `version` from
+`mta.yaml`):
 
 ```bash
 mbt build
-cf deploy mta_archives/pydantic-agent_2.1.0.mtar
+cf deploy mta_archives/pydantic-agent_<version>.mtar
 ```
 
-This update:
+The A2A support (first shipped in MTA 2.1.0) consists of:
 
 - Adds the **`$XSAPPNAME.a2a`** scope, the **`AgentA2AClient`** role
   template, and the **`Agent A2A Client`** role collection
@@ -221,7 +222,7 @@ python tests/test_a2a.py
 | `A2A_PUBLIC_URL`         | *(derived from request)*                           | Public base URL advertised in the agent card. **Set on CF.**        |
 | `A2A_AGENT_NAME`         | `SAP BTP Multi-Agent Orchestrator`                 | `name` field in the agent card.                                      |
 | `A2A_AGENT_DESCRIPTION`  | *(see `mta.yaml`)*                                 | `description` field in the agent card.                               |
-| `A2A_AGENT_VERSION`      | `2.1.0`                                            | `version` field in the agent card.                                   |
+| `A2A_AGENT_VERSION`      | `2.1.0` (code default in `agents/a2a.py`)          | `version` field in the agent card. Nothing sets it in `mta.yaml`, so the card advertises the code default, not the deployed MTA version: set it in your landscape's `.mtaext` (or `cf set-env`) to the MTA version you deploy, and bump it when you redeploy. |
 | `A2A_PROVIDER_ORG`       | `SAP BTP Dynamic Multi-Agent`                      | `provider.organization` field.                                       |
 | `A2A_PROVIDER_URL`       | SAP community blog URL                             | `provider.url` field.                                                |
 | `A2A_CONTEXT_TTL`        | `3600`                                             | Seconds a conversation's message history is kept in memory.         |
@@ -271,7 +272,7 @@ Joule client-id to their XSUAA `oauth2-configuration.allowed-clients`.
   "protocolVersion": "0.3.0",
   "name": "SAP BTP Multi-Agent Orchestrator",
   "description": "Dynamic multi-agent orchestrator for SAP BTP.",
-  "version": "2.1.0",
+  "version": "<A2A_AGENT_VERSION>",
   "url": "https://<approuter>/a2a",
   "preferredTransport": "JSONRPC",
   "provider": {
@@ -314,3 +315,31 @@ Joule client-id to their XSUAA `oauth2-configuration.allowed-clients`.
   "security": [{ "xsuaa": [] }]
 }
 ```
+
+---
+
+## 8. Open items
+
+Carried over from the working notes kept while the A2A endpoint was first
+deployed; none of these is done by the code in this repository.
+
+1. **Joule service key.** Create it on the same XSUAA instance the app
+   binds (§2.2) and hand `clientid` / `clientsecret` / `url` to Joule.
+2. **End-to-end smoke test** with a client-credentials token against the
+   approuter `/a2a` route (§2.4) before registering anything in Joule.
+3. **Register the agent in the Joule Agent Hub** (§3). Pro-code flow only
+   at the time of writing.
+4. **MCP trust for Joule-originated calls** (§6, last entry). A token Joule
+   obtains with `client_credentials` names the Joule service key's client
+   id; each MCP server the specialists call must accept it (XSUAA
+   `oauth2-configuration.allowed-clients`), or a token-exchange step has to
+   be added. Until then, MCP calls from Joule-initiated turns fail with 401.
+5. **Advertise the deployed version.** Set `A2A_AGENT_VERSION` per
+   landscape (§5) so the card does not report the code default.
+6. **Backend-side scope check.** Confirm the backend enforces the `a2a`
+   scope on its own CF route (not only through `approuter/xs-app.json`)
+   and that conversation contexts are isolated per caller rather than by
+   the client-chosen `contextId` alone; close whichever of the two is
+   still open before exposing the backend route to anything but the
+   approuter.
+

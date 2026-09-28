@@ -36,10 +36,13 @@ from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
 from agents.api_runs import router as runs_router  # noqa: E402
 from agents.auth import (  # noqa: E402
+    InvalidToken,
+    authenticate,
     current_base_url,
+    current_claims,
     current_jwt,
     current_principal,
-    principal_from_token,
+    get_validator,
     public_base_url,
 )
 from agents.chat_app import dynamic_chat_app  # noqa: E402
@@ -127,6 +130,11 @@ async def _token_keepwarm(interval: float) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail closed before anything is served: with AUTH_REQUIRED on (the
+    # default on CF) and no XSUAA binding this raises AuthConfigurationError
+    # and the process never comes up, instead of answering every route to
+    # anyone. See the agents.auth module docstring.
+    get_validator()
     await init_db()
     # A process that has just started owns no run, so every row still marked
     # `running` is a ghost from the previous process (crash, or a CF redeploy
@@ -173,6 +181,18 @@ async def lifespan(app: FastAPI):
 # ---------------------------------------------------------------------------
 ON_CF = "VCAP_APPLICATION" in os.environ
 
+_STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_warned_no_public_url = False
+
+
+def _origin_of(url: str) -> str:
+    """``scheme://host[:port]`` of a URL, lowercased, for origin comparison."""
+    parts = url.strip().lower().split("/")
+    if len(parts) >= 3 and parts[1] == "":
+        return f"{parts[0]}//{parts[2]}"
+    return url.strip().lower()
+
+
 class JWTBindingMiddleware:
     def __init__(self, app) -> None:
         self.app = app
@@ -182,7 +202,10 @@ class JWTBindingMiddleware:
             await self.app(scope, receive, send)
             return
 
-        wanted = (b"authorization", b"x-forwarded-proto", b"x-forwarded-host", b"host")
+        wanted = (
+            b"authorization", b"x-forwarded-proto", b"x-forwarded-host", b"host",
+            b"origin", b"sec-fetch-site",
+        )
         hdrs: dict[bytes, bytes] = {}
         for key, value in scope.get("headers", []):
             lk = key.lower()
@@ -201,6 +224,7 @@ class JWTBindingMiddleware:
         # token on a request that needs it, fail fast with a clear message
         # instead of letting the chat silently lose MCP authentication.
         path = scope.get("path", "")
+        method = scope.get("method", "GET")
         # /.well-known/agent-card.json is anonymously readable (Joule
         # and other A2A clients fetch it before authenticating). Admin,
         # A2A JSON-RPC and the chat UI still require a forwarded JWT.
@@ -209,11 +233,15 @@ class JWTBindingMiddleware:
             or path.startswith("/.well-known/")
             or path.startswith("/static/")
         )
-        needs_jwt = ON_CF and not is_public and not path.startswith("/admin")
+        is_admin = path == "/admin" or path.startswith("/admin/")
+        # /admin is left to require_admin for the *missing* token case so its
+        # own 401 is what the UI sees; a token that is present but invalid is
+        # rejected here like everywhere else.
+        needs_jwt = ON_CF and not is_public and not is_admin
         if needs_jwt and not token:
             logger.warning(
                 "Rejecting %s %s: no JWT — did you hit the approuter URL?",
-                scope.get("method"), path,
+                method, path,
             )
             await _send_json(
                 send,
@@ -225,38 +253,98 @@ class JWTBindingMiddleware:
             )
             return
 
-        if token:
-            logger.info("JWT bound for %s %s", scope.get("method"), path)
+        # Forwarded scheme/host as the approuter reports them.
+        fwd_origin: str | None = None
+        host = hdrs.get(b"x-forwarded-host") or hdrs.get(b"host")
+        if host:
+            proto_h = hdrs.get(b"x-forwarded-proto")
+            scheme = (
+                proto_h.decode("latin-1").split(",")[0].strip()
+                if proto_h
+                else scope.get("scheme", "https")
+            )
+            host_str = host.decode("latin-1").split(",")[0].strip()
+            fwd_origin = f"{scheme}://{host_str}"
 
-        # Public base URL (scheme://host) as seen by the approuter, used to
-        # build the OAuth2 redirect_uri. An explicit override wins so the
-        # redirect_uri exactly matches what is registered with the target.
-        # Optional explicit public base URL for OAuth2 redirect_uri
-        # construction (PUBLIC_BASE_URL / A2A_PUBLIC_URL — the same resolver
-        # scheduled runs use), falling back to the forwarded headers.
+        # Public base URL (scheme://host) used to build the OAuth2
+        # redirect_uri (PUBLIC_BASE_URL / A2A_PUBLIC_URL — the same resolver
+        # scheduled runs use). Locally it falls back to the forwarded headers.
+        # On CF it does not: the value ends up as a registered redirect_uri
+        # and, for DCR servers, re-registers the shared client whenever it
+        # changes, so a client-controlled header must not feed it. mta.yaml
+        # wires PUBLIC_BASE_URL from the approuter route, so on CF it is only
+        # empty when a deployment overrides that with nothing.
         base_url = public_base_url() or ""
         if not base_url:
-            host = hdrs.get(b"x-forwarded-host") or hdrs.get(b"host")
-            if host:
-                proto_h = hdrs.get(b"x-forwarded-proto")
-                scheme = (
-                    proto_h.decode("latin-1").split(",")[0].strip()
-                    if proto_h
-                    else scope.get("scheme", "https")
-                )
-                host_str = host.decode("latin-1").split(",")[0].strip()
-                base_url = f"{scheme}://{host_str}"
+            if ON_CF:
+                global _warned_no_public_url
+                if not _warned_no_public_url:
+                    _warned_no_public_url = True
+                    logger.warning(
+                        "PUBLIC_BASE_URL/A2A_PUBLIC_URL is not set; refusing to "
+                        "derive the public URL from X-Forwarded-Host on Cloud "
+                        "Foundry. Per-user OAuth2 sign-in will not work until "
+                        "it is configured."
+                    )
+            elif fwd_origin:
+                base_url = fwd_origin
 
-        principal = principal_from_token(token)
+        # CSRF guard for the admin API. The approuter routes run with
+        # csrfProtection off, so a state-changing admin request that the
+        # browser attributes to another site is refused here. Browsers send
+        # Origin on every cross-site POST/PUT/PATCH/DELETE; server-to-server
+        # callers (the job scheduler on /api/*/run) send none and are not
+        # affected, and /admin is the only prefix checked.
+        if is_admin and method in _STATE_CHANGING:
+            fetch_site = (hdrs.get(b"sec-fetch-site") or b"").decode("latin-1").strip().lower()
+            origin_h = hdrs.get(b"origin")
+            if fetch_site not in ("same-origin", "none") and origin_h:
+                origin = _origin_of(origin_h.decode("latin-1"))
+                allowed = {
+                    _origin_of(u) for u in (base_url, public_base_url() or "", fwd_origin or "") if u
+                }
+                if origin not in allowed:
+                    logger.warning(
+                        "Rejecting %s %s: Origin %r is not this app (%s)",
+                        method, path, origin, ", ".join(sorted(allowed)) or "-",
+                    )
+                    await _send_json(
+                        send, 403,
+                        {"detail": "Cross-site request refused: Origin does not match this app."},
+                    )
+                    return
+
+        # Validate the token once; the dependencies reuse the claims.
+        try:
+            claims, principal = await authenticate(token)
+        except InvalidToken as e:
+            if not is_public:
+                logger.warning("Rejecting %s %s: %s", method, path, e)
+                await _send_json(send, 401, {"detail": f"Invalid bearer token: {e}"})
+                return
+            # Anonymous paths (agent card, static assets) serve without an
+            # identity; a stale token there is dropped, not fatal.
+            claims, principal = None, None
+        if ON_CF and not is_public and token and principal is None:
+            # Validated (or unverifiable in an open deployment) but carries no
+            # usable identity: nothing downstream could key a user on it.
+            logger.warning("Rejecting %s %s: token yields no principal", method, path)
+            await _send_json(send, 401, {"detail": "Bearer token carries no user identity."})
+            return
+
+        if token:
+            logger.info("JWT bound for %s %s", method, path)
 
         marker = current_jwt.set(token)
         marker_principal = current_principal.set(principal)
+        marker_claims = current_claims.set(claims)
         marker_base = current_base_url.set(base_url)
         try:
             await self.app(scope, receive, send)
         finally:
             current_jwt.reset(marker)
             current_principal.reset(marker_principal)
+            current_claims.reset(marker_claims)
             current_base_url.reset(marker_base)
 
 

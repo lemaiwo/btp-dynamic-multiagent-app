@@ -60,22 +60,21 @@ modules:
       # A2A / Joule integration — the public approuter URL of this app.
       # Joule fetches the agent card from this URL; the card's `url`
       # field is derived from it, so it MUST match the approuter host.
-      # Example: https://<org>-<space>-pydantic-agent-approuter.cfapps.eu20-001.hana.ondemand.com
-      A2A_PUBLIC_URL: ""
+      # Taken from the approuter module's route (see its `provides`), so it
+      # is right on every landscape without an extension descriptor. Override
+      # in an .mtaext only when a custom domain fronts the approuter.
+      A2A_PUBLIC_URL: ~{pydantic-agent-approuter-api/url}
       # Public base URL used to build the OAuth2 redirect_uri for per-user
-      # (auth_mode="oauth2") MCP servers: <base>/oauth/callback. Leave empty
-      # to fall back to A2A_PUBLIC_URL, then to the approuter's forwarded
-      # host headers. Set this only if those are unavailable or incorrect.
+      # (auth_mode="oauth2") MCP servers: <base>/oauth/callback, and the URL
+      # API-triggered (scheduled) runs bind, since they have no request to
+      # read a host from.
       #
-      # API-triggered (scheduled) runs have no request to read headers from,
-      # so they need one of PUBLIC_BASE_URL / A2A_PUBLIC_URL to be set: with
-      # both empty, every run fails immediately in run_as.
-      #
-      # The value is the approuter route, which differs per landscape, so it
-      # is left empty here and pinned in an extension descriptor
-      # (cf deploy ... -e <landscape>.mtaext). A landscape that runs scheduled
-      # agents MUST set it there.
-      PUBLIC_BASE_URL: ""
+      # Same source as A2A_PUBLIC_URL. On Cloud Foundry the backend never
+      # derives this from X-Forwarded-Host: that header is client-controlled
+      # and the value becomes a registered OAuth redirect_uri. With both
+      # variables empty on CF, per-user OAuth2 sign-in and scheduled runs
+      # fail instead of trusting the header (app.py logs a warning once).
+      PUBLIC_BASE_URL: ~{pydantic-agent-approuter-api/url}
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
     requires:
@@ -87,6 +86,10 @@ modules:
       # the app's XSUAA binding to mint the token it calls the action endpoint
       # with, so binding it first leaves it with nothing to grant against.
       - name: agent-jobscheduler
+      # The approuter's own route, for PUBLIC_BASE_URL / A2A_PUBLIC_URL above.
+      # Mutual requires between the two modules are fine: ${default-url} is
+      # known before either is deployed, so the deployer resolves both.
+      - name: pydantic-agent-approuter-api
     provides:
       - name: pydantic-agent-api
         properties:
@@ -137,6 +140,10 @@ modules:
           url: ~{url}
           forwardAuthToken: false
       - name: ui5-admin-repo-runtime
+    provides:
+      - name: pydantic-agent-approuter-api
+        properties:
+          url: ${default-url}
 
   - name: ui5-admin
     type: html5

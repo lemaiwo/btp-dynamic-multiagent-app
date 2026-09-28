@@ -3,13 +3,29 @@
 Provides:
 - `current_jwt` contextvar — holds the bound user's JWT for the current request,
   read by the MCP httpx auth to forward it to MCP servers.
+- `current_principal` / `current_claims` contextvars — the identity and the
+  validated claims of the bound token, set once per request by
+  ``JWTBindingMiddleware`` so the dependencies below never decode twice.
 - `XsuaaValidator` — validates incoming JWTs against the XSUAA JWKS and checks
   required scopes.
-- FastAPI dependencies `require_user` and `require_admin`.
+- FastAPI dependencies `require_user`, `require_admin`, `require_a2a` and
+  `require_jobscheduler`.
+
+Fail-closed switch
+------------------
+``AUTH_REQUIRED`` decides what happens when no XSUAA binding can be resolved.
+It defaults to ``true`` whenever ``VCAP_APPLICATION`` is set (a Cloud Foundry
+container) and ``false`` otherwise (local development, tests). When it is true
+and there is no ``xsuaa`` entry in ``VCAP_SERVICES``, ``get_validator`` raises
+``AuthConfigurationError`` and the app refuses to start (``app.py`` lifespan)
+instead of serving every route to everyone with a single warning line. Set
+``AUTH_REQUIRED=false`` explicitly to run an unbound container open, e.g. a
+throwaway Docker/Kyma deployment behind some other gate.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -34,6 +50,12 @@ current_jwt: ContextVar[str | None] = ContextVar("current_jwt", default=None)
 # Stable identifier for the calling user, used to key per-user OAuth2 tokens
 # (auth_mode="oauth2"). Derived from the validated XSUAA JWT on CF.
 current_principal: ContextVar[str | None] = ContextVar("current_principal", default=None)
+
+# Validated claims of the bound JWT, set by JWTBindingMiddleware after it has
+# checked the signature/audience once. The FastAPI dependencies reuse these
+# instead of decoding (and possibly refetching the JWKS) a second time. None
+# means "not validated on this request" (no token, or no middleware in front).
+current_claims: ContextVar[dict[str, Any] | None] = ContextVar("current_claims", default=None)
 
 # Public base URL of the current request (scheme://host as seen by the
 # approuter), used to build the OAuth2 redirect_uri for the callback.
@@ -70,6 +92,42 @@ def principal_from_token(token: str | None) -> str | None:
             return None
         return _principal_claim(payload)
     return None if validator is not None else "local-dev"
+
+
+class InvalidToken(Exception):
+    """A bearer token was presented but did not validate."""
+
+
+async def authenticate(token: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Validate ``token`` once and return ``(claims, principal)``.
+
+    The one place a request's token is checked: ``JWTBindingMiddleware`` calls
+    it and stores both results in ``current_claims`` / ``current_principal``.
+    Validation runs in a worker thread because ``PyJWKClient`` fetches the JWK
+    set with a *blocking* urllib call; on the event loop one slow XSUAA round
+    trip would stall every in-flight stream.
+
+    - With an XSUAA binding: the signature, expiry and audience are verified;
+      a token that fails raises ``InvalidToken`` (the caller answers 401).
+    - Without one (local dev): the claims are read unverified, and a missing
+      token maps to the constant ``local-dev`` principal, so the per-user
+      OAuth2 flow stays exercisable locally.
+    """
+    validator = get_validator()
+    if not token:
+        return (None, None) if validator is not None else (None, "local-dev")
+    if validator is None:
+        try:
+            payload = jwt.decode(token, options={"verify_signature": False})
+        except Exception:
+            logger.warning("Could not decode bearer token (dev mode)", exc_info=True)
+            return None, None
+        return payload, _principal_claim(payload)
+    try:
+        payload = await asyncio.to_thread(validator.validate, token)
+    except HTTPException as e:
+        raise InvalidToken(str(e.detail)) from e
+    return payload, _principal_claim(payload)
 
 
 def _principal_claim(payload: dict[str, Any]) -> str | None:
@@ -157,14 +215,39 @@ class XsuaaValidator:
                 audience=self.client_id,
                 options={"verify_aud": True},
             )
-        except jwt.InvalidAudienceError:
-            # XSUAA sometimes issues without 'aud'; retry with aud check disabled
-            payload = jwt.decode(
-                token,
-                signing_key,
-                algorithms=["RS256"],
-                options={"verify_aud": False},
-            )
+        except jwt.MissingRequiredClaimError as e:
+            # XSUAA sometimes issues tokens without an `aud` claim at all
+            # (notably client_credentials tokens). Those are accepted only when
+            # the token demonstrably belongs to *this* app: its client_id is
+            # ours, or it carries a scope under our xsappname. A token that
+            # HAS an `aud` naming another app never reaches this branch --
+            # PyJWT raises InvalidAudienceError for it, which is a 401 below.
+            if getattr(e, "claim", None) != "aud":
+                logger.warning("JWT validation failed: %s", e)
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid JWT: {e}"
+                )
+            try:
+                payload = jwt.decode(
+                    token,
+                    signing_key,
+                    algorithms=["RS256"],
+                    options={"verify_aud": False},
+                )
+            except jwt.PyJWTError as e2:
+                logger.warning("JWT validation failed: %s", e2)
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid JWT: {e2}"
+                )
+            if not self._issued_for_this_app(payload):
+                logger.warning(
+                    "JWT without aud rejected: client_id=%r is not ours and no "
+                    "%s.* scope is present", payload.get("client_id"), self.xsappname,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Invalid JWT: token was not issued for this application",
+                )
         except jwt.PyJWTError as e:
             logger.warning("JWT validation failed: %s", e)
             raise HTTPException(
@@ -172,6 +255,21 @@ class XsuaaValidator:
             )
 
         return payload
+
+    def _issued_for_this_app(self, payload: dict[str, Any]) -> bool:
+        """Whether an ``aud``-less token belongs to this app.
+
+        XSUAA writes the OAuth client into both ``client_id`` and ``cid``;
+        either matching our client is proof enough. Failing that, a scope
+        prefixed with our xsappname could only have been granted by our own
+        xs-security.json.
+        """
+        for claim in ("client_id", "cid"):
+            if payload.get(claim) == self.client_id:
+                return True
+        prefix = f"{self.xsappname}."
+        scopes = payload.get("scope") or []
+        return any(isinstance(sc, str) and sc.startswith(prefix) for sc in scopes)
 
     def has_scope(self, payload: dict[str, Any], scope: str) -> bool:
         scopes = payload.get("scope") or []
@@ -183,12 +281,43 @@ _validator: XsuaaValidator | None = None
 _validator_checked = False
 
 
+class AuthConfigurationError(RuntimeError):
+    """Raised when AUTH_REQUIRED is on but no XSUAA binding can be resolved."""
+
+
+def auth_required() -> bool:
+    """Whether the process must refuse to run without an XSUAA binding.
+
+    ``AUTH_REQUIRED`` wins when set (``true``/``false``, case-insensitive);
+    otherwise it is on exactly when ``VCAP_APPLICATION`` marks a CF container.
+    """
+    raw = (os.environ.get("AUTH_REQUIRED") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return "VCAP_APPLICATION" in os.environ
+
+
 def get_validator() -> XsuaaValidator | None:
+    """The process-wide validator, or None when running open (dev mode).
+
+    Raises ``AuthConfigurationError`` instead of returning None when
+    ``auth_required()`` is true, so a misbound container fails loudly (the
+    lifespan calls this first) rather than serving every route to anyone.
+    """
     global _validator, _validator_checked
     if _validator_checked:
         return _validator
-    _validator_checked = True
     creds = get_xsuaa_credentials()
+    if not creds and auth_required():
+        raise AuthConfigurationError(
+            "AUTH_REQUIRED is on (default on Cloud Foundry) but no XSUAA "
+            "credentials were found in VCAP_SERVICES. Bind the xsuaa service "
+            "instance, or set AUTH_REQUIRED=false to knowingly run without "
+            "JWT validation."
+        )
+    _validator_checked = True
     if creds:
         _validator = XsuaaValidator(creds)
     else:
@@ -209,22 +338,19 @@ def _extract_token(request: Request) -> str | None:
 # ---------------------------------------------------------------------------
 # FastAPI dependencies
 #
-# Deliberately `def`, not `async def`. Nothing in them awaits, but
-# `validator.validate()` reaches PyJWKClient, which fetches the JWK set with
-# a *blocking* urllib call. Declared async, that call runs on the event loop
-# and stalls every other request in flight — one JWKS refresh delaying an
-# unrelated page load. Declared sync, FastAPI runs them in a threadpool and
-# a slow refresh costs only the request that triggered it.
+# ``JWTBindingMiddleware`` validates the bearer token once per request and
+# leaves the claims in ``current_claims``; these reuse them. They only fall
+# back to validating the token themselves when the middleware is not in front
+# (a router mounted in a test, say). Deliberately `def`, not `async def`:
+# that fallback reaches PyJWKClient, which fetches the JWK set with a
+# *blocking* urllib call. Declared sync, FastAPI runs them in a threadpool
+# and a slow refresh costs only the request that triggered it.
 # ---------------------------------------------------------------------------
-def require_user(request: Request) -> dict[str, Any]:
-    """Ensure a valid JWT is present (any authenticated user)."""
-    validator = get_validator()
+def _validated_claims(request: Request, validator: XsuaaValidator) -> dict[str, Any]:
+    claims = current_claims.get()
+    if claims is not None:
+        return claims
     token = _extract_token(request)
-
-    if validator is None:
-        # Dev mode (no XSUAA): allow and return anonymous user
-        return {"user_name": "local-dev", "scope": []}
-
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
@@ -232,25 +358,37 @@ def require_user(request: Request) -> dict[str, Any]:
     return validator.validate(token)
 
 
+def _require_scope(request: Request, scope: str, detail: str) -> dict[str, Any]:
+    validator = get_validator()
+    if validator is None:
+        return {"user_name": "local-dev", "scope": [scope]}
+    payload = _validated_claims(request, validator)
+    if not validator.has_scope(payload, scope):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+    return payload
+
+
+def require_user(request: Request) -> dict[str, Any]:
+    """Ensure a valid JWT is present (any authenticated user)."""
+    validator = get_validator()
+    if validator is None:
+        # Dev mode (no XSUAA): allow and return anonymous user
+        return {"user_name": "local-dev", "scope": []}
+    return _validated_claims(request, validator)
+
+
 def require_admin(request: Request) -> dict[str, Any]:
     """Ensure caller holds the `<xsappname>.admin` scope."""
-    validator = get_validator()
-    token = _extract_token(request)
+    return _require_scope(request, "admin", "Admin scope required")
 
-    if validator is None:
-        return {"user_name": "local-dev", "scope": ["admin"]}
 
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
-        )
-    payload = validator.validate(token)
-    if not validator.has_scope(payload, "admin"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin scope required",
-        )
-    return payload
+def require_a2a(request: Request) -> dict[str, Any]:
+    """Ensure the caller holds the `<xsappname>.a2a` scope.
+
+    The approuter enforces the same scope on its `/a2a` route, but the backend
+    has a public CF route of its own, so the check has to live here too.
+    """
+    return _require_scope(request, "a2a", "A2A scope required")
 
 
 def require_jobscheduler(request: Request) -> dict[str, Any]:
@@ -259,23 +397,7 @@ def require_jobscheduler(request: Request) -> dict[str, Any]:
     Granted to the jobscheduler service instance via `grant-as-authority-to-apps`
     in xs-security.json, so only the scheduler can trigger runs.
     """
-    validator = get_validator()
-    token = _extract_token(request)
-
-    if validator is None:
-        return {"user_name": "local-dev", "scope": ["JOBSCHEDULER"]}
-
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token"
-        )
-    payload = validator.validate(token)
-    if not validator.has_scope(payload, "JOBSCHEDULER"):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Job scheduler scope required",
-        )
-    return payload
+    return _require_scope(request, "JOBSCHEDULER", "Job scheduler scope required")
 
 
 # ---------------------------------------------------------------------------

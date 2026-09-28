@@ -113,6 +113,16 @@ export type OAuthClient =
            * narrow `team` further; blank means every channel of the team.
            */
           channels?: string;
+          // --- destinations ---
+          /**
+           * `destination` only. On, the destination is resolved with the
+           * signed-in user's JWT (sent to the destination service as
+           * X-user-token) and the tools act as that user; off, the
+           * destination's own app-level credential is used and the app-only
+           * rules apply (mailbox required, Teams read-only). Only sent as
+           * `true`. See agents/destination_auth.py.
+           */
+          user_context?: boolean;
       };
 
 export interface McpServer {
@@ -141,6 +151,10 @@ export interface AgentInput {
     /** Overrides the globally-active LLM for this agent only. Blank means
      * "use the active model" (see `ModelInfo`, `GET /admin/api/model`). */
     model_name: string;
+    /** Deep-agent tools (planning, scratchpad, sub-agents). Optional on the
+     * wire: an absent key keeps what is stored, like `peers`. See the
+     * `--- deep agents ---` section at the end of this file. */
+    deep?: DeepConfig;
 }
 
 /** What GET /admin/api/agents returns. Servers are redacted. */
@@ -226,6 +240,11 @@ export interface CredentialStatus {
     /** ISO expiry of the access token, or null when the server issued no
      * `expires_in` (the token does not expire on its own). */
     expires_at: string | null;
+    /** True for `app_only` and `destination` servers: connected by
+     * configuration, not by anyone signing in. For those the server reports
+     * `has_token: true` and `token_state: "valid"` so the panel does not show
+     * "not connected" with no way to fix it. */
+    no_user_token: boolean;
 }
 
 /** One agent/server whose scheduled runs will fail for want of a credential. */
@@ -275,7 +294,10 @@ export interface ImportPayload {
     orchestrator_instructions?: string | null;
     skills: SkillInput[];
     agents: AgentInput[];
-    /** If true, delete agents/skills absent from the import. */
+    /** Optional: an export made before workflows existed carries none, and
+     * `replace` only removes workflows when the bundle has this section. */
+    workflows?: WorkflowInput[];
+    /** If true, delete agents/skills/workflows absent from the import. */
     replace: boolean;
 }
 
@@ -475,3 +497,65 @@ export interface WorkflowRunDetail {
     items: WorkflowItemRun[];
     steps: WorkflowStepRun[];
 }
+
+// --- where used ---
+/** One agent that lists the queried agent as a peer. */
+export interface WhereUsedPeer {
+    id: number;
+    name: string;
+    enabled: boolean;
+}
+
+/** One workflow step that runs the queried agent; `branch_key` null is the
+ * main line. Positions count within their group, as everywhere else. */
+export interface WhereUsedStep {
+    position: number;
+    branch_key: string | null;
+}
+
+export interface WhereUsedWorkflow {
+    id: number;
+    name: string;
+    api_slug: string | null;
+    enabled: boolean;
+    steps: WhereUsedStep[];
+}
+
+/** GET /admin/api/agents/{id}/where-used. Disabled referrers are included
+ * and flagged -- unlike the server's delete/disable guard, this is for an
+ * operator to read, and a switched-off workflow still needs its agent. */
+export interface AgentWhereUsed {
+    agent: { id: number; name: string };
+    peers: WhereUsedPeer[];
+    workflows: WhereUsedWorkflow[];
+}
+
+// --- deep agents -------------------------------------------------------------
+
+/** Mirrors `agents.deep.DeepConfig`. `GET` always returns it (defaults when
+ * nothing is stored); `POST`/`PUT` may omit it to keep the stored value. */
+export interface DeepConfig {
+    enabled: boolean;
+    /** `write_todos` / `read_todos` */
+    planning: boolean;
+    /** `ls` / `read_file` / `write_file` / `edit_file` on a per-run scratchpad */
+    scratchpad: boolean;
+    /** the `task` tool that runs an ephemeral sub-agent */
+    subagents: boolean;
+    /** 1..20 concurrent sub-agents per run */
+    max_subagents: number;
+    /** 1..3; 1 means sub-agents cannot spawn sub-agents of their own */
+    subagent_max_depth: number;
+    /** replaces the default sub-agent system prompt when non-blank */
+    subagent_instructions: string;
+}
+
+export const DEEP_DEFAULTS: Readonly<DeepConfig> = Object.freeze({
+    enabled: false,
+    planning: true,
+    scratchpad: true,
+    subagents: true,
+    max_subagents: 5,
+    subagent_max_depth: 1,
+    subagent_instructions: ""
+});

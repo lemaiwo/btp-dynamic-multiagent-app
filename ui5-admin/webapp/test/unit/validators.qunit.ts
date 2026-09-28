@@ -1,4 +1,5 @@
-import validators, { validateWorkflowSteps } from "com/agent/admin/model/validators";
+import validators, { validateDeep, validateWorkflowSteps } from "com/agent/admin/model/validators";
+import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 import type { WorkflowStep } from "com/agent/admin/service/types";
 
 QUnit.module("validators.validateServerUrl");
@@ -182,6 +183,60 @@ QUnit.test("destination mode refuses dynamic registration", (assert) => {
     assert.ok(
         validators.validateOAuth({ dcr: true }, "destination", "builtin:jira").length > 0
     );
+});
+
+// --- destinations ---
+QUnit.module("validators.validateOAuth on a destination, per built-in");
+
+QUnit.test("the destination name has a shape", (assert) => {
+    assert.ok(validators.validateOAuth({ destination: "bad name!" }, "destination", "builtin:jira")
+        .indexOf("destination name") > -1);
+    assert.ok(validators.validateOAuth({ destination: "x".repeat(201) }, "destination", "builtin:jira")
+        .length > 0);
+    assert.strictEqual(validators.validateOAuth({ destination: "My.Dest-1_a" }, "destination", "builtin:jira"), "");
+});
+
+QUnit.test("outlook and gmail need a mailbox unless acting as the signed-in user", (assert) => {
+    ["builtin:outlook", "builtin:gmail"].forEach((url) => {
+        assert.ok(validators.validateOAuth({ destination: "D" }, "destination", url)
+            .indexOf("mailbox") > -1, `${url} without a mailbox`);
+        assert.strictEqual(validators.validateOAuth(
+            { destination: "D", mailbox: "svc@example.com" }, "destination", url), "");
+        assert.strictEqual(validators.validateOAuth(
+            { destination: "D", user_context: true }, "destination", url), "");
+    });
+});
+
+QUnit.test("teams needs its team on a destination and posts only as the user", (assert) => {
+    assert.ok(validators.validateOAuth({ destination: "D" }, "destination", "builtin:teams")
+        .indexOf("team") > -1);
+    assert.strictEqual(validators.validateOAuth(
+        { destination: "D", team: "t" }, "destination", "builtin:teams"), "");
+    const error = validators.validateOAuth(
+        { destination: "D", team: "t", allow_send: true }, "destination", "builtin:teams");
+    assert.ok(error.indexOf("signed-in user") > -1, error);
+    assert.strictEqual(validators.validateOAuth(
+        { destination: "D", team: "t", allow_send: true, user_context: true },
+        "destination", "builtin:teams"), "");
+});
+
+QUnit.test("built-ins with no user refuse the user-context switch", (assert) => {
+    ["builtin:sapnotes", "builtin:sapnotedetail", "builtin:jira", "builtin:slack"].forEach((url) => {
+        assert.ok(validators.validateOAuth({ destination: "D", user_context: true }, "destination", url)
+            .indexOf("no signed-in user") > -1, url);
+        assert.strictEqual(validators.validateOAuth({ destination: "D" }, "destination", url), "", url);
+    });
+});
+
+QUnit.test("validateServers accepts a destination on every built-in", (assert) => {
+    const errors = validators.validateServers([
+        { url: "builtin:gmail", auth_mode: "destination", oauth: { destination: "G", user_context: true } },
+        { url: "builtin:outlook", auth_mode: "destination", oauth: { destination: "O", mailbox: "a@b" } },
+        { url: "builtin:teams", auth_mode: "destination", oauth: { destination: "T", team: "t" } },
+        { url: "builtin:sapnotes", auth_mode: "destination", oauth: { destination: "N" } },
+        { url: "builtin:sapnotedetail", auth_mode: "destination", oauth: { destination: "S" } }
+    ]);
+    assert.deepEqual(errors, {});
 });
 
 QUnit.module("validators.validateServers");
@@ -446,4 +501,31 @@ QUnit.test("errors are keyed by the step's index", function (assert) {
         wfStep({ kind: "http", agent_name: "", config: { destination: "", path: "/x", timeout_seconds: 30 } })
     ]);
     assert.deepEqual(Object.keys(errors), ["1", "2"]);
+});
+
+// --- deep agents -------------------------------------------------------------
+
+QUnit.module("validators.validateDeep");
+
+QUnit.test("the defaults and the full range are valid", function (assert) {
+    assert.deepEqual(validateDeep(undefined), {}, "no config, nothing to check");
+    assert.deepEqual(validateDeep({ ...DEEP_DEFAULTS }), {});
+    assert.deepEqual(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 1, subagent_max_depth: 1 }), {});
+    assert.deepEqual(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 20, subagent_max_depth: 3 }), {});
+});
+
+QUnit.test("max_subagents must be 1..20", function (assert) {
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 0 }).max_subagents, "0 is refused");
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 21 }).max_subagents, "21 is refused");
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 2.5 }).max_subagents, "fractions are refused");
+    assert.notOk(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 0 }).subagent_max_depth,
+        "an error on one field does not spill onto the other");
+});
+
+QUnit.test("subagent_max_depth must be 1..3", function (assert) {
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, subagent_max_depth: 0 }).subagent_max_depth, "0 is refused");
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, subagent_max_depth: 4 }).subagent_max_depth, "4 is refused");
+    const both = validateDeep({ ...DEEP_DEFAULTS, max_subagents: 99, subagent_max_depth: 9 });
+    assert.deepEqual(Object.keys(both).sort(), ["max_subagents", "subagent_max_depth"],
+        "both fields report at once so the form can flag both controls");
 });
