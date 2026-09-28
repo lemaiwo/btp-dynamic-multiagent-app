@@ -182,7 +182,7 @@
                         </headerToolbar>
                         <columns>
                             <Column><Text text="{i18n>stepBranch}" /></Column>
-                            <Column><Text text="{i18n>stepAgent}" /></Column>
+                            <Column><Text text="{i18n>stepKindColumn}" /></Column>
                             <Column><Text text="{i18n>stepInstructions}" /></Column>
                             <Column><Text text="{i18n>stepFanOut}" /></Column>
                             <Column><Text text="{i18n>stepTimeout}" /></Column>
@@ -199,16 +199,144 @@
                                         width="9rem">
                                         <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
                                     </Select>
-                                    <Select
-                                        selectedKey="{workflow>agent_name}"
-                                        items="{workflow>agentOptions}"
-                                        forceSelection="false"
-                                        change=".onStepRowChange"
-                                        width="10rem">
-                                        <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
-                                    </Select>
-                                    <TextArea value="{workflow>instructions}" rows="2" width="100%" />
-                                    <CheckBox selected="{workflow>fan_out}" select=".onStepRowChange" />
+                                    <!-- step kinds: the kind picks which of the
+                                         forms in the next cell is shown; the
+                                         agent dropdown only applies to kind
+                                         "agent". -->
+                                    <VBox>
+                                        <Select
+                                            class="stepKindSelect"
+                                            selectedKey="{workflow>kind}"
+                                            change=".onStepKindChange"
+                                            width="10rem">
+                                            <core:Item key="agent" text="{i18n>stepKindAgent}" />
+                                            <core:Item key="condition" text="{i18n>stepKindCondition}" />
+                                            <core:Item key="transform" text="{i18n>stepKindTransform}" />
+                                            <core:Item key="http" text="{i18n>stepKindHttp}" />
+                                            <core:Item key="python" text="{i18n>stepKindPython}" />
+                                        </Select>
+                                        <Select
+                                            class="stepAgentSelect sapUiTinyMarginTop"
+                                            selectedKey="{workflow>agent_name}"
+                                            items="{workflow>agentOptions}"
+                                            forceSelection="false"
+                                            change=".onStepRowChange"
+                                            visible="{= ${workflow>kind} === 'agent' }"
+                                            width="10rem">
+                                            <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
+                                        </Select>
+                                    </VBox>
+                                    <VBox width="100%">
+                                        <TextArea
+                                            value="{workflow>instructions}"
+                                            visible="{= ${workflow>kind} === 'agent' }"
+                                            rows="2"
+                                            width="100%" />
+
+                                        <!-- condition -->
+                                        <VBox class="stepKindForm" visible="{= ${workflow>kind} === 'condition' }" width="100%">
+                                            <Text text="{i18n>stepCondHint}" class="sapUiTinyMarginBottom" />
+                                            <List items="{workflow>cfg/rules}" showNoData="false" showSeparators="None">
+                                                <CustomListItem>
+                                                    <HBox wrap="Wrap" alignItems="Center" class="sapUiTinyMarginBottom">
+                                                        <Select selectedKey="{workflow>source}" width="6rem" class="sapUiTinyMarginEnd" tooltip="{i18n>stepCondSource}">
+                                                            <core:Item key="text" text="text" />
+                                                            <core:Item key="item" text="item" />
+                                                            <core:Item key="json" text="json" />
+                                                        </Select>
+                                                        <Input value="{workflow>field}" placeholder="{i18n>stepCondField}" width="9rem" class="sapUiTinyMarginEnd" />
+                                                        <Select selectedKey="{workflow>op}" width="8rem" class="sapUiTinyMarginEnd" tooltip="{i18n>stepCondOp}">
+                                                            <core:Item key="contains" text="contains" />
+                                                            <core:Item key="not_contains" text="not_contains" />
+                                                            <core:Item key="equals" text="equals" />
+                                                            <core:Item key="not_equals" text="not_equals" />
+                                                            <core:Item key="matches" text="matches" />
+                                                            <core:Item key="not_matches" text="not_matches" />
+                                                            <core:Item key="gt" text="gt" />
+                                                            <core:Item key="lt" text="lt" />
+                                                            <core:Item key="is_empty" text="is_empty" />
+                                                            <core:Item key="not_empty" text="not_empty" />
+                                                        </Select>
+                                                        <Input value="{workflow>value}" placeholder="{i18n>stepCondValue}" width="9rem" class="sapUiTinyMarginEnd" />
+                                                        <CheckBox selected="{workflow>case_sensitive}" text="{i18n>stepCondCase}" />
+                                                        <Select selectedKey="{workflow>action}" width="7rem" class="sapUiTinyMarginEnd" tooltip="{i18n>stepCondAction}">
+                                                            <core:Item key="continue" text="{i18n>stepActionContinue}" />
+                                                            <core:Item key="stop" text="{i18n>stepActionStop}" />
+                                                        </Select>
+                                                        <Input value="{workflow>output}" placeholder="{i18n>stepCondOutput}" width="12rem" class="sapUiTinyMarginEnd" />
+                                                        <Button icon="sap-icon://decline" type="Transparent" tooltip="{i18n>stepRemoveRule}" press=".onRemoveConditionRule" />
+                                                    </HBox>
+                                                </CustomListItem>
+                                            </List>
+                                            <HBox alignItems="Center" wrap="Wrap">
+                                                <Button class="addRuleButton sapUiTinyMarginEnd" icon="sap-icon://add" text="{i18n>stepAddRule}" press=".onAddConditionRule" />
+                                                <Label text="{i18n>stepCondElse}" class="sapUiTinyMarginEnd" />
+                                                <Select selectedKey="{workflow>cfg/else_action}" width="7rem" class="sapUiTinyMarginEnd">
+                                                    <core:Item key="continue" text="{i18n>stepActionContinue}" />
+                                                    <core:Item key="stop" text="{i18n>stepActionStop}" />
+                                                </Select>
+                                                <Input value="{workflow>cfg/else_output}" placeholder="{i18n>stepCondOutput}" width="14rem" />
+                                            </HBox>
+                                        </VBox>
+
+                                        <!-- transform -->
+                                        <f:SimpleForm class="stepKindForm" visible="{= ${workflow>kind} === 'transform' }" layout="ResponsiveGridLayout" editable="true" labelSpanL="3" labelSpanM="3">
+                                            <Label text="{i18n>stepTfExtract}" />
+                                            <Input class="stepTfExtract" value="{workflow>cfg/extract_json}" placeholder="a.b[0]" />
+                                            <Label text="{i18n>stepTfPattern}" />
+                                            <Input class="stepTfPattern" value="{workflow>cfg/regex_pattern}" />
+                                            <Label text="{i18n>stepTfReplace}" />
+                                            <Input value="{workflow>cfg/regex_replace}" />
+                                            <Label text="{i18n>stepTfFlags}" />
+                                            <Input value="{workflow>cfg/regex_flags}" placeholder="imsx" width="5rem" />
+                                            <Label text="{i18n>stepTfTemplate}" />
+                                            <TextArea class="stepTfTemplate" value="{workflow>cfg/template}" rows="2" width="100%" placeholder="Summary: \{\{text}} (\{\{item.id}})" />
+                                            <Label text="{i18n>stepTfTruncate}" />
+                                            <Input class="stepTfTruncate" value="{workflow>cfg/truncate}" type="Number" width="7rem" />
+                                        </f:SimpleForm>
+
+                                        <!-- http -->
+                                        <f:SimpleForm class="stepKindForm" visible="{= ${workflow>kind} === 'http' }" layout="ResponsiveGridLayout" editable="true" labelSpanL="3" labelSpanM="3">
+                                            <Label text="{i18n>stepHttpDestination}" required="true" />
+                                            <Input class="stepHttpDestination" value="{workflow>cfg/destination}" />
+                                            <Label text="{i18n>stepHttpMethod}" />
+                                            <Select selectedKey="{workflow>cfg/method}" width="7rem">
+                                                <core:Item key="GET" text="GET" />
+                                                <core:Item key="POST" text="POST" />
+                                                <core:Item key="PUT" text="PUT" />
+                                                <core:Item key="PATCH" text="PATCH" />
+                                                <core:Item key="DELETE" text="DELETE" />
+                                            </Select>
+                                            <Label text="{i18n>stepHttpPath}" required="true" />
+                                            <Input class="stepHttpPath" value="{workflow>cfg/path}" placeholder="/rest/api/2/issue/\{\{item.id}}" />
+                                            <Label text="{i18n>stepHttpQuery}" />
+                                            <TextArea value="{workflow>cfg/query_text}" rows="2" width="100%" placeholder="\{&quot;fields&quot;: &quot;summary&quot;}" />
+                                            <Label text="{i18n>stepHttpHeaders}" />
+                                            <TextArea value="{workflow>cfg/headers_text}" rows="2" width="100%" />
+                                            <Label text="{i18n>stepHttpBody}" />
+                                            <TextArea value="{workflow>cfg/body}" rows="2" width="100%" />
+                                            <Label text="{i18n>stepHttpContentType}" />
+                                            <Input value="{workflow>cfg/content_type}" />
+                                            <Label text="{i18n>stepHttpTimeout}" />
+                                            <StepInput value="{workflow>cfg/http_timeout}" min="1" max="600" step="5" width="7rem" />
+                                            <Label text="{i18n>stepHttpExpect}" />
+                                            <Input value="{workflow>cfg/expect_status_text}" placeholder="200,201 (empty = any 2xx)" />
+                                        </f:SimpleForm>
+
+                                        <!-- python -->
+                                        <f:SimpleForm class="stepKindForm" visible="{= ${workflow>kind} === 'python' }" layout="ResponsiveGridLayout" editable="true" labelSpanL="3" labelSpanM="3">
+                                            <Label text="{i18n>stepPyCode}" required="true" />
+                                            <TextArea class="stepPyCode" value="{workflow>cfg/code}" rows="6" width="100%" placeholder="output = text.upper()" />
+                                            <Label text="" />
+                                            <Text text="{i18n>stepPyHint}" />
+                                            <Label text="{i18n>stepPyTimeout}" />
+                                            <StepInput value="{workflow>cfg/py_timeout}" min="1" max="60" step="1" width="7rem" />
+                                        </f:SimpleForm>
+                                    </VBox>
+                                    <CheckBox
+                                        selected="{workflow>fan_out}"
+                                        enabled="{= ${workflow>kind} === 'agent' }"
+                                        select=".onStepRowChange" />
                                     <StepInput value="{workflow>step_timeout_seconds}" min="10" max="1800" step="10" width="7rem" />
                                     <HBox justifyContent="End" alignItems="Center">
                                         <Button icon="sap-icon://navigation-up-arrow" type="Transparent"

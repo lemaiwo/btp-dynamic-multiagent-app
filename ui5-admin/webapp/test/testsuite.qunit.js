@@ -18,6 +18,7 @@ sap.ui.define(function () {
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },
             "unit/workflowOrder": { title: "Unit: workflowOrder" },
+            "unit/stepKinds": { title: "Unit: stepKinds" },
             "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }
     };

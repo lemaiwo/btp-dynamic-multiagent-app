@@ -1,11 +1,17 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
 import MessageToast from "sap/m/MessageToast";
+import MessageBox from "sap/m/MessageBox";
 import { ValueState } from "sap/ui/core/library";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import { buildDefinitionGraph } from "../model/processFlowGraph";
 import { canMoveWithinGroup, groupSteps, swap } from "../model/workflowOrder";
+import {
+    emptyRule, emptyUiConfig, kindOf, uiConfigFromWire, wireConfigFromUi
+} from "../model/stepKinds";
+import type { UiStepConfig } from "../model/stepKinds";
+import { validateWorkflowSteps } from "../model/validators";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
@@ -45,6 +51,10 @@ interface RowOption {
 interface UiStep extends WorkflowStep {
     agentOptions: RowOption[];
     branchOptions: RowOption[];
+    // --- step kinds ---
+    /** Flat editor copy of `config` for the per-kind forms; see
+     * model/stepKinds.ts. Mapped back to `config` by `collectSteps()`. */
+    cfg?: UiStepConfig;
     /** Whether the move buttons are live for this row; see `workflowOrder`.
      * Precomputed per row because the table binding has no row index to
      * hand a formatter. */
@@ -149,7 +159,12 @@ export default class WorkflowDetail extends BaseController {
                 on_unknown_branch: workflow.on_unknown_branch,
                 enabled: workflow.enabled,
                 branches: (workflow.branches ?? []).map((b) => ({ ...b })),
-                steps: (workflow.steps ?? []).map((s) => ({ ...s }))
+                // --- step kinds --- a row written before kinds existed has
+                // none; it is an agent step. `cfg` is the editor copy of the
+                // stored config, built once here and mapped back on save.
+                steps: (workflow.steps ?? []).map((s) => ({
+                    ...s, kind: kindOf(s), cfg: uiConfigFromWire(kindOf(s), s.config)
+                }))
             } as UiWorkflowData);
             model.setProperty("/title", workflow.name);
             this.refreshStepOptions();
@@ -354,6 +369,9 @@ export default class WorkflowDetail extends BaseController {
             instructions: "",
             fan_out: false,
             step_timeout_seconds: 600,
+            kind: "agent",
+            config: {},
+            cfg: emptyUiConfig("agent"),
             agentOptions: this.buildAgentOptions(""),
             branchOptions: this.buildBranchOptionsForStep(null)
         });
@@ -379,6 +397,57 @@ export default class WorkflowDetail extends BaseController {
     /** A step's branch changed, so the row belongs to another group now. */
     public onStepBranchChange(): void {
         this.regroupSteps();
+    }
+
+    // --- step kinds ---------------------------------------------------------
+
+    /** The model path of the step row a press/change event came from
+     * (`/data/steps/N`), whether the control sits directly in the row or in
+     * a nested rule list under it. */
+    private static stepPath(event: Event): string {
+        const path = (event.getSource() as Control).getBindingContext("workflow")?.getPath() ?? "";
+        const match = /^(\/data\/steps\/\d+)/.exec(path);
+        return match ? match[1] : path;
+    }
+
+    /**
+     * A step's kind changed. The two-way binding has written `kind`; this
+     * clears what the new kind cannot use (an agent, the fan-out flag) and
+     * gives the row a fresh editor config for that kind -- unless it is the
+     * kind the config was built for, so switching away and back within one
+     * edit keeps what was typed.
+     */
+    public onStepKindChange(event: Event): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const path = WorkflowDetail.stepPath(event);
+        const step = model.getProperty(path) as UiStep;
+        const kind = kindOf(step);
+        if (kind !== "agent") {
+            model.setProperty(`${path}/agent_name`, "");
+            model.setProperty(`${path}/fan_out`, false);
+        }
+        if (!step.cfg || step.cfg.kind !== kind) {
+            model.setProperty(`${path}/cfg`, emptyUiConfig(kind));
+        }
+        this.refreshFlow();
+    }
+
+    public onAddConditionRule(event: Event): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const path = `${WorkflowDetail.stepPath(event)}/cfg/rules`;
+        const rules = ((model.getProperty(path) as UiStepConfig["rules"]) || []).slice();
+        rules.push(emptyRule());
+        model.setProperty(path, rules);
+    }
+
+    public onRemoveConditionRule(event: Event): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const rulePath = (event.getSource() as Control).getBindingContext("workflow")?.getPath() ?? "";
+        const index = Number(rulePath.substring(rulePath.lastIndexOf("/") + 1));
+        const listPath = rulePath.substring(0, rulePath.lastIndexOf("/"));
+        const rules = ((model.getProperty(listPath) as UiStepConfig["rules"]) || []).slice();
+        rules.splice(index, 1);
+        model.setProperty(listPath, rules);
     }
 
     /** The row index of a press event's binding context, for tables whose
@@ -419,19 +488,37 @@ export default class WorkflowDetail extends BaseController {
      * globally instead of per group rejects every save for a reason the
      * operator did nothing to cause.
      */
-    private static collectSteps(steps: UiStep[]): WorkflowStep[] {
+    private static collectSteps(steps: UiStep[], strict = false): WorkflowStep[] {
         const counters: Record<string, number> = {};
-        return steps.map((s) => {
+        return steps.map((s, index) => {
             const branchKey = (s.branch_key || "").trim() || null;
             const groupKey = branchKey ?? "";
             counters[groupKey] = (counters[groupKey] || 0) + 1;
+            // --- step kinds --- a non-agent step names no agent and cannot
+            // be the fan-out step; its settings travel in `config`, mapped
+            // back from the flat editor copy. In lenient mode (the preview)
+            // a JSON field that does not parse yet is simply left empty; the
+            // save is strict and reports it with the row number.
+            const kind = kindOf(s);
+            let config: WorkflowStep["config"] = {};
+            if (kind !== "agent") {
+                try {
+                    config = wireConfigFromUi(kind, s.cfg);
+                } catch (error) {
+                    if (strict) {
+                        throw new Error(`${index + 1}\u0000${(error as Error).message}`);
+                    }
+                }
+            }
             return {
                 branch_key: branchKey,
                 position: counters[groupKey],
-                agent_name: s.agent_name,
-                instructions: s.instructions,
-                fan_out: s.fan_out,
-                step_timeout_seconds: s.step_timeout_seconds
+                agent_name: kind === "agent" ? s.agent_name : "",
+                instructions: kind === "agent" ? s.instructions : "",
+                fan_out: kind === "agent" && s.fan_out,
+                step_timeout_seconds: s.step_timeout_seconds,
+                kind,
+                config
             };
         });
     }
@@ -440,6 +527,26 @@ export default class WorkflowDetail extends BaseController {
         const model = this.getModel("workflow") as JSONModel;
         model.setProperty("/errors", {});
         const data = model.getProperty("/data") as UiWorkflowData;
+
+        // --- step kinds --- strict: a JSON field on an http step that does
+        // not parse stops the save here, naming the row, instead of sending
+        // an empty object the operator never typed.
+        let steps: WorkflowStep[];
+        try {
+            steps = WorkflowDetail.collectSteps(data.steps, true);
+        } catch (error) {
+            const [row, message] = String((error as Error).message).split("\u0000");
+            MessageBox.error(this.text("workflowStepInvalid", [row, message ?? row]));
+            return;
+        }
+        const stepErrors = validateWorkflowSteps(steps);
+        const stepErrorRows = Object.keys(stepErrors).map(Number).sort((a, b) => a - b);
+        if (stepErrorRows.length) {
+            MessageBox.error(stepErrorRows
+                .map((i) => this.text("workflowStepInvalid", [String(i + 1), stepErrors[i]]))
+                .join("\n"));
+            return;
+        }
 
         const payload: WorkflowInput = {
             name: data.name,
@@ -452,7 +559,7 @@ export default class WorkflowDetail extends BaseController {
             on_unknown_branch: data.on_unknown_branch,
             enabled: data.enabled,
             branches: WorkflowDetail.collectBranches(data.branches),
-            steps: WorkflowDetail.collectSteps(data.steps)
+            steps
         };
 
         try {

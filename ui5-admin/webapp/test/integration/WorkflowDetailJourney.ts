@@ -8,11 +8,14 @@ import type Table from "sap/m/Table";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Button from "sap/m/Button";
 import type HBox from "sap/m/HBox";
+import type VBox from "sap/m/VBox";
+import type SimpleForm from "sap/ui/layout/form/SimpleForm";
 import type Input from "sap/m/Input";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
 import type Text from "sap/m/Text";
 import type UI5Element from "sap/ui/core/Element";
+import type Control from "sap/ui/core/Control";
 import type ProcessFlow from "sap/suite/ui/commons/ProcessFlow";
 import type { WorkflowStep } from "com/agent/admin/service/types";
 import Common, { backend } from "./pages/Common";
@@ -23,6 +26,12 @@ import Common, { backend } from "./pages/Common";
  * write back through their two-way binding when set programmatically
  * (only a genuine `change` event does). */
 type StepRow = WorkflowStep & { agentOptions: unknown; branchOptions: unknown };
+
+/** A step row's agent `<Select>`. Since step kinds, the second cell is a
+ * VBox holding the kind select and, under it, the agent select. */
+function agentSelectOf(row: ColumnListItem): Select {
+    return (row.getCells()[1] as VBox).getItems()[1] as Select;
+}
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -78,7 +87,7 @@ opaTest(
                     "the fan-out step's branch select preselects 'Main line' (branch_key null)"
                 );
                 Opa5.assert.strictEqual(
-                    (mainLineRow.getCells()[1] as Select).getSelectedKey(), "gmail-agent",
+                    agentSelectOf(mainLineRow).getSelectedKey(), "gmail-agent",
                     "the fan-out step's agent is preselected"
                 );
 
@@ -88,7 +97,7 @@ opaTest(
                     "a branch step's branch is preselected"
                 );
                 Opa5.assert.strictEqual(
-                    (billingRow.getCells()[1] as Select).getSelectedKey(), "btp-agent",
+                    agentSelectOf(billingRow).getSelectedKey(), "btp-agent",
                     "a branch step's agent is preselected"
                 );
             }
@@ -282,22 +291,26 @@ opaTest(
                     [
                         {
                             branch_key: null, position: 1, agent_name: "gmail-agent",
-                            instructions: "Read new mail.", fan_out: true, step_timeout_seconds: 600
+                            instructions: "Read new mail.", fan_out: true, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         },
                         {
                             branch_key: "billing", position: 1, agent_name: "btp-agent",
-                            instructions: "Draft a billing reply.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Draft a billing reply.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         },
                         {
                             branch_key: "support", position: 1, agent_name: "btp-agent",
-                            instructions: "Draft a support reply.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Draft a support reply.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         },
                         {
                             branch_key: "support", position: 2, agent_name: "btp-agent",
-                            instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         }
                     ],
-                    "every step's branch, agent, instructions and per-group position survive the save, unchanged"
+                    "every step's branch, agent, instructions and per-group position survive the save, unchanged (a stored step without a kind is submitted as an agent step)"
                 );
                 Opa5.assert.deepEqual(
                     saved?.branches,
@@ -345,7 +358,7 @@ opaTest(
             success: function (element: UI5Element) {
                 const table = element as Table;
                 const ghostRow = stepRowMatching(table, "Whoever last ran this agent");
-                const agentSelect = ghostRow.getCells()[1] as Select;
+                const agentSelect = agentSelectOf(ghostRow);
                 Opa5.assert.strictEqual(
                     agentSelect.getSelectedKey(), "ghost-agent",
                     "the missing agent's name stays selected instead of the browser defaulting to the first real agent"
@@ -405,7 +418,7 @@ opaTest(
                 const table = element as Table;
                 const ghostRow = stepRowMatching(table, "Whoever last ran this agent");
                 Opa5.assert.strictEqual(
-                    (ghostRow.getCells()[1] as Select).getSelectedKey(), "ghost-agent",
+                    agentSelectOf(ghostRow).getSelectedKey(), "ghost-agent",
                     "after the rejected save, the step still names the missing agent -- it was never silently substituted"
                 );
             }
@@ -581,7 +594,8 @@ opaTest(
                     created?.steps,
                     [{
                         branch_key: "abap", position: 1, agent_name: "gmail-agent",
-                        instructions: "", fan_out: false, step_timeout_seconds: 600
+                        instructions: "", fan_out: false, step_timeout_seconds: 600,
+                        kind: "agent", config: {}
                     }],
                     "the step added on the 'new' form was submitted"
                 );
@@ -649,22 +663,159 @@ opaTest(
                     [
                         {
                             branch_key: "billing", position: 1, agent_name: "btp-agent",
-                            instructions: "Draft a billing reply.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Draft a billing reply.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         },
                         {
                             branch_key: "support", position: 1, agent_name: "btp-agent",
-                            instructions: "Draft a support reply.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Draft a support reply.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         },
                         {
                             branch_key: "support", position: 2, agent_name: "btp-agent",
-                            instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Send the reply.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         },
                         {
                             branch_key: "support", position: 3, agent_name: "btp-agent",
-                            instructions: "Escalate to a human.", fan_out: false, step_timeout_seconds: 600
+                            instructions: "Escalate to a human.", fan_out: false, step_timeout_seconds: 600,
+                            kind: "agent", config: {}
                         }
                     ],
                     "the main line is gone with no gap left behind, and 'support' is numbered 1..3 on its own, not 2..4 following 'billing'"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+// --- step kinds ---
+opaTest(
+    "a transform step added between agent steps is saved with its kind and config, and needs no agent",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp("workflows");
+
+        // Injected after FakeBackend.reset() but before the row press below
+        // loads the editor, so GET /workflows/102 answers with a stored
+        // transform step -- as the server returns one -- already in place.
+        When.waitFor({
+            success: function () {
+                backend.workflows[0].steps.push({
+                    branch_key: "billing", position: 2, agent_name: "",
+                    instructions: "", fan_out: false, step_timeout_seconds: 60,
+                    kind: "transform",
+                    config: { extract_json: "", regex: null, template: "Reply: {{text}}", truncate: 300 }
+                });
+            }
+        });
+
+        When.waitFor({
+            id: "workflowsTable",
+            viewName: "Workflows",
+            matchers: function (element: UI5Element) { return (element as Table).getItems()[0]; },
+            actions: new Press()
+        });
+
+        // The stored transform step opens into its own form: the kind select
+        // says transform, the agent dropdown is hidden for that row and the
+        // template field carries the stored value.
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            check: function (element: UI5Element) {
+                return (element as Table).getItems().length === 5;
+            },
+            success: function (element: UI5Element) {
+                const table = element as Table;
+                const row = table.getItems().find((item) => {
+                    const step = item.getBindingContext("workflow")?.getObject() as StepRow;
+                    return step.kind === "transform";
+                }) as ColumnListItem;
+                Opa5.assert.ok(row, "the stored transform step has a row");
+                const kindCell = row.getCells()[1] as VBox;
+                const kindSelect = kindCell.getItems()[0] as Select;
+                const agentSelect = kindCell.getItems()[1] as Select;
+                Opa5.assert.strictEqual(kindSelect.getSelectedKey(), "transform", "its kind select shows transform");
+                Opa5.assert.notOk(agentSelect.getVisible(), "the agent dropdown is hidden for a transform step");
+                const forms = row.getCells()[2] as VBox;
+                const transformForm = forms.getItems().find(
+                    (c) => c.hasStyleClass("stepKindForm") && c.getVisible()
+                ) as SimpleForm;
+                Opa5.assert.ok(transformForm, "exactly the transform form is visible");
+                const template = transformForm.getContent().find(
+                    (c) => (c as Control).hasStyleClass("stepTfTemplate")
+                ) as Input;
+                Opa5.assert.strictEqual(template.getValue(), "Reply: {{text}}", "the template field carries the stored value");
+                // Edit through the model, as the other journeys do for row
+                // controls (see the StepRow comment above).
+                const model = table.getModel("workflow") as JSONModel;
+                const path = row.getBindingContext("workflow")!.getPath();
+                model.setProperty(`${path}/cfg/template`, "Billing reply: {{text}}");
+                model.setProperty(`${path}/cfg/truncate`, "250");
+            }
+        });
+
+        // A brand-new row switched to `python` gets its editor and is
+        // submitted with code and timeout, no agent.
+        When.waitFor({ id: "addStepButton", viewName: "WorkflowDetail", actions: new Press() });
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const table = element as Table;
+                const model = table.getModel("workflow") as JSONModel;
+                const steps = model.getProperty("/data/steps") as StepRow[];
+                const path = `/data/steps/${steps.length - 1}`;
+                // The binding writes `kind` on a genuine change only, so set
+                // it and fire the handler the way a user's pick would.
+                model.setProperty(`${path}/kind`, "python");
+                const last = table.getItems()[table.getItems().length - 1] as ColumnListItem;
+                const kindSelect = (last.getCells()[1] as VBox).getItems()[0] as Select;
+                kindSelect.fireChange({ selectedItem: kindSelect.getSelectedItem() ?? undefined });
+                const pythonForm = (last.getCells()[2] as VBox).getItems().find(
+                    (c) => c.hasStyleClass("stepKindForm") && c.getVisible()
+                ) as SimpleForm;
+                Opa5.assert.ok(
+                    pythonForm && pythonForm.getContent().some((c) => (c as Control).hasStyleClass("stepPyCode")),
+                    "switching the kind to python shows the python form"
+                );
+                model.setProperty(`${path}/cfg/code`, "output = len(text)");
+                model.setProperty(`${path}/cfg/py_timeout`, 5);
+            }
+        });
+
+        When.waitFor({ id: "saveWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        Then.waitFor({
+            id: "workflowsTable",
+            viewName: "Workflows",
+            success: function () {
+                const saved = backend.workflows.find((w) => w.id === WORKFLOW_ID);
+                const transform = saved?.steps.find((s) => s.kind === "transform");
+                Opa5.assert.deepEqual(
+                    transform,
+                    {
+                        branch_key: "billing", position: 2, agent_name: "", instructions: "",
+                        fan_out: false, step_timeout_seconds: 60, kind: "transform",
+                        config: { extract_json: "", regex: null, template: "Billing reply: {{text}}", truncate: 250 }
+                    },
+                    "the transform step is saved with its kind and the edited config, and no agent"
+                );
+                const python = saved?.steps.find((s) => s.kind === "python");
+                Opa5.assert.deepEqual(
+                    python,
+                    {
+                        branch_key: null, position: 2, agent_name: "", instructions: "",
+                        fan_out: false, step_timeout_seconds: 600, kind: "python",
+                        config: { code: "output = len(text)", timeout_seconds: 5 }
+                    },
+                    "the row switched to python is saved with its code and timeout, positioned after the fan-out step on the main line"
+                );
+                Opa5.assert.ok(
+                    saved?.steps.filter((s) => s.kind === "agent").every((s) => s.config && Object.keys(s.config).length === 0),
+                    "agent steps carry an empty config"
                 );
             }
         });

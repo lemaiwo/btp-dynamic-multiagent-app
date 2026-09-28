@@ -1,4 +1,5 @@
-import validators from "com/agent/admin/model/validators";
+import validators, { validateWorkflowSteps } from "com/agent/admin/model/validators";
+import type { WorkflowStep } from "com/agent/admin/service/types";
 
 QUnit.module("validators.validateServerUrl");
 
@@ -352,4 +353,97 @@ QUnit.test("teams cannot post as the application", function (assert) {
 QUnit.test("teams rejects modes it cannot authenticate with", function (assert) {
     assert.notStrictEqual(validators.validateOAuth(undefined, "jwt", "builtin:teams"), "");
     assert.notStrictEqual(validators.validateOAuth({ dcr: true }, "oauth2", "builtin:teams"), "");
+});
+
+// --- step kinds ---
+QUnit.module("validators.validateWorkflowSteps");
+
+function wfStep(over: Partial<WorkflowStep>): WorkflowStep {
+    return {
+        branch_key: null, position: 1, agent_name: "reader", instructions: "",
+        fan_out: false, step_timeout_seconds: 600, kind: "agent", config: {}, ...over
+    };
+}
+
+QUnit.test("an agent is required only for kind agent", function (assert) {
+    assert.deepEqual(validateWorkflowSteps([wfStep({})]), {}, "a named agent step is fine");
+    assert.ok(validateWorkflowSteps([wfStep({ agent_name: "" })])[0], "an agent step without an agent is not");
+    assert.ok(validateWorkflowSteps([wfStep({ agent_name: "  " })])[0], "blank counts as missing");
+    assert.deepEqual(
+        validateWorkflowSteps([wfStep({ kind: "transform", agent_name: "", config: {} })]),
+        {}, "a transform needs no agent"
+    );
+    assert.deepEqual(
+        validateWorkflowSteps([wfStep({ kind: "condition", agent_name: "", config: { rules: [] } })]),
+        {}, "a condition needs no agent"
+    );
+});
+
+QUnit.test("a step without a kind is an agent step", function (assert) {
+    assert.deepEqual(validateWorkflowSteps([wfStep({ kind: undefined })]), {});
+    assert.ok(validateWorkflowSteps([wfStep({ kind: undefined, agent_name: "" })])[0]);
+});
+
+QUnit.test("the fan-out step must be an agent", function (assert) {
+    const msg = validateWorkflowSteps([
+        wfStep({ kind: "python", agent_name: "", fan_out: true, config: { code: "output = 1", timeout_seconds: 5 } })
+    ])[0];
+    assert.ok(msg && msg.indexOf("fan-out") > -1, msg);
+    assert.deepEqual(validateWorkflowSteps([wfStep({ fan_out: true })]), {}, "an agent fan-out is fine");
+});
+
+QUnit.test("an unknown kind is rejected", function (assert) {
+    const msg = validateWorkflowSteps([wfStep({ kind: "shell" as WorkflowStep["kind"] })])[0];
+    assert.ok(msg && msg.indexOf("shell") > -1, msg);
+});
+
+QUnit.test("timeouts mirror the server's ranges", function (assert) {
+    assert.ok(validateWorkflowSteps([wfStep({ step_timeout_seconds: 5 })])[0], "step timeout below 10");
+    assert.ok(validateWorkflowSteps([wfStep({ step_timeout_seconds: 1801 })])[0], "step timeout above 1800");
+    const py = (t: number): WorkflowStep => wfStep({ kind: "python", agent_name: "", config: { code: "output = 1", timeout_seconds: t } });
+    assert.ok(validateWorkflowSteps([py(0)])[0], "python timeout below 1");
+    assert.ok(validateWorkflowSteps([py(61)])[0], "python timeout above 60");
+    assert.deepEqual(validateWorkflowSteps([py(60)]), {});
+    const http = (t: number): WorkflowStep => wfStep({ kind: "http", agent_name: "", config: { destination: "d", path: "/x", timeout_seconds: t } });
+    assert.ok(validateWorkflowSteps([http(0)])[0], "http timeout below 1");
+    assert.ok(validateWorkflowSteps([http(601)])[0], "http timeout above 600");
+    assert.deepEqual(validateWorkflowSteps([http(30)]), {});
+});
+
+QUnit.test("a python step needs code", function (assert) {
+    const msg = validateWorkflowSteps([wfStep({ kind: "python", agent_name: "", config: { code: "  ", timeout_seconds: 5 } })])[0];
+    assert.ok(msg && msg.indexOf("code") > -1, msg);
+});
+
+QUnit.test("an http step needs a destination and a confined relative path", function (assert) {
+    const http = (over: Record<string, unknown>): string =>
+        validateWorkflowSteps([wfStep({ kind: "http", agent_name: "", config: { destination: "d", path: "/x", timeout_seconds: 30, ...over } })])[0];
+    assert.ok(http({ destination: "" }).indexOf("destination") > -1, "no destination");
+    assert.ok(http({ path: "https://evil.example.com/" }).indexOf("URL") > -1, "absolute URL");
+    assert.ok(http({ path: "//evil.example.com/" }), "protocol-relative");
+    assert.ok(http({ path: "relative" }).indexOf("'/'") > -1, "no leading slash");
+    assert.ok(http({ path: "/a/../b" }).indexOf("..") > -1, "dot-dot segment");
+    assert.ok(http({ path: "/a?x=1" }).indexOf("query") > -1, "query in the path");
+    assert.strictEqual(http({ path: "/issue/{{item.id}}/comment" }), undefined, "a templated path is fine");
+    assert.strictEqual(http({ path: "/x" }), undefined);
+});
+
+QUnit.test("transform and condition configs are checked", function (assert) {
+    const tf = (config: Record<string, unknown>): string =>
+        validateWorkflowSteps([wfStep({ kind: "transform", agent_name: "", config })])[0];
+    assert.ok(tf({ truncate: 0 }), "truncate must be positive");
+    assert.ok(tf({ regex: { pattern: "", flags: "" } }), "a regex needs a pattern");
+    assert.ok(tf({ regex: { pattern: "a", flags: "q" } }), "unknown regex flag");
+    assert.strictEqual(tf({ truncate: null, regex: null, template: "{{text}}" }), undefined);
+    const cond = validateWorkflowSteps([wfStep({ kind: "condition", agent_name: "", config: { rules: [{ when: { op: "nope" } }] } })])[0];
+    assert.ok(cond && cond.indexOf("Rule 1") > -1, cond);
+});
+
+QUnit.test("errors are keyed by the step's index", function (assert) {
+    const errors = validateWorkflowSteps([
+        wfStep({}),
+        wfStep({ agent_name: "" }),
+        wfStep({ kind: "http", agent_name: "", config: { destination: "", path: "/x", timeout_seconds: 30 } })
+    ]);
+    assert.deepEqual(Object.keys(errors), ["1", "2"]);
 });
