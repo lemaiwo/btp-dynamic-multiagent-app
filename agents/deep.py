@@ -35,7 +35,6 @@ import asyncio
 import json
 import logging
 import time
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
@@ -171,12 +170,6 @@ class DeepState:
 _states: dict[str, DeepState] = {}
 _last_sweep = 0.0
 
-# Set only in tests / by callers that must pin a state regardless of run id.
-# Production code shares state through ``deps`` (see ``state_for``).
-current_deep_state: ContextVar[DeepState | None] = ContextVar(
-    "current_deep_state", default=None
-)
-
 
 def _sweep(now: float) -> None:
     """Drop states nobody touched for ``STATE_TTL_SECONDS``. Cheap: runs at
@@ -205,10 +198,6 @@ def state_for(ctx: RunContext[Any]) -> DeepState:
     if isinstance(deps, DeepState):
         deps.last_used = now
         return deps
-    pinned = current_deep_state.get()
-    if pinned is not None:
-        pinned.last_used = now
-        return pinned
     run_id = str(getattr(ctx, "run_id", None) or "no-run-id")
     state = _states.get(run_id)
     if state is None:
