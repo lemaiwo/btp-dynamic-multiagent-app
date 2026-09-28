@@ -1,4 +1,5 @@
-import validators from "com/agent/admin/model/validators";
+import validators, { validateDeep } from "com/agent/admin/model/validators";
+import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 
 QUnit.module("validators.validateServerUrl");
 
@@ -352,4 +353,31 @@ QUnit.test("teams cannot post as the application", function (assert) {
 QUnit.test("teams rejects modes it cannot authenticate with", function (assert) {
     assert.notStrictEqual(validators.validateOAuth(undefined, "jwt", "builtin:teams"), "");
     assert.notStrictEqual(validators.validateOAuth({ dcr: true }, "oauth2", "builtin:teams"), "");
+});
+
+// --- deep agents -------------------------------------------------------------
+
+QUnit.module("validators.validateDeep");
+
+QUnit.test("the defaults and the full range are valid", function (assert) {
+    assert.deepEqual(validateDeep(undefined), {}, "no config, nothing to check");
+    assert.deepEqual(validateDeep({ ...DEEP_DEFAULTS }), {});
+    assert.deepEqual(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 1, subagent_max_depth: 1 }), {});
+    assert.deepEqual(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 20, subagent_max_depth: 3 }), {});
+});
+
+QUnit.test("max_subagents must be 1..20", function (assert) {
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 0 }).max_subagents, "0 is refused");
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 21 }).max_subagents, "21 is refused");
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 2.5 }).max_subagents, "fractions are refused");
+    assert.notOk(validateDeep({ ...DEEP_DEFAULTS, max_subagents: 0 }).subagent_max_depth,
+        "an error on one field does not spill onto the other");
+});
+
+QUnit.test("subagent_max_depth must be 1..3", function (assert) {
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, subagent_max_depth: 0 }).subagent_max_depth, "0 is refused");
+    assert.ok(validateDeep({ ...DEEP_DEFAULTS, subagent_max_depth: 4 }).subagent_max_depth, "4 is refused");
+    const both = validateDeep({ ...DEEP_DEFAULTS, max_subagents: 99, subagent_max_depth: 9 });
+    assert.deepEqual(Object.keys(both).sort(), ["max_subagents", "subagent_max_depth"],
+        "both fields report at once so the form can flag both controls");
 });

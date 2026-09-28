@@ -6,7 +6,7 @@ import Fragment from "sap/ui/core/Fragment";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
-import validators from "../model/validators";
+import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -15,9 +15,10 @@ import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
 import type {
-    AgentInput, AuthMode, CredentialStatus, McpServer,
+    AgentInput, AuthMode, CredentialStatus, DeepConfig, McpServer,
     WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
 } from "../service/types";
+import { DEEP_DEFAULTS } from "../service/types";
 
 const EMPTY_AGENT: AgentInput = {
     name: "",
@@ -33,7 +34,8 @@ const EMPTY_AGENT: AgentInput = {
     run_prompt: "",
     run_timeout_seconds: 1800,
     peers: [],
-    model_name: ""
+    model_name: "",
+    deep: { ...DEEP_DEFAULTS }
 };
 
 /** One entry of the model `<Select>`: a real model name, or the blank
@@ -155,7 +157,10 @@ export default class AgentDetail extends BaseController {
                 run_prompt: agent.run_prompt ?? "",
                 run_timeout_seconds: agent.run_timeout_seconds ?? 1800,
                 peers: agent.peers ?? [],
-                model_name: agent.model_name ?? ""
+                model_name: agent.model_name ?? "",
+                // --- deep agents --- always resent so the panel can clear a
+                // stored config; an older backend without the field gets defaults.
+                deep: { ...DEEP_DEFAULTS, ...(agent.deep ?? {}) } as DeepConfig
             } as AgentInput);
             model.setProperty("/title", agent.name);
             // An agent must never be offered itself as a peer.
@@ -387,6 +392,18 @@ export default class AgentDetail extends BaseController {
             const first = serverErrors[Number(keys[0])];
             model.setProperty("/errors/servers", first);
             MessageBox.error(first);
+            return;
+        }
+
+        // --- deep agents --- range errors land on their StepInput.
+        const deepErrors = validateDeep(data.deep);
+        const deepKeys = Object.keys(deepErrors);
+        if (deepKeys.length > 0) {
+            deepKeys.forEach((field) => {
+                model.setProperty(`/errors/deep_${field}`, deepErrors[field]);
+                model.setProperty(`/errors/deep_${field}State`, ValueState.Error);
+            });
+            MessageBox.error(deepErrors[deepKeys[0]]);
             return;
         }
 

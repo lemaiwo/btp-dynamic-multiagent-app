@@ -1,4 +1,4 @@
-import type { AuthMode, McpServer, OAuthClient } from "../service/types";
+import type { AuthMode, DeepConfig, McpServer, OAuthClient } from "../service/types";
 import { BUILTINS } from "./builtins";
 
 /**
@@ -247,3 +247,30 @@ export default {
         return errors;
     }
 };
+
+// --- deep agents -------------------------------------------------------------
+
+/** Same bounds as `agents.deep.DeepConfig` (pydantic `ge`/`le`). */
+export const DEEP_MAX_SUBAGENTS = 20;
+export const DEEP_MAX_DEPTH = 3;
+
+/**
+ * Validates the deep-agent panel. Keyed by field name so the controller can
+ * attach each message to its control; empty when everything is in range.
+ * Only the numbers can be wrong: the switches are booleans and the prompt is
+ * free text.
+ */
+export function validateDeep(deep: DeepConfig | undefined): Record<string, string> {
+    const errors: Record<string, string> = {};
+    if (!deep) {
+        return errors;
+    }
+    const isInt = (v: unknown): v is number => typeof v === "number" && Number.isInteger(v);
+    if (!isInt(deep.max_subagents) || deep.max_subagents < 1 || deep.max_subagents > DEEP_MAX_SUBAGENTS) {
+        errors.max_subagents = `Concurrent sub-agents must be a whole number from 1 to ${DEEP_MAX_SUBAGENTS}.`;
+    }
+    if (!isInt(deep.subagent_max_depth) || deep.subagent_max_depth < 1 || deep.subagent_max_depth > DEEP_MAX_DEPTH) {
+        errors.subagent_max_depth = `Sub-agent depth must be a whole number from 1 to ${DEEP_MAX_DEPTH}.`;
+    }
+    return errors;
+}
