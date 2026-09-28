@@ -113,6 +113,16 @@ export type OAuthClient =
            * narrow `team` further; blank means every channel of the team.
            */
           channels?: string;
+          // --- destinations ---
+          /**
+           * `destination` only. On, the destination is resolved with the
+           * signed-in user's JWT (sent to the destination service as
+           * X-user-token) and the tools act as that user; off, the
+           * destination's own app-level credential is used and the app-only
+           * rules apply (mailbox required, Teams read-only). Only sent as
+           * `true`. See agents/destination_auth.py.
+           */
+          user_context?: boolean;
       };
 
 export interface McpServer {

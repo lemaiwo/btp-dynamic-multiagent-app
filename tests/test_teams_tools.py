@@ -212,7 +212,15 @@ def test_toolset_refuses_misconfiguration():
             {"team": TEAM, "allow_send": True}, http=graph.client(), auth_mode="app_only"
         )
     with pytest.raises(ValueError, match="supports auth_mode"):
-        teams_toolset({"team": TEAM}, http=graph.client(), auth_mode="destination")
+        teams_toolset({"team": TEAM}, http=graph.client(), auth_mode="jwt")
+    # Through a destination without user context the credential is an
+    # application token, and Graph refuses application posts -- same rule as
+    # app_only, said at build time.
+    with pytest.raises(ValueError, match="without user context"):
+        teams_toolset(
+            {"team": TEAM, "allow_send": True, "destination": "D"},
+            http=graph.client(), auth_mode="destination",
+        )
 
 
 def test_teams_is_a_known_builtin():

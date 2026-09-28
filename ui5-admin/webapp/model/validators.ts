@@ -1,5 +1,10 @@
 import type { AuthMode, DeepConfig, McpServer, OAuthClient } from "../service/types";
-import { BUILTINS } from "./builtins";
+import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } from "./builtins";
+
+// --- destinations ---
+/** What a BTP destination may be called. Mirrors `_DESTINATION_NAME_RE` in
+ * `agents/admin.py`. */
+const DESTINATION_NAME_RE = /^[A-Za-z0-9_.-]{1,200}$/;
 
 /**
  * Client-side mirrors of the Pydantic rules in `agents/admin.py`.
@@ -42,9 +47,9 @@ export default {
 
     /** Returns an error message, or an empty string when the config is valid. */
     validateTeams(oauth: OAuthClient | undefined, authMode: AuthMode): string {
-        if (authMode !== "oauth2" && authMode !== "app_only") {
-            return "Teams requires auth mode 'oauth2' (as the signed-in user) or "
-                + "'app_only' (read-only, as the application).";
+        if (authMode !== "oauth2" && authMode !== "app_only" && authMode !== "destination") {
+            return "Teams requires auth mode 'oauth2' (as the signed-in user), "
+                + "'app_only' (read-only, as the application) or 'destination'.";
         }
         if (oauth && "dcr" in oauth && oauth.dcr === true) {
             return "Teams cannot use dynamic registration: Microsoft Entra ID does "
@@ -58,6 +63,34 @@ export default {
         if (authMode === "app_only" && cfg.allow_send === true) {
             return "Teams cannot post as the application: Graph does not allow it. "
                 + "Use oauth2 to post as the signed-in user, or turn sending off.";
+        }
+        if (authMode === "destination" && cfg.allow_send === true && cfg.user_context !== true) {
+            return "Teams cannot post through a destination without acting as the "
+                + "signed-in user: the destination's app-level credential is an "
+                + "application token, and Graph does not allow application posts. "
+                + "Turn 'Act as signed-in user' on, or turn sending off.";
+        }
+        return "";
+    },
+
+    // --- destinations ---
+    /** The per-built-in rules of destination mode. Mirrors
+     * `_validate_destination_config` in `agents/admin.py`. */
+    validateDestinationBuiltin(cfg: Exclude<OAuthClient, { dcr: true }>, url: string): string {
+        const key = (url || "").trim().replace(/\/+$/, "").toLowerCase();
+        if (!DESTINATION_NAME_RE.test((cfg.destination || "").trim())) {
+            return "The destination name may only contain letters, digits, '_', '.' "
+                + "and '-' (up to 200 characters).";
+        }
+        const userContext = cfg.user_context === true;
+        if (userContext && DESTINATION_USER_CONTEXT_URLS.indexOf(key) === -1) {
+            return "This toolset has no signed-in user to act as; turn 'Act as "
+                + "signed-in user' off.";
+        }
+        if (DESTINATION_MAILBOX_URLS.indexOf(key) > -1 && !userContext
+            && !(cfg.mailbox || "").trim()) {
+            return "A destination with an app-level credential identifies no user: "
+                + "name the mailbox, or turn 'Act as signed-in user' on.";
         }
         return "";
     },
@@ -136,6 +169,10 @@ export default {
                 return "A destination server stores no credential of its own. Keep "
                     + "the secret in the destination, where it can be rotated "
                     + "without touching this app.";
+            }
+            const builtinError = this.validateDestinationBuiltin(dest, url);
+            if (builtinError) {
+                return builtinError;
             }
             // Caught here as well as server-side so the dialog says what is
             // wrong while the field is still on screen. A URL is the mistake

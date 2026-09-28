@@ -36,7 +36,11 @@ logger = logging.getLogger(__name__)
 
 BUILTIN_SAPNOTES_URL = "builtin:sapnotes"
 
-NVD_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_HOST = "services.nvd.nist.gov"
+NVD_PATH = "/rest/json/cves/2.0"
+NVD_URL = f"https://{NVD_HOST}{NVD_PATH}"
+
+AUTH_MODE_DESTINATION = "destination"
 
 # Pinned, never configurable. This is the definition of "an SAP-assigned
 # CVE", not a preference -- a different value makes the toolset meaningless,
@@ -129,11 +133,15 @@ class SapNotesClient:
         min_score: float = DEFAULT_MIN_SCORE,
         lookback_minutes: int | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        url: str = NVD_URL,
     ) -> None:
         self._http = http
         self.min_score = float(min_score)
         self.lookback_minutes = lookback_minutes
         self._sleep = sleep
+        # NVD's endpoint, or the placeholder a destination-backed client
+        # rewrites onto the destination's URL (agents/destination_auth.py).
+        self._url = url
 
     def _params(self, start_index: int = 0) -> dict[str, Any]:
         params: dict[str, Any] = {
@@ -162,7 +170,7 @@ class SapNotesClient:
         """
         params = self._params(start_index)
         response = await retry_once(
-            lambda: self._http.get(NVD_URL, params=params, headers=headers),
+            lambda: self._http.get(self._url, params=params, headers=headers),
             statuses=NVD_RETRY_STATUSES,
             backoff=NVD_RATE_LIMIT_BACKOFF_SECONDS,
             what="NVD",
@@ -276,10 +284,14 @@ def sapnotes_toolset(
     """The SAP notes toolset for one agent, ready for ``Agent(toolsets=...)``.
 
     ``server_key`` and ``auth_mode`` come from
-    :func:`agents.builtins.build_builtin_toolset` in production; ``auth_mode``
-    is accepted and ignored because NVD is public and there is no caller
-    identity to act as. The rest default to the matching values in ``oauth``
-    and are overridable so tests can set them without a config block.
+    :func:`agents.builtins.build_builtin_toolset` in production. NVD is public
+    and there is no caller identity to act as, so ``none`` is the default and
+    every other mode is treated the same -- except ``destination``, which
+    routes the calls through a BTP destination: its URL (NVD itself, or a
+    proxy in front of it) replaces the host, and a ``URL.headers.apiKey``
+    property carries the API key in place of ``NVD_API_KEY``. The rest default
+    to the matching values in ``oauth`` and are overridable so tests can set
+    them without a config block.
     """
     raw_score = min_score if min_score is not None else oauth.get("min_score")
     try:
@@ -295,8 +307,28 @@ def sapnotes_toolset(
     # message rather than surfacing mid-run as an empty note list.
     window = parse_lookback(lookback if lookback is not None else oauth.get("lookback"))
 
+    url = NVD_URL
+    if auth_mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import (
+            PLACEHOLDER_BASE,
+            destination_http_client,
+            resolver_for,
+        )
+
+        # No credential is required of the destination: NVD answers anonymous
+        # calls, and the destination may exist only to name a proxy.
+        url = f"{PLACEHOLDER_BASE}{NVD_PATH}"
+        if http is None:
+            http = destination_http_client(
+                resolver_for(oauth, server_key, require_credential=False),
+                expected_hosts=(NVD_HOST,),
+                server_key=server_key,
+                timeout=60.0,
+            )
     session = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0))
-    client = SapNotesClient(session, min_score=resolved_score, lookback_minutes=window)
+    client = SapNotesClient(
+        session, min_score=resolved_score, lookback_minutes=window, url=url
+    )
     toolset = FunctionToolset()
     # Exposed for `agents.registry`, which closes `http_client` on the old
     # build's servers after a reload.

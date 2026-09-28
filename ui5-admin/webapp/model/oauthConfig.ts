@@ -43,6 +43,23 @@ const OAUTH2_BUILTIN_KEYS: Record<string, string[]> = {
 /** Built-ins whose `allow_send` switch is shown on oauth2. */
 const OAUTH2_ALLOW_SEND_URLS = ["builtin:teams", "builtin:outlook"];
 
+// --- destinations ---
+/**
+ * Keys kept on `destination` per built-in, next to `destination` itself.
+ * Mirrors `_DEST_KEYS_BY_URL` in `agents/db.py`. Jira (the default below)
+ * and Slack keep the shapes they always had.
+ */
+const DESTINATION_BUILTIN_KEYS: Record<string, string[]> = {
+    "builtin:gmail": ["mailbox"],
+    "builtin:outlook": ["mailbox", "lookback", "recipients"],
+    "builtin:teams": ["team", "channels", "lookback"],
+    "builtin:sapnotes": ["min_score", "lookback"],
+    "builtin:sapnotedetail": []
+};
+
+/** Built-ins whose destination may act as the signed-in user. */
+const DESTINATION_USER_CONTEXT_URLS = ["builtin:gmail", "builtin:outlook", "builtin:teams"];
+
 function builtinKey(url: string): string {
     return findBuiltin(url)?.url ?? "";
 }
@@ -65,8 +82,24 @@ export default {
         return (OAUTH2_BUILTIN_KEYS[builtinKey(url)] ?? []).slice();
     },
 
-    /** True when the send switch is kept (and shown) for this url and mode. */
-    keepsAllowSend(url: string, authMode: AuthMode): boolean {
+    /** The built-in keys `cleanOAuth` keeps on destination for this url. */
+    destinationBuiltinKeys(url: string): string[] | undefined {
+        const keys = DESTINATION_BUILTIN_KEYS[builtinKey(url)];
+        return keys ? keys.slice() : undefined;
+    },
+
+    /** True when this url's destination may act as the signed-in user. */
+    supportsUserContext(url: string): boolean {
+        return DESTINATION_USER_CONTEXT_URLS.indexOf(builtinKey(url)) > -1;
+    },
+
+    /**
+     * True when the send switch is kept (and shown) for this url and mode.
+     * On `destination`, `userContext` decides for Teams: an app-level
+     * destination credential is an application token, and Graph refuses
+     * application posts -- the same rule as app-only.
+     */
+    keepsAllowSend(url: string, authMode: AuthMode, userContext = false): boolean {
         const key = builtinKey(url);
         if (authMode === "app_only") {
             // Teams cannot post as the application; the validator says so
@@ -76,7 +109,11 @@ export default {
         if (authMode === "oauth2") {
             return OAUTH2_ALLOW_SEND_URLS.indexOf(key) > -1;
         }
-        return authMode === "destination" && key === "builtin:slack";
+        if (authMode === "destination") {
+            return key === "builtin:slack" || key === "builtin:outlook"
+                || (key === "builtin:teams" && userContext === true);
+        }
+        return false;
     },
 
     /** Drops blank fields so the server sees the same shape `to_config()` builds. */
@@ -104,6 +141,24 @@ export default {
                 slack.allow_send = true;
             }
             return slack as McpServer["oauth"];
+        }
+        const destinationKeys = this.destinationBuiltinKeys(url);
+        if (authMode === "destination" && destinationKeys) {
+            // --- destinations ---
+            // The built-ins that gained destination mode later: the name,
+            // their own pinned keys, and the two switches only ever as `true`.
+            const out: Record<string, unknown> = {
+                destination: String(raw.destination ?? "").trim()
+            };
+            copyNonBlank(raw, destinationKeys, out);
+            const userContext = this.supportsUserContext(url) && raw.user_context === true;
+            if (userContext) {
+                out.user_context = true;
+            }
+            if (this.keepsAllowSend(url, authMode, userContext) && raw.allow_send === true) {
+                out.allow_send = true;
+            }
+            return out as McpServer["oauth"];
         }
         if (authMode === "destination") {
             return {

@@ -1212,7 +1212,12 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     """
     src = oauth if isinstance(oauth, dict) else {}
     cleaned: dict[str, Any] = {}
-    slack = str(url or "").strip().rstrip("/").lower() == "builtin:slack"
+    builtin = str(url or "").strip().rstrip("/").lower()
+    if builtin in _DEST_KEYS_BY_URL:
+        # The built-ins that gained destination mode later keep their own
+        # pinned keys plus the user-context switch; see `# --- destinations ---`.
+        return _clean_builtin_destination(src, builtin)
+    slack = builtin == "builtin:slack"
     for k in _SLACK_DEST_KEYS if slack else _DEST_KEYS:
         v = src.get(k)
         if isinstance(v, (list, tuple)):
@@ -2577,3 +2582,57 @@ async def sweep_stale_runs(session: AsyncSession, *, all_running: bool = False) 
     if swept:
         await session.commit()
     return swept
+
+
+# --- destinations ---------------------------------------------------------
+# Every built-in can run through a BTP destination. The block stores the
+# destination's name, the `user_context` switch (resolve the destination with
+# the signed-in user's JWT and act as that user, versus the destination's own
+# app-level credential) and the same pinned keys the built-in carries on its
+# other modes. Jira and Slack keep their original tuples above; these cover
+# the built-ins that gained the mode later. Mirrored by `cleanOAuth` in
+# ui5-admin/webapp/model/oauthConfig.ts.
+_GMAIL_DEST_KEYS = ("destination", "mailbox")
+_OUTLOOK_DEST_KEYS = ("destination", "mailbox", "lookback", "recipients")
+_TEAMS_DEST_KEYS = ("destination", "team", "channels", "lookback")
+_SAPNOTES_DEST_KEYS = ("destination", "min_score", "lookback")
+_SAPNOTEDETAIL_DEST_KEYS = ("destination",)
+
+_DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
+    "builtin:gmail": _GMAIL_DEST_KEYS,
+    "builtin:outlook": _OUTLOOK_DEST_KEYS,
+    "builtin:teams": _TEAMS_DEST_KEYS,
+    "builtin:sapnotes": _SAPNOTES_DEST_KEYS,
+    "builtin:sapnotedetail": _SAPNOTEDETAIL_DEST_KEYS,
+}
+# Built-ins whose destination may act as the signed-in user. NVD has no user
+# to act as and the me.sap.com cookie is one shared session, so the switch is
+# dropped for those rather than stored as a promise nothing keeps.
+_DEST_USER_CONTEXT_URLS = frozenset({"builtin:gmail", "builtin:outlook", "builtin:teams"})
+# Built-ins with a posting/sending capability switch in destination mode.
+_DEST_ALLOW_SEND_URLS = frozenset({"builtin:outlook", "builtin:teams"})
+
+
+def _clean_builtin_destination(src: dict[str, Any], builtin: str) -> dict[str, Any]:
+    """Normalize a ``destination`` block for a built-in in ``_DEST_KEYS_BY_URL``.
+
+    Same promises as `_clean_destination`: credential keys are dropped, so
+    nothing secret lands in the database, and ``user_context`` /
+    ``allow_send`` are stored as real booleans and only when true -- the
+    string "false" must neither switch whose token a request carries nor
+    open a send tool.
+    """
+    cleaned: dict[str, Any] = {}
+    for k in _DEST_KEYS_BY_URL[builtin]:
+        v = src.get(k)
+        if isinstance(v, (list, tuple)):
+            v = ", ".join(str(x).strip() for x in v if str(x).strip())
+        if v is not None and str(v).strip() != "":
+            cleaned[k] = str(v).strip()
+    if not cleaned.get("destination"):
+        raise ValueError("destination server requires a destination name")
+    if builtin in _DEST_USER_CONTEXT_URLS and src.get("user_context") is True:
+        cleaned["user_context"] = True
+    if builtin in _DEST_ALLOW_SEND_URLS:
+        cleaned["allow_send"] = src.get("allow_send") is True
+    return cleaned

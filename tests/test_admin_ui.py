@@ -1181,6 +1181,135 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             "toggleOauthFields(this); updateEndpointHint()" in html,
         )
 
+        # --- destinations ---------------------------------------------------
+        # Every built-in can run through a BTP destination. The server row
+        # must offer the mode, carry the destination sub-form, and round-trip
+        # each built-in's config block the way agents/db.py stores it.
+        print("\n== destination servers ==")
+        check("auth mode offers a BTP destination", '<option value="destination">' in html)
+        check("destination name field", 'class="dest-destination"' in html)
+        check("act-as-user switch", 'class="dest-user_context"' in html)
+        check("destination config collected on save", "function collectDestinationConfig" in html)
+        check("destination fields follow the built-in", "function syncDestinationFields" in html)
+        check("collectMcpServers handles destination mode",
+              "mode === 'destination'" in html and "collectDestinationConfig(r)" in html)
+
+        if shutil.which("node") is not None:
+            dest_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div id="agent-mcp-servers"></div>
+  <input id="agent-api-slug" value="">
+  <input type="checkbox" id="agent-expose-api">
+  <p id="agent-endpoint-hint"></p>
+</body></html>`, { url: 'https://admin.example/admin' });
+global.window = dom.window;
+global.document = dom.window.document;
+global.location = dom.window.location;
+
+""" + js_no_autoinvoke + r"""
+
+function addAndCollect(server) {
+    document.getElementById('agent-mcp-servers').innerHTML = '';
+    addMcpServerRow(server);
+    const row = document.querySelector('.mcp-server-row');
+    return { row, out: collectMcpServers()[0] };
+}
+
+// 1. Outlook as the signed-in user: mailbox is dropped (/me), send kept.
+let { row, out } = addAndCollect({
+    url: 'builtin:outlook', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', user_context: true, mailbox: 'svc@example.com',
+             lookback: '2d', recipients: 'a@x, b@x', allow_send: true },
+});
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block',
+    'the destination sub-form is shown for the mode');
+assert.strictEqual(row.querySelector('.dest-field-mailbox').style.display, 'none',
+    'no mailbox to name when acting as the user');
+assert.deepStrictEqual(out, {
+    url: 'builtin:outlook', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', lookback: '2d', recipients: 'a@x, b@x',
+             user_context: true, allow_send: true },
+});
+
+// 2. Outlook app-level: the mailbox is kept and user_context is absent.
+({ row, out } = addAndCollect({
+    url: 'builtin:outlook', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', mailbox: 'svc@example.com' },
+}));
+assert.strictEqual(row.querySelector('.dest-field-mailbox').style.display, '');
+assert.deepStrictEqual(out.oauth, { destination: 'GRAPH', mailbox: 'svc@example.com' });
+
+// 3. Teams without user context: allow_send is neither shown nor sent.
+({ row, out } = addAndCollect({
+    url: 'builtin:teams', auth_mode: 'destination',
+    oauth: { destination: 'GRAPH', team: 't1', channels: 'General', allow_send: true },
+}));
+assert.strictEqual(row.querySelector('.dest-field-allow_send').style.display, 'none');
+assert.deepStrictEqual(out.oauth, { destination: 'GRAPH', team: 't1', channels: 'General' });
+row.querySelector('.dest-user_context').checked = true;
+syncDestinationFields(row);
+assert.strictEqual(row.querySelector('.dest-field-allow_send').style.display, '',
+    'as the signed-in user Teams may post');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { destination: 'GRAPH', team: 't1', channels: 'General', user_context: true, allow_send: true });
+
+// 4. Jira keeps its filters and ignores the user switch it never shows.
+({ row, out } = addAndCollect({
+    url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', status: 'Open', api_base: '/api/2',
+             allow_comment: true, user_context: true },
+}));
+assert.strictEqual(row.querySelector('.dest-field-user_context').style.display, 'none');
+assert.deepStrictEqual(out.oauth,
+    { destination: 'JIRA', project: 'ABC', status: 'Open', api_base: '/api/2', allow_comment: true });
+
+// 5. Gmail as the user, sapnotes and sapnotedetail: only what each stores.
+({ out } = addAndCollect({ url: 'builtin:gmail', auth_mode: 'destination',
+    oauth: { destination: 'G', user_context: true, mailbox: 'x@y', lookback: '1d' } }));
+assert.deepStrictEqual(out.oauth, { destination: 'G', user_context: true });
+({ out } = addAndCollect({ url: 'builtin:sapnotes', auth_mode: 'destination',
+    oauth: { destination: 'NVD', min_score: '9.0', user_context: true } }));
+assert.deepStrictEqual(out.oauth, { destination: 'NVD', min_score: '9.0' });
+({ row, out } = addAndCollect({ url: 'builtin:sapnotedetail', auth_mode: 'destination',
+    oauth: { destination: 'MESAP' } }));
+assert.deepStrictEqual(out.oauth, { destination: 'MESAP' });
+assert.ok(row.querySelector('.dest-hint').textContent.includes('URL.headers.Cookie'),
+    'the sapnotedetail hint says where the cookie now lives');
+
+// 6. Editing an oauth2 server is untouched: no destination block is sent.
+({ row, out } = addAndCollect({ url: 'https://x.hana.ondemand.com/mcp', auth_mode: 'oauth2',
+    oauth: { dcr: true } }));
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'none');
+assert.deepStrictEqual(out.oauth, { dcr: true });
+
+console.log('destination server round-trip scenarios passed');
+"""
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, dir=str(ROOT)
+            ) as f:
+                f.write(dest_harness)
+                dest_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", dest_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                check(
+                    "destination servers round-trip through the row per built-in",
+                    result.returncode == 0
+                    and "destination server round-trip scenarios passed" in result.stdout,
+                    (result.stderr or result.stdout)[-1500:],
+                )
+            finally:
+                os.unlink(dest_harness_path)
+
         # ------------------------------------------------------------------
         # saveAgent() must actually SEND all six exposure fields, not just
         # have form elements for them. AgentPayload defaults + whole-object

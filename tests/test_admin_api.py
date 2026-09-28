@@ -1312,6 +1312,29 @@ async def run_tests() -> None:
             str(body)[:300],
         )
         check("health counts what it checked", body["checked"] >= 1, str(body)[:200])
+        # Destination-mode servers hold no user token, so they are reported
+        # in their own list, resolved with the app's token. Without a
+        # destination service binding (this test process) each is 'unbound'.
+        check("health reports destination servers in their own list",
+              isinstance(body.get("destinations"), list), str(body)[:200])
+        dest_r = await client.post("/admin/api/agents", json={
+            "name": "Dest Agent", "description": "d", "instructions": "i",
+            "mcp_servers": [{
+                "url": "builtin:outlook", "auth_mode": "destination",
+                "oauth": {"destination": "GRAPH_USER", "user_context": True},
+            }],
+        })
+        check("an outlook destination server saves", dest_r.status_code in (200, 201), dest_r.text[:200])
+        body = (await client.get("/admin/api/credential-health")).json()
+        dests = [d for d in body["destinations"] if d["agent"] == "Dest Agent"]
+        check("destination server is reported", len(dests) == 1, str(body)[:300])
+        check("destination server reports its name, user context and state",
+              dests and dests[0]["destination"] == "GRAPH_USER"
+              and dests[0]["user_context"] is True
+              and dests[0]["state"] in ("unbound", "error", "resolvable"),
+              str(dests))
+        if dest_r.status_code in (200, 201):
+            await client.delete(f"/admin/api/agents/{dest_r.json()['id']}")
 
         # A session-mode server needs a token like oauth2 does (so its state
         # and expiry are worth showing), but it has no authorization-code

@@ -644,11 +644,12 @@ function addMcpServerRow(server) {
     row.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px';
     row.innerHTML = `
         <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
-            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
+            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com" oninput="syncDestinationFields(this.closest('.mcp-server-row'))">
             <select class="mcp-auth-mode" onchange="toggleOauthFields(this); updateEndpointHint()">
                 <option value="jwt">JWT forward (BTP)</option>
                 <option value="oauth2">OAuth2 (per-user)</option>
                 <option value="none">None (public)</option>
+                <option value="destination">BTP destination</option>
                 <option value="session">Browser session (refreshed by hand)</option>
             </select>
             <button type="button" class="small danger" title="Remove"
@@ -695,6 +696,7 @@ function addMcpServerRow(server) {
                 <code class="oauth-redirect"></code>
             </p>
         </div>
+        ${destinationFieldsHtml()}
     `;
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
@@ -707,6 +709,7 @@ function addMcpServerRow(server) {
     const secret = row.querySelector('.oauth-client-secret');
     secret.placeholder = oauth.has_client_secret ? '•••••• (stored — leave blank to keep)' : '';
     row.querySelector('.oauth-redirect').textContent = location.origin + '/oauth/callback';
+    fillDestinationFields(row, oauth);
     container.appendChild(row);
     toggleOauthFields(row.querySelector('.mcp-auth-mode'));
     updateEndpointHint();
@@ -715,7 +718,9 @@ function addMcpServerRow(server) {
 function toggleOauthFields(select) {
     const row = select.closest('.mcp-server-row');
     row.querySelector('.mcp-oauth').style.display = select.value === 'oauth2' ? 'block' : 'none';
+    row.querySelector('.mcp-destination').style.display = select.value === 'destination' ? 'block' : 'none';
     toggleDcr(row.querySelector('.oauth-dcr'));
+    syncDestinationFields(row);
 }
 
 function toggleDcr(cb) {
@@ -747,6 +752,8 @@ function collectMcpServers() {
                 if (secret) oauth.client_secret = secret;
                 server.oauth = oauth;
             }
+        } else if (mode === 'destination') {
+            server.oauth = collectDestinationConfig(r);
         }
         out.push(server);
     });
@@ -1816,6 +1823,158 @@ function openFromHash() {
     // show the agent with no peers ticked and save it that way.
     return Promise.all([loadSkills(), loadAgents(), loadWorkflows()]).then(() =>
         match[1] === 'agent' ? editAgent(Number(match[2])) : editWorkflow(Number(match[2])));
+}
+
+// --- destinations ------------------------------------------------------------
+// A server on auth mode "BTP destination" stores no credential here: the
+// destination holds the target's URL and credential. The config block is the
+// destination's name, whether to resolve it as the signed-in user
+// (`user_context`, mail and Teams only), and the built-in's own pinned keys.
+// Mirrors `_DEST_KEYS`, `_SLACK_DEST_KEYS` and `_DEST_KEYS_BY_URL` in
+// agents/db.py: a field shown here and not listed there is dropped on save.
+const DESTINATION_FIELDS = {
+    'builtin:jira':          ['project', 'status', 'labels', 'api_base', 'lookback', 'allow_comment'],
+    'builtin:slack':         ['channels', 'lookback', 'allow_send'],
+    'builtin:gmail':         ['user_context', 'mailbox'],
+    'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send'],
+    'builtin:teams':         ['user_context', 'team', 'channels', 'lookback', 'allow_send'],
+    'builtin:sapnotes':      ['min_score', 'lookback'],
+    'builtin:sapnotedetail': [],
+};
+// Text fields, in the order they appear; the two switches are checkboxes.
+const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients',
+    'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
+
+function destinationFieldsHtml() {
+    return `
+        <div class="mcp-destination" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+            <div class="form-grid">
+                <label class="full">Destination name
+                    <input type="text" class="dest-destination" placeholder="MY_DESTINATION">
+                </label>
+                <label class="full dest-field-user_context" style="font-weight:600">
+                    <input type="checkbox" class="dest-user_context" onchange="syncDestinationFields(this.closest('.mcp-server-row'))">
+                    Act as signed-in user
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        Resolve the destination with the user's token (OAuth2UserTokenExchange,
+                        OAuth2JWTBearer, OAuth2SAMLBearerAssertion) and act as that user.
+                        Off means the destination's own app-level credential; scheduled runs need it off.
+                    </span>
+                </label>
+                <label class="dest-field-mailbox">Mailbox
+                    <input type="text" class="dest-mailbox" placeholder="service.mailbox@example.com">
+                </label>
+                <label class="dest-field-team">Team ID
+                    <input type="text" class="dest-team" placeholder="the team's group ID">
+                </label>
+                <label class="dest-field-channels">Channels
+                    <input type="text" class="dest-channels" placeholder="comma-separated; blank means all">
+                </label>
+                <label class="full dest-field-recipients">Recipients
+                    <input type="text" class="dest-recipients" placeholder="team@example.com, basis@example.com">
+                </label>
+                <label class="dest-field-lookback">Look back
+                    <input type="text" class="dest-lookback" placeholder="e.g. 5h, 2d, 1w">
+                </label>
+                <label class="dest-field-project">Project
+                    <input type="text" class="dest-project" placeholder="ABC">
+                </label>
+                <label class="dest-field-status">Status
+                    <input type="text" class="dest-status" placeholder="Open, In Progress">
+                </label>
+                <label class="dest-field-labels">Labels
+                    <input type="text" class="dest-labels" placeholder="comma-separated; ALL must match">
+                </label>
+                <label class="dest-field-api_base">API base path
+                    <input type="text" class="dest-api_base" placeholder="blank means /rest/api/2">
+                </label>
+                <label class="dest-field-min_score">Minimum CVSS score
+                    <input type="text" class="dest-min_score" placeholder="9.0">
+                </label>
+                <label class="full dest-field-allow_send">
+                    <input type="checkbox" class="dest-allow_send"> Allow sending / posting
+                </label>
+                <label class="full dest-field-allow_comment">
+                    <input type="checkbox" class="dest-allow_comment"> Allow commenting
+                </label>
+            </div>
+            <p class="hint dest-hint" style="margin:8px 0 0"></p>
+        </div>
+    `;
+}
+
+function destinationBuiltinOf(row) {
+    return row.querySelector('.mcp-url').value.trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function fillDestinationFields(row, oauth) {
+    oauth = oauth || {};
+    DESTINATION_TEXT_KEYS.forEach(k => {
+        const el = row.querySelector('.dest-' + k);
+        if (el) el.value = oauth[k] == null ? '' : String(oauth[k]);
+    });
+    row.querySelector('.dest-user_context').checked = oauth.user_context === true;
+    row.querySelector('.dest-allow_send').checked = oauth.allow_send === true;
+    row.querySelector('.dest-allow_comment').checked = oauth.allow_comment === true;
+}
+
+/** Shows the fields the current built-in stores on a destination. */
+function syncDestinationFields(row) {
+    const box = row.querySelector('.mcp-destination');
+    if (!box) return;
+    const builtin = destinationBuiltinOf(row);
+    const known = Object.prototype.hasOwnProperty.call(DESTINATION_FIELDS, builtin);
+    const wanted = known ? DESTINATION_FIELDS[builtin] : [];
+    const userContext = row.querySelector('.dest-user_context').checked;
+    box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
+        const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
+        let show = wanted.includes(key);
+        // A destination resolved as the user reads /me: no mailbox to name.
+        if (key === 'mailbox' && userContext) show = false;
+        // Graph refuses application posts, so Teams posts only as the user.
+        if (key === 'allow_send' && builtin === 'builtin:teams' && !userContext) show = false;
+        label.style.display = show ? '' : 'none';
+    });
+    let hint = '';
+    if (!known) {
+        hint = 'A destination works with built-in toolsets only (builtin:gmail, builtin:outlook, '
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:sapnotes, builtin:sapnotedetail).';
+    } else if (builtin === 'builtin:sapnotedetail') {
+        hint = 'The me.sap.com session cookie is read from the destination\'s URL.headers.Cookie property.';
+    } else if (builtin === 'builtin:sapnotes') {
+        hint = 'The destination names NVD or a proxy (NoAuthentication); URL.headers.apiKey carries the API key.';
+    } else if (wanted.includes('user_context')) {
+        hint = userContext
+            ? 'The destination\'s Authentication must be a user-propagating type (OAuth2UserTokenExchange, OAuth2JWTBearer, OAuth2SAMLBearerAssertion).'
+            : 'The destination holds an app-level credential (OAuth2ClientCredentials or a static URL.headers.Authorization).';
+    }
+    row.querySelector('.dest-hint').textContent = hint;
+}
+
+/** The config block for a destination server, shaped as the API stores it. */
+function collectDestinationConfig(row) {
+    const builtin = destinationBuiltinOf(row);
+    const wanted = DESTINATION_FIELDS[builtin] || [];
+    const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
+    DESTINATION_TEXT_KEYS.forEach(k => {
+        if (k === 'destination' || !wanted.includes(k)) return;
+        const v = row.querySelector('.dest-' + k).value.trim();
+        if (v) oauth[k] = v;
+    });
+    const userContext = wanted.includes('user_context') && row.querySelector('.dest-user_context').checked;
+    if (userContext) {
+        oauth.user_context = true;
+        delete oauth.mailbox;
+    }
+    // Only ever sent as true, so a stored config gains no field it never asked for.
+    if (wanted.includes('allow_send') && row.querySelector('.dest-allow_send').checked
+        && !(builtin === 'builtin:teams' && !userContext)) {
+        oauth.allow_send = true;
+    }
+    if (wanted.includes('allow_comment') && row.querySelector('.dest-allow_comment').checked) {
+        oauth.allow_comment = true;
+    }
+    return oauth;
 }
 
 loadSkills();

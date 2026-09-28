@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 from urllib.parse import SplitResult, urlsplit
@@ -258,6 +259,11 @@ class OAuthClientPayload(BaseModel):
     # pinned here rather than tool arguments -- see agents/teams_tools.py.
     team: str = Field(default="", max_length=128)
     channels: str = Field(default="", max_length=512)
+    # destination only. On, the destination is resolved with the signed-in
+    # user's JWT (X-user-token) and the tools act as that user; off, the
+    # destination's own app-level credential is used. See
+    # agents/destination_auth.py.
+    user_context: bool = False
 
     @field_validator("min_score")
     @classmethod
@@ -350,6 +356,8 @@ class OAuthClientPayload(BaseModel):
             config["allow_send"] = True
         if self.allow_comment:
             config["allow_comment"] = True
+        if self.user_context:
+            config["user_context"] = True
         return config
 
 
@@ -395,10 +403,10 @@ class McpServerPayload(BaseModel):
         Each is caught here rather than at reload, where the registry would log
         the failure and drop the agent while the UI still showed it configured.
         """
-        if self.auth_mode not in (AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY):
+        if self.auth_mode not in (AUTH_MODE_OAUTH2, AUTH_MODE_APP_ONLY, AUTH_MODE_DESTINATION):
             raise ValueError(
                 f"{BUILTIN_TEAMS_URL} requires auth_mode=oauth2 (as the signed-in "
-                "user) or app_only (read-only, as the application)"
+                "user), app_only (read-only, as the application) or destination"
             )
         cfg = self.oauth.to_config() if self.oauth else {}
         if cfg.get("dcr"):
@@ -417,6 +425,19 @@ class McpServerPayload(BaseModel):
                 f"{BUILTIN_TEAMS_URL} cannot post under auth_mode=app_only: Graph "
                 "does not let an application send channel messages. Use oauth2 "
                 "to post as the signed-in user, or turn allow_send off"
+            )
+        if (
+            self.auth_mode == AUTH_MODE_DESTINATION
+            and cfg.get("allow_send")
+            and not cfg.get("user_context")
+        ):
+            # The same Graph rule through a destination: an app-level
+            # destination credential is an application token.
+            raise ValueError(
+                f"{BUILTIN_TEAMS_URL} cannot post through a destination without "
+                "oauth.user_context: the destination's app-level credential is an "
+                "application token, and Graph does not let an application send "
+                "channel messages. Turn user_context on, or turn allow_send off"
             )
 
     @staticmethod
@@ -449,15 +470,16 @@ class McpServerPayload(BaseModel):
         is_note_detail = (
             str(self.url or "").strip().rstrip("/").lower() == BUILTIN_SAPNOTEDETAIL_URL
         )
-        if is_note_detail and self.auth_mode != AUTH_MODE_SESSION:
+        if is_note_detail and self.auth_mode not in (AUTH_MODE_SESSION, AUTH_MODE_DESTINATION):
             # Caught here rather than at reload for the same reason the Jira
             # rule is: the toolset has no other way to authenticate, so a
             # server saved under another mode builds fine and then fails
             # mid-run, with the agent still looking configured in the UI.
             raise ValueError(
-                f"{BUILTIN_SAPNOTEDETAIL_URL} requires auth_mode=session: it "
-                "authenticates with a browser session cookie refreshed by a "
-                "human, and holds no credential of its own"
+                f"{BUILTIN_SAPNOTEDETAIL_URL} requires auth_mode=session (a browser "
+                "session cookie stored here) or destination (the cookie held as "
+                "URL.headers.Cookie in a BTP destination); it holds no credential "
+                "of its own"
             )
         if str(self.url or "").strip().rstrip("/").lower() == BUILTIN_TEAMS_URL:
             self._validate_teams()
@@ -552,6 +574,9 @@ class McpServerPayload(BaseModel):
                     "secret in the destination, where it can be rotated without "
                     "touching this app"
                 )
+            # Name shape, user context and the per-built-in pins; see
+            # `# --- destinations ---` at the end of this module.
+            _validate_destination_config(self.url, cfg)
         elif self.auth_mode == AUTH_MODE_NONE and is_builtin_url(self.url):
             # The one credential-free config block. A public built-in reaches
             # a source that needs no token, so the only thing worth storing is
@@ -1146,10 +1171,21 @@ async def api_credential_health() -> dict[str, Any]:
             "expires_at": expiry.isoformat() if expiry else None,
         })
 
+    # Destination-mode servers hold no user token, so they are not among the
+    # entries above; they are reported alongside, resolved with the app's
+    # token, so a deleted or misconfigured destination shows up here rather
+    # than as a failed run. See `_destination_health`.
+    try:
+        destinations = await _destination_health()
+    except Exception:  # noqa: BLE001 — a health check must not 500
+        logger.warning("Could not check destination health", exc_info=True)
+        destinations = []
+
     return {
         "checked": len(entries),
         "healthy": len(entries) - len(problems),
         "problems": problems,
+        "destinations": destinations,
     }
 
 
@@ -2053,3 +2089,125 @@ async def api_agent_where_used(agent_id: int) -> dict[str, Any]:
         if result is None:
             raise HTTPException(status_code=404, detail="Agent not found")
         return result
+
+
+# ---------------------------------------------------------------------------
+# --- destinations ---
+# ---------------------------------------------------------------------------
+# What a BTP destination may be called. The service itself allows a little
+# more, but this covers every real name and keeps the value out of any
+# position where a stray character could be read as a path.
+_DESTINATION_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,200}$")
+
+# Built-ins whose destination may act as the signed-in user. Mirrors
+# `_DEST_USER_CONTEXT_URLS` in agents/db.py.
+_DESTINATION_USER_CONTEXT_URLS = frozenset({
+    "builtin:gmail", "builtin:outlook", "builtin:teams",
+})
+# Built-ins that read a mailbox: without user context the destination's
+# credential names no user, so the target mailbox has to be named.
+_DESTINATION_MAILBOX_URLS = frozenset({"builtin:gmail", "builtin:outlook"})
+
+
+def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
+    """The per-built-in rules of ``auth_mode=destination``, at save time.
+
+    Each mirrors what the toolset factory refuses at build time, so the
+    mistake is a 422 naming the field rather than an agent that vanishes at
+    the next reload. The Jira and Slack rules predate this and live in the
+    branch that calls it; the Teams team-id rule is in `_validate_teams`.
+    """
+    key = str(url or "").strip().rstrip("/").lower()
+    name = str(cfg.get("destination") or "")
+    if not _DESTINATION_NAME_RE.match(name):
+        raise ValueError(
+            "oauth.destination must be a destination name of 1-200 letters, "
+            "digits, '_', '.' or '-'"
+        )
+    user_context = cfg.get("user_context") is True
+    if user_context and key not in _DESTINATION_USER_CONTEXT_URLS:
+        raise ValueError(
+            f"{key} has no signed-in user to act as; turn oauth.user_context off "
+            "(only builtin:gmail, builtin:outlook and builtin:teams act as a user)"
+        )
+    if key in _DESTINATION_MAILBOX_URLS and not user_context and not cfg.get("mailbox"):
+        raise ValueError(
+            f"{key} with auth_mode=destination requires oauth.mailbox unless "
+            "oauth.user_context is on: the destination's app-level credential "
+            "identifies no user, so the target mailbox has to be named"
+        )
+
+
+async def _destination_health() -> list[dict[str, Any]]:
+    """One entry per destination-mode server of an enabled agent.
+
+    Each destination is resolved once with the app's own token -- never a
+    user's, there is none on this request worth borrowing -- and reported as
+    ``resolvable``, ``error`` (with the service's message; no header or token
+    ever reaches the response) or ``unbound`` when this app has no
+    destination service binding at all. A destination meant to act as the
+    signed-in user whose ``Authentication`` is an app-level type gets a
+    warning, because that mismatch otherwise surfaces only as every user
+    reading the same mailbox.
+    """
+    from agents.destination import (
+        MISSING_BINDING_MESSAGE,
+        USER_PROPAGATING_AUTH_TYPES,
+        DestinationError,
+        DestinationResolver,
+        config_from_environment,
+    )
+
+    async with SessionLocal() as session:
+        rows = await list_agents(session)
+    config = config_from_environment(os.environ)
+    resolvers: dict[str, DestinationResolver] = {}
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not row.enabled:
+            continue
+        for srv in row.mcp_servers:
+            if str(srv.get("auth_mode") or "") != AUTH_MODE_DESTINATION:
+                continue
+            oauth = srv.get("oauth") if isinstance(srv.get("oauth"), dict) else {}
+            name = str(oauth.get("destination") or "").strip()
+            user_context = oauth.get("user_context") is True
+            entry: dict[str, Any] = {
+                "agent": row.name,
+                "server_key": str(srv.get("url") or ""),
+                "destination": name,
+                "user_context": user_context,
+                "state": "error",
+                "auth_type": "",
+                "error": None,
+            }
+            if not name:
+                entry["error"] = "no destination name configured"
+            elif config is None:
+                entry["state"] = "unbound"
+                entry["error"] = MISSING_BINDING_MESSAGE
+            else:
+                resolver = resolvers.get(name)
+                if resolver is None:
+                    # A public target (NVD) legitimately hands back no
+                    # credential; that is not what this check is for.
+                    resolver = DestinationResolver(name, config, require_credential=False)
+                    resolvers[name] = resolver
+                try:
+                    resolved = await resolver.resolve()
+                    entry["state"] = "resolvable"
+                    entry["auth_type"] = resolved.auth_type
+                except DestinationError as e:
+                    entry["error"] = str(e)[:400]
+                except Exception as e:  # noqa: BLE001 - a health check must not 500
+                    entry["error"] = f"{type(e).__name__}: {e}"[:400]
+            auth_type = str(entry["auth_type"] or "")
+            if user_context and auth_type and auth_type not in USER_PROPAGATING_AUTH_TYPES:
+                entry["warning"] = (
+                    f"configured to act as the signed-in user, but the destination's "
+                    f"Authentication is {auth_type}, an app-level type; every user "
+                    f"would share one credential. Use OAuth2UserTokenExchange, "
+                    f"OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
+                )
+            out.append(entry)
+    return out

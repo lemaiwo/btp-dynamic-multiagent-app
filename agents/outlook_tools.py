@@ -20,6 +20,11 @@ block; ``agents/builtins.py`` dispatches to it. Two auth modes are supported:
   a service mailbox nobody signs into. Because an app-only token names no user,
   the ``mailbox`` must be given in config and every Graph path becomes
   ``/users/{mailbox}`` instead of ``/me``.
+* ``destination`` -- through a BTP destination, via ``DestinationAuth``. With
+  ``user_context`` the destination service exchanges the signed-in user's JWT
+  for a Graph token (OAuth2UserTokenExchange and friends) and ``/me`` applies;
+  without it the destination's own credential is used and, as for app-only,
+  ``mailbox`` is required.
 
 **On sending.** Drafting is the intended output: a human reads the draft and
 decides. ``send_reply`` exists because a tenant may grant ``Mail.Send`` without
@@ -410,12 +415,37 @@ class OutlookClient:
 
 
 AUTH_MODE_APP_ONLY = "app_only"
+AUTH_MODE_DESTINATION = "destination"
+# The host a Graph destination is expected to name. A destination pointing
+# elsewhere is treated as a proxy in front of Graph; the config block can
+# never change the host, only the destination can.
+GRAPH_HOST = "graph.microsoft.com"
 
 
 def build_http_client(
     oauth: dict[str, Any], server_key: str, auth_mode: str | None = None
 ) -> httpx.AsyncClient:
-    """An httpx client carrying a Microsoft token, app-only or per-user."""
+    """An httpx client carrying a Microsoft token, app-only, per-user, or
+    through a BTP destination.
+
+    Under ``destination`` the URL and the token both come from the destination:
+    as the signed-in user when the config sets ``user_context`` (the
+    destination service exchanges the user's XSUAA JWT), otherwise with the
+    destination's own app-level credential. See :mod:`agents.destination_auth`.
+    """
+    if auth_mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import (
+            destination_http_client,
+            resolver_for,
+            user_context_of,
+        )
+
+        return destination_http_client(
+            resolver_for(oauth, server_key),
+            user_context=user_context_of(oauth),
+            expected_hosts=(GRAPH_HOST,),
+            server_key=server_key,
+        )
     if auth_mode == AUTH_MODE_APP_ONLY:
         from agents.client_credentials import ClientCredentialsAuth, config_from_oauth
 
@@ -463,6 +493,20 @@ def outlook_toolset(
             "'mailbox' in the oauth config: an app-only token identifies no user, "
             "so there is no /me to fall back to"
         )
+    if auth_mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import user_context_of
+
+        # Same rule as app-only, for the same reason: a destination that
+        # holds an app-level credential names no user. As the signed-in user
+        # the destination's token is that person's, and /me is right.
+        if user_context_of(oauth):
+            resolved_mailbox = ""
+        elif not resolved_mailbox:
+            raise ValueError(
+                "builtin:outlook with auth_mode 'destination' and no user context "
+                "requires a 'mailbox' in the config: the destination's app-level "
+                "credential identifies no user, so there is no /me to fall back to"
+            )
 
     # `is True`, as Jira and Slack do: the string "false" must not enable sending.
     can_send = (oauth.get("allow_send") is True) if allow_send is None else (allow_send is True)
