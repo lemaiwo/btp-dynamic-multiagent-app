@@ -56,6 +56,7 @@ from agents.db import (
     VALID_AUTH_MODES,
     SessionLocal,
     agent_referrers,
+    agent_where_used,
     check_delegation_name_collision,
     delete_agent,
     delete_skill,
@@ -2018,3 +2019,18 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
         await session.commit()
         logger.info("Seeded %d skills, %d agents and %d workflows from %s",
                     skill_count, count, workflow_count, seed_path)
+
+
+# --- where used ---
+@router.get("/api/agents/{agent_id}/where-used", dependencies=[Depends(require_admin)])
+async def api_agent_where_used(agent_id: int) -> dict[str, Any]:
+    """Who refers to this agent: peers that list it and workflows that run it.
+
+    Read-only and for display, so unlike the delete/disable guard it includes
+    disabled referrers, each flagged with ``enabled``; see ``agent_where_used``.
+    """
+    async with SessionLocal() as session:
+        result = await agent_where_used(session, agent_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return result

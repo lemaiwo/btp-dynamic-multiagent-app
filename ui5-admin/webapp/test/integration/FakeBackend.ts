@@ -329,6 +329,31 @@ export default class FakeBackend {
         if (path === "import") {
             return this.json({ status: "ok" });
         }
+        // --- where used ---
+        // Derived from the agents and workflows above the way the server
+        // derives it from its tables, so a journey that edits a peer list or
+        // a step sees the change reflected here without a second fixture.
+        if (/^agents\/\d+\/where-used$/.test(path)) {
+            const id = Number(path.split("/")[1]);
+            const agent = this.agents.find((a) => a.id === id);
+            if (!agent) {
+                return this.json({ detail: "Agent not found" }, 404);
+            }
+            return this.json({
+                agent: { id: agent.id, name: agent.name },
+                peers: this.agents
+                    .filter((a) => a.id !== agent.id && (a.peers ?? []).indexOf(agent.name) !== -1)
+                    .map((a) => ({ id: a.id, name: a.name, enabled: a.enabled })),
+                workflows: this.workflows
+                    .filter((w) => w.steps.some((s) => s.agent_name === agent.name))
+                    .map((w) => ({
+                        id: w.id, name: w.name, api_slug: w.api_slug || null, enabled: w.enabled,
+                        steps: w.steps
+                            .filter((s) => s.agent_name === agent.name)
+                            .map((s) => ({ position: s.position, branch_key: s.branch_key }))
+                    }))
+            });
+        }
         return this.json({ detail: `unhandled ${method} ${path}` }, 404);
     }
 }

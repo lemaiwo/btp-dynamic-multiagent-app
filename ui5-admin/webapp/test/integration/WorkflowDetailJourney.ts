@@ -9,6 +9,7 @@ import type ColumnListItem from "sap/m/ColumnListItem";
 import type Button from "sap/m/Button";
 import type HBox from "sap/m/HBox";
 import type Input from "sap/m/Input";
+import type Link from "sap/m/Link";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
 import type Text from "sap/m/Text";
@@ -665,6 +666,82 @@ opaTest(
                         }
                     ],
                     "the main line is gone with no gap left behind, and 'support' is numbered 1..3 on its own, not 2..4 following 'billing'"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+// --- where used ---
+opaTest(
+    "a step row's agent link opens that agent",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        // Row 0 is the main-line fan-out step, which runs gmail-agent. The
+        // link sits last in the Actions cell, after move-up / move-down /
+        // delete, so those keep the positions the other journeys rely on.
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const actions = ((element as Table).getItems()[0] as ColumnListItem).getCells()[5] as HBox;
+                const link = actions.getItems()[3] as Link;
+                Opa5.assert.strictEqual(link.getText(), "Open gmail-agent", "the link names the row's agent");
+            }
+        });
+
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) {
+                const actions = ((element as Table).getItems()[0] as ColumnListItem).getCells()[5] as HBox;
+                return actions.getItems()[3];
+            },
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "agentName",
+            viewName: "AgentDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Input).getValue(), "gmail-agent",
+                    "the agent detail page opened on the step's agent"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "pressing a flow preview node opens its agent",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        When.waitFor({
+            id: "workflowFlow",
+            viewName: "WorkflowDetail",
+            actions: function (element: UI5Element | null) {
+                const flow = element as ProcessFlow;
+                const node = flow.getNodes().find((n) => n.getNodeId() === "billing-0");
+                // ProcessFlowNode's click handler fires nodePress with the
+                // node itself as the parameter object; do the same here.
+                (flow as unknown as { fireNodePress(node: unknown): void }).fireNodePress(node);
+            }
+        });
+
+        Then.waitFor({
+            id: "agentName",
+            viewName: "AgentDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Input).getValue(), "btp-agent",
+                    "the billing branch's first step runs btp-agent, and that agent opened"
                 );
             }
         });

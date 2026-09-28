@@ -1575,6 +1575,59 @@ async def rename_agent_references(
             step.agent_name = new_name
 
 
+# --- where used ---
+async def agent_where_used(
+    session: AsyncSession, agent_id: int
+) -> dict[str, Any] | None:
+    """Everything that refers to one agent, for display rather than for a guard.
+
+    The sibling of ``agent_referrers`` with the opposite audience: that one
+    answers "may this be removed?" and so deliberately sees only *enabled*
+    referrers, because a disabled peer or workflow breaks nothing. An
+    operator reading a where-used list wants the disabled ones too -- a
+    workflow switched off last week still names this agent and will need it
+    the day it is switched back on -- so each entry carries its ``enabled``
+    flag instead of being filtered on it. Returns ``None`` for an unknown id.
+
+    Workflow steps are matched on ``agent_name`` only; a step's ``steps``
+    list is ordered main line first, then branch by key, each by position.
+    """
+    row = await session.get(AgentConfig, agent_id)
+    if row is None:
+        return None
+    peers = [
+        {"id": r.id, "name": r.name, "enabled": bool(r.enabled)}
+        for r in await list_agents(session)
+        if r.id != row.id and row.name in r.peers
+    ]
+    result = await session.execute(
+        select(Workflow, WorkflowStep.position, WorkflowStep.branch_key)
+        .join(WorkflowStep, WorkflowStep.workflow_id == Workflow.id)
+        .where(WorkflowStep.agent_name == row.name)
+        .order_by(Workflow.name, Workflow.id)
+    )
+    by_id: dict[int, dict[str, Any]] = {}
+    for wf, position, branch_key in result.all():
+        entry = by_id.setdefault(wf.id, {
+            "id": wf.id,
+            "name": wf.name,
+            "api_slug": wf.api_slug,
+            "enabled": bool(wf.enabled),
+            "steps": [],
+        })
+        entry["steps"].append({"position": position, "branch_key": branch_key})
+    workflows = list(by_id.values())
+    for entry in workflows:
+        entry["steps"].sort(
+            key=lambda s: (s["branch_key"] is not None, s["branch_key"] or "", s["position"])
+        )
+    return {
+        "agent": {"id": row.id, "name": row.name},
+        "peers": peers,
+        "workflows": workflows,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Skills CRUD
 # ---------------------------------------------------------------------------

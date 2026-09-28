@@ -233,3 +233,15 @@ QUnit.test("getWorkflowRun calls the run id path", async function (assert) {
     assert.strictEqual(calls[0][0], "backend/workflow-runs/wf-run-1", "targets the run id");
     assert.strictEqual(calls[0][1], "GET", "uses GET");
 });
+
+// --- where used ---
+QUnit.test("getAgentWhereUsed calls the agent's where-used path", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, { agent: { id: 7, name: "a" }, peers: [], workflows: [] }, calls);
+
+    const result = await new AdminService().getAgentWhereUsed(7);
+
+    assert.strictEqual(calls[0][0], "backend/agents/7/where-used", "targets the agent's where-used path");
+    assert.strictEqual(calls[0][1], "GET", "uses GET");
+    assert.deepEqual(result.agent, { id: 7, name: "a" }, "returns the parsed body");
+});
