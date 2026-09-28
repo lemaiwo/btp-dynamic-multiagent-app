@@ -18,8 +18,8 @@ from agents.db import (
     create_job_run,
     finish_job_run,
 )
-from agents.db import DEFAULT_RUN_PROMPT
-from agents.registry import registry
+from agents.db import DEFAULT_RUN_PROMPT, get_agent_by_name
+from agents.registry import _MAX_DELEGATION_DEPTH, registry
 from agents.reports import RunReport
 
 logger = logging.getLogger(__name__)
@@ -97,6 +97,101 @@ async def _has_usable_credentials(
         if not await has_usable_token(principal, normalize_mcp_url(str(spec["url"]))):
             return False
     return True
+
+
+class CredentialBlocker:
+    """The first agent in a run's reachable graph with no usable credential.
+
+    ``root`` is the agent the run (or the workflow step) actually names; when
+    ``via_peer`` is set, ``agent_name`` is a peer reached from it and has no
+    step or run of its own to be blamed on.
+    """
+
+    __slots__ = ("principal", "agent_name", "root", "via_peer")
+
+    def __init__(self, principal: str, agent_name: str, root: str, via_peer: bool):
+        self.principal = principal
+        self.agent_name = agent_name
+        self.root = root
+        self.via_peer = via_peer
+
+    def message(self, *, scope: str = "the agent this run names") -> str:
+        via = f" That agent is reached as a peer from {scope}." if self.via_peer else ""
+        return (
+            f"The service account {self.principal!r} has no usable credential "
+            f"for agent {self.agent_name!r}'s MCP servers. It must be "
+            f"re-authorized interactively before scheduled runs can work.{via}"
+        )
+
+
+async def find_credential_blocker(
+    session, roots: dict[tuple[str, str], AgentConfig]
+) -> CredentialBlocker | None:
+    """Walk the peer graph from ``roots`` and check every credential on it.
+
+    ``roots`` maps (principal, agent name) to the agent row; a run binds one
+    identity per root and a delegated peer runs inside it, so the same peer
+    reached under two principals is two different checks.
+
+    Why peers matter: a peer with no usable credential does NOT fail the
+    delegation. registry._delegate returns the sign-in prompt as its *answer*
+    when there is no interactive sink (correct for A2A), the parent model
+    reads it as content, and the run is recorded `success`. So the graph is
+    checked here, before any model call, by both the job and workflow runners.
+
+    Bounded by the same _MAX_DELEGATION_DEPTH that _delegate enforces at run
+    time, and cycle-guarded: mutual peers (A lists B, B lists A) are a
+    legitimate configuration, not an error. An unresolvable peer (missing,
+    disabled, or not built) is skipped: the registry never wires it, so it is
+    not reachable and there is nothing to check.
+    """
+    to_check: dict[tuple[str, str], AgentConfig] = dict(roots)
+    blame: dict[tuple[str, str], str] = {key: key[1] for key in roots}
+    queue = [(key, 0) for key in roots]
+    while queue:
+        (principal, name), depth = queue.pop(0)
+        if depth >= _MAX_DELEGATION_DEPTH:
+            continue
+        for peer in to_check[(principal, name)].peers:
+            key = (principal, peer)
+            if peer == name or key in to_check:
+                continue
+            peer_row = await get_agent_by_name(session, peer)
+            if (peer_row is None or not peer_row.enabled
+                    or registry.build.specialists.get(peer) is None):
+                continue
+            to_check[key] = peer_row
+            blame[key] = blame[(principal, name)]
+            queue.append((key, depth + 1))
+
+    for (principal, name), row in to_check.items():
+        if not await _has_usable_credentials(row, principal):
+            return CredentialBlocker(
+                principal, name, blame[(principal, name)],
+                via_peer=(principal, name) not in roots,
+            )
+    return None
+
+
+# Phrases registry._delegate returns *as the tool answer* when a specialist
+# needs sign-in and there is no interactive sink to wait on. In a scheduled
+# run nobody can click the link, so a report built on one of these is a
+# failure, not a result. Matched case-insensitively against the report.
+SIGNIN_PROMPT_MARKERS = (
+    "needs you to sign in",
+    "needs sign-in",
+    "could not complete sign-in",
+    "/oauth/login?agent=",
+)
+
+
+def signin_prompt_in(report: RunReport) -> str | None:
+    """The first sign-in marker found in a report, or None."""
+    text = f"{report.summary}\n{report.body_md}".lower()
+    for marker in SIGNIN_PROMPT_MARKERS:
+        if marker.lower() in text:
+            return marker
+    return None
 
 
 async def start_run(
@@ -181,16 +276,16 @@ async def execute_run(run_id: str, agent_id: int) -> None:
             )
             return
 
-        if not await _has_usable_credentials(agent):
-            await _finalize(
-                run_id, status="failed",
-                error=(
-                    f"The service account {agent.run_as_principal!r} has no "
-                    "usable credential for this agent's MCP servers. It must "
-                    "be re-authorized interactively before scheduled runs can "
-                    "work."
-                ),
+        # The agent's own servers AND every peer it can delegate to: a peer
+        # whose token was revoked answers with a sign-in prompt the model then
+        # writes into the report, and the run would be recorded `success`.
+        principal = agent.run_as_principal.strip()
+        async with SessionLocal() as session:
+            blocker = await find_credential_blocker(
+                session, {(principal, agent.name): agent}
             )
+        if blocker is not None:
+            await _finalize(run_id, status="failed", error=blocker.message())
             return
 
         specialist = registry.build.specialists.get(agent.name)
@@ -210,6 +305,25 @@ async def execute_run(run_id: str, agent_id: int) -> None:
                 timeout=agent.run_timeout_seconds,
             )
         report: RunReport = result.output
+        marker = signin_prompt_in(report)
+        if marker is not None:
+            # A token died mid-run (or a peer needed sign-in that preflight
+            # could not see). The report is kept so an operator can read what
+            # happened, but the run is a failure: nobody could click the link.
+            await _finalize(
+                run_id,
+                status="failed",
+                summary=report.summary,
+                report=report.model_dump(mode="json"),
+                error=(
+                    "The run ended with a sign-in prompt instead of a result "
+                    f"(the report contains {marker!r}). The service account "
+                    f"{agent.run_as_principal!r} must re-authorize the agent "
+                    "(or one of its peers) interactively before scheduled runs "
+                    "can work."
+                ),
+            )
+            return
         await _finalize(
             run_id,
             status="success",

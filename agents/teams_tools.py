@@ -52,6 +52,7 @@ from urllib.parse import quote
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
+from agents.auth import current_principal
 from agents.lookback import parse_lookback
 from agents.outlook_tools import GRAPH_API, GRAPH_V1, _text_to_html, _truncate
 from agents.outlook_tools import build_http_client as graph_http_client
@@ -61,6 +62,9 @@ __all__ = ["teams_toolset", "TeamsClient", "BUILTIN_TEAMS_URL"]
 logger = logging.getLogger(__name__)
 
 BUILTIN_TEAMS_URL = "builtin:teams"
+
+# How many principals' channel lists one client keeps; the oldest is evicted.
+CHANNEL_CACHE_MAX_PRINCIPALS = 64
 
 AUTH_MODE_OAUTH2 = "oauth2"
 AUTH_MODE_APP_ONLY = "app_only"
@@ -144,7 +148,10 @@ class TeamsClient:
         self._root = f"/teams/{quote(self.team, safe='')}"
         self.allowed = [c.strip() for c in (channels or []) if c.strip()]
         self.lookback_minutes = lookback_minutes
-        self._channels: list[dict[str, str]] | None = None
+        # Channels per signed-in principal: one TeamsClient serves every user
+        # of the agent, and under oauth2 each user sees the channels they are
+        # a member of. Bounded; the oldest principal is evicted.
+        self._channels: dict[str | None, list[dict[str, str]]] = {}
 
     def _window(self, requested: int | None) -> int | None:
         if requested is None:
@@ -166,9 +173,11 @@ class TeamsClient:
         wanted = {a.lower() for a in self.allowed}
         return channel["id"].lower() in wanted or channel["name"].lower() in wanted
 
-    async def list_channels(self) -> list[dict[str, str]]:
-        """The team's channels this toolset may use, fetched once."""
-        if self._channels is None:
+    async def list_channels(self, *, refresh: bool = False) -> list[dict[str, str]]:
+        """The team's channels this toolset may use, cached per principal."""
+        key = current_principal.get()
+        channels = None if refresh else self._channels.get(key)
+        if channels is None:
             data = await self._req(
                 "GET",
                 f"{self._root}/channels",
@@ -183,16 +192,34 @@ class TeamsClient:
                 for c in data.get("value") or []
                 if c.get("id")
             ]
-            self._channels = [c for c in every if self._permitted(c)]
-        return self._channels
+            channels = [c for c in every if self._permitted(c)]
+            self._channels.pop(key, None)
+            self._channels[key] = channels
+            while len(self._channels) > CHANNEL_CACHE_MAX_PRINCIPALS:
+                self._channels.pop(next(iter(self._channels)))
+        return channels
 
-    async def _channel_id(self, channel: str) -> str:
-        """Resolve a channel by display name or id, inside the allow-list only."""
-        wanted = (channel or "").strip().lower()
-        channels = await self.list_channels()
+    @staticmethod
+    def _find_channel(wanted: str, channels: list[dict[str, str]]) -> str | None:
         for c in channels:
             if wanted in (c["id"].lower(), c["name"].lower()):
                 return c["id"]
+        return None
+
+    async def _channel_id(self, channel: str) -> str:
+        """Resolve a channel by display name or id, inside the allow-list only.
+
+        A miss refreshes the cache once before failing, so a channel created
+        after the first lookup does not need a registry reload.
+        """
+        wanted = (channel or "").strip().lower()
+        channels = await self.list_channels()
+        found = self._find_channel(wanted, channels)
+        if found is None:
+            channels = await self.list_channels(refresh=True)
+            found = self._find_channel(wanted, channels)
+        if found is not None:
+            return found
         raise ValueError(
             f"no channel {channel!r} available to this agent; available: "
             f"{', '.join(c['name'] for c in channels) or '(none)'}"
@@ -345,7 +372,8 @@ def teams_toolset(
             "builtin:teams requires a 'team' (the team's id) in its config: the "
             "team is pinned by an admin, never chosen by the agent"
         )
-    can_send = bool(oauth.get("allow_send")) if allow_send is None else bool(allow_send)
+    # `is True`, as Jira and Slack do: the string "false" must not enable sending.
+    can_send = (oauth.get("allow_send") is True) if allow_send is None else (allow_send is True)
     if can_send and mode == AUTH_MODE_APP_ONLY:
         raise ValueError(
             "builtin:teams cannot post under auth_mode 'app_only': Graph does not "

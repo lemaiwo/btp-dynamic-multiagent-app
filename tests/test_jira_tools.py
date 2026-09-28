@@ -511,6 +511,8 @@ async def test_read_and_write() -> None:
     capture: dict = {}
 
     def record(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/2/myself"):
+            return httpx.Response(200, json={"name": "agent-svc"})
         capture["method"] = request.method
         capture["path"] = request.url.path
         capture["sent"] = json.loads(request.content)
@@ -626,6 +628,40 @@ async def test_identity_failures() -> None:
     check("repeat-run safety is back once /myself answers", second == [],
           detail=str(second))
 
+    print("\n-- the degraded filter is said out loud, and commenting is refused --")
+    posted: list[str] = []
+
+    def dead_myself(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/rest/api/2/myself"):
+            return httpx.Response(502, json={})
+        if request.method == "POST" and "/comment" in request.url.path:
+            posted.append(request.url.path)
+            return httpx.Response(201, json={"id": "11", "author": {}})
+        return httpx.Response(200, json={"issues": issues})
+
+    client, http = _client(dead_myself, project="ABC")
+    async with http:
+        await client.list_issues()
+        check("the client reports the answered filter as unavailable",
+              client.answered_filter == "unavailable", client.answered_filter)
+        err = await _raises(client.add_comment("ABC-1", "hello"))
+        check("add_comment is refused while the account is unknown",
+              isinstance(err, RuntimeError) and "duplicate" in str(err), repr(err))
+        check("nothing was posted", posted == [], str(posted))
+        await client.add_comment("ABC-1", "hello", force=True)
+        check("force=True posts anyway", posted == ["/rest/api/2/issue/ABC-1/comment"],
+              str(posted))
+
+    client, http = _client(flaky_myself, project="ABC")
+    calls["n"] = 0
+    async with http:
+        await client.list_issues()
+        first_state = client.answered_filter
+        await client.list_issues()
+    check("the flag flips back to active once /myself answers",
+          first_state == "unavailable" and client.answered_filter == "active",
+          f"{first_state} -> {client.answered_filter}")
+
 
 def test_toolset_build() -> None:
     print("\n-- toolset construction and gating --")
@@ -662,6 +698,19 @@ def test_toolset_build() -> None:
     toolset = _build({"destination": "MY_JIRA_DESTINATION"}, http=http)
     check("the toolset exposes its http client for the registry to close",
           getattr(toolset, "http_client", None) is http)
+    # The tool wrapper (not the client) is what the model sees: it must carry
+    # the answered-filter state next to the issues. Swapping the client's
+    # request method keeps the destination service out of this test.
+    import inspect
+
+    ret = inspect.signature(toolset.tools["list_issues"].function).return_annotation
+    check("the list_issues tool returns a dict carrying answered_filter",
+          "dict" in str(ret), detail=str(ret))
+    check("add_comment takes an explicit force override",
+          "force" in inspect.signature(
+              _build({"destination": "MY_JIRA_DESTINATION", "project": "ABC",
+                      "allow_comment": True}).tools["add_comment"].function
+          ).parameters)
 
     _without_dest_env()
     err = _sync_raises(lambda: jira_toolset(

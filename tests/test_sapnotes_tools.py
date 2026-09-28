@@ -137,6 +137,104 @@ async def test_min_score_is_respected_when_lowered():
     assert "3792978" in numbers
 
 
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_list_critical_notes_pages_through_the_whole_result_set():
+    """The walk follows startIndex until totalResults is exhausted."""
+    payload = load_fixture()
+    records = payload["vulnerabilities"]
+    seen_starts: list[int] = []
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        start = int(request.url.params["startIndex"])
+        seen_starts.append(start)
+        assert request.url.params["resultsPerPage"] == "2000"
+        page = records[start:start + 2]
+        return httpx.Response(200, json={
+            "resultsPerPage": 2, "totalResults": len(records),
+            "startIndex": start, "vulnerabilities": page,
+        })
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = SapNotesClient(http, min_score=9.0, sleep=fake_sleep)
+    result = await client.list_critical_notes(limit=100)
+    assert seen_starts == [0, 2, 4]
+    assert result["total_scanned"] == len(records)
+    assert result["total_results"] == len(records)
+    assert result["pages"] == 3
+    assert [n["note"] for n in result["notes"]] == ["3747649", "3759472"]
+    # A pause between pages, none after the last.
+    assert len(sleeps) == 2
+
+
+@pytest.mark.asyncio
+async def test_limit_applies_to_the_filtered_notes_not_the_fetch():
+    client = client_with_fixture(min_score=9.0, sleep=_no_sleep)
+    result = await client.list_critical_notes(limit=1)
+    assert [n["note"] for n in result["notes"]] == ["3747649"]
+    assert result["count"] == 1
+    assert result["matching"] == 2
+    assert result["truncated"] is True
+    # Every record was still scanned: the cap never shrank the fetch.
+    assert result["total_scanned"] == 5
+    full = await client.list_critical_notes(limit=100)
+    assert full["truncated"] is False and full["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_is_retried_once_then_reported():
+    payload = load_fixture()
+    calls = {"n": 0}
+    waits: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    def flaky(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(403, headers={"Retry-After": "2"})
+        return httpx.Response(200, json=payload)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(flaky))
+    result = await SapNotesClient(http, min_score=9.0, sleep=fake_sleep).list_critical_notes()
+    assert calls["n"] == 2 and result["count"] == 2
+    assert waits == [2.0]
+
+    def always(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(always))
+    with pytest.raises(RuntimeError, match="rate limited"):
+        await SapNotesClient(http, min_score=9.0, sleep=fake_sleep).list_critical_notes()
+
+
+@pytest.mark.asyncio
+async def test_a_server_that_ignores_start_index_cannot_loop_forever():
+    """Wrong totalResults with a repeating page still terminates."""
+    payload = load_fixture()
+    payload["totalResults"] = 10**6
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=payload)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    result = await SapNotesClient(http, min_score=9.0, sleep=_no_sleep).list_critical_notes()
+    from agents.sapnotes_tools import NVD_MAX_PAGES
+
+    assert calls["n"] == NVD_MAX_PAGES
+    assert result["pages"] == NVD_MAX_PAGES
+
+
 def test_toolset_exposes_one_tool_and_pins_the_source():
     from agents.sapnotes_tools import sapnotes_toolset
 
