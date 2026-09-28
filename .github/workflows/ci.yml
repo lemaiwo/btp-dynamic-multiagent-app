@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    name: Python tests (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.13 is what runtime.txt deploys; 3.11 is the floor the README states.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      # tests/test_admin_ui.py syntax-checks the inline admin JS with `node --check`,
+      # and the report-rendering tests run on jsdom.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+      - name: Lint (advisory until the pre-existing findings are worked off)
+        run: pip install ruff && ruff check .
+        continue-on-error: true
+      - name: pytest
+        # asyncio_mode=auto and testpaths come from pytest.ini.
+        run: pytest -q -p no:cacheprovider
+      - name: Admin template contract test
+        run: python tests/test_admin_ui.py
+      - name: Report rendering tests (jsdom)
+        run: |
+          npm ci
+          node tests/test_report_render.mjs
+          node tests/test_report_sanitize.mjs
+      # The chat UI Playwright scripts (tests/test_chat_*_ui.py) are not run
+      # here: templates/chat.html loads the pydantic-ai chat bundle from
+      # cdn.jsdelivr.net at page load, so they need outbound CDN access and a
+      # browser, and they are run by hand against a local server instead.
+
+  ui5-admin:
+    name: UI5 admin (tsc + karma)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui5-admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui5-admin/package-lock.json
+      - run: npm ci
+      - run: npm run ts:check
+      # karma.conf.js already uses ChromeHeadless; the runner image ships a
+      # Chrome that karma-chrome-launcher finds on its own.
+      - run: npx karma start karma.conf.js --single-run

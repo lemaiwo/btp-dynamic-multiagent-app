@@ -6,6 +6,16 @@ delete specialist agents through a web UI, point each one at a BTP-hosted
 MCP server, and reload the orchestrator without redeploying. The chat UI
 and admin UI are both protected by XSUAA.
 
+> **About `docs/`:** the connector setup guides, the workflow design spec
+> and the UI5/AI Core notes referenced from this README, `CLAUDE.md` and
+> the module docstrings live in a `docs/` folder that is **intentionally
+> not in this public repository**. They name real landscapes (CF orgs and
+> spaces, approuter hosts, destination names, OAuth client ids), so
+> `docs/` is gitignored and kept in the operator's local working copy next
+> to the `.mtaext` files. If you are setting the app up elsewhere, ask the
+> operator for that copy; the module docstrings under `agents/` carry the
+> parts that are safe to publish.
+
 ## Architecture
 
 ```
@@ -31,17 +41,21 @@ User  -->  Approuter (XSUAA)  -->  FastAPI app
   httpx client auth reads for every outgoing call — the MCP server sees
   the caller's own identity.
 - **XSUAA-secured admin**: The `/admin` routes require the
-  `$XSAPPNAME.admin` scope (role collection *Pydantic Agent Administrator*).
+  `$XSAPPNAME.admin` scope (role collection *Agent Administrator*, see
+  `xs-security.json`).
 - **Import / export**: Full configuration can be dumped as JSON and
   re-imported, either merging or fully replacing the current set.
 
 ## Prerequisites
 
-- Python 3.13+ (3.11 also works)
+- Python 3.11+ (`runtime.txt` deploys 3.13 on Cloud Foundry; the suites
+  run on both)
 - SAP AI Core service instance with access to Generative AI Hub
 - Optional: a local PostgreSQL instance. Without one the app falls back
   to a SQLite file (`agents_registry.db`) in the project root.
-- Optional: Node.js (only required to run the UI test suite)
+- Node.js 20+ and npm: `mbt build` runs `npm ci && npm run build:ui5` for
+  the UI5 admin app, and the JavaScript test suites need it too. Only the
+  Python backend alone runs without it.
 
 ## Local development
 
@@ -92,7 +106,7 @@ Open:
 
 A SAPUI5 rebuild of the admin UI is available at `/ui5admin`. It is **not** a
 replacement yet — `/admin` remains the supported admin interface. See
-`docs/UI5_ADMIN.md`.
+`docs/UI5_ADMIN.md` (local, not in repo) and `ui5-admin/` in the tree below.
 
 On first startup the database is empty, so the app imports
 [`agents.seed.json`](./agents.seed.json) which contains the Cloud Foundry,
@@ -126,27 +140,59 @@ You can also re-import this file at any time via the admin UI's
    `load_skill` tool, so large instructions don't inflate every request.
 5. Click **Reload agents** — the orchestrator is rebuilt in place and
    the new specialist is available in the chat without restarting.
+   **Saving an agent, skill or workflow never rebuilds anything on its
+   own**: after every edit that should reach the chat or the next
+   scheduled run (a changed instruction, a toolset's send switch, a new
+   peer) press **Reload** (in the UI5 admin: Settings → Reload, or
+   `POST /admin/api/reload`).
 6. Use **Export config** to download a JSON snapshot, or **Import
    config** to load a saved configuration (merge or replace). Skills
    are included in exports and imported before agents.
 
 ### 5. Running the tests
 
-The repo ships with two self-contained test suites that boot the real
-FastAPI app (stubbing SAP AI Core + MCP) over an ASGI transport — no
-external services needed.
+None of the suites needs an external service: the Python ones boot the
+real FastAPI app over an ASGI transport with SAP AI Core and MCP stubbed,
+and store state in throwaway SQLite files. `.github/workflows/ci.yml`
+runs everything below except the Playwright scripts.
 
 ```bash
-# Backend HTTP API tests (HTML admin API incl. skills CRUD)
-python tests/test_admin_api.py
+# Python unit + API tests: registry, auth, OAuth2, connectors (Gmail,
+# Outlook, Teams, Slack, Jira, SAP notes), workflows, A2A, admin API.
+# pytest.ini sets asyncio_mode=auto and testpaths=tests, so no flags.
+pip install pytest pytest-asyncio
+pytest
 
-# Admin UI tests (HTML structure, JS syntax, fetch contract, flows)
+# Admin template contract test for templates/admin.html (HTML structure,
+# `node --check` on the inline JS, every fetch() replayed against the app).
 python tests/test_admin_ui.py
+
+# Run-report rendering + DOMPurify sanitising, on jsdom (root package.json).
+npm ci
+node tests/test_report_render.mjs
+node tests/test_report_sanitize.mjs
+
+# UI5 admin: TypeScript check, then QUnit units + OPA5 journeys in
+# headless Chrome via karma (ui5-admin/karma.conf.js).
+npm --prefix ui5-admin ci
+npm --prefix ui5-admin test
+
+# UI5 admin end-to-end against a real backend on an isolated database
+# (Playwright; see ui5-admin/playwright.config.ts).
+npm --prefix ui5-admin run test:e2e
+
+# Chat UI scripts (progress panel, heartbeat, OAuth auto-continue). Not in
+# CI: templates/chat.html loads the pydantic-ai chat bundle from
+# cdn.jsdelivr.net, so they need a browser with CDN access and a running
+# local server.
+python tests/test_chat_progress_ui.py
+python tests/test_chat_heartbeat_ui.py
+python tests/test_chat_oauth_autocontinue_ui.py
 ```
 
-The UI test uses `node --check` to syntax-check the inline JavaScript,
-so Node.js must be on the `PATH` for that step (everything else
-degrades gracefully).
+`ruff check` (`ruff.toml`: E, F, I at 100 columns) is advisory for now;
+CI runs it without failing the build until the pre-existing findings
+are worked off.
 
 ### 6. Resetting state
 
@@ -161,8 +207,14 @@ degrades gracefully).
 
 ```bash
 mbt build
-cf deploy mta_archives/pydantic-agent_2.0.0.mtar
+cf deploy mta_archives/pydantic-agent_<version>.mtar   # <version> is `version:` in mta.yaml
 ```
+
+`mbt build` needs Node.js: the `ui5-admin` module is built with
+`npm ci && npm run build:ui5` and uploaded to the HTML5 Application
+Repository. Landscape-specific values (routes, the AI Core resource
+group, `PUBLIC_BASE_URL`/`A2A_PUBLIC_URL`, `A2A_AGENT_VERSION`) go in a
+gitignored `<landscape>.mtaext` passed to `cf deploy -e`.
 
 This creates/binds:
 
@@ -172,8 +224,18 @@ This creates/binds:
 | `uaa-service`       | `xsuaa`            | Auth for chat + admin       |
 | `agent-registry-db` | `postgresql-db`    | Dynamic agent configuration |
 
-After deploy, assign the **Pydantic Agent Administrator** role collection
-to your user in the BTP cockpit, then open `/admin` on the approuter URL.
+After deploy, assign the **Agent Administrator** role collection to your
+user in the BTP cockpit (chat-only users get **Agent User**; the Joule
+technical user gets **Agent A2A Client**), then open `/admin` on the
+approuter URL.
+
+> **`xs-security.json` redirect URIs are landscape pins.** The
+> `oauth2-configuration.redirect-uris` list names the CF domains this app
+> has been deployed to; XSUAA refuses the login redirect for any other
+> domain. Deploying to a new landscape means adding its
+> `https://*.cfapps.<landscape>.hana.ondemand.com/**` there (or overriding
+> the whole list in your `.mtaext`); the existing entries are kept because
+> removing one breaks login on that landscape.
 
 ### Optional: CF API restart
 
@@ -194,13 +256,20 @@ for tighter control.
 
 ### MCP authentication modes
 
-Each MCP server is registered with one of three auth modes:
+Each MCP server or built-in toolset is registered with one of six auth
+modes (`AgentConfig.auth_mode`, see `agents/db.py`):
 
-| Mode      | When to use                                                                 | How the user authenticates                          |
-|-----------|------------------------------------------------------------------------------|-----------------------------------------------------|
-| `jwt`     | BTP servers that **trust this app's XSUAA** (same subaccount / granted scope) | This app's XSUAA JWT is forwarded on every request  |
-| `oauth2`  | Servers with their **own** authorization server (separate XSUAA / OAuth)      | Per-user OAuth2 authorization_code (sign in once)   |
-| `none`    | Public servers needing no auth                                               | No token is sent                                    |
+| Mode          | When to use                                                                 | How the call authenticates                                              |
+|---------------|------------------------------------------------------------------------------|-------------------------------------------------------------------------|
+| `jwt`         | BTP servers that **trust this app's XSUAA** (same subaccount / granted scope) | This app's XSUAA JWT is forwarded on every request                      |
+| `oauth2`      | Servers with their **own** authorization server; `builtin:gmail`, `builtin:outlook`, `builtin:teams` as the signed-in user | Per-user OAuth2 authorization_code (sign in once; tokens stored per user) |
+| `none`        | Public servers and `builtin:sapnotes` (NVD)                                  | No token is sent                                                        |
+| `app_only`    | `builtin:outlook` / `builtin:teams` as the application (service mailbox, read-only Teams) | OAuth2 client_credentials with the registration's own secret; `mailbox` names the target |
+| `destination` | `builtin:jira`, `builtin:slack`                                              | The BTP destination named in the config holds the URL and credential; nothing is stored here |
+| `session`     | `builtin:sapnotedetail` (me.sap.com)                                         | A browser session cookie stored by an operator (`scripts/sap_session.py`) |
+
+The UI5 admin's toolset dropdown offers only the modes each built-in can
+actually run with (`ui5-admin/webapp/model/builtins.ts`).
 
 #### Per-user OAuth2 (`oauth2`)
 
@@ -262,20 +331,49 @@ automatically; on a refresh failure the user is re-prompted.
 .
 ├── app.py                      # FastAPI entry point, middleware, lifespan
 ├── agents/
-│   ├── db.py                   # SQLAlchemy models, VCAP postgres resolver
+│   ├── db.py                   # SQLAlchemy models (agents, skills, workflows, runs), VCAP postgres resolver
 │   ├── auth.py                 # XSUAA JWT validation + JWT forward contextvar
-│   ├── shared.py               # MCP factory, SAP AI Core model, JWTForwardAuth
-│   ├── registry.py             # Dynamic orchestrator builder + reload
+│   ├── shared.py               # MCP factory (PerRunMCPServer), SAP AI Core model, JWTForwardAuth
+│   ├── oauth2.py               # Per-user OAuth2 (PKCE, DCR discovery, token storage)
+│   ├── oauth_routes.py         # GET /oauth/callback
+│   ├── client_credentials.py   # app_only token client
+│   ├── destination.py          # BTP destination service resolver
+│   ├── builtins.py             # builtin: pseudo-URL registry -> toolset factories
+│   ├── gmail_tools.py          # builtin:gmail       (Gmail REST, oauth2)
+│   ├── outlook_tools.py        # builtin:outlook     (Microsoft Graph, oauth2 / app_only)
+│   ├── teams_tools.py          # builtin:teams       (Microsoft Graph, oauth2 / app_only)
+│   ├── slack_tools.py          # builtin:slack       (Slack Web API via destination)
+│   ├── jira_tools.py           # builtin:jira        (Jira REST via destination)
+│   ├── sapnotes_tools.py       # builtin:sapnotes    (NVD, public)
+│   ├── sapnotedetail_tools.py  # builtin:sapnotedetail (me.sap.com session cookie)
+│   ├── lookback.py             # shared look-back window parser
+│   ├── registry.py             # Dynamic orchestrator builder, peers, reload
 │   ├── chat_app.py             # Dynamic ASGI wrapper around Agent.to_web()
-│   ├── admin.py                # FastAPI admin router (CRUD / reload / I/O)
+│   ├── admin.py                # FastAPI /admin router (agent/skill/workflow CRUD, reload, import/export)
+│   ├── api_runs.py             # Scheduler entry points: POST /api/agents|workflows/{slug}/run
+│   ├── job_runner.py           # Scheduled single-agent runs + reports
+│   ├── workflow_runner.py      # Workflow engine (main line, fan-out, branches, join)
+│   ├── a2a.py                  # A2A server for SAP Joule (agent card + JSON-RPC)
 │   └── cf_api.py               # CF API restart helper
 ├── templates/
-│   └── admin.html              # Admin UI
-├── approuter/                  # XSUAA-protected approuter
+│   ├── admin.html              # Admin UI (vanilla JS), served at /admin
+│   └── chat.html               # Chat UI shell around the pydantic-ai chat bundle
+├── ui5-admin/                  # SAPUI5 (TypeScript) admin, served at /ui5admin
+│   ├── webapp/                 # Component, views, controllers, model/, service/
+│   ├── webapp/test/            # QUnit units + OPA5 journeys (karma)
+│   └── e2e/                    # Playwright end-to-end tests
+├── approuter/                  # XSUAA-protected approuter (xs-app.json routes)
+├── scripts/                    # Operator scripts: AI Core setup, model deployment, probes, sap_session.py
+├── tests/                      # pytest suites, admin template test, jsdom report tests, chat UI scripts
+├── .github/workflows/ci.yml    # CI: pytest, template test, jsdom tests, UI5 tsc + karma
 ├── agents.seed.json            # Initial agents to import on first startup
-├── mta.yaml                    # MTA deployment descriptor
-├── xs-security.json            # XSUAA scopes + role collections
-└── requirements.txt
+├── mta.yaml                    # MTA deployment descriptor (+ .mtaext per landscape, gitignored)
+├── xs-security.json            # XSUAA scopes, role templates, role collections
+├── JOULE_A2A.md                # Joule / A2A configuration guide
+├── SLACK_SETUP.md              # Slack + BTP destination setup for builtin:slack
+├── pytest.ini · ruff.toml      # Test and lint configuration
+├── runtime.txt                 # Python 3.13 for the CF buildpack
+└── requirements.txt            # Pinned Python dependencies
 ```
 
 ## Import / export format

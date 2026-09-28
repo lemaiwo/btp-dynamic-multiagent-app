@@ -7,6 +7,16 @@ delegates to specialist agents that connect to BTP-hosted MCP servers
 over OAuth 2.1. The user's XSUAA JWT is forwarded to each MCP server.
 SAP AI Core's Generative AI Hub is the LLM provider.
 
+> **`docs/` is not in this repository.** Every `docs/...` path mentioned
+> below (connector setup guides, the workflow design spec, `UI5_ADMIN.md`,
+> `AICORE_RESOURCE_GROUP.md`) is landscape-specific: it names real CF
+> orgs and spaces, approuter hosts, destination names and OAuth client
+> ids, so `docs/` is gitignored and lives only in the operator's local
+> working copy (the same place as the `.mtaext` files). Do not create
+> `docs/` files in the repo to satisfy a reference; ask for the local
+> copy instead. Module docstrings carry the parts that are safe to
+> publish.
+
 ## Architecture
 - **LLM**: SAP AI Core Generative AI Hub (`sap-ai-sdk-gen`) via
   OpenAI-compatible API
@@ -54,7 +64,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/gmail_tools.py` — in-process Gmail tools over the REST API,
   attached when an agent lists the pseudo-URL `builtin:gmail` instead of an
   MCP endpoint. Google's hosted Gmail MCP server refuses every `tools/call`
-  from a self-registered OAuth client; see `docs/GMAIL_SETUP.md`. Auth reuses
+  from a self-registered OAuth client; see `docs/GMAIL_SETUP.md` (local,
+  not in repo). Auth reuses
   `PerUserOAuth2Auth`, so sign-in and refresh are unchanged
 - `agents/outlook_tools.py` — the same idea over Microsoft Graph
   (`builtin:outlook`), with an Inbox subfolder as the queue instead of a
@@ -172,10 +183,18 @@ python app.py
 Local falls back to SQLite if no `DATABASE_URL` is set.
 
 ## Dependencies
-- `pydantic-ai[mcp,web,openai]`, `sap-ai-sdk-gen[all]`, `mcp`, `httpx`,
-  `uvicorn`, `python-dotenv`
+All pinned in `requirements.txt` to the versions the suites last ran on;
+bump a pin, rerun the suites, then deploy.
+- `pydantic-ai[mcp,web,openai,bedrock]`, `sap-ai-sdk-gen[all]`, `mcp`,
+  `httpx`, `uvicorn`, `python-dotenv` (pip warns that the `pydantic-ai`
+  meta package declares none of those extras; the imports work because it
+  pulls them in anyway)
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
-- `sqlalchemy[asyncio]`, `asyncpg` — dynamic agent storage
+- `sqlalchemy[asyncio]`, `asyncpg` (Postgres on CF), `aiosqlite` (the
+  local SQLite fallback) — dynamic agent storage
 - `pyjwt[crypto]` — XSUAA JWT validation
+- Test-only: `pytest`, `pytest-asyncio` (`pytest.ini` sets
+  `asyncio_mode = auto`), `jsdom` via the root `package.json`, `ruff`
+  (`ruff.toml`, advisory in CI)
 - `@ui5/cli`, `ui5-tooling-transpile`, `@sapui5/types`, `karma-ui5`,
   `@playwright/test` — UI5 admin app (dev-only; not in `requirements.txt`)
