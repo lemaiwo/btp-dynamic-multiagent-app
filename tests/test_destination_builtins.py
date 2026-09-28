@@ -56,9 +56,9 @@ class FakeResolver:
         headers = dict(self.headers)
         if user_token and "Authorization" in headers:
             headers["Authorization"] = f"Bearer user-token-of-{principal}"
+        auth_type = "OAuth2UserTokenExchange" if user_token else "OAuth2ClientCredentials"
         return Destination(url=self.url, headers=headers, expires_at=time.monotonic() + 60,
-                           auth_type="OAuth2UserTokenExchange" if user_token else "OAuth2ClientCredentials",
-                           per_user=bool(user_token))
+                           auth_type=auth_type, per_user=bool(user_token))
 
     def invalidate(self, principal: str | None = None) -> None:
         pass
@@ -424,7 +424,8 @@ def test_admin_still_refuses_destination_on_a_remote_url_and_keeps_old_rules():
 def test_user_context_field_is_a_boolean():
     from agents.admin import OAuthClientPayload
 
-    assert OAuthClientPayload(destination="D", user_context=True).to_config()["user_context"] is True
+    on = OAuthClientPayload(destination="D", user_context=True).to_config()
+    assert on["user_context"] is True
     assert "user_context" not in OAuthClientPayload(destination="D").to_config()
     with pytest.raises(ValidationError):
         OAuthClientPayload(destination="D", user_context="maybe")
@@ -467,7 +468,8 @@ async def test_destination_health_without_a_binding_reports_unbound(monkeypatch)
 
     monkeypatch.setattr(admin, "list_agents", fake_list_agents)
     out = await admin._destination_health()
-    assert [e["agent"] for e in out] == ["Mail", "Broken"], "disabled agents and jwt servers are skipped"
+    assert [e["agent"] for e in out] == ["Mail", "Broken"], \
+        "disabled agents and jwt servers are skipped"
     mail, broken = out
     assert mail["state"] == "unbound" and mail["user_context"] is True
     assert mail["destination"] == "GRAPH" and "binding" in mail["error"]
@@ -504,8 +506,12 @@ async def test_destination_health_resolves_with_the_app_token_and_warns_on_misma
             assert "user_token" not in kw, "health resolves with the app token only"
             if self.name == "GONE":
                 raise DestinationError("destination 'GONE' does not exist; secret=never")
-            return Destination(url="https://graph.microsoft.com", headers={"Authorization": "Bearer s3cr3t"},
-                               expires_at=time.monotonic() + 60, auth_type="OAuth2ClientCredentials")
+            return Destination(
+                url="https://graph.microsoft.com",
+                headers={"Authorization": "Bearer s3cr3t"},
+                expires_at=time.monotonic() + 60,
+                auth_type="OAuth2ClientCredentials",
+            )
 
     monkeypatch.setattr(dest_mod, "DestinationResolver", FakeResolverCls)
     out = await admin._destination_health()

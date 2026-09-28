@@ -123,7 +123,8 @@ async def test_per_user_results_are_cached_apart_from_the_app_level_one():
     ann = await resolver.resolve(user_token="jwt-ann", principal="ann")
     bob = await resolver.resolve(user_token="jwt-bob", principal="bob")
     app = await resolver.resolve()
-    assert ann.headers["Authorization"] != bob.headers["Authorization"] != app.headers["Authorization"]
+    tokens = {d.headers["Authorization"] for d in (ann, bob, app)}
+    assert len(tokens) == 3, "each user and the app got a token of their own"
     assert len(svc.destination_calls()) == 3
     # Cache hits: no further calls, and each principal gets their own entry.
     assert (await resolver.resolve(user_token="jwt-ann", principal="ann")) is ann

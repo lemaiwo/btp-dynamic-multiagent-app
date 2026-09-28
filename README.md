@@ -265,11 +265,84 @@ modes (`AgentConfig.auth_mode`, see `agents/db.py`):
 | `oauth2`      | Servers with their **own** authorization server; `builtin:gmail`, `builtin:outlook`, `builtin:teams` as the signed-in user | Per-user OAuth2 authorization_code (sign in once; tokens stored per user) |
 | `none`        | Public servers and `builtin:sapnotes` (NVD)                                  | No token is sent                                                        |
 | `app_only`    | `builtin:outlook` / `builtin:teams` as the application (service mailbox, read-only Teams) | OAuth2 client_credentials with the registration's own secret; `mailbox` names the target |
-| `destination` | `builtin:jira`, `builtin:slack`                                              | The BTP destination named in the config holds the URL and credential; nothing is stored here |
+| `destination` | Every built-in (`builtin:jira` and `builtin:slack` only take this mode); app-level or **as the signed-in user** | The BTP destination named in the config holds the URL and credential; nothing is stored here. With `user_context` the destination service exchanges the user's JWT for the target's token -- see [Destinations for built-in connectors](#destinations-for-built-in-connectors) |
 | `session`     | `builtin:sapnotedetail` (me.sap.com)                                         | A browser session cookie stored by an operator (`scripts/sap_session.py`) |
 
 The UI5 admin's toolset dropdown offers only the modes each built-in can
 actually run with (`ui5-admin/webapp/model/builtins.ts`).
+
+#### Destinations for built-in connectors
+
+Every built-in toolset can reach its API through a **BTP destination**
+instead of holding a credential in this app. The server's config block is
+then just `{"destination": "<name>", "user_context": true|false}` plus the
+built-in's usual pinned keys (`mailbox`, `team`, `channels`, `lookback`,
+`recipients`, `min_score`, ...). The destination supplies the URL -- the
+API host itself, or a proxy such as API Management in front of it; the
+config block can never change the host -- and the credential.
+
+`user_context` decides **whose** credential that is:
+
+| `user_context` | Who the tools act as | Destination `Authentication` types that work | Trust needed on the identity side |
+|---|---|---|---|
+| `false` (default) | The application. Same rules as `app_only`: `builtin:outlook`/`builtin:gmail` need `mailbox`, `builtin:teams` is read-only. Scheduled runs need this. | `OAuth2ClientCredentials`; `NoAuthentication` with a static `URL.headers.Authorization` (Slack's bot token); `NoAuthentication` with `URL.headers.Cookie` (`builtin:sapnotedetail`) or `URL.headers.apiKey` (`builtin:sapnotes`) | None beyond the app registration the destination's client id belongs to |
+| `true` | **The signed-in user**: Graph `/me`, Gmail `users/me`, Teams posts under the user's name. Chat only -- scheduled and API-triggered runs carry no user token and fail with a clear error (no sign-in loop). | `OAuth2UserTokenExchange`, `OAuth2JWTBearer`, `OAuth2SAMLBearerAssertion` (`PrincipalPropagation` for on-premise via the Cloud Connector) | The target's identity provider must trust the token the destination service presents: for Microsoft Graph, a federation or an Entra ID app that accepts the IAS/XSUAA-issued assertion (OAuth2SAMLBearerAssertion) or a JWT-bearer trust; for Google, a Workspace-side trust to IAS. In BTP, set up IAS as the subaccount's trust and configure the destination with the IdP's token service URL and the target audience; the destination's owner does this once |
+
+**How the per-user flow works.** On every tool call the app resolves the
+destination (`GET /destination-configuration/v1/destinations/{name}`) with
+its own destination-service token. When `user_context` is on it also sends
+the request-bound user JWT as the `X-user-token` header; the destination
+service then performs the token exchange / assertion for that user and
+returns an `authTokens` entry that is *that user's* token for the target.
+Results are cached per principal (bounded, 256 entries, until the token
+nears expiry) and separately from the app-level entry, so two users never
+share a token. A 401 from the target drops that user's entry and retries
+once. Implementation: `agents/destination.py` (resolver) and
+`agents/destination_auth.py` (`DestinationAuth`, the httpx auth every
+destination-backed built-in uses; Jira and Slack keep their own resolver
+calls).
+
+`GET /admin/api/credential-health` lists every destination-mode server
+under `destinations`, resolved with the app token, as `resolvable`,
+`error` (the service's message, never a header) or `unbound` (no
+destination service binding), and warns when a `user_context` server sits
+on an app-level `Authentication` type -- every user would share one
+mailbox.
+
+**Worked example: Outlook as the signed-in user (Graph, user token
+exchange).**
+
+1. In the subaccount, establish trust to your Identity Authentication (IAS)
+   tenant and, in IAS, a corporate IdP / application trust that Entra ID
+   accepts for an OAuth2 SAML bearer assertion (Entra ID application
+   registered with the Graph delegated permissions `Mail.Read`,
+   `Mail.ReadWrite`, `Mail.Send` as needed, admin consented).
+2. Create the destination, e.g. `GRAPH_USER`: URL
+   `https://graph.microsoft.com`, Authentication
+   `OAuth2SAMLBearerAssertion` (or `OAuth2UserTokenExchange` when the
+   target trusts XSUAA/IAS JWTs directly), Audience
+   `https://graph.microsoft.com`, Token Service URL
+   `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`, client
+   id/secret of the Entra app, and `scope` = `https://graph.microsoft.com/.default`.
+3. In the admin UI add `builtin:outlook`, auth mode **BTP destination**,
+   destination `GRAPH_USER`, **Act as signed-in user** on. No mailbox: the
+   user's token names it. Turn **Sending** on only if replies may leave the
+   mailbox.
+4. Open the chat as a user: the first tool call resolves the destination
+   with the user's JWT, and Graph answers for that user's Inbox.
+
+The same server with **Act as signed-in user** off and destination
+`GRAPH_APP` (`OAuth2ClientCredentials`, application permissions, an
+Exchange application access policy narrowing it to the service mailbox)
+plus `mailbox = service@example.com` is the unattended variant a scheduler
+can run.
+
+**Worked example: Slack as the bot (static header).** Slack has no
+client-credentials grant, so the bot token lives in the destination: URL
+`https://slack.com/api`, Authentication `NoAuthentication`, additional
+property `URL.headers.Authorization` = `Bearer xoxb-...`. The
+`builtin:slack` server names it in `destination`; nothing else is stored.
+Step by step in `SLACK_SETUP.md`.
 
 #### Per-user OAuth2 (`oauth2`)
 
@@ -337,7 +410,8 @@ automatically; on a refresh failure the user is re-prompted.
 │   ├── oauth2.py               # Per-user OAuth2 (PKCE, DCR discovery, token storage)
 │   ├── oauth_routes.py         # GET /oauth/callback
 │   ├── client_credentials.py   # app_only token client
-│   ├── destination.py          # BTP destination service resolver
+│   ├── destination.py          # BTP destination service resolver (app-level and per-user)
+│   ├── destination_auth.py     # httpx auth routing a built-in through a destination
 │   ├── builtins.py             # builtin: pseudo-URL registry -> toolset factories
 │   ├── gmail_tools.py          # builtin:gmail       (Gmail REST, oauth2)
 │   ├── outlook_tools.py        # builtin:outlook     (Microsoft Graph, oauth2 / app_only)
