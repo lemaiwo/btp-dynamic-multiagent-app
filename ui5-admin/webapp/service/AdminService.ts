@@ -1,5 +1,5 @@
 import type {
-    Agent, AgentInput, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
+    Agent, AgentInput, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
     JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
@@ -242,5 +242,12 @@ export default class AdminService {
 
     public getWorkflowRun(runId: string): Promise<WorkflowRunDetail> {
         return this.request<WorkflowRunDetail>(`workflow-runs/${encodeURIComponent(runId)}`);
+    }
+
+    // --- where used ---
+    /** Who refers to an agent: peers that list it and workflows that run it,
+     * disabled ones included and flagged. */
+    public getAgentWhereUsed(id: number): Promise<AgentWhereUsed> {
+        return this.request<AgentWhereUsed>(`agents/${id}/where-used`);
     }
 }

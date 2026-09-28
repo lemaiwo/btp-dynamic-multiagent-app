@@ -211,6 +211,61 @@
                     </Table>
                 </Panel>
 
+                <!-- where used: filled by loadWhereUsed() for an existing agent;
+                     hidden for a new one, which nothing can refer to yet. The
+                     flags it binds to are computed in the controller, so no
+                     binding here takes .length of a list not loaded yet. -->
+                <Panel
+                    id="whereUsedPanel"
+                    headerText="{i18n>whereUsedPanel}"
+                    expandable="false"
+                    class="sapUiSmallMarginTop"
+                    visible="{= !!${agent>/whereUsed} }">
+                    <Text text="{i18n>whereUsedHint}" />
+                    <Text
+                        id="whereUsedEmpty"
+                        text="{i18n>whereUsedNone}"
+                        class="sapUiSmallMarginTop"
+                        visible="{= !!${agent>/whereUsed/empty} }" />
+                    <List
+                        id="whereUsedWorkflows"
+                        headerText="{i18n>whereUsedWorkflows}"
+                        items="{agent>/whereUsed/workflows}"
+                        visible="{= !!${agent>/whereUsed/hasWorkflows} }"
+                        class="sapUiSmallMarginTop">
+                        <CustomListItem>
+                            <HBox alignItems="Center" class="sapUiSmallMarginBegin sapUiTinyMarginTopBottom">
+                                <Link text="{agent>name}" press=".onOpenWhereUsedWorkflow" />
+                                <ObjectStatus
+                                    text="{i18n>whereUsedDisabled}"
+                                    state="Warning"
+                                    visible="{= !${agent>enabled} }"
+                                    class="sapUiTinyMarginBegin" />
+                                <Text
+                                    text="{ path: 'agent>steps', formatter: '.whereUsedSteps' }"
+                                    class="sapUiSmallMarginBegin" />
+                            </HBox>
+                        </CustomListItem>
+                    </List>
+                    <List
+                        id="whereUsedPeers"
+                        headerText="{i18n>whereUsedPeers}"
+                        items="{agent>/whereUsed/peers}"
+                        visible="{= !!${agent>/whereUsed/hasPeers} }"
+                        class="sapUiSmallMarginTop">
+                        <CustomListItem>
+                            <HBox alignItems="Center" class="sapUiSmallMarginBegin sapUiTinyMarginTopBottom">
+                                <Link text="{agent>name}" press=".onOpenWhereUsedPeer" />
+                                <ObjectStatus
+                                    text="{i18n>whereUsedDisabled}"
+                                    state="Warning"
+                                    visible="{= !${agent>enabled} }"
+                                    class="sapUiTinyMarginBegin" />
+                            </HBox>
+                        </CustomListItem>
+                    </List>
+                </Panel>
+
             </VBox>
         </content>
         <footer>

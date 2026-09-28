@@ -14,7 +14,10 @@ import type Dialog from "sap/m/Dialog";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
-import type { AgentInput, AuthMode, CredentialStatus, McpServer } from "../service/types";
+import type {
+    AgentInput, AuthMode, CredentialStatus, McpServer,
+    WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
+} from "../service/types";
 
 const EMPTY_AGENT: AgentInput = {
     name: "",
@@ -111,6 +114,7 @@ export default class AgentDetail extends BaseController {
                 // Otherwise a credential table left over from whichever agent was
                 // open before navigating here would still be showing.
                 model.setProperty("/credentials", []);
+                model.setProperty("/whereUsed", null); // nothing can refer to it yet
                 // A new agent has no name yet, so it excludes nothing from its
                 // own peer list — every existing agent is offered.
                 model.setProperty("/availableAgents", agents ?? []);
@@ -163,6 +167,7 @@ export default class AgentDetail extends BaseController {
 
             this.publicBaseUrl = config?.public_base_url ?? "";
             void this.loadCredentials();
+            void this.loadWhereUsed();
         });
     }
 
@@ -486,6 +491,64 @@ export default class AgentDetail extends BaseController {
             return;
         }
         window.open(this.publicBaseUrl + status.login_url, "_blank", "noopener");
+    }
+
+    // --- where used ---
+
+    /**
+     * Fills `/whereUsed` for the agent being edited: the two lists plus the
+     * three flags the panel's visibility bindings read (`hasWorkflows`,
+     * `hasPeers`, `empty`), computed here so the view never takes `.length`
+     * of a list that is not loaded yet. Cleared first, so a panel left over
+     * from the agent opened before never shows against this one.
+     */
+    public async loadWhereUsed(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        model.setProperty("/whereUsed", null);
+        if (this.agentId === undefined) {
+            return;
+        }
+        const id = this.agentId;
+        const result = await this.run(
+            this.getAdminService().getAgentWhereUsed(id),
+            this.text("whereUsedLoadFailed")
+        );
+        // Another agent may have been opened while this was in flight.
+        if (!result || this.agentId !== id) {
+            return;
+        }
+        model.setProperty("/whereUsed", {
+            workflows: result.workflows,
+            peers: result.peers,
+            hasWorkflows: result.workflows.length > 0,
+            hasPeers: result.peers.length > 0,
+            empty: result.workflows.length === 0 && result.peers.length === 0
+        });
+    }
+
+    /** "Steps: main #1, support #2" -- one entry per step of that workflow
+     * that runs this agent, positioned within its group as everywhere else. */
+    public whereUsedSteps(steps: WhereUsedStep[] | undefined): string {
+        const parts = (steps ?? []).map(
+            (s) => `${s.branch_key ?? this.text("whereUsedMainLine")} #${s.position}`
+        );
+        return parts.length ? this.text("whereUsedSteps", [parts.join(", ")]) : "";
+    }
+
+    public onOpenWhereUsedWorkflow(event: Event): void {
+        const workflow = (event.getSource() as Control)
+            .getBindingContext("agent")?.getObject() as WhereUsedWorkflow | undefined;
+        if (workflow) {
+            this.getRouter().navTo("workflowDetail", { workflowId: String(workflow.id) });
+        }
+    }
+
+    public onOpenWhereUsedPeer(event: Event): void {
+        const peer = (event.getSource() as Control)
+            .getBindingContext("agent")?.getObject() as WhereUsedPeer | undefined;
+        if (peer) {
+            this.getRouter().navTo("agentDetail", { agentId: String(peer.id) });
+        }
     }
 
     // text(key) is inherited from BaseController — do not redeclare it.

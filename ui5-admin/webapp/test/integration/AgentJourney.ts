@@ -4,7 +4,11 @@ import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
 import type Button from "sap/m/Button";
 import type ColumnListItem from "sap/m/ColumnListItem";
+import type CustomListItem from "sap/m/CustomListItem";
+import type HBox from "sap/m/HBox";
 import type Input from "sap/m/Input";
+import type Link from "sap/m/Link";
+import type List from "sap/m/List";
 import type JSONModel from "sap/ui/model/json/JSONModel";
 import type MultiComboBox from "sap/m/MultiComboBox";
 import type ObjectStatus from "sap/m/ObjectStatus";
@@ -258,6 +262,89 @@ opaTest("an invalid server url is refused inline and the dialog stays open", fun
         success: function (element: UI5Element) {
             const input = element as Input;
             Opa5.assert.strictEqual(input.getValueState(), "Error", "the url field is flagged");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- where used ---
+// gmail-agent (id 101) runs triage-inbox's main-line fan-out step and is the
+// one peer btp-agent lists; btp-agent (id 100) runs the three branch steps
+// and is nobody's peer -- see FakeBackend.reset().
+
+opaTest("the where-used panel lists the workflows and peers that refer to the agent, and its workflow link navigates there", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    Then.waitFor({
+        id: "whereUsedWorkflows",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const items = (element as List).getItems() as CustomListItem[];
+            Opa5.assert.strictEqual(items.length, 1, "the one workflow with a step running this agent is listed");
+            const row = items[0].getContent()[0] as HBox;
+            Opa5.assert.strictEqual((row.getItems()[0] as Link).getText(), "triage-inbox", "named by a link");
+            Opa5.assert.strictEqual(
+                (row.getItems()[2] as Text).getText(false), "Steps: main #1",
+                "with the position of the step that runs it"
+            );
+        }
+    });
+
+    Then.waitFor({
+        id: "whereUsedPeers",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const items = (element as List).getItems() as CustomListItem[];
+            Opa5.assert.strictEqual(items.length, 1, "the one agent listing this one as a peer is listed");
+            const row = items[0].getContent()[0] as HBox;
+            Opa5.assert.strictEqual((row.getItems()[0] as Link).getText(), "btp-agent", "named by a link");
+        }
+    });
+
+    When.waitFor({
+        id: "whereUsedWorkflows",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (((element as List).getItems()[0] as CustomListItem).getContent()[0] as HBox).getItems()[0];
+        },
+        actions: new Press()
+    });
+
+    Then.waitFor({
+        id: "workflowName",
+        viewName: "WorkflowDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Input).getValue(), "triage-inbox", "the workflow detail page opened on that workflow");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the where-used panel lists per-branch step positions and hides an empty peer list", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "whereUsedWorkflows",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const items = (element as List).getItems() as CustomListItem[];
+            Opa5.assert.strictEqual(items.length, 1, "triage-inbox is listed once, not once per step");
+            const row = items[0].getContent()[0] as HBox;
+            Opa5.assert.strictEqual(
+                (row.getItems()[2] as Text).getText(false), "Steps: billing #1, support #1, support #2",
+                "every step that runs the agent is listed by branch and position"
+            );
+        }
+    });
+
+    Then.waitFor({
+        id: "whereUsedPeers",
+        viewName: "AgentDetail",
+        visible: false,
+        success: function (element: UI5Element) {
+            Opa5.assert.notOk((element as List).getVisible(), "no agent lists btp-agent as a peer, so the peer list is not shown");
         }
     });
 

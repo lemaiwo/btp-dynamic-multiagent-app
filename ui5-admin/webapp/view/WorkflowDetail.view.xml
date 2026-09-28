@@ -108,6 +108,7 @@
                             lanes="{flow>/lanes}"
                             scrollable="false"
                             foldedCorners="true"
+                            nodePress=".onFlowNodePress"
                             visible="{= ${flow>/nodes}.length > 0 }">
                             <pf:nodes>
                                 <pf:ProcessFlowNode
@@ -216,6 +217,14 @@
                                         <Button icon="sap-icon://navigation-down-arrow" type="Transparent"
                                             enabled="{workflow>canDown}" tooltip="{i18n>moveStepDown}" press=".onMoveStepDown" />
                                         <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
+                                        <!-- where used: opens the step's agent. Last in the
+                                             cell, so move-up / move-down / delete keep
+                                             their positions. -->
+                                        <Link
+                                            text="{ path: 'workflow>agent_name', formatter: '.openStepAgentText' }"
+                                            visible="{= !!${workflow>agent_name} }"
+                                            press=".onOpenStepAgent"
+                                            class="sapUiTinyMarginBegin" />
                                     </HBox>
                                 </cells>
                             </ColumnListItem>

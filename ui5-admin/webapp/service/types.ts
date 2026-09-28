@@ -432,3 +432,35 @@ export interface WorkflowRunDetail {
     items: WorkflowItemRun[];
     steps: WorkflowStepRun[];
 }
+
+// --- where used ---
+/** One agent that lists the queried agent as a peer. */
+export interface WhereUsedPeer {
+    id: number;
+    name: string;
+    enabled: boolean;
+}
+
+/** One workflow step that runs the queried agent; `branch_key` null is the
+ * main line. Positions count within their group, as everywhere else. */
+export interface WhereUsedStep {
+    position: number;
+    branch_key: string | null;
+}
+
+export interface WhereUsedWorkflow {
+    id: number;
+    name: string;
+    api_slug: string | null;
+    enabled: boolean;
+    steps: WhereUsedStep[];
+}
+
+/** GET /admin/api/agents/{id}/where-used. Disabled referrers are included
+ * and flagged -- unlike the server's delete/disable guard, this is for an
+ * operator to read, and a switched-off workflow still needs its agent. */
+export interface AgentWhereUsed {
+    agent: { id: number; name: string };
+    peers: WhereUsedPeer[];
+    workflows: WhereUsedWorkflow[];
+}
