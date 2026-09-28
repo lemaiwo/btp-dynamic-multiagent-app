@@ -39,6 +39,14 @@ from agents.registry import _MAX_DELEGATION_DEPTH, registry
 
 logger = logging.getLogger(__name__)
 
+# --- step kinds ---
+from agents.step_kinds import (  # noqa: E402
+    StepFailed,
+    context_from_sources,
+    execute_step,
+    step_label,
+)
+
 # Background tasks are kept referenced; asyncio only holds weak references and
 # would otherwise garbage-collect a run mid-flight.
 _tasks: set[asyncio.Task] = set()
@@ -229,7 +237,9 @@ async def _preflight(workflow: Workflow, steps) -> dict:
     do about it.
     """
     resolved: dict = {}
-    names = sorted({s.agent_name for s in steps})
+    # Deterministic steps (condition/transform/http/python) name no agent and
+    # need no credential; only agent steps are checked.
+    names = sorted({s.agent_name for s in steps if _is_agent_step(s)})
     # (principal, agent name) -> row: everything whose credentials have to hold
     # for this run. The pair, not the agent alone, because a peer consulted from
     # a step runs inside *that step's* bound identity — run_as wraps the whole
@@ -355,7 +365,8 @@ async def _record_blocked_step(run_id: str, steps, branches, error) -> None:
     if not agent_name:
         return
     blocked = next(
-        (s for s in _execution_order(steps, branches) if s.agent_name == agent_name),
+        (s for s in _execution_order(steps, branches)
+         if _is_agent_step(s) and s.agent_name == agent_name),
         None,
     )
     if blocked is None:
@@ -377,6 +388,134 @@ async def _record_blocked_step(run_id: str, steps, branches, error) -> None:
         logger.exception(
             "Could not record the blocked step for workflow run %s", run_id
         )
+
+
+# --- step kinds ---
+def _is_agent_step(step) -> bool:
+    """True for a step the model runs; False for condition/transform/http/python.
+
+    Rows written before the ``kind`` column existed carry the server default
+    ``agent``; a snapshot from an older test fixture may lack the attribute.
+    """
+    return (getattr(step, "kind", None) or "agent") == "agent"
+
+
+def _step_source_name(step) -> str:
+    """The ``## From`` label a step's output is handed on under."""
+    return step.agent_name if _is_agent_step(step) else step_label(step.kind, step.position)
+
+
+async def _run_deterministic_step(
+    *,
+    run_id: str,
+    item_run_id: str | None,
+    step,
+    sources: list[tuple[str, str]],
+    item=None,
+):
+    """Run a condition/transform/http/python step and record it.
+
+    Mirrors _run_step: a step run row is opened first, the step's own
+    timeout applies, and a failure is recorded before _WorkflowError is
+    raised so the caller decides what it kills. The row's ``agent_name`` is
+    the kind label ("condition", ...), which is what the run detail shows.
+    Returns the StepOutcome; the caller acts on ``action == "stop"``.
+    """
+    label = step.kind
+    async with SessionLocal() as session:
+        step_run = await create_step_run(
+            session, run_id=run_id, item_run_id=item_run_id,
+            branch_key=step.branch_key, position=step.position,
+            agent_name=label,
+        )
+    ctx = context_from_sources(sources, item)
+    try:
+        outcome = await asyncio.wait_for(
+            execute_step(step.kind, step.config_json, ctx),
+            timeout=step.step_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        message = (
+            f"Step {step.position} ({label}) exceeded its "
+            f"{step.step_timeout_seconds}s timeout."
+        )
+        async with SessionLocal() as session:
+            await finish_step_run(session, step_run.id, status="failed", error=message)
+        raise _WorkflowError(message) from None
+    except asyncio.CancelledError:
+        async with SessionLocal() as session:
+            await finish_step_run(
+                session, step_run.id, status="interrupted",
+                error="Cancelled (app shutting down).",
+            )
+        raise
+    except (StepFailed, ValueError) as e:
+        message = f"Step {step.position} ({label}) failed: {e}"
+        async with SessionLocal() as session:
+            await finish_step_run(session, step_run.id, status="failed", error=message)
+        raise _WorkflowError(message) from None
+    except Exception as e:  # noqa: BLE001
+        message = f"Step {step.position} ({label}) failed: {type(e).__name__}: {e}"
+        logger.exception("Workflow run %s step %s failed", run_id, step.position)
+        async with SessionLocal() as session:
+            await finish_step_run(session, step_run.id, status="failed", error=message)
+        raise _WorkflowError(message) from None
+
+    recorded = outcome.output
+    if outcome.action == "stop":
+        recorded = f"[stop: {outcome.detail}]\n{outcome.output}"
+    elif outcome.detail:
+        recorded = f"[{outcome.detail}]\n{outcome.output}"
+    async with SessionLocal() as session:
+        await finish_step_run(session, step_run.id, status="success", output=recorded)
+    return outcome
+
+
+async def _record_skipped_steps(run_id: str, item_run_id: str | None, steps) -> None:
+    """Mark the steps a condition's ``stop`` skipped, so the run detail and
+    the flow diagram show "skipped" rather than "not run" for them. Best
+    effort: reporting detail, never a reason to fail the run."""
+    try:
+        for step in steps:
+            async with SessionLocal() as session:
+                step_run = await create_step_run(
+                    session, run_id=run_id, item_run_id=item_run_id,
+                    branch_key=step.branch_key, position=step.position,
+                    agent_name=step.agent_name if _is_agent_step(step) else step.kind,
+                )
+                await finish_step_run(session, step_run.id, status="skipped")
+    except Exception:  # noqa: BLE001
+        logger.exception("Could not record skipped steps for workflow run %s", run_id)
+
+
+async def _run_any_step(
+    *,
+    run_id: str,
+    item_run_id: str | None,
+    step,
+    agent_rows: dict,
+    workflow: Workflow,
+    sources: list[tuple[str, str]],
+    item=None,
+) -> tuple[str, str, bool]:
+    """Run one step of either kind. Returns (source name, output text, stop).
+
+    An agent step gets its prompt built from ``sources`` exactly as before; a
+    deterministic step gets the same sources as a StepContext. ``stop`` is
+    only ever True for a condition that chose it.
+    """
+    if _is_agent_step(step):
+        output = await _run_step(
+            run_id=run_id, item_run_id=item_run_id, step=step,
+            agent_row=agent_rows[step.agent_name], workflow=workflow,
+            prompt=build_prompt(step.instructions, sources),
+        )
+        return step.agent_name, str(output), False
+    outcome = await _run_deterministic_step(
+        run_id=run_id, item_run_id=item_run_id, step=step,
+        sources=sources, item=item,
+    )
+    return _step_source_name(step), outcome.output, outcome.action == "stop"
 
 
 async def _run_step(
@@ -521,17 +660,26 @@ async def _run_main_line(run_id, workflow, branches, steps, agent_rows,
     after = [] if fan_index is None else main_line[fan_index + 1:]
 
     previous: list[tuple[str, str]] = []
-    for step in before:
+    for index, step in enumerate(before):
         try:
-            output = await _run_step(
+            name, output, stop = await _run_any_step(
                 run_id=run_id, item_run_id=None, step=step,
-                agent_row=agent_rows[step.agent_name], workflow=workflow,
-                prompt=build_prompt(step.instructions, previous),
+                agent_rows=agent_rows, workflow=workflow, sources=previous,
             )
         except _WorkflowError as e:
             await _finalize(run_id, status="failed", error=str(e))
             return
-        previous = [(step.agent_name, str(output))]
+        previous = [(name, output)]
+        if stop:
+            # A condition on the main line chose `stop`: the run ends here,
+            # successfully, with the condition's output as its final text.
+            # Nothing after it -- the fan-out included -- runs.
+            await _record_skipped_steps(run_id, None, main_line[index + 1:])
+            await _finalize(
+                run_id, status="success",
+                summary=f"Stopped at step {step.position} ({name}).\n{output}".strip(),
+            )
+            return
 
     if fan_index is None:
         # No fan-out step: a linear main line that runs once, with no items.
@@ -601,13 +749,19 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
                     run_id, workflow, branches, branch_steps, agent_rows,
                     item, item_run.id, fan_step,
                 )
-                for step in after:
-                    output = await _run_step(
+                for index, step in enumerate(after):
+                    name, output, stop = await _run_any_step(
                         run_id=run_id, item_run_id=item_run.id, step=step,
-                        agent_row=agent_rows[step.agent_name], workflow=workflow,
-                        prompt=build_prompt(step.instructions, sources),
+                        agent_rows=agent_rows, workflow=workflow,
+                        sources=sources, item=item,
                     )
-                    sources = [(step.agent_name, str(output))]
+                    sources = [(name, output)]
+                    if stop:
+                        # A condition on the join line chose `stop`: the rest
+                        # of the join is skipped for this item, which still
+                        # counts as succeeded.
+                        await _record_skipped_steps(run_id, item_run.id, after[index + 1:])
+                        break
                 # Inside the try, not after it: a DB failure while recording the
                 # success would otherwise escape process(), and the gather below
                 # (deliberately without return_exceptions) propagates it *without*
@@ -711,13 +865,21 @@ async def _run_item_branches(run_id, workflow, branches, branch_steps,
     for branch in selected:
         chained: list[tuple[str, str]] = [(fan_step.agent_name, item.text)]
         last_agent, last_output = fan_step.agent_name, item.text
-        for step in branch_steps.get(branch.key, []):
-            output = await _run_step(
+        steps_in_branch = branch_steps.get(branch.key, [])
+        for index, step in enumerate(steps_in_branch):
+            last_agent, last_output, stop = await _run_any_step(
                 run_id=run_id, item_run_id=item_run_id, step=step,
-                agent_row=agent_rows[step.agent_name], workflow=workflow,
-                prompt=build_prompt(step.instructions, chained),
+                agent_rows=agent_rows, workflow=workflow,
+                sources=chained, item=item,
             )
-            last_agent, last_output = step.agent_name, str(output)
             chained = [(last_agent, last_output)]
+            if stop:
+                # A condition inside the branch chose `stop`: the rest of this
+                # branch is skipped for this item (not failed), and the join
+                # still sees what the branch produced up to here.
+                await _record_skipped_steps(
+                    run_id, item_run_id, steps_in_branch[index + 1:]
+                )
+                break
         sources.append((last_agent, last_output))
     return sources

@@ -168,6 +168,91 @@ async def main() -> None:
             expect="main line")
     rejects("enabling a workflow with no steps", [], [], expect="no steps")
 
+    # --- step kinds ---
+    print("\n== step kinds are validated per kind ==")
+    TRANSFORM = {"branch_key": None, "position": 2, "kind": "transform",
+                 "agent_name": "", "instructions": "", "fan_out": False,
+                 "step_timeout_seconds": 60, "config": {"template": "{{text}}"}}
+    rejects("unknown kind", [], [READER, {**TRANSFORM, "kind": "shell"}],
+            expect="unknown kind")
+    rejects("fan-out step must be an agent",
+            [], [{**READER, "fan_out": False},
+                 {**TRANSFORM, "fan_out": True}],
+            expect="fan-out step must be an agent")
+    rejects("python code must compile",
+            [], [READER, {**TRANSFORM, "kind": "python",
+                          "config": {"code": "def ("}}],
+            expect="compile")
+    rejects("python step names its position",
+            [], [READER, {**TRANSFORM, "kind": "python",
+                          "config": {"code": "def ("}}],
+            expect="step 2 (python)")
+    rejects("http needs a destination",
+            [], [READER, {**TRANSFORM, "kind": "http",
+                          "config": {"path": "/x"}}],
+            expect="destination")
+    rejects("http path is confined",
+            [], [READER, {**TRANSFORM, "kind": "http",
+                          "config": {"destination": "d", "path": "/a/../b"}}],
+            expect="path")
+    rejects("condition op is checked",
+            [], [READER, {**TRANSFORM, "kind": "condition",
+                          "config": {"rules": [{"when": {"op": "nope"}}]}}],
+            expect="op")
+    rejects("transform regex must compile",
+            [], [READER, {**TRANSFORM, "config": {"regex": {"pattern": "("}}}],
+            expect="regex")
+    rejects("an agent step still needs a known agent",
+            [], [READER, {**TRANSFORM, "kind": "agent"}], expect="agent ''")
+    ok = True
+    try:
+        validate_workflow_parts(
+            [], [READER, TRANSFORM,
+                 {**TRANSFORM, "position": 3, "kind": "condition", "config": {}},
+                 {**TRANSFORM, "position": 4, "kind": "python",
+                  "config": {"code": "output = text"}},
+                 {**TRANSFORM, "position": 5, "kind": "http",
+                  "config": {"destination": "jira", "path": "/rest/api/2/myself"}}],
+            {"reader"}, enabled=True,
+        )
+    except ValueError as e:
+        ok = False
+        print(f"    unexpected: {e}")
+    check("non-agent steps need no agent and validate with their configs", ok)
+
+    print("\n== step kind and config survive storage ==")
+    async with SessionLocal() as s:
+        await upsert_agent(s, name="reader", description="r", instructions="r",
+                           mcp_servers=[{"url": "https://x.example.com/mcp",
+                                         "auth_mode": "none"}])
+        wf = await upsert_workflow(
+            s, name="kinds-wf", description="d", enabled=True, branches=[],
+            steps=[{**READER, "fan_out": False},
+                   {**TRANSFORM, "config": {"template": "T:{{text}}", "truncate": 10}},
+                   {**TRANSFORM, "position": 3, "kind": "python",
+                    "agent_name": "ignored-for-non-agents",
+                    "config": {"code": "output = text", "timeout_seconds": 5}}],
+        )
+        _, stored = await get_workflow_parts(s, wf.id)
+    by_pos = {st.position: st for st in stored}
+    check("agent step defaults to kind agent with an empty config",
+          by_pos[1].kind == "agent" and by_pos[1].config == {}
+          and by_pos[1].to_dict()["kind"] == "agent",
+          str(by_pos[1].to_dict()))
+    check("transform config round-trips through config_json",
+          by_pos[2].kind == "transform"
+          and by_pos[2].config["template"] == "T:{{text}}"
+          and by_pos[2].config["truncate"] == 10,
+          str(by_pos[2].to_dict()))
+    check("a non-agent step stores no agent name",
+          by_pos[3].agent_name == "" and by_pos[3].to_dict()["config"]["timeout_seconds"] == 5,
+          str(by_pos[3].to_dict()))
+    async with SessionLocal() as s:
+        await delete_workflow(s, wf.id)
+        reader_row = await get_agent_by_name(s, "reader")
+        if reader_row is not None:
+            await delete_agent(s, reader_row.id)
+
     print("\n== validation accepts a good definition ==")
     ok = True
     try:

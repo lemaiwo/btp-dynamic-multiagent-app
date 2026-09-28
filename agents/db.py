@@ -568,6 +568,20 @@ class WorkflowStep(Base):
     step_timeout_seconds: Mapped[int] = mapped_column(
         Integer, nullable=False, default=600, server_default="600"
     )
+    # --- step kinds ---
+    # "agent" (the default) or one of agents.step_kinds.DETERMINISTIC_KINDS.
+    # A non-agent step keeps agent_name = "" and carries its settings in
+    # config_json, validated by agents.step_kinds at save time.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="agent", server_default="agent"
+    )
+    config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    @property
+    def config(self) -> dict[str, Any]:
+        from agents.step_kinds import config_from_json  # noqa: PLC0415
+
+        return config_from_json(self.config_json)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -577,6 +591,8 @@ class WorkflowStep(Base):
             "instructions": self.instructions,
             "fan_out": bool(self.fan_out),
             "step_timeout_seconds": self.step_timeout_seconds,
+            "kind": self.kind or "agent",
+            "config": self.config,
         }
 
 
@@ -915,6 +931,11 @@ async def init_db() -> None:
             conn, "agent_configs", "model_name", "VARCHAR(128)"
         )
         await _ensure_column(conn, "agent_configs", "peers_json", "TEXT")
+        # --- step kinds ---
+        await _ensure_column(
+            conn, "workflow_steps", "kind", "VARCHAR(16) NOT NULL DEFAULT 'agent'"
+        )
+        await _ensure_column(conn, "workflow_steps", "config_json", "TEXT")
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
         )
@@ -1459,13 +1480,37 @@ def validate_workflow_parts(
             "there are no items."
         )
 
+    # Local import: step_kinds imports nothing from this module, but keeping
+    # the dependency here means loading the models never pulls in httpx.
+    from agents.step_kinds import STEP_KINDS, validate_step_config  # noqa: PLC0415
+
     for s in steps:
-        agent = str(s.get("agent_name") or "").strip()
-        if agent not in known_agents:
+        # --- step kinds ---
+        kind = str(s.get("kind") or "agent").strip()
+        if kind not in STEP_KINDS:
             raise ValueError(
-                f"Step {s.get('position')} names agent {agent!r}, which does not "
-                "exist or is disabled."
+                f"Step {s.get('position')} has unknown kind {kind!r}; expected one "
+                f"of {', '.join(STEP_KINDS)}."
             )
+        agent = str(s.get("agent_name") or "").strip()
+        if kind == "agent":
+            if agent not in known_agents:
+                raise ValueError(
+                    f"Step {s.get('position')} names agent {agent!r}, which does not "
+                    "exist or is disabled."
+                )
+        else:
+            if s.get("fan_out"):
+                raise ValueError(
+                    f"The fan-out step must be an agent step; step "
+                    f"{s.get('position')} is a {kind} step."
+                )
+            try:
+                validate_step_config(kind, s.get("config"))
+            except ValueError as e:
+                raise ValueError(
+                    f"Step {s.get('position')} ({kind}) has an invalid config: {e}"
+                ) from None
         bk = s.get("branch_key")
         if bk is not None and str(bk).strip() not in keys:
             raise ValueError(
@@ -1617,16 +1662,22 @@ async def upsert_workflow(
             description=str(b.get("description") or ""),
             position=int(b.get("position") or 1),
         ))
+    # --- step kinds ---
+    from agents.step_kinds import config_to_json  # noqa: PLC0415
+
     for s in steps:
         bk = s.get("branch_key")
+        kind = str(s.get("kind") or "agent").strip()
         session.add(WorkflowStep(
             workflow_id=row.id,
             branch_key=str(bk).strip() if bk is not None else None,
             position=int(s["position"]),
-            agent_name=str(s["agent_name"]).strip(),
+            agent_name=str(s.get("agent_name") or "").strip() if kind == "agent" else "",
             instructions=str(s.get("instructions") or ""),
             fan_out=1 if s.get("fan_out") else 0,
             step_timeout_seconds=int(s.get("step_timeout_seconds") or 600),
+            kind=kind,
+            config_json=config_to_json(kind, s.get("config")),
         ))
     await session.commit()
     await session.refresh(row)
