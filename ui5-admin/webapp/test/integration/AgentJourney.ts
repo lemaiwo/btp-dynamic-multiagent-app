@@ -37,9 +37,12 @@ opaTest("creating an agent with two toolsets adds it to the list", function (Giv
     When.waitFor({ id: "serverUrl", viewName: "AgentDetail", searchOpenDialogs: true, actions: new EnterText({ text: "https://a.hana.ondemand.com/mcp" }) });
     When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
 
-    // Second toolset
+    // Second toolset: a built-in typed by hand. sapnotes is the one that
+    // needs no credential -- the catalog narrows every built-in to the modes
+    // its factory can build with, so gmail here would flip to oauth2 and OK
+    // would (correctly) refuse the dialog for want of a client id.
     When.waitFor({ id: "addServerButton", viewName: "AgentDetail", actions: new Press() });
-    When.waitFor({ id: "serverUrl", viewName: "AgentDetail", searchOpenDialogs: true, actions: new EnterText({ text: "builtin:gmail" }) });
+    When.waitFor({ id: "serverUrl", viewName: "AgentDetail", searchOpenDialogs: true, actions: new EnterText({ text: "builtin:sapnotes" }) });
     When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
 
     When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });

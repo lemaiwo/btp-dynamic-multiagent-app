@@ -2,22 +2,28 @@ import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import { AdminError } from "./AdminService";
 
-export type ErrorKind = "session" | "conflict" | "error";
+export type ErrorKind = "session" | "forbidden" | "conflict" | "error";
 
 /**
  * The application's single error policy.
  *
- * A 401/403 means the approuter session lapsed; reloading re-authenticates, so
- * that is the only offered action. A 409 from a run trigger means a run is
- * already in flight — informational, not a failure. Everything else is shown
- * with the server's own `detail`, never swallowed.
+ * A 401 means the approuter session lapsed; reloading re-authenticates, so
+ * that is the only offered action. A 403 is a different thing: the user is
+ * signed in but lacks the admin scope, and reloading would only sign them in
+ * again to the same answer, so it is explained and left alone. A 409 from a
+ * run trigger means a run is already in flight — informational, not a
+ * failure. Everything else is shown with the server's own `detail`, never
+ * swallowed.
  */
 export default {
 
     classify(error: unknown): ErrorKind {
         if (error instanceof AdminError) {
-            if (error.status === 401 || error.status === 403) {
+            if (error.status === 401) {
                 return "session";
+            }
+            if (error.status === 403) {
+                return "forbidden";
             }
             if (error.status === 409) {
                 return "conflict";
@@ -53,6 +59,15 @@ export default {
                     emphasizedAction: "Reload",
                     onClose: () => window.location.reload()
                 }
+            );
+            return;
+        }
+        if (kind === "forbidden") {
+            MessageBox.error(
+                "You are signed in, but your user has no access to this function. "
+                + "Ask an administrator for the \"Agent Administrator\" role "
+                + "collection (the admin scope), then sign in again.",
+                { title: "Access denied" }
             );
             return;
         }

@@ -32,4 +32,16 @@ QUnit.test("restricted built-ins offer only what the server accepts", function (
     assert.deepEqual(authModesFor("builtin:slack"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:sapnotedetail"), ["session"]);
     assert.deepEqual(authModesFor("builtin:teams"), ["oauth2", "app_only"]);
+    assert.deepEqual(authModesFor("builtin:gmail"), ["oauth2"]);
+    assert.deepEqual(authModesFor("builtin:outlook"), ["oauth2", "app_only"]);
+    assert.deepEqual(authModesFor("builtin:sapnotes"), ["none"]);
+});
+
+QUnit.test("every built-in restricts its auth modes to what its factory builds", function (assert) {
+    // A mode the factory cannot build is a save that succeeds and an agent
+    // that vanishes from chat at the next reload. No entry may leave the
+    // dropdown open to jwt or destination by omission.
+    BUILTINS.forEach((b) => {
+        assert.ok(Array.isArray(b.authModes) && b.authModes.length > 0, `${b.url} lists authModes`);
+    });
 });

@@ -226,6 +226,11 @@ export interface CredentialStatus {
     /** ISO expiry of the access token, or null when the server issued no
      * `expires_in` (the token does not expire on its own). */
     expires_at: string | null;
+    /** True for `app_only` and `destination` servers: connected by
+     * configuration, not by anyone signing in. For those the server reports
+     * `has_token: true` and `token_state: "valid"` so the panel does not show
+     * "not connected" with no way to fix it. */
+    no_user_token: boolean;
 }
 
 /** One agent/server whose scheduled runs will fail for want of a credential. */
@@ -275,7 +280,10 @@ export interface ImportPayload {
     orchestrator_instructions?: string | null;
     skills: SkillInput[];
     agents: AgentInput[];
-    /** If true, delete agents/skills absent from the import. */
+    /** Optional: an export made before workflows existed carries none, and
+     * `replace` only removes workflows when the bundle has this section. */
+    workflows?: WorkflowInput[];
+    /** If true, delete agents/skills/workflows absent from the import. */
     replace: boolean;
 }
 

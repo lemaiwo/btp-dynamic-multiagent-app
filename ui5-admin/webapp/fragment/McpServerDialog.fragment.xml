@@ -111,27 +111,29 @@
                 placeholder="{= ${server>/url} === 'builtin:slack' ? ${i18n>slackChannelsHint} : ${i18n>channelsHint} }"
                 visible="{= ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:slack' }" />
 
+            <!-- Whatever is visible for a url and mode below must also be kept
+                 by model/oauthConfig.ts cleanOAuth, or OK silently drops it. -->
             <Label text="{i18n>recipientsLabel}"
-                   visible="{= ${server>/url} === 'builtin:outlook' }" />
+                   visible="{= ${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only') }" />
             <Input
                 id="oauthRecipients"
                 value="{server>/oauth/recipients}"
                 placeholder="{i18n>recipientsPlaceholder}"
-                visible="{= ${server>/url} === 'builtin:outlook' }" />
+                visible="{= ${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only') }" />
 
-            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' }" />
+            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' }" />
+                visible="{= ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination' || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
 
-            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') || ${server>/url} === 'builtin:slack' }" />
+            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook')) || ${server>/url} === 'builtin:slack' }" />
             <CheckBox
                 id="oauthAllowSend"
                 selected="{server>/oauth/allow_send}"
                 text="{= ${server>/url} === 'builtin:teams' ? ${i18n>allowPostHint} : ${server>/url} === 'builtin:slack' ? ${i18n>allowSlackPostHint} : ${i18n>allowSendHint} }"
-                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; ${server>/url} === 'builtin:teams') || ${server>/url} === 'builtin:slack' }" />
+                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook')) || ${server>/url} === 'builtin:slack' }" />
 
             <Label text="{i18n>minScoreLabel}"
                    visible="{= ${server>/url} === 'builtin:sapnotes' }" />

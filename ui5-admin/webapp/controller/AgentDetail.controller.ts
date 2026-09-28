@@ -7,6 +7,7 @@ import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import validators from "../model/validators";
+import oauthConfig from "../model/oauthConfig";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
 import type Dialog from "sap/m/Dialog";
@@ -214,11 +215,7 @@ export default class AgentDetail extends BaseController {
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
-            // App-only tokens carry no per-scope request: providers want the
-            // ".default" form, and asking for individual scopes is rejected.
-            scopeHint: server.auth_mode === "app_only"
-                ? "https://graph.microsoft.com/.default"
-                : "",
+            scopeHint: "",
             errors: {}
         });
 
@@ -279,10 +276,28 @@ export default class AgentDetail extends BaseController {
         if (modes.indexOf(current) === -1) {
             serverModel.setProperty("/auth_mode", builtin?.defaultAuthMode ?? modes[0]);
         }
+        // Picking a built-in may have changed the mode above or in
+        // onServerKindChange; the placeholder has to follow either way.
+        this.syncScopeHint();
     }
 
     public onAuthModeChange(): void {
         (this.getModel("server") as JSONModel).setProperty("/errors", {});
+        this.syncScopeHint();
+    }
+
+    /**
+     * The scope placeholder follows the auth mode, so it is recomputed
+     * whenever the mode changes rather than once when the dialog opens.
+     * App-only tokens carry no per-scope request: providers want the
+     * ".default" form, and asking for individual scopes is rejected.
+     */
+    private syncScopeHint(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const mode = serverModel.getProperty("/auth_mode") as AuthMode;
+        serverModel.setProperty(
+            "/scopeHint", mode === "app_only" ? "https://graph.microsoft.com/.default" : ""
+        );
     }
 
     public onCancelServer(): void {
@@ -309,7 +324,7 @@ export default class AgentDetail extends BaseController {
         const carriesOAuth = authMode === "oauth2" || authMode === "app_only"
             || authMode === "destination" || publicBuiltin;
         const oauth = carriesOAuth
-            ? AgentDetail.cleanOAuth(oauthRaw, authMode, url)
+            ? oauthConfig.cleanOAuth(oauthRaw, authMode, url)
             : undefined;
         const oauthError = validators.validateOAuth(oauth, authMode, url);
         if (oauthError) {
@@ -342,78 +357,6 @@ export default class AgentDetail extends BaseController {
         agentModel.setProperty("/data/mcp_servers", servers);
         agentModel.setProperty("/errors/servers", "");
         this.serverDialog?.close();
-    }
-
-    /** Drops blank fields so the server sees the same shape `to_config()` builds. */
-    private static cleanOAuth(
-        raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
-    ): McpServer["oauth"] {
-        if (authMode === "none") {
-            // Whitelisted, not "everything that isn't blank": this block goes
-            // to a server with no credential in it, and it must stay that way
-            // even if the dialog model still holds fields from another mode.
-            const out: Record<string, unknown> = {};
-            validators.BUILTIN_PUBLIC_KEYS.forEach((key) => {
-                const value = String(raw[key] ?? "").trim();
-                if (value) {
-                    out[key] = value;
-                }
-            });
-            return (Object.keys(out).length ? out : undefined) as McpServer["oauth"];
-        }
-        if (authMode === "destination" && findBuiltin(url)?.url === "builtin:slack") {
-            // Slack keeps a channel pin and a posting switch instead of
-            // Jira's filters. Only ever sent as `true`, as for app-only.
-            const slack: Record<string, unknown> = {
-                destination: String(raw.destination ?? "").trim(),
-                channels: String(raw.channels ?? "").trim(),
-                lookback: String(raw.lookback ?? "").trim()
-            };
-            if (raw.allow_send === true) {
-                slack.allow_send = true;
-            }
-            return slack as McpServer["oauth"];
-        }
-        if (authMode === "destination") {
-            return {
-                destination: String(raw.destination ?? "").trim(),
-                project: String(raw.project ?? "").trim(),
-                status: String(raw.status ?? "").trim(),
-                lookback: String(raw.lookback ?? "").trim(),
-                api_base: String(raw.api_base ?? "").trim(),
-                labels: String(raw.labels ?? "").trim(),
-                allow_comment: raw.allow_comment === true
-            } as McpServer["oauth"];
-        }
-        const appOnly = authMode === "app_only";
-        // DCR is meaningless app-only: a client registered on the fly holds no
-        // admin-consented application permissions, so its tokens reach nothing.
-        if (!appOnly && raw.dcr === true) {
-            const scope = String(raw.scope ?? "").trim();
-            return scope ? { dcr: true, scope } : { dcr: true };
-        }
-        // builtin:teams pins its team and channels on either mode, and keeps
-        // its window and send switch on oauth2 too -- see agents/teams_tools.py.
-        const teams = validators.isTeams(url);
-        const out: Record<string, unknown> = { client_id: String(raw.client_id ?? "").trim() };
-        const keys = appOnly
-            ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox", "lookback",
-                "recipients", "team", "channels"]
-            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"]
-                .concat(teams ? ["team", "channels", "lookback"] : []);
-        keys.forEach((key) => {
-            const value = String(raw[key] ?? "").trim();
-            if (value) {
-                out[key] = value;
-            }
-        });
-        // Only ever sent as `true`. Omitting it when off keeps the stored
-        // config identical to what a config file would carry, so an exported
-        // agent does not gain a field it never asked for.
-        if ((appOnly || teams) && raw.allow_send === true) {
-            out.allow_send = true;
-        }
-        return out as McpServer["oauth"];
     }
 
     public onRemoveServer(event: Event): void {

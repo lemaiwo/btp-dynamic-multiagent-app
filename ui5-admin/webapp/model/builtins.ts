@@ -5,8 +5,11 @@ import type { AuthMode } from "../service/types";
  *
  * Mirrors `_FACTORIES` in `agents/builtins.py`: the set is closed, so an entry
  * here without a factory there is a save the server refuses. `authModes` is
- * the list the server accepts for that url (see `McpServerPayload` in
- * `agents/admin.py`); leaving it out means the server does not restrict it.
+ * the list of modes the built-in's factory can actually build with: some are
+ * refused by `McpServerPayload` in `agents/admin.py` at save time, others
+ * (gmail, outlook, sapnotes) are accepted there and only fail at reload, when
+ * the registry logs the error and drops the agent while the UI still shows it
+ * configured. Leaving `authModes` out means the server does not restrict it.
  * `defaultAuthMode` is what the dialog selects when the entry is picked.
  */
 export interface BuiltinToolset {
@@ -20,8 +23,19 @@ export interface BuiltinToolset {
 }
 
 export const BUILTINS: BuiltinToolset[] = [
-    { url: "builtin:gmail", titleKey: "builtinGmail", descriptionKey: "builtinGmailDesc", defaultAuthMode: "oauth2" },
-    { url: "builtin:outlook", titleKey: "builtinOutlook", descriptionKey: "builtinOutlookDesc", defaultAuthMode: "oauth2" },
+    // gmail_toolset refuses app_only (Google app-only access needs domain-wide
+    // delegation) and reads nothing but a per-user token, so oauth2 is the
+    // one mode that builds -- see agents/gmail_tools.py.
+    {
+        url: "builtin:gmail", titleKey: "builtinGmail", descriptionKey: "builtinGmailDesc",
+        defaultAuthMode: "oauth2", authModes: ["oauth2"]
+    },
+    // outlook_toolset builds a per-user or an app-only Graph client and
+    // nothing else -- see build_http_client in agents/outlook_tools.py.
+    {
+        url: "builtin:outlook", titleKey: "builtinOutlook", descriptionKey: "builtinOutlookDesc",
+        defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only"]
+    },
     {
         url: "builtin:teams", titleKey: "builtinTeams", descriptionKey: "builtinTeamsDesc",
         defaultAuthMode: "oauth2", authModes: ["oauth2", "app_only"]
@@ -34,7 +48,12 @@ export const BUILTINS: BuiltinToolset[] = [
         url: "builtin:jira", titleKey: "builtinJira", descriptionKey: "builtinJiraDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },
-    { url: "builtin:sapnotes", titleKey: "builtinSapNotes", descriptionKey: "builtinSapNotesDesc", defaultAuthMode: "none" },
+    // NVD is public: sapnotes_toolset ignores auth_mode and its config block
+    // is the credential-free `none` shape (min_score, lookback) only.
+    {
+        url: "builtin:sapnotes", titleKey: "builtinSapNotes", descriptionKey: "builtinSapNotesDesc",
+        defaultAuthMode: "none", authModes: ["none"]
+    },
     {
         url: "builtin:sapnotedetail", titleKey: "builtinSapNoteDetail", descriptionKey: "builtinSapNoteDetailDesc",
         defaultAuthMode: "session", authModes: ["session"]

@@ -76,18 +76,18 @@ export default class FakeBackend {
                 url: "https://a.hana.ondemand.com/mcp", auth_mode: "oauth2",
                 needs_token: true, has_token: true, token_state: "valid",
                 expires_at: "2099-01-01T00:00:00+00:00",
-                login_url: "/oauth/login?agent=btp-agent&server=a"
+                login_url: "/oauth/login?agent=btp-agent&server=a", no_user_token: false
             },
             {
                 url: "https://b.hana.ondemand.com/mcp", auth_mode: "oauth2",
                 needs_token: true, has_token: false, token_state: "expired",
                 expires_at: "2020-01-01T00:00:00+00:00",
-                login_url: "/oauth/login?agent=btp-agent&server=b"
+                login_url: "/oauth/login?agent=btp-agent&server=b", no_user_token: false
             },
             {
                 url: "builtin:jira", auth_mode: "destination",
                 needs_token: false, has_token: true, token_state: "valid",
-                expires_at: null, login_url: ""
+                expires_at: null, login_url: "", no_user_token: true
             }
         ];
         this.skills = [{
