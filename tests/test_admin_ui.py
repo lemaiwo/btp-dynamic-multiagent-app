@@ -1247,6 +1247,86 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 body[-300:],
             )
 
+        # ------------------------------------------------------------------
+        # --- where used ---
+        # Cross-links between the two editors: the agent modal says which
+        # workflows and peers refer to the agent, and every workflow step row
+        # links to its agent. Both editors are modals over the same page, so
+        # the links are deep links opened in a new tab rather than in-place
+        # switches that would drop the edits in the editor being left.
+        print("\n== where used ==")
+        check("where-used container in the agent modal", 'id="agent-where-used"' in html)
+        check("where-used api used", "/where-used" in js)
+        edit_agent = re.search(r"async function editAgent\(id\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("editAgent() found in JS", edit_agent is not None)
+        check(
+            "editAgent() loads where-used",
+            "loadAgentWhereUsed(a.id)" in (edit_agent.group(1) if edit_agent else ""),
+        )
+        open_agent = re.search(r"async function openAgentModal\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check(
+            "openAgentModal() clears where-used",
+            "renderAgentWhereUsed(null)" in (open_agent.group(1) if open_agent else ""),
+        )
+        step_row = re.search(r"function addWorkflowStepRow\(step\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("addWorkflowStepRow() found in JS", step_row is not None)
+        check(
+            "step rows get an open-agent link",
+            "attachStepAgentLink(row)" in (step_row.group(1) if step_row else ""),
+        )
+        check("deep links are handled on load", "function openFromHash" in js
+              and re.search(r"^openFromHash\(\);\s*$", js, re.MULTILINE) is not None)
+        check("editor links open in a new tab", 'target="_blank"' in js
+              and "link.target = '_blank'" in js)
+
+        if shutil.which("node") is not None:
+            # renderAgentWhereUsed() under a DOM stub: names are operator
+            # text and must land escaped; ids must become numeric deep links.
+            wu_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const el = { innerHTML: '' };
+global.document = {
+    getElementById(id) {
+        if (id === 'agent-where-used') return el;
+        throw new Error('unstubbed getElementById: ' + id);
+    },
+};
+""" + js_no_autoinvoke + r"""
+renderAgentWhereUsed({
+    agent: { id: 1, name: 'x' },
+    peers: [{ id: 5, name: 'peer <b>', enabled: false }],
+    workflows: [{ id: 7, name: 'wf & co', api_slug: null, enabled: true,
+                  steps: [{ position: 1, branch_key: null }, { position: 2, branch_key: 'abap' }] }],
+});
+assert.ok(el.innerHTML.includes('href="#workflow=7"'), 'workflow deep link');
+assert.ok(el.innerHTML.includes('href="#agent=5"'), 'peer deep link');
+assert.ok(el.innerHTML.includes('wf &amp; co'), 'workflow name escaped');
+assert.ok(el.innerHTML.includes('peer &lt;b&gt;'), 'peer name escaped');
+assert.ok(!el.innerHTML.includes('peer <b>'), 'peer name not injected raw');
+assert.ok(el.innerHTML.includes('main #1, abap #2'), 'positions listed per branch');
+assert.ok(el.innerHTML.includes('disabled'), 'a disabled referrer is flagged');
+renderAgentWhereUsed({ agent: { id: 1, name: 'x' }, peers: [], workflows: [] });
+assert.ok(el.innerHTML.includes('no workflow or peer agent'), 'empty state');
+renderAgentWhereUsed(null);
+assert.strictEqual(el.innerHTML, '', 'cleared for a new agent');
+console.log('renderAgentWhereUsed scenarios passed');
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(wu_harness)
+                wu_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", wu_harness_path], capture_output=True, text=True, timeout=10,
+                )
+                check(
+                    "renderAgentWhereUsed() links, escapes and flags referrers",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:500],
+                )
+            finally:
+                os.unlink(wu_harness_path)
+
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
     try:

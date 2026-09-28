@@ -331,6 +331,8 @@
     <div class="modal">
         <h3 id="modal-title">New agent</h3>
         <input type="hidden" id="agent-id">
+        <!-- where used: filled by loadAgentWhereUsed() when an existing agent is opened -->
+        <div id="agent-where-used" style="font-size:.85em;margin:-6px 0 12px"></div>
         <div class="form-grid">
             <label class="full">
                 Name
@@ -1076,6 +1078,7 @@ function addWorkflowStepRow(step) {
         <button type="button" class="secondary small" onclick="this.parentNode.remove()">Remove</button>
     `;
     document.getElementById('workflow-steps').appendChild(row);
+    attachStepAgentLink(row);
 }
 
 function collectWorkflowSteps() {
@@ -1215,6 +1218,7 @@ async function openAgentModal() {
     renderMcpServers([]);
     renderAgentSkillChecks([]);
     renderAgentPeerChecks([], '');
+    renderAgentWhereUsed(null);
     await renderAgentModelOptions('');
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
@@ -1344,6 +1348,7 @@ async function editAgent(id) {
     renderMcpServers(servers);
     renderAgentSkillChecks(a.skills || []);
     renderAgentPeerChecks(a.peers || [], a.name);
+    loadAgentWhereUsed(a.id);
     await renderAgentModelOptions(a.model_name || '');
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
@@ -1652,6 +1657,85 @@ async function runAgentNow(agentId) {
     switchTab('runs');
 }
 
+// --- where used ---
+// Cross-links between the two editors. Both are modals over one page, so a
+// link that switched editors in place would drop whatever is half-edited in
+// the one being left. Instead every link is a deep link (`#agent=<id>`,
+// `#workflow=<id>`) opened in a new tab, and openFromHash() turns that hash
+// into the matching editor once the lists it depends on are loaded.
+function editorLink(kind, id, name, cls) {
+    return `<a href="#${kind}=${Number(id)}" target="_blank" rel="noopener" class="${cls}">${escapeHtml(name)}</a>`;
+}
+
+function renderAgentWhereUsed(data) {
+    const el = document.getElementById('agent-where-used');
+    if (!data) { el.innerHTML = ''; return; }
+    const off = ' <span class="status-badge off">disabled</span>';
+    const workflows = (data.workflows || []).map(w => {
+        const steps = (w.steps || []).map(s =>
+            `${s.branch_key ? escapeHtml(s.branch_key) : 'main'} #${Number(s.position)}`).join(', ');
+        return editorLink('workflow', w.id, w.name, 'wu-workflow') + (w.enabled ? '' : off)
+            + ` <span style="color:var(--muted)">(${steps})</span>`;
+    });
+    const peers = (data.peers || []).map(p =>
+        editorLink('agent', p.id, p.name, 'wu-peer') + (p.enabled ? '' : off));
+    if (!workflows.length && !peers.length) {
+        el.innerHTML = '<strong>Used in:</strong> <span style="color:var(--muted)">no workflow or peer agent.</span>';
+        return;
+    }
+    const parts = [];
+    if (workflows.length) parts.push('workflows ' + workflows.join(', '));
+    if (peers.length) parts.push('consulted by ' + peers.join(', '));
+    el.innerHTML = '<strong>Used in:</strong> ' + parts.join(' &middot; ');
+}
+
+async function loadAgentWhereUsed(id) {
+    renderAgentWhereUsed(null);
+    let data = null;
+    try {
+        const res = await api(`/agents/${id}/where-used`);
+        if (res.ok) data = await res.json();
+    } catch (e) { /* reported below */ }
+    // Opening another agent while this request was in flight: its answer is
+    // not about the agent now in the form.
+    if (String(document.getElementById('agent-id').value) !== String(id)) return;
+    if (!data) { toast('Failed to load where this agent is used', 'error'); return; }
+    renderAgentWhereUsed(data);
+}
+
+// The "open" link after a step row's agent select, kept pointing at whichever
+// agent the select currently names, hidden while it names none (or one that
+// no longer exists -- see the missingAgent option in addWorkflowStepRow).
+function attachStepAgentLink(row) {
+    const select = row.querySelector('.wf-step-agent');
+    if (!select) return;
+    const link = document.createElement('a');
+    link.className = 'wf-step-open-agent';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.title = 'Open this agent in the agent editor (new tab)';
+    link.style.cssText = 'flex:0 0 auto;align-self:center;font-size:.85em;white-space:nowrap';
+    link.textContent = 'open';
+    const sync = () => {
+        const agent = allAgents.find(a => a.name === select.value);
+        link.hidden = !agent;
+        link.href = agent ? `#agent=${Number(agent.id)}` : '#';
+    };
+    select.addEventListener('change', sync);
+    sync();
+    select.insertAdjacentElement('afterend', link);
+}
+
+function openFromHash() {
+    const match = /^#(agent|workflow)=(\d+)$/.exec(window.location.hash || '');
+    if (!match) return Promise.resolve();
+    // editAgent/editWorkflow read allAgents/allSkills/allWorkflows for their
+    // checkbox and dropdown lists; opened before those are in, the form would
+    // show the agent with no peers ticked and save it that way.
+    return Promise.all([loadSkills(), loadAgents(), loadWorkflows()]).then(() =>
+        match[1] === 'agent' ? editAgent(Number(match[2])) : editWorkflow(Number(match[2])));
+}
+
 loadSkills();
 loadAgents();
 loadWhoami();
@@ -1659,6 +1743,7 @@ loadOrchestrator();
 loadModel();
 loadWorkflows();
 loadWorkflowRuns();
+openFromHash();
 </script>
 </body>
 </html>
