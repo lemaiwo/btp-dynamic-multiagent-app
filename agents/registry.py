@@ -29,6 +29,8 @@ from agents.db import (
 )
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.shared import create_mcp_server, default_model_name, get_model
+# --- deep agents ---
+from agents.deep import deep_instructions, deep_toolset
 
 logger = logging.getLogger(__name__)
 
@@ -605,11 +607,31 @@ async def build_orchestrator() -> BuildResult:
         if attached_skills:
             specialist_instructions += _skills_instructions(attached_skills)
 
+        specialist_model = _model_for(
+            row, default_model=model, default_name=model_name, cache=model_cache
+        )
+        toolsets = list(servers)
+        # --- deep agents --- opt-in planning / scratchpad / sub-agent tools.
+        # Sub-agents get `servers` (this agent's MCP servers and built-ins)
+        # and are never registered: not a specialist, not a peer.
+        deep_config = row.deep
+        if deep_config.enabled:
+            specialist_instructions += deep_instructions(deep_config)
+            toolsets.append(
+                deep_toolset(
+                    deep_config,
+                    parent_toolsets=servers,
+                    model=specialist_model,
+                    agent_name=row.name,
+                    retries=_TOOL_RETRIES,
+                    progress_handler_factory=_make_progress_handler,
+                )
+            )
+
         specialist = Agent(
-            _model_for(row, default_model=model, default_name=model_name,
-                       cache=model_cache),
+            specialist_model,
             instructions=specialist_instructions,
-            toolsets=servers,
+            toolsets=toolsets,
             retries=_TOOL_RETRIES,
         )
         if attached_skills:

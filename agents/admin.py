@@ -92,6 +92,8 @@ from agents.registry import registry
 from agents.shared import available_models, default_model_name
 from agents.workflow_runner import RunRefused as WorkflowRunRefused
 from agents.workflow_runner import start_workflow_run
+# --- deep agents ---
+from agents.deep import DeepConfig, dump_deep_config
 
 logger = logging.getLogger(__name__)
 
@@ -661,6 +663,9 @@ class AgentPayload(BaseModel):
     run_as_principal: str = Field(default="", max_length=255)
     run_prompt: str = ""
     run_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
+    # --- deep agents --- None (key absent) keeps the stored config, like
+    # peers/model_name; a sent object replaces it (defaults clear the column).
+    deep: DeepConfig | None = None
 
     @field_validator("name")
     @classmethod
@@ -869,6 +874,14 @@ def _or_keep(value: Any) -> Any:
     return KEEP if value is None else value
 
 
+# --- deep agents ---
+def _deep_json_or_keep(deep: DeepConfig | None) -> Any:
+    """upsert_agent's ``deep_json`` for a payload: KEEP when the client sent
+    no ``deep`` key; otherwise the JSON to store (None when it is all
+    defaults, so an explicit reset clears the column)."""
+    return KEEP if deep is None else dump_deep_config(deep)
+
+
 def _unknown_model_note(agent_name: str, model_name: str | None) -> str | None:
     """Warn -- never reject -- when an override names an unavailable model.
 
@@ -927,6 +940,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 run_prompt=payload.run_prompt,
                 run_timeout_seconds=payload.run_timeout_seconds,
                 model_name=_or_keep(payload.model_name),
+                deep_json=_deep_json_or_keep(payload.deep),
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -1016,6 +1030,9 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             row.model_name = payload.model_name.strip() or None
         if payload.peers is not None:
             row.peers_json = json.dumps(payload.peers) if payload.peers else None
+        # --- deep agents ---
+        if payload.deep is not None:
+            row.deep_json = dump_deep_config(payload.deep)
         await session.commit()
         await session.refresh(row)
         _unknown_model_note(payload.name, payload.model_name)
@@ -1801,6 +1818,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         model_name=_or_keep(agent.model_name),
                         commit=False,
                         ignore_collisions_with=doomed,
+                        deep_json=_deep_json_or_keep(agent.deep),
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
@@ -1969,6 +1987,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     run_timeout_seconds=payload.run_timeout_seconds,
                     model_name=_or_keep(payload.model_name),
                     commit=False,
+                    deep_json=_deep_json_or_keep(payload.deep),
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)

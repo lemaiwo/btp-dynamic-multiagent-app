@@ -274,6 +274,10 @@ class AgentConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+    # --- deep agents ---
+    # JSON-encoded agents.deep.DeepConfig: planning tool, per-run scratchpad
+    # and ephemeral sub-agents, all opt-in. Null means the defaults (off).
+    deep_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     @property
     def mcp_servers(self) -> list[dict[str, Any]]:
@@ -337,6 +341,15 @@ class AgentConfig(Base):
             return []
         return [str(p) for p in data if isinstance(p, str) and p.strip()]
 
+    # --- deep agents ---
+    @property
+    def deep(self):
+        """The parsed deep-agent config (``agents.deep.DeepConfig``); the
+        defaults, i.e. disabled, when the column is null or malformed."""
+        from agents.deep import parse_deep_config
+
+        return parse_deep_config(self.deep_json, agent_name=self.name)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
@@ -358,6 +371,7 @@ class AgentConfig(Base):
             "model_name": self.model_name or "",
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "deep": self.deep.model_dump(),
         }
 
     def to_export(self) -> dict[str, Any]:
@@ -375,6 +389,7 @@ class AgentConfig(Base):
             "run_prompt": self.run_prompt or "",
             "run_timeout_seconds": self.run_timeout_seconds,
             "model_name": self.model_name or "",
+            "deep": self.deep.model_dump(),
         }
 
 
@@ -939,6 +954,8 @@ async def init_db() -> None:
         await _ensure_column(
             conn, "orchestrator_config", "model_name", "VARCHAR(128)"
         )
+        # --- deep agents ---
+        await _ensure_column(conn, "agent_configs", "deep_json", "TEXT")
         # create_all only creates indexes together with a new table; an
         # existing deployment needs them added here.
         await _ensure_index(conn, "uq_agent_configs_api_slug", "agent_configs", "api_slug")
@@ -1392,6 +1409,9 @@ async def upsert_agent(
     peers: list[str] | None | _Keep = KEEP,
     commit: bool = True,
     ignore_collisions_with: set[str] | None = None,
+    # --- deep agents --- JSON from agents.deep.dump_deep_config; None clears,
+    # KEEP (not sent) preserves what is stored, like model_name/peers.
+    deep_json: str | None | _Keep = KEEP,
 ) -> AgentConfig:
     """Create or update the agent named ``name``.
 
@@ -1461,6 +1481,8 @@ async def upsert_agent(
             else (model_name or "").strip() or None
         )
         row.peers_json = peers_json
+        # --- deep agents ---
+        row.deep_json = None if isinstance(deep_json, _Keep) else deep_json
     else:
         existing.description = description
         existing.instructions = instructions
@@ -1486,6 +1508,9 @@ async def upsert_agent(
             existing.model_name = (model_name or "").strip() or None
         if not isinstance(peers, _Keep):
             existing.peers_json = peers_json
+        # --- deep agents ---
+        if not isinstance(deep_json, _Keep):
+            existing.deep_json = deep_json
         row = existing
     if commit:
         await session.commit()
