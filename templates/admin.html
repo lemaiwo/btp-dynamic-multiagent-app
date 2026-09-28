@@ -1136,17 +1136,29 @@ function addWorkflowStepRow(step) {
     const missingAgent =
         step.agent_name && !allAgents.some(a => a.name === step.agent_name)
             ? step.agent_name : null;
+    // --- step kinds ---
+    // A row is a flex line (branch, kind, agent, instructions, ...) plus a
+    // config block under it that only a non-agent kind shows.
+    const kind = STEP_KINDS.includes(step.kind) ? step.kind : 'agent';
+    const isAgent = kind === 'agent';
     const row = document.createElement('div');
     row.className = 'wf-step-row';
-    row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px;align-items:flex-start';
+    row.style.cssText = 'margin-bottom:6px';
     row.innerHTML = `
+        <div style="display:flex;gap:6px;align-items:flex-start">
         <select class="wf-step-branch" style="flex:0 0 130px">
             <option value="">Main line</option>
             ${branchKeys.map(k =>
                 `<option value="${escapeHtml(k)}" ${k === step.branch_key ? 'selected' : ''}>${escapeHtml(k)}</option>`
             ).join('')}
         </select>
-        <select class="wf-step-agent" style="flex:0 0 170px">
+        <select class="wf-step-kind" style="flex:0 0 100px" title="Step kind"
+                onchange="onWorkflowStepKindChange(this)">
+            ${STEP_KINDS.map(k =>
+                `<option value="${k}" ${k === kind ? 'selected' : ''}>${k}</option>`
+            ).join('')}
+        </select>
+        <select class="wf-step-agent" style="flex:0 0 170px;${isAgent ? '' : 'display:none'}">
             ${missingAgent
                 ? `<option value="${escapeHtml(missingAgent)}" selected disabled>${escapeHtml(missingAgent)} (missing)</option>`
                 : ''}
@@ -1154,14 +1166,18 @@ function addWorkflowStepRow(step) {
                 `<option value="${escapeHtml(a.name)}" ${a.name === step.agent_name ? 'selected' : ''}>${escapeHtml(a.name)}</option>`
             ).join('')}
         </select>
-        <textarea class="wf-step-instructions" rows="2" style="flex:1"
+        <textarea class="wf-step-instructions" rows="2" style="flex:1;${isAgent ? '' : 'display:none'}"
                   placeholder="What should this agent do with what it was handed?">${escapeHtml(step.instructions || '')}</textarea>
-        <label style="font-weight:normal;white-space:nowrap">
+        <span class="wf-step-kind-hint" style="flex:1;color:var(--muted);font-size:12px;${isAgent ? 'display:none' : ''}">${escapeHtml(STEP_KIND_HINTS[kind] || '')}</span>
+        <label class="wf-step-fanout-label" style="font-weight:normal;white-space:nowrap;${isAgent ? '' : 'display:none'}">
             <input type="checkbox" class="wf-step-fanout" ${step.fan_out ? 'checked' : ''}> fan-out
         </label>
-        <input type="number" class="wf-step-timeout" style="flex:0 0 80px"
+        <input type="number" class="wf-step-timeout" style="flex:0 0 80px" title="Step timeout (seconds)"
                value="${step.step_timeout_seconds || 600}" min="10">
-        <button type="button" class="secondary small" onclick="this.parentNode.remove()">Remove</button>
+        <button type="button" class="secondary small" onclick="this.closest('.wf-step-row').remove()">Remove</button>
+        </div>
+        <div class="wf-step-config" data-kind="${kind}"
+             style="margin:4px 0 0 136px;${isAgent ? 'display:none' : ''}">${isAgent ? '' : stepConfigEditorHtml(kind, step.config || {})}</div>
     `;
     document.getElementById('workflow-steps').appendChild(row);
     attachStepAgentLink(row);
@@ -1174,13 +1190,19 @@ function collectWorkflowSteps() {
         const branch = row.querySelector('.wf-step-branch').value || null;
         const groupKey = branch === null ? '__main__' : branch;
         counters[groupKey] = (counters[groupKey] || 0) + 1;
+        // --- step kinds ---
+        const kindSelect = row.querySelector('.wf-step-kind');
+        const kind = kindSelect ? kindSelect.value : 'agent';
+        const isAgent = kind === 'agent';
         return {
             branch_key: branch,
             position: counters[groupKey],
-            agent_name: row.querySelector('.wf-step-agent').value,
-            instructions: row.querySelector('.wf-step-instructions').value,
-            fan_out: row.querySelector('.wf-step-fanout').checked,
+            kind,
+            agent_name: isAgent ? row.querySelector('.wf-step-agent').value : '',
+            instructions: isAgent ? row.querySelector('.wf-step-instructions').value : '',
+            fan_out: isAgent && row.querySelector('.wf-step-fanout').checked,
             step_timeout_seconds: parseInt(row.querySelector('.wf-step-timeout').value, 10) || 600,
+            config: isAgent ? {} : collectStepConfig(kind, row, counters[groupKey]),
         };
     });
 }
@@ -1194,6 +1216,206 @@ function collectWorkflowBranches() {
         }))
         .filter(b => b.key);
 }
+
+// --- step kinds ---
+// Mirrors agents/step_kinds.py: the kinds, the condition operators, and the
+// per-kind config shape. The server validates every config again on save.
+// {% raw %} -- this block mentions {{text}}-style placeholders that Jinja
+// must hand through untouched.
+const STEP_KINDS = ['agent', 'condition', 'transform', 'http', 'python'];
+const STEP_KIND_HINTS = {
+    condition: 'Rules over the previous text (or the item / its JSON); first match wins. "stop" ends the run, the branch, or the join here.',
+    transform: 'extract_json → regex → template → truncate, in that order. Placeholders: {{text}} {{item.id}} {{json.a.b}} {{source.NAME}}.',
+    http: 'Calls a BTP destination with a relative path; the response body (JSON pretty-printed) becomes the text handed on.',
+    python: 'Runs in a sandboxed subprocess with text, item, sources, json_data; assign the result to `output`.',
+};
+const CONDITION_OPS = ['contains', 'not_contains', 'equals', 'not_equals', 'matches',
+                       'not_matches', 'gt', 'lt', 'is_empty', 'not_empty'];
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+
+function optionsHtml(values, selected) {
+    return values.map(v =>
+        `<option value="${escapeHtml(v)}" ${v === selected ? 'selected' : ''}>${escapeHtml(v)}</option>`
+    ).join('');
+}
+
+function conditionRuleRowHtml(rule) {
+    const when = (rule && rule.when) || {};
+    const then = (rule && rule.then) || {};
+    return `
+        <div class="wf-cond-rule" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-bottom:3px">
+            <span style="color:var(--muted)">if</span>
+            <select class="wf-cond-source">${optionsHtml(['text', 'item', 'json'], when.source || 'text')}</select>
+            <input class="wf-cond-field" style="width:120px" placeholder="field (item/json path)" value="${escapeHtml(when.field || '')}">
+            <select class="wf-cond-op">${optionsHtml(CONDITION_OPS, when.op || 'contains')}</select>
+            <input class="wf-cond-value" style="width:140px" placeholder="value" value="${escapeHtml(when.value == null ? '' : String(when.value))}">
+            <label style="font-weight:normal;white-space:nowrap"><input type="checkbox" class="wf-cond-case" ${when.case_sensitive ? 'checked' : ''}> case</label>
+            <span style="color:var(--muted)">then</span>
+            <select class="wf-cond-action">${optionsHtml(['continue', 'stop'], then.action || 'continue')}</select>
+            <input class="wf-cond-output" style="width:180px" placeholder="output template (empty = pass through)" value="${escapeHtml(then.output || '')}">
+            <button type="button" class="secondary small" onclick="this.parentNode.remove()">×</button>
+        </div>`;
+}
+
+function addConditionRuleRow(button) {
+    const list = button.closest('.wf-step-config').querySelector('.wf-cond-rules');
+    list.insertAdjacentHTML('beforeend', conditionRuleRowHtml({}));
+}
+
+function stepConfigEditorHtml(kind, cfg) {
+    cfg = cfg || {};
+    const json = v => (v && Object.keys(v).length) ? JSON.stringify(v, null, 2) : '';
+    if (kind === 'condition') {
+        const rules = Array.isArray(cfg.rules) ? cfg.rules : [];
+        const els = cfg['else'] || {};
+        return `
+            <div class="wf-cond-rules">${rules.map(conditionRuleRowHtml).join('')}</div>
+            <button type="button" class="secondary small" onclick="addConditionRuleRow(this)">+ rule</button>
+            <div style="display:flex;gap:4px;align-items:center;margin-top:4px">
+                <span style="color:var(--muted)">else</span>
+                <select class="wf-cond-else-action">${optionsHtml(['continue', 'stop'], els.action || 'continue')}</select>
+                <input class="wf-cond-else-output" style="width:240px" placeholder="output template (empty = pass through)" value="${escapeHtml(els.output || '')}">
+            </div>`;
+    }
+    if (kind === 'transform') {
+        const rx = cfg.regex || {};
+        return `
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+                <input class="wf-tf-extract" style="width:160px" placeholder="extract_json path (a.b[0])" value="${escapeHtml(cfg.extract_json || '')}">
+                <input class="wf-tf-pattern" style="width:160px" placeholder="regex pattern" value="${escapeHtml(rx.pattern || '')}">
+                <input class="wf-tf-replace" style="width:120px" placeholder="replace" value="${escapeHtml(rx.replace || '')}">
+                <input class="wf-tf-flags" style="width:50px" placeholder="imsx" value="${escapeHtml(rx.flags || '')}">
+                <input type="number" class="wf-tf-truncate" style="width:90px" min="1" placeholder="truncate" value="${cfg.truncate || ''}">
+            </div>
+            <textarea class="wf-tf-template" rows="2" style="width:100%;margin-top:4px"
+                      placeholder="template, e.g. Summary: {{text}} ({{item.id}})">${escapeHtml(cfg.template || '')}</textarea>`;
+    }
+    if (kind === 'http') {
+        const expect = Array.isArray(cfg.expect_status) ? cfg.expect_status.join(',') : '';
+        return `
+            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
+                <input class="wf-http-destination" style="width:150px" placeholder="destination name" value="${escapeHtml(cfg.destination || '')}">
+                <select class="wf-http-method">${optionsHtml(HTTP_METHODS, (cfg.method || 'GET').toUpperCase())}</select>
+                <input class="wf-http-path" style="width:240px" placeholder="/relative/path/{{item.id}}" value="${escapeHtml(cfg.path || '/')}">
+                <input class="wf-http-content-type" style="width:150px" placeholder="content type" value="${escapeHtml(cfg.content_type || 'application/json')}">
+                <input type="number" class="wf-http-timeout" style="width:70px" min="1" max="600" title="timeout (s)" value="${cfg.timeout_seconds || 30}">
+                <input class="wf-http-expect" style="width:110px" placeholder="expect: 2xx" title="expected status codes, comma-separated (empty = 2xx)" value="${escapeHtml(expect)}">
+            </div>
+            <div style="display:flex;gap:4px;margin-top:4px">
+                <textarea class="wf-http-query" rows="2" style="flex:1" placeholder='query as JSON, e.g. {"fields": "summary"}'>${escapeHtml(json(cfg.query))}</textarea>
+                <textarea class="wf-http-headers" rows="2" style="flex:1" placeholder='headers as JSON'>${escapeHtml(json(cfg.headers))}</textarea>
+            </div>
+            <textarea class="wf-http-body" rows="2" style="width:100%;margin-top:4px" placeholder="body template (sent for POST/PUT/PATCH/DELETE)">${escapeHtml(cfg.body || '')}</textarea>`;
+    }
+    if (kind === 'python') {
+        return `
+            <textarea class="wf-py-code" rows="6" style="width:100%;font-family:monospace"
+                      placeholder="output = text.upper()">${escapeHtml(cfg.code || '')}</textarea>
+            <label style="font-weight:normal">timeout (s)
+                <input type="number" class="wf-py-timeout" style="width:70px" min="1" max="60" value="${cfg.timeout_seconds || 10}">
+            </label>`;
+    }
+    return '';
+}
+
+function parseJsonField(text, what, position) {
+    const raw = (text || '').trim();
+    if (!raw) return {};
+    try {
+        const value = JSON.parse(raw);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+        return value;
+    } catch (e) {
+        toast(`Step ${position}: ${what} must be a JSON object.`, 'error');
+        throw new Error(`Step ${position}: ${what} must be a JSON object.`);
+    }
+}
+
+function collectStepConfig(kind, row, position) {
+    const box = row.querySelector('.wf-step-config');
+    const val = cls => { const el = box.querySelector('.' + cls); return el ? el.value : ''; };
+    if (kind === 'condition') {
+        const rules = Array.from(box.querySelectorAll('.wf-cond-rule')).map(r => ({
+            when: {
+                source: r.querySelector('.wf-cond-source').value,
+                field: r.querySelector('.wf-cond-field').value.trim(),
+                op: r.querySelector('.wf-cond-op').value,
+                value: r.querySelector('.wf-cond-value').value,
+                case_sensitive: r.querySelector('.wf-cond-case').checked,
+            },
+            then: {
+                action: r.querySelector('.wf-cond-action').value,
+                output: r.querySelector('.wf-cond-output').value,
+            },
+        }));
+        return {
+            rules,
+            'else': {action: val('wf-cond-else-action') || 'continue', output: val('wf-cond-else-output')},
+        };
+    }
+    if (kind === 'transform') {
+        const pattern = val('wf-tf-pattern');
+        const truncate = parseInt(val('wf-tf-truncate'), 10);
+        return {
+            extract_json: val('wf-tf-extract').trim(),
+            regex: pattern ? {pattern, replace: val('wf-tf-replace'), flags: val('wf-tf-flags').trim()} : null,
+            template: val('wf-tf-template'),
+            truncate: truncate > 0 ? truncate : null,
+        };
+    }
+    if (kind === 'http') {
+        const expect = val('wf-http-expect').split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0);
+        const cfg = {
+            destination: val('wf-http-destination').trim(),
+            method: val('wf-http-method') || 'GET',
+            path: val('wf-http-path').trim() || '/',
+            query: parseJsonField(val('wf-http-query'), 'query', position),
+            headers: parseJsonField(val('wf-http-headers'), 'headers', position),
+            body: val('wf-http-body'),
+            content_type: val('wf-http-content-type').trim() || 'application/json',
+            timeout_seconds: parseInt(val('wf-http-timeout'), 10) || 30,
+        };
+        if (expect.length) cfg.expect_status = expect;
+        return cfg;
+    }
+    if (kind === 'python') {
+        return {code: val('wf-py-code'), timeout_seconds: parseInt(val('wf-py-timeout'), 10) || 10};
+    }
+    return {};
+}
+
+function onWorkflowStepKindChange(select) {
+    const row = select.closest('.wf-step-row');
+    const kind = select.value;
+    const isAgent = kind === 'agent';
+    const show = (cls, on) => {
+        const el = row.querySelector('.' + cls);
+        if (el) el.style.display = on ? '' : 'none';
+    };
+    show('wf-step-agent', isAgent);
+    show('wf-step-instructions', isAgent);
+    show('wf-step-fanout-label', isAgent);
+    show('wf-step-kind-hint', !isAgent);
+    // The "open agent" link (attachStepAgentLink) follows the agent select.
+    const openLink = row.querySelector('.wf-step-open-agent');
+    if (openLink) openLink.hidden = !isAgent || openLink.getAttribute('href') === '#';
+    const hint = row.querySelector('.wf-step-kind-hint');
+    if (hint) hint.textContent = STEP_KIND_HINTS[kind] || '';
+    if (isAgent) row.querySelector('.wf-step-fanout').checked = false;
+    const box = row.querySelector('.wf-step-config');
+    if (isAgent) {
+        box.style.display = 'none';
+        return;
+    }
+    // Rebuild only when the kind actually changed, so switching away and
+    // back within one edit does not wipe what was typed.
+    if (box.dataset.kind !== kind) {
+        box.innerHTML = stepConfigEditorHtml(kind, {});
+        box.dataset.kind = kind;
+    }
+    box.style.display = '';
+}
+// {% endraw %}
 
 async function runWorkflowNow(id) {
     const res = await api(`/workflows/${id}/run`, {method: 'POST'});
@@ -1807,10 +2029,16 @@ function attachStepAgentLink(row) {
     link.textContent = 'open';
     const sync = () => {
         const agent = allAgents.find(a => a.name === select.value);
-        link.hidden = !agent;
+        // --- step kinds --- a non-agent row (condition/transform/http/python)
+        // has its agent select hidden, and the link goes with it.
+        const kindSelect = row.querySelector('.wf-step-kind');
+        const isAgent = !kindSelect || kindSelect.value === 'agent';
+        link.hidden = !agent || !isAgent;
         link.href = agent ? `#agent=${Number(agent.id)}` : '#';
     };
     select.addEventListener('change', sync);
+    const kindSelect = row.querySelector('.wf-step-kind');
+    if (kindSelect) kindSelect.addEventListener('change', sync);
     sync();
     select.insertAdjacentElement('afterend', link);
 }

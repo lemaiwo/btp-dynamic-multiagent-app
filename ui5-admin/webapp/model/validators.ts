@@ -1,4 +1,4 @@
-import type { AuthMode, DeepConfig, McpServer, OAuthClient } from "../service/types";
+import type { AuthMode, DeepConfig, McpServer, OAuthClient, WorkflowStep } from "../service/types";
 import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } from "./builtins";
 
 // --- destinations ---
@@ -284,6 +284,115 @@ export default {
         return errors;
     }
 };
+
+// --- step kinds ---
+/**
+ * Client-side mirror of the per-step rules in `validate_workflow_parts`
+ * (agents/db.py) and the config models in agents/step_kinds.py, for the
+ * workflow editor: an agent is required only for kind "agent", the fan-out
+ * step must be an agent, timeouts have the server's bounds, a python step
+ * needs code, an http step needs a destination and a confined relative path.
+ *
+ * Keyed by step index in the submitted list; the message is what the server
+ * would say, minus the position prefix the caller adds. The server remains
+ * authoritative -- python code, say, is only compiled there.
+ */
+export function validateWorkflowSteps(steps: WorkflowStep[]): Record<number, string> {
+    const errors: Record<number, string> = {};
+    const kinds: string[] = ["agent", "condition", "transform", "http", "python"];
+    const ops: string[] = [
+        "contains", "not_contains", "equals", "not_equals", "matches",
+        "not_matches", "gt", "lt", "is_empty", "not_empty"
+    ];
+    steps.forEach((step, index) => {
+        const kind = step.kind || "agent";
+        const timeout = Number(step.step_timeout_seconds);
+        if (kinds.indexOf(kind) === -1) {
+            errors[index] = `Unknown step kind '${kind}'.`;
+            return;
+        }
+        if (!(timeout >= 10 && timeout <= 1800)) {
+            errors[index] = "The step timeout must be between 10 and 1800 seconds.";
+            return;
+        }
+        if (kind === "agent") {
+            if (!(step.agent_name || "").trim()) {
+                errors[index] = "An agent step must name an agent.";
+            }
+            return;
+        }
+        if (step.fan_out) {
+            errors[index] = `The fan-out step must be an agent step; this is a ${kind} step.`;
+            return;
+        }
+        const c = (step.config || {}) as Record<string, unknown>;
+        if (kind === "python") {
+            if (!String(c.code || "").trim()) {
+                errors[index] = "A python step needs code that assigns `output`.";
+                return;
+            }
+            const t = Number(c.timeout_seconds);
+            if (!(t >= 1 && t <= 60)) {
+                errors[index] = "A python step's timeout must be between 1 and 60 seconds.";
+            }
+            return;
+        }
+        if (kind === "http") {
+            if (!String(c.destination || "").trim()) {
+                errors[index] = "An http step needs a destination name.";
+                return;
+            }
+            const path = String(c.path || "").trim();
+            // Templates are rendered before the request; probe the static
+            // shape with placeholders blanked, as agents/step_kinds.py does.
+            const probe = path.replace(/\{\{[^}]*\}\}/g, "x");
+            if (probe.includes("://") || probe.startsWith("//") || probe.includes("\\")) {
+                errors[index] = "The http path is a path, not a URL: the host comes from the destination.";
+                return;
+            }
+            if (!probe.startsWith("/")) {
+                errors[index] = "The http path must start with '/'.";
+                return;
+            }
+            if (probe.includes("?") || probe.includes("#")) {
+                errors[index] = "Put query parameters in the query field, not in the path.";
+                return;
+            }
+            if (probe.split("/").some((s) => s === ".." || s === ".")) {
+                errors[index] = "The http path must not contain '.' or '..' segments.";
+                return;
+            }
+            const t = Number(c.timeout_seconds);
+            if (!(t >= 1 && t <= 600)) {
+                errors[index] = "An http step's timeout must be between 1 and 600 seconds.";
+            }
+            return;
+        }
+        if (kind === "transform") {
+            const truncate = c.truncate;
+            if (truncate !== null && truncate !== undefined && !(Number(truncate) >= 1)) {
+                errors[index] = "Truncate must be a positive number of characters.";
+                return;
+            }
+            const regex = c.regex as { pattern?: string; flags?: string } | null | undefined;
+            if (regex && !(regex.pattern || "").length) {
+                errors[index] = "A regex needs a pattern.";
+                return;
+            }
+            if (regex && /[^imsx]/.test(regex.flags || "")) {
+                errors[index] = "Regex flags may only be i, m, s or x.";
+            }
+            return;
+        }
+        // condition
+        const rules = Array.isArray(c.rules) ? (c.rules as { when?: { op?: string } }[]) : [];
+        const bad = rules.findIndex((r) => ops.indexOf(String(r.when?.op || "")) === -1);
+        if (bad > -1) {
+            errors[index] = `Rule ${bad + 1} has an unknown operator.`;
+        }
+    });
+    return errors;
+}
 
 // --- deep agents -------------------------------------------------------------
 

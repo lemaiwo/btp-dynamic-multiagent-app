@@ -339,6 +339,57 @@ export interface WorkflowStep {
     instructions: string;
     fan_out: boolean;
     step_timeout_seconds: number;
+    // --- step kinds ---
+    /** "agent" (the default when absent) or a deterministic kind; mirrors
+     * `WorkflowStep.kind` in agents/db.py. */
+    kind?: StepKind;
+    /** The kind's settings, validated server-side by agents/step_kinds.py;
+     * `{}` for an agent step. */
+    config?: StepConfig;
+}
+
+// --- step kinds ---
+export type StepKind = "agent" | "condition" | "transform" | "http" | "python";
+
+/** Wire shape of a step's config. Kept loose on purpose: the server owns the
+ * schema (agents/step_kinds.py) and rejects what it does not accept; the UI
+ * edits a flattened copy (see model/stepKinds.ts) and maps back. */
+export type StepConfig = Record<string, unknown>;
+
+export type ConditionSource = "text" | "item" | "json";
+export type ConditionOp =
+    | "contains" | "not_contains" | "equals" | "not_equals" | "matches"
+    | "not_matches" | "gt" | "lt" | "is_empty" | "not_empty";
+export type StepAction = "continue" | "stop";
+
+export interface ConditionRule {
+    when: { source: ConditionSource; field: string; op: ConditionOp; value: string; case_sensitive: boolean };
+    then: { action: StepAction; output: string };
+}
+export interface ConditionConfig {
+    rules: ConditionRule[];
+    else: { action: StepAction; output: string };
+}
+export interface TransformConfig {
+    extract_json: string;
+    regex: { pattern: string; replace: string; flags: string } | null;
+    template: string;
+    truncate: number | null;
+}
+export interface HttpConfig {
+    destination: string;
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    path: string;
+    query: Record<string, string>;
+    headers: Record<string, string>;
+    body: string;
+    content_type: string;
+    timeout_seconds: number;
+    expect_status?: number[];
+}
+export interface PythonConfig {
+    code: string;
+    timeout_seconds: number;
 }
 
 /** Fields shared by `Workflow` and `WorkflowInput`; see each for what each

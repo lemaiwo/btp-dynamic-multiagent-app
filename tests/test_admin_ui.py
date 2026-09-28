@@ -667,6 +667,171 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             finally:
                 os.unlink(editor_harness_path)
 
+            # --- step kinds ---
+            # Non-agent steps (condition/transform/http/python) carry a kind
+            # and a config instead of an agent. The editor must round-trip
+            # each kind's config, build a config for a row whose kind was
+            # switched in the UI, and refuse to submit a malformed headers
+            # JSON rather than silently sending nothing.
+            check("step kind selector is rendered per row", "wf-step-kind" in js)
+            check("step kinds mirror the server's set",
+                  "['agent', 'condition', 'transform', 'http', 'python']" in js)
+            kinds_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div id="workflow-modal"></div>
+  <span id="workflow-modal-title"></span>
+  <input id="workflow-id"><input id="workflow-name">
+  <input id="workflow-description"><input id="workflow-api-slug">
+  <input id="workflow-run-as"><input id="workflow-timeout">
+  <input id="workflow-max-parallel">
+  <select id="workflow-on-unknown-branch">
+    <option value="fail">fail</option><option value="skip">skip</option>
+  </select>
+  <input type="checkbox" id="workflow-skip-seen">
+  <input type="checkbox" id="workflow-enabled">
+  <div id="workflow-branches"></div>
+  <div id="workflow-steps"></div>
+</body></html>`);
+global.window = dom.window;
+global.document = dom.window.document;
+
+""" + js_no_autoinvoke + r"""
+
+const COND = {rules: [{when: {source: 'json', field: 'issue.priority', op: 'equals',
+                              value: 'High', case_sensitive: false},
+                       then: {action: 'stop', output: 'Escalated {{item.id}}'}}],
+              else: {action: 'continue', output: ''}};
+const TF = {extract_json: 'issue.summary', regex: {pattern: 'a', replace: 'b', flags: 'i'},
+            template: 'S: {{text}}', truncate: 200};
+const HTTP = {destination: 'jira', method: 'POST', path: '/rest/api/2/issue/{{item.id}}/comment',
+              query: {notify: 'false'}, headers: {'X-Trace': '1'}, body: '{"body": "{{text}}"}',
+              content_type: 'application/json', timeout_seconds: 20, expect_status: [200, 201]};
+const PY = {code: "output = text.upper()", timeout_seconds: 7};
+const DEF = {
+    id: 9, name: 'kinds', description: '', api_slug: '', run_as_principal: '',
+    run_timeout_seconds: 1200, skip_seen_items: true, max_parallel_items: 1,
+    on_unknown_branch: 'fail', enabled: true, branches: [],
+    steps: [
+        {branch_key: null, position: 1, kind: 'agent', agent_name: 'reader',
+         instructions: 'read', fan_out: false, step_timeout_seconds: 300, config: {}},
+        {branch_key: null, position: 2, kind: 'condition', agent_name: '',
+         instructions: '', fan_out: false, step_timeout_seconds: 60, config: COND},
+        {branch_key: null, position: 3, kind: 'transform', agent_name: '',
+         instructions: '', fan_out: false, step_timeout_seconds: 60, config: TF},
+        {branch_key: null, position: 4, kind: 'http', agent_name: '',
+         instructions: '', fan_out: false, step_timeout_seconds: 60, config: HTTP},
+        {branch_key: null, position: 5, kind: 'python', agent_name: '',
+         instructions: '', fan_out: false, step_timeout_seconds: 60, config: PY},
+    ],
+};
+
+let saved = null;
+global.fetch = async (url, opts = {}) => {
+    if ((opts.method || 'GET') === 'GET') {
+        return { ok: true, json: async () => DEF };
+    }
+    saved = JSON.parse(opts.body);
+    return { ok: true, json: async () => ({}) };
+};
+loadWorkflows = async () => {};
+
+async function main() {
+    allAgents = [{name: 'reader'}];
+
+    // 1. Every kind's config survives open -> save unchanged.
+    saved = null;
+    await editWorkflow(9);
+    await saveWorkflow();
+    assert.ok(saved, 'save must post a body');
+    assert.deepStrictEqual(saved.steps.map(s => s.kind),
+        ['agent', 'condition', 'transform', 'http', 'python'], 'kinds round-trip');
+    assert.deepStrictEqual(saved.steps[0].config, {}, 'an agent step sends an empty config');
+    assert.strictEqual(saved.steps[0].agent_name, 'reader');
+    assert.strictEqual(saved.steps[1].agent_name, '', 'a non-agent step sends no agent');
+    assert.deepStrictEqual(saved.steps[1].config, COND, 'condition config round-trips');
+    assert.deepStrictEqual(saved.steps[2].config, TF, 'transform config round-trips');
+    assert.deepStrictEqual(saved.steps[3].config, HTTP, 'http config round-trips');
+    assert.deepStrictEqual(saved.steps[4].config, PY, 'python config round-trips');
+    assert.ok(saved.steps.every(s => s.position === saved.steps.indexOf(s) + 1),
+        'positions are contiguous across kinds');
+
+    // 2. The agent controls are hidden for a non-agent row, and shown for an agent row.
+    const rows = Array.from(document.querySelectorAll('#workflow-steps .wf-step-row'));
+    assert.strictEqual(rows[1].querySelector('.wf-step-agent').style.display, 'none',
+        'the agent dropdown is hidden for a condition step');
+    assert.strictEqual(rows[1].querySelector('.wf-step-config').style.display, '',
+        'the config editor is shown for a condition step');
+    assert.strictEqual(rows[0].querySelector('.wf-step-config').style.display, 'none',
+        'the config editor is hidden for an agent step');
+
+    // 3. Switching a fresh row to `python` builds its editor and collects its config.
+    addWorkflowStepRow();
+    const fresh = document.querySelectorAll('#workflow-steps .wf-step-row')[5];
+    const kindSelect = fresh.querySelector('.wf-step-kind');
+    kindSelect.value = 'python';
+    onWorkflowStepKindChange(kindSelect);
+    assert.ok(fresh.querySelector('.wf-py-code'), 'the python editor appears on kind change');
+    assert.strictEqual(fresh.querySelector('.wf-step-agent').style.display, 'none');
+    fresh.querySelector('.wf-py-code').value = 'output = len(text)';
+    fresh.querySelector('.wf-py-timeout').value = '3';
+    saved = null;
+    await saveWorkflow();
+    assert.deepStrictEqual(saved.steps[5],
+        {branch_key: null, position: 6, kind: 'python', agent_name: '', instructions: '',
+         fan_out: false, step_timeout_seconds: 600,
+         config: {code: 'output = len(text)', timeout_seconds: 3}},
+        'a row switched to python submits its code and timeout');
+
+    // 4. Switching back to agent hides the editor and sends an agent step.
+    kindSelect.value = 'agent';
+    onWorkflowStepKindChange(kindSelect);
+    assert.strictEqual(fresh.querySelector('.wf-step-config').style.display, 'none');
+    saved = null;
+    await saveWorkflow();
+    assert.strictEqual(saved.steps[5].kind, 'agent');
+    assert.deepStrictEqual(saved.steps[5].config, {});
+
+    // 5. Malformed headers JSON on an http step is refused before the request.
+    rows[3].querySelector('.wf-http-headers').value = '{not json';
+    saved = null;
+    let threw = false;
+    try { await saveWorkflow(); } catch (e) { threw = true; }
+    assert.ok(threw, 'a malformed headers JSON aborts the save');
+    assert.strictEqual(saved, null, 'nothing was posted');
+    assert.ok(document.getElementById('toast').textContent.includes('Step 4'),
+        'the toast names the step');
+
+    console.log('workflow step kinds editor scenarios passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, dir=str(ROOT)
+            ) as f:
+                f.write(kinds_harness)
+                kinds_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", kinds_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                check(
+                    "the workflow editor round-trips every step kind's config, "
+                    "builds one on kind change, and refuses malformed JSON",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(kinds_harness_path)
+
             # --------------------------------------------------------------
             # A name containing a quote and a parenthesis must round-trip
             # safely through the Delete buttons on all three tables. Before

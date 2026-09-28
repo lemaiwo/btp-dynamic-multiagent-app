@@ -820,13 +820,31 @@ class WorkflowBranchPayload(BaseModel):
 class WorkflowStepPayload(BaseModel):
     branch_key: str | None = None
     position: int
-    agent_name: str = Field(min_length=1, max_length=64)
+    # Blank is legal for a non-agent kind; validate_workflow_parts requires a
+    # real, enabled agent when kind is "agent" and says which step is wrong.
+    agent_name: str = Field(default="", max_length=64)
     instructions: str = ""
     fan_out: bool = False
     # Bounded like the workflow's own timeout below: 0 would make every run of
     # this step fail instantly at asyncio.wait_for, and a step outliving the
     # whole run's budget can only ever be killed by the run timeout.
     step_timeout_seconds: int = Field(default=600, ge=10, le=1800)
+    # --- step kinds ---
+    # "agent" or one of agents.step_kinds.DETERMINISTIC_KINDS. Checked by
+    # validate_workflow_parts rather than a Literal here, so the 400/422 names
+    # the step position instead of a pydantic location path.
+    kind: str = Field(default="agent", max_length=16)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("agent_name", "kind", mode="before")
+    @classmethod
+    def _null_is_blank(cls, v: Any) -> Any:
+        return "" if v is None else v
+
+    @field_validator("config", mode="before")
+    @classmethod
+    def _null_config_is_empty(cls, v: Any) -> Any:
+        return {} if v is None else v
 
 
 class WorkflowPayload(BaseModel):

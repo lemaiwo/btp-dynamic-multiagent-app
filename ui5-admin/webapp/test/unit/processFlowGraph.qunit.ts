@@ -1,6 +1,8 @@
 import {
     buildDefinitionGraph,
     decorateWithRun,
+    DETERMINISTIC_GLYPH,
+    DETERMINISTIC_STATE_TEXT,
     FlowGraph
 } from "com/agent/admin/model/processFlowGraph";
 import { WorkflowBranch, WorkflowStep, WorkflowStepRun } from "com/agent/admin/service/types";
@@ -254,4 +256,75 @@ QUnit.test("decoration does not mutate the definition graph", function (assert) 
     decorateWithRun(graph, [stepRun({ position: 0 })], null);
     assert.strictEqual(graph.nodes[0].state, "Neutral", "original stays untouched");
     assert.notOk(graph.nodes[0].highlighted);
+});
+
+// --- step kinds ---
+QUnit.module("processFlowGraph: step kinds");
+
+QUnit.test("a deterministic step is labelled by its kind, not by an agent", function (assert) {
+    const graph = buildDefinitionGraph([], [
+        step({ position: 1, agent_name: "reader" }),
+        step({ position: 2, agent_name: "", kind: "transform",
+               config: { extract_json: "issue.summary", template: "S: {{text}}", truncate: 200 } }),
+        step({ position: 3, agent_name: "", kind: "condition",
+               config: { rules: [{ when: { op: "contains" } }], else: { action: "stop" } } }),
+        step({ position: 4, agent_name: "", kind: "http",
+               config: { destination: "jira", method: "post", path: "/rest/api/2/x" } }),
+        step({ position: 5, agent_name: "", kind: "python", config: { code: "\noutput = text\n" } }),
+        step({ position: 6, agent_name: "writer" })
+    ]);
+    const titles = graph.nodes.map((n) => n.title);
+    assert.deepEqual(
+        titles,
+        ["reader", `${DETERMINISTIC_GLYPH} transform`, `${DETERMINISTIC_GLYPH} condition`,
+         `${DETERMINISTIC_GLYPH} http`, `${DETERMINISTIC_GLYPH} python`, "writer"],
+        "non-agent nodes carry the glyph and the kind; agent nodes the agent name"
+    );
+    assert.deepEqual(
+        graph.nodes.slice(1, 5).map((n) => n.texts[1]),
+        ["json issue.summary, template, ≤200", "1 rule", "POST jira/rest/api/2/x", "output = text"],
+        "the second text line summarises what the step does"
+    );
+    assert.ok(
+        graph.nodes.slice(1, 5).every((n) => n.state === "Neutral" && n.stateText === DETERMINISTIC_STATE_TEXT),
+        "deterministic nodes are Neutral with their own state text, never Planned"
+    );
+    assert.strictEqual(graph.nodes[0].stateText, "", "agent nodes keep an empty state text");
+    assert.deepEqual(
+        graph.nodes.map((n) => n.children),
+        [["main-1"], ["main-2"], ["main-3"], ["main-4"], ["main-5"], []],
+        "the chain runs through deterministic nodes like any other"
+    );
+});
+
+QUnit.test("an empty-agent row is Planned only when its kind is agent", function (assert) {
+    const graph = buildDefinitionGraph([], [
+        step({ position: 1, agent_name: "" }),
+        step({ position: 2, agent_name: "", kind: "python", config: { code: "output = 1" } })
+    ]);
+    assert.strictEqual(graph.nodes[0].state, "Planned", "an agent step without an agent is still planned");
+    assert.strictEqual(graph.nodes[0].title, "(no agent)");
+    assert.strictEqual(graph.nodes[1].state, "Neutral", "a python step needs no agent");
+});
+
+QUnit.test("a step without a kind is drawn as an agent step", function (assert) {
+    const graph = buildDefinitionGraph([], [step({ position: 1, agent_name: "legacy" })]);
+    assert.strictEqual(graph.nodes[0].title, "legacy");
+    assert.strictEqual(graph.nodes[0].stateText, "");
+});
+
+QUnit.test("a run that stopped at a condition shows the skipped steps as skipped", function (assert) {
+    const graph = buildDefinitionGraph([], [
+        step({ position: 1, agent_name: "reader" }),
+        step({ position: 2, agent_name: "", kind: "condition", config: { rules: [] } }),
+        step({ position: 3, agent_name: "writer" })
+    ]);
+    const decorated = decorateWithRun(graph, [
+        stepRun({ position: 1, agent_name: "reader", status: "success" }),
+        stepRun({ position: 2, agent_name: "condition", status: "success" }),
+        stepRun({ position: 3, agent_name: "writer", status: "skipped" as WorkflowStepRun["status"] })
+    ], null);
+    assert.strictEqual(decorated.nodes[1].state, "Positive", "the condition ran");
+    assert.strictEqual(decorated.nodes[2].stateText, "skipped", "the skipped step says so");
+    assert.strictEqual(decorated.nodes[2].state, "Neutral", "skipped is neither success nor failure");
 });

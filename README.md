@@ -520,3 +520,109 @@ Agent Hub**. The agent card is served at
 See [**JOULE_A2A.md**](./JOULE_A2A.md) for the full configuration guide
 covering BTP approuter routes, XSUAA scope/role-collection setup,
 service-key creation, and how to register the agent in Joule.
+
+## Workflows
+
+A workflow is a declared, ordered sequence of steps run as one background
+job: a main line, at most one **fan-out** step whose agent returns work
+items, per-item **branches** the fan-out step selects, and the remaining
+main-line steps as the join that runs once per item. Steps hand plain text
+to each other; the next step sees each predecessor's output as a fenced
+`## From <name>` block. Workflows are edited in the admin UI and triggered
+manually or by the BTP Job Scheduling Service via
+`POST /api/workflows/{slug}/run`. The engine lives in
+`agents/workflow_runner.py`.
+
+### Step kinds
+
+Every step has a `kind`. The default, `agent`, runs a specialist agent with
+the step's `instructions`. Four deterministic kinds run without a model;
+they take the previous step's text (and, inside a branch or on the join,
+the fan-out item) and hand text on exactly as an agent step would. Their
+settings live in the step's `config`, validated on save by
+`agents/step_kinds.py`, and their output is handed on under the name
+`<kind>#<position>` (for example `transform#2`). A non-agent step names no
+agent and cannot be the fan-out step.
+
+Templates (`transform.template`, a condition's `output`, `http.path`,
+`http.query` values and `http.body`) know four placeholders and nothing
+else: `{{text}}`, `{{item.<path>}}` (the fan-out item, e.g. `{{item.id}}`),
+`{{json.<path>}}` (the previous text parsed as JSON, e.g.
+`{{json.issue.key}}`) and `{{source.<name>}}`. Paths are dotted with
+`[n]` indexes. Unknown placeholders render empty; nothing is evaluated.
+
+**`condition`** — the first matching rule wins; `else` applies when none
+does. `source` is `text` (the previous text), `item` (the fan-out item,
+only inside a branch or on the join) or `json` (the previous text parsed
+as JSON; a rule is false when it does not parse). `stop` on the main line
+before the fan-out ends the run successfully with the output as its final
+text; inside a branch it skips the rest of that branch for that item (the
+skipped steps are recorded as `skipped`, not failed, and the join still
+sees what the branch produced); on the join line it skips the rest of the
+join for that item. An empty `output` passes the incoming text through.
+
+```json
+{"rules": [{"when": {"source": "json", "field": "issue.priority", "op": "equals",
+                     "value": "High", "case_sensitive": false},
+            "then": {"action": "stop", "output": "Escalated {{item.id}}"}}],
+ "else": {"action": "continue", "output": ""}}
+```
+
+Operators: `contains`, `not_contains`, `equals`, `not_equals`, `matches`,
+`not_matches` (regular expression), `gt`, `lt` (numeric when both sides
+are numbers, lexical otherwise), `is_empty`, `not_empty`.
+
+**`transform`** — applied in this order: `extract_json` (a path into the
+previous text parsed as JSON; the step fails when it is not JSON), `regex`
+(`re.sub` with flags from `i`, `m`, `s`, `x`), `template`, `truncate`
+(characters).
+
+```json
+{"extract_json": "issue.summary",
+ "regex": {"pattern": "\\s+", "replace": " ", "flags": ""},
+ "template": "Summary of {{json.issue.key}}: {{text}}",
+ "truncate": 2000}
+```
+
+**`http`** — one request through a BTP destination (resolved the same way
+`builtin:jira` resolves its destination: the destination holds the URL and
+the credential, the app stores nothing). `path` is relative and confined:
+no scheme, no `//`, no `.` or `..` segments, no query string (use `query`).
+The response body is the step's output, pretty-printed when the content
+type is JSON; a status outside `expect_status` (default any 2xx) fails the
+step with the status and an excerpt of the body.
+
+```json
+{"destination": "jira", "method": "POST",
+ "path": "/rest/api/2/issue/{{item.id}}/comment",
+ "query": {}, "headers": {}, "body": "{\"body\": \"{{text}}\"}",
+ "content_type": "application/json", "timeout_seconds": 30,
+ "expect_status": [201]}
+```
+
+**`python`** — runs `code` in a subprocess (`python -I -S -E`, see
+`agents/_python_step_runner.py`) with the globals `text`, `item`,
+`sources` (name → text) and `json_data` (the previous text parsed as JSON,
+or `None`), plus these modules pre-imported and importable: `json`, `re`,
+`math`, `datetime`, `statistics`, `collections`, `itertools`, `string`,
+`textwrap`, `base64`, `hashlib`, `uuid`, `decimal`, `fractions`,
+`functools`, `operator`, `typing`, `dataclasses`, `urllib.parse`. The
+value of `output` becomes the step's text (a `str` as is, anything else
+JSON-serialised), capped at 64 KB. Any exception fails the step with the
+traceback tail; `timeout_seconds` (1–60) kills the process.
+
+```json
+{"code": "nums = [int(x) for x in text.split()]\noutput = {'sum': sum(nums)}",
+ "timeout_seconds": 10}
+```
+
+*Sandbox caveat.* The code is admin-authored and runs inside the admin
+trust boundary — whoever can save a workflow can already point agents at
+arbitrary MCP servers. The sandbox exists to stop mistakes, not a hostile
+admin: other imports (`os`, `sys`, `subprocess`, `socket`, `ctypes`,
+`importlib`, …) are refused, `open` is removed, the process gets an empty
+environment (never `VCAP_SERVICES` or any secret), a throwaway working
+directory, a 256 MB address-space limit and a CPU limit, and is killed on
+timeout. There is no network only because `socket` and `urllib.request`
+are not importable; egress is not blocked, and the pre-imported modules
+reach the interpreter transitively (`typing.sys`). Treat it accordingly.

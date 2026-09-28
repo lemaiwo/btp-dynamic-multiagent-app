@@ -1,4 +1,5 @@
 import type { WorkflowBranch, WorkflowStep, WorkflowStepRun } from "../service/types";
+import { kindOf, stepSummary } from "./stepKinds";
 
 /**
  * Turns a workflow definition into the lanes and nodes a
@@ -150,6 +151,8 @@ export function buildDefinitionGraph(
             nodeId: mainNodeId(index),
             laneId: laneId(position),
             agentName: step.agent_name,
+            kind: kindOf(step),
+            summary: stepSummary(step),
             texts: [LANE_MAIN],
             children,
             branchKey: null,
@@ -170,6 +173,8 @@ export function buildDefinitionGraph(
                     nodeId: branchNodeId(key, index),
                     laneId: laneId(position),
                     agentName: step.agent_name,
+                    kind: kindOf(step),
+                    summary: stepSummary(step),
                     texts: [key],
                     children: next ? [next] : [],
                     branchKey: key,
@@ -184,16 +189,41 @@ export function buildDefinitionGraph(
     return { lanes, nodes };
 }
 
+// --- step kinds ---
+/** Title prefix marking a node that runs without a model. ProcessFlowNode
+ * has no icon property of its own, so the glyph is the visible marker; the
+ * kind's summary goes in the second text line and `stateText` names it. */
+export const DETERMINISTIC_GLYPH = "⚙";
+export const DETERMINISTIC_STATE_TEXT = "no model";
+
 function makeNode(spec: {
     nodeId: string;
     laneId: string;
     agentName: string;
+    kind?: string;
+    summary?: string;
     texts: string[];
     children: string[];
     branchKey: string | null;
     position: number;
     perRun: boolean;
 }): FlowNode {
+    const kind = spec.kind || "agent";
+    if (kind !== "agent") {
+        return {
+            nodeId: spec.nodeId,
+            laneId: spec.laneId,
+            title: `${DETERMINISTIC_GLYPH} ${kind}`,
+            texts: spec.summary ? [...spec.texts, spec.summary] : spec.texts,
+            children: spec.children,
+            state: "Neutral",
+            stateText: DETERMINISTIC_STATE_TEXT,
+            highlighted: false,
+            branchKey: spec.branchKey,
+            position: spec.position,
+            perRun: spec.perRun
+        };
+    }
     return {
         nodeId: spec.nodeId,
         laneId: spec.laneId,

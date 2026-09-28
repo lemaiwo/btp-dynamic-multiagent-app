@@ -166,6 +166,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `_finalize`, shutdown cancel). Steps hand plain text to each other; the join
   step sees one `## From` block per branch taken. See
   `docs/superpowers/specs/2026-08-31-agent-workflows-design.md`
+- `agents/step_kinds.py` — the deterministic step kinds a `WorkflowStep.kind`
+  can name besides `agent`: `condition` (first matching rule wins; `stop`
+  ends the main line successfully, skips the rest of a branch for one item,
+  or skips the rest of the join), `transform` (extract_json → regex →
+  template → truncate), `http` (a BTP destination via `agents.destination`,
+  confined relative path) and `python` (admin-authored code in a
+  `python -I -S -E` subprocess started by `agents/_python_step_runner.py`:
+  import allowlist, no `open`, empty environment, temp cwd, RLIMIT_AS/CPU,
+  killed on timeout — a guard against mistakes, not against a hostile
+  admin). Pydantic config models double as the save-time gate
+  (`validate_step_config`, called from `validate_workflow_parts`); the
+  runner calls `execute_step` and hands the output on as `<kind>#<position>`.
+  Templates know `{{text}}`, `{{item.x}}`, `{{json.x}}`, `{{source.NAME}}`
+  and are substituted, never evaluated. Mirrored in the UI by
+  `ui5-admin/webapp/model/stepKinds.ts` and the step editors in both admins
 - `agents/admin.py` — FastAPI `/admin` router: agent + skill + workflow CRUD,
   reload, restart, import/export, seed-on-startup
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
