@@ -1967,6 +1967,445 @@ console.log('renderAgentWhereUsed scenarios passed');
             finally:
                 os.unlink(wu_harness_path)
 
+        # ------------------------------------------------------------------
+        # --- detail runs ---
+        # The editors double as detail pages: Run now / Refresh in the modal
+        # header (only for a saved row) and a "Last runs" table at the bottom
+        # whose rows deep-link to the run detail views in a new tab.
+        print("\n== detail runs (editor header buttons + last runs) ==")
+        for el_id, tag in (
+            ("agent-run-now", "button"), ("agent-refresh", "button"),
+            ("agent-last-runs", "div"),
+            ("workflow-run-now", "button"), ("workflow-refresh", "button"),
+            ("workflow-last-runs", "div"),
+        ):
+            found = find(coll, tag, id=el_id)
+            check(f"{tag}#{el_id} present", found is not None)
+            check(f"#{el_id} starts hidden (new-row default)",
+                  found is not None and "hidden" in found[1])
+        for el_id, handler in (
+            ("agent-run-now", "runAgentFromDetail()"),
+            ("agent-refresh", "refreshAgentDetail()"),
+            ("workflow-run-now", "runWorkflowFromDetail()"),
+            ("workflow-refresh", "refreshWorkflowDetail()"),
+        ):
+            found = find(coll, "button", id=el_id)
+            check(f"#{el_id} onclick={handler}",
+                  found is not None and found[1].get("onclick") == handler)
+        check("JS has the detail-runs header", "// --- detail runs ---" in js)
+        edit_agent = re.search(r"async function editAgent\(id\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("editAgent() shows the detail-runs controls",
+              "setDetailRunsMode('agent', a.id)" in (edit_agent.group(1) if edit_agent else ""))
+        open_agent = re.search(r"async function openAgentModal\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("openAgentModal() hides them for a new agent",
+              "setDetailRunsMode('agent', '')" in (open_agent.group(1) if open_agent else ""))
+        edit_wf = re.search(r"async function editWorkflow\(id\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("editWorkflow() shows the detail-runs controls",
+              "setDetailRunsMode('workflow', w.id)" in (edit_wf.group(1) if edit_wf else ""))
+        open_wf = re.search(r"function openWorkflowModal\(\)\s*\{(.*?)\n\}", js, re.DOTALL)
+        check("openWorkflowModal() hides them for a new workflow",
+              "setDetailRunsMode('workflow', '')" in (open_wf.group(1) if open_wf else ""))
+        check("openFromHash() handles run deep links",
+              "/^#(run|workflow-run)=" in js and "openRunFromHash(" in js)
+        check("editor Run now reuses the list's agent run helper",
+              "startAgentRun(" in js and js.count("startAgentRun(") >= 3)
+        check("editor Run now reuses the list's workflow run helper",
+              "startWorkflowRun(" in js and js.count("startWorkflowRun(") >= 3)
+        check("last-runs refresh after a run: 1 s and 5 s",
+              "DETAIL_RUN_REFRESH_DELAYS = [1000, 5000]" in js)
+        check("Refresh confirms before discarding unsaved edits",
+              "detailFormDirty(kind)" in js
+              and "confirm(`This ${cfg.noun} has unsaved changes" in js)
+        # The discovery/replay section above must have seen the new api()
+        # calls (and replayed them against the live app).
+        for want in (
+            ("GET", "/admin/api/runs?agent_id=1&limit=10"),
+            ("GET", "/admin/api/workflow-runs?workflow_id=1&limit=10"),
+            ("GET", "/admin/api/agents/1"),
+            ("GET", "/admin/api/workflows/1"),
+        ):
+            check(f"api() call discovered: {want[0]} {want[1]}", want in discovered)
+
+        # --- run detail auto-refresh ---
+        print("\n== run detail auto-refresh (toolbar + poller) ==")
+        for prefix in ("run-detail", "workflow-run-detail"):
+            check(f"button#{prefix}-refresh present",
+                  find(coll, "button", id=f"{prefix}-refresh") is not None)
+            cb = find(coll, "input", id=f"{prefix}-autorefresh")
+            check(f"input#{prefix}-autorefresh is a checkbox, checked by default",
+                  cb is not None and cb[1].get("type") == "checkbox" and "checked" in cb[1])
+            check(f"span#{prefix}-autorefresh-status present",
+                  find(coll, "span", id=f"{prefix}-autorefresh-status") is not None)
+            check(f"button#{prefix}-close present",
+                  find(coll, "button", id=f"{prefix}-close") is not None)
+        check("pure helpers exist",
+              "function isLiveRunStatus(status)" in js
+              and "function nextRefreshDelay(failures)" in js)
+        check("one shared stopAutoRefresh()", "function stopAutoRefresh()" in js)
+        check("run rows open through the poller",
+              "openRunDetail('run', row.dataset.id)" in js
+              and "openRunDetail('workflow-run', row.dataset.id)" in js)
+        check("workflow run rows no longer interpolate the id into onclick",
+              "showWorkflowRun('${r.id}')" not in js)
+        check("switchTab() pauses the job-run poller",
+              "_autoRefresh.kind === 'run'" in js)
+
+        if shutil.which("node") is not None:
+            # --- detail runs --- render functions under jsdom: server text is
+            # escaped, ids become deep links, the empty/error states read
+            # right, and the header buttons + block exist only for a saved row.
+            detail_runs_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <input type="hidden" id="agent-id"><input type="hidden" id="workflow-id">
+  <button id="agent-run-now" hidden></button><button id="agent-refresh" hidden></button>
+  <div id="agent-last-runs" hidden></div>
+  <button id="workflow-run-now" hidden></button><button id="workflow-refresh" hidden></button>
+  <div id="workflow-last-runs" hidden></div>
+</body></html>`);
+global.window = dom.window;
+global.document = dom.window.document;
+
+""" + js_no_autoinvoke + r"""
+
+const urls = [];
+global.fetch = async (url) => {
+    urls.push(String(url));
+    return { ok: true, json: async () => [] };
+};
+const tick = () => new Promise(r => setImmediate(r));
+const byId = id => document.getElementById(id);
+
+async function main() {
+    // 1. Agent last runs: escaped, linked, duration formatted, summary truncated.
+    const long = 'x'.repeat(200);
+    renderDetailRuns('agent', [
+        { id: 'r-1', status: 'success', trigger: 'manual',
+          started_at: '2026-09-29T10:00:00Z', finished_at: '2026-09-29T10:01:05Z',
+          summary: 'found <b>3</b> & more', error: null },
+        { id: 'r-2', status: 'failed', trigger: 'scheduler',
+          started_at: '2026-09-29T09:00:00Z', finished_at: '2026-09-29T09:00:07Z',
+          summary: null, error: 'boom <script>' },
+        { id: 'r-3', status: 'running', trigger: 'manual',
+          started_at: new Date(Date.now() - 65000).toISOString(), finished_at: null,
+          summary: long, error: null },
+        { id: '"><img src=x onerror=1>', status: 'success', trigger: 'manual',
+          started_at: null, finished_at: null, summary: '', error: null },
+    ], 5);
+    let html = byId('agent-last-runs').innerHTML;
+    assert.ok(html.includes('href="#run=r-1"') && html.includes('href="#run=r-2"'),
+        'job run deep links');
+    assert.ok(html.includes('target="_blank"') && html.includes('rel="noopener"'),
+        'links open a new tab');
+    // Text is compared on the cell, elements via the DOM: jsdom serializes
+    // `<` inside an attribute (the title holds the full summary) unescaped,
+    // which is valid HTML, so a substring check on innerHTML would misfire.
+    const box = byId('agent-last-runs');
+    assert.ok(html.includes('>found &lt;b&gt;3&lt;/b&gt; &amp; more<'), 'summary escaped');
+    assert.strictEqual(box.querySelector('b'), null, 'summary not injected raw');
+    assert.ok(html.includes('>boom &lt;script&gt;<'), 'error text escaped');
+    assert.strictEqual(box.querySelector('script'), null, 'error text not injected raw');
+    assert.strictEqual(box.querySelector('img'), null, 'a hostile id cannot inject markup');
+    assert.ok(html.includes('status-badge status-success')
+        && html.includes('status-badge status-failed'), 'status badges reuse the Job Runs styling');
+    assert.ok(html.includes('1m 05s') && html.includes('7s'), 'durations formatted');
+    assert.ok(html.includes('1m 0') && html.includes('…'),
+        'a live run counts up and is marked open-ended');
+    const longCell = [...box.querySelectorAll('td.dr-summary')]
+        .find(c => c.getAttribute('title') === long);
+    assert.ok(longCell, 'full summary kept in the title');
+    assert.ok(longCell.textContent.length < long.length && longCell.textContent.endsWith('…'),
+        'long summary truncated in the cell');
+    assert.ok(html.includes('<th>Status</th><th>Trigger</th><th>Started</th><th>Duration</th><th>Summary</th>'),
+        'agent columns');
+    assert.ok(html.includes('detail-runs-refresh'), 'block has its own Refresh link');
+
+    // 2. Empty and error states.
+    renderDetailRuns('agent', [], 5);
+    assert.ok(byId('agent-last-runs').innerHTML.includes('No runs yet'), 'empty state');
+    renderDetailRuns('agent', null, 5);
+    assert.ok(byId('agent-last-runs').innerHTML.includes('Could not load the runs'), 'error state');
+
+    // 3. Workflow last runs: item counts and the workflow-run deep link.
+    renderDetailRuns('workflow', [
+        { id: 'w-1', status: 'running', trigger: 'scheduler', items_total: 3, items_succeeded: 1,
+          items_failed: 1, items_skipped: 0, started_at: '2026-09-29T10:00:00Z', finished_at: null,
+          summary: null, error: 'x <i>' },
+    ], 9);
+    html = byId('workflow-last-runs').innerHTML;
+    assert.ok(html.includes('href="#workflow-run=w-1"'), 'workflow run deep link');
+    assert.ok(html.includes('3 · 1 ok · 1 failed · 0 skipped'), 'item counts');
+    assert.ok(html.includes('>x &lt;i&gt;<'), 'workflow error escaped');
+    assert.strictEqual(byId('workflow-last-runs').querySelector('i'), null,
+        'workflow error not injected raw');
+    assert.ok(html.includes('<th>Status</th><th>Trigger</th><th>Items</th><th>Started</th><th>Finished</th><th>Summary</th>'),
+        'workflow columns');
+
+    // 4. Hidden for a new row, shown (and loaded) for a saved one.
+    setDetailRunsMode('agent', '');
+    assert.ok(byId('agent-run-now').hidden && byId('agent-refresh').hidden,
+        'buttons hidden for a new agent');
+    assert.ok(byId('agent-last-runs').hidden && byId('agent-last-runs').innerHTML === '',
+        'block hidden and empty');
+    assert.strictEqual(urls.length, 0, 'nothing fetched for a new agent');
+
+    byId('agent-id').value = '5';
+    setDetailRunsMode('agent', 5);
+    await tick();
+    assert.ok(!byId('agent-run-now').hidden && !byId('agent-refresh').hidden,
+        'buttons shown for a saved agent');
+    assert.ok(!byId('agent-last-runs').hidden, 'block shown for a saved agent');
+    assert.deepStrictEqual(urls, ['/admin/api/runs?agent_id=5&limit=10'],
+        'agent runs fetched with id and limit');
+    assert.ok(byId('agent-last-runs').innerHTML.includes('No runs yet'),
+        'rendered once the answer is in');
+
+    byId('workflow-id').value = '9';
+    setDetailRunsMode('workflow', 9);
+    await tick();
+    assert.ok(!byId('workflow-run-now').hidden && !byId('workflow-refresh').hidden,
+        'workflow buttons shown');
+    assert.strictEqual(urls[1], '/admin/api/workflow-runs?workflow_id=9&limit=10',
+        'workflow runs fetched');
+    setDetailRunsMode('workflow', '');
+    assert.ok(byId('workflow-run-now').hidden && byId('workflow-last-runs').hidden,
+        'workflow controls hidden again');
+
+    // 5. A late answer for a row no longer in the form is dropped.
+    byId('agent-last-runs').innerHTML = 'KEEP';
+    await loadDetailRuns('agent', 4);
+    assert.strictEqual(byId('agent-last-runs').innerHTML, 'KEEP', 'stale answer ignored');
+
+    console.log('detail runs scenarios passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=ROOT) as f:
+                f.write(detail_runs_harness)
+                detail_runs_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", detail_runs_harness_path], capture_output=True, text=True, timeout=30,
+                )
+                check(
+                    "renderDetailRuns()/setDetailRunsMode() escape, link and hide for a new row",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(detail_runs_harness_path)
+
+            # --- run detail auto-refresh --- the poller under jsdom with hand
+            # driven timers: starts for a live run, stops on a terminal
+            # payload, on an unticked box and on close; Refresh re-fetches;
+            # a failed poll toasts once and backs off.
+            autorefresh_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div class="toolbar" id="run-detail-toolbar" hidden>
+    <button id="run-detail-refresh"></button>
+    <input type="checkbox" id="run-detail-autorefresh" checked>
+    <span id="run-detail-autorefresh-status"></span>
+  </div>
+  <div id="run-detail"></div>
+  <div id="workflow-run-detail-toolbar" hidden>
+    <button id="workflow-run-detail-refresh"></button>
+    <input type="checkbox" id="workflow-run-detail-autorefresh" checked>
+    <span id="workflow-run-detail-autorefresh-status"></span>
+  </div>
+  <div id="workflow-run-detail"></div>
+</body></html>`);
+global.window = dom.window;
+global.document = dom.window.document;
+
+// Timers are driven by hand: every setTimeout the page code asks for lands
+// here, and fire() runs the oldest pending one.
+const timers = [];
+global.setTimeout = (fn, ms) => {
+    timers.push({ fn, ms, cancelled: false, fired: false });
+    return timers.length;
+};
+global.clearTimeout = id => { if (timers[id - 1]) timers[id - 1].cancelled = true; };
+
+""" + js_no_autoinvoke + r"""
+
+const toasts = [];
+toast = (msg) => { toasts.push(msg); };   // no toast timers in the queue
+let status = 'running', okResp = true, fetchCount = 0;
+global.fetch = async (url) => {
+    fetchCount += 1;
+    if (!okResp) return { ok: false, json: async () => ({ detail: 'boom' }) };
+    if (String(url).includes('/workflow-runs/')) {
+        return { ok: true, json: async () => ({
+            run: { id: 'w1', workflow_name: 'wf', status, trigger: 'manual',
+                   started_at: null, finished_at: null, summary: null, error: null },
+            items: [], steps: [],
+        }) };
+    }
+    return { ok: true, json: async () => ({
+        id: 'r1', agent_name: 'a', status, trigger: 'manual',
+        started_at: '2026-09-29T10:00:00Z', finished_at: null,
+        summary: 'sum <b>', error: null, report: null,
+    }) };
+};
+const live = () => timers.filter(t => !t.cancelled && !t.fired);
+async function fire() {
+    const t = live()[0];
+    assert.ok(t, 'a timer is pending');
+    t.fired = true;
+    await t.fn();
+}
+const byId = id => document.getElementById(id);
+
+async function main() {
+    // Pure helpers.
+    for (const s of ['running', 'pending', 'Queued']) assert.ok(isLiveRunStatus(s), s + ' is live');
+    for (const s of ['success', 'failed', 'interrupted', '', null, undefined]) {
+        assert.ok(!isLiveRunStatus(s), s + ' is terminal');
+    }
+    assert.strictEqual(nextRefreshDelay(0), 3000);
+    assert.strictEqual(nextRefreshDelay(1), 10000);
+    assert.strictEqual(nextRefreshDelay(4), 10000);
+
+    // 1. A running run: rendered, toolbar shown, one 3 s timer queued.
+    await openRunDetail('run', 'r1');
+    const statusEl = byId('run-detail-autorefresh-status');
+    assert.strictEqual(fetchCount, 1);
+    assert.ok(!byId('run-detail-toolbar').hidden, 'toolbar shown');
+    assert.ok(byId('run-detail').innerHTML.includes('sum &lt;b&gt;'), 'run rendered, escaped');
+    assert.strictEqual(live().length, 1, 'exactly one poll scheduled');
+    assert.strictEqual(live()[0].ms, 3000);
+    assert.ok(statusEl.textContent.includes('Auto-refreshing every 3 s'), statusEl.textContent);
+    assert.ok(statusEl.textContent.includes('Last refreshed'), statusEl.textContent);
+
+    // 2. Still running: the chain continues with a single timer.
+    await fire();
+    assert.strictEqual(fetchCount, 2);
+    assert.strictEqual(live().length, 1, 'never more than one pending poll');
+
+    // 3. Finished payload: polling stops.
+    status = 'success';
+    await fire();
+    assert.strictEqual(fetchCount, 3);
+    assert.strictEqual(live().length, 0, 'no poll after a terminal status');
+    assert.strictEqual(_autoRefresh, null);
+    assert.ok(statusEl.textContent.includes('Finished, auto-refresh stopped'),
+        statusEl.textContent);
+
+    // 4. Unticking stops it; ticking again polls at once and resumes.
+    status = 'running';
+    await openRunDetail('run', 'r1');
+    assert.strictEqual(live().length, 1);
+    const box = byId('run-detail-autorefresh');
+    box.checked = false;
+    await toggleAutoRefresh('run');
+    assert.strictEqual(live().length, 0, 'unticked: timer cleared');
+    assert.ok(statusEl.textContent.includes('Auto-refresh off'), statusEl.textContent);
+    let before = fetchCount;
+    box.checked = true;
+    await toggleAutoRefresh('run');
+    assert.strictEqual(fetchCount, before + 1, 're-ticked: polled at once');
+    assert.strictEqual(live().length, 1, 're-ticked: chain resumed');
+    // Unticked while a run finishes: no timer, and nothing to resume later.
+    box.checked = false;
+    await toggleAutoRefresh('run');
+    assert.strictEqual(live().length, 0);
+    box.checked = true;
+
+    // 5. Closing the view clears the timer and resets the view.
+    await openRunDetail('run', 'r1');
+    assert.strictEqual(live().length, 1);
+    closeRunDetail('run');
+    assert.strictEqual(live().length, 0, 'closed: timer cleared');
+    assert.strictEqual(_autoRefresh, null);
+    assert.ok(byId('run-detail-toolbar').hidden, 'closed: toolbar hidden');
+    assert.ok(byId('run-detail').innerHTML.includes('Select a run'), 'closed: placeholder back');
+    assert.strictEqual(statusEl.textContent, '');
+    await refreshRunDetail('run');
+    assert.strictEqual(live().length, 0, 'Refresh with nothing open is a no-op');
+
+    // 6. The Refresh button re-fetches and restarts the countdown.
+    await openRunDetail('run', 'r1');
+    before = fetchCount;
+    const oldTimer = live()[0];
+    await refreshRunDetail('run');
+    assert.strictEqual(fetchCount, before + 1, 'Refresh re-fetched');
+    assert.ok(oldTimer.cancelled, 'Refresh replaced the pending poll');
+    assert.strictEqual(live().length, 1);
+
+    // 7. A failed poll: one toast, 10 s back-off, last good render kept.
+    okResp = false;
+    toasts.length = 0;
+    await fire();
+    assert.strictEqual(toasts.length, 1, 'one toast on the first failure');
+    assert.strictEqual(live()[0].ms, 10000, 'backed off to 10 s');
+    assert.ok(byId('run-detail').innerHTML.includes('sum &lt;b&gt;'), 'last good render kept');
+    assert.ok(statusEl.textContent.includes('retrying in 10 s'), statusEl.textContent);
+    await fire();
+    assert.strictEqual(toasts.length, 1, 'no toast on repeated failures');
+    okResp = true;
+    await fire();
+    assert.strictEqual(live()[0].ms, 3000, 'back to 3 s once a poll succeeds');
+
+    // 8. Opening another run supersedes the poll: one shared poller.
+    await openRunDetail('workflow-run', 'w1');
+    assert.strictEqual(live().length, 1, 'the job-run poll was replaced, not added to');
+    assert.strictEqual(_autoRefresh.kind, 'workflow-run');
+    assert.ok(!byId('workflow-run-detail-toolbar').hidden);
+    assert.ok(byId('workflow-run-detail').innerHTML.includes('status-running'),
+        'workflow run rendered');
+    status = 'failed';
+    await fire();
+    assert.strictEqual(live().length, 0);
+    assert.ok(byId('workflow-run-detail-autorefresh-status').textContent.includes('Finished'),
+        'workflow poll stopped');
+
+    // 9. A run that never loads (404) is not polled.
+    okResp = false;
+    await openRunDetail('run', 'missing');
+    assert.strictEqual(live().length, 0, 'no poll for a run that never loaded');
+    assert.ok(byId('run-detail').innerHTML.includes('Failed to load run'),
+        'first-load failure shown inline');
+    okResp = true;
+
+    // 10. Leaving the Job Runs tab pauses the job-run poll.
+    status = 'running';
+    await openRunDetail('run', 'r1');
+    assert.strictEqual(live().length, 1);
+    switchTab('config');
+    assert.strictEqual(live().length, 0, 'tab hidden: timer cleared');
+    assert.strictEqual(_autoRefresh, null);
+    assert.ok(statusEl.textContent.includes('paused'), statusEl.textContent);
+
+    console.log('run detail auto-refresh scenarios passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=ROOT) as f:
+                f.write(autorefresh_harness)
+                autorefresh_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", autorefresh_harness_path], capture_output=True, text=True, timeout=30,
+                )
+                check(
+                    "run detail poller starts, stops, backs off, refreshes and closes",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(autorefresh_harness_path)
+
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
     try:

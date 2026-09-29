@@ -100,6 +100,24 @@
         }
         .modal h3 { margin-top: 0; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+        /* A class that sets display (.toolbar, .modal-head) would otherwise beat the
+           UA's [hidden] rule and keep a hidden element visible. */
+        [hidden] { display: none !important; }
+        /* --- detail runs --- editor header actions and the "Last runs" block */
+        .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+        .modal-head h3 { margin: 0 0 12px 0; }
+        .modal-head-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+        .detail-runs { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 8px; }
+        .detail-runs-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+        .detail-runs-head strong { font-size: 13px; }
+        .detail-runs table td, .detail-runs table th { padding: 6px 8px; font-size: 12px; }
+        .detail-runs tr.dr-row { cursor: pointer; }
+        .detail-runs tr.dr-row:hover td { background: var(--bg); }
+        .detail-runs td.dr-summary { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* --- run detail auto-refresh --- toolbar above each run detail view */
+        .detail-toolbar { align-items: center; }
+        .detail-toolbar label { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-weight: normal; }
+        .detail-toolbar .hint { color: var(--muted); font-size: 12px; }
         #toast {
             position: fixed;
             bottom: 24px;
@@ -337,6 +355,16 @@
                 <tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr>
             </tbody>
         </table>
+        <!-- --- run detail auto-refresh --- shown once a run is opened -->
+        <div class="toolbar detail-toolbar" id="workflow-run-detail-toolbar" hidden>
+            <button type="button" class="secondary small" id="workflow-run-detail-refresh"
+                    onclick="refreshRunDetail('workflow-run')">Refresh</button>
+            <label><input type="checkbox" id="workflow-run-detail-autorefresh" checked
+                          onchange="toggleAutoRefresh('workflow-run')"> Auto-refresh while running</label>
+            <span class="hint" id="workflow-run-detail-autorefresh-status"></span>
+            <button type="button" class="secondary small" id="workflow-run-detail-close"
+                    style="margin-left:auto" onclick="closeRunDetail('workflow-run')">Close</button>
+        </div>
         <div id="workflow-run-detail"></div>
     </div>
 
@@ -385,6 +413,16 @@
     </div>
     <div class="panel">
         <h2>Run detail</h2>
+        <!-- --- run detail auto-refresh --- shown once a run is opened -->
+        <div class="toolbar detail-toolbar" id="run-detail-toolbar" hidden>
+            <button type="button" class="secondary small" id="run-detail-refresh"
+                    onclick="refreshRunDetail('run')">Refresh</button>
+            <label><input type="checkbox" id="run-detail-autorefresh" checked
+                          onchange="toggleAutoRefresh('run')"> Auto-refresh while running</label>
+            <span class="hint" id="run-detail-autorefresh-status"></span>
+            <button type="button" class="secondary small" id="run-detail-close"
+                    style="margin-left:auto" onclick="closeRunDetail('run')">Close</button>
+        </div>
         <div id="run-detail"><p class="hint">Select a run above to see its report.</p></div>
     </div>
     </div>
@@ -392,7 +430,16 @@
 
 <div id="agent-modal" class="modal-backdrop" onclick="if(event.target===this)closeAgentModal()">
     <div class="modal">
-        <h3 id="modal-title">New agent</h3>
+        <!-- --- detail runs --- Run now / Refresh exist only for a saved agent -->
+        <div class="modal-head">
+            <h3 id="modal-title">New agent</h3>
+            <div class="modal-head-actions">
+                <button type="button" class="secondary small" id="agent-refresh" hidden
+                        title="Reload this agent from the server" onclick="refreshAgentDetail()">Refresh</button>
+                <button type="button" class="small" id="agent-run-now" hidden
+                        title="Start a run of this agent now" onclick="runAgentFromDetail()">Run now</button>
+            </div>
+        </div>
         <input type="hidden" id="agent-id">
         <!-- where used: filled by loadAgentWhereUsed() when an existing agent is opened -->
         <div id="agent-where-used" style="font-size:.85em;margin:-6px 0 12px"></div>
@@ -492,6 +539,8 @@
                 </label>
             </fieldset>
         </div>
+        <!-- --- detail runs --- latest runs of this agent; hidden for a new agent -->
+        <div id="agent-last-runs" class="detail-runs" hidden></div>
         <div class="modal-actions">
             <button class="secondary" onclick="closeAgentModal()">Cancel</button>
             <button onclick="saveAgent()">Save</button>
@@ -526,7 +575,16 @@
 
 <div id="workflow-modal" class="modal-backdrop" onclick="if(event.target===this)closeWorkflowModal()">
     <div class="modal">
-        <h3 id="workflow-modal-title">New workflow</h3>
+        <!-- --- detail runs --- Run now / Refresh exist only for a saved workflow -->
+        <div class="modal-head">
+            <h3 id="workflow-modal-title">New workflow</h3>
+            <div class="modal-head-actions">
+                <button type="button" class="secondary small" id="workflow-refresh" hidden
+                        title="Reload this workflow from the server" onclick="refreshWorkflowDetail()">Refresh</button>
+                <button type="button" class="small" id="workflow-run-now" hidden
+                        title="Start a run of this workflow now" onclick="runWorkflowFromDetail()">Run now</button>
+            </div>
+        </div>
         <input type="hidden" id="workflow-id">
         <div class="form-grid">
             <label class="full">Name
@@ -573,6 +631,8 @@
             </label>
         </div>
 
+        <!-- --- detail runs --- latest runs of this workflow; hidden for a new workflow -->
+        <div id="workflow-last-runs" class="detail-runs" hidden></div>
         <div class="modal-actions">
             <button class="secondary" onclick="closeWorkflowModal()">Cancel</button>
             <button onclick="saveWorkflow()">Save</button>
@@ -1105,6 +1165,7 @@ function openWorkflowModal() {
     document.getElementById('workflow-enabled').checked = true;
     document.getElementById('workflow-branches').innerHTML = '';
     document.getElementById('workflow-steps').innerHTML = '';
+    setDetailRunsMode('workflow', '');
     document.getElementById('workflow-modal').classList.add('open');
 }
 
@@ -1114,7 +1175,7 @@ function closeWorkflowModal() {
 
 async function editWorkflow(id) {
     const res = await api(`/workflows/${id}`);
-    if (!res.ok) { toast('Failed to load workflow', 'error'); return; }
+    if (!res.ok) { toast('Failed to load workflow', 'error'); return false; }
     const w = await res.json();
     document.getElementById('workflow-modal-title').textContent = `Edit workflow: ${w.name}`;
     document.getElementById('workflow-id').value = w.id;
@@ -1134,11 +1195,13 @@ async function editWorkflow(id) {
     (w.branches || []).forEach(b => addWorkflowBranchRow(b));
     document.getElementById('workflow-steps').innerHTML = '';
     (w.steps || []).forEach(s => addWorkflowStepRow(s));
+    setDetailRunsMode('workflow', w.id);
 
     document.getElementById('workflow-modal').classList.add('open');
     // The rows were built while the modal was still hidden (no layout, so
     // no scrollHeight); size the instruction textareas now they are visible.
     autoGrowAll(document.getElementById('workflow-steps'));
+    return true;
 }
 
 async function saveWorkflow() {
@@ -1667,11 +1730,20 @@ function onWorkflowStepKindChange(select) {
 }
 // {% endraw %}
 
-async function runWorkflowNow(id) {
+// Shared by the list's Run button and the editor's (--- detail runs ---).
+async function startWorkflowRun(id) {
     const res = await api(`/workflows/${id}/run`, {method: 'POST'});
-    if (!res.ok) { toast((await res.json()).detail || 'Run failed to start', 'error'); return; }
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Run failed to start: ' + errText(err), 'error');
+        return false;
+    }
     toast('Run started');
-    loadWorkflowRuns();
+    return true;
+}
+
+async function runWorkflowNow(id) {
+    if (await startWorkflowRun(id)) loadWorkflowRuns();
 }
 
 async function loadWorkflowRuns() {
@@ -1692,23 +1764,34 @@ function renderWorkflowRuns() {
             + (r.items_failed ? `, ${r.items_failed} failed` : '')
             + (r.items_skipped ? `, ${r.items_skipped} skipped` : '');
         return `
-            <tr class="run-row" style="cursor:pointer" onclick="showWorkflowRun('${r.id}')">
+            <tr class="run-row" style="cursor:pointer" data-id="${escapeHtml(r.id)}">
                 <td>${escapeHtml(r.workflow_name)}</td>
                 <td><span class="status-badge status-${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></td>
                 <td>${escapeHtml(counts)}</td>
                 <td>${r.started_at ? escapeHtml(new Date(r.started_at).toLocaleString()) : ''}</td>
                 <td class="row-actions">
-                    <button class="small secondary" onclick="event.stopPropagation();showWorkflowRun('${r.id}')">View</button>
+                    <button class="small secondary">View</button>
                 </td>
             </tr>
         `;
     }).join('');
+    // The id is read back via .dataset (see loadAgents) and the View button
+    // simply bubbles to its row. openRunDetail() starts the auto-refresh
+    // (--- run detail auto-refresh ---) around showWorkflowRun().
+    tbody.querySelectorAll('.run-row').forEach(row =>
+        row.addEventListener('click', () => openRunDetail('workflow-run', row.dataset.id)));
 }
 
+// Returns the run's status (the auto-refresh poller decides on it), or null
+// when the fetch failed.
 async function showWorkflowRun(runId) {
     const res = await api(`/workflow-runs/${runId}`);
     const el = document.getElementById('workflow-run-detail');
-    if (!res.ok) { el.innerHTML = '<p class="hint">Failed to load run.</p>'; return; }
+    if (!res.ok) {
+        // A failed poll keeps the last good render; only a first load reports inline.
+        if (!detailShows(el, runId)) el.innerHTML = '<p class="hint">Failed to load run.</p>';
+        return null;
+    }
     const data = await res.json();
     const run = data.run;
     const items = data.items || [];
@@ -1746,6 +1829,7 @@ async function showWorkflowRun(runId) {
     `;
     }).join('');
 
+    const scrollMark = markScroll();
     el.innerHTML = `
         <h3>${escapeHtml(run.workflow_name)} — <span class="status-badge status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></h3>
         <p class="hint">Trigger: ${escapeHtml(run.trigger)} · Started: ${run.started_at ? escapeHtml(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + escapeHtml(new Date(run.finished_at).toLocaleString()) : ''}</p>
@@ -1758,6 +1842,9 @@ async function showWorkflowRun(runId) {
         <table><thead><tr><th>Item</th><th>Branch</th><th>#</th><th>Agent</th><th>Status</th><th>Output</th></tr></thead>
             <tbody>${stepRows || '<tr><td colspan="6" style="color:var(--muted)">No steps recorded.</td></tr>'}</tbody></table>
     `;
+    markDetailShown(el, runId);
+    restoreScroll(scrollMark);
+    return run.status ?? '';
 }
 
 async function loadOrchestrator() {
@@ -1777,6 +1864,7 @@ async function openAgentModal() {
     renderAgentSkillChecks([]);
     renderAgentPeerChecks([], '');
     renderAgentWhereUsed(null);
+    setDetailRunsMode('agent', '');
     await renderAgentModelOptions('');
     setDeepForm(null);
     document.getElementById('agent-enabled').checked = true;
@@ -1894,7 +1982,7 @@ function closeAgentModal() {
 
 async function editAgent(id) {
     const res = await api(`/agents/${id}`);
-    if (!res.ok) { toast('Failed to load agent', 'error'); return; }
+    if (!res.ok) { toast('Failed to load agent', 'error'); return false; }
     const a = await res.json();
     document.getElementById('modal-title').textContent = `Edit agent: ${a.name}`;
     document.getElementById('agent-id').value = a.id;
@@ -1919,7 +2007,9 @@ async function editAgent(id) {
     document.getElementById('agent-run-prompt').value = a.run_prompt || '';
     document.getElementById('agent-run-timeout').value = a.run_timeout_seconds || 1800;
     updateEndpointHint();
+    setDetailRunsMode('agent', a.id);
     document.getElementById('agent-modal').classList.add('open');
+    return true;
 }
 
 async function saveAgent() {
@@ -2076,6 +2166,14 @@ function switchTab(name) {
     document.querySelectorAll('.tab-panel').forEach(p =>
         p.classList.toggle('active', p.id === 'tab-' + name));
     if (name === 'runs') loadRuns();
+    // --- run detail auto-refresh --- a hidden tab is not polled; coming back
+    // re-fetches the run once and picks the chain up if it is still live.
+    if (name !== 'runs' && _autoRefresh && _autoRefresh.kind === 'run') {
+        stopAutoRefresh();
+        setAutoRefreshStatus('run', 'Auto-refresh paused while the tab is hidden');
+    } else if (name === 'runs' && _runDetailShown.run && !_autoRefresh && autoRefreshWanted('run')) {
+        openRunDetail('run', _runDetailShown.run);
+    }
 }
 
 async function loadRuns() {
@@ -2094,7 +2192,7 @@ async function loadRuns() {
             <td>${esc(r.summary || r.error || '')}</td>
           </tr>`).join('') + '</tbody></table>';
     el.querySelectorAll('.run-row').forEach(row =>
-        row.addEventListener('click', () => showRun(row.dataset.id)));
+        row.addEventListener('click', () => openRunDetail('run', row.dataset.id)));
 }
 
 let _mermaidLoading = null;
@@ -2188,11 +2286,18 @@ async function renderReportBody(container, report, runId) {
     }
 }
 
+// Returns the run's status (the auto-refresh poller decides on it), or null
+// when the fetch failed.
 async function showRun(id) {
     const res = await fetch(`/admin/api/runs/${id}`);
     const el = document.getElementById('run-detail');
-    if (!res.ok) { el.innerHTML = '<p class="error">Failed to load run.</p>'; return; }
+    if (!res.ok) {
+        // A failed poll keeps the last good render; only a first load reports inline.
+        if (!detailShows(el, id)) el.innerHTML = '<p class="error">Failed to load run.</p>';
+        return null;
+    }
     const run = await res.json();
+    const scrollMark = markScroll();
     el.innerHTML = `<h3>${esc(run.agent_name)} — <span class="status-badge status-${esc(run.status)}">${esc(run.status)}</span></h3>`
         + `<p class="hint">Trigger: ${esc(run.trigger)} · Started: ${run.started_at ? esc(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + esc(new Date(run.finished_at).toLocaleString()) : ''}</p>`
         + (run.summary ? `<p>${esc(run.summary)}</p>` : '')
@@ -2205,17 +2310,25 @@ async function showRun(id) {
         err.textContent = 'Failed to render report body.';
         el.appendChild(err);
     }
+    markDetailShown(el, id);
+    restoreScroll(scrollMark);
+    return run.status ?? '';
 }
 
-async function runAgentNow(agentId) {
+// Shared by the list's Run button and the editor's (--- detail runs ---).
+async function startAgentRun(agentId) {
     const res = await fetch(`/admin/api/agents/${agentId}/run`, {method: 'POST'});
     if (!res.ok) {
         const err = await res.json().catch(() => ({detail: res.statusText}));
         toast('Run failed: ' + errText(err), 'error');
-        return;
+        return false;
     }
     toast('Run started.', 'success');
-    switchTab('runs');
+    return true;
+}
+
+async function runAgentNow(agentId) {
+    if (await startAgentRun(agentId)) switchTab('runs');
 }
 
 // --- where used ---
@@ -2294,7 +2407,12 @@ function attachStepAgentLink(row) {
 }
 
 function openFromHash() {
-    const match = /^#(agent|workflow)=(\d+)$/.exec(window.location.hash || '');
+    const hash = window.location.hash || '';
+    // --- detail runs --- `#run=<id>` / `#workflow-run=<id>` from an editor's
+    // last-runs table open the matching run detail view.
+    const run = /^#(run|workflow-run)=([\w-]+)$/.exec(hash);
+    if (run) return openRunFromHash(run[1], run[2]);
+    const match = /^#(agent|workflow)=(\d+)$/.exec(hash);
     if (!match) return Promise.resolve();
     // editAgent/editWorkflow read allAgents/allSkills/allWorkflows for their
     // checkbox and dropdown lists; opened before those are in, the form would
@@ -2453,6 +2571,401 @@ function collectDestinationConfig(row) {
         oauth.allow_comment = true;
     }
     return oauth;
+}
+
+// --- detail runs ---
+// The agent and workflow editors are the closest thing this admin has to a
+// detail page, so each gets Run now / Refresh in its header and a "Last runs"
+// table at the bottom. Both run detail views live elsewhere on the page (the
+// Job Runs tab, the workflow-runs panel) and the editors are modals, so a row
+// opens its run as a deep link (`#run=<id>`, `#workflow-run=<id>`) in a new
+// tab -- the rule the where-used links follow -- and openFromHash() turns
+// that hash into the detail view. Everything rendered here is server text
+// (summaries are model output) and goes through escapeHtml.
+const td = html => `<td>${html}</td>`;
+
+const DETAIL_RUNS = {
+    agent: {
+        idField: 'agent-id', runBtn: 'agent-run-now', refreshBtn: 'agent-refresh',
+        box: 'agent-last-runs', hash: 'run', noun: 'agent',
+        list: id => api(`/runs?agent_id=${Number(id)}&limit=10`),
+        start: id => startAgentRun(id),
+        columns: ['Status', 'Trigger', 'Started', 'Duration', 'Summary'],
+        cells: r => [
+            td(statusBadge(r.status)), td(escapeHtml(r.trigger || '')), td(fmtWhen(r.started_at)),
+            td(escapeHtml(fmtDuration(r.started_at, r.finished_at, r.status))),
+            summaryCell(r.summary || r.error || ''),
+        ],
+    },
+    workflow: {
+        idField: 'workflow-id', runBtn: 'workflow-run-now', refreshBtn: 'workflow-refresh',
+        box: 'workflow-last-runs', hash: 'workflow-run', noun: 'workflow',
+        list: id => api(`/workflow-runs?workflow_id=${Number(id)}&limit=10`),
+        start: id => startWorkflowRun(id),
+        columns: ['Status', 'Trigger', 'Items', 'Started', 'Finished', 'Summary'],
+        cells: r => [
+            td(statusBadge(r.status)), td(escapeHtml(r.trigger || '')),
+            `<td title="total · succeeded · failed · skipped">${escapeHtml(itemCounts(r))}</td>`,
+            td(fmtWhen(r.started_at)), td(fmtWhen(r.finished_at)),
+            summaryCell(r.summary || r.error || ''),
+        ],
+    },
+};
+
+// The form as loaded, per editor (JSON); Refresh compares against it.
+const _detailSnapshot = {agent: null, workflow: null};
+
+function statusBadge(status) {
+    const s = escapeHtml(status || '');
+    return `<span class="status-badge status-${s}">${s}</span>`;
+}
+
+function fmtWhen(iso) {
+    return iso ? escapeHtml(new Date(iso).toLocaleString()) : '<span style="color:var(--muted)">—</span>';
+}
+
+// "12s", "3m 05s", "1h 02m"; a live run counts up to now and ends in an ellipsis.
+function fmtDuration(startedAt, finishedAt, status) {
+    if (!startedAt) return '—';
+    const end = finishedAt ? new Date(finishedAt) : (isLiveRunStatus(status) ? new Date() : null);
+    if (!end) return '—';
+    const secs = Math.max(0, Math.round((end - new Date(startedAt)) / 1000));
+    if (!Number.isFinite(secs)) return '—';
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), sec = secs % 60;
+    const pad = n => String(n).padStart(2, '0');
+    const text = h ? `${h}h ${pad(m)}m` : m ? `${m}m ${pad(sec)}s` : `${sec}s`;
+    return finishedAt ? text : text + '…';
+}
+
+function itemCounts(r) {
+    const n = v => Number(v) || 0;
+    return `${n(r.items_total)} · ${n(r.items_succeeded)} ok · ${n(r.items_failed)} failed · ${n(r.items_skipped)} skipped`;
+}
+
+function summaryCell(text) {
+    const full = String(text || '');
+    const short = full.length > 80 ? full.slice(0, 77) + '…' : full;
+    return `<td class="dr-summary" title="${escapeHtml(full)}">${escapeHtml(short)}</td>`;
+}
+
+// runs: an array (possibly empty), or null when the request failed.
+function renderDetailRuns(kind, runs, id) {
+    const cfg = DETAIL_RUNS[kind];
+    const box = document.getElementById(cfg.box);
+    if (!box) return;
+    const head = '<div class="detail-runs-head"><strong>Last runs</strong>'
+        + '<a href="#" class="link detail-runs-refresh">Refresh</a></div>';
+    let body;
+    if (runs === null) {
+        body = '<p class="hint">Could not load the runs.</p>';
+    } else if (!runs.length) {
+        body = '<p class="hint">No runs yet.</p>';
+    } else {
+        body = `<table><thead><tr>${cfg.columns.map(c => `<th>${c}</th>`).join('')}<th></th></tr></thead><tbody>`
+            + runs.map(r => {
+                const href = `#${cfg.hash}=${encodeURIComponent(String(r.id))}`;
+                return `<tr class="dr-row" data-href="${escapeHtml(href)}" title="Open this run in a new tab">`
+                    + cfg.cells(r).join('')
+                    + `<td class="row-actions"><a class="link dr-open" href="${escapeHtml(href)}" target="_blank" rel="noopener">open</a></td></tr>`;
+            }).join('')
+            + '</tbody></table>';
+    }
+    box.innerHTML = head + body;
+    box.querySelector('.detail-runs-refresh').addEventListener('click', e => {
+        e.preventDefault();
+        loadDetailRuns(kind, id);
+    });
+    // The href is read back via .dataset, never interpolated into JS source.
+    box.querySelectorAll('tr.dr-row').forEach(row => row.addEventListener('click', e => {
+        if (e.target && e.target.closest && e.target.closest('a')) return;  // the link opens itself
+        window.open(row.dataset.href, '_blank', 'noopener');
+    }));
+}
+
+async function loadDetailRuns(kind, id) {
+    const cfg = DETAIL_RUNS[kind];
+    const box = document.getElementById(cfg.box);
+    if (!box || !id) return;
+    let runs = null;
+    try {
+        const res = await cfg.list(id);
+        if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) runs = data;
+        }
+    } catch (e) { /* rendered as "could not load" */ }
+    // Another row was opened while this request ran: its answer is not about
+    // the one now in the form.
+    if (String(document.getElementById(cfg.idField).value) !== String(id)) return;
+    renderDetailRuns(kind, runs, id);
+}
+
+// Called by openAgentModal/editAgent and openWorkflowModal/editWorkflow once
+// the form is filled. The header buttons and the last-runs block exist only
+// for a saved row (id truthy); the form snapshot is what Refresh compares
+// against. Every element is optional so a partial DOM (tests) still works.
+function setDetailRunsMode(kind, id) {
+    const cfg = DETAIL_RUNS[kind];
+    const existing = !!id;
+    [cfg.runBtn, cfg.refreshBtn].forEach(bid => {
+        const btn = document.getElementById(bid);
+        if (btn) { btn.hidden = !existing; btn.disabled = false; }
+    });
+    const box = document.getElementById(cfg.box);
+    if (box) {
+        box.hidden = !existing;
+        box.innerHTML = existing ? '<p class="hint">Loading runs…</p>' : '';
+    }
+    _detailSnapshot[kind] = existing ? detailFormSnapshot(kind) : null;
+    if (existing) loadDetailRuns(kind, id);
+}
+
+// The same fields saveAgent()/saveWorkflow() send, read the same way; kept
+// separate because those bodies are contract-checked by the test suite.
+function detailFormSnapshot(kind) {
+    try {
+        const v = id => document.getElementById(id).value;
+        const c = id => document.getElementById(id).checked;
+        if (kind === 'agent') {
+            return JSON.stringify({
+                name: v('agent-name'), description: v('agent-description'),
+                instructions: v('agent-instructions'), mcp_servers: collectMcpServers(),
+                skills: collectAgentSkills(), peers: collectAgentPeers(),
+                model_name: v('agent-model-name'), deep: collectDeep(),
+                enabled: c('agent-enabled'), expose_chat: c('agent-expose-chat'),
+                expose_api: c('agent-expose-api'), api_slug: v('agent-api-slug'),
+                run_as_principal: v('agent-run-as'), run_prompt: v('agent-run-prompt'),
+                run_timeout_seconds: v('agent-run-timeout'),
+            });
+        }
+        return JSON.stringify({
+            name: v('workflow-name'), description: v('workflow-description'),
+            api_slug: v('workflow-api-slug'), run_as_principal: v('workflow-run-as'),
+            run_timeout_seconds: v('workflow-timeout'), max_parallel_items: v('workflow-max-parallel'),
+            on_unknown_branch: v('workflow-on-unknown-branch'), skip_seen_items: c('workflow-skip-seen'),
+            enabled: c('workflow-enabled'), branches: collectWorkflowBranches(), steps: collectWorkflowSteps(),
+        });
+    } catch (e) {
+        return null;  // an unreadable form is treated as clean, never as a blocker
+    }
+}
+
+function detailFormDirty(kind) {
+    const before = _detailSnapshot[kind];
+    if (before === null) return false;
+    const now = detailFormSnapshot(kind);
+    return now !== null && now !== before;
+}
+
+// Refresh: re-fetch the row and refill the form (editAgent/editWorkflow also
+// reload where-used, the credential status and the last runs), unless the
+// form has unsaved edits and the operator wants to keep them.
+async function refreshDetail(kind) {
+    const cfg = DETAIL_RUNS[kind];
+    const id = document.getElementById(cfg.idField).value;
+    if (!id) return;
+    if (detailFormDirty(kind)
+        && !confirm(`This ${cfg.noun} has unsaved changes. Discard them and reload it from the server?`)) return;
+    const ok = kind === 'agent' ? await editAgent(Number(id)) : await editWorkflow(Number(id));
+    if (ok) toast(`${cfg.noun === 'agent' ? 'Agent' : 'Workflow'} reloaded.`);
+}
+function refreshAgentDetail() { return refreshDetail('agent'); }
+function refreshWorkflowDetail() { return refreshDetail('workflow'); }
+
+// Run now from the editor: same request and toasts as the list's button; the
+// button is disabled while the request is out, and the last-runs block is
+// re-read about 1 s later (the row is there) and again about 5 s later (a
+// quick run has finished by then).
+const DETAIL_RUN_REFRESH_DELAYS = [1000, 5000];
+
+async function runFromDetail(kind) {
+    const cfg = DETAIL_RUNS[kind];
+    const id = document.getElementById(cfg.idField).value;
+    const btn = document.getElementById(cfg.runBtn);
+    if (!id || !btn || btn.disabled) return;
+    btn.disabled = true;
+    try {
+        if (!await cfg.start(Number(id))) return;
+        if (kind === 'workflow') loadWorkflowRuns();
+        DETAIL_RUN_REFRESH_DELAYS.forEach(ms => setTimeout(() => {
+            if (String(document.getElementById(cfg.idField).value) === String(id)) loadDetailRuns(kind, id);
+        }, ms));
+    } finally {
+        btn.disabled = false;
+    }
+}
+function runAgentFromDetail() { return runFromDetail('agent'); }
+function runWorkflowFromDetail() { return runFromDetail('workflow'); }
+
+async function openRunFromHash(kind, id) {
+    if (kind === 'run') switchTab('runs'); else await loadWorkflowRuns();
+    await openRunDetail(kind, id);
+    const el = document.getElementById(RUN_DETAIL_VIEWS[kind].el);
+    if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({block: 'start'});
+}
+
+// --- run detail auto-refresh ---
+// One poller for both run detail views (the Job Runs tab's #run-detail and
+// the workflow-runs panel's #workflow-run-detail). While the run is live it
+// re-fetches every 3 s on a setTimeout chain, so two requests are never in
+// flight; it stops on a terminal status, on an unticked box, when the view is
+// closed or another run is opened (stopAutoRefresh), and backs off to 10 s
+// after a failed poll (one toast). The pure helpers come first so the jsdom
+// harness can pin them.
+const LIVE_RUN_STATUSES = ['pending', 'queued', 'running'];
+const AUTO_REFRESH_MS = 3000;
+const AUTO_REFRESH_BACKOFF_MS = 10000;
+
+function isLiveRunStatus(status) {
+    return LIVE_RUN_STATUSES.includes(String(status || '').toLowerCase());
+}
+
+function nextRefreshDelay(failures) {
+    return failures > 0 ? AUTO_REFRESH_BACKOFF_MS : AUTO_REFRESH_MS;
+}
+
+const RUN_DETAIL_VIEWS = {
+    'run': {
+        el: 'run-detail', toolbar: 'run-detail-toolbar', checkbox: 'run-detail-autorefresh',
+        status: 'run-detail-autorefresh-status',
+        empty: '<p class="hint">Select a run above to see its report.</p>',
+        load: id => showRun(id),
+    },
+    'workflow-run': {
+        el: 'workflow-run-detail', toolbar: 'workflow-run-detail-toolbar',
+        checkbox: 'workflow-run-detail-autorefresh',
+        status: 'workflow-run-detail-autorefresh-status', empty: '',
+        load: id => showWorkflowRun(id),
+    },
+};
+const _runDetailShown = {'run': null, 'workflow-run': null};  // run id each view shows
+let _autoRefresh = null;  // the one active poll: {kind, id, timer, failures, inFlight, loaded}
+
+function stopAutoRefresh() {
+    if (!_autoRefresh) return;
+    if (_autoRefresh.timer) clearTimeout(_autoRefresh.timer);
+    _autoRefresh = null;
+}
+
+function setAutoRefreshStatus(kind, text) {
+    const el = document.getElementById(RUN_DETAIL_VIEWS[kind].status);
+    if (el) el.textContent = text;
+}
+
+function autoRefreshWanted(kind) {
+    const box = document.getElementById(RUN_DETAIL_VIEWS[kind].checkbox);
+    return !box || box.checked;
+}
+
+// Scroll bookkeeping around a re-render: the detail is replaced wholesale, so
+// the page offset is put back if the swap moved it. Guarded because the
+// renderers also run under test stubs without a window.
+function markScroll() {
+    return (typeof window !== 'undefined' && typeof window.scrollY === 'number')
+        ? {x: window.scrollX, y: window.scrollY} : null;
+}
+function restoreScroll(mark) {
+    if (mark && (window.scrollY !== mark.y || window.scrollX !== mark.x)) window.scrollTo(mark.x, mark.y);
+}
+function detailShows(el, id) {
+    return !!(el && el.dataset && el.dataset.runId === String(id));
+}
+function markDetailShown(el, id) {
+    if (el && el.dataset) el.dataset.runId = String(id);
+}
+
+// Open a run in its view and start (or restart) the poll for it.
+async function openRunDetail(kind, id) {
+    stopAutoRefresh();
+    const view = RUN_DETAIL_VIEWS[kind];
+    _runDetailShown[kind] = String(id);
+    const bar = document.getElementById(view.toolbar);
+    if (bar) bar.hidden = false;
+    const state = {kind, id: String(id), timer: null, failures: 0, inFlight: false, loaded: false};
+    _autoRefresh = state;
+    return pollRunDetail(state);
+}
+
+async function pollRunDetail(state) {
+    if (state !== _autoRefresh || state.inFlight) return;
+    state.timer = null;
+    state.inFlight = true;
+    let status = null;
+    try { status = await RUN_DETAIL_VIEWS[state.kind].load(state.id); } catch (e) { status = null; }
+    state.inFlight = false;
+    if (state !== _autoRefresh) return;  // closed or superseded while the request ran
+    const kind = state.kind;
+    const stamp = 'Last refreshed ' + new Date().toLocaleTimeString();
+    if (status === null) {
+        if (!state.loaded) {
+            // Never loaded (404, network): the view says so; nothing to poll.
+            setAutoRefreshStatus(kind, 'Could not load the run');
+            _autoRefresh = null;
+            return;
+        }
+        state.failures += 1;
+        if (state.failures === 1) toast('Could not refresh the run; retrying more slowly.', 'error');
+    } else {
+        state.loaded = true;
+        state.failures = 0;
+        if (!isLiveRunStatus(status)) {
+            setAutoRefreshStatus(kind, 'Finished, auto-refresh stopped · ' + stamp);
+            _autoRefresh = null;
+            return;
+        }
+    }
+    if (!autoRefreshWanted(kind)) {
+        setAutoRefreshStatus(kind, 'Auto-refresh off · ' + stamp);
+        return;  // the state stays current, so re-ticking the box resumes it
+    }
+    const delay = nextRefreshDelay(state.failures);
+    setAutoRefreshStatus(kind, (state.failures
+        ? `Refresh failed, retrying in ${delay / 1000} s`
+        : `Auto-refreshing every ${delay / 1000} s`) + ' · ' + stamp);
+    state.timer = setTimeout(() => pollRunDetail(state), delay);
+}
+
+// The Refresh button: fetch now and restart the countdown. A poll already in
+// flight is left to finish rather than doubled.
+function refreshRunDetail(kind) {
+    const id = _runDetailShown[kind];
+    if (!id) return Promise.resolve();
+    if (_autoRefresh && _autoRefresh.kind === kind && _autoRefresh.id === id && _autoRefresh.inFlight) {
+        return Promise.resolve();
+    }
+    return openRunDetail(kind, id);
+}
+
+function toggleAutoRefresh(kind) {
+    const id = _runDetailShown[kind];
+    if (!id) return Promise.resolve();
+    if (!autoRefreshWanted(kind)) {
+        if (_autoRefresh && _autoRefresh.kind === kind && _autoRefresh.timer) {
+            clearTimeout(_autoRefresh.timer);
+            _autoRefresh.timer = null;
+        }
+        setAutoRefreshStatus(kind, 'Auto-refresh off');
+        return Promise.resolve();
+    }
+    // Ticked again: poll right away; a poll in flight continues the chain itself.
+    if (_autoRefresh && _autoRefresh.kind === kind && _autoRefresh.id === id) {
+        return (!_autoRefresh.inFlight && !_autoRefresh.timer) ? pollRunDetail(_autoRefresh) : Promise.resolve();
+    }
+    return openRunDetail(kind, id);
+}
+
+function closeRunDetail(kind) {
+    if (_autoRefresh && _autoRefresh.kind === kind) stopAutoRefresh();
+    _runDetailShown[kind] = null;
+    const view = RUN_DETAIL_VIEWS[kind];
+    const bar = document.getElementById(view.toolbar);
+    if (bar) bar.hidden = true;
+    const el = document.getElementById(view.el);
+    if (el) {
+        el.innerHTML = view.empty;
+        if (el.dataset) delete el.dataset.runId;
+    }
+    setAutoRefreshStatus(kind, '');
 }
 
 loadSkills();
