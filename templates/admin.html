@@ -165,6 +165,60 @@
             margin: 0; font-size: 12px;
         }
         .wf-step-output.error { color: var(--danger); }
+        /* --- workflow step cards --- one card per step: a header line with the
+           selectors and a full-width body for the instructions / kind config,
+           so long instructions are readable instead of squeezed into a row. */
+        .wf-step {
+            border: 1px solid var(--border); border-radius: 6px;
+            background: #fafbfc; padding: 10px 12px; margin-bottom: 10px;
+        }
+        .wf-step-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+        .wf-step-head label { margin: 0; font-weight: normal; white-space: nowrap; }
+        .wf-step-num {
+            flex: 0 0 auto; min-width: 2.2em; font-weight: 600; font-size: 12px;
+            color: var(--muted); text-transform: uppercase;
+        }
+        .wf-step-tools { flex: 0 0 auto; margin-left: auto; display: flex; gap: 4px; }
+        .wf-step-tools button { padding: 4px 8px; }
+        .wf-step-body { margin-top: 8px; }
+        .wf-step-kind-hint { display: block; color: var(--muted); font-size: 12px; margin: 0 0 6px 0; }
+        .wf-step-config { margin: 0; }
+        .wf-cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; align-items: end; }
+        .wf-cfg-grid > label, .wf-cfg-grid > .wf-field { margin: 0; min-width: 0; }
+        .wf-cfg-grid > label { font-weight: 500; font-size: 12px; color: var(--muted); }
+        .wf-cfg-grid > label > input, .wf-cfg-grid > label > select { margin-top: 3px; }
+        .wf-cfg-grid > .full { grid-column: 1 / -1; }
+        .wf-cfg-grid input[type="number"] {
+            width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+            border-radius: 4px; font-family: inherit; font-size: 13px;
+        }
+        .wf-field { display: block; min-width: 0; }
+        .wf-field-head {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 12px; font-weight: 500; color: var(--muted); margin: 0 0 3px 0;
+        }
+        .wf-field-head .wf-text-counter { margin-left: auto; font-weight: normal; }
+        .wf-field-head .wf-expand-btn { padding: 2px 8px; font-size: 12px; }
+        .wf-field textarea {
+            width: 100%; display: block; min-height: 4rem; resize: vertical;
+            font-size: 13px; line-height: 1.5;
+        }
+        .wf-field textarea.wf-step-instructions {
+            min-height: 10rem; font-family: inherit; font-size: 14px; line-height: 1.5;
+        }
+        .wf-field textarea.wf-py-code { min-height: 14rem; font-family: Menlo, Consolas, monospace; }
+        .wf-cond-rules .wf-cond-rule input, .wf-cond-rules .wf-cond-rule select,
+        .wf-cond-else input, .wf-cond-else select { width: auto; padding: 5px 8px; }
+        .wf-cond-else { display: flex; gap: 4px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+        /* --- text editor modal --- a large editor over the workflow modal */
+        #text-editor-modal { z-index: 20; padding-top: 3vh; }
+        #text-editor-modal .modal { width: 960px; max-width: 96vw; max-height: 94vh; }
+        #text-editor-textarea {
+            width: 100%; height: calc(94vh - 170px); min-height: 240px; max-height: 80vh;
+            font-size: 14px; line-height: 1.5; resize: vertical;
+        }
+        #text-editor-modal .modal-actions { align-items: center; }
+        #text-editor-modal .wf-text-counter { margin-right: auto; color: var(--muted); font-size: 12px; }
         #runs-list table td, #runs-list table th { cursor: default; }
         #runs-list .run-row { cursor: pointer; }
         #runs-list .run-row:hover { background: #f8f9fb; }
@@ -519,6 +573,22 @@
         <div class="modal-actions">
             <button class="secondary" onclick="closeWorkflowModal()">Cancel</button>
             <button onclick="saveWorkflow()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Large text editor: opened by the ⤢ Expand button next to a workflow
+     step's instructions / template / body / code textarea. Done writes the
+     text back to that textarea; Cancel (or Esc) leaves it as it was. -->
+<div id="text-editor-modal" class="modal-backdrop" onclick="if(event.target===this)closeTextEditor(false)">
+    <div class="modal" role="dialog" aria-labelledby="text-editor-title">
+        <h3 id="text-editor-title">Edit text</h3>
+        <textarea id="text-editor-textarea" spellcheck="false"></textarea>
+        <div class="modal-actions">
+            <span id="text-editor-counter" class="wf-text-counter"></span>
+            <span style="color:var(--muted);font-size:12px">Esc cancels · Ctrl/⌘+Enter applies</span>
+            <button type="button" class="secondary" id="text-editor-cancel" onclick="closeTextEditor(false)">Cancel</button>
+            <button type="button" id="text-editor-done" onclick="closeTextEditor(true)">Done</button>
         </div>
     </div>
 </div>
@@ -1063,6 +1133,9 @@ async function editWorkflow(id) {
     (w.steps || []).forEach(s => addWorkflowStepRow(s));
 
     document.getElementById('workflow-modal').classList.add('open');
+    // The rows were built while the modal was still hidden (no layout, so
+    // no scrollHeight); size the instruction textareas now they are visible.
+    autoGrowAll(document.getElementById('workflow-steps'));
 }
 
 async function saveWorkflow() {
@@ -1137,16 +1210,17 @@ function addWorkflowStepRow(step) {
         step.agent_name && !allAgents.some(a => a.name === step.agent_name)
             ? step.agent_name : null;
     // --- step kinds ---
-    // A row is a flex line (branch, kind, agent, instructions, ...) plus a
-    // config block under it that only a non-agent kind shows.
+    // A step is a card: a header line (number, branch, kind, agent, fan-out,
+    // timeout, move/remove) and a full-width body that holds the agent
+    // instructions, or the kind's config editor for a non-agent kind.
     const kind = STEP_KINDS.includes(step.kind) ? step.kind : 'agent';
     const isAgent = kind === 'agent';
     const row = document.createElement('div');
-    row.className = 'wf-step-row';
-    row.style.cssText = 'margin-bottom:6px';
+    row.className = 'wf-step-row wf-step';
     row.innerHTML = `
-        <div style="display:flex;gap:6px;align-items:flex-start">
-        <select class="wf-step-branch" style="flex:0 0 130px">
+        <div class="wf-step-head">
+        <span class="wf-step-num" title="Order in this editor; the position within a branch is assigned on save"></span>
+        <select class="wf-step-branch" style="flex:0 0 130px" title="Main line or branch">
             <option value="">Main line</option>
             ${branchKeys.map(k =>
                 `<option value="${escapeHtml(k)}" ${k === step.branch_key ? 'selected' : ''}>${escapeHtml(k)}</option>`
@@ -1158,7 +1232,7 @@ function addWorkflowStepRow(step) {
                 `<option value="${k}" ${k === kind ? 'selected' : ''}>${k}</option>`
             ).join('')}
         </select>
-        <select class="wf-step-agent" style="flex:0 0 170px;${isAgent ? '' : 'display:none'}">
+        <select class="wf-step-agent" style="flex:0 0 170px;${isAgent ? '' : 'display:none'}" title="Agent">
             ${missingAgent
                 ? `<option value="${escapeHtml(missingAgent)}" selected disabled>${escapeHtml(missingAgent)} (missing)</option>`
                 : ''}
@@ -1166,21 +1240,176 @@ function addWorkflowStepRow(step) {
                 `<option value="${escapeHtml(a.name)}" ${a.name === step.agent_name ? 'selected' : ''}>${escapeHtml(a.name)}</option>`
             ).join('')}
         </select>
-        <textarea class="wf-step-instructions" rows="2" style="flex:1;${isAgent ? '' : 'display:none'}"
-                  placeholder="What should this agent do with what it was handed?">${escapeHtml(step.instructions || '')}</textarea>
-        <span class="wf-step-kind-hint" style="flex:1;color:var(--muted);font-size:12px;${isAgent ? 'display:none' : ''}">${escapeHtml(STEP_KIND_HINTS[kind] || '')}</span>
-        <label class="wf-step-fanout-label" style="font-weight:normal;white-space:nowrap;${isAgent ? '' : 'display:none'}">
+        <label class="wf-step-fanout-label" style="${isAgent ? '' : 'display:none'}" title="This step returns the work items">
             <input type="checkbox" class="wf-step-fanout" ${step.fan_out ? 'checked' : ''}> fan-out
         </label>
-        <input type="number" class="wf-step-timeout" style="flex:0 0 80px" title="Step timeout (seconds)"
-               value="${step.step_timeout_seconds || 600}" min="10">
-        <button type="button" class="secondary small" onclick="this.closest('.wf-step-row').remove()">Remove</button>
+        <label class="wf-step-timeout-label" title="Step timeout (seconds)">timeout
+            <input type="number" class="wf-step-timeout" style="width:80px;margin-left:4px" title="Step timeout (seconds)"
+                   value="${step.step_timeout_seconds || 600}" min="10"> s
+        </label>
+        <span class="wf-step-tools">
+            <button type="button" class="secondary small wf-step-up" title="Move up" onclick="moveWorkflowStep(this, -1)">&uarr;</button>
+            <button type="button" class="secondary small wf-step-down" title="Move down" onclick="moveWorkflowStep(this, 1)">&darr;</button>
+            <button type="button" class="secondary small wf-step-remove" onclick="removeWorkflowStep(this)">Remove</button>
+        </span>
+        </div>
+        <div class="wf-step-body">
+        <span class="wf-step-kind-hint" style="${isAgent ? 'display:none' : ''}">${escapeHtml(STEP_KIND_HINTS[kind] || '')}</span>
+        <div class="wf-step-agent-body" style="${isAgent ? '' : 'display:none'}">
+            ${textFieldHtml('Instructions', 'wf-step-instructions', step.instructions || '', {
+                rows: 8, placeholder: 'What should this agent do with what it was handed?'})}
         </div>
         <div class="wf-step-config" data-kind="${kind}"
-             style="margin:4px 0 0 136px;${isAgent ? 'display:none' : ''}">${isAgent ? '' : stepConfigEditorHtml(kind, step.config || {})}</div>
+             style="${isAgent ? 'display:none' : ''}">${isAgent ? '' : stepConfigEditorHtml(kind, step.config || {})}</div>
+        </div>
     `;
     document.getElementById('workflow-steps').appendChild(row);
     attachStepAgentLink(row);
+    wireTextFields(row);
+    renumberWorkflowSteps();
+}
+
+function renumberWorkflowSteps() {
+    document.querySelectorAll('#workflow-steps .wf-step-row .wf-step-num')
+        .forEach((el, i) => { el.textContent = `Step ${i + 1}`; });
+}
+
+function moveWorkflowStep(button, direction) {
+    const row = button.closest('.wf-step-row');
+    const sibling = direction < 0 ? row.previousElementSibling : row.nextElementSibling;
+    if (!sibling || !sibling.classList.contains('wf-step-row')) return;
+    if (direction < 0) sibling.insertAdjacentElement('beforebegin', row);
+    else sibling.insertAdjacentElement('afterend', row);
+    renumberWorkflowSteps();
+}
+
+function removeWorkflowStep(button) {
+    button.closest('.wf-step-row').remove();
+    renumberWorkflowSteps();
+}
+
+// --- text fields --- a labelled textarea with a live "N lines · M chars"
+// counter and an Expand button that opens it in the large editor modal.
+// The textarea keeps its own class (wf-step-instructions, wf-py-code, ...),
+// which is what collectWorkflowSteps / collectStepConfig read.
+function textFieldHtml(label, cls, value, opts) {
+    opts = opts || {};
+    const extra = opts.full ? ' full' : '';
+    const attrs = [
+        `class="${escapeHtml(cls)}"`,
+        `rows="${opts.rows || 4}"`,
+        opts.placeholder ? `placeholder="${escapeHtml(opts.placeholder)}"` : '',
+        opts.mono ? 'spellcheck="false"' : '',
+    ].filter(Boolean).join(' ');
+    return `
+        <div class="wf-field${extra}">
+            <div class="wf-field-head">
+                <span class="wf-field-label">${escapeHtml(label)}</span>
+                <span class="wf-text-counter"></span>
+                <button type="button" class="secondary small wf-expand-btn"
+                        title="Edit in a larger editor" onclick="openTextEditorFor(this)">&#x2922; Expand</button>
+            </div>
+            <textarea ${attrs}>${escapeHtml(value || '')}</textarea>
+        </div>`;
+}
+
+// Grow a textarea with its content, up to ~60% of the viewport; past that it
+// scrolls. Hidden elements (a modal not yet open) have no scrollHeight, so
+// they are left alone and measured again by autoGrowAll once visible.
+function autoGrow(textarea) {
+    if (!textarea) return;
+    const maxPx = Math.floor(((typeof window !== 'undefined' && window.innerHeight) || 800) * 0.6);
+    textarea.style.height = 'auto';
+    const needed = textarea.scrollHeight;
+    if (!needed) return;
+    textarea.style.height = Math.min(needed + 2, maxPx) + 'px';
+    textarea.style.overflowY = needed + 2 > maxPx ? 'auto' : 'hidden';
+}
+
+function textCounterLabel(text) {
+    const value = text || '';
+    const lines = value ? value.split('\n').length : 0;
+    return `${lines} line${lines === 1 ? '' : 's'} · ${value.length} char${value.length === 1 ? '' : 's'}`;
+}
+
+function updateTextCounter(textarea) {
+    const field = textarea.closest ? textarea.closest('.wf-field') : null;
+    const counter = field ? field.querySelector('.wf-text-counter') : null;
+    if (counter) counter.textContent = textCounterLabel(textarea.value);
+}
+
+function wireTextFields(root) {
+    root.querySelectorAll('.wf-field textarea').forEach(ta => {
+        if (ta.dataset.wired) return;
+        ta.dataset.wired = '1';
+        ta.addEventListener('input', () => { autoGrow(ta); updateTextCounter(ta); });
+        autoGrow(ta);
+        updateTextCounter(ta);
+    });
+}
+
+function autoGrowAll(root) {
+    root.querySelectorAll('.wf-field textarea').forEach(autoGrow);
+}
+
+// --- text editor modal --- one modal, reused for every expandable textarea.
+let textEditorSource = null;
+let textEditorOriginal = '';
+
+function openTextEditorFor(button) {
+    const field = button.closest('.wf-field');
+    const source = field && field.querySelector('textarea');
+    if (!source) return;
+    const labelEl = field.querySelector('.wf-field-label');
+    const row = field.closest('.wf-step-row');
+    const num = row && row.querySelector('.wf-step-num');
+    const title = (num && num.textContent ? num.textContent + ' — ' : '')
+        + (labelEl ? labelEl.textContent : 'Edit text');
+    openTextEditor(source, title);
+}
+
+function onTextEditorKeydown(event) {
+    if (event.key === 'Escape') { event.preventDefault(); closeTextEditor(false); }
+    else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); closeTextEditor(true); }
+}
+
+function openTextEditor(sourceTextarea, title) {
+    textEditorSource = sourceTextarea;
+    textEditorOriginal = sourceTextarea.value;
+    const modal = document.getElementById('text-editor-modal');
+    const ta = document.getElementById('text-editor-textarea');
+    document.getElementById('text-editor-title').textContent = title || 'Edit text';
+    ta.value = sourceTextarea.value;
+    ta.placeholder = sourceTextarea.placeholder || '';
+    try {
+        // Code stays monospace, prose stays proportional -- same as its source.
+        ta.style.fontFamily = window.getComputedStyle(sourceTextarea).fontFamily || '';
+    } catch (e) { ta.style.fontFamily = ''; }
+    const counter = document.getElementById('text-editor-counter');
+    const tick = () => { counter.textContent = textCounterLabel(ta.value); };
+    ta.oninput = tick;
+    tick();
+    modal.classList.add('open');
+    document.addEventListener('keydown', onTextEditorKeydown);
+    try { ta.focus(); } catch (e) { /* not focusable in a headless DOM */ }
+}
+
+function closeTextEditor(apply) {
+    const modal = document.getElementById('text-editor-modal');
+    const ta = document.getElementById('text-editor-textarea');
+    document.removeEventListener('keydown', onTextEditorKeydown);
+    modal.classList.remove('open');
+    const source = textEditorSource;
+    textEditorSource = null;
+    if (!source) return;
+    source.value = apply ? ta.value : textEditorOriginal;
+    // Re-run the source's own listeners (autoGrow + counter) and anything
+    // else that watches it.
+    const EventCtor = (typeof window !== 'undefined' && window.Event) || Event;
+    source.dispatchEvent(new EventCtor('input', {bubbles: true}));
+    autoGrow(source);
+    updateTextCounter(source);
+    if (apply) { try { source.focus(); } catch (e) { /* headless */ } }
 }
 
 function collectWorkflowSteps() {
@@ -1246,13 +1475,13 @@ function conditionRuleRowHtml(rule) {
         <div class="wf-cond-rule" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-bottom:3px">
             <span style="color:var(--muted)">if</span>
             <select class="wf-cond-source">${optionsHtml(['text', 'item', 'json'], when.source || 'text')}</select>
-            <input class="wf-cond-field" style="width:120px" placeholder="field (item/json path)" value="${escapeHtml(when.field || '')}">
+            <input type="text" class="wf-cond-field" style="width:140px" placeholder="field (item/json path)" value="${escapeHtml(when.field || '')}">
             <select class="wf-cond-op">${optionsHtml(CONDITION_OPS, when.op || 'contains')}</select>
-            <input class="wf-cond-value" style="width:140px" placeholder="value" value="${escapeHtml(when.value == null ? '' : String(when.value))}">
+            <input type="text" class="wf-cond-value" style="width:160px" placeholder="value" value="${escapeHtml(when.value == null ? '' : String(when.value))}">
             <label style="font-weight:normal;white-space:nowrap"><input type="checkbox" class="wf-cond-case" ${when.case_sensitive ? 'checked' : ''}> case</label>
             <span style="color:var(--muted)">then</span>
             <select class="wf-cond-action">${optionsHtml(['continue', 'stop'], then.action || 'continue')}</select>
-            <input class="wf-cond-output" style="width:180px" placeholder="output template (empty = pass through)" value="${escapeHtml(then.output || '')}">
+            <input type="text" class="wf-cond-output" style="width:220px" placeholder="output template (empty = pass through)" value="${escapeHtml(then.output || '')}">
             <button type="button" class="secondary small" onclick="this.parentNode.remove()">×</button>
         </div>`;
 }
@@ -1269,51 +1498,67 @@ function stepConfigEditorHtml(kind, cfg) {
         const rules = Array.isArray(cfg.rules) ? cfg.rules : [];
         const els = cfg['else'] || {};
         return `
+            <div class="wf-field-head"><span class="wf-field-label">Rules</span> <span style="font-weight:normal">(first match wins)</span></div>
             <div class="wf-cond-rules">${rules.map(conditionRuleRowHtml).join('')}</div>
             <button type="button" class="secondary small" onclick="addConditionRuleRow(this)">+ rule</button>
-            <div style="display:flex;gap:4px;align-items:center;margin-top:4px">
+            <div class="wf-cond-else">
                 <span style="color:var(--muted)">else</span>
                 <select class="wf-cond-else-action">${optionsHtml(['continue', 'stop'], els.action || 'continue')}</select>
-                <input class="wf-cond-else-output" style="width:240px" placeholder="output template (empty = pass through)" value="${escapeHtml(els.output || '')}">
+                <input type="text" class="wf-cond-else-output" style="width:280px" placeholder="output template (empty = pass through)" value="${escapeHtml(els.output || '')}">
             </div>`;
     }
     if (kind === 'transform') {
         const rx = cfg.regex || {};
         return `
-            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-                <input class="wf-tf-extract" style="width:160px" placeholder="extract_json path (a.b[0])" value="${escapeHtml(cfg.extract_json || '')}">
-                <input class="wf-tf-pattern" style="width:160px" placeholder="regex pattern" value="${escapeHtml(rx.pattern || '')}">
-                <input class="wf-tf-replace" style="width:120px" placeholder="replace" value="${escapeHtml(rx.replace || '')}">
-                <input class="wf-tf-flags" style="width:50px" placeholder="imsx" value="${escapeHtml(rx.flags || '')}">
-                <input type="number" class="wf-tf-truncate" style="width:90px" min="1" placeholder="truncate" value="${cfg.truncate || ''}">
-            </div>
-            <textarea class="wf-tf-template" rows="2" style="width:100%;margin-top:4px"
-                      placeholder="template, e.g. Summary: {{text}} ({{item.id}})">${escapeHtml(cfg.template || '')}</textarea>`;
+            <div class="wf-cfg-grid">
+                <label>extract_json path
+                    <input type="text" class="wf-tf-extract" placeholder="a.b[0]" value="${escapeHtml(cfg.extract_json || '')}"></label>
+                <label>truncate (characters)
+                    <input type="number" class="wf-tf-truncate" min="1" placeholder="no limit" value="${cfg.truncate || ''}"></label>
+                <label>regex pattern
+                    <input type="text" class="wf-tf-pattern" placeholder="(?P<id>\\d+)" value="${escapeHtml(rx.pattern || '')}"></label>
+                <label>regex replace
+                    <input type="text" class="wf-tf-replace" placeholder="\\g<id>" value="${escapeHtml(rx.replace || '')}"></label>
+                <label>regex flags
+                    <input type="text" class="wf-tf-flags" placeholder="imsx" value="${escapeHtml(rx.flags || '')}"></label>
+                ${textFieldHtml('Template', 'wf-tf-template', cfg.template || '', {
+                    rows: 4, full: true, mono: true,
+                    placeholder: 'e.g. Summary: {{text}} ({{item.id}})'})}
+            </div>`;
     }
     if (kind === 'http') {
         const expect = Array.isArray(cfg.expect_status) ? cfg.expect_status.join(',') : '';
         return `
-            <div style="display:flex;gap:4px;flex-wrap:wrap;align-items:center">
-                <input class="wf-http-destination" style="width:150px" placeholder="destination name" value="${escapeHtml(cfg.destination || '')}">
-                <select class="wf-http-method">${optionsHtml(HTTP_METHODS, (cfg.method || 'GET').toUpperCase())}</select>
-                <input class="wf-http-path" style="width:240px" placeholder="/relative/path/{{item.id}}" value="${escapeHtml(cfg.path || '/')}">
-                <input class="wf-http-content-type" style="width:150px" placeholder="content type" value="${escapeHtml(cfg.content_type || 'application/json')}">
-                <input type="number" class="wf-http-timeout" style="width:70px" min="1" max="600" title="timeout (s)" value="${cfg.timeout_seconds || 30}">
-                <input class="wf-http-expect" style="width:110px" placeholder="expect: 2xx" title="expected status codes, comma-separated (empty = 2xx)" value="${escapeHtml(expect)}">
-            </div>
-            <div style="display:flex;gap:4px;margin-top:4px">
-                <textarea class="wf-http-query" rows="2" style="flex:1" placeholder='query as JSON, e.g. {"fields": "summary"}'>${escapeHtml(json(cfg.query))}</textarea>
-                <textarea class="wf-http-headers" rows="2" style="flex:1" placeholder='headers as JSON'>${escapeHtml(json(cfg.headers))}</textarea>
-            </div>
-            <textarea class="wf-http-body" rows="2" style="width:100%;margin-top:4px" placeholder="body template (sent for POST/PUT/PATCH/DELETE)">${escapeHtml(cfg.body || '')}</textarea>`;
+            <div class="wf-cfg-grid">
+                <label>destination
+                    <input type="text" class="wf-http-destination" placeholder="destination name" value="${escapeHtml(cfg.destination || '')}"></label>
+                <label>method
+                    <select class="wf-http-method">${optionsHtml(HTTP_METHODS, (cfg.method || 'GET').toUpperCase())}</select></label>
+                <label class="full">path <span style="font-weight:normal">(relative to the destination)</span>
+                    <input type="text" class="wf-http-path" placeholder="/relative/path/{{item.id}}" value="${escapeHtml(cfg.path || '/')}"></label>
+                <label>content type
+                    <input type="text" class="wf-http-content-type" placeholder="application/json" value="${escapeHtml(cfg.content_type || 'application/json')}"></label>
+                <label>timeout (s)
+                    <input type="number" class="wf-http-timeout" min="1" max="600" value="${cfg.timeout_seconds || 30}"></label>
+                <label class="full">expected status codes <span style="font-weight:normal">(comma-separated; empty = any 2xx)</span>
+                    <input type="text" class="wf-http-expect" placeholder="200, 201" value="${escapeHtml(expect)}"></label>
+                ${textFieldHtml('Query (JSON object)', 'wf-http-query', json(cfg.query), {
+                    rows: 3, mono: true, placeholder: '{"fields": "summary"}'})}
+                ${textFieldHtml('Headers (JSON object)', 'wf-http-headers', json(cfg.headers), {
+                    rows: 3, mono: true, placeholder: '{"X-Trace": "1"}'})}
+                ${textFieldHtml('Body template', 'wf-http-body', cfg.body || '', {
+                    rows: 4, full: true, mono: true,
+                    placeholder: 'sent for POST/PUT/PATCH/DELETE, e.g. {"body": "{{text}}"}'})}
+            </div>`;
     }
     if (kind === 'python') {
         return `
-            <textarea class="wf-py-code" rows="6" style="width:100%;font-family:monospace"
-                      placeholder="output = text.upper()">${escapeHtml(cfg.code || '')}</textarea>
-            <label style="font-weight:normal">timeout (s)
-                <input type="number" class="wf-py-timeout" style="width:70px" min="1" max="60" value="${cfg.timeout_seconds || 10}">
-            </label>`;
+            <div class="wf-cfg-grid">
+                ${textFieldHtml('Code', 'wf-py-code', cfg.code || '', {
+                    rows: 12, full: true, mono: true, placeholder: 'output = text.upper()'})}
+                <label>timeout (s)
+                    <input type="number" class="wf-py-timeout" min="1" max="60" value="${cfg.timeout_seconds || 10}"></label>
+            </div>`;
     }
     return '';
 }
@@ -1394,6 +1639,7 @@ function onWorkflowStepKindChange(select) {
     };
     show('wf-step-agent', isAgent);
     show('wf-step-instructions', isAgent);
+    show('wf-step-agent-body', isAgent);
     show('wf-step-fanout-label', isAgent);
     show('wf-step-kind-hint', !isAgent);
     // The "open agent" link (attachStepAgentLink) follows the agent select.
@@ -1412,6 +1658,7 @@ function onWorkflowStepKindChange(select) {
     if (box.dataset.kind !== kind) {
         box.innerHTML = stepConfigEditorHtml(kind, {});
         box.dataset.kind = kind;
+        wireTextFields(box);
     }
     box.style.display = '';
 }

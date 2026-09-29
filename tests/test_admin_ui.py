@@ -259,6 +259,49 @@ async def main() -> None:
                 for e in coll.elements),
         )
 
+        # --- workflow step cards + large text editor ---
+        # The step instructions used to be a two-row textarea squeezed into
+        # one flex line with six other controls. Each step is now a card with
+        # a full-width instructions field, and every long-text field has an
+        # Expand button that opens it in a large modal editor.
+        check("text editor modal present",
+              find(coll, "div", id="text-editor-modal") is not None)
+        check("text editor modal reuses the page's modal styling",
+              (find(coll, "div", id="text-editor-modal") or ("", {}, ""))[1]
+              .get("class") == "modal-backdrop")
+        check("text editor textarea present",
+              find(coll, "textarea", id="text-editor-textarea") is not None)
+        check("text editor title present",
+              find(coll, "h3", id="text-editor-title") is not None)
+        check("text editor Done button applies",
+              (find(coll, "button", id="text-editor-done") or ("", {}, ""))[1]
+              .get("onclick") == "closeTextEditor(true)")
+        check("text editor Cancel button discards",
+              (find(coll, "button", id="text-editor-cancel") or ("", {}, ""))[1]
+              .get("onclick") == "closeTextEditor(false)")
+        check("clicking the backdrop cancels the text editor",
+              "closeTextEditor(false)" in
+              (find(coll, "div", id="text-editor-modal") or ("", {}, ""))[1]
+              .get("onclick", ""))
+        check("text editor counter present",
+              find(coll, "span", id="text-editor-counter") is not None)
+        css = html[html.find("<style>"): html.find("</style>")]
+        check("step card style defined", ".wf-step {" in css)
+        check("step instructions get a readable min-height and line-height",
+              re.search(r"textarea\.wf-step-instructions\s*\{[^}]*min-height:\s*10rem", css)
+              is not None
+              and re.search(r"textarea\.wf-step-instructions\s*\{[^}]*line-height:\s*1\.5", css)
+              is not None
+              and re.search(r"textarea\.wf-step-instructions\s*\{[^}]*font-size:\s*14px", css)
+              is not None)
+        check("text editor textarea fills the modal",
+              re.search(r"#text-editor-textarea\s*\{[^}]*height:\s*calc\(94vh", css) is not None)
+        check("text editor stacks above the workflow modal",
+              re.search(r"#text-editor-modal\s*\{[^}]*z-index:\s*20", css) is not None)
+        check("per-kind config editors use a two-column grid",
+              re.search(r"\.wf-cfg-grid\s*\{[^}]*grid-template-columns:\s*1fr 1fr", css)
+              is not None)
+
         # Import file input
         file_input = next(
             (e for e in coll.elements
@@ -831,6 +874,274 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 )
             finally:
                 os.unlink(kinds_harness_path)
+
+            # --- workflow step cards + text editor ---
+            # Source-level contract first: the pieces the harness below
+            # exercises must be the shipped ones, not lookalikes.
+            step_row_src = re.search(
+                r"function addWorkflowStepRow\(step\)\s*\{(.*?)\n\}", js, re.DOTALL)
+            step_row_body = step_row_src.group(1) if step_row_src else ""
+            check("step rows are cards", "'wf-step-row wf-step'" in step_row_body)
+            check("step card has a header line and a body",
+                  'class="wf-step-head"' in step_row_body
+                  and 'class="wf-step-body"' in step_row_body)
+            check("instructions are a full-width 8-row field",
+                  re.search(r"textFieldHtml\('Instructions',\s*'wf-step-instructions'[^)]*rows:\s*8",
+                            step_row_body, re.DOTALL) is not None)
+            check("python code is a 12-row field with Expand",
+                  re.search(r"textFieldHtml\('Code',\s*'wf-py-code'[^)]*rows:\s*12", js, re.DOTALL)
+                  is not None)
+            check("transform template is a 4-row field with Expand",
+                  re.search(r"textFieldHtml\('Template',\s*'wf-tf-template'[^)]*rows:\s*4", js,
+                            re.DOTALL) is not None)
+            check("http body is a 4-row field with Expand",
+                  re.search(r"textFieldHtml\('Body template',\s*'wf-http-body'[^)]*rows:\s*4", js,
+                            re.DOTALL) is not None)
+            check("autoGrow helper defined", "function autoGrow(textarea)" in js)
+            check("openTextEditor is generic over its source textarea",
+                  "function openTextEditor(sourceTextarea, title)" in js)
+            check("Expand button opens the text editor",
+                  'class="secondary small wf-expand-btn"' in js
+                  and 'onclick="openTextEditorFor(this)"' in js)
+            check("Esc cancels the text editor",
+                  "event.key === 'Escape'" in js and "closeTextEditor(false)" in js)
+            check("text editor wires and unwires its key handler",
+                  "document.addEventListener('keydown', onTextEditorKeydown)" in js
+                  and "document.removeEventListener('keydown', onTextEditorKeydown)" in js)
+            check("editWorkflow re-measures textareas once the modal is visible",
+                  re.search(r"function editWorkflow\(id\).*?classList\.add\('open'\);\s*(//[^\n]*\n\s*)*autoGrowAll\(",
+                            js, re.DOTALL) is not None)
+            check("step rows can be reordered",
+                  "moveWorkflowStep(this, -1)" in step_row_body
+                  and "moveWorkflowStep(this, 1)" in step_row_body)
+
+            # Behavioural check under jsdom: the counter and autoGrow follow
+            # the textarea, the Expand -> Done round trip writes back to the
+            # source textarea and re-runs its listeners, Cancel and Esc do
+            # not, and the reorder buttons change what collectWorkflowSteps
+            # submits. jsdom does no layout, so scrollHeight is stubbed on
+            # the element under test.
+            cards_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <div id="workflow-modal"></div>
+  <span id="workflow-modal-title"></span>
+  <input id="workflow-id"><input id="workflow-name">
+  <input id="workflow-description"><input id="workflow-api-slug">
+  <input id="workflow-run-as"><input id="workflow-timeout">
+  <input id="workflow-max-parallel">
+  <select id="workflow-on-unknown-branch">
+    <option value="fail">fail</option><option value="skip">skip</option>
+  </select>
+  <input type="checkbox" id="workflow-skip-seen">
+  <input type="checkbox" id="workflow-enabled">
+  <div id="workflow-branches"></div>
+  <div id="workflow-steps"></div>
+  <div id="text-editor-modal" class="modal-backdrop">
+    <h3 id="text-editor-title"></h3>
+    <textarea id="text-editor-textarea"></textarea>
+    <span id="text-editor-counter"></span>
+  </div>
+</body></html>`);
+global.window = dom.window;
+global.document = dom.window.document;
+
+""" + js_no_autoinvoke + r"""
+
+const DEF = {
+    id: 3, name: 'cards', description: '', api_slug: '', run_as_principal: '',
+    run_timeout_seconds: 1200, skip_seen_items: true, max_parallel_items: 1,
+    on_unknown_branch: 'fail', enabled: true, branches: [],
+    steps: [
+        {branch_key: null, position: 1, kind: 'agent', agent_name: 'reader',
+         instructions: 'line one\nline two\nline three', fan_out: true,
+         step_timeout_seconds: 300, config: {}},
+        {branch_key: null, position: 2, kind: 'agent', agent_name: 'drafter',
+         instructions: 'draft it', fan_out: false, step_timeout_seconds: 400, config: {}},
+        {branch_key: null, position: 3, kind: 'python', agent_name: '',
+         instructions: '', fan_out: false, step_timeout_seconds: 60,
+         config: {code: 'output = text', timeout_seconds: 5}},
+    ],
+};
+let saved = null;
+global.fetch = async (url, opts = {}) => {
+    if ((opts.method || 'GET') === 'GET') return { ok: true, json: async () => DEF };
+    saved = JSON.parse(opts.body);
+    return { ok: true, json: async () => ({}) };
+};
+loadWorkflows = async () => {};
+
+const modal = document.getElementById('text-editor-modal');
+const modalTa = document.getElementById('text-editor-textarea');
+const stubHeight = (el, h) => Object.defineProperty(el, 'scrollHeight', {configurable: true, get: () => h});
+const fire = (el, type) => el.dispatchEvent(new window.Event(type, {bubbles: true}));
+const key = (k, extra = {}) => document.dispatchEvent(
+    new window.KeyboardEvent('keydown', Object.assign({key: k, bubbles: true}, extra)));
+// jsdom runs no inline onclick= handlers, so the buttons are checked for
+// the right wiring and their handlers are then invoked directly.
+const expand = scope => {
+    const btn = scope.querySelector('.wf-expand-btn');
+    assert.strictEqual(btn.getAttribute('onclick'), 'openTextEditorFor(this)');
+    openTextEditorFor(btn);
+};
+const press = (row, cls, fn) => {
+    const btn = row.querySelector('.' + cls);
+    assert.ok(btn.getAttribute('onclick').startsWith(fn + '('), cls + ' calls ' + fn);
+    return btn;
+};
+
+async function main() {
+    allAgents = [{id: 1, name: 'reader'}, {id: 2, name: 'drafter'}];
+    await editWorkflow(3);
+    const rows = () => Array.from(document.querySelectorAll('#workflow-steps .wf-step-row'));
+    assert.strictEqual(rows().length, 3);
+
+    // 1. Card layout: header + body, instructions in the body, counter filled.
+    const card = rows()[0];
+    assert.ok(card.classList.contains('wf-step'), 'row is a card');
+    const head = card.querySelector('.wf-step-head');
+    assert.ok(head.querySelector('.wf-step-agent'), 'agent select is in the header');
+    assert.ok(head.querySelector('.wf-step-open-agent'), 'open-agent link is in the header');
+    assert.ok(head.querySelector('.wf-step-timeout'), 'timeout is in the header');
+    assert.strictEqual(head.querySelector('.wf-step-num').textContent, 'Step 1');
+    assert.strictEqual(rows()[2].querySelector('.wf-step-num').textContent, 'Step 3');
+    const ta = card.querySelector('.wf-step-body .wf-field textarea.wf-step-instructions');
+    assert.ok(ta, 'instructions textarea lives in the card body as a text field');
+    assert.strictEqual(ta.getAttribute('rows'), '8');
+    assert.strictEqual(ta.value, 'line one\nline two\nline three');
+    const counter = card.querySelector('.wf-field .wf-text-counter');
+    assert.strictEqual(counter.textContent, '3 lines · 28 chars', 'counter reflects the loaded text');
+    assert.ok(card.querySelector('.wf-field .wf-expand-btn'), 'Expand button next to the instructions');
+
+    // 2. autoGrow follows the content on input, capped at 60vh (jsdom: 768px).
+    stubHeight(ta, 300);
+    ta.value = 'x';
+    fire(ta, 'input');
+    assert.strictEqual(ta.style.height, '302px', 'grows to scrollHeight');
+    assert.strictEqual(counter.textContent, '1 line · 1 char', 'counter follows input');
+    stubHeight(ta, 5000);
+    fire(ta, 'input');
+    assert.strictEqual(ta.style.height, Math.floor(768 * 0.6) + 'px', 'capped near 60vh');
+    assert.strictEqual(ta.style.overflowY, 'auto', 'scrolls once capped');
+    stubHeight(ta, 0);
+    ta.value = 'kept';
+    fire(ta, 'input');
+    assert.strictEqual(ta.style.height, 'auto', 'no scrollHeight (hidden): left to CSS');
+
+    // 3. Expand -> edit -> Done writes back and re-runs the source listeners.
+    expand(card.querySelector('.wf-field'));
+    assert.ok(modal.classList.contains('open'), 'text editor opens');
+    assert.strictEqual(modalTa.value, 'kept', 'editor starts from the source text');
+    assert.ok(document.getElementById('text-editor-title').textContent.includes('Instructions'));
+    assert.ok(document.getElementById('text-editor-title').textContent.includes('Step 1'));
+    modalTa.value = 'new\ntext';
+    fire(modalTa, 'input');
+    assert.strictEqual(document.getElementById('text-editor-counter').textContent, '2 lines · 8 chars');
+    closeTextEditor(true);
+    assert.ok(!modal.classList.contains('open'), 'Done closes the editor');
+    assert.strictEqual(ta.value, 'new\ntext', 'Done writes back to the source textarea');
+    assert.strictEqual(counter.textContent, '2 lines · 8 chars', 'source counter re-run');
+
+    // 4. Expand -> edit -> Esc leaves the source untouched.
+    expand(card.querySelector('.wf-field'));
+    modalTa.value = 'discarded';
+    key('Escape');
+    assert.ok(!modal.classList.contains('open'), 'Esc closes the editor');
+    assert.strictEqual(ta.value, 'new\ntext', 'Esc does not write back');
+    // The key handler is gone once closed: Esc again must be a no-op.
+    ta.value = 'after';
+    key('Escape');
+    assert.strictEqual(ta.value, 'after', 'no stale key handler');
+
+    // 5. Expand -> edit -> Cancel leaves the source untouched too.
+    expand(card.querySelector('.wf-field'));
+    modalTa.value = 'also discarded';
+    closeTextEditor(false);
+    assert.strictEqual(ta.value, 'after', 'Cancel does not write back');
+    // Ctrl+Enter applies.
+    expand(card.querySelector('.wf-field'));
+    modalTa.value = 'applied by key';
+    key('Enter', {ctrlKey: true});
+    assert.ok(!modal.classList.contains('open'));
+    assert.strictEqual(ta.value, 'applied by key');
+
+    // 6. Non-agent kinds: code/template/body are text fields with Expand,
+    //    the agent body is hidden, and the Expand round trip reaches them.
+    const py = rows()[2];
+    assert.strictEqual(py.querySelector('.wf-step-agent-body').style.display, 'none');
+    const code = py.querySelector('.wf-step-config .wf-field textarea.wf-py-code');
+    assert.ok(code, 'python code is a text field');
+    assert.strictEqual(code.getAttribute('rows'), '12');
+    expand(py.querySelector('.wf-step-config'));
+    assert.strictEqual(modalTa.value, 'output = text');
+    modalTa.value = 'output = text.upper()';
+    closeTextEditor(true);
+    assert.strictEqual(code.value, 'output = text.upper()');
+    const kindSelect = rows()[1].querySelector('.wf-step-kind');
+    kindSelect.value = 'transform';
+    onWorkflowStepKindChange(kindSelect);
+    assert.strictEqual(rows()[1].querySelector('.wf-step-agent-body').style.display, 'none',
+        'switching to a non-agent kind hides the instructions block');
+    const tmpl = rows()[1].querySelector('.wf-field textarea.wf-tf-template');
+    assert.ok(tmpl && tmpl.getAttribute('rows') === '4', 'transform template is a 4-row text field');
+    assert.ok(tmpl.dataset.wired, 'a rebuilt editor is wired for autoGrow/counter');
+    kindSelect.value = 'http';
+    onWorkflowStepKindChange(kindSelect);
+    const body = rows()[1].querySelector('.wf-field textarea.wf-http-body');
+    assert.ok(body && body.getAttribute('rows') === '4', 'http body is a 4-row text field');
+    assert.ok(rows()[1].querySelector('.wf-field textarea.wf-http-headers'), 'headers is a text field');
+    kindSelect.value = 'agent';
+    onWorkflowStepKindChange(kindSelect);
+    assert.strictEqual(rows()[1].querySelector('.wf-step-agent-body').style.display, '',
+        'switching back to agent shows the instructions block');
+
+    // 7. Reordering: move step 3 up, then save; the submitted order follows.
+    moveWorkflowStep(press(rows()[2], 'wf-step-up', 'moveWorkflowStep'), -1);
+    assert.deepStrictEqual(rows().map(r => r.querySelector('.wf-step-num').textContent),
+        ['Step 1', 'Step 2', 'Step 3'], 'renumbered after a move');
+    assert.strictEqual(rows()[1].querySelector('.wf-step-kind').value, 'python');
+    moveWorkflowStep(press(rows()[0], 'wf-step-up', 'moveWorkflowStep'), -1);  // no-op at the top
+    assert.strictEqual(rows()[0].querySelector('.wf-step-agent').value, 'reader');
+    saved = null;
+    await saveWorkflow();
+    assert.deepStrictEqual(saved.steps.map(s => [s.kind, s.position]),
+        [['agent', 1], ['python', 2], ['agent', 3]], 'save reflects the new order');
+    assert.strictEqual(saved.steps[0].instructions, 'applied by key',
+        'the edited instructions are what gets saved');
+    assert.strictEqual(saved.steps[1].config.code, 'output = text.upper()');
+    removeWorkflowStep(press(rows()[1], 'wf-step-remove', 'removeWorkflowStep'));
+    assert.deepStrictEqual(rows().map(r => r.querySelector('.wf-step-num').textContent),
+        ['Step 1', 'Step 2'], 'renumbered after a remove');
+
+    console.log('workflow step card / text editor scenarios passed');
+}
+
+main().catch(err => { console.error(err); process.exitCode = 1; });
+"""
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".js", delete=False, dir=str(ROOT)
+            ) as f:
+                f.write(cards_harness)
+                cards_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", cards_harness_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                check(
+                    "step cards: counter and autoGrow follow the textarea, "
+                    "Expand/Done writes back, Cancel/Esc do not, reorder is saved",
+                    result.returncode == 0,
+                    (result.stdout + result.stderr).strip()[:1200],
+                )
+            finally:
+                os.unlink(cards_harness_path)
 
             # --------------------------------------------------------------
             # A name containing a quote and a parenthesis must round-trip
