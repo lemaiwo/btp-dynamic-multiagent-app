@@ -27,3 +27,34 @@
 .workflowStepOutput {
     white-space: pre-wrap;
 }
+/* Workflow step editor (WorkflowDetail.view.xml): the long text fields get
+   room, and the expand dialog's text area fills the dialog. */
+.stepEditorTextArea textarea {
+    font-size: 0.875rem;
+    line-height: 1.4;
+}
+.stepEditorCode textarea {
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    white-space: pre;
+    overflow-x: auto;
+}
+.stepEditorCounter {
+    color: var(--sapContent_LabelColor);
+    font-size: 0.75rem;
+}
+.stepEditorHeader .sapMLabel {
+    display: block;
+    margin-bottom: 0.25rem;
+}
+/* The dialog disables its own scrolling (sapMDialogStretchContent), so the
+   content box is the full dialog height; the text area takes all of it. */
+.stepTextDialogArea,
+.stepTextDialogArea .sapMTextAreaInner {
+    height: 100%;
+    box-sizing: border-box;
+}
+.stepTextDialogArea textarea {
+    height: 100%;
+    font-size: 0.875rem;
+    line-height: 1.4;
+}

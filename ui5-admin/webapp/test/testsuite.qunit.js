@@ -20,6 +20,8 @@ sap.ui.define(function () {
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },
             "unit/workflowOrder": { title: "Unit: workflowOrder" },
             "unit/stepKinds": { title: "Unit: stepKinds" },
+            "unit/textStats": { title: "Unit: textStats" },
+            "unit/NullableKey": { title: "Unit: NullableKey binding type" },
             "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }
     };

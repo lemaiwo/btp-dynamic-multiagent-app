@@ -277,3 +277,49 @@ export function stepSummary(step: Pick<WorkflowStep, "kind" | "config">): string
     }
     return "";
 }
+
+// --- step list ---
+/** The icon the Steps list shows per kind. */
+export const KIND_ICONS: Record<StepKind, string> = {
+    agent: "sap-icon://person-placeholder",
+    condition: "sap-icon://decision",
+    transform: "sap-icon://edit",
+    http: "sap-icon://cloud",
+    python: "sap-icon://source-code"
+};
+
+export function stepKindIcon(kind: string | undefined): string {
+    return KIND_ICONS[kindOf({ kind: kind as StepKind })];
+}
+
+/** How many characters a list summary may run to before it is cut. */
+export const SUMMARY_MAX = 80;
+
+/** The first non-blank line of `text`, cut to `max` characters with an
+ * ellipsis. Empty for blank text. */
+export function firstLine(text: string | undefined | null, max = SUMMARY_MAX): string {
+    const line = String(text ?? "").split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
+    return line.length > max ? line.slice(0, max - 1).trimEnd() + "…" : line;
+}
+
+/** The one-line summary the Steps list shows for a row while it is being
+ * edited: the first line of an agent step's instructions, or the kind's
+ * summary built from the *editor* copy of its config (`cfg`), which is what
+ * the operator is typing into -- `config` is only refreshed on save. A
+ * JSON field that does not parse yet falls back to the stored config, so a
+ * half-typed header never blanks the row. */
+export function stepListSummary(step: Pick<WorkflowStep, "kind" | "instructions" | "config"> & { cfg?: UiStepConfig }): string {
+    const kind = kindOf(step);
+    if (kind === "agent") {
+        return firstLine(step.instructions);
+    }
+    let config: StepConfig | undefined = step.config;
+    if (step.cfg) {
+        try {
+            config = wireConfigFromUi(kind, step.cfg);
+        } catch {
+            // keep the stored config
+        }
+    }
+    return firstLine(stepSummary({ kind, config }));
+}

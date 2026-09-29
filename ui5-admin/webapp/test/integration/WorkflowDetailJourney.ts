@@ -3,18 +3,19 @@ import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
 import HashChanger from "sap/ui/core/routing/HashChanger";
+import { MAIN_LINE_KEY } from "com/agent/admin/model/NullableKey";
 import type JSONModel from "sap/ui/model/json/JSONModel";
 import type Table from "sap/m/Table";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Button from "sap/m/Button";
 import type HBox from "sap/m/HBox";
-import type VBox from "sap/m/VBox";
-import type SimpleForm from "sap/ui/layout/form/SimpleForm";
 import type Input from "sap/m/Input";
 import type Link from "sap/m/Link";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
 import type Text from "sap/m/Text";
+import type TextArea from "sap/m/TextArea";
+import type Title from "sap/m/Title";
 import type UI5Element from "sap/ui/core/Element";
 import type Control from "sap/ui/core/Control";
 import type ProcessFlow from "sap/suite/ui/commons/ProcessFlow";
@@ -23,15 +24,37 @@ import Common, { backend } from "./pages/Common";
 
 /** The subset of a step-row model entry this file manipulates directly
  * (arrange only -- never asserted on) to set a freshly `onAddStep`'d row's
- * branch/agent without driving the row's `<Select>` controls, which do not
- * write back through their two-way binding when set programmatically
+ * branch/agent without driving the editor's `<Select>` controls, which do
+ * not write back through their two-way binding when set programmatically
  * (only a genuine `change` event does). */
 type StepRow = WorkflowStep & { agentOptions: unknown; branchOptions: unknown };
 
-/** A step row's agent `<Select>`. Since step kinds, the second cell is a
- * VBox holding the kind select and, under it, the agent select. */
-function agentSelectOf(row: ColumnListItem): Select {
-    return (row.getCells()[1] as VBox).getItems()[1] as Select;
+/** Cells of a row in the Steps list (WorkflowDetail.view.xml): number,
+ * branch, kind, summary, fan-out badge, timeout, actions. The list is
+ * read-mostly since the master-detail rework; a step's fields are edited in
+ * the `stepEditor` panel, which shows the selected row. */
+const CELL_BRANCH = 1;
+const CELL_SUMMARY = 3;
+const CELL_ACTIONS = 6;
+
+/** The delete button of a step row: the Actions cell holds move-up /
+ * move-down / delete, so it is the last item inside it. */
+function deleteButtonOf(row: ColumnListItem): Control {
+    return (row.getCells()[CELL_ACTIONS] as HBox).getItems()[2];
+}
+
+/** The 0-based index of the step list's selected row, -1 for none. */
+function selectedIndexOf(table: Table): number {
+    const item = table.getSelectedItem();
+    return item ? table.getItems().indexOf(item) : -1;
+}
+
+/** Matcher for a control inside an open dialog by the tail of its id --
+ * the text dialog is a dependent of the WorkflowDetail page, so its
+ * controls carry the view prefix, and `searchOpenDialogs` ignores
+ * `viewName`. */
+function idEndsWith(suffix: string): (element: UI5Element) => boolean {
+    return (element: UI5Element) => element.getId().endsWith(`--${suffix}`);
 }
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
@@ -43,8 +66,8 @@ QUnit.module("Workflow detail journey");
 // FakeBackend.ts's reset() and WorkflowJourney.ts's own copy of this constant.
 const WORKFLOW_ID = 102;
 
-/** The step row carrying `needle` in its instructions. The steps table groups
- * main-line rows ahead of branch rows, so a row's position in the table no
+/** The step row carrying `needle` in its instructions. The steps list groups
+ * main-line rows ahead of branch rows, so a row's position in the list no
  * longer follows the order steps were appended in -- find rows by content. */
 function stepRowMatching(table: Table, needle: string): ColumnListItem {
     return (table.getItems() as ColumnListItem[]).filter((row) =>
@@ -82,25 +105,94 @@ opaTest(
                 Opa5.assert.strictEqual(table.getItems().length, 4, "all four seeded steps are listed");
                 const rows = table.getItems() as ColumnListItem[];
 
-                const mainLineRow = rows[0];
                 Opa5.assert.strictEqual(
-                    (mainLineRow.getCells()[0] as Select).getSelectedKey(), "",
-                    "the fan-out step's branch select preselects 'Main line' (branch_key null)"
+                    (rows[0].getCells()[CELL_BRANCH] as Text).getText(false), "Main line",
+                    "the fan-out step's row names the main line (branch_key null)"
                 );
                 Opa5.assert.strictEqual(
-                    agentSelectOf(mainLineRow).getSelectedKey(), "gmail-agent",
+                    (rows[0].getCells()[CELL_SUMMARY] as Text).getText(false), "Read new mail.",
+                    "an agent step's row summarises its instructions"
+                );
+                Opa5.assert.strictEqual(
+                    (rows[1].getCells()[CELL_BRANCH] as Text).getText(false), "billing",
+                    "a branch step's row names its branch"
+                );
+                Opa5.assert.strictEqual(selectedIndexOf(table), 0, "the first step opens in the editor");
+            }
+        });
+
+        // The editor opened on the first (main-line, fan-out) step.
+        Then.waitFor({
+            id: "stepBranch",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const select = element as Select;
+                // MAIN_LINE_KEY rather than "": with an empty selectedKey the
+                // control renders blank even though a "" item exists, which is
+                // exactly the bug the NullableKey binding type closes.
+                Opa5.assert.strictEqual(
+                    select.getSelectedKey(), MAIN_LINE_KEY,
+                    "the fan-out step's branch select preselects the main-line key (branch_key null)"
+                );
+                Opa5.assert.strictEqual(
+                    select.getSelectedItem()?.getText(), "Main line",
+                    "and the control visibly reads 'Main line', not blank"
+                );
+            }
+        });
+        Then.waitFor({
+            id: "stepAgent",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Select).getSelectedKey(), "gmail-agent",
                     "the fan-out step's agent is preselected"
                 );
+            }
+        });
 
-                const billingRow = rows[1];
+        // Selecting the billing row switches the editor to that step.
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return (element as Table).getItems()[1]; },
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "stepBranch",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return (element as Select).getSelectedKey() === "billing"; },
+            success: function () {
+                Opa5.assert.ok(true, "a branch step's branch is preselected");
+            },
+            errorMessage: "the editor did not switch to the billing step"
+        });
+        Then.waitFor({
+            id: "stepAgent",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
                 Opa5.assert.strictEqual(
-                    (billingRow.getCells()[0] as Select).getSelectedKey(), "billing",
-                    "a branch step's branch is preselected"
-                );
-                Opa5.assert.strictEqual(
-                    agentSelectOf(billingRow).getSelectedKey(), "btp-agent",
+                    (element as Select).getSelectedKey(), "btp-agent",
                     "a branch step's agent is preselected"
                 );
+            }
+        });
+        Then.waitFor({
+            id: "stepInstructions",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as TextArea).getValue(), "Draft a billing reply.",
+                    "selecting a row shows its instructions in the editor"
+                );
+            }
+        });
+        Then.waitFor({
+            id: "stepEditorTitle",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Title).getText(), "Step 2", "the editor is titled by the row number");
             }
         });
 
@@ -353,13 +445,22 @@ opaTest(
             actions: new Press()
         });
 
-        Then.waitFor({
+        // Open the ghost step in the editor.
+        When.waitFor({
             id: "stepsTable",
             viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) {
+                return stepRowMatching(element as Table, "Whoever last ran this agent");
+            },
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "stepAgent",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return (element as Select).getSelectedKey() === "ghost-agent"; },
             success: function (element: UI5Element) {
-                const table = element as Table;
-                const ghostRow = stepRowMatching(table, "Whoever last ran this agent");
-                const agentSelect = agentSelectOf(ghostRow);
+                const agentSelect = element as Select;
                 Opa5.assert.strictEqual(
                     agentSelect.getSelectedKey(), "ghost-agent",
                     "the missing agent's name stays selected instead of the browser defaulting to the first real agent"
@@ -369,7 +470,8 @@ opaTest(
                     selectedItem?.getEnabled(), false,
                     "the placeholder carrying the missing name cannot itself be (re-)selected, so a save is forced to fail rather than quietly keep it"
                 );
-            }
+            },
+            errorMessage: "the editor did not open on the ghost step with its stored agent name selected"
         });
 
         // The end-to-end guarantee that actually matters: the disabled
@@ -419,8 +521,19 @@ opaTest(
                 const table = element as Table;
                 const ghostRow = stepRowMatching(table, "Whoever last ran this agent");
                 Opa5.assert.strictEqual(
-                    agentSelectOf(ghostRow).getSelectedKey(), "ghost-agent",
+                    ghostRow.getBindingContext("workflow")?.getProperty("agent_name"), "ghost-agent",
                     "after the rejected save, the step still names the missing agent -- it was never silently substituted"
+                );
+                Opa5.assert.strictEqual(table.getSelectedItem(), ghostRow, "the ghost step is still the one in the editor");
+            }
+        });
+        Then.waitFor({
+            id: "stepAgent",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as Select).getSelectedKey(), "ghost-agent",
+                    "and the editor still shows that name"
                 );
             }
         });
@@ -624,13 +737,20 @@ opaTest(
             id: "stepsTable",
             viewName: "WorkflowDetail",
             matchers: function (element: UI5Element) {
-                // The Actions cell holds move-up / move-down / delete, so the
-                // delete button is the last item inside it rather than the
-                // cell itself.
-                const actions = ((element as Table).getItems()[0] as ColumnListItem).getCells()[5] as HBox;
-                return actions.getItems()[2];
+                return deleteButtonOf((element as Table).getItems()[0] as ColumnListItem);
             },
             actions: new Press()
+        });
+
+        // The deleted row was the one in the editor; its neighbour (the row
+        // that took its place) is selected instead of the editor going blank.
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            check: function (element: UI5Element) { return (element as Table).getItems().length === 3; },
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(selectedIndexOf(element as Table), 0, "deleting the selected row selects its neighbour");
+            }
         });
 
         // Add a third step to "support", which already has two (positions 1
@@ -698,26 +818,20 @@ opaTest(
     function (Given: Common, When: Common, Then: Common) {
         Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
 
-        // Row 0 is the main-line fan-out step, which runs gmail-agent. The
-        // link sits last in the Actions cell, after move-up / move-down /
-        // delete, so those keep the positions the other journeys rely on.
+        // Row 0 is the main-line fan-out step, which runs gmail-agent; it
+        // opens in the editor on load, and the link sits in the editor's
+        // header.
         Then.waitFor({
-            id: "stepsTable",
+            id: "stepAgentLink",
             viewName: "WorkflowDetail",
             success: function (element: UI5Element) {
-                const actions = ((element as Table).getItems()[0] as ColumnListItem).getCells()[5] as HBox;
-                const link = actions.getItems()[3] as Link;
-                Opa5.assert.strictEqual(link.getText(), "Open gmail-agent", "the link names the row's agent");
+                Opa5.assert.strictEqual((element as Link).getText(), "Open gmail-agent", "the link names the step's agent");
             }
         });
 
         When.waitFor({
-            id: "stepsTable",
+            id: "stepAgentLink",
             viewName: "WorkflowDetail",
-            matchers: function (element: UI5Element) {
-                const actions = ((element as Table).getItems()[0] as ColumnListItem).getCells()[5] as HBox;
-                return actions.getItems()[3];
-            },
             actions: new Press()
         });
 
@@ -795,71 +909,104 @@ opaTest(
             actions: new Press()
         });
 
-        // The stored transform step opens into its own form: the kind select
-        // says transform, the agent dropdown is hidden for that row and the
-        // template field carries the stored value.
+        // The stored transform step has a row summarising its config;
+        // selecting it opens its own form: the kind select says transform,
+        // the agent dropdown is hidden and the template field carries the
+        // stored value.
+        // (The matcher, not `check`, gates on the row count: OPA hands
+        // `check` the matcher's result, i.e. the row, not the table.)
         When.waitFor({
             id: "stepsTable",
             viewName: "WorkflowDetail",
-            check: function (element: UI5Element) {
-                return (element as Table).getItems().length === 5;
-            },
-            success: function (element: UI5Element) {
+            matchers: function (element: UI5Element) {
                 const table = element as Table;
+                if (table.getItems().length !== 5) {
+                    return false;
+                }
                 const row = table.getItems().find((item) => {
                     const step = item.getBindingContext("workflow")?.getObject() as StepRow;
                     return step.kind === "transform";
                 }) as ColumnListItem;
                 Opa5.assert.ok(row, "the stored transform step has a row");
-                const kindCell = row.getCells()[1] as VBox;
-                const kindSelect = kindCell.getItems()[0] as Select;
-                const agentSelect = kindCell.getItems()[1] as Select;
-                Opa5.assert.strictEqual(kindSelect.getSelectedKey(), "transform", "its kind select shows transform");
-                Opa5.assert.notOk(agentSelect.getVisible(), "the agent dropdown is hidden for a transform step");
-                const forms = row.getCells()[2] as VBox;
-                const transformForm = forms.getItems().find(
-                    (c) => c.hasStyleClass("stepKindForm") && c.getVisible()
-                ) as SimpleForm;
-                Opa5.assert.ok(transformForm, "exactly the transform form is visible");
-                const template = transformForm.getContent().find(
-                    (c) => (c as Control).hasStyleClass("stepTfTemplate")
-                ) as Input;
+                Opa5.assert.strictEqual(
+                    (row.getCells()[CELL_SUMMARY] as Text).getText(false), "template, ≤300",
+                    "its row summarises the stored config"
+                );
+                return row;
+            },
+            actions: new Press()
+        });
+        Then.waitFor({
+            id: "stepKind",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return (element as Select).getSelectedKey() === "transform"; },
+            success: function () {
+                Opa5.assert.ok(true, "its kind select shows transform");
+            },
+            errorMessage: "the editor did not open on the transform step"
+        });
+        Then.waitFor({
+            id: "stepAgent",
+            viewName: "WorkflowDetail",
+            visible: false,
+            success: function (element: UI5Element) {
+                Opa5.assert.notOk((element as Select).getVisible(), "the agent dropdown is hidden for a transform step");
+            }
+        });
+        When.waitFor({
+            id: "stepTfTemplate",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const template = element as TextArea;
                 Opa5.assert.strictEqual(template.getValue(), "Reply: {{text}}", "the template field carries the stored value");
-                // Edit through the model, as the other journeys do for row
+                // Edit through the model, as the other journeys do for bound
                 // controls (see the StepRow comment above).
-                const model = table.getModel("workflow") as JSONModel;
-                const path = row.getBindingContext("workflow")!.getPath();
+                const model = template.getModel("workflow") as JSONModel;
+                const path = template.getBindingContext("workflow")!.getPath();
                 model.setProperty(`${path}/cfg/template`, "Billing reply: {{text}}");
                 model.setProperty(`${path}/cfg/truncate`, "250");
             }
         });
 
-        // A brand-new row switched to `python` gets its editor and is
-        // submitted with code and timeout, no agent.
+        // A brand-new row is selected as it is added; switched to `python`
+        // it gets its editor and is submitted with code and timeout, no
+        // agent.
         When.waitFor({ id: "addStepButton", viewName: "WorkflowDetail", actions: new Press() });
         When.waitFor({
             id: "stepsTable",
             viewName: "WorkflowDetail",
+            check: function (element: UI5Element) { return (element as Table).getItems().length === 6; },
             success: function (element: UI5Element) {
                 const table = element as Table;
+                Opa5.assert.strictEqual(selectedIndexOf(table), 5, "the added step is selected");
                 const model = table.getModel("workflow") as JSONModel;
-                const steps = model.getProperty("/data/steps") as StepRow[];
-                const path = `/data/steps/${steps.length - 1}`;
-                // The binding writes `kind` on a genuine change only, so set
-                // it and fire the handler the way a user's pick would.
-                model.setProperty(`${path}/kind`, "python");
-                const last = table.getItems()[table.getItems().length - 1] as ColumnListItem;
-                const kindSelect = (last.getCells()[1] as VBox).getItems()[0] as Select;
+                model.setProperty("/data/steps/5/kind", "python");
+            }
+        });
+        When.waitFor({
+            id: "stepKind",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                // The binding writes `kind` on a genuine change only, so it
+                // was set on the model above; fire the handler the way a
+                // user's pick would.
+                const kindSelect = element as Select;
                 kindSelect.fireChange({ selectedItem: kindSelect.getSelectedItem() ?? undefined });
-                const pythonForm = (last.getCells()[2] as VBox).getItems().find(
-                    (c) => c.hasStyleClass("stepKindForm") && c.getVisible()
-                ) as SimpleForm;
-                Opa5.assert.ok(
-                    pythonForm && pythonForm.getContent().some((c) => (c as Control).hasStyleClass("stepPyCode")),
-                    "switching the kind to python shows the python form"
+            }
+        });
+        When.waitFor({
+            id: "stepPyCode",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const code = element as TextArea;
+                Opa5.assert.ok(code.getVisible(), "switching the kind to python shows the python form");
+                Opa5.assert.strictEqual(
+                    code.getBindingContext("workflow")?.getPath(), "/data/steps/5",
+                    "the editor is bound to the new row"
                 );
-                model.setProperty(`${path}/cfg/code`, "output = len(text)");
-                model.setProperty(`${path}/cfg/py_timeout`, 5);
+                const model = code.getModel("workflow") as JSONModel;
+                model.setProperty("/data/steps/5/cfg/code", "output = len(text)");
+                model.setProperty("/data/steps/5/cfg/py_timeout", 5);
             }
         });
 
@@ -894,6 +1041,270 @@ opaTest(
                     saved?.steps.filter((s) => s.kind === "agent").every((s) => s.config && Object.keys(s.config).length === 0),
                     "agent steps carry an empty config"
                 );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+// --- step editor (master-detail) ---
+opaTest(
+    "the Expand dialog edits the instructions in full: Done writes back, Cancel leaves them as they were",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        // The first step (gmail-agent, "Read new mail.") opens on load.
+        Then.waitFor({
+            id: "stepInstructions",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as TextArea).getValue(), "Read new mail.", "the editor shows the selected step's instructions");
+                Opa5.assert.ok((element as TextArea).getRows() >= 12, "the instructions field is tall enough to read");
+            }
+        });
+        Then.waitFor({
+            id: "stepInstructionsCounter",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Text).getText(false), "14 characters · 1 line", "the counter reflects the text");
+            }
+        });
+
+        When.waitFor({ id: "stepInstructionsExpand", viewName: "WorkflowDetail", actions: new Press() });
+
+        // The dialog opens on the same text; typing replaces it (EnterText
+        // clears the field first).
+        When.waitFor({
+            controlType: "sap.m.TextArea",
+            searchOpenDialogs: true,
+            matchers: idEndsWith("stepTextDialogArea"),
+            success: function (elements: UI5Element[]) {
+                Opa5.assert.strictEqual((elements[0] as TextArea).getValue(), "Read new mail.", "the dialog opens on the field's text");
+            }
+        });
+        When.waitFor({
+            controlType: "sap.m.TextArea",
+            searchOpenDialogs: true,
+            matchers: idEndsWith("stepTextDialogArea"),
+            actions: new EnterText({ text: "Read new mail.\nSkip newsletters." })
+        });
+        When.waitFor({
+            controlType: "sap.m.Button",
+            searchOpenDialogs: true,
+            matchers: idEndsWith("stepTextDialogDone"),
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "stepInstructions",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const area = element as TextArea;
+                Opa5.assert.strictEqual(area.getValue(), "Read new mail.\nSkip newsletters.", "Done wrote the dialog's text back to the field");
+                const model = area.getModel("workflow") as JSONModel;
+                Opa5.assert.strictEqual(
+                    model.getProperty("/data/steps/0/instructions"), "Read new mail.\nSkip newsletters.",
+                    "and to the step in the model, where the save reads it"
+                );
+            }
+        });
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const row = (element as Table).getItems()[0] as ColumnListItem;
+                Opa5.assert.strictEqual(
+                    (row.getCells()[CELL_SUMMARY] as Text).getText(false), "Read new mail.",
+                    "the row summary stays the first line"
+                );
+            }
+        });
+
+        // Cancel: the field keeps what it had when the dialog opened.
+        When.waitFor({ id: "stepInstructionsExpand", viewName: "WorkflowDetail", actions: new Press() });
+        When.waitFor({
+            controlType: "sap.m.TextArea",
+            searchOpenDialogs: true,
+            matchers: idEndsWith("stepTextDialogArea"),
+            actions: new EnterText({ text: "Discarded draft." })
+        });
+        When.waitFor({
+            controlType: "sap.m.Button",
+            searchOpenDialogs: true,
+            matchers: idEndsWith("stepTextDialogCancel"),
+            actions: new Press()
+        });
+        Then.waitFor({
+            id: "stepInstructions",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as TextArea).getValue(), "Read new mail.\nSkip newsletters.",
+                    "Cancel restored the text the dialog opened with"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "adding a step selects it, and a validation error selects the offending row",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp("workflows/new");
+
+        Then.waitFor({
+            id: "stepEditorEmpty",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.ok((element as Control).getVisible(), "with no steps there is nothing to edit: the empty state shows");
+            }
+        });
+
+        When.waitFor({ id: "workflowName", viewName: "WorkflowDetail", actions: new EnterText({ text: "select-on-error" }) });
+
+        // Step 1: left without an agent -- the row the validation will name.
+        When.waitFor({ id: "addStepButton", viewName: "WorkflowDetail", actions: new Press() });
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(selectedIndexOf(element as Table), 0, "the first added step is selected");
+            }
+        });
+        Then.waitFor({
+            id: "stepEditor",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.ok((element as Control).getVisible(), "the editor replaces the empty state");
+            }
+        });
+
+        // Step 2: valid, and selected as it is added.
+        When.waitFor({ id: "addStepButton", viewName: "WorkflowDetail", actions: new Press() });
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const table = element as Table;
+                Opa5.assert.strictEqual(selectedIndexOf(table), 1, "adding a second step selects it");
+                const model = table.getModel("workflow") as JSONModel;
+                const steps = model.getProperty("/data/steps") as StepRow[];
+                steps[1].agent_name = "gmail-agent";
+                model.setProperty("/data/steps", steps);
+            }
+        });
+        Then.waitFor({
+            id: "stepEditorTitle",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Title).getText(), "Step 2", "the editor is on the new row");
+            }
+        });
+
+        When.waitFor({ id: "saveWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        Then.waitFor({
+            controlType: "sap.m.Dialog",
+            searchOpenDialogs: true,
+            matchers: function (element: UI5Element) {
+                const dialog = element as Dialog;
+                const text = dialog.getDomRef()?.textContent ?? "";
+                return dialog.getTitle() === "Error" && text.indexOf("Step 1: An agent step must name an agent.") !== -1;
+            },
+            success: function () {
+                Opa5.assert.ok(true, "the client-side validation names the row without an agent");
+            },
+            errorMessage: "No 'Error' dialog naming step 1 appeared"
+        });
+        When.waitFor({
+            controlType: "sap.m.Button",
+            searchOpenDialogs: true,
+            matchers: function (element: UI5Element) { return (element as Button).getVisible(); },
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(selectedIndexOf(element as Table), 0, "the offending row is selected");
+            }
+        });
+        Then.waitFor({
+            id: "stepEditorTitle",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Title).getText(), "Step 1", "and the editor shows it, agent field in view");
+            }
+        });
+        Then.waitFor({
+            id: "stepAgent",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Select).getSelectedKey(), "", "with no agent chosen yet");
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "moving the selected step keeps it selected, and the editor follows it",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        // Select "Draft a support reply." (support #1) and move it down.
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return stepRowMatching(element as Table, "Draft a support reply."); },
+            actions: new Press()
+        });
+        Then.waitFor({
+            id: "stepInstructions",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return (element as TextArea).getValue() === "Draft a support reply."; },
+            success: function () { Opa5.assert.ok(true, "the support step is in the editor"); }
+        });
+        When.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) {
+                const row = stepRowMatching(element as Table, "Draft a support reply.");
+                return (row.getCells()[CELL_ACTIONS] as HBox).getItems()[1];
+            },
+            actions: new Press()
+        });
+
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            check: function (element: UI5Element) { return selectedIndexOf(element as Table) === 3; },
+            success: function (element: UI5Element) {
+                const table = element as Table;
+                Opa5.assert.strictEqual(
+                    (table.getSelectedItem() as ColumnListItem).getBindingContext("workflow")?.getProperty("instructions"),
+                    "Draft a support reply.",
+                    "the moved row is still the selected one, now last"
+                );
+            }
+        });
+        Then.waitFor({
+            id: "stepEditorTitle",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Title).getText(), "Step 4", "the editor followed the row to its new number");
+            }
+        });
+        Then.waitFor({
+            id: "stepInstructions",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as TextArea).getValue(), "Draft a support reply.", "and still shows its instructions");
             }
         });
 

@@ -8,13 +8,20 @@ import { AdminError } from "../service/AdminService";
 import { buildDefinitionGraph } from "../model/processFlowGraph";
 import { canMoveWithinGroup, groupSteps, swap } from "../model/workflowOrder";
 import {
-    emptyRule, emptyUiConfig, kindOf, uiConfigFromWire, wireConfigFromUi
+    emptyRule, emptyUiConfig, kindOf, stepKindIcon, stepListSummary, uiConfigFromWire, wireConfigFromUi
 } from "../model/stepKinds";
 import type { UiStepConfig } from "../model/stepKinds";
+import { counterText } from "../model/textStats";
+import { MAIN_LINE_KEY } from "../model/NullableKey";
 import { validateWorkflowSteps } from "../model/validators";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
+import type Table from "sap/m/Table";
+import type Dialog from "sap/m/Dialog";
+import type Panel from "sap/m/Panel";
+import type ListItemBase from "sap/m/ListItemBase";
+import type { ListBase$SelectionChangeEvent } from "sap/m/ListBase";
 import type ProcessFlowNode from "sap/suite/ui/commons/ProcessFlowNode";
 import type { FlowNode } from "../model/processFlowGraph";
 import type {
@@ -62,6 +69,9 @@ interface UiStep extends WorkflowStep {
      * hand a formatter. */
     canUp?: boolean;
     canDown?: boolean;
+    /** 1-based row number shown in the step list; also what the
+     * validation messages call "Step N". Set by `applyMoveFlags`. */
+    rowNo?: number;
 }
 
 interface UiWorkflowData extends Omit<WorkflowInput, "steps"> {
@@ -80,7 +90,10 @@ export default class WorkflowDetail extends BaseController {
             title: "",
             data: JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData,
             availableAgents: [],
-            errors: {}
+            errors: {},
+            // --- step editor --- which row of /data/steps the editor shows
+            // (-1: none, empty state), and the text dialog's scratch value.
+            ui: { selectedStep: -1, dialogText: "", dialogTitle: "" }
         }), "workflow");
         // Its own model, so redrawing the graph cannot feed back into the
         // editor state it was drawn from.
@@ -118,6 +131,10 @@ export default class WorkflowDetail extends BaseController {
         return this.withBusy(async () => {
             const model = this.getModel("workflow") as JSONModel;
             model.setProperty("/errors", {});
+            // The router reuses this controller across workflows, so a
+            // selection left over from the previous one must not point the
+            // editor at a row of the next.
+            this.selectStep(-1);
 
             // Fetched before either branch below returns: a step's agent <Select>
             // needs the full agent list (disabled agents included -- a disabled
@@ -135,6 +152,7 @@ export default class WorkflowDetail extends BaseController {
                 model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData);
                 model.setProperty("/title", this.text("newWorkflow"));
                 this.refreshStepOptions();
+                this.selectStep(-1);
                 return;
             }
 
@@ -170,6 +188,9 @@ export default class WorkflowDetail extends BaseController {
             } as UiWorkflowData);
             model.setProperty("/title", workflow.name);
             this.refreshStepOptions();
+            // Open on the first step so the editor is not empty for a
+            // workflow that has steps.
+            this.selectStep((model.getProperty("/data/steps") as UiStep[]).length ? 0 : -1);
         });
     }
 
@@ -213,7 +234,10 @@ export default class WorkflowDetail extends BaseController {
         const branches = (this.getModel("workflow") as JSONModel).getProperty("/data/branches") as WorkflowBranch[];
         const keys = branches.map((b) => (b.key || "").trim()).filter(Boolean);
         const options: RowOption[] = [
-            { key: "", text: this.text("stepMainLine"), enabled: true },
+            // MAIN_LINE_KEY, not "": sap.m.Select shows nothing for an empty
+            // selectedKey. The NullableKey binding type on the dropdown maps
+            // the sentinel to the model's null.
+            { key: MAIN_LINE_KEY, text: this.text("stepMainLine"), enabled: true },
             ...keys.map((k) => ({ key: k, text: k, enabled: true }))
         ];
         const normalized = (branchKey || "").trim();
@@ -259,7 +283,14 @@ export default class WorkflowDetail extends BaseController {
         const model = this.getModel("workflow") as JSONModel;
         const branches = model.getProperty("/data/branches") as WorkflowBranch[];
         const steps = model.getProperty("/data/steps") as UiStep[];
-        model.setProperty("/data/steps", groupSteps(steps, branches));
+        // groupSteps keeps the row objects, so the selected one can be
+        // found again wherever grouping moved it.
+        const selected = steps[this.selectedIndex()];
+        const grouped = groupSteps(steps, branches);
+        model.setProperty("/data/steps", grouped);
+        if (selected) {
+            model.setProperty("/ui/selectedStep", grouped.indexOf(selected));
+        }
         this.applyMoveFlags();
     }
 
@@ -281,6 +312,7 @@ export default class WorkflowDetail extends BaseController {
 
         model.setProperty("/data/steps", steps.map((s, index) => ({
             ...s,
+            rowNo: index + 1,
             canUp: canMoveWithinGroup(steps, index, -1),
             canDown: canMoveWithinGroup(steps, index, 1)
         })));
@@ -290,6 +322,9 @@ export default class WorkflowDetail extends BaseController {
             canUp: index > 0,
             canDown: index < branches.length - 1
         })));
+        // Replacing the array re-creates the list items, so the selection
+        // has to be put back on the row the editor is showing.
+        this.applySelection();
         this.refreshFlow();
     }
 
@@ -302,7 +337,13 @@ export default class WorkflowDetail extends BaseController {
         if (!canMoveWithinGroup(steps, index, delta)) {
             return;
         }
+        const selected = this.selectedIndex();
         model.setProperty("/data/steps", swap(steps, index, delta));
+        if (selected === index) {
+            model.setProperty("/ui/selectedStep", index + delta);
+        } else if (selected === index + delta) {
+            model.setProperty("/ui/selectedStep", index);
+        }
         this.applyMoveFlags();
     }
 
@@ -378,6 +419,7 @@ export default class WorkflowDetail extends BaseController {
             branchOptions: this.buildBranchOptionsForStep(null)
         });
         model.setProperty("/data/steps", steps);
+        model.setProperty("/ui/selectedStep", steps.length - 1);
         this.applyMoveFlags();
     }
 
@@ -387,7 +429,176 @@ export default class WorkflowDetail extends BaseController {
         const steps = (model.getProperty("/data/steps") as UiStep[]).slice();
         steps.splice(index, 1);
         model.setProperty("/data/steps", steps);
+        const selected = this.selectedIndex();
+        if (selected === index) {
+            // The neighbour that took its place, else the one before it.
+            model.setProperty("/ui/selectedStep", Math.min(index, steps.length - 1));
+        } else if (selected > index) {
+            model.setProperty("/ui/selectedStep", selected - 1);
+        }
         this.applyMoveFlags();
+    }
+
+    // --- step editor (master-detail) ------------------------------------
+
+    private selectedIndex(): number {
+        const value = (this.getModel("workflow") as JSONModel).getProperty("/ui/selectedStep") as number;
+        return typeof value === "number" && value >= 0 ? value : -1;
+    }
+
+    /** Shows step `index` in the editor and selects its row; -1 (or an
+     * index past the end) clears both and shows the empty state. */
+    public selectStep(index: number): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const count = ((model.getProperty("/data/steps") as UiStep[]) || []).length;
+        model.setProperty("/ui/selectedStep", index >= 0 && index < count ? index : -1);
+        this.applySelection();
+    }
+
+    /**
+     * Points the editor and the list at `/ui/selectedStep`.
+     *
+     * The editor is element-bound to the row's path, so its fields keep
+     * their plain relative two-way bindings; a replaced `/data/steps`
+     * array resolves through the same path to the new row object. The
+     * list's own selection is index-based too (`rememberSelections`), so
+     * it is set explicitly after every re-order.
+     */
+    private applySelection(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const count = ((model.getProperty("/data/steps") as UiStep[]) || []).length;
+        let index = this.selectedIndex();
+        if (index >= count) {
+            index = -1;
+            model.setProperty("/ui/selectedStep", -1);
+        }
+        const editor = this.byId("stepEditor") as Panel | undefined;
+        const table = this.byId("stepsTable") as Table | undefined;
+        if (index < 0) {
+            editor?.unbindElement("workflow");
+            table?.removeSelections(true);
+            return;
+        }
+        const path = `/data/steps/${index}`;
+        if (editor && editor.getElementBinding("workflow")?.getPath() !== path) {
+            editor.bindElement({ path, model: "workflow" });
+        }
+        const item = table?.getItems()[index];
+        if (table && item && table.getSelectedItem() !== item) {
+            table.setSelectedItem(item, true);
+        }
+    }
+
+    public onStepSelectionChange(event: ListBase$SelectionChangeEvent): void {
+        const item = event.getParameter("listItem") as ListItemBase | undefined;
+        const path = item?.getBindingContext("workflow")?.getPath() ?? "";
+        const index = Number(path.substring(path.lastIndexOf("/") + 1));
+        if (Number.isFinite(index) && event.getParameter("selected")) {
+            this.selectStep(index);
+        }
+    }
+
+    /** "Step N" over the editor: the same number the list shows and the
+     * validation messages use. */
+    public stepEditorTitle(index: number): string {
+        return index >= 0 ? this.text("stepEditorTitle", [index + 1]) : "";
+    }
+
+    public stepBranchText(branchKey: string | null): string {
+        return (branchKey || "").trim() || this.text("stepMainLine");
+    }
+
+    public stepKindIcon(kind: string | undefined): string {
+        return stepKindIcon(kind);
+    }
+
+    public stepKindText(kind: string | undefined): string {
+        const key: Record<string, string> = {
+            agent: "stepKindAgent", condition: "stepKindCondition", transform: "stepKindTransform",
+            http: "stepKindHttp", python: "stepKindPython"
+        };
+        return this.text(key[kindOf({ kind: kind as UiStep["kind"] })]);
+    }
+
+    /** The list row's summary, from the fields that can change it, bound
+     * as parts: a JSONModel binding to the `cfg` object itself would not
+     * notice a field edited in place, and the formatter runs bound to the
+     * controller, so the row cannot be read off the control either. */
+    public stepRowSummary(
+        kind: UiStep["kind"], instructions: string, rules: UiStepConfig["rules"] | undefined,
+        extractJson: string, regexPattern: string, template: string, truncate: string,
+        method: UiStepConfig["method"], destination: string, path: string, code: string
+    ): string {
+        const k = kindOf({ kind });
+        const cfg: UiStepConfig = {
+            ...emptyUiConfig(k),
+            rules: rules || [],
+            extract_json: extractJson || "",
+            regex_pattern: regexPattern || "",
+            template: template || "",
+            truncate: truncate || "",
+            method: method || "GET",
+            destination: destination || "",
+            path: path || "/",
+            code: code || ""
+        };
+        return stepListSummary({ kind: k, instructions: instructions || "", cfg });
+    }
+
+    public textCounter(text: string | undefined | null): string {
+        return counterText(text);
+    }
+
+    // --- text dialog ---
+
+    /** Model path of the field the open text dialog edits. */
+    private textDialogPath = "";
+
+    /** Opens the large text dialog on `path` (absolute, in the `workflow`
+     * model). The dialog edits a scratch copy; Done writes it back, Cancel
+     * (or Escape) leaves the field exactly as it was when the dialog opened. */
+    public openTextDialog(path: string, title: string): void {
+        const model = this.getModel("workflow") as JSONModel;
+        this.textDialogPath = path;
+        model.setProperty("/ui/dialogTitle", title);
+        model.setProperty("/ui/dialogText", String(model.getProperty(path) ?? ""));
+        (this.byId("stepTextDialog") as Dialog).open();
+    }
+
+    /** An Expand button: `app:prop` names the field relative to the step
+     * row the button is bound to, `app:titleKey` the i18n key of its label. */
+    public onExpandText(event: Event): void {
+        const source = event.getSource() as Control;
+        const prop = String(source.data("prop") ?? "");
+        const titleKey = String(source.data("titleKey") ?? "");
+        const rowPath = WorkflowDetail.stepPath(event);
+        if (!prop || !rowPath) {
+            return;
+        }
+        this.openTextDialog(`${rowPath}/${prop}`, titleKey ? this.text(titleKey) : "");
+    }
+
+    public onTextDialogDone(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        if (this.textDialogPath) {
+            model.setProperty(this.textDialogPath, model.getProperty("/ui/dialogText"));
+        }
+        this.closeTextDialog();
+    }
+
+    public onTextDialogCancel(): void {
+        this.closeTextDialog();
+    }
+
+    /** Escape behaves like Cancel. */
+    public onTextDialogEscape(promise: { resolve(): void }): void {
+        this.closeTextDialog();
+        promise.resolve();
+    }
+
+    private closeTextDialog(): void {
+        this.textDialogPath = "";
+        (this.byId("stepTextDialog") as Dialog | undefined)?.close();
     }
 
     /** A step row's branch, agent or fan-out changed. The two-way binding has
@@ -538,12 +749,16 @@ export default class WorkflowDetail extends BaseController {
             steps = WorkflowDetail.collectSteps(data.steps, true);
         } catch (error) {
             const [row, message] = String((error as Error).message).split("\u0000");
+            // Select the row the message names, so the field is in view
+            // once the message is dismissed.
+            this.selectStep(Number(row) - 1);
             MessageBox.error(this.text("workflowStepInvalid", [row, message ?? row]));
             return;
         }
         const stepErrors = validateWorkflowSteps(steps);
         const stepErrorRows = Object.keys(stepErrors).map(Number).sort((a, b) => a - b);
         if (stepErrorRows.length) {
+            this.selectStep(stepErrorRows[0]);
             MessageBox.error(stepErrorRows
                 .map((i) => this.text("workflowStepInvalid", [String(i + 1), stepErrors[i]]))
                 .join("\n"));
@@ -623,8 +838,8 @@ export default class WorkflowDetail extends BaseController {
 
     // --- where used ---
 
-    /** The link text on a step row: "Open <agent>", blank while the row
-     * names no agent (the link is hidden then anyway). */
+    /** The link text over the step editor: "Open <agent>", blank while the
+     * step names no agent (the link is hidden then anyway). */
     public openStepAgentText(agentName: string): string {
         return agentName ? this.text("openStepAgent", [agentName]) : "";
     }

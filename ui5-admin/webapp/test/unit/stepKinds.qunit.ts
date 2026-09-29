@@ -1,11 +1,16 @@
 import {
     emptyRule,
     emptyUiConfig,
+    firstLine,
     kindOf,
+    stepKindIcon,
+    stepListSummary,
     stepSummary,
     uiConfigFromWire,
     wireConfigFromUi,
-    STEP_KINDS
+    KIND_ICONS,
+    STEP_KINDS,
+    SUMMARY_MAX
 } from "com/agent/admin/model/stepKinds";
 import type { ConditionConfig, HttpConfig, TransformConfig } from "com/agent/admin/service/types";
 
@@ -111,4 +116,69 @@ QUnit.test("summaries say what a step does", function (assert) {
     assert.strictEqual(stepSummary({ kind: "http", config: { destination: "jira", path: "/x" } }), "GET jira/x");
     assert.strictEqual(stepSummary({ kind: "python", config: { code: "\n  output = 1\n" } }), "output = 1");
     assert.strictEqual(stepSummary({ kind: "python", config: { code: "x".repeat(60) } }).length, 41);
+});
+
+QUnit.module("stepKinds: the step list");
+
+QUnit.test("every kind has an icon, and an unknown or missing kind gets the agent's", function (assert) {
+    STEP_KINDS.forEach((kind) => {
+        assert.ok(/^sap-icon:\/\/\S+$/.test(KIND_ICONS[kind]), `${kind} has an icon`);
+    });
+    assert.strictEqual(stepKindIcon(undefined), KIND_ICONS.agent);
+    assert.strictEqual(stepKindIcon("bogus"), KIND_ICONS.agent);
+    assert.strictEqual(stepKindIcon("python"), "sap-icon://source-code");
+});
+
+QUnit.test("firstLine takes the first non-blank line and cuts it with an ellipsis", function (assert) {
+    assert.strictEqual(firstLine(""), "");
+    assert.strictEqual(firstLine(undefined), "");
+    assert.strictEqual(firstLine("\n\n  Read new mail.  \nThen reply."), "Read new mail.");
+    const long = "a".repeat(100);
+    const cut = firstLine(long);
+    assert.strictEqual(cut.length, SUMMARY_MAX, "cut to the maximum, ellipsis included");
+    assert.ok(cut.endsWith("…"));
+    assert.strictEqual(firstLine("a".repeat(SUMMARY_MAX)), "a".repeat(SUMMARY_MAX), "exactly the maximum is not cut");
+    assert.strictEqual(firstLine("hello world", 7), "hello…", "a trailing blank before the ellipsis is trimmed");
+    assert.strictEqual(firstLine("hello world", 8), "hello w…");
+});
+
+QUnit.test("an agent step's summary is the first line of its instructions", function (assert) {
+    assert.strictEqual(
+        stepListSummary({ kind: "agent", instructions: "Read new mail.\nThen triage it.", config: {} }),
+        "Read new mail."
+    );
+    assert.strictEqual(stepListSummary({ instructions: "", config: {} }), "", "a step without a kind is an agent step");
+});
+
+QUnit.test("a deterministic step's summary follows the editor copy of its config, not the stored one", function (assert) {
+    const cfg = emptyUiConfig("http");
+    cfg.method = "POST";
+    cfg.destination = "jira";
+    cfg.path = "/rest/api/2/issue";
+    assert.strictEqual(
+        stepListSummary({ kind: "http", instructions: "", config: { method: "GET", destination: "old", path: "/" }, cfg }),
+        "POST jira/rest/api/2/issue"
+    );
+    const py = emptyUiConfig("python");
+    py.code = "\n  output = text.upper()\nprint(1)";
+    assert.strictEqual(stepListSummary({ kind: "python", instructions: "", cfg: py }), "output = text.upper()");
+    const cond = emptyUiConfig("condition");
+    cond.rules = [emptyRule(), emptyRule()];
+    assert.strictEqual(stepListSummary({ kind: "condition", instructions: "", cfg: cond }), "2 rules");
+});
+
+QUnit.test("a JSON field that does not parse yet falls back to the stored config", function (assert) {
+    const cfg = emptyUiConfig("http");
+    cfg.destination = "typed";
+    cfg.query_text = "{not json";
+    assert.strictEqual(
+        stepListSummary({ kind: "http", instructions: "", config: { method: "GET", destination: "stored", path: "/x" }, cfg }),
+        "GET stored/x",
+        "the half-typed header never blanks the row"
+    );
+    assert.strictEqual(
+        stepListSummary({ kind: "http", instructions: "", cfg }),
+        "GET /",
+        "with nothing stored either, the empty http summary"
+    );
 });
