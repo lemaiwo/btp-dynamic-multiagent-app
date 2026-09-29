@@ -213,6 +213,9 @@
         /* --- text editor modal --- a large editor over the workflow modal */
         #text-editor-modal { z-index: 20; padding-top: 3vh; }
         #text-editor-modal .modal { width: 960px; max-width: 96vw; max-height: 94vh; }
+        /* The workflow editor holds one card per step, each with a multi-line
+           instructions field: give it the room a form of that size needs. */
+        #workflow-modal .modal { width: 1040px; max-width: 96vw; max-height: 92vh; }
         #text-editor-textarea {
             width: 100%; height: calc(94vh - 170px); min-height: 240px; max-height: 80vh;
             font-size: 14px; line-height: 1.5; resize: vertical;
