@@ -37,6 +37,9 @@ DEFAULT_LIFETIME_SECONDS = 300
 
 DESTINATION_PATH = "/destination-configuration/v1/destinations/"
 
+# Additional destination properties of this form are sent as request headers.
+_STATIC_HEADER_PREFIX = "URL.headers."
+
 MISSING_BINDING_MESSAGE = (
     "no destination service binding found. On Cloud Foundry, bind a "
     "'destination' service instance to the app. Locally, set "
@@ -264,10 +267,23 @@ class DestinationResolver:
         if not url:
             raise DestinationError(f"destination {self.name!r} has no URL configured")
 
-        headers: dict[str, str] = {}
+        # Static headers set as `URL.headers.<Name>` additional properties.
+        # This is how a destination carries a long-lived bearer token the
+        # target issues itself (a Slack bot token): NoAuthentication plus
+        # `URL.headers.Authorization = Bearer ...`.
+        headers: dict[str, str] = {
+            key[len(_STATIC_HEADER_PREFIX):]: str(value).strip()
+            for key, value in config.items()
+            if key.startswith(_STATIC_HEADER_PREFIX)
+            and key[len(_STATIC_HEADER_PREFIX):]
+            and str(value or "").strip()
+        }
         lifetime = DEFAULT_LIFETIME_SECONDS
         tokens = (payload or {}).get("authTokens") or []
         if not tokens:
+            if any(k.lower() == "authorization" for k in headers):
+                deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
+                return Destination(url=url, headers=headers, expires_at=deadline)
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
             # the bare 401-after-one-retry the caller would otherwise report,
@@ -275,8 +291,9 @@ class DestinationResolver:
             raise DestinationError(
                 f"destination {self.name!r} returned no authentication token; "
                 f"check its Authentication type in the subaccount -- this "
-                f"integration needs OAuth2ClientCredentials, and a destination "
-                f"set to NoAuthentication carries no credential to send"
+                f"integration needs OAuth2ClientCredentials, or NoAuthentication "
+                f"with a URL.headers.Authorization property, and this "
+                f"destination carries neither"
             )
         token = tokens[0] or {}
         if token.get("error"):

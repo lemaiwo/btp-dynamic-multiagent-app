@@ -190,7 +190,7 @@ async def main() -> None:
     check("recognises builtin:gmail", is_builtin_url(BUILTIN_GMAIL_URL))
     check("case/space tolerant", is_builtin_url("  Builtin:Gmail "))
     check("rejects https URLs", not is_builtin_url("https://host/mcp"))
-    check("rejects unknown builtins", not is_builtin_url("builtin:slack"))
+    check("rejects unknown builtins", not is_builtin_url("builtin:discord"))
 
     # --- search_threads ----------------------------------------------------
     # threads.list returns only id+snippet, so headers come from a per-thread
@@ -336,7 +336,7 @@ async def main() -> None:
                                  "scope": "s"})
     check("accepts builtin:gmail", ok.url == BUILTIN_GMAIL_URL)
 
-    for bad in ["builtin:slack", "builtin:", "builtin"]:
+    for bad in ["builtin:discord", "builtin:", "builtin"]:
         try:
             McpServerPayload(url=bad, auth_mode="none")
             check(f"rejects {bad!r}", False, "accepted")

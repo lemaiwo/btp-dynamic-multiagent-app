@@ -68,6 +68,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   becomes the verdict callout, and the tool's `status` (`ok`/`attention`)
   tints it. Replies stay plain text — a report shell on an answer to a person
   would read as a newsletter
+- `agents/teams_tools.py` — Teams channels over Microsoft Graph
+  (`builtin:teams`). One `team` (and optionally `channels`) is pinned in
+  config, never a tool argument. `oauth2` reads and, with `allow_send`,
+  posts as the signed-in user; `app_only` is read-only because Graph refuses
+  application posts. Unit-tested only; setup notes are in the module docstring
+- `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
+  bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
+  BTP destination (NoAuthentication + `URL.headers.Authorization`, which
+  `agents/destination.py` sends as a static header). Scope is the channels the
+  bot is in, or a pinned `channels` list; posting needs `allow_send`, and
+  posted text is escaped so it cannot `<!channel>` or mention anyone.
+  Unit-tested only; Slack + BTP setup guide in `SLACK_SETUP.md`
 - `agents/destination.py` — resolves a BTP destination (URL + ready
   `Authorization` header) from the destination service, cached until its
   token nears expiry. Stores no credential for the target: the destination
@@ -119,7 +131,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is unchanged and still the supported admin at
   `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
-  `docs/UI5_ADMIN.md`
+  `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
+  `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
+  auth modes the server accepts per built-in
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the

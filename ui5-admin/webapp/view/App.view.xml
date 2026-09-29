@@ -16,7 +16,24 @@
                 <ToolbarSpacer />
                 <Title text="{i18n>appTitle}" level="H1" />
                 <ToolbarSpacer />
-                <Text text="{appView>/userLabel}" />
+                <!-- The signed-in user sits behind this icon rather than on the
+                     header itself: an XSUAA label is an email address, which is
+                     both long enough to crowd the title on a narrow window and
+                     not something to leave on screen during a shared session. -->
+                <MenuButton
+                    id="userMenu"
+                    icon="sap-icon://person-placeholder"
+                    type="Transparent"
+                    tooltip="{i18n>userMenuTooltip}">
+                    <menu>
+                        <Menu id="userMenuList">
+                            <MenuItem
+                                id="userMenuName"
+                                icon="sap-icon://person-placeholder"
+                                text="{appView>/userLabel}" />
+                        </Menu>
+                    </menu>
+                </MenuButton>
             </tnt:ToolHeader>
         </tnt:header>
         <tnt:sideContent>

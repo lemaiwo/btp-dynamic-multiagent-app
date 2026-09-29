@@ -42,7 +42,10 @@ export default class App extends BaseController {
             // rather than to a specific item. attachRouteMatched below
             // still fires in time for every real route, cold load included.
             selectedKey: "",
-            userLabel: ""
+            // The header's user menu always has this one entry, so it carries a
+            // placeholder until whoami answers (and keeps it if that call
+            // fails) rather than opening onto an empty menu.
+            userLabel: this.text("userUnknown")
         });
         this.setModel(model, "appView");
 
@@ -76,7 +79,11 @@ export default class App extends BaseController {
             "Could not read the signed-in user."
         );
         if (who) {
-            (this.getModel("appView") as JSONModel).setProperty("/userLabel", who.label);
+            // Locally there is no XSUAA, so the token carries neither email nor
+            // user_name and the label comes back empty; the opaque principal is
+            // still better than a blank menu entry.
+            const label = who.label || who.principal || this.text("userUnknown");
+            (this.getModel("appView") as JSONModel).setProperty("/userLabel", label);
         }
     }
 

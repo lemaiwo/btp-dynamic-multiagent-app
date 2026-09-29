@@ -102,6 +102,17 @@ export type OAuthClient =
            * the choice must not be one an injected instruction can make.
            */
           recipients?: string;
+          /**
+           * `builtin:teams` only. The id of the one team the toolset may read
+           * (and, with `allow_send` on oauth2, post to). Pinned, never a tool
+           * argument. See agents/teams_tools.py.
+           */
+          team?: string;
+          /**
+           * `builtin:teams` only. Comma-separated channel names or ids that
+           * narrow `team` further; blank means every channel of the team.
+           */
+          channels?: string;
       };
 
 export interface McpServer {
