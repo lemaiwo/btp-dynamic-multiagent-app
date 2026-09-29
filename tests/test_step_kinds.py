@@ -440,6 +440,7 @@ async def test_python_prints_do_not_corrupt_the_result():
 def test_python_env_is_minimal_and_carries_no_secrets(monkeypatch):
     monkeypatch.setenv("CANARY_SECRET", "s3cret-value")
     monkeypatch.setenv("VCAP_SERVICES", '{"x": 1}')
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
     env = sk.python_step_env()
     assert env == {"PATH": "/usr/bin:/bin"}
     # The runner itself, started the way the step starts it, sees no canary:
@@ -455,6 +456,17 @@ def test_python_env_is_minimal_and_carries_no_secrets(monkeypatch):
     )
     seen = json.loads(result.stdout)
     assert "CANARY_SECRET" not in seen["env"] and "VCAP_SERVICES" not in seen["env"]
+
+
+def test_python_env_carries_the_library_path_and_nothing_else(monkeypatch):
+    """The CF Python buildpack links the interpreter against a libpython under
+    /home/vcap/deps, found only through LD_LIBRARY_PATH: without it every python
+    step dies with exit code 127 before running a line."""
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/home/vcap/deps/0/python/lib")
+    monkeypatch.setenv("CANARY_SECRET", "s3cret-value")
+    monkeypatch.setenv("VCAP_SERVICES", '{"x": 1}')
+    env = sk.python_step_env()
+    assert env == {"PATH": "/usr/bin:/bin", "LD_LIBRARY_PATH": "/home/vcap/deps/0/python/lib"}
 
 
 async def test_python_subprocess_is_started_with_the_minimal_env(monkeypatch):

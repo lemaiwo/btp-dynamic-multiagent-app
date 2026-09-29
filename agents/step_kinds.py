@@ -66,6 +66,10 @@ RUNNER_PATH = Path(__file__).resolve().parent / "_python_step_runner.py"
 # The python subprocess sees exactly this environment: no VCAP_SERVICES, no
 # AICORE_*, no DATABASE_URL. PATH alone, so the interpreter can start.
 PYTHON_STEP_ENV: dict[str, str] = {"PATH": "/usr/bin:/bin"}
+# ...plus these, copied from the parent when set. On CF the buildpack's
+# interpreter finds its libpython only through LD_LIBRARY_PATH; without it the
+# child exits 127 before running a line. A library path, never a credential.
+PYTHON_STEP_PASSTHROUGH: tuple[str, ...] = ("LD_LIBRARY_PATH",)
 PYTHON_STEP_MEMORY_BYTES = 256 * 1024 * 1024
 PYTHON_STEP_OUTPUT_CAP = 64 * 1024
 HTTP_BODY_EXCERPT = 500
@@ -740,8 +744,14 @@ def _describe_statuses(codes: list[int]) -> str:
 # python
 # ---------------------------------------------------------------------------
 def python_step_env() -> dict[str, str]:
-    """The child's whole environment. Deliberately not derived from os.environ."""
-    return dict(PYTHON_STEP_ENV)
+    """The child's whole environment: a fixed PATH plus an allowlist copied
+    from os.environ. Never os.environ itself."""
+    env = dict(PYTHON_STEP_ENV)
+    for name in PYTHON_STEP_PASSTHROUGH:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    return env
 
 
 def _limits(cpu_seconds: int):
