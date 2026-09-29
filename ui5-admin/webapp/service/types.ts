@@ -108,6 +108,14 @@ export type OAuthClient =
            */
           from?: string;
           /**
+           * `builtin:smtp` and `builtin:outlook` only. The look of originated
+           * mail: `band`, `band_text`, `band_sub`, `accent`, `link`,
+           * `heading`, `head_cell`, `zebra`, `shell` (hex colours), `font`,
+           * `logo_url` (https), `org_name`, `footer`. Validated server-side
+           * by `MailTheme.from_config` in agents/mail_render.py.
+           */
+          theme?: Record<string, string>;
+          /**
            * `builtin:teams` only. The id of the one team the toolset may read
            * (and, with `allow_send` on oauth2, post to). Pinned, never a tool
            * argument. See agents/teams_tools.py.

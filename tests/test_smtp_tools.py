@@ -553,3 +553,104 @@ async def test_destination_health_resolves_a_mail_destination_by_its_properties(
     assert entry["state"] == "resolvable", entry
     assert entry["auth_type"] == "BasicAuthentication"
     assert PASSWORD not in json.dumps(entry)
+
+
+# --- mail theme -------------------------------------------------------------------
+
+THEME = {"band": "#102030", "accent": "#e0a010", "link": "#123abc",
+         "logo_url": "https://example.com/logo.png", "org_name": "Example Org",
+         "footer": "Sent by the example platform"}
+
+
+async def test_send_mail_html_carries_the_configured_theme():
+    toolset, _ = _toolset(theme=THEME)
+    await _send(toolset, body="All green.\n\nSee [the run](https://example.com/run).")
+    msg = _parsed(FakeSMTP.instances[0])
+    html = msg.get_body(("html",)).get_content()
+    assert "background-color:#102030" in html
+    assert "#e0a010" in html
+    assert "color:#123abc" in html
+    assert '<img src="https://example.com/logo.png"' in html
+    assert "Sent by the example platform" in html
+    assert "#1f3348" not in html
+    # The plain-text part is untouched by the theme.
+    assert "#102030" not in msg.get_body(("plain",)).get_content()
+
+
+def test_a_bad_theme_is_refused_at_build():
+    with pytest.raises(ValueError, match="band"):
+        _toolset(theme={"band": "blue"})
+
+
+def test_admin_accepts_a_theme_on_smtp():
+    p = _payload(destination="MAIL_RELAY", recipients="team@example.com", allow_send=True,
+                 theme=THEME)
+    assert p.oauth.to_config()["theme"] == THEME
+
+
+@pytest.mark.parametrize("theme,message", [
+    ({"band": "blue"}, "band"),
+    ({"logo_url": "http://example.com/logo.png"}, "https"),
+    ({"bandd": "#102030"}, "unknown"),
+])
+def test_admin_refuses_a_bad_theme(theme, message):
+    with pytest.raises(ValidationError, match=message):
+        _payload(destination="MAIL_RELAY", theme=theme)
+
+
+def test_admin_refuses_a_theme_on_a_server_that_sends_no_mail():
+    from agents.admin import McpServerPayload
+
+    with pytest.raises(ValidationError, match="theme"):
+        McpServerPayload(url="builtin:jira", auth_mode="destination",
+                         oauth={"destination": "JIRA", "project": "ABC",
+                                "theme": {"band": "#102030"}})
+
+
+def test_admin_api_answers_422_on_a_bad_theme():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from agents.admin import McpServerPayload
+
+    app = FastAPI()
+
+    def probe(server) -> dict:
+        return {"ok": True}
+
+    # This module uses postponed annotations; resolve the body model here.
+    probe.__annotations__["server"] = McpServerPayload
+    app.post("/probe")(probe)
+
+    client = TestClient(app)
+    base = {"url": "builtin:smtp", "auth_mode": "destination",
+            "oauth": {"destination": "MAIL_RELAY"}}
+    assert client.post("/probe", json=base).status_code == 200
+    bad = {**base, "oauth": {"destination": "MAIL_RELAY", "theme": {"link": "javascript:x"}}}
+    r = client.post("/probe", json=bad)
+    assert r.status_code == 422
+    assert "link" in r.text
+
+
+def test_storage_keeps_the_theme_through_save_load_build():
+    from agents.db import _clean_oauth
+
+    stored = _clean_oauth({"destination": "MAIL_RELAY", "recipients": "a@example.com",
+                           "allow_send": True, "theme": THEME},
+                          "destination", None, url="builtin:smtp")
+    assert stored["theme"] == THEME
+    # What the registry hands the factory is the stored block.
+    toolset = smtp_toolset(json.loads(json.dumps(stored)), resolver=FakeResolver(None),
+                           auth_mode="destination")
+    assert "send_mail" in toolset.tools
+
+
+def test_storage_drops_an_empty_theme_and_refuses_a_bad_one():
+    from agents.db import _clean_oauth
+
+    out = _clean_oauth({"destination": "D", "theme": {}}, "destination", None,
+                       url="builtin:smtp")
+    assert "theme" not in out
+    with pytest.raises(ValueError, match="band"):
+        _clean_oauth({"destination": "D", "theme": {"band": "x"}}, "destination", None,
+                     url="builtin:smtp")

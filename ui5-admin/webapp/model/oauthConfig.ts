@@ -61,6 +61,17 @@ const DESTINATION_BUILTIN_KEYS: Record<string, string[]> = {
 /** Built-ins whose destination may act as the signed-in user. */
 const DESTINATION_USER_CONTEXT_URLS = ["builtin:gmail", "builtin:outlook", "builtin:teams"];
 
+/**
+ * Built-ins that originate report mail and so keep a `theme` object (see
+ * `MailTheme` in `agents/mail_render.py`) on whatever mode they run. Mirrors
+ * `_MAIL_THEME_URLS` in `agents/db.py` and `agents/admin.py`.
+ */
+const MAIL_THEME_URLS = ["builtin:smtp", "builtin:outlook"];
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function builtinKey(url: string): string {
     return findBuiltin(url)?.url ?? "";
 }
@@ -117,8 +128,56 @@ export default {
         return false;
     },
 
+    /** True when this url sends report mail and so takes a mail theme. */
+    supportsMailTheme(url: string): boolean {
+        return MAIL_THEME_URLS.indexOf(builtinKey(url)) > -1;
+    },
+
+    /**
+     * The "Mail theme (JSON)" textarea as a theme object. Blank is no theme.
+     * Only the JSON shape is checked here; the keys and values (hex colours,
+     * an https logo, lengths) are the server's `MailTheme.from_config`, whose
+     * 422 names the key.
+     */
+    parseMailTheme(text: string): { theme?: Record<string, unknown>; error: string } {
+        const source = (text || "").trim();
+        if (!source) {
+            return { error: "" };
+        }
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(source);
+        } catch (e) {
+            return { error: `Mail theme is not valid JSON: ${(e as Error).message}` };
+        }
+        if (!isPlainObject(parsed)) {
+            return { error: "Mail theme must be a JSON object, e.g. {\"band\": \"#1f3348\"}." };
+        }
+        return { theme: parsed, error: "" };
+    },
+
+    /** A stored theme as the textarea shows it; blank when there is none. */
+    formatMailTheme(theme: unknown): string {
+        return isPlainObject(theme) && Object.keys(theme).length
+            ? JSON.stringify(theme, null, 2)
+            : "";
+    },
+
     /** Drops blank fields so the server sees the same shape `to_config()` builds. */
     cleanOAuth(
+        raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
+    ): McpServer["oauth"] {
+        const out = this.cleanOAuthFields(raw, authMode, url) as Record<string, unknown> | undefined;
+        // The theme rides along on every mode a mail built-in runs, except
+        // DCR, which the server stores as `{dcr, scope}` only.
+        if (out && out.dcr !== true && this.supportsMailTheme(url)
+            && isPlainObject(raw.theme) && Object.keys(raw.theme).length) {
+            out.theme = Object.assign({}, raw.theme);
+        }
+        return out as McpServer["oauth"];
+    },
+
+    cleanOAuthFields(
         raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
     ): McpServer["oauth"] {
         const key = builtinKey(url);

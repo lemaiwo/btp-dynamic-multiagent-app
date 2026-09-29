@@ -52,7 +52,7 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from agents.auth import current_principal
 from agents.lookback import parse_lookback
-from agents.mail_render import render_report_html, split_subject
+from agents.mail_render import MailTheme, render_report_html, split_subject
 
 # Printed at the foot of every report this app originates. Short on purpose:
 # it says where the mail came from, and that no human saw it first.
@@ -173,8 +173,11 @@ class OutlookClient:
         mailbox: str = "",
         lookback_minutes: int | None = None,
         recipients: list[str] | None = None,
+        theme: MailTheme | None = None,
     ) -> None:
         self._http = http
+        # The look of originated mail only; replies stay plain.
+        self.theme = theme
         # Folder ids per mailbox owner. One OutlookClient serves every user of
         # the agent, and under ``/me`` each signed-in user has a different
         # Inbox; a single shared map handed the first caller's ids to everyone
@@ -396,7 +399,8 @@ class OutlookClient:
             "body": {
                 "contentType": "HTML",
                 "content": render_report_html(
-                    body, title=title, subline=subline, status=status, footer=REPORT_FOOTER
+                    body, title=title, subline=subline, status=status,
+                    footer=REPORT_FOOTER, theme=self.theme,
                 ),
             },
             "toRecipients": self._to_recipients(),
@@ -546,12 +550,18 @@ def outlook_toolset(
         recipients if recipients is not None else oauth.get("recipients")
     )
 
+    try:
+        theme = MailTheme.from_config(oauth.get("theme"))
+    except ValueError as exc:
+        raise ValueError(f"{server_key}: {exc}") from None
+
     session = http or build_http_client(oauth, server_key, auth_mode)
     client = OutlookClient(
         session,
         mailbox=resolved_mailbox,
         lookback_minutes=window,
         recipients=resolved_recipients,
+        theme=theme,
     )
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.

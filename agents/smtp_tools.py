@@ -64,7 +64,7 @@ from typing import Any, Mapping
 
 from pydantic_ai.toolsets import FunctionToolset
 
-from agents.mail_render import render_report_html, split_subject
+from agents.mail_render import MailTheme, render_report_html, split_subject
 from agents.outlook_tools import REPORT_FOOTER
 
 logger = logging.getLogger(__name__)
@@ -185,10 +185,18 @@ def _deliver(settings: SmtpSettings, message: EmailMessage, recipients: list[str
 class SmtpClient:
     """Sends originated mail through one MAIL destination."""
 
-    def __init__(self, resolver: Any, *, recipients: list[str], sender: str = "") -> None:
+    def __init__(
+        self,
+        resolver: Any,
+        *,
+        recipients: list[str],
+        sender: str = "",
+        theme: MailTheme | None = None,
+    ) -> None:
         self._resolver = resolver
         self.recipients = list(recipients)
         self.sender = sender
+        self.theme = theme
 
     @property
     def _name(self) -> str:
@@ -210,7 +218,7 @@ class SmtpClient:
         # verdict callout, tinted by `status`.
         msg.add_alternative(
             render_report_html(body, title=title, subline=subline, status=status,
-                               footer=REPORT_FOOTER),
+                               footer=REPORT_FOOTER, theme=self.theme),
             subtype="html",
         )
         return msg
@@ -311,6 +319,12 @@ def smtp_toolset(
             f"{server_key} has allow_send on but no 'recipients': the audience of "
             f"originated mail is fixed in config and never chosen by the agent"
         )
+    # Validated at build even when sending is off, so a bad theme is a rebuild
+    # error naming the key rather than a surprise the day sending is turned on.
+    try:
+        theme = MailTheme.from_config(oauth.get("theme"))
+    except ValueError as exc:
+        raise ValueError(f"{server_key}: {exc}") from None
 
     toolset = FunctionToolset()
     if not can_send:
@@ -321,6 +335,7 @@ def smtp_toolset(
         resolver or build_resolver(resolved_destination),
         recipients=resolved_recipients,
         sender=resolved_sender,
+        theme=theme,
     )
 
     @toolset.tool

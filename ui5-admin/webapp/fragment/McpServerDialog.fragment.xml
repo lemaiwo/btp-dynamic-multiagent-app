@@ -129,6 +129,20 @@
                 placeholder="{i18n>smtpFromPlaceholder}"
                 visible="{= ${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination' }" />
 
+            <!-- Kept by cleanOAuth for smtp/outlook only; see MailTheme in
+                 agents/mail_render.py for the keys. -->
+            <Label text="{i18n>mailThemeLabel}"
+                   visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
+            <TextArea
+                id="oauthMailTheme"
+                value="{server>/themeJson}"
+                rows="5"
+                width="100%"
+                placeholder="{i18n>mailThemePlaceholder}"
+                valueState="{server>/errors/themeState}"
+                valueStateText="{server>/errors/theme}"
+                visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
+
             <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"

@@ -313,5 +313,171 @@ def main() -> None:
         sys.exit(1)
 
 
+
+# --- pytest-collected: the mail theme ----------------------------------------
+# A theme is optional per-server config. Without one, the output must stay
+# byte-identical to what the renderer produced before themes existed: every
+# report already in someone's inbox is the reference.
+
+import pytest  # noqa: E402
+
+FIXTURE = ROOT / "tests" / "fixtures" / "mail_render_default.html"
+SAMPLE_BODY = """Needs attention: one job failed.
+Second verdict line.
+
+## Resources
+
+| Server | CPU | Note |
+| --- | ---: | :---: |
+| s01 | 96 | `hot` |
+| s02 | 12 | [link](https://example.com/x) |
+
+### Detail
+
+- one **bold**
+  - nested *em*
+1. first
+
+> quoted
+
+```
+code <x>
+```
+
+---
+
+Plain paragraph with `code`."""
+
+
+def _sample(theme=None) -> str:
+    kwargs = {"theme": theme} if theme is not None else {}
+    return render_report_html(SAMPLE_BODY, title="Daily check <x>", subline="2026-09-29",
+                              status="attention", footer="Footer text & more", **kwargs)
+
+
+def test_default_output_is_byte_identical_to_before_themes():
+    assert _sample() == FIXTURE.read_text()
+
+
+def test_an_empty_theme_is_the_default():
+    from agents.mail_render import MailTheme
+
+    assert _sample(MailTheme()) == FIXTURE.read_text()
+    assert MailTheme.from_config(None) == MailTheme()
+    assert MailTheme.from_config({}) == MailTheme()
+
+
+def test_themed_colours_reach_band_link_heading_tables_and_shell():
+    from agents.mail_render import MailTheme
+
+    theme = MailTheme.from_config({
+        "band": "#102030", "band_text": "#fafafa", "band_sub": "#a0b0c0",
+        "accent": "#e0a010", "link": "#123abc", "heading": "#334455",
+        "head_cell": "#eeeeee", "zebra": "#f0f0f0", "shell": "#dddddd",
+    })
+    doc = _sample(theme)
+    assert "background-color:#102030" in doc
+    assert "color:#fafafa" in doc
+    assert "color:#a0b0c0" in doc
+    assert "#e0a010" in doc, "the accent rule appears"
+    assert "color:#123abc" in doc, "links use the themed colour"
+    assert "color:#334455" in doc, "headings use the themed colour"
+    assert "background-color:#eeeeee" in doc
+    assert "background-color:#f0f0f0" in doc
+    assert "background-color:#dddddd" in doc
+    for old in ("#1f3348", "#1d6fa5", "#eef2f6", "#eef1f5"):
+        assert old not in doc, f"default colour {old} leaked into a themed mail"
+
+
+def test_status_tints_stay_semantic():
+    from agents.mail_render import MailTheme
+
+    theme = MailTheme.from_config({"band": "#102030", "accent": "#e0a010"})
+    assert "#b9770e" in _sample(theme)
+    ok = render_report_html("Fine.", title="T", status="ok", theme=theme)
+    assert "#1e7b4d" in ok
+
+
+def test_accent_is_absent_by_default():
+    from agents.mail_render import MailTheme
+
+    doc = _sample(MailTheme(band="#102030"))
+    assert "height:3px" not in doc
+
+
+def test_themed_font_is_used():
+    from agents.mail_render import MailTheme
+
+    doc = _sample(MailTheme.from_config({"font": "Georgia, 'Times New Roman', serif"}))
+    assert "font-family:Georgia, 'Times New Roman', serif" in doc
+    assert "Segoe UI" not in doc
+
+
+def test_logo_is_an_outlook_safe_img_with_escaping():
+    from agents.mail_render import MailTheme
+
+    theme = MailTheme.from_config({"logo_url": "https://example.com/logo.png?a=1&b=2",
+                                   "org_name": "Example & Co"})
+    doc = render_report_html("Body.", title="T", theme=theme)
+    assert '<img src="https://example.com/logo.png?a=1&amp;b=2"' in doc
+    assert 'alt="Example &amp; Co"' in doc
+    assert 'height="28"' in doc
+    assert 'border="0"' in doc
+    assert "width:auto" in doc
+
+
+def test_org_name_shows_in_the_band_without_a_logo_and_is_escaped():
+    from agents.mail_render import MailTheme
+
+    doc = render_report_html("Body.", title="T",
+                             theme=MailTheme.from_config({"org_name": "<b>Example</b>"}))
+    assert "&lt;b&gt;Example&lt;/b&gt;" in doc
+    assert "<b>Example</b>" not in doc
+    assert "<img" not in doc
+
+
+def test_theme_footer_overrides_the_default_footer_and_is_escaped():
+    from agents.mail_render import MailTheme
+
+    doc = render_report_html("Body.", title="T", footer="Default footer",
+                             theme=MailTheme.from_config({"footer": "Sent by <ops>"}))
+    assert "Sent by &lt;ops&gt;" in doc
+    assert "Default footer" not in doc
+
+
+@pytest.mark.parametrize("cfg,message", [
+    ({"band": "red"}, "band"),
+    ({"link": "#12345"}, "link"),
+    ({"accent": "#12345g"}, "accent"),
+    ({"zebra": "#ffffff\n"}, "zebra"),
+    ({"band": 123}, "band"),
+    ({"logo_url": "http://example.com/logo.png"}, "https"),
+    ({"logo_url": "https://example.com/a b.png"}, "logo_url"),
+    ({"logo_url": 'https://example.com/"onerror=x'}, "logo_url"),
+    ({"logo_url": "https://example.com/<x>"}, "logo_url"),
+    ({"logo_url": "https://example.com/javascript:alert(1)"}, "logo_url"),
+    ({"font": "Arial; background:url(x)"}, "font"),
+    ({"org_name": "x" * 81}, "org_name"),
+    ({"footer": "x" * 301}, "footer"),
+    ({"banner": "#ffffff"}, "unknown"),
+    ("not a dict", "object"),
+])
+def test_from_config_rejects_bad_values(cfg, message):
+    from agents.mail_render import MailTheme
+
+    with pytest.raises(ValueError, match=message):
+        MailTheme.from_config(cfg)
+
+
+def test_to_config_round_trips_only_what_was_set():
+    from agents.mail_render import MailTheme
+
+    cfg = {"band": "#102030", "logo_url": "https://example.com/l.png", "org_name": "Example"}
+    theme = MailTheme.from_config(cfg)
+    assert theme.to_config() == cfg
+    assert MailTheme.from_config(theme.to_config()) == theme
+    assert MailTheme().to_config() == {}
+
+
 if __name__ == "__main__":
     main()

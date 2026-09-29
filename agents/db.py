@@ -1259,7 +1259,32 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     return cleaned
 
 
+# Built-ins that originate report mail and so keep a `theme` block (see
+# agents/mail_render.MailTheme) next to their other keys, whatever the mode.
+_MAIL_THEME_URLS = frozenset({"builtin:smtp", "builtin:outlook"})
+
+
 def _clean_oauth(
+    oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
+) -> dict[str, Any] | None:
+    """`_clean_oauth_block`, plus the mail ``theme`` for the mail built-ins.
+
+    The theme is validated and stored as only the keys that differ from the
+    default; an empty or all-default theme stores nothing. A bad theme is a
+    ValueError, like every other malformed block.
+    """
+    cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
+    builtin = str(url or "").strip().rstrip("/").lower()
+    if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
+        from agents.mail_render import MailTheme
+
+        theme = MailTheme.from_config(oauth.get("theme")).to_config()
+        if theme:
+            cleaned["theme"] = theme
+    return cleaned
+
+
+def _clean_oauth_block(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
     """Normalize an OAuth config dict for storage.

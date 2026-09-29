@@ -41,6 +41,8 @@ from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
+from agents.mail_render import MailTheme
+from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.slack_tools import BUILTIN_SLACK_URL
 from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
@@ -269,8 +271,20 @@ class OAuthClientPayload(BaseModel):
     # mail.smtp.from. `from` on the wire and in storage; a Python keyword, so
     # the attribute is named `sender`.
     sender: str = Field(default="", max_length=320, alias="from")
+    # builtin:smtp and builtin:outlook only. The look of originated mail:
+    # colours, font, logo, org name, footer. See agents/mail_render.MailTheme.
+    theme: dict[str, Any] | None = None
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("theme")
+    @classmethod
+    def _validate_theme(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        # Validated here so a bad colour or a non-https logo is a 422 naming
+        # the key, not a registry rebuild that drops the agent.
+        if v is None:
+            return None
+        return MailTheme.from_config(v).to_config() or None
 
     @field_validator("min_score")
     @classmethod
@@ -360,6 +374,8 @@ class OAuthClientPayload(BaseModel):
             "from": self.sender.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
+        if self.theme:
+            config["theme"] = dict(self.theme)
         if self.allow_send:
             config["allow_send"] = True
         if self.allow_comment:
@@ -459,6 +475,8 @@ class McpServerPayload(BaseModel):
 
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
+        if self.oauth is not None and self.oauth.theme:
+            _validate_mail_theme(self.url, self.oauth.theme)
         # Before the per-mode rules, because the oauth2 branch below returns
         # early for DCR.
         if (
@@ -2175,6 +2193,22 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
             "oauth.user_context is on: the destination's app-level credential "
             "identifies no user, so the target mailbox has to be named"
         )
+
+
+# Built-ins that originate mail through agents/mail_render and so read a
+# `theme`. Mirrors `_MAIL_THEME_URLS` in agents/db.py.
+_MAIL_THEME_URLS = frozenset({BUILTIN_SMTP_URL, BUILTIN_OUTLOOK_URL})
+
+
+def _validate_mail_theme(url: str, theme: Any) -> None:
+    """``oauth.theme`` only where mail is originated, and only valid values."""
+    key = str(url or "").strip().rstrip("/").lower()
+    if key not in _MAIL_THEME_URLS:
+        raise ValueError(
+            f"oauth.theme is only supported for {', '.join(sorted(_MAIL_THEME_URLS))}; "
+            f"{key} sends no report mail"
+        )
+    MailTheme.from_config(theme)
 
 
 def _validate_smtp_config(cfg: dict[str, Any]) -> None:

@@ -202,3 +202,45 @@ QUnit.test("supportsUserContext names the built-ins that act as a user", functio
         assert.notOk(oauthConfig.supportsUserContext(url), url);
     });
 });
+
+QUnit.module("oauthConfig — mail theme");
+
+const THEME = { band: "#102030", logo_url: "https://example.com/logo.png", org_name: "Example" };
+
+QUnit.test("the mail built-ins keep a theme object on every mode they send from", function (assert) {
+    const smtp = oauthConfig.cleanOAuth(fullForm({ theme: THEME }), "destination", "builtin:smtp") as Record<string, unknown>;
+    assert.deepEqual(smtp.theme, THEME, "smtp on destination");
+    (["oauth2", "app_only", "destination"] as AuthMode[]).forEach((mode) => {
+        const out = oauthConfig.cleanOAuth(fullForm({ theme: THEME }), mode, "builtin:outlook") as Record<string, unknown>;
+        assert.deepEqual(out.theme, THEME, `outlook on ${mode}`);
+    });
+});
+
+QUnit.test("a theme is dropped where no report mail is sent, and when empty", function (assert) {
+    const jira = oauthConfig.cleanOAuth(fullForm({ theme: THEME }), "destination", "builtin:jira") as Record<string, unknown>;
+    assert.notOk("theme" in jira, "jira sends no mail");
+    const teams = oauthConfig.cleanOAuth(fullForm({ theme: THEME }), "oauth2", "builtin:teams") as Record<string, unknown>;
+    assert.notOk("theme" in teams, "teams sends no mail");
+    const empty = oauthConfig.cleanOAuth(fullForm({ theme: {} }), "destination", "builtin:smtp") as Record<string, unknown>;
+    assert.notOk("theme" in empty, "an empty theme is no theme");
+    assert.ok(oauthConfig.supportsMailTheme("builtin:outlook"));
+    assert.notOk(oauthConfig.supportsMailTheme("builtin:gmail"));
+});
+
+QUnit.test("parseMailTheme reads the JSON textarea", function (assert) {
+    assert.deepEqual(oauthConfig.parseMailTheme(""), { error: "" }, "blank means no theme");
+    assert.deepEqual(oauthConfig.parseMailTheme("  "), { error: "" });
+    assert.deepEqual(oauthConfig.parseMailTheme(JSON.stringify(THEME)), { theme: THEME, error: "" });
+    const broken = oauthConfig.parseMailTheme("{ band: #102030 }");
+    assert.notOk(broken.theme);
+    assert.ok(/JSON/.test(broken.error), broken.error);
+    assert.ok(/object/.test(oauthConfig.parseMailTheme("[1, 2]").error), "an array is refused");
+    assert.ok(/object/.test(oauthConfig.parseMailTheme("\"#102030\"").error), "a string is refused");
+});
+
+QUnit.test("formatMailTheme round-trips what parseMailTheme reads", function (assert) {
+    assert.strictEqual(oauthConfig.formatMailTheme(undefined), "");
+    assert.strictEqual(oauthConfig.formatMailTheme({}), "");
+    const text = oauthConfig.formatMailTheme(THEME);
+    assert.deepEqual(oauthConfig.parseMailTheme(text).theme, THEME);
+});

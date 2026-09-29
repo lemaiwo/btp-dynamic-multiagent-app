@@ -255,6 +255,8 @@ export default class AgentDetail extends BaseController {
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
+            // The mail theme is edited as JSON text; cleanOAuth gets the parsed object.
+            themeJson: oauthConfig.formatMailTheme((server.oauth as { theme?: unknown } | undefined)?.theme),
             scopeHint: "",
             errors: {}
         });
@@ -348,7 +350,22 @@ export default class AgentDetail extends BaseController {
         const serverModel = this.getModel("server") as JSONModel;
         const url = (serverModel.getProperty("/url") as string).trim();
         const authMode = serverModel.getProperty("/auth_mode") as McpServer["auth_mode"];
-        const oauthRaw = serverModel.getProperty("/oauth") as Record<string, unknown>;
+        const oauthRaw = Object.assign(
+            {}, serverModel.getProperty("/oauth") as Record<string, unknown>
+        );
+        delete oauthRaw.theme;
+        if (oauthConfig.supportsMailTheme(url)) {
+            const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);
+            if (parsedTheme.error) {
+                serverModel.setProperty("/errors", {
+                    theme: parsedTheme.error, themeState: ValueState.Error
+                });
+                return;
+            }
+            if (parsedTheme.theme) {
+                oauthRaw.theme = parsedTheme.theme;
+            }
+        }
 
         const urlError = validators.validateServerUrl(url, authMode);
         if (urlError) {

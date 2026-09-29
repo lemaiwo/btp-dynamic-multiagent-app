@@ -1763,6 +1763,22 @@ assert.ok(row.querySelector('.dest-hint').textContent.includes('URL.headers.Cook
 assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'none');
 assert.deepStrictEqual(out.oauth, { dcr: true });
 
+// 7. The mail built-ins carry an optional theme as JSON; bad JSON refuses.
+({ row, out } = addAndCollect({ url: 'builtin:smtp', auth_mode: 'destination',
+    oauth: { destination: 'MAIL', recipients: 'a@example.com', allow_send: true,
+             theme: { band: '#102030', org_name: 'Example' } } }));
+assert.strictEqual(row.querySelector('.dest-field-theme').style.display, '');
+assert.deepStrictEqual(out.oauth, { destination: 'MAIL', recipients: 'a@example.com',
+    allow_send: true, theme: { band: '#102030', org_name: 'Example' } });
+row.querySelector('.dest-theme').value = '{ band: #102030 }';
+assert.throws(() => collectMcpServers(), /Mail theme is not valid JSON/);
+row.querySelector('.dest-theme').value = '[1]';
+assert.throws(() => collectMcpServers(), /JSON object/);
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', theme: { band: '#102030' } } }));
+assert.strictEqual(row.querySelector('.dest-field-theme').style.display, 'none');
+assert.ok(!('theme' in out.oauth), 'jira sends no mail, so no theme');
+
 console.log('destination server round-trip scenarios passed');
 """
             with tempfile.NamedTemporaryFile(

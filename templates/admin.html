@@ -2014,7 +2014,13 @@ async function editAgent(id) {
 
 async function saveAgent() {
     const id = document.getElementById('agent-id').value;
-    const servers = collectMcpServers();
+    let servers;
+    try {
+        servers = collectMcpServers();
+    } catch (e) {
+        toast(e.message, 'error');
+        return;
+    }
     if (!servers.length) {
         toast('Add at least one MCP server', 'error');
         return;
@@ -2432,11 +2438,11 @@ const DESTINATION_FIELDS = {
     'builtin:jira':          ['project', 'status', 'labels', 'api_base', 'lookback', 'allow_comment'],
     'builtin:slack':         ['channels', 'lookback', 'allow_send'],
     'builtin:gmail':         ['user_context', 'mailbox'],
-    'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send'],
+    'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send', 'theme'],
     'builtin:teams':         ['user_context', 'team', 'channels', 'lookback', 'allow_send'],
     'builtin:sapnotes':      ['min_score', 'lookback'],
     'builtin:sapnotedetail': [],
-    'builtin:smtp':          ['recipients', 'from', 'allow_send'],
+    'builtin:smtp':          ['recipients', 'from', 'allow_send', 'theme'],
 };
 // Text fields, in the order they appear; the two switches are checkboxes.
 const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
@@ -2494,6 +2500,9 @@ function destinationFieldsHtml() {
                 <label class="full dest-field-allow_send">
                     <input type="checkbox" class="dest-allow_send"> Allow sending / posting
                 </label>
+                <label class="full dest-field-theme">Mail theme (JSON)
+                    <textarea class="dest-theme" rows="4" placeholder='{"band": "#1f3348", "accent": "#e0a010", "logo_url": "https://example.com/logo.png", "org_name": "Example"}'></textarea>
+                </label>
                 <label class="full dest-field-allow_comment">
                     <input type="checkbox" class="dest-allow_comment"> Allow commenting
                 </label>
@@ -2516,6 +2525,9 @@ function fillDestinationFields(row, oauth) {
     row.querySelector('.dest-user_context').checked = oauth.user_context === true;
     row.querySelector('.dest-allow_send').checked = oauth.allow_send === true;
     row.querySelector('.dest-allow_comment').checked = oauth.allow_comment === true;
+    const theme = oauth.theme;
+    row.querySelector('.dest-theme').value =
+        theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
 }
 
 /** Shows the fields the current built-in stores on a destination. */
@@ -2575,6 +2587,21 @@ function collectDestinationConfig(row) {
     }
     if (wanted.includes('allow_comment') && row.querySelector('.dest-allow_comment').checked) {
         oauth.allow_comment = true;
+    }
+    // The look of originated mail (MailTheme in agents/mail_render.py). Only
+    // the JSON shape is checked here; the server's 422 names a bad key.
+    const themeText = wanted.includes('theme') ? row.querySelector('.dest-theme').value.trim() : '';
+    if (themeText) {
+        let theme;
+        try {
+            theme = JSON.parse(themeText);
+        } catch (e) {
+            throw new Error('Mail theme is not valid JSON: ' + e.message);
+        }
+        if (!theme || typeof theme !== 'object' || Array.isArray(theme)) {
+            throw new Error('Mail theme must be a JSON object.');
+        }
+        if (Object.keys(theme).length) oauth.theme = theme;
     }
     return oauth;
 }

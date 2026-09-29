@@ -81,7 +81,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   The subject's ` -- ` tail becomes the header subline, the opening paragraph
   becomes the verdict callout, and the tool's `status` (`ok`/`attention`)
   tints it. Replies stay plain text — a report shell on an answer to a person
-  would read as a newsletter
+  would read as a newsletter. `MailTheme` (validated by `from_config`) restyles
+  band/accent/links/headings/tables/font, adds a logo or org name and replaces
+  the footer, from an optional `theme` object in a `builtin:smtp`/`builtin:outlook`
+  server's config; status tints stay fixed, and no theme renders byte-identically
 - `agents/teams_tools.py` — Teams channels over Microsoft Graph
   (`builtin:teams`). One `team` (and optionally `channels`) is pinned in
   config, never a tool argument. `oauth2` reads and, with `allow_send`,

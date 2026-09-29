@@ -599,3 +599,65 @@ async def test_a_reply_is_not_dressed_up_as_a_report():
     assert "<p>" in comment
     assert "#1f3348" not in comment, "a reply gets no header band"
     assert "<table" not in comment, "a reply gets no report shell"
+
+
+# --- pytest-collected: the mail theme ----------------------------------------
+
+_THEME = {"band": "#102030", "link": "#123abc", "org_name": "Example Org"}
+
+
+@pytest.mark.asyncio
+async def test_send_mail_uses_the_configured_theme():
+    from agents.mail_render import MailTheme
+
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"],
+                           theme=MailTheme.from_config(_THEME))
+    await client.send_mail("Report -- 2026-09-29", "All clear.")
+    content = seen["json"]["message"]["body"]["content"]
+    assert "background-color:#102030" in content
+    assert "Example Org" in content
+    assert "#1f3348" not in content
+
+
+@pytest.mark.asyncio
+async def test_the_toolset_reads_the_theme_from_config():
+    seen, http = _recorder(201)
+    toolset = outlook_toolset({"mailbox": "agent@example.com", "recipients": "team@example.com",
+                               "theme": _THEME}, http=http)
+    await toolset.tools["create_mail_draft"].function(subject="Digest", body="All clear.")
+    assert "background-color:#102030" in seen["json"]["body"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_ignores_the_theme():
+    from agents.mail_render import MailTheme
+
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"],
+                           theme=MailTheme.from_config(_THEME))
+    await client.send_reply("msg-1", "Here is the answer.")
+    assert "#102030" not in seen["json"]["comment"]
+
+
+def test_a_bad_theme_is_refused_at_build():
+    with pytest.raises(ValueError, match="unknown"):
+        outlook_toolset({"mailbox": "agent@example.com", "theme": {"colour": "#102030"}},
+                        http=httpx.AsyncClient(transport=httpx.MockTransport(
+                            lambda r: httpx.Response(200))))
+
+
+@pytest.mark.parametrize("mode,oauth", [
+    ("destination", {"destination": "GRAPH", "mailbox": "a@example.com"}),
+    ("app_only", {"client_id": "c", "client_secret": "s", "token_url": "https://login.example.com/t",
+                  "mailbox": "a@example.com"}),
+    ("oauth2", {"client_id": "c", "client_secret": "s", "uaa_url": "https://uaa.example.com"}),
+])
+def test_storage_keeps_the_outlook_theme_on_every_mode(mode, oauth):
+    from agents.admin import McpServerPayload
+    from agents.db import _clean_oauth
+
+    payload = McpServerPayload(url="builtin:outlook", auth_mode=mode,
+                               oauth={**oauth, "theme": _THEME})
+    stored = _clean_oauth(payload.oauth.to_config(), mode, None, url="builtin:outlook")
+    assert stored["theme"] == _THEME
