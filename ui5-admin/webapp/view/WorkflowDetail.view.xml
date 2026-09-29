@@ -12,6 +12,25 @@
         title="{workflow>/title}"
         showNavButton="true"
         navButtonPress=".onBack">
+        <!-- Both only for a workflow that exists on the server: a new one
+             has nothing to run or reload yet. Run now is the list page's
+             button on this page. -->
+        <headerContent>
+            <Button
+                id="runWorkflowNowButton"
+                icon="sap-icon://play"
+                text="{i18n>runNow}"
+                type="Emphasized"
+                visible="{= !!${workflow>/isExisting} }"
+                enabled="{= !${workflow>/runBusy} }"
+                press=".onRunNow" />
+            <Button
+                id="refreshWorkflowButton"
+                icon="sap-icon://refresh"
+                text="{i18n>refresh}"
+                visible="{= !!${workflow>/isExisting} }"
+                press=".onRefresh" />
+        </headerContent>
         <content>
             <VBox class="sapUiSmallMargin">
 
@@ -131,6 +150,56 @@
                             </pf:lanes>
                         </pf:ProcessFlow>
                     </VBox>
+                </Panel>
+
+                <!-- last runs: the newest runs of this workflow, loaded with
+                     the workflow and again after Run now. The full list is
+                     the Workflow Runs page. -->
+                <Panel
+                    id="workflowRunsPanel"
+                    headerText="{i18n>lastRunsPanel}"
+                    expandable="false"
+                    class="sapUiSmallMarginTop"
+                    visible="{= !!${workflow>/isExisting} }">
+                    <Table
+                        id="workflowRunsTable"
+                        items="{workflow>/runs}"
+                        noDataText="{i18n>noRunsYet}">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <Title id="workflowRunsCount" text="{workflow>/runsCount}" />
+                                <ToolbarSpacer />
+                                <Button id="refreshWorkflowRunsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefreshRuns" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>colStatus}" /></Column>
+                            <Column><Text text="{i18n>colTrigger}" /></Column>
+                            <Column><Text text="{i18n>colItems}" /></Column>
+                            <Column><Text text="{i18n>colStarted}" /></Column>
+                            <Column><Text text="{i18n>colFinished}" /></Column>
+                            <Column><Text text="{i18n>colSummary}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem type="Navigation" press=".onOpenRun">
+                                <cells>
+                                    <ObjectStatus
+                                        text="{workflow>status}"
+                                        state="{ path: 'workflow>status', formatter: '.formatter.workflowRunStatusState' }" />
+                                    <Text text="{workflow>trigger}" />
+                                    <HBox>
+                                        <ObjectNumber number="{workflow>items_total}" unit="{i18n>itemsTotal}" class="sapUiTinyMarginEnd" />
+                                        <ObjectNumber number="{workflow>items_succeeded}" unit="{i18n>itemsSucceeded}" state="Success" class="sapUiTinyMarginEnd" />
+                                        <ObjectNumber number="{workflow>items_failed}" unit="{i18n>itemsFailed}" state="Error" class="sapUiTinyMarginEnd" />
+                                        <ObjectNumber number="{workflow>items_skipped}" unit="{i18n>itemsSkipped}" />
+                                    </HBox>
+                                    <Text text="{ path: 'workflow>started_at', formatter: '.formatter.timestamp' }" />
+                                    <Text text="{ path: 'workflow>finished_at', formatter: '.formatter.timestamp' }" />
+                                    <Text text="{workflow>summary}" maxLines="2" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
                 </Panel>
 
                 <Panel headerText="{i18n>branchesPanel}" expandable="false" class="sapUiSmallMarginTop">

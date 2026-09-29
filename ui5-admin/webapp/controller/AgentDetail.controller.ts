@@ -10,12 +10,14 @@ import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
+import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
 import type Dialog from "sap/m/Dialog";
+import type ColumnListItem from "sap/m/ColumnListItem";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
 import type {
-    AgentInput, AuthMode, CredentialStatus, DeepConfig, McpServer,
+    Agent, AgentInput, AuthMode, CredentialStatus, DeepConfig, JobRun, McpServer,
     WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
 } from "../service/types";
 import { DEEP_DEFAULTS } from "../service/types";
@@ -58,6 +60,11 @@ export default class AgentDetail extends BaseController {
     /** Index being edited in the server dialog; -1 means "adding a new one". */
     private editingServerIndex = -1;
     private publicBaseUrl = "";
+    /** `canonical()` of `/data` as loaded, for the Refresh button's dirty
+     * check; undefined for a new agent or one that failed to load. */
+    private snapshot?: string;
+    /** Timers armed by Run now to reload the last-runs panel. */
+    private runRefreshTimers: ReturnType<typeof setTimeout>[] = [];
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -66,7 +73,13 @@ export default class AgentDetail extends BaseController {
             availableSkills: [],
             availableAgents: [],
             availableModels: [],
-            errors: {}
+            errors: {},
+            // --- run / refresh / last runs ---
+            isExisting: false,
+            canRun: false,
+            runBusy: false,
+            runs: [],
+            runsCount: runsCountLabel(0)
         }), "agent");
         this.setModel(new JSONModel({}), "server");
 
@@ -76,10 +89,16 @@ export default class AgentDetail extends BaseController {
         });
     }
 
+    public onExit(): void {
+        this.clearRunRefreshTimers();
+    }
+
     private load(id: string): Promise<void> {
         return this.withBusy(async () => {
             const model = this.getModel("agent") as JSONModel;
             model.setProperty("/errors", {});
+            this.clearRunRefreshTimers();
+            this.snapshot = undefined;
 
             // Issued together, not one after another: none of the three reads
             // the others' result, so awaiting them in sequence made opening an
@@ -111,6 +130,10 @@ export default class AgentDetail extends BaseController {
 
             if (id === "new") {
                 this.agentId = undefined;
+                model.setProperty("/isExisting", false);
+                model.setProperty("/canRun", false);
+                model.setProperty("/runs", []);
+                model.setProperty("/runsCount", runsCountLabel(0));
                 model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
                 model.setProperty("/title", this.text("newAgent"));
                 // Otherwise a credential table left over from whichever agent was
@@ -125,9 +148,12 @@ export default class AgentDetail extends BaseController {
             }
 
             this.agentId = Number(id);
+            model.setProperty("/isExisting", true);
             // Also independent of each other, so also issued together. The
             // base URL is only read further down, and fetching it for an agent
-            // that turns out not to exist costs nothing.
+            // that turns out not to exist costs nothing. The last runs load
+            // alongside; loadRuns() reports its own failure with a toast and
+            // leaves the panel empty, so it can never take the form with it.
             const [agent, config] = await Promise.all([
                 this.run(
                     this.getAdminService().getAgent(this.agentId),
@@ -136,9 +162,11 @@ export default class AgentDetail extends BaseController {
                 this.run(
                     this.getAdminService().getConfig(),
                     "Could not read the public base URL."
-                )
+                ),
+                this.loadRuns()
             ]);
             if (!agent) {
+                model.setProperty("/canRun", false);
                 return;
             }
             // Copy only the input fields; id/created_at/updated_at and the legacy
@@ -163,6 +191,8 @@ export default class AgentDetail extends BaseController {
                 deep: { ...DEEP_DEFAULTS, ...(agent.deep ?? {}) } as DeepConfig
             } as AgentInput);
             model.setProperty("/title", agent.name);
+            this.snapshot = canonical(model.getProperty("/data"));
+            model.setProperty("/canRun", AgentDetail.isRunnable(agent));
             // An agent must never be offered itself as a peer.
             model.setProperty("/availableAgents", (agents ?? []).filter((a) => a.name !== agent.name));
             model.setProperty(
@@ -565,6 +595,134 @@ export default class AgentDetail extends BaseController {
             .getBindingContext("agent")?.getObject() as WhereUsedPeer | undefined;
         if (peer) {
             this.getRouter().navTo("agentDetail", { agentId: String(peer.id) });
+        }
+    }
+
+    // --- run now / refresh / last runs ---
+
+    /** The list page shows its Run now button only for an agent exposed as a
+     * job API; the same rule, on the saved state, enables this page's. */
+    private static isRunnable(agent: Agent): boolean {
+        return !!agent.expose_api;
+    }
+
+    /**
+     * The newest runs of this agent, for the panel. Never throws and never
+     * goes through ErrorHandler's dialog: a failure here shows one toast and
+     * an empty panel, because it must not break opening the agent.
+     */
+    public async loadRuns(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        const id = this.agentId;
+        if (id === undefined) {
+            model.setProperty("/runs", []);
+            model.setProperty("/runsCount", runsCountLabel(0));
+            return;
+        }
+        let runs: JobRun[] = [];
+        try {
+            runs = await this.getAdminService().listRuns({ agentId: id, limit: LAST_RUNS_LIMIT });
+        } catch {
+            MessageToast.show(this.text("lastRunsLoadFailed"));
+        }
+        // Another agent may have been opened while this was in flight.
+        if (this.agentId !== id) {
+            return;
+        }
+        model.setProperty("/runs", runs);
+        model.setProperty("/runsCount", runsCountLabel(runs.length, LAST_RUNS_LIMIT));
+    }
+
+    public onRefreshRuns(): void {
+        void this.loadRuns();
+    }
+
+    public onOpenRun(event: Event): void {
+        const run = (event.getSource() as ColumnListItem)
+            .getBindingContext("agent")?.getObject() as JobRun | undefined;
+        if (run) {
+            this.getRouter().navTo("runDetail", { runId: run.id });
+        }
+    }
+
+    /**
+     * Starts a run, the way the list page does (same toast, same error
+     * handling), then reloads the panel shortly after so the run shows up
+     * as running, and once more so a short run shows its outcome. Unlike
+     * the list page it stays here rather than opening the run: the panel is
+     * the point of this page.
+     */
+    public async onRunNow(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        const id = this.agentId;
+        if (id === undefined || model.getProperty("/runBusy")) {
+            return;
+        }
+        const name = model.getProperty("/title") as string;
+        model.setProperty("/runBusy", true);
+        try {
+            const started = await this.run(
+                this.getAdminService().runNow(id),
+                `Could not start a run for "${name}".`
+            );
+            if (!started) {
+                return;
+            }
+            MessageToast.show(this.text("runStarted").replace("{0}", started.run_id));
+            this.clearRunRefreshTimers();
+            RUN_REFRESH_DELAYS_MS.forEach((delay) => {
+                this.runRefreshTimers.push(setTimeout(() => {
+                    if (this.agentId === id) {
+                        void this.loadRuns();
+                    }
+                }, delay));
+            });
+        } finally {
+            model.setProperty("/runBusy", false);
+        }
+    }
+
+    private clearRunRefreshTimers(): void {
+        this.runRefreshTimers.forEach((t) => clearTimeout(t));
+        this.runRefreshTimers = [];
+    }
+
+    /** Whether the form differs from what was loaded. */
+    private isDirty(): boolean {
+        return isDirty(this.snapshot, (this.getModel("agent") as JSONModel).getProperty("/data"));
+    }
+
+    /**
+     * Reloads the agent from the server: the form, the credential status,
+     * where-used and the last runs. Unsaved edits are lost, so it asks first
+     * when there are any.
+     */
+    public onRefresh(): void {
+        if (this.agentId === undefined) {
+            return;
+        }
+        if (!this.isDirty()) {
+            void this.reload();
+            return;
+        }
+        MessageBox.confirm(this.text("refreshDiscardConfirm"), {
+            title: this.text("refresh"),
+            emphasizedAction: MessageBox.Action.OK,
+            onClose: (action: string) => {
+                if (action === MessageBox.Action.OK) {
+                    void this.reload();
+                }
+            }
+        });
+    }
+
+    private async reload(): Promise<void> {
+        if (this.agentId === undefined) {
+            return;
+        }
+        await this.load(String(this.agentId));
+        if (this.snapshot !== undefined) {
+            MessageToast.show(this.text("reloadedFromServer"));
         }
     }
 

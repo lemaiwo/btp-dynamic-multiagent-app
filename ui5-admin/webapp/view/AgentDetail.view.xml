@@ -9,6 +9,28 @@
         title="{agent>/title}"
         showNavButton="true"
         navButtonPress=".onBack">
+        <!-- Both only for an agent that exists on the server: a new one has
+             nothing to run or reload yet. Run now is the list page's button
+             on this page; it stays enabled only under the same condition the
+             list page shows it (expose_api, as saved), with the tooltip
+             saying why otherwise. -->
+        <headerContent>
+            <Button
+                id="runAgentNowButton"
+                icon="sap-icon://play"
+                text="{i18n>runNow}"
+                type="Emphasized"
+                visible="{= !!${agent>/isExisting} }"
+                enabled="{= !!${agent>/canRun} &amp;&amp; !${agent>/runBusy} }"
+                tooltip="{= ${agent>/canRun} ? ${i18n>runNow} : ${i18n>runNotExposed} }"
+                press=".onRunNow" />
+            <Button
+                id="refreshAgentButton"
+                icon="sap-icon://refresh"
+                text="{i18n>refresh}"
+                visible="{= !!${agent>/isExisting} }"
+                press=".onRefresh" />
+        </headerContent>
         <content>
             <VBox class="sapUiSmallMargin">
 
@@ -262,6 +284,49 @@
                                         press=".onSignIn" />
                                     <Text text="{i18n>sessionHint}"
                                           visible="{= ${agent>auth_mode} === 'session' }" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
+                </Panel>
+
+                <!-- last runs: the newest job runs of this agent, loaded with
+                     the agent and again after Run now. The full list, with
+                     every agent, is the Job Runs page. -->
+                <Panel
+                    id="agentRunsPanel"
+                    headerText="{i18n>lastRunsPanel}"
+                    expandable="false"
+                    class="sapUiSmallMarginTop"
+                    visible="{= !!${agent>/isExisting} }">
+                    <Table
+                        id="agentRunsTable"
+                        items="{agent>/runs}"
+                        noDataText="{i18n>noRunsYet}">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <Title id="agentRunsCount" text="{agent>/runsCount}" />
+                                <ToolbarSpacer />
+                                <Button id="refreshAgentRunsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefreshRuns" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>colStatus}" /></Column>
+                            <Column><Text text="{i18n>colTrigger}" /></Column>
+                            <Column><Text text="{i18n>colStarted}" /></Column>
+                            <Column><Text text="{i18n>colDuration}" /></Column>
+                            <Column><Text text="{i18n>colSummary}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem type="Navigation" press=".onOpenRun">
+                                <cells>
+                                    <ObjectStatus
+                                        text="{agent>status}"
+                                        state="{ path: 'agent>status', formatter: '.formatter.runStatusState' }" />
+                                    <Text text="{agent>trigger}" />
+                                    <Text text="{ path: 'agent>started_at', formatter: '.formatter.timestamp' }" />
+                                    <Text text="{ parts: ['agent>started_at', 'agent>finished_at'], formatter: '.formatter.runDuration' }" />
+                                    <Text text="{agent>summary}" maxLines="2" />
                                 </cells>
                             </ColumnListItem>
                         </items>

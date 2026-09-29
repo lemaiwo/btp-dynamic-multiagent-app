@@ -2,6 +2,7 @@ import opaTest from "sap/ui/test/opaQunit";
 import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
+import HashChanger from "sap/ui/core/routing/HashChanger";
 import type Button from "sap/m/Button";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type CustomListItem from "sap/m/CustomListItem";
@@ -12,9 +13,12 @@ import type List from "sap/m/List";
 import type JSONModel from "sap/ui/model/json/JSONModel";
 import type MultiComboBox from "sap/m/MultiComboBox";
 import type ObjectStatus from "sap/m/ObjectStatus";
+import type Panel from "sap/m/Panel";
 import type Select from "sap/m/Select";
 import type Table from "sap/m/Table";
 import type Text from "sap/m/Text";
+import type TextArea from "sap/m/TextArea";
+import type Title from "sap/m/Title";
 import type UI5Element from "sap/ui/core/Element";
 import type StepInput from "sap/m/StepInput";
 import type Switch from "sap/m/Switch";
@@ -432,6 +436,181 @@ opaTest("an agent without a deep config saves the defaults, not nothing", functi
                 },
                 "the defaults are sent explicitly, so the backend can tell 'off' from 'not sent'"
             );
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- run now / refresh / last runs ------------------------------------------
+// FakeBackend.reset() seeds run-1 (success) and run-2 (running) for btp-agent
+// (id 100, exposed as a job API) and run-3 for gmail-agent (id 101). POST
+// agents/{id}/run records the call in backend.runNowCalls and prepends a
+// running run, which the panel's delayed reload then picks up.
+
+opaTest("an existing agent shows Run now, Refresh and its own last runs, and a run row opens the run", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "runAgentNowButton",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const button = element as Button;
+            Opa5.assert.ok(button.getVisible(), "Run now is in the header");
+            Opa5.assert.ok(button.getEnabled(), "and enabled, since the agent is exposed as a job API");
+        }
+    });
+    Then.waitFor({
+        id: "refreshAgentButton",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.ok((element as Button).getVisible(), "Refresh is in the header");
+        }
+    });
+    Then.waitFor({
+        id: "agentRunsTable",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const rows = (element as Table).getItems() as ColumnListItem[];
+            Opa5.assert.strictEqual(rows.length, 2, "only this agent's runs are listed, not the other agent's");
+            Opa5.assert.deepEqual(
+                rows.map((row) => (row.getCells()[0] as ObjectStatus).getText()),
+                ["success", "running"],
+                "newest first, with the status of each"
+            );
+            Opa5.assert.strictEqual(
+                (rows[0].getCells()[3] as Text).getText(false), "1m 30s",
+                "a finished run shows its duration"
+            );
+        }
+    });
+    Then.waitFor({
+        id: "agentRunsCount",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Title).getText(), "2 runs", "the panel header counts them");
+        }
+    });
+
+    When.waitFor({
+        id: "agentRunsTable",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) { return (element as Table).getItems()[0]; },
+        actions: new Press()
+    });
+    Then.waitFor({
+        check: function () { return HashChanger.getInstance().getHash() === "runs/run-1"; },
+        success: function () {
+            Opa5.assert.ok(true, "pressing a run row opens that run's detail");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("Run now on the detail page posts to the run endpoint and the last-runs panel picks up the new run", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    When.waitFor({ id: "runAgentNowButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        check: function () { return backend.runNowCalls.indexOf("agents/100/run") !== -1; },
+        success: function () {
+            Opa5.assert.deepEqual(backend.runNowCalls, ["agents/100/run"], "exactly one run was requested, for this agent");
+        }
+    });
+    Then.waitFor({
+        id: "agentRunsTable",
+        viewName: "AgentDetail",
+        // The panel reloads itself about a second after the run started;
+        // polled rather than asserted once.
+        check: function (element: UI5Element) { return (element as Table).getItems().length === 3; },
+        success: function (element: UI5Element) {
+            const first = (element as Table).getItems()[0] as ColumnListItem;
+            Opa5.assert.strictEqual(
+                (first.getCells()[0] as ObjectStatus).getText(), "running",
+                "the new run appears at the top as running without pressing Refresh"
+            );
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("Refresh on a dirty agent form asks first, then reloads everything from the server", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    // Make the form dirty, then change the record behind it: a reload that
+    // just restored the snapshot would not show the new description.
+    When.waitFor({ id: "agentName", viewName: "AgentDetail", actions: new EnterText({ text: "renamed-locally" }) });
+    When.waitFor({
+        id: "agentDescription",
+        viewName: "AgentDetail",
+        success: function () {
+            const agent = backend.agents.find((a) => a.id === 100);
+            if (agent) {
+                agent.description = "changed on the server";
+            }
+        }
+    });
+    When.waitFor({ id: "refreshAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    // The confirm is a MessageBox in the static area.
+    When.waitFor({
+        controlType: "sap.m.Button",
+        searchOpenDialogs: true,
+        matchers: { properties: { text: "OK" } },
+        actions: new Press(),
+        errorMessage: "no discard confirmation was shown for the dirty form"
+    });
+
+    Then.waitFor({
+        id: "agentName",
+        viewName: "AgentDetail",
+        check: function (element: UI5Element) { return (element as Input).getValue() === "btp-agent"; },
+        success: function () {
+            Opa5.assert.ok(true, "the local rename was discarded");
+        }
+    });
+    Then.waitFor({
+        id: "agentDescription",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual(
+                (element as TextArea).getValue(), "changed on the server",
+                "the form shows what the server has now, not the snapshot it was loaded with"
+            );
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a new agent has neither the header buttons nor the last-runs panel", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/new");
+
+    Then.waitFor({
+        id: "runAgentNowButton",
+        viewName: "AgentDetail",
+        visible: false,
+        success: function (element: UI5Element) {
+            Opa5.assert.notOk((element as Button).getVisible(), "nothing to run yet");
+        }
+    });
+    Then.waitFor({
+        id: "refreshAgentButton",
+        viewName: "AgentDetail",
+        visible: false,
+        success: function (element: UI5Element) {
+            Opa5.assert.notOk((element as Button).getVisible(), "nothing to reload yet");
+        }
+    });
+    Then.waitFor({
+        id: "agentRunsPanel",
+        viewName: "AgentDetail",
+        visible: false,
+        success: function (element: UI5Element) {
+            Opa5.assert.notOk((element as Panel).getVisible(), "no runs to list yet");
         }
     });
 

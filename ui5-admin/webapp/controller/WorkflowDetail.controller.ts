@@ -12,12 +12,15 @@ import {
 } from "../model/stepKinds";
 import type { UiStepConfig } from "../model/stepKinds";
 import { counterText } from "../model/textStats";
+import formatter from "../model/formatter";
+import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
 import { MAIN_LINE_KEY } from "../model/NullableKey";
 import { validateWorkflowSteps } from "../model/validators";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
 import type Table from "sap/m/Table";
+import type ColumnListItem from "sap/m/ColumnListItem";
 import type Dialog from "sap/m/Dialog";
 import type Panel from "sap/m/Panel";
 import type ListItemBase from "sap/m/ListItemBase";
@@ -25,7 +28,7 @@ import type { ListBase$SelectionChangeEvent } from "sap/m/ListBase";
 import type ProcessFlowNode from "sap/suite/ui/commons/ProcessFlowNode";
 import type { FlowNode } from "../model/processFlowGraph";
 import type {
-    Agent, WorkflowBranch, WorkflowInput, WorkflowStep
+    Agent, WorkflowBranch, WorkflowInput, WorkflowRun, WorkflowStep
 } from "../service/types";
 
 const EMPTY_WORKFLOW: WorkflowInput = {
@@ -83,7 +86,15 @@ interface UiWorkflowData extends Omit<WorkflowInput, "steps"> {
  */
 export default class WorkflowDetail extends BaseController {
 
+    public formatter = formatter;
+
     private workflowId?: number;
+    /** `canonical()` of the save payload as loaded, for the Refresh
+     * button's dirty check; undefined for a new workflow or one that
+     * failed to load. */
+    private snapshot?: string;
+    /** Timers armed by Run now to reload the last-runs panel. */
+    private runRefreshTimers: ReturnType<typeof setTimeout>[] = [];
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -93,7 +104,12 @@ export default class WorkflowDetail extends BaseController {
             errors: {},
             // --- step editor --- which row of /data/steps the editor shows
             // (-1: none, empty state), and the text dialog's scratch value.
-            ui: { selectedStep: -1, dialogText: "", dialogTitle: "" }
+            ui: { selectedStep: -1, dialogText: "", dialogTitle: "" },
+            // --- run / refresh / last runs ---
+            isExisting: false,
+            runBusy: false,
+            runs: [],
+            runsCount: runsCountLabel(0)
         }), "workflow");
         // Its own model, so redrawing the graph cannot feed back into the
         // editor state it was drawn from.
@@ -127,10 +143,16 @@ export default class WorkflowDetail extends BaseController {
         (this.getModel("flow") as JSONModel).setData(graph);
     }
 
+    public onExit(): void {
+        this.clearRunRefreshTimers();
+    }
+
     private load(id: string): Promise<void> {
         return this.withBusy(async () => {
             const model = this.getModel("workflow") as JSONModel;
             model.setProperty("/errors", {});
+            this.clearRunRefreshTimers();
+            this.snapshot = undefined;
             // The router reuses this controller across workflows, so a
             // selection left over from the previous one must not point the
             // editor at a row of the next.
@@ -149,6 +171,9 @@ export default class WorkflowDetail extends BaseController {
 
             if (id === "new") {
                 this.workflowId = undefined;
+                model.setProperty("/isExisting", false);
+                model.setProperty("/runs", []);
+                model.setProperty("/runsCount", runsCountLabel(0));
                 model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData);
                 model.setProperty("/title", this.text("newWorkflow"));
                 this.refreshStepOptions();
@@ -157,10 +182,17 @@ export default class WorkflowDetail extends BaseController {
             }
 
             this.workflowId = Number(id);
-            const workflow = await this.run(
-                this.getAdminService().getWorkflow(this.workflowId),
-                this.text("workflowLoadFailed")
-            );
+            model.setProperty("/isExisting", true);
+            // The last runs load alongside the workflow; loadRuns() reports
+            // its own failure with a toast and leaves the panel empty, so it
+            // can never take the form with it.
+            const [workflow] = await Promise.all([
+                this.run(
+                    this.getAdminService().getWorkflow(this.workflowId),
+                    this.text("workflowLoadFailed")
+                ),
+                this.loadRuns()
+            ]);
             if (!workflow) {
                 return;
             }
@@ -191,6 +223,9 @@ export default class WorkflowDetail extends BaseController {
             // Open on the first step so the editor is not empty for a
             // workflow that has steps.
             this.selectStep((model.getProperty("/data/steps") as UiStep[]).length ? 0 : -1);
+            // Taken after refreshStepOptions/regroup, on the payload a save
+            // would send, so the per-row UI fields never count as edits.
+            this.snapshot = canonical(this.buildPayload());
         });
     }
 
@@ -736,6 +771,26 @@ export default class WorkflowDetail extends BaseController {
         });
     }
 
+    /** The wire shape of the form. `steps` defaults to the lenient
+     * collection (the preview's), which is what the dirty check compares;
+     * onSave passes the strictly collected ones. */
+    private buildPayload(steps?: WorkflowStep[]): WorkflowInput {
+        const data = (this.getModel("workflow") as JSONModel).getProperty("/data") as UiWorkflowData;
+        return {
+            name: data.name,
+            description: data.description,
+            api_slug: data.api_slug,
+            run_as_principal: data.run_as_principal,
+            run_timeout_seconds: data.run_timeout_seconds,
+            skip_seen_items: data.skip_seen_items,
+            max_parallel_items: data.max_parallel_items,
+            on_unknown_branch: data.on_unknown_branch,
+            enabled: data.enabled,
+            branches: WorkflowDetail.collectBranches(data.branches),
+            steps: steps ?? WorkflowDetail.collectSteps(data.steps)
+        };
+    }
+
     public async onSave(): Promise<void> {
         const model = this.getModel("workflow") as JSONModel;
         model.setProperty("/errors", {});
@@ -765,19 +820,7 @@ export default class WorkflowDetail extends BaseController {
             return;
         }
 
-        const payload: WorkflowInput = {
-            name: data.name,
-            description: data.description,
-            api_slug: data.api_slug,
-            run_as_principal: data.run_as_principal,
-            run_timeout_seconds: data.run_timeout_seconds,
-            skip_seen_items: data.skip_seen_items,
-            max_parallel_items: data.max_parallel_items,
-            on_unknown_branch: data.on_unknown_branch,
-            enabled: data.enabled,
-            branches: WorkflowDetail.collectBranches(data.branches),
-            steps
-        };
+        const payload = this.buildPayload(steps);
 
         try {
             const saved = await this.getAdminService().upsertWorkflow(payload, this.workflowId);
@@ -903,6 +946,127 @@ export default class WorkflowDetail extends BaseController {
             return;
         }
         this.getRouter().navTo("agentDetail", { agentId: String(match.id) });
+    }
+
+    // --- run now / refresh / last runs ---
+
+    /**
+     * The newest runs of this workflow, for the panel. Never throws and
+     * never goes through ErrorHandler's dialog: a failure here shows one
+     * toast and an empty panel, because it must not break opening the
+     * workflow.
+     */
+    public async loadRuns(): Promise<void> {
+        const model = this.getModel("workflow") as JSONModel;
+        const id = this.workflowId;
+        if (id === undefined) {
+            model.setProperty("/runs", []);
+            model.setProperty("/runsCount", runsCountLabel(0));
+            return;
+        }
+        let runs: WorkflowRun[] = [];
+        try {
+            runs = await this.getAdminService().listWorkflowRuns({ workflowId: id, limit: LAST_RUNS_LIMIT });
+        } catch {
+            MessageToast.show(this.text("lastRunsLoadFailed"));
+        }
+        // Another workflow may have been opened while this was in flight.
+        if (this.workflowId !== id) {
+            return;
+        }
+        model.setProperty("/runs", runs);
+        model.setProperty("/runsCount", runsCountLabel(runs.length, LAST_RUNS_LIMIT));
+    }
+
+    public onRefreshRuns(): void {
+        void this.loadRuns();
+    }
+
+    public onOpenRun(event: Event): void {
+        const run = (event.getSource() as ColumnListItem)
+            .getBindingContext("workflow")?.getObject() as WorkflowRun | undefined;
+        if (run) {
+            this.getRouter().navTo("workflowRunDetail", { runId: run.id });
+        }
+    }
+
+    /**
+     * Starts a run, the way the list page does (same toast, same error
+     * handling), then reloads the panel shortly after so the run shows up
+     * as running, and once more so a short run shows its outcome.
+     */
+    public async onRunNow(): Promise<void> {
+        const model = this.getModel("workflow") as JSONModel;
+        const id = this.workflowId;
+        if (id === undefined || model.getProperty("/runBusy")) {
+            return;
+        }
+        const name = model.getProperty("/title") as string;
+        model.setProperty("/runBusy", true);
+        try {
+            const started = await this.run(
+                this.getAdminService().runWorkflowNow(id),
+                `Could not start a run for "${name}".`
+            );
+            if (!started) {
+                return;
+            }
+            MessageToast.show(this.text("workflowRunStarted").replace("{0}", started.run_id));
+            this.clearRunRefreshTimers();
+            RUN_REFRESH_DELAYS_MS.forEach((delay) => {
+                this.runRefreshTimers.push(setTimeout(() => {
+                    if (this.workflowId === id) {
+                        void this.loadRuns();
+                    }
+                }, delay));
+            });
+        } finally {
+            model.setProperty("/runBusy", false);
+        }
+    }
+
+    private clearRunRefreshTimers(): void {
+        this.runRefreshTimers.forEach((t) => clearTimeout(t));
+        this.runRefreshTimers = [];
+    }
+
+    /** Whether the form differs from what was loaded, compared on the
+     * payload a save would send. */
+    private isDirty(): boolean {
+        return isDirty(this.snapshot, this.buildPayload());
+    }
+
+    /**
+     * Reloads the workflow from the server: the form, the preview and the
+     * last runs. Unsaved edits are lost, so it asks first when there are any.
+     */
+    public onRefresh(): void {
+        if (this.workflowId === undefined) {
+            return;
+        }
+        if (!this.isDirty()) {
+            void this.reload();
+            return;
+        }
+        MessageBox.confirm(this.text("refreshDiscardConfirm"), {
+            title: this.text("refresh"),
+            emphasizedAction: MessageBox.Action.OK,
+            onClose: (action: string) => {
+                if (action === MessageBox.Action.OK) {
+                    void this.reload();
+                }
+            }
+        });
+    }
+
+    private async reload(): Promise<void> {
+        if (this.workflowId === undefined) {
+            return;
+        }
+        await this.load(String(this.workflowId));
+        if (this.snapshot !== undefined) {
+            MessageToast.show(this.text("reloadedFromServer"));
+        }
     }
 
     // text(key) is inherited from BaseController -- do not redeclare it.

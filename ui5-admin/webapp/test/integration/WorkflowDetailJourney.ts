@@ -11,6 +11,9 @@ import type Button from "sap/m/Button";
 import type HBox from "sap/m/HBox";
 import type Input from "sap/m/Input";
 import type Link from "sap/m/Link";
+import type ObjectNumber from "sap/m/ObjectNumber";
+import type ObjectStatus from "sap/m/ObjectStatus";
+import type Panel from "sap/m/Panel";
 import type Select from "sap/m/Select";
 import type Dialog from "sap/m/Dialog";
 import type Text from "sap/m/Text";
@@ -1305,6 +1308,194 @@ opaTest(
             viewName: "WorkflowDetail",
             success: function (element: UI5Element) {
                 Opa5.assert.strictEqual((element as TextArea).getValue(), "Draft a support reply.", "and still shows its instructions");
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+// --- run now / refresh / last runs ------------------------------------------
+// FakeBackend.reset() seeds wf-run-1 (success, 2 items) and wf-run-2
+// (running) for triage-inbox. POST workflows/{id}/run records the call in
+// backend.runNowCalls and prepends a running run.
+
+opaTest(
+    "an existing workflow shows Run now, Refresh and its last runs, and a run row opens the run",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        Then.waitFor({
+            id: "runWorkflowNowButton",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.ok((element as Button).getVisible(), "Run now is in the header");
+                Opa5.assert.ok((element as Button).getEnabled(), "and enabled");
+            }
+        });
+        Then.waitFor({
+            id: "refreshWorkflowButton",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.ok((element as Button).getVisible(), "Refresh is in the header");
+            }
+        });
+        Then.waitFor({
+            id: "workflowRunsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                const rows = (element as Table).getItems() as ColumnListItem[];
+                Opa5.assert.strictEqual(rows.length, 2, "both seeded runs of this workflow are listed");
+                Opa5.assert.deepEqual(
+                    rows.map((row) => (row.getCells()[0] as ObjectStatus).getText()),
+                    ["success", "running"],
+                    "with the status of each"
+                );
+                const counts = (rows[0].getCells()[2] as HBox).getItems() as ObjectNumber[];
+                Opa5.assert.deepEqual(
+                    counts.map((n) => String(n.getNumber())), ["2", "1", "0", "1"],
+                    "the item counts of the finished run: total, succeeded, failed, skipped"
+                );
+            }
+        });
+        Then.waitFor({
+            id: "workflowRunsCount",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Title).getText(), "2 runs", "the panel header counts them");
+            }
+        });
+
+        When.waitFor({
+            id: "workflowRunsTable",
+            viewName: "WorkflowDetail",
+            matchers: function (element: UI5Element) { return (element as Table).getItems()[0]; },
+            actions: new Press()
+        });
+        Then.waitFor({
+            check: function () { return HashChanger.getInstance().getHash() === "workflow-runs/wf-run-1"; },
+            success: function () {
+                Opa5.assert.ok(true, "pressing a run row opens that run's detail");
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "Run now on the workflow detail page posts to the run endpoint and the last-runs panel picks up the new run",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        When.waitFor({ id: "runWorkflowNowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        Then.waitFor({
+            check: function () { return backend.runNowCalls.indexOf(`workflows/${WORKFLOW_ID}/run`) !== -1; },
+            success: function () {
+                Opa5.assert.deepEqual(backend.runNowCalls, [`workflows/${WORKFLOW_ID}/run`], "exactly one run was requested, for this workflow");
+            }
+        });
+        Then.waitFor({
+            id: "workflowRunsTable",
+            viewName: "WorkflowDetail",
+            check: function (element: UI5Element) { return (element as Table).getItems().length === 3; },
+            success: function (element: UI5Element) {
+                const first = (element as Table).getItems()[0] as ColumnListItem;
+                Opa5.assert.strictEqual(
+                    (first.getCells()[0] as ObjectStatus).getText(), "running",
+                    "the new run appears at the top as running without pressing Refresh"
+                );
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "Refresh on a dirty workflow form asks first, then reloads from the server",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp(`workflows/${WORKFLOW_ID}`);
+
+        When.waitFor({ id: "workflowName", viewName: "WorkflowDetail", actions: new EnterText({ text: "renamed-locally" }) });
+        When.waitFor({
+            id: "workflowDescription",
+            viewName: "WorkflowDetail",
+            success: function () {
+                const workflow = backend.workflows.find((w) => w.id === WORKFLOW_ID);
+                if (workflow) {
+                    workflow.description = "changed on the server";
+                }
+            }
+        });
+        When.waitFor({ id: "refreshWorkflowButton", viewName: "WorkflowDetail", actions: new Press() });
+
+        When.waitFor({
+            controlType: "sap.m.Button",
+            searchOpenDialogs: true,
+            matchers: { properties: { text: "OK" } },
+            actions: new Press(),
+            errorMessage: "no discard confirmation was shown for the dirty form"
+        });
+
+        Then.waitFor({
+            id: "workflowName",
+            viewName: "WorkflowDetail",
+            check: function (element: UI5Element) { return (element as Input).getValue() === "triage-inbox"; },
+            success: function () {
+                Opa5.assert.ok(true, "the local rename was discarded");
+            }
+        });
+        Then.waitFor({
+            id: "workflowDescription",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual(
+                    (element as TextArea).getValue(), "changed on the server",
+                    "the form shows what the server has now"
+                );
+            }
+        });
+        Then.waitFor({
+            id: "stepsTable",
+            viewName: "WorkflowDetail",
+            success: function (element: UI5Element) {
+                Opa5.assert.strictEqual((element as Table).getItems().length, 4, "the steps were reloaded too");
+            }
+        });
+
+        Then.iStopTheApp();
+    }
+);
+
+opaTest(
+    "a new workflow has neither the header buttons nor the last-runs panel",
+    function (Given: Common, When: Common, Then: Common) {
+        Given.iStartTheApp("workflows/new");
+
+        Then.waitFor({
+            id: "runWorkflowNowButton",
+            viewName: "WorkflowDetail",
+            visible: false,
+            success: function (element: UI5Element) {
+                Opa5.assert.notOk((element as Button).getVisible(), "nothing to run yet");
+            }
+        });
+        Then.waitFor({
+            id: "refreshWorkflowButton",
+            viewName: "WorkflowDetail",
+            visible: false,
+            success: function (element: UI5Element) {
+                Opa5.assert.notOk((element as Button).getVisible(), "nothing to reload yet");
+            }
+        });
+        Then.waitFor({
+            id: "workflowRunsPanel",
+            viewName: "WorkflowDetail",
+            visible: false,
+            success: function (element: UI5Element) {
+                Opa5.assert.notOk((element as Panel).getVisible(), "no runs to list yet");
             }
         });
 
