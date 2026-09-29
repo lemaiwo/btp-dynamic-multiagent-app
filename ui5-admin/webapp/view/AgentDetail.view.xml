@@ -326,7 +326,7 @@
                                     <Text text="{agent>trigger}" />
                                     <Text text="{ path: 'agent>started_at', formatter: '.formatter.timestamp' }" />
                                     <Text text="{ parts: ['agent>started_at', 'agent>finished_at'], formatter: '.formatter.runDuration' }" />
-                                    <Text text="{agent>summary}" maxLines="2" />
+                                    <Text text="{ parts: ['agent>summary', 'agent>error'], formatter: '.formatter.runSummary' }" maxLines="2" />
                                 </cells>
                             </ColumnListItem>
                         </items>

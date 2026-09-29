@@ -81,3 +81,15 @@ QUnit.test("never signing in is a warning, not an error", function (assert) {
 QUnit.test("an unknown token state degrades to a warning", function (assert) {
     assert.strictEqual(formatter.credentialState(true, "bogus" as never), "Warning");
 });
+
+QUnit.module("formatter.runSummary: a run table's one line per run");
+
+QUnit.test("prefers the summary, falls back to the error, never shows null", function (assert) {
+    assert.strictEqual(formatter.runSummary("3 mails triaged", null), "3 mails triaged", "summary wins");
+    assert.strictEqual(formatter.runSummary("3 mails triaged", "ignored"), "3 mails triaged", "even when an error is also recorded");
+    assert.strictEqual(formatter.runSummary(null, "No run-as principal is configured"), "No run-as principal is configured",
+        "a failed preflight has no summary, so its error is the line");
+    assert.strictEqual(formatter.runSummary("   ", "boom"), "boom", "a blank summary counts as none");
+    assert.strictEqual(formatter.runSummary(null, null), "", "nothing at all renders empty, not 'null'");
+    assert.strictEqual(formatter.runSummary(undefined, undefined), "", "same for undefined");
+});

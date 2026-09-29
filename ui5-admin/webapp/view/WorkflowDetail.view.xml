@@ -195,7 +195,7 @@
                                     </HBox>
                                     <Text text="{ path: 'workflow>started_at', formatter: '.formatter.timestamp' }" />
                                     <Text text="{ path: 'workflow>finished_at', formatter: '.formatter.timestamp' }" />
-                                    <Text text="{workflow>summary}" maxLines="2" />
+                                    <Text text="{ parts: ['workflow>summary', 'workflow>error'], formatter: '.formatter.runSummary' }" maxLines="2" />
                                 </cells>
                             </ColumnListItem>
                         </items>

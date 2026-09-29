@@ -31,7 +31,7 @@
                             <Text text="{runs>trigger}" />
                             <Text text="{ path: 'runs>started_at', formatter: '.formatter.timestamp' }" />
                             <Text text="{ parts: ['runs>started_at', 'runs>finished_at'], formatter: '.formatter.runDuration' }" />
-                            <Text text="{runs>summary}" maxLines="2" />
+                            <Text text="{ parts: ['runs>summary', 'runs>error'], formatter: '.formatter.runSummary' }" maxLines="2" />
                         </cells>
                     </ColumnListItem>
                 </items>

@@ -81,6 +81,14 @@ export default {
         return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
     },
 
+    /** The one line a run table shows for a run: its summary, or, when it
+     * produced none (a failed preflight, a crashed step), its error. Without
+     * the fallback a failed run shows an empty cell next to a red status. */
+    runSummary(summary: string | null | undefined, error: string | null | undefined): string {
+        const text = (summary || "").trim() || (error || "").trim();
+        return text;
+    },
+
     /** Renders a null timestamp as an em dash rather than the string "null". */
     timestamp(iso: string | null): string {
         if (!iso) {
