@@ -75,6 +75,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `teams_tools` reuses it. Built and unit-tested but **never run against a
   real mailbox**: `docs/OUTLOOK_SETUP.md` and `scripts/probe_outlook.py`
   cover the tenant gates that have to clear first
+- `agents/mail_render.py` — markdown subset → Outlook-safe HTML for the mail
+  this app *originates* (`send_mail`, `create_mail_draft`). Nested tables and
+  inline styles only: Outlook on Windows lays mail out with Word's engine.
+  The subject's ` -- ` tail becomes the header subline, the opening paragraph
+  becomes the verdict callout, and the tool's `status` (`ok`/`attention`)
+  tints it. Replies stay plain text — a report shell on an answer to a person
+  would read as a newsletter
 - `agents/teams_tools.py` — Teams channels over Microsoft Graph
   (`builtin:teams`). One `team` (and optionally `channels`) is pinned in
   config, never a tool argument. `oauth2` reads and, with `allow_send`,
