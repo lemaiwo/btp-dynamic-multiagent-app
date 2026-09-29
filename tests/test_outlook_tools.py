@@ -421,4 +421,90 @@ def test_recipients_cannot_be_overridden_by_a_tool_argument():
     params = inspect.signature(toolset.tools["send_mail"].function).parameters
     assert "to" not in params
     assert "recipients" not in params
-    assert sorted(params) == ["body", "subject"]
+    # `status` tints the verdict the model already wrote; it is presentation,
+    # not audience. Everything else about who receives the mail stays in config.
+    assert sorted(params) == ["body", "status", "subject"]
+
+
+# --- pytest-collected: the report template ---------------------------------
+# Originating mail is a report to a team, so it goes out through the renderer
+# in agents/mail_render.py. Replies are a message to a person and stay plain:
+# a branded header band on a reply would read as a newsletter, not an answer.
+
+
+def _recorder(status_code: int = 202):
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["json"] = json.loads(request.content) if request.content else {}
+        return httpx.Response(status_code, json={"id": "draft-1"} if status_code < 202 else None)
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                             transport=httpx.MockTransport(handler))
+    return seen, http
+
+
+@pytest.mark.asyncio
+async def test_send_mail_renders_markdown_as_a_report():
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"])
+    await client.send_mail(
+        "SAP SIA/100 daily status -- 2026-09-22",
+        "Needs attention.\n\n## Resources\n\n| Server | CPU |\n| --- | --- |\n| s01 | 96 |",
+        status="attention",
+    )
+    body = seen["json"]["message"]["body"]
+
+    assert body["contentType"] == "HTML"
+    assert "<table" in body["content"], body["content"][:400]
+    assert "<th" in body["content"], "the pipe table should render as a table"
+    assert "| Server |" not in body["content"], "raw markdown should not survive"
+    assert "#b9770e" in body["content"], "an attention verdict should be amber"
+
+
+@pytest.mark.asyncio
+async def test_send_mail_keeps_the_subject_and_reuses_its_date():
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"])
+    await client.send_mail("SAP SIA/100 job runs -- 20260922", "All clear.")
+    message = seen["json"]["message"]
+
+    # The subject Graph sends is untouched -- the renderer only borrows it.
+    assert message["subject"] == "SAP SIA/100 job runs -- 20260922"
+    assert "SAP SIA/100 job runs" in message["body"]["content"]
+    assert "20260922" in message["body"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_send_mail_without_a_status_is_not_coloured_as_healthy():
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"])
+    await client.send_mail("Report", "Something happened.")
+    content = seen["json"]["message"]["body"]["content"]
+
+    assert "#1e7b4d" not in content, "no verdict must never read as a green all-clear"
+
+
+@pytest.mark.asyncio
+async def test_create_mail_draft_is_rendered_the_same_way():
+    seen, http = _recorder(201)
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"])
+    await client.create_mail_draft("Digest -- week 39", "All clear.\n\n- one\n- two", status="ok")
+    body = seen["json"]["body"]
+
+    assert body["contentType"] == "HTML"
+    assert "<li" in body["content"]
+    assert "#1e7b4d" in body["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_is_not_dressed_up_as_a_report():
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"])
+    await client.send_reply("msg-1", "Here is the answer.\n\nSecond paragraph.")
+    comment = seen["json"]["comment"]
+
+    assert "<p>" in comment
+    assert "#1f3348" not in comment, "a reply gets no header band"
+    assert "<table" not in comment, "a reply gets no report shell"
