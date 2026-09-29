@@ -53,6 +53,12 @@ export const BUILTINS: BuiltinToolset[] = [
         url: "builtin:jira", titleKey: "builtinJira", descriptionKey: "builtinJiraDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
     },
+    // smtp_toolset reads the SMTP host and credential from a MAIL destination
+    // and has no other way to authenticate -- see agents/smtp_tools.py.
+    {
+        url: "builtin:smtp", titleKey: "builtinSmtp", descriptionKey: "builtinSmtpDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
+    },
     // NVD is public: sapnotes_toolset's config block is the credential-free
     // `none` shape (min_score, lookback); a destination only adds a proxy URL
     // and an apiKey header.

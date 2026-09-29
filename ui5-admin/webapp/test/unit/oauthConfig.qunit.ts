@@ -166,6 +166,17 @@ QUnit.test("sapnotes keeps its public knobs; sapnotedetail only the name", funct
     assert.deepEqual(detail, { destination: "DEST" });
 });
 
+QUnit.test("smtp keeps its recipients, sender and send switch, nothing else", function (assert) {
+    const out = oauthConfig.cleanOAuth(
+        fullForm({ user_context: true, from: "reports@example.com" }), "destination", "builtin:smtp"
+    );
+    assert.deepEqual(out, {
+        destination: "DEST", recipients: "team@example.com",
+        from: "reports@example.com", allow_send: true
+    });
+    assert.notOk(oauthConfig.supportsUserContext("builtin:smtp"), "the relay credential is the app's");
+});
+
 QUnit.test("the switches are only ever sent as true", function (assert) {
     const out = oauthConfig.cleanOAuth(
         fullForm({ user_context: false, allow_send: false }), "destination", "builtin:outlook"
@@ -186,7 +197,7 @@ QUnit.test("supportsUserContext names the built-ins that act as a user", functio
     ["builtin:gmail", "builtin:outlook", "builtin:teams"].forEach((url) => {
         assert.ok(oauthConfig.supportsUserContext(url), url);
     });
-    ["builtin:jira", "builtin:slack", "builtin:sapnotes", "builtin:sapnotedetail",
+    ["builtin:jira", "builtin:slack", "builtin:smtp", "builtin:sapnotes", "builtin:sapnotedetail",
         "https://mcp.example.hana.ondemand.com/mcp"].forEach((url) => {
         assert.notOk(oauthConfig.supportsUserContext(url), url);
     });

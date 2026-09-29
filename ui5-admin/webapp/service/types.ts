@@ -103,6 +103,11 @@ export type OAuthClient =
            */
           recipients?: string;
           /**
+           * `builtin:smtp` only. Sender address overriding the MAIL
+           * destination's `mail.smtp.from`. Blank uses the destination's.
+           */
+          from?: string;
+          /**
            * `builtin:teams` only. The id of the one team the toolset may read
            * (and, with `allow_send` on oauth2, post to). Pinned, never a tool
            * argument. See agents/teams_tools.py.

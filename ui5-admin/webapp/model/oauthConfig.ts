@@ -54,7 +54,8 @@ const DESTINATION_BUILTIN_KEYS: Record<string, string[]> = {
     "builtin:outlook": ["mailbox", "lookback", "recipients"],
     "builtin:teams": ["team", "channels", "lookback"],
     "builtin:sapnotes": ["min_score", "lookback"],
-    "builtin:sapnotedetail": []
+    "builtin:sapnotedetail": [],
+    "builtin:smtp": ["recipients", "from"]
 };
 
 /** Built-ins whose destination may act as the signed-in user. */
@@ -110,7 +111,7 @@ export default {
             return OAUTH2_ALLOW_SEND_URLS.indexOf(key) > -1;
         }
         if (authMode === "destination") {
-            return key === "builtin:slack" || key === "builtin:outlook"
+            return key === "builtin:slack" || key === "builtin:outlook" || key === "builtin:smtp"
                 || (key === "builtin:teams" && userContext === true);
         }
         return false;

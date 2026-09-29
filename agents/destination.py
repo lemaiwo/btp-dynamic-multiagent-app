@@ -199,6 +199,56 @@ class Destination:
     per_user: bool = False
 
 
+# Destination property names whose value is a credential. Matched
+# case-insensitively as a substring, so `mail.password`, `Password`,
+# `clientSecret` and `tokenServicePassword` are all covered.
+_SECRET_PROPERTY_MARKERS = ("password", "secret", "token", "key")
+
+
+class DestinationProperties(Mapping[str, str]):
+    """A destination's raw ``destinationConfiguration``, read-only.
+
+    For destinations that are not an HTTP endpoint -- a ``MAIL`` destination
+    has no ``URL``, only ``mail.smtp.host``, ``mail.user``, ``mail.password``
+    and friends -- the properties themselves are the resolution. Some of them
+    are credentials, so ``repr()``/``str()`` list property *names* only: a
+    value that reaches a log line through ``logger.exception``, a traceback
+    frame or an f-string must not print the secret.
+
+    ``expires_at`` follows the same rule as :class:`Destination`: a
+    :func:`time.monotonic` deadline with the skew already subtracted.
+    """
+
+    __slots__ = ("_values", "expires_at", "auth_type")
+
+    def __init__(self, values: Mapping[str, Any], *, expires_at: float) -> None:
+        self._values = {str(k): "" if v is None else str(v) for k, v in values.items()}
+        self.expires_at = expires_at
+        self.auth_type = self._values.get("Authentication", "").strip()
+
+    def __getitem__(self, key: str) -> str:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    @staticmethod
+    def is_secret(name: str) -> bool:
+        lowered = name.lower()
+        return any(marker in lowered for marker in _SECRET_PROPERTY_MARKERS)
+
+    def __repr__(self) -> str:
+        shown = ", ".join(
+            f"{k}=***" if self.is_secret(k) else k for k in sorted(self._values)
+        )
+        return f"DestinationProperties({shown})"
+
+    __str__ = __repr__
+
+
 class DestinationResolver:
     """Resolves one named destination, caching until its token nears expiry.
 
@@ -226,6 +276,10 @@ class DestinationResolver:
         # and, at most, a static header.
         self.require_credential = require_credential
         self._cached: Destination | None = None
+        # The raw properties, for destinations used by what they carry rather
+        # than by a URL (MAIL). App-level only: no built-in resolves those
+        # per user. Same lifetime rules as `_cached`.
+        self._cached_properties: DestinationProperties | None = None
         # Per-principal results, least recently used first. Kept apart from
         # the app-level entry: the two are different credentials, and a
         # user's token must never be handed to a request made as the app.
@@ -241,11 +295,13 @@ class DestinationResolver:
         """
         if principal is None:
             self._cached = None
+            self._cached_properties = None
         else:
             self._per_user.pop(principal, None)
 
     def invalidate_all(self) -> None:
         self._cached = None
+        self._cached_properties = None
         self._per_user.clear()
 
     @property
@@ -319,7 +375,52 @@ class DestinationResolver:
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=httpx.Timeout(30.0), transport=self._transport)
 
+    async def resolve_properties(self, *, force: bool = False) -> DestinationProperties:
+        """The destination's raw ``destinationConfiguration``, fetched or cached.
+
+        For destinations that carry settings rather than a URL -- a ``MAIL``
+        destination's ``mail.smtp.host``, ``mail.user``, ``mail.password``.
+        Resolved with the app's own token, never a user's, and cached like
+        :meth:`resolve`: until the returned token nears expiry, or
+        :data:`DEFAULT_LIFETIME_SECONDS` when the response carries none. The
+        values include the destination's credential; the returned mapping's
+        ``repr`` masks them, and nothing here logs them.
+        """
+        current = self._cached_properties
+        if not force and current is not None and time.monotonic() < current.expires_at:
+            return current
+        async with self._lock:
+            current = self._cached_properties
+            if (
+                not force
+                and current is not None
+                and time.monotonic() < current.expires_at
+            ):
+                return current
+            payload = await self._fetch_payload()
+            config = (payload or {}).get("destinationConfiguration") or {}
+            if not isinstance(config, dict) or not config:
+                raise DestinationError(
+                    f"destination {self.name!r} returned no configuration"
+                )
+            lifetime = DEFAULT_LIFETIME_SECONDS
+            tokens = (payload or {}).get("authTokens") or []
+            if tokens and isinstance(tokens[0], dict):
+                try:
+                    lifetime = int(float(tokens[0].get("expires_in")))
+                except (TypeError, ValueError):
+                    lifetime = DEFAULT_LIFETIME_SECONDS
+            deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
+            resolved = DestinationProperties(config, expires_at=deadline)
+            self._cached_properties = resolved
+            return resolved
+
     async def _fetch(self, *, user_token: str | None = None) -> Destination:
+        payload = await self._fetch_payload(user_token=user_token)
+        return self._destination_from(payload, per_user=bool(user_token))
+
+    async def _fetch_payload(self, *, user_token: str | None = None) -> Any:
+        """The destination service's "find destination" response, as JSON."""
         async with self._client() as http:
             token = await self._service_token(http)
             headers = {"Authorization": f"Bearer {token}"}
@@ -344,8 +445,7 @@ class DestinationResolver:
                     f"destination service returned {response.status_code} for "
                     f"{self.name!r}: {response.text[:400]}"
                 )
-            payload = response.json()
-        return self._destination_from(payload, per_user=bool(user_token))
+            return response.json()
 
     async def _service_token(self, http: httpx.AsyncClient) -> str:
         try:

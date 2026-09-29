@@ -30,6 +30,7 @@ QUnit.test("a remote server is offered neither destination nor session", functio
 QUnit.test("restricted built-ins offer only what the server accepts", function (assert) {
     assert.deepEqual(authModesFor("builtin:jira"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:slack"), ["destination"]);
+    assert.deepEqual(authModesFor("builtin:smtp"), ["destination"]);
     assert.deepEqual(authModesFor("builtin:sapnotedetail"), ["session", "destination"]);
     assert.deepEqual(authModesFor("builtin:teams"), ["oauth2", "app_only", "destination"]);
     assert.deepEqual(authModesFor("builtin:gmail"), ["oauth2", "destination"]);

@@ -2436,9 +2436,10 @@ const DESTINATION_FIELDS = {
     'builtin:teams':         ['user_context', 'team', 'channels', 'lookback', 'allow_send'],
     'builtin:sapnotes':      ['min_score', 'lookback'],
     'builtin:sapnotedetail': [],
+    'builtin:smtp':          ['recipients', 'from', 'allow_send'],
 };
 // Text fields, in the order they appear; the two switches are checkboxes.
-const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients',
+const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
     'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
 
 function destinationFieldsHtml() {
@@ -2468,6 +2469,9 @@ function destinationFieldsHtml() {
                 </label>
                 <label class="full dest-field-recipients">Recipients
                     <input type="text" class="dest-recipients" placeholder="team@example.com, basis@example.com">
+                </label>
+                <label class="full dest-field-from">From
+                    <input type="text" class="dest-from" placeholder="reports@example.com; blank uses the destination's mail.smtp.from">
                 </label>
                 <label class="dest-field-lookback">Look back
                     <input type="text" class="dest-lookback" placeholder="e.g. 5h, 2d, 1w">
@@ -2534,7 +2538,9 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with built-in toolsets only (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:sapnotes, builtin:sapnotedetail).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sapnotes, builtin:sapnotedetail).';
+    } else if (builtin === 'builtin:smtp') {
+        hint = 'A destination of Type MAIL: mail.smtp.host/port, mail.user, mail.password, mail.smtp.from. The server certificate is always verified.';
     } else if (builtin === 'builtin:sapnotedetail') {
         hint = 'The me.sap.com session cookie is read from the destination\'s URL.headers.Cookie property.';
     } else if (builtin === 'builtin:sapnotes') {

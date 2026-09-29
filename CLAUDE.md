@@ -95,9 +95,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   bot is in, or a pinned `channels` list; posting needs `allow_send`, and
   posted text is escaped so it cannot `<!channel>` or mention anyone.
   Unit-tested only; Slack + BTP setup guide in `SLACK_SETUP.md`
+- `agents/smtp_tools.py` — report mail over SMTP (`builtin:smtp`), with host
+  and credential from a BTP destination of Type `MAIL` (`destination` mode
+  only, Internet proxy only). One tool, `send_mail`, with outlook's contract:
+  `allow_send` must be `true`, the audience is the pinned `recipients`, an
+  optional `from` overrides `mail.smtp.from`, and the body goes through
+  `agents/mail_render.py`. STARTTLS or implicit TLS with the certificate
+  always verified; a login is never sent unencrypted. Stdlib `smtplib` in a
+  thread. Unit-tested only; setup notes in the module docstring
 - `agents/destination.py` — resolves a BTP destination (URL + ready
   `Authorization` header) from the destination service, cached until its
-  token nears expiry. Stores no credential for the target: the destination
+  token nears expiry. `resolve_properties()` returns the raw
+  `destinationConfiguration` instead (for `MAIL` destinations, which have no
+  URL), same cache rules, with a `repr` that masks credential values. Stores no credential for the target: the destination
   holds it. Binding comes from `VCAP_SERVICES` or `DESTINATION_*` env vars.
   `resolve(user_token=, principal=)` sends the user's JWT as `X-user-token`
   so a user-propagating destination (OAuth2UserTokenExchange, OAuth2JWTBearer,

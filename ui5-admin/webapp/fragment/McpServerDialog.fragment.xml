@@ -114,26 +114,34 @@
             <!-- Whatever is visible for a url and mode below must also be kept
                  by model/oauthConfig.ts cleanOAuth, or OK silently drops it. -->
             <Label text="{i18n>recipientsLabel}"
-                   visible="{= ${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination') }" />
+                   visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
             <Input
                 id="oauthRecipients"
                 value="{server>/oauth/recipients}"
                 placeholder="{i18n>recipientsPlaceholder}"
-                visible="{= ${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination') }" />
+                visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
 
-            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+            <Label text="{i18n>smtpFromLabel}"
+                   visible="{= ${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination' }" />
+            <Input
+                id="oauthSmtpFrom"
+                value="{server>/oauth/from}"
+                placeholder="{i18n>smtpFromPlaceholder}"
+                visible="{= ${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination' }" />
+
+            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+                visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
 
-            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
+            <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:smtp' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
             <CheckBox
                 id="oauthAllowSend"
                 selected="{server>/oauth/allow_send}"
-                text="{= ${server>/url} === 'builtin:teams' ? ${i18n>allowPostHint} : ${server>/url} === 'builtin:slack' ? ${i18n>allowSlackPostHint} : ${i18n>allowSendHint} }"
-                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
+                text="{= ${server>/url} === 'builtin:teams' ? ${i18n>allowPostHint} : ${server>/url} === 'builtin:slack' ? ${i18n>allowSlackPostHint} : ${server>/url} === 'builtin:smtp' ? ${i18n>allowSmtpSendHint} : ${i18n>allowSendHint} }"
+                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:smtp' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
 
             <Label text="{i18n>minScoreLabel}"
                    visible="{= ${server>/url} === 'builtin:sapnotes' }" />
@@ -148,7 +156,7 @@
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
-                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
+                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
                 visible="{= ${server>/auth_mode} === 'destination' }" />
 
             <!-- destinations: whose credential the destination hands back.

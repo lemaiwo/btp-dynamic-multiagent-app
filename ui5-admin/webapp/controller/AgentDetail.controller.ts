@@ -244,7 +244,7 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", team: "", channels: "", user_context: false },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false },
             // "mcp" for a remote server, otherwise the built-in's url.
             kind: findBuiltin(server.url)?.url ?? "mcp",
             kinds: [{ key: "mcp", text: this.text("toolsetRemoteMcp") }].concat(

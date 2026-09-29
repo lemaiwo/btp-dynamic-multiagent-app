@@ -303,6 +303,7 @@ async def test_sapnotedetail_destination_without_a_cookie_reads_as_an_expired_se
     ("builtin:teams", {"destination": "D", "team": "t"}),
     ("builtin:sapnotes", {"destination": "D"}),
     ("builtin:sapnotedetail", {"destination": "D"}),
+    ("builtin:smtp", {"destination": "D", "recipients": "a@example.com", "allow_send": True}),
 ])
 def test_build_without_a_destination_binding_names_the_server(url, oauth):
     from agents.builtins import build_builtin_toolset
@@ -312,7 +313,7 @@ def test_build_without_a_destination_binding_names_the_server(url, oauth):
 
 
 @pytest.mark.parametrize("url", ["builtin:gmail", "builtin:outlook", "builtin:teams",
-                                 "builtin:sapnotes", "builtin:sapnotedetail"])
+                                 "builtin:sapnotes", "builtin:sapnotedetail", "builtin:smtp"])
 def test_build_without_a_destination_name_is_refused(url):
     from agents.builtins import build_builtin_toolset
 
@@ -391,6 +392,7 @@ def test_admin_accepts_every_builtin_on_a_destination():
     _payload("builtin:teams", destination="D", team="t", user_context=True, allow_send=True)
     _payload("builtin:sapnotes", destination="D", min_score="9.0")
     _payload("builtin:sapnotedetail", destination="D")
+    _payload("builtin:smtp", destination="D", recipients="a@example.com", allow_send=True)
 
 
 @pytest.mark.parametrize("url,oauth,message", [

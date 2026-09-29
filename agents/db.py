@@ -2652,6 +2652,9 @@ _OUTLOOK_DEST_KEYS = ("destination", "mailbox", "lookback", "recipients")
 _TEAMS_DEST_KEYS = ("destination", "team", "channels", "lookback")
 _SAPNOTES_DEST_KEYS = ("destination", "min_score", "lookback")
 _SAPNOTEDETAIL_DEST_KEYS = ("destination",)
+# builtin:smtp: the fixed audience and an optional sender overriding the MAIL
+# destination's mail.smtp.from. The SMTP credential stays in the destination.
+_SMTP_DEST_KEYS = ("destination", "recipients", "from")
 
 _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:gmail": _GMAIL_DEST_KEYS,
@@ -2659,13 +2662,14 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:teams": _TEAMS_DEST_KEYS,
     "builtin:sapnotes": _SAPNOTES_DEST_KEYS,
     "builtin:sapnotedetail": _SAPNOTEDETAIL_DEST_KEYS,
+    "builtin:smtp": _SMTP_DEST_KEYS,
 }
 # Built-ins whose destination may act as the signed-in user. NVD has no user
 # to act as and the me.sap.com cookie is one shared session, so the switch is
 # dropped for those rather than stored as a promise nothing keeps.
 _DEST_USER_CONTEXT_URLS = frozenset({"builtin:gmail", "builtin:outlook", "builtin:teams"})
 # Built-ins with a posting/sending capability switch in destination mode.
-_DEST_ALLOW_SEND_URLS = frozenset({"builtin:outlook", "builtin:teams"})
+_DEST_ALLOW_SEND_URLS = frozenset({"builtin:outlook", "builtin:teams", "builtin:smtp"})
 
 
 def _clean_builtin_destination(src: dict[str, Any], builtin: str) -> dict[str, Any]:

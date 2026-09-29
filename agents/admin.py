@@ -35,7 +35,7 @@ from urllib.parse import SplitResult, urlsplit
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field, HttpUrl, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
 
 from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
@@ -43,6 +43,7 @@ from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.slack_tools import BUILTIN_SLACK_URL
+from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
 from agents.teams_tools import BUILTIN_TEAMS_URL
 from agents.db import (
     AUTH_MODE_JWT,
@@ -264,6 +265,12 @@ class OAuthClientPayload(BaseModel):
     # destination's own app-level credential is used. See
     # agents/destination_auth.py.
     user_context: bool = False
+    # builtin:smtp only. The sender address, overriding the MAIL destination's
+    # mail.smtp.from. `from` on the wire and in storage; a Python keyword, so
+    # the attribute is named `sender`.
+    sender: str = Field(default="", max_length=320, alias="from")
+
+    model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("min_score")
     @classmethod
@@ -350,6 +357,7 @@ class OAuthClientPayload(BaseModel):
             "recipients": self.recipients.strip(),
             "team": self.team.strip(),
             "channels": self.channels.strip(),
+            "from": self.sender.strip(),
         }
         config = {k: v for k, v in fields.items() if v}
         if self.allow_send:
@@ -493,6 +501,17 @@ class McpServerPayload(BaseModel):
                 f"{BUILTIN_SLACK_URL} requires auth_mode=destination: the Slack "
                 "bot token lives in the BTP destination named in "
                 "oauth.destination, as URL.headers.Authorization"
+            )
+        if (
+            str(self.url or "").strip().rstrip("/").lower() == BUILTIN_SMTP_URL
+            and self.auth_mode != AUTH_MODE_DESTINATION
+        ):
+            # Same reason as the Jira rule above: the SMTP host and its
+            # credential live only in a BTP destination of Type MAIL.
+            raise ValueError(
+                f"{BUILTIN_SMTP_URL} requires auth_mode=destination: the SMTP "
+                "server and its credential live in the BTP MAIL destination "
+                "named in oauth.destination"
             )
         if self.auth_mode == AUTH_MODE_SESSION and not is_note_detail:
             raise ValueError(
@@ -2148,12 +2167,34 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
             f"{key} has no signed-in user to act as; turn oauth.user_context off "
             "(only builtin:gmail, builtin:outlook and builtin:teams act as a user)"
         )
+    if key == BUILTIN_SMTP_URL:
+        _validate_smtp_config(cfg)
     if key in _DESTINATION_MAILBOX_URLS and not user_context and not cfg.get("mailbox"):
         raise ValueError(
             f"{key} with auth_mode=destination requires oauth.mailbox unless "
             "oauth.user_context is on: the destination's app-level credential "
             "identifies no user, so the target mailbox has to be named"
         )
+
+
+def _validate_smtp_config(cfg: dict[str, Any]) -> None:
+    """``builtin:smtp``'s pins, mirroring what ``smtp_toolset`` refuses."""
+    from agents.jira_tools import normalize_csv_list
+
+    recipients = normalize_csv_list(cfg.get("recipients"))
+    bad = [r for r in recipients if not is_address(r)]
+    if bad:
+        raise ValueError(
+            f"oauth.recipients: not a valid recipient address: {', '.join(bad)}"
+        )
+    if cfg.get("allow_send") is True and not recipients:
+        raise ValueError(
+            f"{BUILTIN_SMTP_URL} with allow_send requires oauth.recipients: the "
+            "audience of originated mail is fixed here, never chosen by the agent"
+        )
+    sender = str(cfg.get("from") or "").strip()
+    if sender and not is_address(sender):
+        raise ValueError("oauth.from must be a single email address")
 
 
 async def _destination_health() -> list[dict[str, Any]]:
@@ -2212,9 +2253,15 @@ async def _destination_health() -> list[dict[str, Any]]:
                     resolver = DestinationResolver(name, config, require_credential=False)
                     resolvers[name] = resolver
                 try:
-                    resolved = await resolver.resolve()
+                    if str(srv.get("url") or "").strip().rstrip("/").lower() == BUILTIN_SMTP_URL:
+                        # A MAIL destination has no URL; its properties are
+                        # the resolution. Only the auth type is reported.
+                        props = await resolver.resolve_properties()
+                        entry["auth_type"] = props.auth_type
+                    else:
+                        resolved = await resolver.resolve()
+                        entry["auth_type"] = resolved.auth_type
                     entry["state"] = "resolvable"
-                    entry["auth_type"] = resolved.auth_type
                 except DestinationError as e:
                     entry["error"] = str(e)[:400]
                 except Exception as e:  # noqa: BLE001 - a health check must not 500

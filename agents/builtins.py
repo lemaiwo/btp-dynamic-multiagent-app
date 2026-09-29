@@ -25,6 +25,7 @@ builtin:outlook    user      app*      user / app*   --       --
 builtin:teams      user      app (ro)  user / app(ro)--       --
 builtin:slack      --        --        app           --       --
 builtin:jira       --        --        app           --       --
+builtin:smtp       --        --        app (MAIL)    --       --
 builtin:sapnotes   --        --        app (public)  default  --
 builtin:sapnotedetail --     --        app (cookie)  --       default
 ================== ========= ========= ============= ======== ========
@@ -34,7 +35,9 @@ builtin:sapnotedetail --     --        app (cookie)  --       default
 with the signed-in user's JWT (``X-user-token``) and the tools act as that
 user; off, the destination's own credential is used and the app-only rules
 apply (``*`` = ``mailbox`` required, ``ro`` = read-only). See
-:mod:`agents.destination_auth`.
+:mod:`agents.destination_auth`. ``builtin:smtp`` reads a ``MAIL``
+destination's properties (host, user, password) rather than a URL; see
+:mod:`agents.smtp_tools`.
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
 from agents.sapnotes_tools import BUILTIN_SAPNOTES_URL, sapnotes_toolset
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL, sapnotedetail_toolset
 from agents.slack_tools import BUILTIN_SLACK_URL, slack_toolset
+from agents.smtp_tools import BUILTIN_SMTP_URL, smtp_toolset
 from agents.teams_tools import BUILTIN_TEAMS_URL, teams_toolset
 
 # url -> factory(oauth, server_key) -> AbstractToolset
@@ -56,6 +60,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_TEAMS_URL: teams_toolset,
     BUILTIN_SLACK_URL: slack_toolset,
     BUILTIN_JIRA_URL: jira_toolset,
+    BUILTIN_SMTP_URL: smtp_toolset,
     BUILTIN_SAPNOTES_URL: sapnotes_toolset,
     BUILTIN_SAPNOTEDETAIL_URL: sapnotedetail_toolset,
 }
