@@ -99,11 +99,20 @@ QUnit.test("ticks until the tick reports done, then is inactive", function (asse
     });
     poller.start();
     assert.ok(poller.isActive(), "active right after start");
-    setTimeout(() => {
+    // Wait for the poller to finish rather than a fixed 120 ms: timers on a
+    // loaded CI runner (and under UI5's autowaiter) can fire late, so a
+    // fixed deadline saw 2 ticks there. The assertions are unchanged.
+    const started = Date.now();
+    const check = (): void => {
+        if (poller.isActive() && Date.now() - started < 2000) {
+            setTimeout(check, 10);
+            return;
+        }
         assert.strictEqual(ticks, 3, "polled until the run finished, then stopped");
         assert.notOk(poller.isActive(), "inactive once done");
         done();
-    }, 120);
+    };
+    setTimeout(check, 10);
 });
 
 QUnit.test("never overlaps ticks and stop() arms no further timer", function (assert) {

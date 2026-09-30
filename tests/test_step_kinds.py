@@ -471,6 +471,9 @@ def test_python_env_carries_the_library_path_and_nothing_else(monkeypatch):
 
 async def test_python_subprocess_is_started_with_the_minimal_env(monkeypatch):
     monkeypatch.setenv("CANARY_SECRET", "s3cret-value")
+    # CI runners (setup-python) export LD_LIBRARY_PATH, which the step passes
+    # through by design; pin it off here so the env is exactly PATH.
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
     captured = {}
     real = asyncio.create_subprocess_exec
 
