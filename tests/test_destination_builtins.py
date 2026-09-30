@@ -235,7 +235,7 @@ def test_teams_posts_through_a_destination_only_as_the_user():
 async def test_sapnotes_through_a_destination_uses_its_url_and_headers():
     from agents.sapnotes_tools import sapnotes_toolset
 
-    sample = json.loads((FIXTURES / "nvd_sap_sample.json").read_text())
+    sample = json.loads((FIXTURES / "nvd_sap_sample.json").read_text(encoding="utf-8"))
     rec = Recorder(lambda r: httpx.Response(200, json=sample))
     resolver = FakeResolver("https://nvd-proxy.example/nvd", headers={"apiKey": "from-destination"})
     toolset = sapnotes_toolset(
@@ -265,7 +265,7 @@ def test_sapnotes_default_mode_still_calls_nvd_directly():
 async def test_sapnotedetail_through_a_destination_uses_the_destination_cookie():
     from agents.sapnotedetail_tools import sapnotedetail_toolset
 
-    detail = json.loads((FIXTURES / "sapnote_detail.json").read_text())
+    detail = json.loads((FIXTURES / "sapnote_detail.json").read_text(encoding="utf-8"))
     rec = Recorder(lambda r: httpx.Response(
         200, json=detail, headers={"content-type": "application/json"}))
     resolver = FakeResolver("https://me.sap.com", headers={"Cookie": "SAP_SESSIONID=abc"})

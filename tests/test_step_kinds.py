@@ -421,6 +421,10 @@ async def test_python_timeout_kills_the_subprocess():
     assert asyncio.get_event_loop().time() - started < 5
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="the cap is a POSIX rlimit applied through preexec_fn; Windows has neither",
+)
 async def test_python_memory_cap():
     with pytest.raises(sk.StepFailed, match="MemoryError"):
         await run("python", {"code": "x = bytearray(600 * 1024 * 1024)\noutput = 'no'"}, ctx())

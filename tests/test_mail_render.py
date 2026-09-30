@@ -356,13 +356,13 @@ def _sample(theme=None) -> str:
 
 
 def test_default_output_is_byte_identical_to_before_themes():
-    assert _sample() == FIXTURE.read_text()
+    assert _sample() == FIXTURE.read_text(encoding="utf-8")
 
 
 def test_an_empty_theme_is_the_default():
     from agents.mail_render import MailTheme
 
-    assert _sample(MailTheme()) == FIXTURE.read_text()
+    assert _sample(MailTheme()) == FIXTURE.read_text(encoding="utf-8")
     assert MailTheme.from_config(None) == MailTheme()
     assert MailTheme.from_config({}) == MailTheme()
 
