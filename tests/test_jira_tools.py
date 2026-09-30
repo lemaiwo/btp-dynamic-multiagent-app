@@ -188,10 +188,10 @@ def test_multi_value_filters() -> None:
     # Against live Jira, IN vs AND here was 20 issues vs 0 -- the two are not
     # interchangeable, and this is the assertion that pins it.
     check("several labels are ANDed, not INed",
-          build_jql("ABC", "", None, "NEXUSFORGE, agent")
-          == 'project = "ABC" AND labels = "NEXUSFORGE" AND labels = "agent" '
+          build_jql("ABC", "", None, "TEAM-X, agent")
+          == 'project = "ABC" AND labels = "TEAM-X" AND labels = "agent" '
              "ORDER BY updated ASC",
-          detail=build_jql("ABC", "", None, "NEXUSFORGE, agent"))
+          detail=build_jql("ABC", "", None, "TEAM-X, agent"))
     check("labels IN(...) is never emitted",
           "labels IN" not in build_jql("ABC", "", None, "a, b"),
           detail=build_jql("ABC", "", None, "a, b"))

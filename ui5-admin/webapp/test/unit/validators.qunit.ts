@@ -135,7 +135,7 @@ QUnit.test("destination mode accepts comma-separated labels and statuses", (asse
             {
                 destination: "MY_JIRA_DESTINATION",
                 status: "Open, In Progress, In Analysis",
-                labels: "NEXUSFORGE, agent"
+                labels: "TEAM-X, agent"
             },
             "destination",
             "builtin:jira"
