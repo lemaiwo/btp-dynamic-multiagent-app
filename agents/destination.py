@@ -10,15 +10,25 @@ Contrast :mod:`agents.client_credentials`, which authenticates *as* the
 application and therefore must hold a client secret in our own database. Here
 the only thing configured is a name.
 
+A destination can also act **as the signed-in user**. Sending that user's
+XSUAA JWT as ``X-user-token`` makes an ``OAuth2UserTokenExchange``,
+``OAuth2JWTBearer``, ``OAuth2SAMLBearerAssertion`` or ``PrincipalPropagation``
+destination hand back a token *for that user*, which is how a built-in can
+read a person's mailbox or post under their name without this app holding a
+per-user refresh token. Those results are cached per principal, separately
+from the app-level result, and bounded.
+
 This module knows nothing about what sits behind the destination.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -39,6 +49,26 @@ DESTINATION_PATH = "/destination-configuration/v1/destinations/"
 
 # Additional destination properties of this form are sent as request headers.
 _STATIC_HEADER_PREFIX = "URL.headers."
+
+# The header the destination service reads the end user's token from, for the
+# user-propagating authentication types. Case-insensitive on the wire; this
+# spelling is the one the service documents.
+USER_TOKEN_HEADER = "X-user-token"
+
+# How many principals' resolutions one resolver keeps. A busy multi-user agent
+# must not grow this without limit; the least recently used entry goes first.
+PER_USER_CACHE_MAX = 256
+
+# Destination authentication types that act as the caller rather than as the
+# application. Reported in diagnostics; the resolver itself does not branch
+# on them, because the service does the right thing given the header.
+USER_PROPAGATING_AUTH_TYPES = frozenset({
+    "OAuth2UserTokenExchange",
+    "OAuth2JWTBearer",
+    "OAuth2SAMLBearerAssertion",
+    "PrincipalPropagation",
+    "SAMLAssertion",
+})
 
 MISSING_BINDING_MESSAGE = (
     "no destination service binding found. On Cloud Foundry, bind a "
@@ -160,6 +190,63 @@ class Destination:
     url: str
     headers: dict[str, str]
     expires_at: float
+    # The destination's ``Authentication`` property, for diagnostics only:
+    # "OAuth2ClientCredentials", "OAuth2UserTokenExchange", "NoAuthentication"
+    # and so on. Empty when the response did not say.
+    auth_type: str = ""
+    # True when this was resolved with a user's token, so a log line can say
+    # whose credential a request carried.
+    per_user: bool = False
+
+
+# Destination property names whose value is a credential. Matched
+# case-insensitively as a substring, so `mail.password`, `Password`,
+# `clientSecret` and `tokenServicePassword` are all covered.
+_SECRET_PROPERTY_MARKERS = ("password", "secret", "token", "key")
+
+
+class DestinationProperties(Mapping[str, str]):
+    """A destination's raw ``destinationConfiguration``, read-only.
+
+    For destinations that are not an HTTP endpoint -- a ``MAIL`` destination
+    has no ``URL``, only ``mail.smtp.host``, ``mail.user``, ``mail.password``
+    and friends -- the properties themselves are the resolution. Some of them
+    are credentials, so ``repr()``/``str()`` list property *names* only: a
+    value that reaches a log line through ``logger.exception``, a traceback
+    frame or an f-string must not print the secret.
+
+    ``expires_at`` follows the same rule as :class:`Destination`: a
+    :func:`time.monotonic` deadline with the skew already subtracted.
+    """
+
+    __slots__ = ("_values", "expires_at", "auth_type")
+
+    def __init__(self, values: Mapping[str, Any], *, expires_at: float) -> None:
+        self._values = {str(k): "" if v is None else str(v) for k, v in values.items()}
+        self.expires_at = expires_at
+        self.auth_type = self._values.get("Authentication", "").strip()
+
+    def __getitem__(self, key: str) -> str:
+        return self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    @staticmethod
+    def is_secret(name: str) -> bool:
+        lowered = name.lower()
+        return any(marker in lowered for marker in _SECRET_PROPERTY_MARKERS)
+
+    def __repr__(self) -> str:
+        shown = ", ".join(
+            f"{k}=***" if self.is_secret(k) else k for k in sorted(self._values)
+        )
+        return f"DestinationProperties({shown})"
+
+    __str__ = __repr__
 
 
 class DestinationResolver:
@@ -176,20 +263,79 @@ class DestinationResolver:
         config: DestinationServiceConfig,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        require_credential: bool = True,
     ) -> None:
         self.name = (name or "").strip()
         self._config = config
         # A constructor seam for tests. Patching httpx.AsyncClient globally
         # instead would also intercept the caller's own API traffic.
         self._transport = transport
+        # Whether a destination that hands back no credential at all is a
+        # configuration error. True for every target that needs one; False
+        # for a public API (NVD) where the destination only supplies a URL
+        # and, at most, a static header.
+        self.require_credential = require_credential
         self._cached: Destination | None = None
+        # The raw properties, for destinations used by what they carry rather
+        # than by a URL (MAIL). App-level only: no built-in resolves those
+        # per user. Same lifetime rules as `_cached`.
+        self._cached_properties: DestinationProperties | None = None
+        # Per-principal results, least recently used first. Kept apart from
+        # the app-level entry: the two are different credentials, and a
+        # user's token must never be handed to a request made as the app.
+        self._per_user: OrderedDict[str, Destination] = OrderedDict()
         self._lock = asyncio.Lock()
 
-    def invalidate(self) -> None:
-        """Drop the cached destination, so the next resolve re-fetches."""
-        self._cached = None
+    def invalidate(self, principal: str | None = None) -> None:
+        """Drop a cached destination, so the next resolve re-fetches.
 
-    async def resolve(self, *, force: bool = False) -> Destination:
+        Without ``principal`` the app-level entry goes; with one, only that
+        principal's entry. A 401 from the target under one user says nothing
+        about anyone else's token.
+        """
+        if principal is None:
+            self._cached = None
+            self._cached_properties = None
+        else:
+            self._per_user.pop(principal, None)
+
+    def invalidate_all(self) -> None:
+        self._cached = None
+        self._cached_properties = None
+        self._per_user.clear()
+
+    @property
+    def cached_principals(self) -> list[str]:
+        """The principals with a live per-user entry. For tests and diagnostics."""
+        return list(self._per_user)
+
+    @staticmethod
+    def _user_key(principal: str | None, user_token: str) -> str:
+        # Keyed by principal when the caller knows it. A token without a
+        # principal is keyed by its digest, so two users are never mixed up
+        # and the raw token is never a dictionary key that a debugger prints.
+        if principal:
+            return principal
+        return "token:" + hashlib.sha256(user_token.encode("utf-8")).hexdigest()
+
+    async def resolve(
+        self,
+        *,
+        force: bool = False,
+        user_token: str | None = None,
+        principal: str | None = None,
+    ) -> Destination:
+        """The destination, fetched or from cache.
+
+        With ``user_token`` (the signed-in user's XSUAA JWT) the destination
+        service is asked to resolve *for that user*: the token goes along as
+        ``X-user-token``, which is what makes a user-propagating
+        authentication type return that person's token. The result is cached
+        under ``principal`` (or a digest of the token), never in the
+        app-level slot. Without ``user_token`` the behaviour is unchanged.
+        """
+        if user_token:
+            return await self._resolve_for_user(user_token, principal, force=force)
         current = self._cached
         if not force and current is not None and time.monotonic() < current.expires_at:
             return current
@@ -206,16 +352,84 @@ class DestinationResolver:
             self._cached = resolved
             return resolved
 
+    async def _resolve_for_user(
+        self, user_token: str, principal: str | None, *, force: bool
+    ) -> Destination:
+        key = self._user_key(principal, user_token)
+        hit = self._per_user.get(key)
+        if not force and hit is not None and time.monotonic() < hit.expires_at:
+            self._per_user.move_to_end(key)
+            return hit
+        async with self._lock:
+            hit = self._per_user.get(key)
+            if not force and hit is not None and time.monotonic() < hit.expires_at:
+                self._per_user.move_to_end(key)
+                return hit
+            resolved = await self._fetch(user_token=user_token)
+            self._per_user.pop(key, None)
+            self._per_user[key] = resolved
+            while len(self._per_user) > PER_USER_CACHE_MAX:
+                self._per_user.popitem(last=False)
+            return resolved
+
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(timeout=httpx.Timeout(30.0), transport=self._transport)
 
-    async def _fetch(self) -> Destination:
+    async def resolve_properties(self, *, force: bool = False) -> DestinationProperties:
+        """The destination's raw ``destinationConfiguration``, fetched or cached.
+
+        For destinations that carry settings rather than a URL -- a ``MAIL``
+        destination's ``mail.smtp.host``, ``mail.user``, ``mail.password``.
+        Resolved with the app's own token, never a user's, and cached like
+        :meth:`resolve`: until the returned token nears expiry, or
+        :data:`DEFAULT_LIFETIME_SECONDS` when the response carries none. The
+        values include the destination's credential; the returned mapping's
+        ``repr`` masks them, and nothing here logs them.
+        """
+        current = self._cached_properties
+        if not force and current is not None and time.monotonic() < current.expires_at:
+            return current
+        async with self._lock:
+            current = self._cached_properties
+            if (
+                not force
+                and current is not None
+                and time.monotonic() < current.expires_at
+            ):
+                return current
+            payload = await self._fetch_payload()
+            config = (payload or {}).get("destinationConfiguration") or {}
+            if not isinstance(config, dict) or not config:
+                raise DestinationError(
+                    f"destination {self.name!r} returned no configuration"
+                )
+            lifetime = DEFAULT_LIFETIME_SECONDS
+            tokens = (payload or {}).get("authTokens") or []
+            if tokens and isinstance(tokens[0], dict):
+                try:
+                    lifetime = int(float(tokens[0].get("expires_in")))
+                except (TypeError, ValueError):
+                    lifetime = DEFAULT_LIFETIME_SECONDS
+            deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
+            resolved = DestinationProperties(config, expires_at=deadline)
+            self._cached_properties = resolved
+            return resolved
+
+    async def _fetch(self, *, user_token: str | None = None) -> Destination:
+        payload = await self._fetch_payload(user_token=user_token)
+        return self._destination_from(payload, per_user=bool(user_token))
+
+    async def _fetch_payload(self, *, user_token: str | None = None) -> Any:
+        """The destination service's "find destination" response, as JSON."""
         async with self._client() as http:
             token = await self._service_token(http)
+            headers = {"Authorization": f"Bearer {token}"}
+            if user_token:
+                headers[USER_TOKEN_HEADER] = user_token
             try:
                 response = await http.get(
                     f"{self._config.api_url}{DESTINATION_PATH}{self.name}",
-                    headers={"Authorization": f"Bearer {token}"},
+                    headers=headers,
                 )
             except httpx.HTTPError as exc:
                 raise DestinationError(
@@ -231,8 +445,7 @@ class DestinationResolver:
                     f"destination service returned {response.status_code} for "
                     f"{self.name!r}: {response.text[:400]}"
                 )
-            payload = response.json()
-        return self._destination_from(payload)
+            return response.json()
 
     async def _service_token(self, http: httpx.AsyncClient) -> str:
         try:
@@ -261,11 +474,12 @@ class DestinationResolver:
             )
         return token
 
-    def _destination_from(self, payload: Any) -> Destination:
+    def _destination_from(self, payload: Any, *, per_user: bool = False) -> Destination:
         config = (payload or {}).get("destinationConfiguration") or {}
         url = str(config.get("URL") or "").strip().rstrip("/")
         if not url:
             raise DestinationError(f"destination {self.name!r} has no URL configured")
+        auth_type = str(config.get("Authentication") or "").strip()
 
         # Static headers set as `URL.headers.<Name>` additional properties.
         # This is how a destination carries a long-lived bearer token the
@@ -281,25 +495,37 @@ class DestinationResolver:
         lifetime = DEFAULT_LIFETIME_SECONDS
         tokens = (payload or {}).get("authTokens") or []
         if not tokens:
-            if any(k.lower() == "authorization" for k in headers):
+            if (
+                any(k.lower() == "authorization" for k in headers)
+                or not self.require_credential
+            ):
                 deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
-                return Destination(url=url, headers=headers, expires_at=deadline)
+                return Destination(
+                    url=url, headers=headers, expires_at=deadline,
+                    auth_type=auth_type, per_user=per_user,
+                )
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
             # the bare 401-after-one-retry the caller would otherwise report,
             # which points at the target rather than at the destination.
+            hint = (
+                " (it was resolved with the user's token, so a user-propagating "
+                "type such as OAuth2UserTokenExchange would also do)"
+                if per_user else ""
+            )
             raise DestinationError(
                 f"destination {self.name!r} returned no authentication token; "
                 f"check its Authentication type in the subaccount -- this "
                 f"integration needs OAuth2ClientCredentials, or NoAuthentication "
                 f"with a URL.headers.Authorization property, and this "
-                f"destination carries neither"
+                f"destination carries neither{hint}"
             )
         token = tokens[0] or {}
         if token.get("error"):
+            what = "for the signed-in user" if per_user else "from the target"
             raise DestinationError(
-                f"destination {self.name!r} could not obtain a token from the "
-                f"target: {token['error']}"
+                f"destination {self.name!r} could not obtain a token {what}: "
+                f"{token['error']}"
             )
         header = token.get("http_header") or {}
         key = str(header.get("key") or "").strip()
@@ -314,4 +540,26 @@ class DestinationResolver:
             lifetime = DEFAULT_LIFETIME_SECONDS
 
         deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
-        return Destination(url=url, headers=headers, expires_at=deadline)
+        return Destination(
+            url=url, headers=headers, expires_at=deadline,
+            auth_type=auth_type, per_user=per_user,
+        )
+
+
+def resolver_from_environment(
+    name: str, *, server_key: str = "", require_credential: bool = True
+) -> DestinationResolver:
+    """A resolver for ``name`` from the ambient destination service binding.
+
+    Raises rather than returning None when there is no binding: a toolset
+    built against nothing would fail later with an AttributeError from inside
+    a tool call, which tells an operator nothing about what to fix.
+    ``server_key`` only prefixes that message.
+    """
+    import os
+
+    config = config_from_environment(os.environ)
+    if config is None:
+        prefix = f"{server_key}: " if server_key else ""
+        raise DestinationError(f"{prefix}{MISSING_BINDING_MESSAGE}")
+    return DestinationResolver(name, config, require_credential=require_credential)

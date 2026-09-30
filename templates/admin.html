@@ -100,6 +100,24 @@
         }
         .modal h3 { margin-top: 0; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+        /* A class that sets display (.toolbar, .modal-head) would otherwise beat the
+           UA's [hidden] rule and keep a hidden element visible. */
+        [hidden] { display: none !important; }
+        /* --- detail runs --- editor header actions and the "Last runs" block */
+        .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+        .modal-head h3 { margin: 0 0 12px 0; }
+        .modal-head-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+        .detail-runs { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 8px; }
+        .detail-runs-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+        .detail-runs-head strong { font-size: 13px; }
+        .detail-runs table td, .detail-runs table th { padding: 6px 8px; font-size: 12px; }
+        .detail-runs tr.dr-row { cursor: pointer; }
+        .detail-runs tr.dr-row:hover td { background: var(--bg); }
+        .detail-runs td.dr-summary { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* --- run detail auto-refresh --- toolbar above each run detail view */
+        .detail-toolbar { align-items: center; }
+        .detail-toolbar label { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-weight: normal; }
+        .detail-toolbar .hint { color: var(--muted); font-size: 12px; }
         #toast {
             position: fixed;
             bottom: 24px;
@@ -133,6 +151,12 @@
         fieldset.exposure legend { font-weight: 600; font-size: 13px; padding: 0 4px; }
         fieldset.exposure label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
         fieldset.exposure label input[type="checkbox"] { margin-right: 6px; font-weight: normal; }
+        /* --- deep agents --- collapsible section in the agent form */
+        details.deep { border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; grid-column: 1 / -1; }
+        details.deep summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+        details.deep label { display: block; margin: 8px 0 4px 0; font-weight: 500; font-size: 13px; }
+        details.deep label input[type="checkbox"] { margin-right: 6px; }
+        details.deep .deep-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
         .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
         .tab-btn {
             background: none; color: var(--muted); border: none; border-bottom: 2px solid transparent;
@@ -159,6 +183,63 @@
             margin: 0; font-size: 12px;
         }
         .wf-step-output.error { color: var(--danger); }
+        /* --- workflow step cards --- one card per step: a header line with the
+           selectors and a full-width body for the instructions / kind config,
+           so long instructions are readable instead of squeezed into a row. */
+        .wf-step {
+            border: 1px solid var(--border); border-radius: 6px;
+            background: #fafbfc; padding: 10px 12px; margin-bottom: 10px;
+        }
+        .wf-step-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+        .wf-step-head label { margin: 0; font-weight: normal; white-space: nowrap; }
+        .wf-step-num {
+            flex: 0 0 auto; min-width: 2.2em; font-weight: 600; font-size: 12px;
+            color: var(--muted); text-transform: uppercase;
+        }
+        .wf-step-tools { flex: 0 0 auto; margin-left: auto; display: flex; gap: 4px; }
+        .wf-step-tools button { padding: 4px 8px; }
+        .wf-step-body { margin-top: 8px; }
+        .wf-step-kind-hint { display: block; color: var(--muted); font-size: 12px; margin: 0 0 6px 0; }
+        .wf-step-config { margin: 0; }
+        .wf-cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; align-items: end; }
+        .wf-cfg-grid > label, .wf-cfg-grid > .wf-field { margin: 0; min-width: 0; }
+        .wf-cfg-grid > label { font-weight: 500; font-size: 12px; color: var(--muted); }
+        .wf-cfg-grid > label > input, .wf-cfg-grid > label > select { margin-top: 3px; }
+        .wf-cfg-grid > .full { grid-column: 1 / -1; }
+        .wf-cfg-grid input[type="number"] {
+            width: 100%; padding: 8px 10px; border: 1px solid var(--border);
+            border-radius: 4px; font-family: inherit; font-size: 13px;
+        }
+        .wf-field { display: block; min-width: 0; }
+        .wf-field-head {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 12px; font-weight: 500; color: var(--muted); margin: 0 0 3px 0;
+        }
+        .wf-field-head .wf-text-counter { margin-left: auto; font-weight: normal; }
+        .wf-field-head .wf-expand-btn { padding: 2px 8px; font-size: 12px; }
+        .wf-field textarea {
+            width: 100%; display: block; min-height: 4rem; resize: vertical;
+            font-size: 13px; line-height: 1.5;
+        }
+        .wf-field textarea.wf-step-instructions {
+            min-height: 10rem; font-family: inherit; font-size: 14px; line-height: 1.5;
+        }
+        .wf-field textarea.wf-py-code { min-height: 14rem; font-family: Menlo, Consolas, monospace; }
+        .wf-cond-rules .wf-cond-rule input, .wf-cond-rules .wf-cond-rule select,
+        .wf-cond-else input, .wf-cond-else select { width: auto; padding: 5px 8px; }
+        .wf-cond-else { display: flex; gap: 4px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+        /* --- text editor modal --- a large editor over the workflow modal */
+        #text-editor-modal { z-index: 20; padding-top: 3vh; }
+        #text-editor-modal .modal { width: 960px; max-width: 96vw; max-height: 94vh; }
+        /* The workflow editor holds one card per step, each with a multi-line
+           instructions field: give it the room a form of that size needs. */
+        #workflow-modal .modal { width: 1040px; max-width: 96vw; max-height: 92vh; }
+        #text-editor-textarea {
+            width: 100%; height: calc(94vh - 170px); min-height: 240px; max-height: 80vh;
+            font-size: 14px; line-height: 1.5; resize: vertical;
+        }
+        #text-editor-modal .modal-actions { align-items: center; }
+        #text-editor-modal .wf-text-counter { margin-right: auto; color: var(--muted); font-size: 12px; }
         #runs-list table td, #runs-list table th { cursor: default; }
         #runs-list .run-row { cursor: pointer; }
         #runs-list .run-row:hover { background: #f8f9fb; }
@@ -274,6 +355,16 @@
                 <tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr>
             </tbody>
         </table>
+        <!-- --- run detail auto-refresh --- shown once a run is opened -->
+        <div class="toolbar detail-toolbar" id="workflow-run-detail-toolbar" hidden>
+            <button type="button" class="secondary small" id="workflow-run-detail-refresh"
+                    onclick="refreshRunDetail('workflow-run')">Refresh</button>
+            <label><input type="checkbox" id="workflow-run-detail-autorefresh" checked
+                          onchange="toggleAutoRefresh('workflow-run')"> Auto-refresh while running</label>
+            <span class="hint" id="workflow-run-detail-autorefresh-status"></span>
+            <button type="button" class="secondary small" id="workflow-run-detail-close"
+                    style="margin-left:auto" onclick="closeRunDetail('workflow-run')">Close</button>
+        </div>
         <div id="workflow-run-detail"></div>
     </div>
 
@@ -322,6 +413,16 @@
     </div>
     <div class="panel">
         <h2>Run detail</h2>
+        <!-- --- run detail auto-refresh --- shown once a run is opened -->
+        <div class="toolbar detail-toolbar" id="run-detail-toolbar" hidden>
+            <button type="button" class="secondary small" id="run-detail-refresh"
+                    onclick="refreshRunDetail('run')">Refresh</button>
+            <label><input type="checkbox" id="run-detail-autorefresh" checked
+                          onchange="toggleAutoRefresh('run')"> Auto-refresh while running</label>
+            <span class="hint" id="run-detail-autorefresh-status"></span>
+            <button type="button" class="secondary small" id="run-detail-close"
+                    style="margin-left:auto" onclick="closeRunDetail('run')">Close</button>
+        </div>
         <div id="run-detail"><p class="hint">Select a run above to see its report.</p></div>
     </div>
     </div>
@@ -329,8 +430,19 @@
 
 <div id="agent-modal" class="modal-backdrop" onclick="if(event.target===this)closeAgentModal()">
     <div class="modal">
-        <h3 id="modal-title">New agent</h3>
+        <!-- --- detail runs --- Run now / Refresh exist only for a saved agent -->
+        <div class="modal-head">
+            <h3 id="modal-title">New agent</h3>
+            <div class="modal-head-actions">
+                <button type="button" class="secondary small" id="agent-refresh" hidden
+                        title="Reload this agent from the server" onclick="refreshAgentDetail()">Refresh</button>
+                <button type="button" class="small" id="agent-run-now" hidden
+                        title="Start a run of this agent now" onclick="runAgentFromDetail()">Run now</button>
+            </div>
+        </div>
         <input type="hidden" id="agent-id">
+        <!-- where used: filled by loadAgentWhereUsed() when an existing agent is opened -->
+        <div id="agent-where-used" style="font-size:.85em;margin:-6px 0 12px"></div>
         <div class="form-grid">
             <label class="full">
                 Name
@@ -368,6 +480,33 @@
                     <option value="">Use the active model</option>
                 </select>
             </label>
+            <!-- --- deep agents --- -->
+            <details class="deep" id="agent-deep-section">
+                <summary>Deep agent <span style="color:var(--muted);font-weight:normal">(optional — planning tool, per-run scratchpad and ephemeral sub-agents)</span></summary>
+                <label><input type="checkbox" id="agent-deep-enabled" onchange="updateDeepHint()"> Enable deep-agent tools for this specialist</label>
+                <p class="hint" id="agent-deep-hint">
+                    The specialist is told to plan first, keep long intermediate results in a scratchpad
+                    that lives only for the run, and hand isolated sub-tasks to ephemeral sub-agents that
+                    get the same MCP servers and built-ins. Sub-agents are not specialists: the orchestrator
+                    and peers never see them.
+                </p>
+                <div class="deep-grid">
+                    <label><input type="checkbox" id="agent-deep-planning" checked> Planning (<code>write_todos</code>, <code>read_todos</code>)</label>
+                    <label><input type="checkbox" id="agent-deep-scratchpad" checked> Scratchpad (<code>ls</code>, <code>read_file</code>, <code>write_file</code>, <code>edit_file</code>)</label>
+                    <label><input type="checkbox" id="agent-deep-subagents" checked> Sub-agents (<code>task</code>)</label>
+                    <span></span>
+                    <label>Max concurrent sub-agents
+                        <input type="number" id="agent-deep-max-subagents" value="5" min="1" max="20">
+                    </label>
+                    <label>Max sub-agent depth <span style="color:var(--muted);font-weight:normal">(1 = sub-agents cannot spawn their own)</span>
+                        <input type="number" id="agent-deep-max-depth" value="1" min="1" max="3">
+                    </label>
+                </div>
+                <label>Sub-agent instructions <span style="color:var(--muted);font-weight:normal">(optional — replaces the default sub-agent system prompt)</span>
+                    <textarea id="agent-deep-instructions" rows="3"
+                              placeholder="You are a sub-agent. Complete the task and return a concise result…"></textarea>
+                </label>
+            </details>
             <label class="full">
                 <input type="checkbox" id="agent-enabled" checked>
                 Enabled
@@ -400,6 +539,8 @@
                 </label>
             </fieldset>
         </div>
+        <!-- --- detail runs --- latest runs of this agent; hidden for a new agent -->
+        <div id="agent-last-runs" class="detail-runs" hidden></div>
         <div class="modal-actions">
             <button class="secondary" onclick="closeAgentModal()">Cancel</button>
             <button onclick="saveAgent()">Save</button>
@@ -434,7 +575,16 @@
 
 <div id="workflow-modal" class="modal-backdrop" onclick="if(event.target===this)closeWorkflowModal()">
     <div class="modal">
-        <h3 id="workflow-modal-title">New workflow</h3>
+        <!-- --- detail runs --- Run now / Refresh exist only for a saved workflow -->
+        <div class="modal-head">
+            <h3 id="workflow-modal-title">New workflow</h3>
+            <div class="modal-head-actions">
+                <button type="button" class="secondary small" id="workflow-refresh" hidden
+                        title="Reload this workflow from the server" onclick="refreshWorkflowDetail()">Refresh</button>
+                <button type="button" class="small" id="workflow-run-now" hidden
+                        title="Start a run of this workflow now" onclick="runWorkflowFromDetail()">Run now</button>
+            </div>
+        </div>
         <input type="hidden" id="workflow-id">
         <div class="form-grid">
             <label class="full">Name
@@ -481,9 +631,27 @@
             </label>
         </div>
 
+        <!-- --- detail runs --- latest runs of this workflow; hidden for a new workflow -->
+        <div id="workflow-last-runs" class="detail-runs" hidden></div>
         <div class="modal-actions">
             <button class="secondary" onclick="closeWorkflowModal()">Cancel</button>
             <button onclick="saveWorkflow()">Save</button>
+        </div>
+    </div>
+</div>
+
+<!-- Large text editor: opened by the ⤢ Expand button next to a workflow
+     step's instructions / template / body / code textarea. Done writes the
+     text back to that textarea; Cancel (or Esc) leaves it as it was. -->
+<div id="text-editor-modal" class="modal-backdrop" onclick="if(event.target===this)closeTextEditor(false)">
+    <div class="modal" role="dialog" aria-labelledby="text-editor-title">
+        <h3 id="text-editor-title">Edit text</h3>
+        <textarea id="text-editor-textarea" spellcheck="false"></textarea>
+        <div class="modal-actions">
+            <span id="text-editor-counter" class="wf-text-counter"></span>
+            <span style="color:var(--muted);font-size:12px">Esc cancels · Ctrl/⌘+Enter applies</span>
+            <button type="button" class="secondary" id="text-editor-cancel" onclick="closeTextEditor(false)">Cancel</button>
+            <button type="button" id="text-editor-done" onclick="closeTextEditor(true)">Done</button>
         </div>
     </div>
 </div>
@@ -609,11 +777,12 @@ function addMcpServerRow(server) {
     row.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px';
     row.innerHTML = `
         <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
-            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com">
+            <input type="url" class="mcp-url" placeholder="https://example-mcp.cfapps.eu20-001.hana.ondemand.com" oninput="syncDestinationFields(this.closest('.mcp-server-row'))">
             <select class="mcp-auth-mode" onchange="toggleOauthFields(this); updateEndpointHint()">
                 <option value="jwt">JWT forward (BTP)</option>
                 <option value="oauth2">OAuth2 (per-user)</option>
                 <option value="none">None (public)</option>
+                <option value="destination">BTP destination</option>
                 <option value="session">Browser session (refreshed by hand)</option>
             </select>
             <button type="button" class="small danger" title="Remove"
@@ -660,6 +829,7 @@ function addMcpServerRow(server) {
                 <code class="oauth-redirect"></code>
             </p>
         </div>
+        ${destinationFieldsHtml()}
     `;
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
@@ -672,6 +842,7 @@ function addMcpServerRow(server) {
     const secret = row.querySelector('.oauth-client-secret');
     secret.placeholder = oauth.has_client_secret ? '•••••• (stored — leave blank to keep)' : '';
     row.querySelector('.oauth-redirect').textContent = location.origin + '/oauth/callback';
+    fillDestinationFields(row, oauth);
     container.appendChild(row);
     toggleOauthFields(row.querySelector('.mcp-auth-mode'));
     updateEndpointHint();
@@ -680,7 +851,9 @@ function addMcpServerRow(server) {
 function toggleOauthFields(select) {
     const row = select.closest('.mcp-server-row');
     row.querySelector('.mcp-oauth').style.display = select.value === 'oauth2' ? 'block' : 'none';
+    row.querySelector('.mcp-destination').style.display = select.value === 'destination' ? 'block' : 'none';
     toggleDcr(row.querySelector('.oauth-dcr'));
+    syncDestinationFields(row);
 }
 
 function toggleDcr(cb) {
@@ -712,6 +885,8 @@ function collectMcpServers() {
                 if (secret) oauth.client_secret = secret;
                 server.oauth = oauth;
             }
+        } else if (mode === 'destination') {
+            server.oauth = collectDestinationConfig(r);
         }
         out.push(server);
     });
@@ -800,6 +975,52 @@ function collectAgentPeers() {
     return Array.from(document.querySelectorAll('#agent-peers .agent-peer-check'))
         .filter(cb => cb.checked)
         .map(cb => cb.value);
+}
+
+// --- deep agents ------------------------------------------------------------
+// Mirrors agents.deep.DeepConfig; the server validates the ranges again.
+const DEEP_DEFAULTS = {
+    enabled: false, planning: true, scratchpad: true, subagents: true,
+    max_subagents: 5, subagent_max_depth: 1, subagent_instructions: '',
+};
+
+function setDeepForm(deep) {
+    const d = Object.assign({}, DEEP_DEFAULTS, deep || {});
+    document.getElementById('agent-deep-enabled').checked = !!d.enabled;
+    document.getElementById('agent-deep-planning').checked = !!d.planning;
+    document.getElementById('agent-deep-scratchpad').checked = !!d.scratchpad;
+    document.getElementById('agent-deep-subagents').checked = !!d.subagents;
+    document.getElementById('agent-deep-max-subagents').value = d.max_subagents;
+    document.getElementById('agent-deep-max-depth').value = d.subagent_max_depth;
+    document.getElementById('agent-deep-instructions').value = d.subagent_instructions || '';
+    // Open the section when it is in use, so an enabled config is visible at a glance.
+    document.getElementById('agent-deep-section').open = !!d.enabled;
+    updateDeepHint();
+}
+
+function clampInt(value, min, max, fallback) {
+    const n = parseInt(value, 10);
+    if (Number.isNaN(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+function collectDeep() {
+    return {
+        enabled: document.getElementById('agent-deep-enabled').checked,
+        planning: document.getElementById('agent-deep-planning').checked,
+        scratchpad: document.getElementById('agent-deep-scratchpad').checked,
+        subagents: document.getElementById('agent-deep-subagents').checked,
+        max_subagents: clampInt(document.getElementById('agent-deep-max-subagents').value, 1, 20, 5),
+        subagent_max_depth: clampInt(document.getElementById('agent-deep-max-depth').value, 1, 3, 1),
+        subagent_instructions: document.getElementById('agent-deep-instructions').value.trim(),
+    };
+}
+
+function updateDeepHint() {
+    const on = document.getElementById('agent-deep-enabled').checked;
+    ['agent-deep-planning', 'agent-deep-scratchpad', 'agent-deep-subagents',
+     'agent-deep-max-subagents', 'agent-deep-max-depth', 'agent-deep-instructions']
+        .forEach(id => { document.getElementById(id).disabled = !on; });
 }
 
 async function renderAgentModelOptions(selected) {
@@ -944,6 +1165,7 @@ function openWorkflowModal() {
     document.getElementById('workflow-enabled').checked = true;
     document.getElementById('workflow-branches').innerHTML = '';
     document.getElementById('workflow-steps').innerHTML = '';
+    setDetailRunsMode('workflow', '');
     document.getElementById('workflow-modal').classList.add('open');
 }
 
@@ -953,7 +1175,7 @@ function closeWorkflowModal() {
 
 async function editWorkflow(id) {
     const res = await api(`/workflows/${id}`);
-    if (!res.ok) { toast('Failed to load workflow', 'error'); return; }
+    if (!res.ok) { toast('Failed to load workflow', 'error'); return false; }
     const w = await res.json();
     document.getElementById('workflow-modal-title').textContent = `Edit workflow: ${w.name}`;
     document.getElementById('workflow-id').value = w.id;
@@ -973,8 +1195,13 @@ async function editWorkflow(id) {
     (w.branches || []).forEach(b => addWorkflowBranchRow(b));
     document.getElementById('workflow-steps').innerHTML = '';
     (w.steps || []).forEach(s => addWorkflowStepRow(s));
+    setDetailRunsMode('workflow', w.id);
 
     document.getElementById('workflow-modal').classList.add('open');
+    // The rows were built while the modal was still hidden (no layout, so
+    // no scrollHeight); size the instruction textareas now they are visible.
+    autoGrowAll(document.getElementById('workflow-steps'));
+    return true;
 }
 
 async function saveWorkflow() {
@@ -1048,17 +1275,30 @@ function addWorkflowStepRow(step) {
     const missingAgent =
         step.agent_name && !allAgents.some(a => a.name === step.agent_name)
             ? step.agent_name : null;
+    // --- step kinds ---
+    // A step is a card: a header line (number, branch, kind, agent, fan-out,
+    // timeout, move/remove) and a full-width body that holds the agent
+    // instructions, or the kind's config editor for a non-agent kind.
+    const kind = STEP_KINDS.includes(step.kind) ? step.kind : 'agent';
+    const isAgent = kind === 'agent';
     const row = document.createElement('div');
-    row.className = 'wf-step-row';
-    row.style.cssText = 'display:flex;gap:6px;margin-bottom:4px;align-items:flex-start';
+    row.className = 'wf-step-row wf-step';
     row.innerHTML = `
-        <select class="wf-step-branch" style="flex:0 0 130px">
+        <div class="wf-step-head">
+        <span class="wf-step-num" title="Order in this editor; the position within a branch is assigned on save"></span>
+        <select class="wf-step-branch" style="flex:0 0 130px" title="Main line or branch">
             <option value="">Main line</option>
             ${branchKeys.map(k =>
                 `<option value="${escapeHtml(k)}" ${k === step.branch_key ? 'selected' : ''}>${escapeHtml(k)}</option>`
             ).join('')}
         </select>
-        <select class="wf-step-agent" style="flex:0 0 170px">
+        <select class="wf-step-kind" style="flex:0 0 100px" title="Step kind"
+                onchange="onWorkflowStepKindChange(this)">
+            ${STEP_KINDS.map(k =>
+                `<option value="${k}" ${k === kind ? 'selected' : ''}>${k}</option>`
+            ).join('')}
+        </select>
+        <select class="wf-step-agent" style="flex:0 0 170px;${isAgent ? '' : 'display:none'}" title="Agent">
             ${missingAgent
                 ? `<option value="${escapeHtml(missingAgent)}" selected disabled>${escapeHtml(missingAgent)} (missing)</option>`
                 : ''}
@@ -1066,16 +1306,176 @@ function addWorkflowStepRow(step) {
                 `<option value="${escapeHtml(a.name)}" ${a.name === step.agent_name ? 'selected' : ''}>${escapeHtml(a.name)}</option>`
             ).join('')}
         </select>
-        <textarea class="wf-step-instructions" rows="2" style="flex:1"
-                  placeholder="What should this agent do with what it was handed?">${escapeHtml(step.instructions || '')}</textarea>
-        <label style="font-weight:normal;white-space:nowrap">
+        <label class="wf-step-fanout-label" style="${isAgent ? '' : 'display:none'}" title="This step returns the work items">
             <input type="checkbox" class="wf-step-fanout" ${step.fan_out ? 'checked' : ''}> fan-out
         </label>
-        <input type="number" class="wf-step-timeout" style="flex:0 0 80px"
-               value="${step.step_timeout_seconds || 600}" min="10">
-        <button type="button" class="secondary small" onclick="this.parentNode.remove()">Remove</button>
+        <label class="wf-step-timeout-label" title="Step timeout (seconds)">timeout
+            <input type="number" class="wf-step-timeout" style="width:80px;margin-left:4px" title="Step timeout (seconds)"
+                   value="${step.step_timeout_seconds || 600}" min="10"> s
+        </label>
+        <span class="wf-step-tools">
+            <button type="button" class="secondary small wf-step-up" title="Move up" onclick="moveWorkflowStep(this, -1)">&uarr;</button>
+            <button type="button" class="secondary small wf-step-down" title="Move down" onclick="moveWorkflowStep(this, 1)">&darr;</button>
+            <button type="button" class="secondary small wf-step-remove" onclick="removeWorkflowStep(this)">Remove</button>
+        </span>
+        </div>
+        <div class="wf-step-body">
+        <span class="wf-step-kind-hint" style="${isAgent ? 'display:none' : ''}">${escapeHtml(STEP_KIND_HINTS[kind] || '')}</span>
+        <div class="wf-step-agent-body" style="${isAgent ? '' : 'display:none'}">
+            ${textFieldHtml('Instructions', 'wf-step-instructions', step.instructions || '', {
+                rows: 8, placeholder: 'What should this agent do with what it was handed?'})}
+        </div>
+        <div class="wf-step-config" data-kind="${kind}"
+             style="${isAgent ? 'display:none' : ''}">${isAgent ? '' : stepConfigEditorHtml(kind, step.config || {})}</div>
+        </div>
     `;
     document.getElementById('workflow-steps').appendChild(row);
+    attachStepAgentLink(row);
+    wireTextFields(row);
+    renumberWorkflowSteps();
+}
+
+function renumberWorkflowSteps() {
+    document.querySelectorAll('#workflow-steps .wf-step-row .wf-step-num')
+        .forEach((el, i) => { el.textContent = `Step ${i + 1}`; });
+}
+
+function moveWorkflowStep(button, direction) {
+    const row = button.closest('.wf-step-row');
+    const sibling = direction < 0 ? row.previousElementSibling : row.nextElementSibling;
+    if (!sibling || !sibling.classList.contains('wf-step-row')) return;
+    if (direction < 0) sibling.insertAdjacentElement('beforebegin', row);
+    else sibling.insertAdjacentElement('afterend', row);
+    renumberWorkflowSteps();
+}
+
+function removeWorkflowStep(button) {
+    button.closest('.wf-step-row').remove();
+    renumberWorkflowSteps();
+}
+
+// --- text fields --- a labelled textarea with a live "N lines · M chars"
+// counter and an Expand button that opens it in the large editor modal.
+// The textarea keeps its own class (wf-step-instructions, wf-py-code, ...),
+// which is what collectWorkflowSteps / collectStepConfig read.
+function textFieldHtml(label, cls, value, opts) {
+    opts = opts || {};
+    const extra = opts.full ? ' full' : '';
+    const attrs = [
+        `class="${escapeHtml(cls)}"`,
+        `rows="${opts.rows || 4}"`,
+        opts.placeholder ? `placeholder="${escapeHtml(opts.placeholder)}"` : '',
+        opts.mono ? 'spellcheck="false"' : '',
+    ].filter(Boolean).join(' ');
+    return `
+        <div class="wf-field${extra}">
+            <div class="wf-field-head">
+                <span class="wf-field-label">${escapeHtml(label)}</span>
+                <span class="wf-text-counter"></span>
+                <button type="button" class="secondary small wf-expand-btn"
+                        title="Edit in a larger editor" onclick="openTextEditorFor(this)">&#x2922; Expand</button>
+            </div>
+            <textarea ${attrs}>${escapeHtml(value || '')}</textarea>
+        </div>`;
+}
+
+// Grow a textarea with its content, up to ~60% of the viewport; past that it
+// scrolls. Hidden elements (a modal not yet open) have no scrollHeight, so
+// they are left alone and measured again by autoGrowAll once visible.
+function autoGrow(textarea) {
+    if (!textarea) return;
+    const maxPx = Math.floor(((typeof window !== 'undefined' && window.innerHeight) || 800) * 0.6);
+    textarea.style.height = 'auto';
+    const needed = textarea.scrollHeight;
+    if (!needed) return;
+    textarea.style.height = Math.min(needed + 2, maxPx) + 'px';
+    textarea.style.overflowY = needed + 2 > maxPx ? 'auto' : 'hidden';
+}
+
+function textCounterLabel(text) {
+    const value = text || '';
+    const lines = value ? value.split('\n').length : 0;
+    return `${lines} line${lines === 1 ? '' : 's'} · ${value.length} char${value.length === 1 ? '' : 's'}`;
+}
+
+function updateTextCounter(textarea) {
+    const field = textarea.closest ? textarea.closest('.wf-field') : null;
+    const counter = field ? field.querySelector('.wf-text-counter') : null;
+    if (counter) counter.textContent = textCounterLabel(textarea.value);
+}
+
+function wireTextFields(root) {
+    root.querySelectorAll('.wf-field textarea').forEach(ta => {
+        if (ta.dataset.wired) return;
+        ta.dataset.wired = '1';
+        ta.addEventListener('input', () => { autoGrow(ta); updateTextCounter(ta); });
+        autoGrow(ta);
+        updateTextCounter(ta);
+    });
+}
+
+function autoGrowAll(root) {
+    root.querySelectorAll('.wf-field textarea').forEach(autoGrow);
+}
+
+// --- text editor modal --- one modal, reused for every expandable textarea.
+let textEditorSource = null;
+let textEditorOriginal = '';
+
+function openTextEditorFor(button) {
+    const field = button.closest('.wf-field');
+    const source = field && field.querySelector('textarea');
+    if (!source) return;
+    const labelEl = field.querySelector('.wf-field-label');
+    const row = field.closest('.wf-step-row');
+    const num = row && row.querySelector('.wf-step-num');
+    const title = (num && num.textContent ? num.textContent + ' — ' : '')
+        + (labelEl ? labelEl.textContent : 'Edit text');
+    openTextEditor(source, title);
+}
+
+function onTextEditorKeydown(event) {
+    if (event.key === 'Escape') { event.preventDefault(); closeTextEditor(false); }
+    else if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); closeTextEditor(true); }
+}
+
+function openTextEditor(sourceTextarea, title) {
+    textEditorSource = sourceTextarea;
+    textEditorOriginal = sourceTextarea.value;
+    const modal = document.getElementById('text-editor-modal');
+    const ta = document.getElementById('text-editor-textarea');
+    document.getElementById('text-editor-title').textContent = title || 'Edit text';
+    ta.value = sourceTextarea.value;
+    ta.placeholder = sourceTextarea.placeholder || '';
+    try {
+        // Code stays monospace, prose stays proportional -- same as its source.
+        ta.style.fontFamily = window.getComputedStyle(sourceTextarea).fontFamily || '';
+    } catch (e) { ta.style.fontFamily = ''; }
+    const counter = document.getElementById('text-editor-counter');
+    const tick = () => { counter.textContent = textCounterLabel(ta.value); };
+    ta.oninput = tick;
+    tick();
+    modal.classList.add('open');
+    document.addEventListener('keydown', onTextEditorKeydown);
+    try { ta.focus(); } catch (e) { /* not focusable in a headless DOM */ }
+}
+
+function closeTextEditor(apply) {
+    const modal = document.getElementById('text-editor-modal');
+    const ta = document.getElementById('text-editor-textarea');
+    document.removeEventListener('keydown', onTextEditorKeydown);
+    modal.classList.remove('open');
+    const source = textEditorSource;
+    textEditorSource = null;
+    if (!source) return;
+    source.value = apply ? ta.value : textEditorOriginal;
+    // Re-run the source's own listeners (autoGrow + counter) and anything
+    // else that watches it.
+    const EventCtor = (typeof window !== 'undefined' && window.Event) || Event;
+    source.dispatchEvent(new EventCtor('input', {bubbles: true}));
+    autoGrow(source);
+    updateTextCounter(source);
+    if (apply) { try { source.focus(); } catch (e) { /* headless */ } }
 }
 
 function collectWorkflowSteps() {
@@ -1085,13 +1485,19 @@ function collectWorkflowSteps() {
         const branch = row.querySelector('.wf-step-branch').value || null;
         const groupKey = branch === null ? '__main__' : branch;
         counters[groupKey] = (counters[groupKey] || 0) + 1;
+        // --- step kinds ---
+        const kindSelect = row.querySelector('.wf-step-kind');
+        const kind = kindSelect ? kindSelect.value : 'agent';
+        const isAgent = kind === 'agent';
         return {
             branch_key: branch,
             position: counters[groupKey],
-            agent_name: row.querySelector('.wf-step-agent').value,
-            instructions: row.querySelector('.wf-step-instructions').value,
-            fan_out: row.querySelector('.wf-step-fanout').checked,
+            kind,
+            agent_name: isAgent ? row.querySelector('.wf-step-agent').value : '',
+            instructions: isAgent ? row.querySelector('.wf-step-instructions').value : '',
+            fan_out: isAgent && row.querySelector('.wf-step-fanout').checked,
             step_timeout_seconds: parseInt(row.querySelector('.wf-step-timeout').value, 10) || 600,
+            config: isAgent ? {} : collectStepConfig(kind, row, counters[groupKey]),
         };
     });
 }
@@ -1106,11 +1512,238 @@ function collectWorkflowBranches() {
         .filter(b => b.key);
 }
 
-async function runWorkflowNow(id) {
+// --- step kinds ---
+// Mirrors agents/step_kinds.py: the kinds, the condition operators, and the
+// per-kind config shape. The server validates every config again on save.
+// {% raw %} -- this block mentions {{text}}-style placeholders that Jinja
+// must hand through untouched.
+const STEP_KINDS = ['agent', 'condition', 'transform', 'http', 'python'];
+const STEP_KIND_HINTS = {
+    condition: 'Rules over the previous text (or the item / its JSON); first match wins. "stop" ends the run, the branch, or the join here.',
+    transform: 'extract_json → regex → template → truncate, in that order. Placeholders: {{text}} {{item.id}} {{json.a.b}} {{source.NAME}}.',
+    http: 'Calls a BTP destination with a relative path; the response body (JSON pretty-printed) becomes the text handed on.',
+    python: 'Runs in a sandboxed subprocess with text, item, sources, json_data; assign the result to `output`.',
+};
+const CONDITION_OPS = ['contains', 'not_contains', 'equals', 'not_equals', 'matches',
+                       'not_matches', 'gt', 'lt', 'is_empty', 'not_empty'];
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+
+function optionsHtml(values, selected) {
+    return values.map(v =>
+        `<option value="${escapeHtml(v)}" ${v === selected ? 'selected' : ''}>${escapeHtml(v)}</option>`
+    ).join('');
+}
+
+function conditionRuleRowHtml(rule) {
+    const when = (rule && rule.when) || {};
+    const then = (rule && rule.then) || {};
+    return `
+        <div class="wf-cond-rule" style="display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-bottom:3px">
+            <span style="color:var(--muted)">if</span>
+            <select class="wf-cond-source">${optionsHtml(['text', 'item', 'json'], when.source || 'text')}</select>
+            <input type="text" class="wf-cond-field" style="width:140px" placeholder="field (item/json path)" value="${escapeHtml(when.field || '')}">
+            <select class="wf-cond-op">${optionsHtml(CONDITION_OPS, when.op || 'contains')}</select>
+            <input type="text" class="wf-cond-value" style="width:160px" placeholder="value" value="${escapeHtml(when.value == null ? '' : String(when.value))}">
+            <label style="font-weight:normal;white-space:nowrap"><input type="checkbox" class="wf-cond-case" ${when.case_sensitive ? 'checked' : ''}> case</label>
+            <span style="color:var(--muted)">then</span>
+            <select class="wf-cond-action">${optionsHtml(['continue', 'stop'], then.action || 'continue')}</select>
+            <input type="text" class="wf-cond-output" style="width:220px" placeholder="output template (empty = pass through)" value="${escapeHtml(then.output || '')}">
+            <button type="button" class="secondary small" onclick="this.parentNode.remove()">×</button>
+        </div>`;
+}
+
+function addConditionRuleRow(button) {
+    const list = button.closest('.wf-step-config').querySelector('.wf-cond-rules');
+    list.insertAdjacentHTML('beforeend', conditionRuleRowHtml({}));
+}
+
+function stepConfigEditorHtml(kind, cfg) {
+    cfg = cfg || {};
+    const json = v => (v && Object.keys(v).length) ? JSON.stringify(v, null, 2) : '';
+    if (kind === 'condition') {
+        const rules = Array.isArray(cfg.rules) ? cfg.rules : [];
+        const els = cfg['else'] || {};
+        return `
+            <div class="wf-field-head"><span class="wf-field-label">Rules</span> <span style="font-weight:normal">(first match wins)</span></div>
+            <div class="wf-cond-rules">${rules.map(conditionRuleRowHtml).join('')}</div>
+            <button type="button" class="secondary small" onclick="addConditionRuleRow(this)">+ rule</button>
+            <div class="wf-cond-else">
+                <span style="color:var(--muted)">else</span>
+                <select class="wf-cond-else-action">${optionsHtml(['continue', 'stop'], els.action || 'continue')}</select>
+                <input type="text" class="wf-cond-else-output" style="width:280px" placeholder="output template (empty = pass through)" value="${escapeHtml(els.output || '')}">
+            </div>`;
+    }
+    if (kind === 'transform') {
+        const rx = cfg.regex || {};
+        return `
+            <div class="wf-cfg-grid">
+                <label>extract_json path
+                    <input type="text" class="wf-tf-extract" placeholder="a.b[0]" value="${escapeHtml(cfg.extract_json || '')}"></label>
+                <label>truncate (characters)
+                    <input type="number" class="wf-tf-truncate" min="1" placeholder="no limit" value="${cfg.truncate || ''}"></label>
+                <label>regex pattern
+                    <input type="text" class="wf-tf-pattern" placeholder="(?P<id>\\d+)" value="${escapeHtml(rx.pattern || '')}"></label>
+                <label>regex replace
+                    <input type="text" class="wf-tf-replace" placeholder="\\g<id>" value="${escapeHtml(rx.replace || '')}"></label>
+                <label>regex flags
+                    <input type="text" class="wf-tf-flags" placeholder="imsx" value="${escapeHtml(rx.flags || '')}"></label>
+                ${textFieldHtml('Template', 'wf-tf-template', cfg.template || '', {
+                    rows: 4, full: true, mono: true,
+                    placeholder: 'e.g. Summary: {{text}} ({{item.id}})'})}
+            </div>`;
+    }
+    if (kind === 'http') {
+        const expect = Array.isArray(cfg.expect_status) ? cfg.expect_status.join(',') : '';
+        return `
+            <div class="wf-cfg-grid">
+                <label>destination
+                    <input type="text" class="wf-http-destination" placeholder="destination name" value="${escapeHtml(cfg.destination || '')}"></label>
+                <label>method
+                    <select class="wf-http-method">${optionsHtml(HTTP_METHODS, (cfg.method || 'GET').toUpperCase())}</select></label>
+                <label class="full">path <span style="font-weight:normal">(relative to the destination)</span>
+                    <input type="text" class="wf-http-path" placeholder="/relative/path/{{item.id}}" value="${escapeHtml(cfg.path || '/')}"></label>
+                <label>content type
+                    <input type="text" class="wf-http-content-type" placeholder="application/json" value="${escapeHtml(cfg.content_type || 'application/json')}"></label>
+                <label>timeout (s)
+                    <input type="number" class="wf-http-timeout" min="1" max="600" value="${cfg.timeout_seconds || 30}"></label>
+                <label class="full">expected status codes <span style="font-weight:normal">(comma-separated; empty = any 2xx)</span>
+                    <input type="text" class="wf-http-expect" placeholder="200, 201" value="${escapeHtml(expect)}"></label>
+                ${textFieldHtml('Query (JSON object)', 'wf-http-query', json(cfg.query), {
+                    rows: 3, mono: true, placeholder: '{"fields": "summary"}'})}
+                ${textFieldHtml('Headers (JSON object)', 'wf-http-headers', json(cfg.headers), {
+                    rows: 3, mono: true, placeholder: '{"X-Trace": "1"}'})}
+                ${textFieldHtml('Body template', 'wf-http-body', cfg.body || '', {
+                    rows: 4, full: true, mono: true,
+                    placeholder: 'sent for POST/PUT/PATCH/DELETE, e.g. {"body": "{{text}}"}'})}
+            </div>`;
+    }
+    if (kind === 'python') {
+        return `
+            <div class="wf-cfg-grid">
+                ${textFieldHtml('Code', 'wf-py-code', cfg.code || '', {
+                    rows: 12, full: true, mono: true, placeholder: 'output = text.upper()'})}
+                <label>timeout (s)
+                    <input type="number" class="wf-py-timeout" min="1" max="60" value="${cfg.timeout_seconds || 10}"></label>
+            </div>`;
+    }
+    return '';
+}
+
+function parseJsonField(text, what, position) {
+    const raw = (text || '').trim();
+    if (!raw) return {};
+    try {
+        const value = JSON.parse(raw);
+        if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('not an object');
+        return value;
+    } catch (e) {
+        toast(`Step ${position}: ${what} must be a JSON object.`, 'error');
+        throw new Error(`Step ${position}: ${what} must be a JSON object.`);
+    }
+}
+
+function collectStepConfig(kind, row, position) {
+    const box = row.querySelector('.wf-step-config');
+    const val = cls => { const el = box.querySelector('.' + cls); return el ? el.value : ''; };
+    if (kind === 'condition') {
+        const rules = Array.from(box.querySelectorAll('.wf-cond-rule')).map(r => ({
+            when: {
+                source: r.querySelector('.wf-cond-source').value,
+                field: r.querySelector('.wf-cond-field').value.trim(),
+                op: r.querySelector('.wf-cond-op').value,
+                value: r.querySelector('.wf-cond-value').value,
+                case_sensitive: r.querySelector('.wf-cond-case').checked,
+            },
+            then: {
+                action: r.querySelector('.wf-cond-action').value,
+                output: r.querySelector('.wf-cond-output').value,
+            },
+        }));
+        return {
+            rules,
+            'else': {action: val('wf-cond-else-action') || 'continue', output: val('wf-cond-else-output')},
+        };
+    }
+    if (kind === 'transform') {
+        const pattern = val('wf-tf-pattern');
+        const truncate = parseInt(val('wf-tf-truncate'), 10);
+        return {
+            extract_json: val('wf-tf-extract').trim(),
+            regex: pattern ? {pattern, replace: val('wf-tf-replace'), flags: val('wf-tf-flags').trim()} : null,
+            template: val('wf-tf-template'),
+            truncate: truncate > 0 ? truncate : null,
+        };
+    }
+    if (kind === 'http') {
+        const expect = val('wf-http-expect').split(',').map(s => parseInt(s.trim(), 10)).filter(n => n > 0);
+        const cfg = {
+            destination: val('wf-http-destination').trim(),
+            method: val('wf-http-method') || 'GET',
+            path: val('wf-http-path').trim() || '/',
+            query: parseJsonField(val('wf-http-query'), 'query', position),
+            headers: parseJsonField(val('wf-http-headers'), 'headers', position),
+            body: val('wf-http-body'),
+            content_type: val('wf-http-content-type').trim() || 'application/json',
+            timeout_seconds: parseInt(val('wf-http-timeout'), 10) || 30,
+        };
+        if (expect.length) cfg.expect_status = expect;
+        return cfg;
+    }
+    if (kind === 'python') {
+        return {code: val('wf-py-code'), timeout_seconds: parseInt(val('wf-py-timeout'), 10) || 10};
+    }
+    return {};
+}
+
+function onWorkflowStepKindChange(select) {
+    const row = select.closest('.wf-step-row');
+    const kind = select.value;
+    const isAgent = kind === 'agent';
+    const show = (cls, on) => {
+        const el = row.querySelector('.' + cls);
+        if (el) el.style.display = on ? '' : 'none';
+    };
+    show('wf-step-agent', isAgent);
+    show('wf-step-instructions', isAgent);
+    show('wf-step-agent-body', isAgent);
+    show('wf-step-fanout-label', isAgent);
+    show('wf-step-kind-hint', !isAgent);
+    // The "open agent" link (attachStepAgentLink) follows the agent select.
+    const openLink = row.querySelector('.wf-step-open-agent');
+    if (openLink) openLink.hidden = !isAgent || openLink.getAttribute('href') === '#';
+    const hint = row.querySelector('.wf-step-kind-hint');
+    if (hint) hint.textContent = STEP_KIND_HINTS[kind] || '';
+    if (isAgent) row.querySelector('.wf-step-fanout').checked = false;
+    const box = row.querySelector('.wf-step-config');
+    if (isAgent) {
+        box.style.display = 'none';
+        return;
+    }
+    // Rebuild only when the kind actually changed, so switching away and
+    // back within one edit does not wipe what was typed.
+    if (box.dataset.kind !== kind) {
+        box.innerHTML = stepConfigEditorHtml(kind, {});
+        box.dataset.kind = kind;
+        wireTextFields(box);
+    }
+    box.style.display = '';
+}
+// {% endraw %}
+
+// Shared by the list's Run button and the editor's (--- detail runs ---).
+async function startWorkflowRun(id) {
     const res = await api(`/workflows/${id}/run`, {method: 'POST'});
-    if (!res.ok) { toast((await res.json()).detail || 'Run failed to start', 'error'); return; }
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({detail: res.statusText}));
+        toast('Run failed to start: ' + errText(err), 'error');
+        return false;
+    }
     toast('Run started');
-    loadWorkflowRuns();
+    return true;
+}
+
+async function runWorkflowNow(id) {
+    if (await startWorkflowRun(id)) loadWorkflowRuns();
 }
 
 async function loadWorkflowRuns() {
@@ -1131,23 +1764,34 @@ function renderWorkflowRuns() {
             + (r.items_failed ? `, ${r.items_failed} failed` : '')
             + (r.items_skipped ? `, ${r.items_skipped} skipped` : '');
         return `
-            <tr class="run-row" style="cursor:pointer" onclick="showWorkflowRun('${r.id}')">
+            <tr class="run-row" style="cursor:pointer" data-id="${escapeHtml(r.id)}">
                 <td>${escapeHtml(r.workflow_name)}</td>
                 <td><span class="status-badge status-${escapeHtml(r.status)}">${escapeHtml(r.status)}</span></td>
                 <td>${escapeHtml(counts)}</td>
                 <td>${r.started_at ? escapeHtml(new Date(r.started_at).toLocaleString()) : ''}</td>
                 <td class="row-actions">
-                    <button class="small secondary" onclick="event.stopPropagation();showWorkflowRun('${r.id}')">View</button>
+                    <button class="small secondary">View</button>
                 </td>
             </tr>
         `;
     }).join('');
+    // The id is read back via .dataset (see loadAgents) and the View button
+    // simply bubbles to its row. openRunDetail() starts the auto-refresh
+    // (--- run detail auto-refresh ---) around showWorkflowRun().
+    tbody.querySelectorAll('.run-row').forEach(row =>
+        row.addEventListener('click', () => openRunDetail('workflow-run', row.dataset.id)));
 }
 
+// Returns the run's status (the auto-refresh poller decides on it), or null
+// when the fetch failed.
 async function showWorkflowRun(runId) {
     const res = await api(`/workflow-runs/${runId}`);
     const el = document.getElementById('workflow-run-detail');
-    if (!res.ok) { el.innerHTML = '<p class="hint">Failed to load run.</p>'; return; }
+    if (!res.ok) {
+        // A failed poll keeps the last good render; only a first load reports inline.
+        if (!detailShows(el, runId)) el.innerHTML = '<p class="hint">Failed to load run.</p>';
+        return null;
+    }
     const data = await res.json();
     const run = data.run;
     const items = data.items || [];
@@ -1185,6 +1829,7 @@ async function showWorkflowRun(runId) {
     `;
     }).join('');
 
+    const scrollMark = markScroll();
     el.innerHTML = `
         <h3>${escapeHtml(run.workflow_name)} — <span class="status-badge status-${escapeHtml(run.status)}">${escapeHtml(run.status)}</span></h3>
         <p class="hint">Trigger: ${escapeHtml(run.trigger)} · Started: ${run.started_at ? escapeHtml(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + escapeHtml(new Date(run.finished_at).toLocaleString()) : ''}</p>
@@ -1197,6 +1842,9 @@ async function showWorkflowRun(runId) {
         <table><thead><tr><th>Item</th><th>Branch</th><th>#</th><th>Agent</th><th>Status</th><th>Output</th></tr></thead>
             <tbody>${stepRows || '<tr><td colspan="6" style="color:var(--muted)">No steps recorded.</td></tr>'}</tbody></table>
     `;
+    markDetailShown(el, runId);
+    restoreScroll(scrollMark);
+    return run.status ?? '';
 }
 
 async function loadOrchestrator() {
@@ -1215,7 +1863,10 @@ async function openAgentModal() {
     renderMcpServers([]);
     renderAgentSkillChecks([]);
     renderAgentPeerChecks([], '');
+    renderAgentWhereUsed(null);
+    setDetailRunsMode('agent', '');
     await renderAgentModelOptions('');
+    setDeepForm(null);
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-expose-api').checked = false;
@@ -1302,10 +1953,15 @@ async function refreshCredentials() {
                 // Connect button that goes nowhere is worse than showing
                 // nothing, so point at the refresh script instead.
                 + (s.login_url
-                    ? '<button type="button" class="secondary" '
-                      + 'onclick="connectServer(\'' + esc(s.login_url) + '\')">Connect</button>'
+                    // data-attribute + .dataset, like the delete buttons: the
+                    // value never re-enters JS source, so nothing in a
+                    // response body can break out of a string literal.
+                    ? '<button type="button" class="secondary connect-server-btn" '
+                      + 'data-login-url="' + esc(s.login_url) + '">Connect</button>'
                     : '<span class="hint">refreshed with scripts/sap_session.py</span>')
                 + '</p>').join('');
+        box.querySelectorAll('.connect-server-btn').forEach(btn =>
+            btn.addEventListener('click', () => connectServer(btn.dataset.loginUrl)));
     } catch (e) { box.innerHTML = ''; }
 }
 
@@ -1326,7 +1982,7 @@ function closeAgentModal() {
 
 async function editAgent(id) {
     const res = await api(`/agents/${id}`);
-    if (!res.ok) { toast('Failed to load agent', 'error'); return; }
+    if (!res.ok) { toast('Failed to load agent', 'error'); return false; }
     const a = await res.json();
     document.getElementById('modal-title').textContent = `Edit agent: ${a.name}`;
     document.getElementById('agent-id').value = a.id;
@@ -1339,7 +1995,9 @@ async function editAgent(id) {
     renderMcpServers(servers);
     renderAgentSkillChecks(a.skills || []);
     renderAgentPeerChecks(a.peers || [], a.name);
+    loadAgentWhereUsed(a.id);
     await renderAgentModelOptions(a.model_name || '');
+    setDeepForm(a.deep || null);
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
@@ -1349,12 +2007,20 @@ async function editAgent(id) {
     document.getElementById('agent-run-prompt').value = a.run_prompt || '';
     document.getElementById('agent-run-timeout').value = a.run_timeout_seconds || 1800;
     updateEndpointHint();
+    setDetailRunsMode('agent', a.id);
     document.getElementById('agent-modal').classList.add('open');
+    return true;
 }
 
 async function saveAgent() {
     const id = document.getElementById('agent-id').value;
-    const servers = collectMcpServers();
+    let servers;
+    try {
+        servers = collectMcpServers();
+    } catch (e) {
+        toast(e.message, 'error');
+        return;
+    }
     if (!servers.length) {
         toast('Add at least one MCP server', 'error');
         return;
@@ -1367,6 +2033,7 @@ async function saveAgent() {
         skills: collectAgentSkills(),
         peers: collectAgentPeers(),
         model_name: document.getElementById('agent-model-name').value,
+        deep: collectDeep(),
         enabled: document.getElementById('agent-enabled').checked,
         expose_chat: document.getElementById('agent-expose-chat').checked,
         expose_api: document.getElementById('agent-expose-api').checked,
@@ -1505,6 +2172,14 @@ function switchTab(name) {
     document.querySelectorAll('.tab-panel').forEach(p =>
         p.classList.toggle('active', p.id === 'tab-' + name));
     if (name === 'runs') loadRuns();
+    // --- run detail auto-refresh --- a hidden tab is not polled; coming back
+    // re-fetches the run once and picks the chain up if it is still live.
+    if (name !== 'runs' && _autoRefresh && _autoRefresh.kind === 'run') {
+        stopAutoRefresh();
+        setAutoRefreshStatus('run', 'Auto-refresh paused while the tab is hidden');
+    } else if (name === 'runs' && _runDetailShown.run && !_autoRefresh && autoRefreshWanted('run')) {
+        openRunDetail('run', _runDetailShown.run);
+    }
 }
 
 async function loadRuns() {
@@ -1523,7 +2198,7 @@ async function loadRuns() {
             <td>${esc(r.summary || r.error || '')}</td>
           </tr>`).join('') + '</tbody></table>';
     el.querySelectorAll('.run-row').forEach(row =>
-        row.addEventListener('click', () => showRun(row.dataset.id)));
+        row.addEventListener('click', () => openRunDetail('run', row.dataset.id)));
 }
 
 let _mermaidLoading = null;
@@ -1617,11 +2292,18 @@ async function renderReportBody(container, report, runId) {
     }
 }
 
+// Returns the run's status (the auto-refresh poller decides on it), or null
+// when the fetch failed.
 async function showRun(id) {
     const res = await fetch(`/admin/api/runs/${id}`);
     const el = document.getElementById('run-detail');
-    if (!res.ok) { el.innerHTML = '<p class="error">Failed to load run.</p>'; return; }
+    if (!res.ok) {
+        // A failed poll keeps the last good render; only a first load reports inline.
+        if (!detailShows(el, id)) el.innerHTML = '<p class="error">Failed to load run.</p>';
+        return null;
+    }
     const run = await res.json();
+    const scrollMark = markScroll();
     el.innerHTML = `<h3>${esc(run.agent_name)} — <span class="status-badge status-${esc(run.status)}">${esc(run.status)}</span></h3>`
         + `<p class="hint">Trigger: ${esc(run.trigger)} · Started: ${run.started_at ? esc(new Date(run.started_at).toLocaleString()) : ''}${run.finished_at ? ' · Finished: ' + esc(new Date(run.finished_at).toLocaleString()) : ''}</p>`
         + (run.summary ? `<p>${esc(run.summary)}</p>` : '')
@@ -1634,17 +2316,689 @@ async function showRun(id) {
         err.textContent = 'Failed to render report body.';
         el.appendChild(err);
     }
+    markDetailShown(el, id);
+    restoreScroll(scrollMark);
+    return run.status ?? '';
 }
 
-async function runAgentNow(agentId) {
+// Shared by the list's Run button and the editor's (--- detail runs ---).
+async function startAgentRun(agentId) {
     const res = await fetch(`/admin/api/agents/${agentId}/run`, {method: 'POST'});
     if (!res.ok) {
         const err = await res.json().catch(() => ({detail: res.statusText}));
         toast('Run failed: ' + errText(err), 'error');
-        return;
+        return false;
     }
     toast('Run started.', 'success');
-    switchTab('runs');
+    return true;
+}
+
+async function runAgentNow(agentId) {
+    if (await startAgentRun(agentId)) switchTab('runs');
+}
+
+// --- where used ---
+// Cross-links between the two editors. Both are modals over one page, so a
+// link that switched editors in place would drop whatever is half-edited in
+// the one being left. Instead every link is a deep link (`#agent=<id>`,
+// `#workflow=<id>`) opened in a new tab, and openFromHash() turns that hash
+// into the matching editor once the lists it depends on are loaded.
+function editorLink(kind, id, name, cls) {
+    return `<a href="#${kind}=${Number(id)}" target="_blank" rel="noopener" class="${cls}">${escapeHtml(name)}</a>`;
+}
+
+function renderAgentWhereUsed(data) {
+    const el = document.getElementById('agent-where-used');
+    if (!data) { el.innerHTML = ''; return; }
+    const off = ' <span class="status-badge off">disabled</span>';
+    const workflows = (data.workflows || []).map(w => {
+        const steps = (w.steps || []).map(s =>
+            `${s.branch_key ? escapeHtml(s.branch_key) : 'main'} #${Number(s.position)}`).join(', ');
+        return editorLink('workflow', w.id, w.name, 'wu-workflow') + (w.enabled ? '' : off)
+            + ` <span style="color:var(--muted)">(${steps})</span>`;
+    });
+    const peers = (data.peers || []).map(p =>
+        editorLink('agent', p.id, p.name, 'wu-peer') + (p.enabled ? '' : off));
+    if (!workflows.length && !peers.length) {
+        el.innerHTML = '<strong>Used in:</strong> <span style="color:var(--muted)">no workflow or peer agent.</span>';
+        return;
+    }
+    const parts = [];
+    if (workflows.length) parts.push('workflows ' + workflows.join(', '));
+    if (peers.length) parts.push('consulted by ' + peers.join(', '));
+    el.innerHTML = '<strong>Used in:</strong> ' + parts.join(' &middot; ');
+}
+
+async function loadAgentWhereUsed(id) {
+    renderAgentWhereUsed(null);
+    let data = null;
+    try {
+        const res = await api(`/agents/${id}/where-used`);
+        if (res.ok) data = await res.json();
+    } catch (e) { /* reported below */ }
+    // Opening another agent while this request was in flight: its answer is
+    // not about the agent now in the form.
+    if (String(document.getElementById('agent-id').value) !== String(id)) return;
+    if (!data) { toast('Failed to load where this agent is used', 'error'); return; }
+    renderAgentWhereUsed(data);
+}
+
+// The "open" link after a step row's agent select, kept pointing at whichever
+// agent the select currently names, hidden while it names none (or one that
+// no longer exists -- see the missingAgent option in addWorkflowStepRow).
+function attachStepAgentLink(row) {
+    const select = row.querySelector('.wf-step-agent');
+    if (!select) return;
+    const link = document.createElement('a');
+    link.className = 'wf-step-open-agent';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.title = 'Open this agent in the agent editor (new tab)';
+    link.style.cssText = 'flex:0 0 auto;align-self:center;font-size:.85em;white-space:nowrap';
+    link.textContent = 'open';
+    const sync = () => {
+        const agent = allAgents.find(a => a.name === select.value);
+        // --- step kinds --- a non-agent row (condition/transform/http/python)
+        // has its agent select hidden, and the link goes with it.
+        const kindSelect = row.querySelector('.wf-step-kind');
+        const isAgent = !kindSelect || kindSelect.value === 'agent';
+        link.hidden = !agent || !isAgent;
+        link.href = agent ? `#agent=${Number(agent.id)}` : '#';
+    };
+    select.addEventListener('change', sync);
+    const kindSelect = row.querySelector('.wf-step-kind');
+    if (kindSelect) kindSelect.addEventListener('change', sync);
+    sync();
+    select.insertAdjacentElement('afterend', link);
+}
+
+function openFromHash() {
+    const hash = window.location.hash || '';
+    // --- detail runs --- `#run=<id>` / `#workflow-run=<id>` from an editor's
+    // last-runs table open the matching run detail view.
+    const run = /^#(run|workflow-run)=([\w-]+)$/.exec(hash);
+    if (run) return openRunFromHash(run[1], run[2]);
+    const match = /^#(agent|workflow)=(\d+)$/.exec(hash);
+    if (!match) return Promise.resolve();
+    // editAgent/editWorkflow read allAgents/allSkills/allWorkflows for their
+    // checkbox and dropdown lists; opened before those are in, the form would
+    // show the agent with no peers ticked and save it that way.
+    return Promise.all([loadSkills(), loadAgents(), loadWorkflows()]).then(() =>
+        match[1] === 'agent' ? editAgent(Number(match[2])) : editWorkflow(Number(match[2])));
+}
+
+// --- destinations ------------------------------------------------------------
+// A server on auth mode "BTP destination" stores no credential here: the
+// destination holds the target's URL and credential. The config block is the
+// destination's name, whether to resolve it as the signed-in user
+// (`user_context`, mail and Teams only), and the built-in's own pinned keys.
+// Mirrors `_DEST_KEYS`, `_SLACK_DEST_KEYS` and `_DEST_KEYS_BY_URL` in
+// agents/db.py: a field shown here and not listed there is dropped on save.
+const DESTINATION_FIELDS = {
+    'builtin:jira':          ['project', 'status', 'labels', 'api_base', 'lookback', 'allow_comment'],
+    'builtin:slack':         ['channels', 'lookback', 'allow_send'],
+    'builtin:gmail':         ['user_context', 'mailbox'],
+    'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send', 'theme'],
+    'builtin:teams':         ['user_context', 'team', 'channels', 'lookback', 'allow_send'],
+    'builtin:sapnotes':      ['min_score', 'lookback'],
+    'builtin:sapnotedetail': [],
+    'builtin:smtp':          ['recipients', 'from', 'allow_send', 'theme'],
+};
+// Text fields, in the order they appear; the two switches are checkboxes.
+const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
+    'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
+
+function destinationFieldsHtml() {
+    return `
+        <div class="mcp-destination" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
+            <div class="form-grid">
+                <label class="full">Destination name
+                    <input type="text" class="dest-destination" placeholder="MY_DESTINATION">
+                </label>
+                <label class="full dest-field-user_context" style="font-weight:600">
+                    <input type="checkbox" class="dest-user_context" onchange="syncDestinationFields(this.closest('.mcp-server-row'))">
+                    Act as signed-in user
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        Resolve the destination with the user's token (OAuth2UserTokenExchange,
+                        OAuth2JWTBearer, OAuth2SAMLBearerAssertion) and act as that user.
+                        Off means the destination's own app-level credential; scheduled runs need it off.
+                    </span>
+                </label>
+                <label class="dest-field-mailbox">Mailbox
+                    <input type="text" class="dest-mailbox" placeholder="service.mailbox@example.com">
+                </label>
+                <label class="dest-field-team">Team ID
+                    <input type="text" class="dest-team" placeholder="the team's group ID">
+                </label>
+                <label class="dest-field-channels">Channels
+                    <input type="text" class="dest-channels" placeholder="comma-separated; blank means all">
+                </label>
+                <label class="full dest-field-recipients">Recipients
+                    <input type="text" class="dest-recipients" placeholder="team@example.com, basis@example.com">
+                </label>
+                <label class="full dest-field-from">From
+                    <input type="text" class="dest-from" placeholder="reports@example.com; blank uses the destination's mail.smtp.from">
+                </label>
+                <label class="dest-field-lookback">Look back
+                    <input type="text" class="dest-lookback" placeholder="e.g. 5h, 2d, 1w">
+                </label>
+                <label class="dest-field-project">Project
+                    <input type="text" class="dest-project" placeholder="ABC">
+                </label>
+                <label class="dest-field-status">Status
+                    <input type="text" class="dest-status" placeholder="Open, In Progress">
+                </label>
+                <label class="dest-field-labels">Labels
+                    <input type="text" class="dest-labels" placeholder="comma-separated; ALL must match">
+                </label>
+                <label class="dest-field-api_base">API base path
+                    <input type="text" class="dest-api_base" placeholder="blank means /rest/api/2">
+                </label>
+                <label class="dest-field-min_score">Minimum CVSS score
+                    <input type="text" class="dest-min_score" placeholder="9.0">
+                </label>
+                <label class="full dest-field-allow_send">
+                    <input type="checkbox" class="dest-allow_send"> Allow sending / posting
+                </label>
+                <label class="full dest-field-theme">Mail theme (JSON)
+                    <textarea class="dest-theme" rows="4" placeholder='{"band": "#1f3348", "accent": "#e0a010", "logo_url": "https://example.com/logo.png", "org_name": "Example"}'></textarea>
+                </label>
+                <label class="full dest-field-allow_comment">
+                    <input type="checkbox" class="dest-allow_comment"> Allow commenting
+                </label>
+            </div>
+            <p class="hint dest-hint" style="margin:8px 0 0"></p>
+        </div>
+    `;
+}
+
+function destinationBuiltinOf(row) {
+    return row.querySelector('.mcp-url').value.trim().replace(/\/+$/, '').toLowerCase();
+}
+
+function fillDestinationFields(row, oauth) {
+    oauth = oauth || {};
+    DESTINATION_TEXT_KEYS.forEach(k => {
+        const el = row.querySelector('.dest-' + k);
+        if (el) el.value = oauth[k] == null ? '' : String(oauth[k]);
+    });
+    row.querySelector('.dest-user_context').checked = oauth.user_context === true;
+    row.querySelector('.dest-allow_send').checked = oauth.allow_send === true;
+    row.querySelector('.dest-allow_comment').checked = oauth.allow_comment === true;
+    const theme = oauth.theme;
+    row.querySelector('.dest-theme').value =
+        theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
+}
+
+/** Shows the fields the current built-in stores on a destination. */
+function syncDestinationFields(row) {
+    const box = row.querySelector('.mcp-destination');
+    if (!box) return;
+    const builtin = destinationBuiltinOf(row);
+    const known = Object.prototype.hasOwnProperty.call(DESTINATION_FIELDS, builtin);
+    const wanted = known ? DESTINATION_FIELDS[builtin] : [];
+    const userContext = row.querySelector('.dest-user_context').checked;
+    box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
+        const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
+        let show = wanted.includes(key);
+        // A destination resolved as the user reads /me: no mailbox to name.
+        if (key === 'mailbox' && userContext) show = false;
+        // Graph refuses application posts, so Teams posts only as the user.
+        if (key === 'allow_send' && builtin === 'builtin:teams' && !userContext) show = false;
+        label.style.display = show ? '' : 'none';
+    });
+    let hint = '';
+    if (!known) {
+        hint = 'A destination works with built-in toolsets only (builtin:gmail, builtin:outlook, '
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sapnotes, builtin:sapnotedetail).';
+    } else if (builtin === 'builtin:smtp') {
+        hint = 'A destination of Type MAIL: mail.smtp.host/port, mail.user, mail.password, mail.smtp.from. The server certificate is always verified.';
+    } else if (builtin === 'builtin:sapnotedetail') {
+        hint = 'The me.sap.com session cookie is read from the destination\'s URL.headers.Cookie property.';
+    } else if (builtin === 'builtin:sapnotes') {
+        hint = 'The destination names NVD or a proxy (NoAuthentication); URL.headers.apiKey carries the API key.';
+    } else if (wanted.includes('user_context')) {
+        hint = userContext
+            ? 'The destination\'s Authentication must be a user-propagating type (OAuth2UserTokenExchange, OAuth2JWTBearer, OAuth2SAMLBearerAssertion).'
+            : 'The destination holds an app-level credential (OAuth2ClientCredentials or a static URL.headers.Authorization).';
+    }
+    row.querySelector('.dest-hint').textContent = hint;
+}
+
+/** The config block for a destination server, shaped as the API stores it. */
+function collectDestinationConfig(row) {
+    const builtin = destinationBuiltinOf(row);
+    const wanted = DESTINATION_FIELDS[builtin] || [];
+    const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
+    DESTINATION_TEXT_KEYS.forEach(k => {
+        if (k === 'destination' || !wanted.includes(k)) return;
+        const v = row.querySelector('.dest-' + k).value.trim();
+        if (v) oauth[k] = v;
+    });
+    const userContext = wanted.includes('user_context') && row.querySelector('.dest-user_context').checked;
+    if (userContext) {
+        oauth.user_context = true;
+        delete oauth.mailbox;
+    }
+    // Only ever sent as true, so a stored config gains no field it never asked for.
+    if (wanted.includes('allow_send') && row.querySelector('.dest-allow_send').checked
+        && !(builtin === 'builtin:teams' && !userContext)) {
+        oauth.allow_send = true;
+    }
+    if (wanted.includes('allow_comment') && row.querySelector('.dest-allow_comment').checked) {
+        oauth.allow_comment = true;
+    }
+    // The look of originated mail (MailTheme in agents/mail_render.py). Only
+    // the JSON shape is checked here; the server's 422 names a bad key.
+    const themeText = wanted.includes('theme') ? row.querySelector('.dest-theme').value.trim() : '';
+    if (themeText) {
+        let theme;
+        try {
+            theme = JSON.parse(themeText);
+        } catch (e) {
+            throw new Error('Mail theme is not valid JSON: ' + e.message);
+        }
+        if (!theme || typeof theme !== 'object' || Array.isArray(theme)) {
+            throw new Error('Mail theme must be a JSON object.');
+        }
+        if (Object.keys(theme).length) oauth.theme = theme;
+    }
+    return oauth;
+}
+
+// --- detail runs ---
+// The agent and workflow editors are the closest thing this admin has to a
+// detail page, so each gets Run now / Refresh in its header and a "Last runs"
+// table at the bottom. Both run detail views live elsewhere on the page (the
+// Job Runs tab, the workflow-runs panel) and the editors are modals, so a row
+// opens its run as a deep link (`#run=<id>`, `#workflow-run=<id>`) in a new
+// tab -- the rule the where-used links follow -- and openFromHash() turns
+// that hash into the detail view. Everything rendered here is server text
+// (summaries are model output) and goes through escapeHtml.
+const td = html => `<td>${html}</td>`;
+
+const DETAIL_RUNS = {
+    agent: {
+        idField: 'agent-id', runBtn: 'agent-run-now', refreshBtn: 'agent-refresh',
+        box: 'agent-last-runs', hash: 'run', noun: 'agent',
+        list: id => api(`/runs?agent_id=${Number(id)}&limit=10`),
+        start: id => startAgentRun(id),
+        columns: ['Status', 'Trigger', 'Started', 'Duration', 'Summary'],
+        cells: r => [
+            td(statusBadge(r.status)), td(escapeHtml(r.trigger || '')), td(fmtWhen(r.started_at)),
+            td(escapeHtml(fmtDuration(r.started_at, r.finished_at, r.status))),
+            summaryCell(r.summary || r.error || ''),
+        ],
+    },
+    workflow: {
+        idField: 'workflow-id', runBtn: 'workflow-run-now', refreshBtn: 'workflow-refresh',
+        box: 'workflow-last-runs', hash: 'workflow-run', noun: 'workflow',
+        list: id => api(`/workflow-runs?workflow_id=${Number(id)}&limit=10`),
+        start: id => startWorkflowRun(id),
+        columns: ['Status', 'Trigger', 'Items', 'Started', 'Finished', 'Summary'],
+        cells: r => [
+            td(statusBadge(r.status)), td(escapeHtml(r.trigger || '')),
+            `<td title="total · succeeded · failed · skipped">${escapeHtml(itemCounts(r))}</td>`,
+            td(fmtWhen(r.started_at)), td(fmtWhen(r.finished_at)),
+            summaryCell(r.summary || r.error || ''),
+        ],
+    },
+};
+
+// The form as loaded, per editor (JSON); Refresh compares against it.
+const _detailSnapshot = {agent: null, workflow: null};
+
+function statusBadge(status) {
+    const s = escapeHtml(status || '');
+    return `<span class="status-badge status-${s}">${s}</span>`;
+}
+
+function fmtWhen(iso) {
+    return iso ? escapeHtml(new Date(iso).toLocaleString()) : '<span style="color:var(--muted)">—</span>';
+}
+
+// "12s", "3m 05s", "1h 02m"; a live run counts up to now and ends in an ellipsis.
+function fmtDuration(startedAt, finishedAt, status) {
+    if (!startedAt) return '—';
+    const end = finishedAt ? new Date(finishedAt) : (isLiveRunStatus(status) ? new Date() : null);
+    if (!end) return '—';
+    const secs = Math.max(0, Math.round((end - new Date(startedAt)) / 1000));
+    if (!Number.isFinite(secs)) return '—';
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), sec = secs % 60;
+    const pad = n => String(n).padStart(2, '0');
+    const text = h ? `${h}h ${pad(m)}m` : m ? `${m}m ${pad(sec)}s` : `${sec}s`;
+    return finishedAt ? text : text + '…';
+}
+
+function itemCounts(r) {
+    const n = v => Number(v) || 0;
+    return `${n(r.items_total)} · ${n(r.items_succeeded)} ok · ${n(r.items_failed)} failed · ${n(r.items_skipped)} skipped`;
+}
+
+function summaryCell(text) {
+    const full = String(text || '');
+    const short = full.length > 80 ? full.slice(0, 77) + '…' : full;
+    return `<td class="dr-summary" title="${escapeHtml(full)}">${escapeHtml(short)}</td>`;
+}
+
+// runs: an array (possibly empty), or null when the request failed.
+function renderDetailRuns(kind, runs, id) {
+    const cfg = DETAIL_RUNS[kind];
+    const box = document.getElementById(cfg.box);
+    if (!box) return;
+    const head = '<div class="detail-runs-head"><strong>Last runs</strong>'
+        + '<a href="#" class="link detail-runs-refresh">Refresh</a></div>';
+    let body;
+    if (runs === null) {
+        body = '<p class="hint">Could not load the runs.</p>';
+    } else if (!runs.length) {
+        body = '<p class="hint">No runs yet.</p>';
+    } else {
+        body = `<table><thead><tr>${cfg.columns.map(c => `<th>${c}</th>`).join('')}<th></th></tr></thead><tbody>`
+            + runs.map(r => {
+                const href = `#${cfg.hash}=${encodeURIComponent(String(r.id))}`;
+                return `<tr class="dr-row" data-href="${escapeHtml(href)}" title="Open this run in a new tab">`
+                    + cfg.cells(r).join('')
+                    + `<td class="row-actions"><a class="link dr-open" href="${escapeHtml(href)}" target="_blank" rel="noopener">open</a></td></tr>`;
+            }).join('')
+            + '</tbody></table>';
+    }
+    box.innerHTML = head + body;
+    box.querySelector('.detail-runs-refresh').addEventListener('click', e => {
+        e.preventDefault();
+        loadDetailRuns(kind, id);
+    });
+    // The href is read back via .dataset, never interpolated into JS source.
+    box.querySelectorAll('tr.dr-row').forEach(row => row.addEventListener('click', e => {
+        if (e.target && e.target.closest && e.target.closest('a')) return;  // the link opens itself
+        window.open(row.dataset.href, '_blank', 'noopener');
+    }));
+}
+
+async function loadDetailRuns(kind, id) {
+    const cfg = DETAIL_RUNS[kind];
+    const box = document.getElementById(cfg.box);
+    if (!box || !id) return;
+    let runs = null;
+    try {
+        const res = await cfg.list(id);
+        if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) runs = data;
+        }
+    } catch (e) { /* rendered as "could not load" */ }
+    // Another row was opened while this request ran: its answer is not about
+    // the one now in the form.
+    if (String(document.getElementById(cfg.idField).value) !== String(id)) return;
+    renderDetailRuns(kind, runs, id);
+}
+
+// Called by openAgentModal/editAgent and openWorkflowModal/editWorkflow once
+// the form is filled. The header buttons and the last-runs block exist only
+// for a saved row (id truthy); the form snapshot is what Refresh compares
+// against. Every element is optional so a partial DOM (tests) still works.
+function setDetailRunsMode(kind, id) {
+    const cfg = DETAIL_RUNS[kind];
+    const existing = !!id;
+    [cfg.runBtn, cfg.refreshBtn].forEach(bid => {
+        const btn = document.getElementById(bid);
+        if (btn) { btn.hidden = !existing; btn.disabled = false; }
+    });
+    const box = document.getElementById(cfg.box);
+    if (box) {
+        box.hidden = !existing;
+        box.innerHTML = existing ? '<p class="hint">Loading runs…</p>' : '';
+    }
+    _detailSnapshot[kind] = existing ? detailFormSnapshot(kind) : null;
+    if (existing) loadDetailRuns(kind, id);
+}
+
+// The same fields saveAgent()/saveWorkflow() send, read the same way; kept
+// separate because those bodies are contract-checked by the test suite.
+function detailFormSnapshot(kind) {
+    try {
+        const v = id => document.getElementById(id).value;
+        const c = id => document.getElementById(id).checked;
+        if (kind === 'agent') {
+            return JSON.stringify({
+                name: v('agent-name'), description: v('agent-description'),
+                instructions: v('agent-instructions'), mcp_servers: collectMcpServers(),
+                skills: collectAgentSkills(), peers: collectAgentPeers(),
+                model_name: v('agent-model-name'), deep: collectDeep(),
+                enabled: c('agent-enabled'), expose_chat: c('agent-expose-chat'),
+                expose_api: c('agent-expose-api'), api_slug: v('agent-api-slug'),
+                run_as_principal: v('agent-run-as'), run_prompt: v('agent-run-prompt'),
+                run_timeout_seconds: v('agent-run-timeout'),
+            });
+        }
+        return JSON.stringify({
+            name: v('workflow-name'), description: v('workflow-description'),
+            api_slug: v('workflow-api-slug'), run_as_principal: v('workflow-run-as'),
+            run_timeout_seconds: v('workflow-timeout'), max_parallel_items: v('workflow-max-parallel'),
+            on_unknown_branch: v('workflow-on-unknown-branch'), skip_seen_items: c('workflow-skip-seen'),
+            enabled: c('workflow-enabled'), branches: collectWorkflowBranches(), steps: collectWorkflowSteps(),
+        });
+    } catch (e) {
+        return null;  // an unreadable form is treated as clean, never as a blocker
+    }
+}
+
+function detailFormDirty(kind) {
+    const before = _detailSnapshot[kind];
+    if (before === null) return false;
+    const now = detailFormSnapshot(kind);
+    return now !== null && now !== before;
+}
+
+// Refresh: re-fetch the row and refill the form (editAgent/editWorkflow also
+// reload where-used, the credential status and the last runs), unless the
+// form has unsaved edits and the operator wants to keep them.
+async function refreshDetail(kind) {
+    const cfg = DETAIL_RUNS[kind];
+    const id = document.getElementById(cfg.idField).value;
+    if (!id) return;
+    if (detailFormDirty(kind)
+        && !confirm(`This ${cfg.noun} has unsaved changes. Discard them and reload it from the server?`)) return;
+    const ok = kind === 'agent' ? await editAgent(Number(id)) : await editWorkflow(Number(id));
+    if (ok) toast(`${cfg.noun === 'agent' ? 'Agent' : 'Workflow'} reloaded.`);
+}
+function refreshAgentDetail() { return refreshDetail('agent'); }
+function refreshWorkflowDetail() { return refreshDetail('workflow'); }
+
+// Run now from the editor: same request and toasts as the list's button; the
+// button is disabled while the request is out, and the last-runs block is
+// re-read about 1 s later (the row is there) and again about 5 s later (a
+// quick run has finished by then).
+const DETAIL_RUN_REFRESH_DELAYS = [1000, 5000];
+
+async function runFromDetail(kind) {
+    const cfg = DETAIL_RUNS[kind];
+    const id = document.getElementById(cfg.idField).value;
+    const btn = document.getElementById(cfg.runBtn);
+    if (!id || !btn || btn.disabled) return;
+    btn.disabled = true;
+    try {
+        if (!await cfg.start(Number(id))) return;
+        if (kind === 'workflow') loadWorkflowRuns();
+        DETAIL_RUN_REFRESH_DELAYS.forEach(ms => setTimeout(() => {
+            if (String(document.getElementById(cfg.idField).value) === String(id)) loadDetailRuns(kind, id);
+        }, ms));
+    } finally {
+        btn.disabled = false;
+    }
+}
+function runAgentFromDetail() { return runFromDetail('agent'); }
+function runWorkflowFromDetail() { return runFromDetail('workflow'); }
+
+async function openRunFromHash(kind, id) {
+    if (kind === 'run') switchTab('runs'); else await loadWorkflowRuns();
+    await openRunDetail(kind, id);
+    const el = document.getElementById(RUN_DETAIL_VIEWS[kind].el);
+    if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({block: 'start'});
+}
+
+// --- run detail auto-refresh ---
+// One poller for both run detail views (the Job Runs tab's #run-detail and
+// the workflow-runs panel's #workflow-run-detail). While the run is live it
+// re-fetches every 3 s on a setTimeout chain, so two requests are never in
+// flight; it stops on a terminal status, on an unticked box, when the view is
+// closed or another run is opened (stopAutoRefresh), and backs off to 10 s
+// after a failed poll (one toast). The pure helpers come first so the jsdom
+// harness can pin them.
+const LIVE_RUN_STATUSES = ['pending', 'queued', 'running'];
+const AUTO_REFRESH_MS = 3000;
+const AUTO_REFRESH_BACKOFF_MS = 10000;
+
+function isLiveRunStatus(status) {
+    return LIVE_RUN_STATUSES.includes(String(status || '').toLowerCase());
+}
+
+function nextRefreshDelay(failures) {
+    return failures > 0 ? AUTO_REFRESH_BACKOFF_MS : AUTO_REFRESH_MS;
+}
+
+const RUN_DETAIL_VIEWS = {
+    'run': {
+        el: 'run-detail', toolbar: 'run-detail-toolbar', checkbox: 'run-detail-autorefresh',
+        status: 'run-detail-autorefresh-status',
+        empty: '<p class="hint">Select a run above to see its report.</p>',
+        load: id => showRun(id),
+    },
+    'workflow-run': {
+        el: 'workflow-run-detail', toolbar: 'workflow-run-detail-toolbar',
+        checkbox: 'workflow-run-detail-autorefresh',
+        status: 'workflow-run-detail-autorefresh-status', empty: '',
+        load: id => showWorkflowRun(id),
+    },
+};
+const _runDetailShown = {'run': null, 'workflow-run': null};  // run id each view shows
+let _autoRefresh = null;  // the one active poll: {kind, id, timer, failures, inFlight, loaded}
+
+function stopAutoRefresh() {
+    if (!_autoRefresh) return;
+    if (_autoRefresh.timer) clearTimeout(_autoRefresh.timer);
+    _autoRefresh = null;
+}
+
+function setAutoRefreshStatus(kind, text) {
+    const el = document.getElementById(RUN_DETAIL_VIEWS[kind].status);
+    if (el) el.textContent = text;
+}
+
+function autoRefreshWanted(kind) {
+    const box = document.getElementById(RUN_DETAIL_VIEWS[kind].checkbox);
+    return !box || box.checked;
+}
+
+// Scroll bookkeeping around a re-render: the detail is replaced wholesale, so
+// the page offset is put back if the swap moved it. Guarded because the
+// renderers also run under test stubs without a window.
+function markScroll() {
+    return (typeof window !== 'undefined' && typeof window.scrollY === 'number')
+        ? {x: window.scrollX, y: window.scrollY} : null;
+}
+function restoreScroll(mark) {
+    if (mark && (window.scrollY !== mark.y || window.scrollX !== mark.x)) window.scrollTo(mark.x, mark.y);
+}
+function detailShows(el, id) {
+    return !!(el && el.dataset && el.dataset.runId === String(id));
+}
+function markDetailShown(el, id) {
+    if (el && el.dataset) el.dataset.runId = String(id);
+}
+
+// Open a run in its view and start (or restart) the poll for it.
+async function openRunDetail(kind, id) {
+    stopAutoRefresh();
+    const view = RUN_DETAIL_VIEWS[kind];
+    _runDetailShown[kind] = String(id);
+    const bar = document.getElementById(view.toolbar);
+    if (bar) bar.hidden = false;
+    const state = {kind, id: String(id), timer: null, failures: 0, inFlight: false, loaded: false};
+    _autoRefresh = state;
+    return pollRunDetail(state);
+}
+
+async function pollRunDetail(state) {
+    if (state !== _autoRefresh || state.inFlight) return;
+    state.timer = null;
+    state.inFlight = true;
+    let status = null;
+    try { status = await RUN_DETAIL_VIEWS[state.kind].load(state.id); } catch (e) { status = null; }
+    state.inFlight = false;
+    if (state !== _autoRefresh) return;  // closed or superseded while the request ran
+    const kind = state.kind;
+    const stamp = 'Last refreshed ' + new Date().toLocaleTimeString();
+    if (status === null) {
+        if (!state.loaded) {
+            // Never loaded (404, network): the view says so; nothing to poll.
+            setAutoRefreshStatus(kind, 'Could not load the run');
+            _autoRefresh = null;
+            return;
+        }
+        state.failures += 1;
+        if (state.failures === 1) toast('Could not refresh the run; retrying more slowly.', 'error');
+    } else {
+        state.loaded = true;
+        state.failures = 0;
+        if (!isLiveRunStatus(status)) {
+            setAutoRefreshStatus(kind, 'Finished, auto-refresh stopped · ' + stamp);
+            _autoRefresh = null;
+            return;
+        }
+    }
+    if (!autoRefreshWanted(kind)) {
+        setAutoRefreshStatus(kind, 'Auto-refresh off · ' + stamp);
+        return;  // the state stays current, so re-ticking the box resumes it
+    }
+    const delay = nextRefreshDelay(state.failures);
+    setAutoRefreshStatus(kind, (state.failures
+        ? `Refresh failed, retrying in ${delay / 1000} s`
+        : `Auto-refreshing every ${delay / 1000} s`) + ' · ' + stamp);
+    state.timer = setTimeout(() => pollRunDetail(state), delay);
+}
+
+// The Refresh button: fetch now and restart the countdown. A poll already in
+// flight is left to finish rather than doubled.
+function refreshRunDetail(kind) {
+    const id = _runDetailShown[kind];
+    if (!id) return Promise.resolve();
+    if (_autoRefresh && _autoRefresh.kind === kind && _autoRefresh.id === id && _autoRefresh.inFlight) {
+        return Promise.resolve();
+    }
+    return openRunDetail(kind, id);
+}
+
+function toggleAutoRefresh(kind) {
+    const id = _runDetailShown[kind];
+    if (!id) return Promise.resolve();
+    if (!autoRefreshWanted(kind)) {
+        if (_autoRefresh && _autoRefresh.kind === kind && _autoRefresh.timer) {
+            clearTimeout(_autoRefresh.timer);
+            _autoRefresh.timer = null;
+        }
+        setAutoRefreshStatus(kind, 'Auto-refresh off');
+        return Promise.resolve();
+    }
+    // Ticked again: poll right away; a poll in flight continues the chain itself.
+    if (_autoRefresh && _autoRefresh.kind === kind && _autoRefresh.id === id) {
+        return (!_autoRefresh.inFlight && !_autoRefresh.timer) ? pollRunDetail(_autoRefresh) : Promise.resolve();
+    }
+    return openRunDetail(kind, id);
+}
+
+function closeRunDetail(kind) {
+    if (_autoRefresh && _autoRefresh.kind === kind) stopAutoRefresh();
+    _runDetailShown[kind] = null;
+    const view = RUN_DETAIL_VIEWS[kind];
+    const bar = document.getElementById(view.toolbar);
+    if (bar) bar.hidden = true;
+    const el = document.getElementById(view.el);
+    if (el) {
+        el.innerHTML = view.empty;
+        if (el.dataset) delete el.dataset.runId;
+    }
+    setAutoRefreshStatus(kind, '');
 }
 
 loadSkills();
@@ -1654,6 +3008,7 @@ loadOrchestrator();
 loadModel();
 loadWorkflows();
 loadWorkflowRuns();
+openFromHash();
 </script>
 </body>
 </html>

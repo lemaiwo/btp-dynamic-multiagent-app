@@ -10,6 +10,18 @@
         showNavButton="true"
         navButtonPress=".onBack">
         <headerContent>
+            <Text id="runAutoRefreshStatus" text="{run>/auto/status}" class="sapUiTinyMarginEnd" />
+            <ToggleButton
+                id="autoRefreshRunToggle"
+                icon="sap-icon://synchronize"
+                text="{i18n>autoRefresh}"
+                pressed="{run>/auto/enabled}"
+                press=".onToggleAutoRefresh" />
+            <Button
+                id="refreshRunDetailButton"
+                icon="sap-icon://refresh"
+                text="{i18n>refresh}"
+                press=".onRefresh" />
             <Button
                 id="downloadReportButton"
                 icon="sap-icon://download"
@@ -22,6 +34,7 @@
                 <f:SimpleForm layout="ResponsiveGridLayout" editable="false">
                     <Label text="{i18n>colStatus}" />
                     <ObjectStatus
+                        id="runStatus"
                         text="{run>/data/status}"
                         state="{ path: 'run>/data/status', formatter: '.formatter.runStatusState' }" />
 

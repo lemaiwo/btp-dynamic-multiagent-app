@@ -426,6 +426,97 @@ def test_recipients_cannot_be_overridden_by_a_tool_argument():
     assert sorted(params) == ["body", "status", "subject"]
 
 
+@pytest.mark.asyncio
+async def test_folder_cache_is_per_principal_and_refreshes_on_a_miss():
+    """One OutlookClient serves every user; under /me each has their own Inbox."""
+    from agents.auth import current_principal
+
+    fetches: list[str | None] = []
+    per_user = {
+        "ann@example.com": {"value": [{"id": "ANN-agent", "displayName": "agent"}]},
+        "bob@example.com": {"value": [{"id": "BOB-agent", "displayName": "agent"},
+                                      {"id": "BOB-late", "displayName": "late"}]},
+    }
+    listed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        who = current_principal.get()
+        if path.endswith("/mailFolders/inbox/childFolders"):
+            fetches.append(who)
+            return httpx.Response(200, json=per_user[who])
+        if "/mailFolders/" in path and path.endswith("/messages"):
+            listed.append(path.split("/mailFolders/")[1].split("/")[0])
+            return httpx.Response(200, json={"value": []})
+        return httpx.Response(404, json={"error": {"message": path}})
+
+    client = OutlookClient(httpx.AsyncClient(
+        base_url="https://graph.microsoft.com", transport=httpx.MockTransport(handler)))
+
+    token = current_principal.set("ann@example.com")
+    try:
+        await client.list_pending("agent")
+        await client.list_pending("agent")
+    finally:
+        current_principal.reset(token)
+    token = current_principal.set("bob@example.com")
+    try:
+        await client.list_pending("agent")
+    finally:
+        current_principal.reset(token)
+    # Ann's folders were fetched once and reused; Bob got his own lookup and
+    # his own id, not Ann's.
+    assert fetches == ["ann@example.com", "bob@example.com"]
+    assert listed == ["ANN-agent", "ANN-agent", "BOB-agent"]
+
+    # A folder created after the first lookup: one refresh, then found.
+    per_user["ann@example.com"]["value"].append({"id": "ANN-new", "displayName": "new"})
+    token = current_principal.set("ann@example.com")
+    try:
+        await client.list_pending("new")
+        with pytest.raises(ValueError, match="nope"):
+            await client.list_pending("nope")
+    finally:
+        current_principal.reset(token)
+    assert listed[-1] == "ANN-new"
+    # The miss refreshed once for "new" and once more for "nope"; no more.
+    assert fetches.count("ann@example.com") == 3
+
+
+def test_folder_cache_is_bounded():
+    from agents.auth import current_principal
+    from agents.outlook_tools import FOLDER_CACHE_MAX_OWNERS
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [{"id": "X", "displayName": "agent"}]})
+
+    client = OutlookClient(httpx.AsyncClient(
+        base_url="https://graph.microsoft.com", transport=httpx.MockTransport(handler)))
+
+    async def warm(n: int) -> None:
+        for i in range(n):
+            token = current_principal.set(f"user{i}@example.com")
+            try:
+                await client._folder_id("agent")
+            finally:
+                current_principal.reset(token)
+
+    asyncio.run(warm(FOLDER_CACHE_MAX_OWNERS + 10))
+    assert len(client._folders) == FOLDER_CACHE_MAX_OWNERS
+    assert "user0@example.com" not in client._folders
+
+
+def test_allow_send_must_be_the_boolean_true():
+    """A string "true" (or any other truthy junk) does not switch sending on."""
+    for junk in ("true", "yes", 1, "false"):
+        toolset = outlook_toolset(
+            {"mailbox": "agent@example.com", "recipients": "team@example.com",
+             "allow_send": junk},
+            http=httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))),
+        )
+        assert "send_mail" not in toolset.tools, junk
+
+
 # --- pytest-collected: the report template ---------------------------------
 # Originating mail is a report to a team, so it goes out through the renderer
 # in agents/mail_render.py. Replies are a message to a person and stay plain:
@@ -508,3 +599,65 @@ async def test_a_reply_is_not_dressed_up_as_a_report():
     assert "<p>" in comment
     assert "#1f3348" not in comment, "a reply gets no header band"
     assert "<table" not in comment, "a reply gets no report shell"
+
+
+# --- pytest-collected: the mail theme ----------------------------------------
+
+_THEME = {"band": "#102030", "link": "#123abc", "org_name": "Example Org"}
+
+
+@pytest.mark.asyncio
+async def test_send_mail_uses_the_configured_theme():
+    from agents.mail_render import MailTheme
+
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"],
+                           theme=MailTheme.from_config(_THEME))
+    await client.send_mail("Report -- 2026-09-29", "All clear.")
+    content = seen["json"]["message"]["body"]["content"]
+    assert "background-color:#102030" in content
+    assert "Example Org" in content
+    assert "#1f3348" not in content
+
+
+@pytest.mark.asyncio
+async def test_the_toolset_reads_the_theme_from_config():
+    seen, http = _recorder(201)
+    toolset = outlook_toolset({"mailbox": "agent@example.com", "recipients": "team@example.com",
+                               "theme": _THEME}, http=http)
+    await toolset.tools["create_mail_draft"].function(subject="Digest", body="All clear.")
+    assert "background-color:#102030" in seen["json"]["body"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_a_reply_ignores_the_theme():
+    from agents.mail_render import MailTheme
+
+    seen, http = _recorder()
+    client = OutlookClient(http, mailbox="agent@example.com", recipients=["team@example.com"],
+                           theme=MailTheme.from_config(_THEME))
+    await client.send_reply("msg-1", "Here is the answer.")
+    assert "#102030" not in seen["json"]["comment"]
+
+
+def test_a_bad_theme_is_refused_at_build():
+    with pytest.raises(ValueError, match="unknown"):
+        outlook_toolset({"mailbox": "agent@example.com", "theme": {"colour": "#102030"}},
+                        http=httpx.AsyncClient(transport=httpx.MockTransport(
+                            lambda r: httpx.Response(200))))
+
+
+@pytest.mark.parametrize("mode,oauth", [
+    ("destination", {"destination": "GRAPH", "mailbox": "a@example.com"}),
+    ("app_only", {"client_id": "c", "client_secret": "s", "token_url": "https://login.example.com/t",
+                  "mailbox": "a@example.com"}),
+    ("oauth2", {"client_id": "c", "client_secret": "s", "uaa_url": "https://uaa.example.com"}),
+])
+def test_storage_keeps_the_outlook_theme_on_every_mode(mode, oauth):
+    from agents.admin import McpServerPayload
+    from agents.db import _clean_oauth
+
+    payload = McpServerPayload(url="builtin:outlook", auth_mode=mode,
+                               oauth={**oauth, "theme": _THEME})
+    stored = _clean_oauth(payload.oauth.to_config(), mode, None, url="builtin:outlook")
+    assert stored["theme"] == _THEME

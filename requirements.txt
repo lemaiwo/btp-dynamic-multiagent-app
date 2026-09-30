@@ -1,17 +1,19 @@
-# Pinned: these drive APIs the app imports directly (e.g.
-# pydantic_ai.mcp.MCPServerStreamableHTTP). Leaving pydantic-ai unpinned let the
-# CF buildpack install a newer version that moved that symbol, crashing startup.
-# Keep in sync with the locally verified versions.
+# Every entry is pinned to the version the test suite was last run against.
+# The CF Python buildpack resolves this file fresh on each deploy, so an
+# unpinned package means a deploy can pick up a release nobody has tested:
+# leaving pydantic-ai unpinned once let the buildpack install a version that
+# moved pydantic_ai.mcp.MCPServerStreamableHTTP and crashed startup.
+# Bump deliberately: change the pin, run the suites, then deploy.
 pydantic-ai[mcp,web,openai,bedrock]==1.72.0
 sap-ai-sdk-gen[all]==6.6.0
 mcp==1.26.0
-httpx
-uvicorn
-python-dotenv
-fastapi
-jinja2
-python-multipart
-sqlalchemy[asyncio]>=2.0
-asyncpg
-aiosqlite
-pyjwt[crypto]
+httpx==0.28.1
+uvicorn==0.54.0
+python-dotenv==1.2.3
+fastapi==0.141.1
+jinja2==3.1.6
+python-multipart==0.0.32
+sqlalchemy[asyncio]==2.1.1
+asyncpg==0.31.0
+aiosqlite==0.22.1
+pyjwt[crypto]==2.15.0

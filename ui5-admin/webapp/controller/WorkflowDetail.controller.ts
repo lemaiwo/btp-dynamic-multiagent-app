@@ -1,16 +1,34 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
 import MessageToast from "sap/m/MessageToast";
+import MessageBox from "sap/m/MessageBox";
 import { ValueState } from "sap/ui/core/library";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import { buildDefinitionGraph } from "../model/processFlowGraph";
 import { canMoveWithinGroup, groupSteps, swap } from "../model/workflowOrder";
+import {
+    emptyRule, emptyUiConfig, kindOf, stepKindIcon, stepListSummary, uiConfigFromWire, wireConfigFromUi
+} from "../model/stepKinds";
+import type { UiStepConfig } from "../model/stepKinds";
+import { counterText } from "../model/textStats";
+import formatter from "../model/formatter";
+import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
+import { MAIN_LINE_KEY } from "../model/NullableKey";
+import { validateWorkflowSteps } from "../model/validators";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
+import type Table from "sap/m/Table";
+import type ColumnListItem from "sap/m/ColumnListItem";
+import type Dialog from "sap/m/Dialog";
+import type Panel from "sap/m/Panel";
+import type ListItemBase from "sap/m/ListItemBase";
+import type { ListBase$SelectionChangeEvent } from "sap/m/ListBase";
+import type ProcessFlowNode from "sap/suite/ui/commons/ProcessFlowNode";
+import type { FlowNode } from "../model/processFlowGraph";
 import type {
-    Agent, WorkflowBranch, WorkflowInput, WorkflowStep
+    Agent, WorkflowBranch, WorkflowInput, WorkflowRun, WorkflowStep
 } from "../service/types";
 
 const EMPTY_WORKFLOW: WorkflowInput = {
@@ -45,11 +63,18 @@ interface RowOption {
 interface UiStep extends WorkflowStep {
     agentOptions: RowOption[];
     branchOptions: RowOption[];
+    // --- step kinds ---
+    /** Flat editor copy of `config` for the per-kind forms; see
+     * model/stepKinds.ts. Mapped back to `config` by `collectSteps()`. */
+    cfg?: UiStepConfig;
     /** Whether the move buttons are live for this row; see `workflowOrder`.
      * Precomputed per row because the table binding has no row index to
      * hand a formatter. */
     canUp?: boolean;
     canDown?: boolean;
+    /** 1-based row number shown in the step list; also what the
+     * validation messages call "Step N". Set by `applyMoveFlags`. */
+    rowNo?: number;
 }
 
 interface UiWorkflowData extends Omit<WorkflowInput, "steps"> {
@@ -61,14 +86,30 @@ interface UiWorkflowData extends Omit<WorkflowInput, "steps"> {
  */
 export default class WorkflowDetail extends BaseController {
 
+    public formatter = formatter;
+
     private workflowId?: number;
+    /** `canonical()` of the save payload as loaded, for the Refresh
+     * button's dirty check; undefined for a new workflow or one that
+     * failed to load. */
+    private snapshot?: string;
+    /** Timers armed by Run now to reload the last-runs panel. */
+    private runRefreshTimers: ReturnType<typeof setTimeout>[] = [];
 
     public onInit(): void {
         this.setModel(new JSONModel({
             title: "",
             data: JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData,
             availableAgents: [],
-            errors: {}
+            errors: {},
+            // --- step editor --- which row of /data/steps the editor shows
+            // (-1: none, empty state), and the text dialog's scratch value.
+            ui: { selectedStep: -1, dialogText: "", dialogTitle: "" },
+            // --- run / refresh / last runs ---
+            isExisting: false,
+            runBusy: false,
+            runs: [],
+            runsCount: runsCountLabel(0)
         }), "workflow");
         // Its own model, so redrawing the graph cannot feed back into the
         // editor state it was drawn from.
@@ -102,10 +143,20 @@ export default class WorkflowDetail extends BaseController {
         (this.getModel("flow") as JSONModel).setData(graph);
     }
 
+    public onExit(): void {
+        this.clearRunRefreshTimers();
+    }
+
     private load(id: string): Promise<void> {
         return this.withBusy(async () => {
             const model = this.getModel("workflow") as JSONModel;
             model.setProperty("/errors", {});
+            this.clearRunRefreshTimers();
+            this.snapshot = undefined;
+            // The router reuses this controller across workflows, so a
+            // selection left over from the previous one must not point the
+            // editor at a row of the next.
+            this.selectStep(-1);
 
             // Fetched before either branch below returns: a step's agent <Select>
             // needs the full agent list (disabled agents included -- a disabled
@@ -120,17 +171,28 @@ export default class WorkflowDetail extends BaseController {
 
             if (id === "new") {
                 this.workflowId = undefined;
+                model.setProperty("/isExisting", false);
+                model.setProperty("/runs", []);
+                model.setProperty("/runsCount", runsCountLabel(0));
                 model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_WORKFLOW)) as UiWorkflowData);
                 model.setProperty("/title", this.text("newWorkflow"));
                 this.refreshStepOptions();
+                this.selectStep(-1);
                 return;
             }
 
             this.workflowId = Number(id);
-            const workflow = await this.run(
-                this.getAdminService().getWorkflow(this.workflowId),
-                this.text("workflowLoadFailed")
-            );
+            model.setProperty("/isExisting", true);
+            // The last runs load alongside the workflow; loadRuns() reports
+            // its own failure with a toast and leaves the panel empty, so it
+            // can never take the form with it.
+            const [workflow] = await Promise.all([
+                this.run(
+                    this.getAdminService().getWorkflow(this.workflowId),
+                    this.text("workflowLoadFailed")
+                ),
+                this.loadRuns()
+            ]);
             if (!workflow) {
                 return;
             }
@@ -149,10 +211,21 @@ export default class WorkflowDetail extends BaseController {
                 on_unknown_branch: workflow.on_unknown_branch,
                 enabled: workflow.enabled,
                 branches: (workflow.branches ?? []).map((b) => ({ ...b })),
-                steps: (workflow.steps ?? []).map((s) => ({ ...s }))
+                // --- step kinds --- a row written before kinds existed has
+                // none; it is an agent step. `cfg` is the editor copy of the
+                // stored config, built once here and mapped back on save.
+                steps: (workflow.steps ?? []).map((s) => ({
+                    ...s, kind: kindOf(s), cfg: uiConfigFromWire(kindOf(s), s.config)
+                }))
             } as UiWorkflowData);
             model.setProperty("/title", workflow.name);
             this.refreshStepOptions();
+            // Open on the first step so the editor is not empty for a
+            // workflow that has steps.
+            this.selectStep((model.getProperty("/data/steps") as UiStep[]).length ? 0 : -1);
+            // Taken after refreshStepOptions/regroup, on the payload a save
+            // would send, so the per-row UI fields never count as edits.
+            this.snapshot = canonical(this.buildPayload());
         });
     }
 
@@ -196,7 +269,10 @@ export default class WorkflowDetail extends BaseController {
         const branches = (this.getModel("workflow") as JSONModel).getProperty("/data/branches") as WorkflowBranch[];
         const keys = branches.map((b) => (b.key || "").trim()).filter(Boolean);
         const options: RowOption[] = [
-            { key: "", text: this.text("stepMainLine"), enabled: true },
+            // MAIN_LINE_KEY, not "": sap.m.Select shows nothing for an empty
+            // selectedKey. The NullableKey binding type on the dropdown maps
+            // the sentinel to the model's null.
+            { key: MAIN_LINE_KEY, text: this.text("stepMainLine"), enabled: true },
             ...keys.map((k) => ({ key: k, text: k, enabled: true }))
         ];
         const normalized = (branchKey || "").trim();
@@ -242,7 +318,14 @@ export default class WorkflowDetail extends BaseController {
         const model = this.getModel("workflow") as JSONModel;
         const branches = model.getProperty("/data/branches") as WorkflowBranch[];
         const steps = model.getProperty("/data/steps") as UiStep[];
-        model.setProperty("/data/steps", groupSteps(steps, branches));
+        // groupSteps keeps the row objects, so the selected one can be
+        // found again wherever grouping moved it.
+        const selected = steps[this.selectedIndex()];
+        const grouped = groupSteps(steps, branches);
+        model.setProperty("/data/steps", grouped);
+        if (selected) {
+            model.setProperty("/ui/selectedStep", grouped.indexOf(selected));
+        }
         this.applyMoveFlags();
     }
 
@@ -264,6 +347,7 @@ export default class WorkflowDetail extends BaseController {
 
         model.setProperty("/data/steps", steps.map((s, index) => ({
             ...s,
+            rowNo: index + 1,
             canUp: canMoveWithinGroup(steps, index, -1),
             canDown: canMoveWithinGroup(steps, index, 1)
         })));
@@ -273,6 +357,9 @@ export default class WorkflowDetail extends BaseController {
             canUp: index > 0,
             canDown: index < branches.length - 1
         })));
+        // Replacing the array re-creates the list items, so the selection
+        // has to be put back on the row the editor is showing.
+        this.applySelection();
         this.refreshFlow();
     }
 
@@ -285,7 +372,13 @@ export default class WorkflowDetail extends BaseController {
         if (!canMoveWithinGroup(steps, index, delta)) {
             return;
         }
+        const selected = this.selectedIndex();
         model.setProperty("/data/steps", swap(steps, index, delta));
+        if (selected === index) {
+            model.setProperty("/ui/selectedStep", index + delta);
+        } else if (selected === index + delta) {
+            model.setProperty("/ui/selectedStep", index);
+        }
         this.applyMoveFlags();
     }
 
@@ -354,10 +447,14 @@ export default class WorkflowDetail extends BaseController {
             instructions: "",
             fan_out: false,
             step_timeout_seconds: 600,
+            kind: "agent",
+            config: {},
+            cfg: emptyUiConfig("agent"),
             agentOptions: this.buildAgentOptions(""),
             branchOptions: this.buildBranchOptionsForStep(null)
         });
         model.setProperty("/data/steps", steps);
+        model.setProperty("/ui/selectedStep", steps.length - 1);
         this.applyMoveFlags();
     }
 
@@ -367,7 +464,176 @@ export default class WorkflowDetail extends BaseController {
         const steps = (model.getProperty("/data/steps") as UiStep[]).slice();
         steps.splice(index, 1);
         model.setProperty("/data/steps", steps);
+        const selected = this.selectedIndex();
+        if (selected === index) {
+            // The neighbour that took its place, else the one before it.
+            model.setProperty("/ui/selectedStep", Math.min(index, steps.length - 1));
+        } else if (selected > index) {
+            model.setProperty("/ui/selectedStep", selected - 1);
+        }
         this.applyMoveFlags();
+    }
+
+    // --- step editor (master-detail) ------------------------------------
+
+    private selectedIndex(): number {
+        const value = (this.getModel("workflow") as JSONModel).getProperty("/ui/selectedStep") as number;
+        return typeof value === "number" && value >= 0 ? value : -1;
+    }
+
+    /** Shows step `index` in the editor and selects its row; -1 (or an
+     * index past the end) clears both and shows the empty state. */
+    public selectStep(index: number): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const count = ((model.getProperty("/data/steps") as UiStep[]) || []).length;
+        model.setProperty("/ui/selectedStep", index >= 0 && index < count ? index : -1);
+        this.applySelection();
+    }
+
+    /**
+     * Points the editor and the list at `/ui/selectedStep`.
+     *
+     * The editor is element-bound to the row's path, so its fields keep
+     * their plain relative two-way bindings; a replaced `/data/steps`
+     * array resolves through the same path to the new row object. The
+     * list's own selection is index-based too (`rememberSelections`), so
+     * it is set explicitly after every re-order.
+     */
+    private applySelection(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const count = ((model.getProperty("/data/steps") as UiStep[]) || []).length;
+        let index = this.selectedIndex();
+        if (index >= count) {
+            index = -1;
+            model.setProperty("/ui/selectedStep", -1);
+        }
+        const editor = this.byId("stepEditor") as Panel | undefined;
+        const table = this.byId("stepsTable") as Table | undefined;
+        if (index < 0) {
+            editor?.unbindElement("workflow");
+            table?.removeSelections(true);
+            return;
+        }
+        const path = `/data/steps/${index}`;
+        if (editor && editor.getElementBinding("workflow")?.getPath() !== path) {
+            editor.bindElement({ path, model: "workflow" });
+        }
+        const item = table?.getItems()[index];
+        if (table && item && table.getSelectedItem() !== item) {
+            table.setSelectedItem(item, true);
+        }
+    }
+
+    public onStepSelectionChange(event: ListBase$SelectionChangeEvent): void {
+        const item = event.getParameter("listItem") as ListItemBase | undefined;
+        const path = item?.getBindingContext("workflow")?.getPath() ?? "";
+        const index = Number(path.substring(path.lastIndexOf("/") + 1));
+        if (Number.isFinite(index) && event.getParameter("selected")) {
+            this.selectStep(index);
+        }
+    }
+
+    /** "Step N" over the editor: the same number the list shows and the
+     * validation messages use. */
+    public stepEditorTitle(index: number): string {
+        return index >= 0 ? this.text("stepEditorTitle", [index + 1]) : "";
+    }
+
+    public stepBranchText(branchKey: string | null): string {
+        return (branchKey || "").trim() || this.text("stepMainLine");
+    }
+
+    public stepKindIcon(kind: string | undefined): string {
+        return stepKindIcon(kind);
+    }
+
+    public stepKindText(kind: string | undefined): string {
+        const key: Record<string, string> = {
+            agent: "stepKindAgent", condition: "stepKindCondition", transform: "stepKindTransform",
+            http: "stepKindHttp", python: "stepKindPython"
+        };
+        return this.text(key[kindOf({ kind: kind as UiStep["kind"] })]);
+    }
+
+    /** The list row's summary, from the fields that can change it, bound
+     * as parts: a JSONModel binding to the `cfg` object itself would not
+     * notice a field edited in place, and the formatter runs bound to the
+     * controller, so the row cannot be read off the control either. */
+    public stepRowSummary(
+        kind: UiStep["kind"], instructions: string, rules: UiStepConfig["rules"] | undefined,
+        extractJson: string, regexPattern: string, template: string, truncate: string,
+        method: UiStepConfig["method"], destination: string, path: string, code: string
+    ): string {
+        const k = kindOf({ kind });
+        const cfg: UiStepConfig = {
+            ...emptyUiConfig(k),
+            rules: rules || [],
+            extract_json: extractJson || "",
+            regex_pattern: regexPattern || "",
+            template: template || "",
+            truncate: truncate || "",
+            method: method || "GET",
+            destination: destination || "",
+            path: path || "/",
+            code: code || ""
+        };
+        return stepListSummary({ kind: k, instructions: instructions || "", cfg });
+    }
+
+    public textCounter(text: string | undefined | null): string {
+        return counterText(text);
+    }
+
+    // --- text dialog ---
+
+    /** Model path of the field the open text dialog edits. */
+    private textDialogPath = "";
+
+    /** Opens the large text dialog on `path` (absolute, in the `workflow`
+     * model). The dialog edits a scratch copy; Done writes it back, Cancel
+     * (or Escape) leaves the field exactly as it was when the dialog opened. */
+    public openTextDialog(path: string, title: string): void {
+        const model = this.getModel("workflow") as JSONModel;
+        this.textDialogPath = path;
+        model.setProperty("/ui/dialogTitle", title);
+        model.setProperty("/ui/dialogText", String(model.getProperty(path) ?? ""));
+        (this.byId("stepTextDialog") as Dialog).open();
+    }
+
+    /** An Expand button: `app:prop` names the field relative to the step
+     * row the button is bound to, `app:titleKey` the i18n key of its label. */
+    public onExpandText(event: Event): void {
+        const source = event.getSource() as Control;
+        const prop = String(source.data("prop") ?? "");
+        const titleKey = String(source.data("titleKey") ?? "");
+        const rowPath = WorkflowDetail.stepPath(event);
+        if (!prop || !rowPath) {
+            return;
+        }
+        this.openTextDialog(`${rowPath}/${prop}`, titleKey ? this.text(titleKey) : "");
+    }
+
+    public onTextDialogDone(): void {
+        const model = this.getModel("workflow") as JSONModel;
+        if (this.textDialogPath) {
+            model.setProperty(this.textDialogPath, model.getProperty("/ui/dialogText"));
+        }
+        this.closeTextDialog();
+    }
+
+    public onTextDialogCancel(): void {
+        this.closeTextDialog();
+    }
+
+    /** Escape behaves like Cancel. */
+    public onTextDialogEscape(promise: { resolve(): void }): void {
+        this.closeTextDialog();
+        promise.resolve();
+    }
+
+    private closeTextDialog(): void {
+        this.textDialogPath = "";
+        (this.byId("stepTextDialog") as Dialog | undefined)?.close();
     }
 
     /** A step row's branch, agent or fan-out changed. The two-way binding has
@@ -379,6 +645,57 @@ export default class WorkflowDetail extends BaseController {
     /** A step's branch changed, so the row belongs to another group now. */
     public onStepBranchChange(): void {
         this.regroupSteps();
+    }
+
+    // --- step kinds ---------------------------------------------------------
+
+    /** The model path of the step row a press/change event came from
+     * (`/data/steps/N`), whether the control sits directly in the row or in
+     * a nested rule list under it. */
+    private static stepPath(event: Event): string {
+        const path = (event.getSource() as Control).getBindingContext("workflow")?.getPath() ?? "";
+        const match = /^(\/data\/steps\/\d+)/.exec(path);
+        return match ? match[1] : path;
+    }
+
+    /**
+     * A step's kind changed. The two-way binding has written `kind`; this
+     * clears what the new kind cannot use (an agent, the fan-out flag) and
+     * gives the row a fresh editor config for that kind -- unless it is the
+     * kind the config was built for, so switching away and back within one
+     * edit keeps what was typed.
+     */
+    public onStepKindChange(event: Event): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const path = WorkflowDetail.stepPath(event);
+        const step = model.getProperty(path) as UiStep;
+        const kind = kindOf(step);
+        if (kind !== "agent") {
+            model.setProperty(`${path}/agent_name`, "");
+            model.setProperty(`${path}/fan_out`, false);
+        }
+        if (!step.cfg || step.cfg.kind !== kind) {
+            model.setProperty(`${path}/cfg`, emptyUiConfig(kind));
+        }
+        this.refreshFlow();
+    }
+
+    public onAddConditionRule(event: Event): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const path = `${WorkflowDetail.stepPath(event)}/cfg/rules`;
+        const rules = ((model.getProperty(path) as UiStepConfig["rules"]) || []).slice();
+        rules.push(emptyRule());
+        model.setProperty(path, rules);
+    }
+
+    public onRemoveConditionRule(event: Event): void {
+        const model = this.getModel("workflow") as JSONModel;
+        const rulePath = (event.getSource() as Control).getBindingContext("workflow")?.getPath() ?? "";
+        const index = Number(rulePath.substring(rulePath.lastIndexOf("/") + 1));
+        const listPath = rulePath.substring(0, rulePath.lastIndexOf("/"));
+        const rules = ((model.getProperty(listPath) as UiStepConfig["rules"]) || []).slice();
+        rules.splice(index, 1);
+        model.setProperty(listPath, rules);
     }
 
     /** The row index of a press event's binding context, for tables whose
@@ -419,29 +736,47 @@ export default class WorkflowDetail extends BaseController {
      * globally instead of per group rejects every save for a reason the
      * operator did nothing to cause.
      */
-    private static collectSteps(steps: UiStep[]): WorkflowStep[] {
+    private static collectSteps(steps: UiStep[], strict = false): WorkflowStep[] {
         const counters: Record<string, number> = {};
-        return steps.map((s) => {
+        return steps.map((s, index) => {
             const branchKey = (s.branch_key || "").trim() || null;
             const groupKey = branchKey ?? "";
             counters[groupKey] = (counters[groupKey] || 0) + 1;
+            // --- step kinds --- a non-agent step names no agent and cannot
+            // be the fan-out step; its settings travel in `config`, mapped
+            // back from the flat editor copy. In lenient mode (the preview)
+            // a JSON field that does not parse yet is simply left empty; the
+            // save is strict and reports it with the row number.
+            const kind = kindOf(s);
+            let config: WorkflowStep["config"] = {};
+            if (kind !== "agent") {
+                try {
+                    config = wireConfigFromUi(kind, s.cfg);
+                } catch (error) {
+                    if (strict) {
+                        throw new Error(`${index + 1}\u0000${(error as Error).message}`);
+                    }
+                }
+            }
             return {
                 branch_key: branchKey,
                 position: counters[groupKey],
-                agent_name: s.agent_name,
-                instructions: s.instructions,
-                fan_out: s.fan_out,
-                step_timeout_seconds: s.step_timeout_seconds
+                agent_name: kind === "agent" ? s.agent_name : "",
+                instructions: kind === "agent" ? s.instructions : "",
+                fan_out: kind === "agent" && s.fan_out,
+                step_timeout_seconds: s.step_timeout_seconds,
+                kind,
+                config
             };
         });
     }
 
-    public async onSave(): Promise<void> {
-        const model = this.getModel("workflow") as JSONModel;
-        model.setProperty("/errors", {});
-        const data = model.getProperty("/data") as UiWorkflowData;
-
-        const payload: WorkflowInput = {
+    /** The wire shape of the form. `steps` defaults to the lenient
+     * collection (the preview's), which is what the dirty check compares;
+     * onSave passes the strictly collected ones. */
+    private buildPayload(steps?: WorkflowStep[]): WorkflowInput {
+        const data = (this.getModel("workflow") as JSONModel).getProperty("/data") as UiWorkflowData;
+        return {
             name: data.name,
             description: data.description,
             api_slug: data.api_slug,
@@ -452,8 +787,40 @@ export default class WorkflowDetail extends BaseController {
             on_unknown_branch: data.on_unknown_branch,
             enabled: data.enabled,
             branches: WorkflowDetail.collectBranches(data.branches),
-            steps: WorkflowDetail.collectSteps(data.steps)
+            steps: steps ?? WorkflowDetail.collectSteps(data.steps)
         };
+    }
+
+    public async onSave(): Promise<void> {
+        const model = this.getModel("workflow") as JSONModel;
+        model.setProperty("/errors", {});
+        const data = model.getProperty("/data") as UiWorkflowData;
+
+        // --- step kinds --- strict: a JSON field on an http step that does
+        // not parse stops the save here, naming the row, instead of sending
+        // an empty object the operator never typed.
+        let steps: WorkflowStep[];
+        try {
+            steps = WorkflowDetail.collectSteps(data.steps, true);
+        } catch (error) {
+            const [row, message] = String((error as Error).message).split("\u0000");
+            // Select the row the message names, so the field is in view
+            // once the message is dismissed.
+            this.selectStep(Number(row) - 1);
+            MessageBox.error(this.text("workflowStepInvalid", [row, message ?? row]));
+            return;
+        }
+        const stepErrors = validateWorkflowSteps(steps);
+        const stepErrorRows = Object.keys(stepErrors).map(Number).sort((a, b) => a - b);
+        if (stepErrorRows.length) {
+            this.selectStep(stepErrorRows[0]);
+            MessageBox.error(stepErrorRows
+                .map((i) => this.text("workflowStepInvalid", [String(i + 1), stepErrors[i]]))
+                .join("\n"));
+            return;
+        }
+
+        const payload = this.buildPayload(steps);
 
         try {
             const saved = await this.getAdminService().upsertWorkflow(payload, this.workflowId);
@@ -510,6 +877,196 @@ export default class WorkflowDetail extends BaseController {
     public endpointHint(apiSlug: string): string {
         const slug = (apiSlug || "").trim() || this.text("apiSlugPlaceholder");
         return this.text("apiSlugRunHint", [slug]);
+    }
+
+    // --- where used ---
+
+    /** The link text over the step editor: "Open <agent>", blank while the
+     * step names no agent (the link is hidden then anyway). */
+    public openStepAgentText(agentName: string): string {
+        return agentName ? this.text("openStepAgent", [agentName]) : "";
+    }
+
+    public onOpenStepAgent(event: Event): void {
+        const step = (event.getSource() as Control)
+            .getBindingContext("workflow")?.getObject() as WorkflowStep | undefined;
+        void this.openAgentByName(step?.agent_name ?? "");
+    }
+
+    /**
+     * A click on a preview node opens its agent.
+     *
+     * The runtime hands the pressed `ProcessFlowNode` itself as the event's
+     * parameter object (`fireNodePress(this)` in ProcessFlowNode's click
+     * handler), and that control is bound to the `FlowNode` it was drawn
+     * from. The node is matched back to a step by group and position -- the
+     * same recomputed positions `refreshFlow` drew it with -- rather than by
+     * its title, which is a display string ("(no agent)" for an empty row).
+     */
+    public onFlowNodePress(event: Event): void {
+        const node = event.getParameters() as unknown as ProcessFlowNode | undefined;
+        const flowNode = node?.getBindingContext?.("flow")?.getObject() as FlowNode | undefined;
+        if (!flowNode) {
+            return;
+        }
+        const data = (this.getModel("workflow") as JSONModel).getProperty("/data") as UiWorkflowData;
+        const step = WorkflowDetail.collectSteps(data.steps).find(
+            (s) => s.branch_key === flowNode.branchKey && s.position === flowNode.position
+        );
+        void this.openAgentByName(step?.agent_name ?? "");
+    }
+
+    /**
+     * Resolves an agent name to its id through the list the step selects
+     * already use, refetching once in case the agent was created after this
+     * page loaded, then navigates to it. A name that still matches nothing
+     * is a step the server will refuse to save; say so instead of opening
+     * a blank page.
+     */
+    private async openAgentByName(name: string): Promise<void> {
+        if (!name) {
+            return;
+        }
+        const model = this.getModel("workflow") as JSONModel;
+        let agents = model.getProperty("/availableAgents") as Agent[];
+        let match = agents.find((a) => a.name === name);
+        if (!match) {
+            const fresh = await this.run(
+                this.getAdminService().listAgents(),
+                this.text("workflowLoadAgentsFailed")
+            );
+            if (fresh) {
+                agents = fresh;
+                model.setProperty("/availableAgents", agents);
+                match = agents.find((a) => a.name === name);
+            }
+        }
+        if (!match) {
+            MessageToast.show(this.text("stepAgentNotFound", [name]));
+            return;
+        }
+        this.getRouter().navTo("agentDetail", { agentId: String(match.id) });
+    }
+
+    // --- run now / refresh / last runs ---
+
+    /**
+     * The newest runs of this workflow, for the panel. Never throws and
+     * never goes through ErrorHandler's dialog: a failure here shows one
+     * toast and an empty panel, because it must not break opening the
+     * workflow.
+     */
+    public async loadRuns(): Promise<void> {
+        const model = this.getModel("workflow") as JSONModel;
+        const id = this.workflowId;
+        if (id === undefined) {
+            model.setProperty("/runs", []);
+            model.setProperty("/runsCount", runsCountLabel(0));
+            return;
+        }
+        let runs: WorkflowRun[] = [];
+        try {
+            runs = await this.getAdminService().listWorkflowRuns({ workflowId: id, limit: LAST_RUNS_LIMIT });
+        } catch {
+            MessageToast.show(this.text("lastRunsLoadFailed"));
+        }
+        // Another workflow may have been opened while this was in flight.
+        if (this.workflowId !== id) {
+            return;
+        }
+        model.setProperty("/runs", runs);
+        model.setProperty("/runsCount", runsCountLabel(runs.length, LAST_RUNS_LIMIT));
+    }
+
+    public onRefreshRuns(): void {
+        void this.loadRuns();
+    }
+
+    public onOpenRun(event: Event): void {
+        const run = (event.getSource() as ColumnListItem)
+            .getBindingContext("workflow")?.getObject() as WorkflowRun | undefined;
+        if (run) {
+            this.getRouter().navTo("workflowRunDetail", { runId: run.id });
+        }
+    }
+
+    /**
+     * Starts a run, the way the list page does (same toast, same error
+     * handling), then reloads the panel shortly after so the run shows up
+     * as running, and once more so a short run shows its outcome.
+     */
+    public async onRunNow(): Promise<void> {
+        const model = this.getModel("workflow") as JSONModel;
+        const id = this.workflowId;
+        if (id === undefined || model.getProperty("/runBusy")) {
+            return;
+        }
+        const name = model.getProperty("/title") as string;
+        model.setProperty("/runBusy", true);
+        try {
+            const started = await this.run(
+                this.getAdminService().runWorkflowNow(id),
+                `Could not start a run for "${name}".`
+            );
+            if (!started) {
+                return;
+            }
+            MessageToast.show(this.text("workflowRunStarted").replace("{0}", started.run_id));
+            this.clearRunRefreshTimers();
+            RUN_REFRESH_DELAYS_MS.forEach((delay) => {
+                this.runRefreshTimers.push(setTimeout(() => {
+                    if (this.workflowId === id) {
+                        void this.loadRuns();
+                    }
+                }, delay));
+            });
+        } finally {
+            model.setProperty("/runBusy", false);
+        }
+    }
+
+    private clearRunRefreshTimers(): void {
+        this.runRefreshTimers.forEach((t) => clearTimeout(t));
+        this.runRefreshTimers = [];
+    }
+
+    /** Whether the form differs from what was loaded, compared on the
+     * payload a save would send. */
+    private isDirty(): boolean {
+        return isDirty(this.snapshot, this.buildPayload());
+    }
+
+    /**
+     * Reloads the workflow from the server: the form, the preview and the
+     * last runs. Unsaved edits are lost, so it asks first when there are any.
+     */
+    public onRefresh(): void {
+        if (this.workflowId === undefined) {
+            return;
+        }
+        if (!this.isDirty()) {
+            void this.reload();
+            return;
+        }
+        MessageBox.confirm(this.text("refreshDiscardConfirm"), {
+            title: this.text("refresh"),
+            emphasizedAction: MessageBox.Action.OK,
+            onClose: (action: string) => {
+                if (action === MessageBox.Action.OK) {
+                    void this.reload();
+                }
+            }
+        });
+    }
+
+    private async reload(): Promise<void> {
+        if (this.workflowId === undefined) {
+            return;
+        }
+        await this.load(String(this.workflowId));
+        if (this.snapshot !== undefined) {
+            MessageToast.show(this.text("reloadedFromServer"));
+        }
     }
 
     // text(key) is inherited from BaseController -- do not redeclare it.

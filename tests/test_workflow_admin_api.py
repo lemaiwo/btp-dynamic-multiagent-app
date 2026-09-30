@@ -192,6 +192,109 @@ async def main() -> None:
         r = await c.delete(f"/admin/api/workflows/{wf_id}")
         check("deleted", r.status_code in (200, 204), str(r.status_code))
 
+        # --- step kinds ---
+        print("\n== step kinds round-trip through the API ==")
+        KINDS = {
+            **GOOD, "name": "kinds", "api_slug": "kinds", "branches": [],
+            "steps": [
+                {"branch_key": None, "position": 1, "agent_name": "reader",
+                 "instructions": "read", "fan_out": False, "step_timeout_seconds": 600},
+                {"branch_key": None, "position": 2, "kind": "condition", "agent_name": "",
+                 "instructions": "", "fan_out": False, "step_timeout_seconds": 60,
+                 "config": {"rules": [{"when": {"source": "text", "op": "contains",
+                                                "value": "nothing"},
+                                       "then": {"action": "stop", "output": "Done."}}],
+                            "else": {"action": "continue"}}},
+                {"branch_key": None, "position": 3, "kind": "transform",
+                 "config": {"template": "{{text}}", "truncate": 500}},
+                {"branch_key": None, "position": 4, "kind": "python",
+                 "config": {"code": "output = text.upper()", "timeout_seconds": 5}},
+                {"branch_key": None, "position": 5, "kind": "http",
+                 "config": {"destination": "jira", "method": "POST",
+                            "path": "/rest/api/2/issue/{{item.id}}/comment",
+                            "body": "{\"body\": \"{{text}}\"}"}},
+                {"branch_key": None, "position": 6, "agent_name": "drafter",
+                 "instructions": "draft", "fan_out": False, "step_timeout_seconds": 600},
+            ],
+        }
+        r = await c.post("/admin/api/workflows", json=KINDS)
+        check("created with mixed kinds", r.status_code in (200, 201),
+              f"{r.status_code} {r.text[:300]}")
+        kinds_id = r.json()["id"]
+        body = r.json()
+        kinds = [s["kind"] for s in body["steps"]]
+        check("every step reports its kind",
+              kinds == ["agent", "condition", "transform", "python", "http", "agent"], str(kinds))
+        check("agent steps carry an empty config and non-agent steps an empty agent name",
+              body["steps"][0]["config"] == {} and body["steps"][2]["agent_name"] == "",
+              str(body["steps"][:3])[:300])
+        check("configs are normalised and returned",
+              body["steps"][1]["config"]["else"]["action"] == "continue"
+              and body["steps"][4]["config"]["method"] == "POST"
+              and body["steps"][4]["config"]["expect_status"][0] == 200,
+              str(body["steps"][4])[:300])
+        r = await c.get(f"/admin/api/workflows/{kinds_id}")
+        check("GET returns the same kinds and configs",
+              [s["kind"] for s in r.json()["steps"]] == kinds
+              and r.json()["steps"][3]["config"]["code"] == "output = text.upper()",
+              r.text[:300])
+
+        print("\n== invalid kind configs are 4xx naming the step ==")
+        for label, mutate, expect in [
+            ("unknown kind", lambda d: d["steps"][2].update({"kind": "shell"}), "Step 3"),
+            ("python that does not compile",
+             lambda d: d["steps"][3].update({"config": {"code": "def ("}}), "Step 4 (python)"),
+            ("http without a destination",
+             lambda d: d["steps"][4].update({"config": {"path": "/x"}}), "Step 5 (http)"),
+            ("http path escaping the destination",
+             lambda d: d["steps"][4]["config"].update({"path": "https://evil.example.com/"}),
+             "Step 5 (http)"),
+            ("a deterministic fan-out step",
+             lambda d: d["steps"][2].update({"fan_out": True}), "fan-out step must be an agent"),
+            ("an agent step with no agent",
+             lambda d: d["steps"][0].update({"agent_name": ""}), "Step 1"),
+        ]:
+            import copy  # noqa: PLC0415
+            payload = copy.deepcopy(KINDS)
+            payload.update({"name": "broken-kinds", "api_slug": "broken-kinds"})
+            mutate(payload)
+            r = await c.post("/admin/api/workflows", json=payload)
+            check(f"{label} rejected with 4xx", 400 <= r.status_code < 500,
+                  f"{r.status_code} {r.text[:160]}")
+            check(f"{label} names the step", expect.lower() in r.text.lower(), r.text[:200])
+
+        print("\n== export carries kinds and import accepts them ==")
+        r = await c.get("/admin/api/export")
+        check("export ok", r.status_code == 200, str(r.status_code))
+        bundle = r.json()
+        exported = next((w for w in bundle["workflows"] if w["name"] == "kinds"), None)
+        check("exported workflow lists step kinds",
+              exported is not None
+              and [s["kind"] for s in exported["steps"]] == kinds
+              and exported["steps"][4]["config"]["destination"] == "jira",
+              str(exported)[:300])
+        r = await c.delete(f"/admin/api/workflows/{kinds_id}")
+        check("deleted before re-import", r.status_code in (200, 204), str(r.status_code))
+        r = await c.post("/admin/api/import", json={"workflows": [exported]})
+        check("import of the exported workflow succeeds", r.status_code == 200,
+              f"{r.status_code} {r.text[:300]}")
+        r = await c.get("/admin/api/workflows")
+        imported = next((w for w in r.json() if w["name"] == "kinds"), None)
+        check("imported workflow exists", imported is not None, r.text[:200])
+        if imported is not None:
+            r = await c.get(f"/admin/api/workflows/{imported['id']}")
+            check("imported steps keep their kinds and configs",
+                  [s["kind"] for s in r.json()["steps"]] == kinds
+                  and r.json()["steps"][1]["config"]["rules"][0]["then"]["output"] == "Done.",
+                  r.text[:300])
+            broken = copy.deepcopy(exported)
+            broken["steps"][3]["config"]["code"] = "def ("
+            r = await c.post("/admin/api/import", json={"workflows": [broken]})
+            check("import with a broken python step is 422 naming the step",
+                  r.status_code == 422 and "step 4 (python)" in r.text.lower(),
+                  f"{r.status_code} {r.text[:200]}")
+            await c.delete(f"/admin/api/workflows/{imported['id']}")
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 

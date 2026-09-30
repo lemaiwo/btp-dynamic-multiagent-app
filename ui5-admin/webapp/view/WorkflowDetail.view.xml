@@ -4,12 +4,33 @@
     xmlns:mvc="sap.ui.core.mvc"
     xmlns:core="sap.ui.core"
     xmlns:f="sap.ui.layout.form"
+    xmlns:l="sap.ui.layout"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1"
     xmlns:pf="sap.suite.ui.commons">
     <Page
         id="workflowDetailPage"
         title="{workflow>/title}"
         showNavButton="true"
         navButtonPress=".onBack">
+        <!-- Both only for a workflow that exists on the server: a new one
+             has nothing to run or reload yet. Run now is the list page's
+             button on this page. -->
+        <headerContent>
+            <Button
+                id="runWorkflowNowButton"
+                icon="sap-icon://play"
+                text="{i18n>runNow}"
+                type="Emphasized"
+                visible="{= !!${workflow>/isExisting} }"
+                enabled="{= !${workflow>/runBusy} }"
+                press=".onRunNow" />
+            <Button
+                id="refreshWorkflowButton"
+                icon="sap-icon://refresh"
+                text="{i18n>refresh}"
+                visible="{= !!${workflow>/isExisting} }"
+                press=".onRefresh" />
+        </headerContent>
         <content>
             <VBox class="sapUiSmallMargin">
 
@@ -108,6 +129,7 @@
                             lanes="{flow>/lanes}"
                             scrollable="false"
                             foldedCorners="true"
+                            nodePress=".onFlowNodePress"
                             visible="{= ${flow>/nodes}.length > 0 }">
                             <pf:nodes>
                                 <pf:ProcessFlowNode
@@ -128,6 +150,56 @@
                             </pf:lanes>
                         </pf:ProcessFlow>
                     </VBox>
+                </Panel>
+
+                <!-- last runs: the newest runs of this workflow, loaded with
+                     the workflow and again after Run now. The full list is
+                     the Workflow Runs page. -->
+                <Panel
+                    id="workflowRunsPanel"
+                    headerText="{i18n>lastRunsPanel}"
+                    expandable="false"
+                    class="sapUiSmallMarginTop"
+                    visible="{= !!${workflow>/isExisting} }">
+                    <Table
+                        id="workflowRunsTable"
+                        items="{workflow>/runs}"
+                        noDataText="{i18n>noRunsYet}">
+                        <headerToolbar>
+                            <OverflowToolbar>
+                                <Title id="workflowRunsCount" text="{workflow>/runsCount}" />
+                                <ToolbarSpacer />
+                                <Button id="refreshWorkflowRunsButton" icon="sap-icon://refresh" text="{i18n>refresh}" press=".onRefreshRuns" />
+                            </OverflowToolbar>
+                        </headerToolbar>
+                        <columns>
+                            <Column><Text text="{i18n>colStatus}" /></Column>
+                            <Column><Text text="{i18n>colTrigger}" /></Column>
+                            <Column><Text text="{i18n>colItems}" /></Column>
+                            <Column><Text text="{i18n>colStarted}" /></Column>
+                            <Column><Text text="{i18n>colFinished}" /></Column>
+                            <Column><Text text="{i18n>colSummary}" /></Column>
+                        </columns>
+                        <items>
+                            <ColumnListItem type="Navigation" press=".onOpenRun">
+                                <cells>
+                                    <ObjectStatus
+                                        text="{workflow>status}"
+                                        state="{ path: 'workflow>status', formatter: '.formatter.workflowRunStatusState' }" />
+                                    <Text text="{workflow>trigger}" />
+                                    <HBox>
+                                        <ObjectNumber number="{workflow>items_total}" unit="{i18n>itemsTotal}" class="sapUiTinyMarginEnd" />
+                                        <ObjectNumber number="{workflow>items_succeeded}" unit="{i18n>itemsSucceeded}" state="Success" class="sapUiTinyMarginEnd" />
+                                        <ObjectNumber number="{workflow>items_failed}" unit="{i18n>itemsFailed}" state="Error" class="sapUiTinyMarginEnd" />
+                                        <ObjectNumber number="{workflow>items_skipped}" unit="{i18n>itemsSkipped}" />
+                                    </HBox>
+                                    <Text text="{ path: 'workflow>started_at', formatter: '.formatter.timestamp' }" />
+                                    <Text text="{ path: 'workflow>finished_at', formatter: '.formatter.timestamp' }" />
+                                    <Text text="{ parts: ['workflow>summary', 'workflow>error'], formatter: '.formatter.runSummary' }" maxLines="2" />
+                                </cells>
+                            </ColumnListItem>
+                        </items>
+                    </Table>
                 </Panel>
 
                 <Panel headerText="{i18n>branchesPanel}" expandable="false" class="sapUiSmallMarginTop">
@@ -169,62 +241,370 @@
 
                 <Panel headerText="{i18n>stepsPanel}" expandable="false" class="sapUiSmallMarginTop">
                     <Text text="{i18n>stepFanOutHint}" />
-                    <Table
-                        id="stepsTable"
-                        class="sapUiTinyMarginTop"
-                        items="{workflow>/data/steps}"
-                        noDataText="{i18n>noSteps}">
-                        <headerToolbar>
-                            <OverflowToolbar>
-                                <ToolbarSpacer />
-                                <Button id="addStepButton" icon="sap-icon://add" text="{i18n>addStep}" press=".onAddStep" />
-                            </OverflowToolbar>
-                        </headerToolbar>
-                        <columns>
-                            <Column><Text text="{i18n>stepBranch}" /></Column>
-                            <Column><Text text="{i18n>stepAgent}" /></Column>
-                            <Column><Text text="{i18n>stepInstructions}" /></Column>
-                            <Column><Text text="{i18n>stepFanOut}" /></Column>
-                            <Column><Text text="{i18n>stepTimeout}" /></Column>
-                            <Column hAlign="End"><Text text="{i18n>colActions}" /></Column>
-                        </columns>
-                        <items>
-                            <ColumnListItem>
-                                <cells>
-                                    <Select
-                                        selectedKey="{workflow>branch_key}"
-                                        items="{workflow>branchOptions}"
-                                        forceSelection="false"
-                                        change=".onStepBranchChange"
-                                        width="9rem">
-                                        <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
-                                    </Select>
-                                    <Select
-                                        selectedKey="{workflow>agent_name}"
-                                        items="{workflow>agentOptions}"
-                                        forceSelection="false"
-                                        change=".onStepRowChange"
-                                        width="10rem">
-                                        <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
-                                    </Select>
-                                    <TextArea value="{workflow>instructions}" rows="2" width="100%" />
-                                    <CheckBox selected="{workflow>fan_out}" select=".onStepRowChange" />
-                                    <StepInput value="{workflow>step_timeout_seconds}" min="10" max="1800" step="10" width="7rem" />
-                                    <HBox justifyContent="End" alignItems="Center">
-                                        <Button icon="sap-icon://navigation-up-arrow" type="Transparent"
-                                            enabled="{workflow>canUp}" tooltip="{i18n>moveStepUp}" press=".onMoveStepUp" />
-                                        <Button icon="sap-icon://navigation-down-arrow" type="Transparent"
-                                            enabled="{workflow>canDown}" tooltip="{i18n>moveStepDown}" press=".onMoveStepDown" />
-                                        <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
+                    <!-- Master-detail: a compact, read-mostly list of the steps
+                         on the left (below, on narrower screens) and one
+                         editor for the selected step with room for its
+                         instructions on the right. The editor is element-bound
+                         to the selected row's model path, so every field keeps
+                         its plain two-way binding. -->
+                    <l:Grid
+                        class="sapUiTinyMarginTop stepsMasterDetail"
+                        containerQuery="true"
+                        hSpacing="1"
+                        vSpacing="1"
+                        defaultSpan="XL12 L12 M12 S12">
+                        <Table
+                            id="stepsTable"
+                            items="{workflow>/data/steps}"
+                            mode="SingleSelectMaster"
+                            selectionChange=".onStepSelectionChange"
+                            contextualWidth="Auto"
+                            noDataText="{i18n>noSteps}">
+                            <layoutData>
+                                <l:GridData span="XL5 L12 M12 S12" />
+                            </layoutData>
+                            <headerToolbar>
+                                <OverflowToolbar>
+                                    <Title text="{i18n>stepListTitle}" />
+                                    <ToolbarSpacer />
+                                    <Button id="addStepButton" icon="sap-icon://add" text="{i18n>addStep}" press=".onAddStep" />
+                                </OverflowToolbar>
+                            </headerToolbar>
+                            <columns>
+                                <Column width="2.5rem"><Text text="{i18n>stepNumber}" /></Column>
+                                <Column width="7rem"><Text text="{i18n>stepBranch}" /></Column>
+                                <Column width="8rem"><Text text="{i18n>stepKind}" /></Column>
+                                <Column><Text text="{i18n>stepSummary}" /></Column>
+                                <Column width="5rem" minScreenWidth="Tablet" demandPopin="true" popinDisplay="WithoutHeader"><Text text="{i18n>stepFanOutShort}" /></Column>
+                                <Column width="5rem" hAlign="End" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>stepTimeoutShort}" /></Column>
+                                <Column width="7.5rem" hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                            </columns>
+                            <items>
+                                <ColumnListItem>
+                                    <cells>
+                                        <Text text="{workflow>rowNo}" />
+                                        <Text text="{ path: 'workflow>branch_key', formatter: '.stepBranchText' }" />
+                                        <HBox alignItems="Center">
+                                            <core:Icon src="{ path: 'workflow>kind', formatter: '.stepKindIcon' }" class="sapUiTinyMarginEnd" />
+                                            <Text text="{ path: 'workflow>kind', formatter: '.stepKindText' }" />
+                                        </HBox>
+                                        <!-- Summary: the parts only trigger the redraw; the
+                                             formatter reads the whole row. -->
+                                        <Text
+                                            text="{ parts: [
+                                                'workflow>kind', 'workflow>instructions', 'workflow>cfg/rules',
+                                                'workflow>cfg/extract_json', 'workflow>cfg/regex_pattern',
+                                                'workflow>cfg/template', 'workflow>cfg/truncate',
+                                                'workflow>cfg/method', 'workflow>cfg/destination', 'workflow>cfg/path',
+                                                'workflow>cfg/code'
+                                            ], formatter: '.stepRowSummary' }"
+                                            maxLines="1"
+                                            wrapping="false" />
+                                        <ObjectStatus
+                                            text="{i18n>stepFanOutBadge}"
+                                            state="Information"
+                                            icon="sap-icon://split"
+                                            visible="{= !!${workflow>fan_out} }" />
+                                        <Text text="{workflow>step_timeout_seconds}" />
+                                        <HBox justifyContent="End" alignItems="Center">
+                                            <Button icon="sap-icon://navigation-up-arrow" type="Transparent"
+                                                enabled="{workflow>canUp}" tooltip="{i18n>moveStepUp}" press=".onMoveStepUp" />
+                                            <Button icon="sap-icon://navigation-down-arrow" type="Transparent"
+                                                enabled="{workflow>canDown}" tooltip="{i18n>moveStepDown}" press=".onMoveStepDown" />
+                                            <Button icon="sap-icon://delete" type="Transparent" tooltip="{i18n>removeStep}" press=".onRemoveStep" />
+                                        </HBox>
+                                    </cells>
+                                </ColumnListItem>
+                            </items>
+                        </Table>
+
+                        <VBox id="stepEditorBox" width="100%">
+                            <layoutData>
+                                <l:GridData span="XL7 L12 M12 S12" />
+                            </layoutData>
+                            <IllustratedMessage
+                                id="stepEditorEmpty"
+                                illustrationType="sapIllus-NoEntries"
+                                illustrationSize="Spot"
+                                title="{i18n>stepEditorEmptyTitle}"
+                                description="{i18n>stepEditorEmptyText}"
+                                visible="{= !(${workflow>/ui/selectedStep} >= 0) }" />
+                            <!-- Element-bound by the controller (selectStep) to
+                                 workflow>/data/steps/N. -->
+                            <Panel id="stepEditor" width="100%" visible="{= ${workflow>/ui/selectedStep} >= 0 }">
+                                <headerToolbar>
+                                    <OverflowToolbar>
+                                        <Title id="stepEditorTitle" text="{ path: 'workflow>/ui/selectedStep', formatter: '.stepEditorTitle' }" />
+                                        <ToolbarSpacer />
+                                        <!-- where used: opens the step's agent -->
+                                        <Link
+                                            id="stepAgentLink"
+                                            text="{ path: 'workflow>agent_name', formatter: '.openStepAgentText' }"
+                                            visible="{= !!${workflow>agent_name} &amp;&amp; (${workflow>kind} || 'agent') === 'agent' }"
+                                            press=".onOpenStepAgent" />
+                                    </OverflowToolbar>
+                                </headerToolbar>
+                                <content>
+                                    <!-- header row: what the step is -->
+                                    <HBox wrap="Wrap" alignItems="End" class="stepEditorHeader">
+                                        <VBox class="sapUiSmallMarginEnd sapUiTinyMarginBottom">
+                                            <Label text="{i18n>stepBranch}" labelFor="stepBranch" />
+                                            <Select
+                                                id="stepBranch"
+                                                selectedKey="{ path: 'workflow>branch_key', type: 'com.agent.admin.model.NullableKey' }"
+                                                items="{workflow>branchOptions}"
+                                                forceSelection="false"
+                                                change=".onStepBranchChange"
+                                                width="10rem">
+                                                <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
+                                            </Select>
+                                        </VBox>
+                                        <VBox class="sapUiSmallMarginEnd sapUiTinyMarginBottom">
+                                            <Label text="{i18n>stepKind}" labelFor="stepKind" />
+                                            <Select
+                                                id="stepKind"
+                                                selectedKey="{workflow>kind}"
+                                                change=".onStepKindChange"
+                                                width="10rem">
+                                                <core:Item key="agent" text="{i18n>stepKindAgent}" />
+                                                <core:Item key="condition" text="{i18n>stepKindCondition}" />
+                                                <core:Item key="transform" text="{i18n>stepKindTransform}" />
+                                                <core:Item key="http" text="{i18n>stepKindHttp}" />
+                                                <core:Item key="python" text="{i18n>stepKindPython}" />
+                                            </Select>
+                                        </VBox>
+                                        <VBox class="sapUiSmallMarginEnd sapUiTinyMarginBottom" visible="{= ${workflow>kind} === 'agent' }">
+                                            <Label text="{i18n>stepAgent}" labelFor="stepAgent" />
+                                            <Select
+                                                id="stepAgent"
+                                                selectedKey="{workflow>agent_name}"
+                                                items="{workflow>agentOptions}"
+                                                forceSelection="false"
+                                                change=".onStepRowChange"
+                                                visible="{= ${workflow>kind} === 'agent' }"
+                                                width="14rem">
+                                                <core:Item key="{workflow>key}" text="{workflow>text}" enabled="{workflow>enabled}" />
+                                            </Select>
+                                        </VBox>
+                                        <VBox class="sapUiSmallMarginEnd sapUiTinyMarginBottom">
+                                            <Label text="{i18n>stepTimeout}" labelFor="stepTimeout" />
+                                            <StepInput id="stepTimeout" value="{workflow>step_timeout_seconds}" min="10" max="1800" step="10" width="8rem" />
+                                        </VBox>
+                                        <VBox class="sapUiTinyMarginBottom">
+                                            <Label text="" />
+                                            <CheckBox
+                                                id="stepFanOut"
+                                                text="{i18n>stepFanOut}"
+                                                selected="{workflow>fan_out}"
+                                                enabled="{= ${workflow>kind} === 'agent' }"
+                                                select=".onStepRowChange" />
+                                        </VBox>
                                     </HBox>
-                                </cells>
-                            </ColumnListItem>
-                        </items>
-                    </Table>
+
+                                    <!-- agent -->
+                                    <VBox width="100%" visible="{= ${workflow>kind} === 'agent' }" class="sapUiSmallMarginTop">
+                                        <Label text="{i18n>stepInstructions}" labelFor="stepInstructions" />
+                                        <TextArea
+                                            id="stepInstructions"
+                                            value="{workflow>instructions}"
+                                            valueLiveUpdate="true"
+                                            rows="12"
+                                            growing="true"
+                                            growingMaxLines="40"
+                                            width="100%"
+                                            class="stepEditorTextArea" />
+                                        <HBox justifyContent="SpaceBetween" alignItems="Center" width="100%">
+                                            <Text id="stepInstructionsCounter" text="{ path: 'workflow>instructions', formatter: '.textCounter' }" class="stepEditorCounter" />
+                                            <Button
+                                                id="stepInstructionsExpand"
+                                                icon="sap-icon://full-screen"
+                                                text="{i18n>expandText}"
+                                                type="Transparent"
+                                                press=".onExpandText"
+                                                app:prop="instructions"
+                                                app:titleKey="stepInstructions" />
+                                        </HBox>
+                                    </VBox>
+
+                                    <!-- condition -->
+                                    <VBox width="100%" visible="{= ${workflow>kind} === 'condition' }" class="sapUiSmallMarginTop">
+                                        <Text text="{i18n>stepCondHint}" class="sapUiTinyMarginBottom" />
+                                        <Table id="stepCondRules" items="{workflow>cfg/rules}" noDataText="{i18n>stepCondNoRules}" contextualWidth="Auto">
+                                            <headerToolbar>
+                                                <OverflowToolbar>
+                                                    <Title text="{i18n>stepCondRules}" />
+                                                    <ToolbarSpacer />
+                                                    <Button id="stepCondAddRule" icon="sap-icon://add" text="{i18n>stepAddRule}" press=".onAddConditionRule" />
+                                                </OverflowToolbar>
+                                            </headerToolbar>
+                                            <columns>
+                                                <Column width="6rem"><Text text="{i18n>stepCondSource}" /></Column>
+                                                <Column><Text text="{i18n>stepCondField}" /></Column>
+                                                <Column width="8rem"><Text text="{i18n>stepCondOp}" /></Column>
+                                                <Column><Text text="{i18n>stepCondValue}" /></Column>
+                                                <Column width="4rem" hAlign="Center" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>stepCondCaseShort}" /></Column>
+                                                <Column width="7rem"><Text text="{i18n>stepCondAction}" /></Column>
+                                                <Column minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>stepCondOutput}" /></Column>
+                                                <Column width="3rem" hAlign="End"><Text text="" /></Column>
+                                            </columns>
+                                            <items>
+                                                <ColumnListItem>
+                                                    <cells>
+                                                        <Select selectedKey="{workflow>source}" width="100%" tooltip="{i18n>stepCondSource}">
+                                                            <core:Item key="text" text="text" />
+                                                            <core:Item key="item" text="item" />
+                                                            <core:Item key="json" text="json" />
+                                                        </Select>
+                                                        <Input value="{workflow>field}" placeholder="{i18n>stepCondField}" width="100%" />
+                                                        <Select selectedKey="{workflow>op}" width="100%" tooltip="{i18n>stepCondOp}">
+                                                            <core:Item key="contains" text="contains" />
+                                                            <core:Item key="not_contains" text="not_contains" />
+                                                            <core:Item key="equals" text="equals" />
+                                                            <core:Item key="not_equals" text="not_equals" />
+                                                            <core:Item key="matches" text="matches" />
+                                                            <core:Item key="not_matches" text="not_matches" />
+                                                            <core:Item key="gt" text="gt" />
+                                                            <core:Item key="lt" text="lt" />
+                                                            <core:Item key="is_empty" text="is_empty" />
+                                                            <core:Item key="not_empty" text="not_empty" />
+                                                        </Select>
+                                                        <Input value="{workflow>value}" placeholder="{i18n>stepCondValue}" width="100%" />
+                                                        <CheckBox selected="{workflow>case_sensitive}" tooltip="{i18n>stepCondCase}" />
+                                                        <Select selectedKey="{workflow>action}" width="100%" tooltip="{i18n>stepCondAction}">
+                                                            <core:Item key="continue" text="{i18n>stepActionContinue}" />
+                                                            <core:Item key="stop" text="{i18n>stepActionStop}" />
+                                                        </Select>
+                                                        <Input value="{workflow>output}" placeholder="{i18n>stepCondOutput}" width="100%" />
+                                                        <Button icon="sap-icon://decline" type="Transparent" tooltip="{i18n>stepRemoveRule}" press=".onRemoveConditionRule" />
+                                                    </cells>
+                                                </ColumnListItem>
+                                            </items>
+                                        </Table>
+                                        <f:SimpleForm layout="ResponsiveGridLayout" editable="true" labelSpanXL="2" labelSpanL="2" labelSpanM="3" labelSpanS="12" columnsXL="1" columnsL="1" columnsM="1" adjustLabelSpan="false">
+                                            <Label text="{i18n>stepCondElse}" />
+                                            <Select id="stepCondElseAction" selectedKey="{workflow>cfg/else_action}" width="10rem">
+                                                <core:Item key="continue" text="{i18n>stepActionContinue}" />
+                                                <core:Item key="stop" text="{i18n>stepActionStop}" />
+                                            </Select>
+                                            <Label text="{i18n>stepCondOutput}" />
+                                            <Input id="stepCondElseOutput" value="{workflow>cfg/else_output}" placeholder="{i18n>stepCondOutputHint}" />
+                                        </f:SimpleForm>
+                                    </VBox>
+
+                                    <!-- transform -->
+                                    <f:SimpleForm visible="{= ${workflow>kind} === 'transform' }" layout="ResponsiveGridLayout" editable="true" labelSpanXL="2" labelSpanL="2" labelSpanM="3" labelSpanS="12" columnsXL="1" columnsL="1" columnsM="1" adjustLabelSpan="false" class="sapUiSmallMarginTop">
+                                        <Label text="{i18n>stepTfExtract}" />
+                                        <Input id="stepTfExtract" value="{workflow>cfg/extract_json}" placeholder="a.b[0]" />
+                                        <Label text="{i18n>stepTfPattern}" />
+                                        <Input id="stepTfPattern" value="{workflow>cfg/regex_pattern}" />
+                                        <Label text="{i18n>stepTfReplace}" />
+                                        <Input id="stepTfReplace" value="{workflow>cfg/regex_replace}" />
+                                        <Label text="{i18n>stepTfFlags}" />
+                                        <Input id="stepTfFlags" value="{workflow>cfg/regex_flags}" placeholder="imsx" width="6rem" />
+                                        <Label text="{i18n>stepTfTemplate}" />
+                                        <VBox width="100%">
+                                            <TextArea id="stepTfTemplate" value="{workflow>cfg/template}" valueLiveUpdate="true" rows="6" growing="true" growingMaxLines="30" width="100%" placeholder="Summary: \{\{text}} (\{\{item.id}})" class="stepEditorTextArea" />
+                                            <HBox justifyContent="SpaceBetween" alignItems="Center" width="100%">
+                                                <Text text="{ path: 'workflow>cfg/template', formatter: '.textCounter' }" class="stepEditorCounter" />
+                                                <Button id="stepTfTemplateExpand" icon="sap-icon://full-screen" text="{i18n>expandText}" type="Transparent" press=".onExpandText" app:prop="cfg/template" app:titleKey="stepTfTemplate" />
+                                            </HBox>
+                                        </VBox>
+                                        <Label text="{i18n>stepTfTruncate}" />
+                                        <Input id="stepTfTruncate" value="{workflow>cfg/truncate}" type="Number" width="8rem" />
+                                    </f:SimpleForm>
+
+                                    <!-- http -->
+                                    <f:SimpleForm visible="{= ${workflow>kind} === 'http' }" layout="ResponsiveGridLayout" editable="true" labelSpanXL="2" labelSpanL="2" labelSpanM="3" labelSpanS="12" columnsXL="1" columnsL="1" columnsM="1" adjustLabelSpan="false" class="sapUiSmallMarginTop">
+                                        <Label text="{i18n>stepHttpDestination}" required="true" />
+                                        <Input id="stepHttpDestination" value="{workflow>cfg/destination}" />
+                                        <Label text="{i18n>stepHttpMethod}" />
+                                        <Select id="stepHttpMethod" selectedKey="{workflow>cfg/method}" width="8rem">
+                                            <core:Item key="GET" text="GET" />
+                                            <core:Item key="POST" text="POST" />
+                                            <core:Item key="PUT" text="PUT" />
+                                            <core:Item key="PATCH" text="PATCH" />
+                                            <core:Item key="DELETE" text="DELETE" />
+                                        </Select>
+                                        <Label text="{i18n>stepHttpPath}" required="true" />
+                                        <Input id="stepHttpPath" value="{workflow>cfg/path}" placeholder="/rest/api/2/issue/\{\{item.id}}" />
+                                        <Label text="{i18n>stepHttpQuery}" />
+                                        <TextArea id="stepHttpQuery" value="{workflow>cfg/query_text}" rows="3" growing="true" growingMaxLines="12" width="100%" placeholder="\{&quot;fields&quot;: &quot;summary&quot;}" class="stepEditorTextArea" />
+                                        <Label text="{i18n>stepHttpHeaders}" />
+                                        <TextArea id="stepHttpHeaders" value="{workflow>cfg/headers_text}" rows="3" growing="true" growingMaxLines="12" width="100%" class="stepEditorTextArea" />
+                                        <Label text="{i18n>stepHttpBody}" />
+                                        <VBox width="100%">
+                                            <TextArea id="stepHttpBody" value="{workflow>cfg/body}" valueLiveUpdate="true" rows="6" growing="true" growingMaxLines="30" width="100%" class="stepEditorTextArea" />
+                                            <HBox justifyContent="SpaceBetween" alignItems="Center" width="100%">
+                                                <Text text="{ path: 'workflow>cfg/body', formatter: '.textCounter' }" class="stepEditorCounter" />
+                                                <Button id="stepHttpBodyExpand" icon="sap-icon://full-screen" text="{i18n>expandText}" type="Transparent" press=".onExpandText" app:prop="cfg/body" app:titleKey="stepHttpBody" />
+                                            </HBox>
+                                        </VBox>
+                                        <Label text="{i18n>stepHttpContentType}" />
+                                        <Input id="stepHttpContentType" value="{workflow>cfg/content_type}" />
+                                        <Label text="{i18n>stepHttpTimeout}" />
+                                        <StepInput id="stepHttpTimeout" value="{workflow>cfg/http_timeout}" min="1" max="600" step="5" width="8rem" />
+                                        <Label text="{i18n>stepHttpExpect}" />
+                                        <Input id="stepHttpExpect" value="{workflow>cfg/expect_status_text}" placeholder="200,201 (empty = any 2xx)" />
+                                    </f:SimpleForm>
+
+                                    <!-- python -->
+                                    <f:SimpleForm visible="{= ${workflow>kind} === 'python' }" layout="ResponsiveGridLayout" editable="true" labelSpanXL="2" labelSpanL="2" labelSpanM="3" labelSpanS="12" columnsXL="1" columnsL="1" columnsM="1" adjustLabelSpan="false" class="sapUiSmallMarginTop">
+                                        <Label text="{i18n>stepPyCode}" required="true" />
+                                        <VBox width="100%">
+                                            <TextArea id="stepPyCode" value="{workflow>cfg/code}" valueLiveUpdate="true" rows="16" growing="true" growingMaxLines="60" width="100%" placeholder="output = text.upper()" class="stepEditorTextArea stepEditorCode" />
+                                            <HBox justifyContent="SpaceBetween" alignItems="Center" width="100%">
+                                                <Text text="{ path: 'workflow>cfg/code', formatter: '.textCounter' }" class="stepEditorCounter" />
+                                                <Button id="stepPyCodeExpand" icon="sap-icon://full-screen" text="{i18n>expandText}" type="Transparent" press=".onExpandText" app:prop="cfg/code" app:titleKey="stepPyCode" />
+                                            </HBox>
+                                            <Text text="{i18n>stepPyHint}" class="sapUiTinyMarginTop" />
+                                        </VBox>
+                                        <Label text="{i18n>stepPyTimeout}" />
+                                        <StepInput id="stepPyTimeout" value="{workflow>cfg/py_timeout}" min="1" max="60" step="1" width="8rem" />
+                                    </f:SimpleForm>
+                                </content>
+                            </Panel>
+                        </VBox>
+                    </l:Grid>
                 </Panel>
 
             </VBox>
         </content>
+        <dependents>
+            <!-- One dialog for every long text field of the step editor:
+                 openTextDialog(path, title) copies the value into
+                 workflow>/ui/dialogText, Done writes it back to `path`,
+                 Cancel leaves the field as it was when the dialog opened. -->
+            <Dialog
+                id="stepTextDialog"
+                title="{workflow>/ui/dialogTitle}"
+                stretch="{device>/system/phone}"
+                contentWidth="80%"
+                contentHeight="80%"
+                verticalScrolling="false"
+                horizontalScrolling="false"
+                draggable="true"
+                resizable="true"
+                escapeHandler=".onTextDialogEscape">
+                <subHeader>
+                    <Toolbar>
+                        <Text id="stepTextDialogCounter" text="{ path: 'workflow>/ui/dialogText', formatter: '.textCounter' }" class="sapUiSmallMarginBegin" />
+                    </Toolbar>
+                </subHeader>
+                <content>
+                    <TextArea
+                        id="stepTextDialogArea"
+                        value="{workflow>/ui/dialogText}"
+                        valueLiveUpdate="true"
+                        width="100%"
+                        height="100%"
+                        class="stepTextDialogArea" />
+                </content>
+                <buttons>
+                    <Button id="stepTextDialogDone" text="{i18n>done}" type="Emphasized" press=".onTextDialogDone" />
+                    <Button id="stepTextDialogCancel" text="{i18n>cancel}" press=".onTextDialogCancel" />
+                </buttons>
+            </Dialog>
+        </dependents>
         <footer>
             <OverflowToolbar>
                 <ToolbarSpacer />

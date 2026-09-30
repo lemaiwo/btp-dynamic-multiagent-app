@@ -10,6 +10,20 @@
         title="{run>/data/workflow_name}"
         showNavButton="true"
         navButtonPress=".onBack">
+        <headerContent>
+            <Text id="workflowRunAutoRefreshStatus" text="{run>/auto/status}" class="sapUiTinyMarginEnd" />
+            <ToggleButton
+                id="autoRefreshWorkflowRunToggle"
+                icon="sap-icon://synchronize"
+                text="{i18n>autoRefresh}"
+                pressed="{run>/auto/enabled}"
+                press=".onToggleAutoRefresh" />
+            <Button
+                id="refreshWorkflowRunDetailButton"
+                icon="sap-icon://refresh"
+                text="{i18n>refresh}"
+                press=".onRefresh" />
+        </headerContent>
         <content>
             <VBox class="sapUiSmallMargin">
                 <f:SimpleForm layout="ResponsiveGridLayout" editable="false">

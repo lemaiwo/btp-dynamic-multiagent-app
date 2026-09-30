@@ -7,6 +7,16 @@ delegates to specialist agents that connect to BTP-hosted MCP servers
 over OAuth 2.1. The user's XSUAA JWT is forwarded to each MCP server.
 SAP AI Core's Generative AI Hub is the LLM provider.
 
+> **`docs/` is not in this repository.** Every `docs/...` path mentioned
+> below (connector setup guides, the workflow design spec, `UI5_ADMIN.md`,
+> `AICORE_RESOURCE_GROUP.md`) is landscape-specific: it names real CF
+> orgs and spaces, approuter hosts, destination names and OAuth client
+> ids, so `docs/` is gitignored and lives only in the operator's local
+> working copy (the same place as the `.mtaext` files). Do not create
+> `docs/` files in the repo to satisfy a reference; ask for the local
+> copy instead. Module docstrings carry the parts that are safe to
+> publish.
+
 ## Architecture
 - **LLM**: SAP AI Core Generative AI Hub (`sap-ai-sdk-gen`) via
   OpenAI-compatible API
@@ -54,25 +64,33 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/gmail_tools.py` — in-process Gmail tools over the REST API,
   attached when an agent lists the pseudo-URL `builtin:gmail` instead of an
   MCP endpoint. Google's hosted Gmail MCP server refuses every `tools/call`
-  from a self-registered OAuth client; see `docs/GMAIL_SETUP.md`. Auth reuses
-  `PerUserOAuth2Auth`, so sign-in and refresh are unchanged
+  from a self-registered OAuth client; see `docs/GMAIL_SETUP.md` (local,
+  not in repo). Auth reuses
+  `PerUserOAuth2Auth`, so sign-in and refresh are unchanged. On a
+  `destination`, `GmailClient(mailbox=)` switches `users/me` to
+  `users/{mailbox}` for the app-level case
 - `agents/outlook_tools.py` — the same idea over Microsoft Graph
   (`builtin:outlook`), with an Inbox subfolder as the queue instead of a
-  label. Built and unit-tested but **never run against a real mailbox**:
-  `docs/OUTLOOK_SETUP.md` and `scripts/probe_outlook.py` cover the tenant
-  gates that have to clear first
+  label. `build_http_client` picks per-user, app-only or destination auth;
+  `teams_tools` reuses it. Built and unit-tested but **never run against a
+  real mailbox**: `docs/OUTLOOK_SETUP.md` and `scripts/probe_outlook.py`
+  cover the tenant gates that have to clear first
 - `agents/mail_render.py` — markdown subset → Outlook-safe HTML for the mail
   this app *originates* (`send_mail`, `create_mail_draft`). Nested tables and
   inline styles only: Outlook on Windows lays mail out with Word's engine.
   The subject's ` -- ` tail becomes the header subline, the opening paragraph
   becomes the verdict callout, and the tool's `status` (`ok`/`attention`)
   tints it. Replies stay plain text — a report shell on an answer to a person
-  would read as a newsletter
+  would read as a newsletter. `MailTheme` (validated by `from_config`) restyles
+  band/accent/links/headings/tables/font, adds a logo or org name and replaces
+  the footer, from an optional `theme` object in a `builtin:smtp`/`builtin:outlook`
+  server's config; status tints stay fixed, and no theme renders byte-identically
 - `agents/teams_tools.py` — Teams channels over Microsoft Graph
   (`builtin:teams`). One `team` (and optionally `channels`) is pinned in
   config, never a tool argument. `oauth2` reads and, with `allow_send`,
   posts as the signed-in user; `app_only` is read-only because Graph refuses
-  application posts. Unit-tested only; setup notes are in the module docstring
+  application posts; `destination` follows `user_context` (posting only as
+  the user). Unit-tested only; setup notes are in the module docstring
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
   bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
   BTP destination (NoAuthentication + `URL.headers.Authorization`, which
@@ -80,10 +98,42 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   bot is in, or a pinned `channels` list; posting needs `allow_send`, and
   posted text is escaped so it cannot `<!channel>` or mention anyone.
   Unit-tested only; Slack + BTP setup guide in `SLACK_SETUP.md`
+- `agents/smtp_tools.py` — report mail over SMTP (`builtin:smtp`), with host
+  and credential from a BTP destination of Type `MAIL` (`destination` mode
+  only, Internet proxy only). One tool, `send_mail`, with outlook's contract:
+  `allow_send` must be `true`, the audience is the pinned `recipients`, an
+  optional `from` overrides `mail.smtp.from`, and the body goes through
+  `agents/mail_render.py`. STARTTLS or implicit TLS with the certificate
+  always verified; a login is never sent unencrypted. Stdlib `smtplib` in a
+  thread. Unit-tested only; setup notes in the module docstring
 - `agents/destination.py` — resolves a BTP destination (URL + ready
   `Authorization` header) from the destination service, cached until its
-  token nears expiry. Stores no credential for the target: the destination
-  holds it. Binding comes from `VCAP_SERVICES` or `DESTINATION_*` env vars
+  token nears expiry. `resolve_properties()` returns the raw
+  `destinationConfiguration` instead (for `MAIL` destinations, which have no
+  URL), same cache rules, with a `repr` that masks credential values. Stores no credential for the target: the destination
+  holds it. Binding comes from `VCAP_SERVICES` or `DESTINATION_*` env vars.
+  `resolve(user_token=, principal=)` sends the user's JWT as `X-user-token`
+  so a user-propagating destination (OAuth2UserTokenExchange, OAuth2JWTBearer,
+  OAuth2SAMLBearerAssertion, PrincipalPropagation) returns that user's token;
+  per-user results live in a bounded LRU keyed by principal, apart from the
+  app-level entry. `Destination.auth_type` echoes the `Authentication` type
+  for diagnostics; `require_credential=False` accepts a bare-URL destination
+  (public targets)
+- `agents/destination_auth.py` — `DestinationAuth` (httpx auth) and
+  `destination_http_client`: a built-in issues requests against
+  `PLACEHOLDER_BASE` (`https://destination.invalid`), the auth resolves the
+  destination per request (as the signed-in user when `user_context`),
+  rewrites the URL onto the destination's, sets its headers, retries once on
+  401, and refuses to send the credential to a host the destination did not
+  name. `DestinationUserRequired` (a `DestinationError`, deliberately not
+  `OAuthAuthorizationRequired`) is raised when `user_context` is on and no
+  JWT is bound -- scheduled runs. Every built-in accepts
+  `auth_mode="destination"` with `{destination, user_context}` plus its pinned
+  keys; `user_context=false` keeps the app-only rules (mailbox required,
+  Teams read-only). Storage keys per built-in are `_DEST_KEYS_BY_URL` in
+  `agents/db.py`; save-time rules are `_validate_destination_config` in
+  `agents/admin.py`; `GET /admin/api/credential-health` reports
+  destination servers under `destinations`
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -95,13 +145,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   public NVD API (`builtin:sapnotes`). `sourceIdentifier=cna@sap.com` is
   pinned in code; the CVSS floor is the one configurable knob. Returns the
   whole backlog by default, because SAP re-releases notes without NVD
-  re-publishing the CVE. See `docs/SAP_SECURITY_NOTES.md`
+  re-publishing the CVE. An optional `destination` supplies a proxy URL and
+  a `URL.headers.apiKey` header in place of `NVD_API_KEY`. See
+  `docs/SAP_SECURITY_NOTES.md`
 - `agents/sapnotedetail_tools.py` — SAP note detail from the private
   `me.sap.com` backend (`builtin:sapnotedetail`), giving the support-package
   level that fixes each note. Authenticates with a browser session cookie
   under `auth_mode="session"`, stored in `mcp_oauth_tokens` and refreshed by
   hand with `scripts/sap_session.py`; Playwright stays off the platform.
-  See `docs/SAP_NOTE_DETAIL.md`
+  Under `auth_mode="destination"` the cookie moves into the destination's
+  `URL.headers.Cookie` property and is refreshed there instead. See
+  `docs/SAP_NOTE_DETAIL.md`
 - `agents/registry.py` — `build_orchestrator` dynamically constructs the
   orchestrator + delegation tools + specialists from the DB; `Registry`
   singleton with `reload()` for atomic swaps. Attached skills are listed
@@ -112,6 +166,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   instead of through the orchestrator. Recursion is bounded by
   `AGENT_DELEGATION_MAX_DEPTH` and a re-entry guard. `AgentConfig.model_name`
   overrides the globally active model per agent
+- `agents/deep.py` — opt-in "deep agent" tools per specialist
+  (`AgentConfig.deep_json`, parsed by `DeepConfig`): `write_todos`/
+  `read_todos`, an in-memory per-run scratchpad (`ls`/`read_file`/
+  `write_file`/`edit_file`, capped at 200 files / 256 KB / 4 MB) and a
+  `task` tool that runs an ephemeral sub-agent with the parent's toolsets.
+  State is one `DeepState` per `RunContext.run_id` in a TTL table; a
+  sub-agent gets the parent's state as `deps`, so the two share a plan and
+  scratchpad while a peer reached by delegation does not. `task` is omitted
+  once `depth >= subagent_max_depth`; concurrency is a semaphore per state
+  and depth. `registry.build_orchestrator` appends `deep_instructions` and
+  the `deep_toolset` when the row's config is enabled; sub-agents are never
+  registered as specialists or peers
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
@@ -120,6 +186,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `_finalize`, shutdown cancel). Steps hand plain text to each other; the join
   step sees one `## From` block per branch taken. See
   `docs/superpowers/specs/2026-08-31-agent-workflows-design.md`
+- `agents/step_kinds.py` — the deterministic step kinds a `WorkflowStep.kind`
+  can name besides `agent`: `condition` (first matching rule wins; `stop`
+  ends the main line successfully, skips the rest of a branch for one item,
+  or skips the rest of the join), `transform` (extract_json → regex →
+  template → truncate), `http` (a BTP destination via `agents.destination`,
+  confined relative path) and `python` (admin-authored code in a
+  `python -I -S -E` subprocess started by `agents/_python_step_runner.py`:
+  import allowlist, no `open`, empty environment, temp cwd, RLIMIT_AS/CPU,
+  killed on timeout — a guard against mistakes, not against a hostile
+  admin). Pydantic config models double as the save-time gate
+  (`validate_step_config`, called from `validate_workflow_parts`); the
+  runner calls `execute_step` and hands the output on as `<kind>#<position>`.
+  Templates know `{{text}}`, `{{item.x}}`, `{{json.x}}`, `{{source.NAME}}`
+  and are substituted, never evaluated. Mirrored in the UI by
+  `ui5-admin/webapp/model/stepKinds.ts` and the step editors in both admins
 - `agents/admin.py` — FastAPI `/admin` router: agent + skill + workflow CRUD,
   reload, restart, import/export, seed-on-startup
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
@@ -179,10 +260,18 @@ python app.py
 Local falls back to SQLite if no `DATABASE_URL` is set.
 
 ## Dependencies
-- `pydantic-ai[mcp,web,openai]`, `sap-ai-sdk-gen[all]`, `mcp`, `httpx`,
-  `uvicorn`, `python-dotenv`
+All pinned in `requirements.txt` to the versions the suites last ran on;
+bump a pin, rerun the suites, then deploy.
+- `pydantic-ai[mcp,web,openai,bedrock]`, `sap-ai-sdk-gen[all]`, `mcp`,
+  `httpx`, `uvicorn`, `python-dotenv` (pip warns that the `pydantic-ai`
+  meta package declares none of those extras; the imports work because it
+  pulls them in anyway)
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
-- `sqlalchemy[asyncio]`, `asyncpg` — dynamic agent storage
+- `sqlalchemy[asyncio]`, `asyncpg` (Postgres on CF), `aiosqlite` (the
+  local SQLite fallback) — dynamic agent storage
 - `pyjwt[crypto]` — XSUAA JWT validation
+- Test-only: `pytest`, `pytest-asyncio` (`pytest.ini` sets
+  `asyncio_mode = auto`), `jsdom` via the root `package.json`, `ruff`
+  (`ruff.toml`, advisory in CI)
 - `@ui5/cli`, `ui5-tooling-transpile`, `@sapui5/types`, `karma-ui5`,
   `@playwright/test` — UI5 admin app (dev-only; not in `requirements.txt`)

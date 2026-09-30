@@ -18,10 +18,11 @@ Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
 QUnit.module("Workflow run journey");
 
-// FakeBackend.reset() seeds exactly one workflow run, "wf-run-1", with one
-// pre-fan-out step (step-1), one item that ran a step in the "billing"
+// FakeBackend.reset() seeds two workflow runs. "wf-run-1" is finished, with
+// one pre-fan-out step (step-1), one item that ran a step in the "billing"
 // branch (item-1 / step-2), and one item skip_seen_items skipped before any
-// step ran (item-2, no steps) -- see FakeBackend.ts's reset().
+// step ran (item-2, no steps); "wf-run-2" is still running, with nothing
+// produced yet -- see FakeBackend.ts's reset().
 const RUN_ID = "wf-run-1";
 
 opaTest(
@@ -34,7 +35,7 @@ opaTest(
             viewName: "WorkflowRuns",
             success: function (element: UI5Element) {
                 const table = element as Table;
-                Opa5.assert.strictEqual(table.getItems().length, 1, "the seeded run is listed");
+                Opa5.assert.strictEqual(table.getItems().length, 2, "both seeded runs are listed");
                 const model = table.getModel("workflowRuns") as JSONModel;
                 Opa5.assert.strictEqual(model.getProperty("/items/0/workflow_name"), "triage-inbox", "workflow name is bound");
                 Opa5.assert.strictEqual(model.getProperty("/items/0/status"), "success", "status is bound");

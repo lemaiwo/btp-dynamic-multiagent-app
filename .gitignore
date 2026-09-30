@@ -46,3 +46,13 @@ tests/local/
 # Fetched SAP note payloads and other scratch artifacts. Note content is
 # SAP-licensed material and support-backbone output; it is not ours to commit.
 tmp/
+
+# Hub wiring and operator memory (sapctl) — never commit
+.claude/settings.json
+.claude/settings.local.json
+.mcp.json
+memory/
+CLAUDE.local.md
+
+# Playwright MCP page snapshots and console logs (local browser automation)
+.playwright-mcp/

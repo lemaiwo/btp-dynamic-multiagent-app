@@ -6,14 +6,21 @@ import Fragment from "sap/ui/core/Fragment";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
-import validators from "../model/validators";
+import validators, { validateDeep } from "../model/validators";
+import oauthConfig from "../model/oauthConfig";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
+import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
 import type Dialog from "sap/m/Dialog";
+import type ColumnListItem from "sap/m/ColumnListItem";
 import type Event from "sap/ui/base/Event";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
-import type { AgentInput, AuthMode, CredentialStatus, McpServer } from "../service/types";
+import type {
+    Agent, AgentInput, AuthMode, CredentialStatus, DeepConfig, JobRun, McpServer,
+    WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
+} from "../service/types";
+import { DEEP_DEFAULTS } from "../service/types";
 
 const EMPTY_AGENT: AgentInput = {
     name: "",
@@ -29,7 +36,8 @@ const EMPTY_AGENT: AgentInput = {
     run_prompt: "",
     run_timeout_seconds: 1800,
     peers: [],
-    model_name: ""
+    model_name: "",
+    deep: { ...DEEP_DEFAULTS }
 };
 
 /** One entry of the model `<Select>`: a real model name, or the blank
@@ -52,6 +60,11 @@ export default class AgentDetail extends BaseController {
     /** Index being edited in the server dialog; -1 means "adding a new one". */
     private editingServerIndex = -1;
     private publicBaseUrl = "";
+    /** `canonical()` of `/data` as loaded, for the Refresh button's dirty
+     * check; undefined for a new agent or one that failed to load. */
+    private snapshot?: string;
+    /** Timers armed by Run now to reload the last-runs panel. */
+    private runRefreshTimers: ReturnType<typeof setTimeout>[] = [];
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -60,7 +73,13 @@ export default class AgentDetail extends BaseController {
             availableSkills: [],
             availableAgents: [],
             availableModels: [],
-            errors: {}
+            errors: {},
+            // --- run / refresh / last runs ---
+            isExisting: false,
+            canRun: false,
+            runBusy: false,
+            runs: [],
+            runsCount: runsCountLabel(0)
         }), "agent");
         this.setModel(new JSONModel({}), "server");
 
@@ -70,10 +89,16 @@ export default class AgentDetail extends BaseController {
         });
     }
 
+    public onExit(): void {
+        this.clearRunRefreshTimers();
+    }
+
     private load(id: string): Promise<void> {
         return this.withBusy(async () => {
             const model = this.getModel("agent") as JSONModel;
             model.setProperty("/errors", {});
+            this.clearRunRefreshTimers();
+            this.snapshot = undefined;
 
             // Issued together, not one after another: none of the three reads
             // the others' result, so awaiting them in sequence made opening an
@@ -105,11 +130,16 @@ export default class AgentDetail extends BaseController {
 
             if (id === "new") {
                 this.agentId = undefined;
+                model.setProperty("/isExisting", false);
+                model.setProperty("/canRun", false);
+                model.setProperty("/runs", []);
+                model.setProperty("/runsCount", runsCountLabel(0));
                 model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
                 model.setProperty("/title", this.text("newAgent"));
                 // Otherwise a credential table left over from whichever agent was
                 // open before navigating here would still be showing.
                 model.setProperty("/credentials", []);
+                model.setProperty("/whereUsed", null); // nothing can refer to it yet
                 // A new agent has no name yet, so it excludes nothing from its
                 // own peer list — every existing agent is offered.
                 model.setProperty("/availableAgents", agents ?? []);
@@ -118,9 +148,12 @@ export default class AgentDetail extends BaseController {
             }
 
             this.agentId = Number(id);
+            model.setProperty("/isExisting", true);
             // Also independent of each other, so also issued together. The
             // base URL is only read further down, and fetching it for an agent
-            // that turns out not to exist costs nothing.
+            // that turns out not to exist costs nothing. The last runs load
+            // alongside; loadRuns() reports its own failure with a toast and
+            // leaves the panel empty, so it can never take the form with it.
             const [agent, config] = await Promise.all([
                 this.run(
                     this.getAdminService().getAgent(this.agentId),
@@ -129,9 +162,11 @@ export default class AgentDetail extends BaseController {
                 this.run(
                     this.getAdminService().getConfig(),
                     "Could not read the public base URL."
-                )
+                ),
+                this.loadRuns()
             ]);
             if (!agent) {
+                model.setProperty("/canRun", false);
                 return;
             }
             // Copy only the input fields; id/created_at/updated_at and the legacy
@@ -150,9 +185,14 @@ export default class AgentDetail extends BaseController {
                 run_prompt: agent.run_prompt ?? "",
                 run_timeout_seconds: agent.run_timeout_seconds ?? 1800,
                 peers: agent.peers ?? [],
-                model_name: agent.model_name ?? ""
+                model_name: agent.model_name ?? "",
+                // --- deep agents --- always resent so the panel can clear a
+                // stored config; an older backend without the field gets defaults.
+                deep: { ...DEEP_DEFAULTS, ...(agent.deep ?? {}) } as DeepConfig
             } as AgentInput);
             model.setProperty("/title", agent.name);
+            this.snapshot = canonical(model.getProperty("/data"));
+            model.setProperty("/canRun", AgentDetail.isRunnable(agent));
             // An agent must never be offered itself as a peer.
             model.setProperty("/availableAgents", (agents ?? []).filter((a) => a.name !== agent.name));
             model.setProperty(
@@ -162,6 +202,7 @@ export default class AgentDetail extends BaseController {
 
             this.publicBaseUrl = config?.public_base_url ?? "";
             void this.loadCredentials();
+            void this.loadWhereUsed();
         });
     }
 
@@ -203,7 +244,7 @@ export default class AgentDetail extends BaseController {
         (this.getModel("server") as JSONModel).setData({
             url: server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", team: "", channels: "" },
+            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false },
             // "mcp" for a remote server, otherwise the built-in's url.
             kind: findBuiltin(server.url)?.url ?? "mcp",
             kinds: [{ key: "mcp", text: this.text("toolsetRemoteMcp") }].concat(
@@ -214,11 +255,9 @@ export default class AgentDetail extends BaseController {
             // Secrets are redacted by the server, so a blank field means
             // "keep the stored secret" — say so instead of looking empty.
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
-            // App-only tokens carry no per-scope request: providers want the
-            // ".default" form, and asking for individual scopes is rejected.
-            scopeHint: server.auth_mode === "app_only"
-                ? "https://graph.microsoft.com/.default"
-                : "",
+            // The mail theme is edited as JSON text; cleanOAuth gets the parsed object.
+            themeJson: oauthConfig.formatMailTheme((server.oauth as { theme?: unknown } | undefined)?.theme),
+            scopeHint: "",
             errors: {}
         });
 
@@ -279,10 +318,28 @@ export default class AgentDetail extends BaseController {
         if (modes.indexOf(current) === -1) {
             serverModel.setProperty("/auth_mode", builtin?.defaultAuthMode ?? modes[0]);
         }
+        // Picking a built-in may have changed the mode above or in
+        // onServerKindChange; the placeholder has to follow either way.
+        this.syncScopeHint();
     }
 
     public onAuthModeChange(): void {
         (this.getModel("server") as JSONModel).setProperty("/errors", {});
+        this.syncScopeHint();
+    }
+
+    /**
+     * The scope placeholder follows the auth mode, so it is recomputed
+     * whenever the mode changes rather than once when the dialog opens.
+     * App-only tokens carry no per-scope request: providers want the
+     * ".default" form, and asking for individual scopes is rejected.
+     */
+    private syncScopeHint(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const mode = serverModel.getProperty("/auth_mode") as AuthMode;
+        serverModel.setProperty(
+            "/scopeHint", mode === "app_only" ? "https://graph.microsoft.com/.default" : ""
+        );
     }
 
     public onCancelServer(): void {
@@ -293,7 +350,22 @@ export default class AgentDetail extends BaseController {
         const serverModel = this.getModel("server") as JSONModel;
         const url = (serverModel.getProperty("/url") as string).trim();
         const authMode = serverModel.getProperty("/auth_mode") as McpServer["auth_mode"];
-        const oauthRaw = serverModel.getProperty("/oauth") as Record<string, unknown>;
+        const oauthRaw = Object.assign(
+            {}, serverModel.getProperty("/oauth") as Record<string, unknown>
+        );
+        delete oauthRaw.theme;
+        if (oauthConfig.supportsMailTheme(url)) {
+            const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);
+            if (parsedTheme.error) {
+                serverModel.setProperty("/errors", {
+                    theme: parsedTheme.error, themeState: ValueState.Error
+                });
+                return;
+            }
+            if (parsedTheme.theme) {
+                oauthRaw.theme = parsedTheme.theme;
+            }
+        }
 
         const urlError = validators.validateServerUrl(url, authMode);
         if (urlError) {
@@ -309,7 +381,7 @@ export default class AgentDetail extends BaseController {
         const carriesOAuth = authMode === "oauth2" || authMode === "app_only"
             || authMode === "destination" || publicBuiltin;
         const oauth = carriesOAuth
-            ? AgentDetail.cleanOAuth(oauthRaw, authMode, url)
+            ? oauthConfig.cleanOAuth(oauthRaw, authMode, url)
             : undefined;
         const oauthError = validators.validateOAuth(oauth, authMode, url);
         if (oauthError) {
@@ -344,78 +416,6 @@ export default class AgentDetail extends BaseController {
         this.serverDialog?.close();
     }
 
-    /** Drops blank fields so the server sees the same shape `to_config()` builds. */
-    private static cleanOAuth(
-        raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
-    ): McpServer["oauth"] {
-        if (authMode === "none") {
-            // Whitelisted, not "everything that isn't blank": this block goes
-            // to a server with no credential in it, and it must stay that way
-            // even if the dialog model still holds fields from another mode.
-            const out: Record<string, unknown> = {};
-            validators.BUILTIN_PUBLIC_KEYS.forEach((key) => {
-                const value = String(raw[key] ?? "").trim();
-                if (value) {
-                    out[key] = value;
-                }
-            });
-            return (Object.keys(out).length ? out : undefined) as McpServer["oauth"];
-        }
-        if (authMode === "destination" && findBuiltin(url)?.url === "builtin:slack") {
-            // Slack keeps a channel pin and a posting switch instead of
-            // Jira's filters. Only ever sent as `true`, as for app-only.
-            const slack: Record<string, unknown> = {
-                destination: String(raw.destination ?? "").trim(),
-                channels: String(raw.channels ?? "").trim(),
-                lookback: String(raw.lookback ?? "").trim()
-            };
-            if (raw.allow_send === true) {
-                slack.allow_send = true;
-            }
-            return slack as McpServer["oauth"];
-        }
-        if (authMode === "destination") {
-            return {
-                destination: String(raw.destination ?? "").trim(),
-                project: String(raw.project ?? "").trim(),
-                status: String(raw.status ?? "").trim(),
-                lookback: String(raw.lookback ?? "").trim(),
-                api_base: String(raw.api_base ?? "").trim(),
-                labels: String(raw.labels ?? "").trim(),
-                allow_comment: raw.allow_comment === true
-            } as McpServer["oauth"];
-        }
-        const appOnly = authMode === "app_only";
-        // DCR is meaningless app-only: a client registered on the fly holds no
-        // admin-consented application permissions, so its tokens reach nothing.
-        if (!appOnly && raw.dcr === true) {
-            const scope = String(raw.scope ?? "").trim();
-            return scope ? { dcr: true, scope } : { dcr: true };
-        }
-        // builtin:teams pins its team and channels on either mode, and keeps
-        // its window and send switch on oauth2 too -- see agents/teams_tools.py.
-        const teams = validators.isTeams(url);
-        const out: Record<string, unknown> = { client_id: String(raw.client_id ?? "").trim() };
-        const keys = appOnly
-            ? ["client_secret", "uaa_url", "token_url", "scope", "mailbox", "lookback",
-                "recipients", "team", "channels"]
-            : ["client_secret", "uaa_url", "authorize_url", "token_url", "scope"]
-                .concat(teams ? ["team", "channels", "lookback"] : []);
-        keys.forEach((key) => {
-            const value = String(raw[key] ?? "").trim();
-            if (value) {
-                out[key] = value;
-            }
-        });
-        // Only ever sent as `true`. Omitting it when off keeps the stored
-        // config identical to what a config file would carry, so an exported
-        // agent does not gain a field it never asked for.
-        if ((appOnly || teams) && raw.allow_send === true) {
-            out.allow_send = true;
-        }
-        return out as McpServer["oauth"];
-    }
-
     public onRemoveServer(event: Event): void {
         const context = (event.getSource() as Control).getBindingContext("agent");
         const path = context?.getPath() ?? "";
@@ -439,6 +439,18 @@ export default class AgentDetail extends BaseController {
             const first = serverErrors[Number(keys[0])];
             model.setProperty("/errors/servers", first);
             MessageBox.error(first);
+            return;
+        }
+
+        // --- deep agents --- range errors land on their StepInput.
+        const deepErrors = validateDeep(data.deep);
+        const deepKeys = Object.keys(deepErrors);
+        if (deepKeys.length > 0) {
+            deepKeys.forEach((field) => {
+                model.setProperty(`/errors/deep_${field}`, deepErrors[field]);
+                model.setProperty(`/errors/deep_${field}State`, ValueState.Error);
+            });
+            MessageBox.error(deepErrors[deepKeys[0]]);
             return;
         }
 
@@ -543,6 +555,192 @@ export default class AgentDetail extends BaseController {
             return;
         }
         window.open(this.publicBaseUrl + status.login_url, "_blank", "noopener");
+    }
+
+    // --- where used ---
+
+    /**
+     * Fills `/whereUsed` for the agent being edited: the two lists plus the
+     * three flags the panel's visibility bindings read (`hasWorkflows`,
+     * `hasPeers`, `empty`), computed here so the view never takes `.length`
+     * of a list that is not loaded yet. Cleared first, so a panel left over
+     * from the agent opened before never shows against this one.
+     */
+    public async loadWhereUsed(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        model.setProperty("/whereUsed", null);
+        if (this.agentId === undefined) {
+            return;
+        }
+        const id = this.agentId;
+        const result = await this.run(
+            this.getAdminService().getAgentWhereUsed(id),
+            this.text("whereUsedLoadFailed")
+        );
+        // Another agent may have been opened while this was in flight.
+        if (!result || this.agentId !== id) {
+            return;
+        }
+        model.setProperty("/whereUsed", {
+            workflows: result.workflows,
+            peers: result.peers,
+            hasWorkflows: result.workflows.length > 0,
+            hasPeers: result.peers.length > 0,
+            empty: result.workflows.length === 0 && result.peers.length === 0
+        });
+    }
+
+    /** "Steps: main #1, support #2" -- one entry per step of that workflow
+     * that runs this agent, positioned within its group as everywhere else. */
+    public whereUsedSteps(steps: WhereUsedStep[] | undefined): string {
+        const parts = (steps ?? []).map(
+            (s) => `${s.branch_key ?? this.text("whereUsedMainLine")} #${s.position}`
+        );
+        return parts.length ? this.text("whereUsedSteps", [parts.join(", ")]) : "";
+    }
+
+    public onOpenWhereUsedWorkflow(event: Event): void {
+        const workflow = (event.getSource() as Control)
+            .getBindingContext("agent")?.getObject() as WhereUsedWorkflow | undefined;
+        if (workflow) {
+            this.getRouter().navTo("workflowDetail", { workflowId: String(workflow.id) });
+        }
+    }
+
+    public onOpenWhereUsedPeer(event: Event): void {
+        const peer = (event.getSource() as Control)
+            .getBindingContext("agent")?.getObject() as WhereUsedPeer | undefined;
+        if (peer) {
+            this.getRouter().navTo("agentDetail", { agentId: String(peer.id) });
+        }
+    }
+
+    // --- run now / refresh / last runs ---
+
+    /** The list page shows its Run now button only for an agent exposed as a
+     * job API; the same rule, on the saved state, enables this page's. */
+    private static isRunnable(agent: Agent): boolean {
+        return !!agent.expose_api;
+    }
+
+    /**
+     * The newest runs of this agent, for the panel. Never throws and never
+     * goes through ErrorHandler's dialog: a failure here shows one toast and
+     * an empty panel, because it must not break opening the agent.
+     */
+    public async loadRuns(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        const id = this.agentId;
+        if (id === undefined) {
+            model.setProperty("/runs", []);
+            model.setProperty("/runsCount", runsCountLabel(0));
+            return;
+        }
+        let runs: JobRun[] = [];
+        try {
+            runs = await this.getAdminService().listRuns({ agentId: id, limit: LAST_RUNS_LIMIT });
+        } catch {
+            MessageToast.show(this.text("lastRunsLoadFailed"));
+        }
+        // Another agent may have been opened while this was in flight.
+        if (this.agentId !== id) {
+            return;
+        }
+        model.setProperty("/runs", runs);
+        model.setProperty("/runsCount", runsCountLabel(runs.length, LAST_RUNS_LIMIT));
+    }
+
+    public onRefreshRuns(): void {
+        void this.loadRuns();
+    }
+
+    public onOpenRun(event: Event): void {
+        const run = (event.getSource() as ColumnListItem)
+            .getBindingContext("agent")?.getObject() as JobRun | undefined;
+        if (run) {
+            this.getRouter().navTo("runDetail", { runId: run.id });
+        }
+    }
+
+    /**
+     * Starts a run, the way the list page does (same toast, same error
+     * handling), then reloads the panel shortly after so the run shows up
+     * as running, and once more so a short run shows its outcome. Unlike
+     * the list page it stays here rather than opening the run: the panel is
+     * the point of this page.
+     */
+    public async onRunNow(): Promise<void> {
+        const model = this.getModel("agent") as JSONModel;
+        const id = this.agentId;
+        if (id === undefined || model.getProperty("/runBusy")) {
+            return;
+        }
+        const name = model.getProperty("/title") as string;
+        model.setProperty("/runBusy", true);
+        try {
+            const started = await this.run(
+                this.getAdminService().runNow(id),
+                `Could not start a run for "${name}".`
+            );
+            if (!started) {
+                return;
+            }
+            MessageToast.show(this.text("runStarted").replace("{0}", started.run_id));
+            this.clearRunRefreshTimers();
+            RUN_REFRESH_DELAYS_MS.forEach((delay) => {
+                this.runRefreshTimers.push(setTimeout(() => {
+                    if (this.agentId === id) {
+                        void this.loadRuns();
+                    }
+                }, delay));
+            });
+        } finally {
+            model.setProperty("/runBusy", false);
+        }
+    }
+
+    private clearRunRefreshTimers(): void {
+        this.runRefreshTimers.forEach((t) => clearTimeout(t));
+        this.runRefreshTimers = [];
+    }
+
+    /** Whether the form differs from what was loaded. */
+    private isDirty(): boolean {
+        return isDirty(this.snapshot, (this.getModel("agent") as JSONModel).getProperty("/data"));
+    }
+
+    /**
+     * Reloads the agent from the server: the form, the credential status,
+     * where-used and the last runs. Unsaved edits are lost, so it asks first
+     * when there are any.
+     */
+    public onRefresh(): void {
+        if (this.agentId === undefined) {
+            return;
+        }
+        if (!this.isDirty()) {
+            void this.reload();
+            return;
+        }
+        MessageBox.confirm(this.text("refreshDiscardConfirm"), {
+            title: this.text("refresh"),
+            emphasizedAction: MessageBox.Action.OK,
+            onClose: (action: string) => {
+                if (action === MessageBox.Action.OK) {
+                    void this.reload();
+                }
+            }
+        });
+    }
+
+    private async reload(): Promise<void> {
+        if (this.agentId === undefined) {
+            return;
+        }
+        await this.load(String(this.agentId));
+        if (this.snapshot !== undefined) {
+            MessageToast.show(this.text("reloadedFromServer"));
+        }
     }
 
     // text(key) is inherited from BaseController — do not redeclare it.

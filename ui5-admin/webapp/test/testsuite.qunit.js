@@ -15,9 +15,15 @@ sap.ui.define(function () {
             "unit/formatter": { title: "Unit: formatter" },
             "unit/validators": { title: "Unit: validators" },
             "unit/builtins": { title: "Unit: builtins catalog" },
+            "unit/oauthConfig": { title: "Unit: oauthConfig" },
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },
             "unit/workflowOrder": { title: "Unit: workflowOrder" },
+            "unit/stepKinds": { title: "Unit: stepKinds" },
+            "unit/textStats": { title: "Unit: textStats" },
+            "unit/runsPanel": { title: "Unit: runsPanel" },
+            "unit/autoRefresh": { title: "Unit: autoRefresh" },
+            "unit/NullableKey": { title: "Unit: NullableKey binding type" },
             "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }
     };

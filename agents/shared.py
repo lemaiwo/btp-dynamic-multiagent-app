@@ -201,6 +201,13 @@ async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
             f"this reason, and continue with the other sources."
         )
     except Exception as e:  # noqa: BLE001 — a broken server must not end the run
+        # A sign-in requirement is not a broken server: the delegation tool
+        # in the registry turns it into a sign-in link (or a wait for the
+        # user), so it must propagate rather than be reported as a failure.
+        from agents.oauth2 import OAuthAuthorizationRequired
+
+        if isinstance(e, OAuthAuthorizationRequired):
+            raise
         logger.warning("MCP tool %s failed: %s", name, e, exc_info=True)
         return (
             f"Tool {name!r} failed: {type(e).__name__}: {e} "

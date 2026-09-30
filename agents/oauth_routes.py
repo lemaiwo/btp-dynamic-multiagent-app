@@ -11,6 +11,7 @@ catch-all). On Cloud Foundry it is reached through the approuter, so the
 
 from __future__ import annotations
 
+import html
 import logging
 
 from fastapi import APIRouter, Request
@@ -25,6 +26,12 @@ router = APIRouter(tags=["oauth"])
 
 
 def _page(title: str, body: str, *, ok: bool, auto_close: bool = False) -> HTMLResponse:
+    # Both strings can carry attacker-influenced text (error_description from
+    # the authorization server, the agent name from the query string, token
+    # endpoint responses via ValueError), and this page is served on the
+    # approuter origin with the session cookie. Escape before interpolating.
+    title = html.escape(title, quote=True)
+    body = html.escape(body, quote=True)
     color = "#2e7d32" if ok else "#c62828"
     # When opened as a popup from the chat, close shortly after success — the
     # chat detects the new token and continues on its own.
@@ -34,7 +41,7 @@ def _page(title: str, body: str, *, ok: bool, auto_close: bool = False) -> HTMLR
         if auto_close
         else ""
     )
-    html = f"""<!doctype html>
+    markup = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title}</title>
@@ -51,7 +58,7 @@ def _page(title: str, body: str, *, ok: bool, auto_close: bool = False) -> HTMLR
 </style></head>
 <body><div class="card"><h1>{title}</h1><p>{body}</p>
 <a href="/">Return to chat</a></div>{close_script}</body></html>"""
-    return HTMLResponse(html, status_code=200 if ok else 400)
+    return HTMLResponse(markup, status_code=200 if ok else 400)
 
 
 @router.get("/oauth/login")

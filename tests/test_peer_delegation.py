@@ -289,6 +289,8 @@ async def main() -> None:
     # endpoints to rule that out here.
     await test_export_import_via_http()
 
+    await check_deep_registry_wiring()
+
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
     sys.exit(1 if FAILED else 0)
 
@@ -411,6 +413,101 @@ async def test_export_import_via_http() -> None:
             lifespan_task.cancel()
     finally:
         registry_module.get_model = real_get_model
+
+
+# --- deep agents ---------------------------------------------------------------
+def user_toolsets(agent) -> list:
+    """The toolsets passed to ``Agent(toolsets=...)``. Private, like
+    ``_function_toolset`` above, and for the same reason."""
+    return list(getattr(agent, "_user_toolsets", ()) or ())
+
+
+async def check_deep_registry_wiring() -> None:
+    """The registry attaches the deep toolset and prompt section only to
+    agents whose deep config is enabled, hands the sub-agents the agent's own
+    servers, and never exposes a sub-agent as a specialist or peer."""
+    from pydantic_ai.toolsets import FunctionToolset
+
+    from agents.deep import DeepConfig, dump_deep_config
+
+    print("\n== deep agents: registry wiring ==")
+    async with SessionLocal() as s:
+        await upsert_agent(
+            s, name="deep-on", description="deep specialist", instructions="dig",
+            mcp_servers=servers("deepon"),
+            deep_json=dump_deep_config(DeepConfig(
+                enabled=True, subagents=True, max_subagents=2, subagent_max_depth=1,
+            )),
+        )
+        await upsert_agent(
+            s, name="deep-off", description="plain specialist", instructions="plain",
+            mcp_servers=servers("deepoff"),
+            deep_json=dump_deep_config(DeepConfig(enabled=False)),
+        )
+        await upsert_agent(
+            s, name="deep-noplan", description="scratchpad only", instructions="sp",
+            mcp_servers=servers("deepnoplan"),
+            deep_json=dump_deep_config(DeepConfig(
+                enabled=True, planning=False, subagents=False,
+            )),
+        )
+        row = await get_agent_by_name(s, "deep-on")
+        check("deep config stored and parsed", row.deep.enabled and row.deep.max_subagents == 2,
+              str(row.deep))
+        check("to_dict carries deep", row.to_dict()["deep"]["max_subagents"] == 2)
+        check("to_export carries deep", row.to_export()["deep"]["enabled"] is True)
+        off = await get_agent_by_name(s, "deep-off")
+        check("defaults store as a null column", off.deep_json is None)
+        check("null column reads as disabled defaults", off.deep == DeepConfig())
+
+    build = await build_with_test_model()
+
+    def deep_tools(agent) -> set[str]:
+        names: set[str] = set()
+        for ts in user_toolsets(agent):
+            if isinstance(ts, FunctionToolset):
+                names |= set(ts.tools)
+        return names
+
+    on = build.specialists["deep-on"]
+    check("enabled agent gets the deep tools",
+          {"write_todos", "read_todos", "ls", "read_file", "write_file",
+           "edit_file", "task"} <= deep_tools(on), str(deep_tools(on)))
+    check("enabled agent keeps its MCP server toolset",
+          any(not isinstance(ts, FunctionToolset) for ts in user_toolsets(on)))
+    # Agent keeps its instructions as a list of strings/callables.
+    def prompt_text(agent) -> str:
+        return "\n".join(str(i) for i in (agent._instructions or []))
+
+    check("enabled agent's prompt explains the working method",
+          "## Working method (deep agent)" in prompt_text(on))
+
+    off = build.specialists["deep-off"]
+    check("disabled agent gets no deep tools", deep_tools(off) == set(), str(deep_tools(off)))
+    check("disabled agent's prompt is untouched", prompt_text(off) == "plain")
+
+    noplan = build.specialists["deep-noplan"]
+    check("switches are honoured per group",
+          deep_tools(noplan) == {"ls", "read_file", "write_file", "edit_file"},
+          str(deep_tools(noplan)))
+
+    check("sub-agents are not specialists",
+          not any("sub-agent" in name for name in build.specialists))
+    check("sub-agents are not orchestrator tools",
+          not any("sub" in name for name in tool_names(build.orchestrator)
+                  if name not in ("delegate_deep_on", "delegate_deep_off",
+                                  "delegate_deep_noplan")),
+          str(tool_names(build.orchestrator)))
+    check("deep tools are not registered on the orchestrator",
+          "task" not in tool_names(build.orchestrator)
+          and "write_todos" not in tool_names(build.orchestrator))
+
+    async with SessionLocal() as s:
+        for name in ("deep-on", "deep-off", "deep-noplan"):
+            row = await get_agent_by_name(s, name)
+            if row is not None:
+                await s.delete(row)
+        await s.commit()
 
 
 if __name__ == "__main__":

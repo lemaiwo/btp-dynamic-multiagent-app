@@ -207,7 +207,7 @@ DESTINATION_UAA_URL=<url>
 | Look back | e.g. `2d`. The furthest back the agent may read. It can ask for less, never more. Blank means no limit. |
 | Sending | Off: the agent can only read. On: the agent can also post and reply as the bot. Needs `chat:write`. |
 
-4. Click **OK**, then **Save**. Saving rebuilds the agents, and the new tools are live on the next chat.
+4. Click **OK**, then **Save**. Saving only stores the configuration; press **Reload** (Settings → Reload, or `POST /admin/api/reload`) to rebuild the agents. The new tools are live on the next chat after that.
 
 Recommendations:
 

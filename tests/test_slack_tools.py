@@ -146,6 +146,26 @@ def test_ok_false_raises_and_auth_errors_retry_once():
         run(client._call("nope.method"))
 
 
+def test_rate_limit_is_retried_once_then_raised():
+    slack = Slack()
+    remaining = {"n": 1}
+    real = slack.handler
+
+    def throttled(request: httpx.Request) -> httpx.Response:
+        if remaining["n"]:
+            remaining["n"] -= 1
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return real(request)
+
+    client = SlackClient(Resolver(), httpx.AsyncClient(transport=httpx.MockTransport(throttled)))
+    assert [c["name"] for c in run(client.list_channels())] == ["general", "support"]
+
+    always = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda r: httpx.Response(429, headers={"Retry-After": "0"})))
+    with pytest.raises(SlackError, match="rate limited"):
+        run(SlackClient(Resolver(), always).list_channels())
+
+
 def test_posted_text_cannot_mention_anyone():
     assert _escape("hi <!channel> & <@U1>") == "hi &lt;!channel&gt; &amp; &lt;@U1&gt;"
     slack = Slack()
