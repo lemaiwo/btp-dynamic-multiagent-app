@@ -33,11 +33,14 @@ jobs:
       - name: pytest
         # asyncio_mode=auto and testpaths come from pytest.ini.
         run: pytest -q -p no:cacheprovider
+      # Before the admin test: its editor, run-detail and destination checks
+      # drive templates/admin.html on jsdom too, not only the report tests.
+      - name: Install Node dependencies (jsdom)
+        run: npm ci
       - name: Admin template contract test
         run: python tests/test_admin_ui.py
       - name: Report rendering tests (jsdom)
         run: |
-          npm ci
           node tests/test_report_render.mjs
           node tests/test_report_sanitize.mjs
       # The chat UI Playwright scripts (tests/test_chat_*_ui.py) are not run
