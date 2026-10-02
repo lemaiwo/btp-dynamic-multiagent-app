@@ -93,3 +93,28 @@ QUnit.test("prefers the summary, falls back to the error, never shows null", fun
     assert.strictEqual(formatter.runSummary(null, null), "", "nothing at all renders empty, not 'null'");
     assert.strictEqual(formatter.runSummary(undefined, undefined), "", "same for undefined");
 });
+
+QUnit.module("formatter: a job run's activity and plan");
+
+QUnit.test("an activity entry's status maps to a ValueState", function (assert) {
+    assert.strictEqual(formatter.activityState("running"), "Information");
+    assert.strictEqual(formatter.activityState("ok"), "Success");
+    assert.strictEqual(formatter.activityState("error"), "Error");
+    assert.strictEqual(formatter.activityState(undefined), "None", "a note has no status");
+});
+
+QUnit.test("a plan item's status maps to a ValueState", function (assert) {
+    assert.strictEqual(formatter.todoState("completed"), "Success");
+    assert.strictEqual(formatter.todoState("in_progress"), "Information");
+    assert.strictEqual(formatter.todoState("pending"), "None");
+    assert.strictEqual(formatter.todoState("bogus"), "None");
+});
+
+QUnit.test("an activity time shows the time of day, never 'null'", function (assert) {
+    assert.strictEqual(formatter.timeOfDay(null), "—");
+    assert.strictEqual(formatter.timeOfDay("not a date"), "—");
+    assert.strictEqual(
+        formatter.timeOfDay("2026-10-01T21:11:35+00:00"),
+        new Date("2026-10-01T21:11:35+00:00").toLocaleTimeString()
+    );
+});

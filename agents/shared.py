@@ -168,6 +168,20 @@ class JWTForwardAuth(httpx.Auth):
 # attempt to self-correct an invalid query.
 MCP_TOOL_RETRIES = int(os.environ.get("AGENT_TOOL_RETRIES", "3"))
 
+# Model requests one agent run may make. pydantic-ai's own default is 50,
+# which a deep agent spends before it finishes: its sub-agents run on the
+# parent's usage (deep.py passes usage=ctx.usage), so every request they make
+# counts against the same budget. Every run site passes run_usage_limits()
+# so the ceiling is one setting rather than a default buried in the library.
+AGENT_REQUEST_LIMIT = int(os.environ.get("AGENT_REQUEST_LIMIT", "200"))
+
+
+def run_usage_limits():
+    """The UsageLimits every agent run in this app is started with."""
+    from pydantic_ai.usage import UsageLimits
+
+    return UsageLimits(request_limit=AGENT_REQUEST_LIMIT)
+
 
 async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
     """Keep one failing MCP tool from killing the whole agent run.

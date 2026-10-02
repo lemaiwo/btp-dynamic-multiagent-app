@@ -28,7 +28,12 @@ from agents.db import (
     list_skills,
 )
 from agents.builtins import build_builtin_toolset, is_builtin_url
-from agents.shared import create_mcp_server, default_model_name, get_model
+from agents.shared import (
+    create_mcp_server,
+    default_model_name,
+    get_model,
+    run_usage_limits,
+)
 # --- deep agents ---
 from agents.deep import deep_instructions, deep_toolset
 
@@ -690,7 +695,7 @@ def _attach_delegation_tool(
         from agents.auth import current_principal
         from agents.oauth2 import find_oauth_required, has_usable_token
         from agents.progress import (
-            current_progress,
+            is_interactive,
             report_delegation_end,
             report_delegation_start,
         )
@@ -721,7 +726,7 @@ def _attach_delegation_tool(
             # just to find out. Interactive runs only (A2A/no sink falls through
             # to the run, which raises and returns the static link).
             user_id = current_principal.get()
-            if user_id and current_progress.get() is not None:
+            if user_id and is_interactive():
                 for server_key in _oauth2_server_keys(row):
                     try:
                         # A refreshable token still works without an interactive
@@ -756,6 +761,7 @@ def _attach_delegation_tool(
                         specialist.run(
                             query,
                             usage=ctx.usage,
+                            usage_limits=run_usage_limits(),
                             event_stream_handler=_make_progress_handler(row.name),
                         ),
                         timeout=_SPECIALIST_TIMEOUT,
@@ -787,7 +793,7 @@ def _attach_delegation_tool(
                     # link to, so return the sign-in link immediately instead of
                     # holding the request polling for a sign-in that can't happen.
                     user_id = current_principal.get()
-                    interactive = current_progress.get() is not None
+                    interactive = is_interactive()
                     if not (
                         user_id
                         and interactive

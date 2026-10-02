@@ -59,6 +59,63 @@
                     showIcon="true"
                     class="sapUiSmallMarginTop" />
 
+                <Title
+                    text="{i18n>plan}"
+                    level="H3"
+                    visible="{= ${run>/plan}.length > 0 }"
+                    class="sapUiSmallMarginTop" />
+                <List id="runPlanList" items="{run>/plan}" visible="{= ${run>/plan}.length > 0 }">
+                    <CustomListItem>
+                        <HBox alignItems="Center" class="sapUiTinyMargin">
+                            <ObjectStatus
+                                text="{run>status}"
+                                state="{ path: 'run>status', formatter: '.formatter.todoState' }"
+                                class="sapUiSmallMarginEnd" />
+                            <Text text="{run>content}" />
+                        </HBox>
+                    </CustomListItem>
+                </List>
+
+                <Title text="{i18n>activity}" level="H3" class="sapUiSmallMarginTop" />
+                <List
+                    id="runActivityList"
+                    items="{run>/events}"
+                    noDataText="{i18n>noActivity}"
+                    growing="true"
+                    growingThreshold="50">
+                    <CustomListItem>
+                        <VBox class="sapUiTinyMargin">
+                            <HBox alignItems="Center">
+                                <Text
+                                    text="{ path: 'run>ts', formatter: '.formatter.timeOfDay' }"
+                                    class="sapUiSmallMarginEnd" />
+                                <ObjectStatus
+                                    text="{run>status}"
+                                    state="{ path: 'run>status', formatter: '.formatter.activityState' }"
+                                    visible="{= ${run>kind} === 'tool' }"
+                                    class="sapUiSmallMarginEnd" />
+                                <Text
+                                    text="{= ${run>kind} === 'tool' ? ${run>tool} : ${run>detail} }"
+                                    class="sapUiSmallMarginEnd" />
+                                <Text text="{run>agent}" />
+                            </HBox>
+                            <Text
+                                text="{run>detail}"
+                                visible="{= ${run>kind} === 'tool' &amp;&amp; !!${run>detail} }"
+                                class="sapUiTinyMarginTop" />
+                            <Text
+                                text="{run>output}"
+                                visible="{= !!${run>output} }"
+                                maxLines="3"
+                                class="sapUiTinyMarginTop" />
+                        </VBox>
+                    </CustomListItem>
+                </List>
+                <Text
+                    id="runActivityDropped"
+                    text="{run>/droppedText}"
+                    visible="{= !!${run>/droppedText} }" />
+
                 <Title text="{i18n>report}" level="H3" class="sapUiSmallMarginTop" />
                 <core:HTML id="reportHtml" content="{run>/reportHtml}" sanitizeContent="false" />
                 <Text

@@ -224,11 +224,39 @@ export interface JobRun {
     created_by: string | null;
 }
 
+/** One step of what a job run did; mirrors `agents/run_activity.py`.
+ * `kind` is `tool` for a tool call, otherwise a free-text phase note. */
+export interface RunActivityEvent {
+    ts: string;
+    agent: string;
+    kind: "tool" | "note" | "message" | "delegation_start";
+    tool?: string;
+    detail?: string;
+    status?: "running" | "ok" | "error";
+    output?: string;
+}
+
+/** A deep agent's plan as its last `write_todos` call left it. */
+export interface RunPlanItem {
+    content: string;
+    status: "pending" | "in_progress" | "completed";
+}
+
+export interface RunActivity {
+    events: RunActivityEvent[];
+    plan: RunPlanItem[];
+    /** Oldest events dropped to keep the list bounded. */
+    dropped: number;
+}
+
 /** GET /admin/api/runs/{id} adds the report body to the list shape. */
 export interface JobRunDetail extends JobRun {
     /** Inner fields stay optional: runs predating markdown reports have no
      * body_md (see api_get_run_markdown's 404 path). */
     report?: { body_md?: string; summary?: string } | null;
+    /** Live while the run is running, stored once it ends; null for runs
+     * recorded before activity existed. */
+    activity?: RunActivity | null;
 }
 
 /** Per-MCP-server credential status for a principal. */

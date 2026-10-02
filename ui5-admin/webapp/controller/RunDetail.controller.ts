@@ -28,6 +28,7 @@ export default class RunDetail extends BaseController {
     public onInit(): void {
         this.setModel(new JSONModel({
             data: {}, reportHtml: "", hasReport: false,
+            events: [], plan: [], droppedText: "",
             auto: { enabled: true, status: "" }
         }), "run");
         this.getRouter().getRoute("runDetail")?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
@@ -57,6 +58,9 @@ export default class RunDetail extends BaseController {
         return this.withBusy(async () => {
             const model = this.getModel("run") as JSONModel;
             model.setProperty("/data", {});
+            model.setProperty("/events", []);
+            model.setProperty("/plan", []);
+            model.setProperty("/droppedText", "");
             model.setProperty("/reportHtml", "");
             model.setProperty("/hasReport", false);
 
@@ -77,6 +81,12 @@ export default class RunDetail extends BaseController {
     private async apply(run: JobRunDetail): Promise<void> {
         const model = this.getModel("run") as JSONModel;
         model.setProperty("/data", run);
+        // Newest first: while a run is live, what it is doing now is the
+        // part worth reading, and it should not take scrolling to reach.
+        model.setProperty("/events", [...(run.activity?.events ?? [])].reverse());
+        model.setProperty("/plan", run.activity?.plan ?? []);
+        const dropped = run.activity?.dropped ?? 0;
+        model.setProperty("/droppedText", dropped > 0 ? this.text("activityDropped", [dropped]) : "");
         this.lastRefreshed = clockText(new Date());
         this.updateStatusLine();
 

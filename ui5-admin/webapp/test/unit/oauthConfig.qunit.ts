@@ -122,7 +122,7 @@ QUnit.test("agrees with where the dialog shows the switch", function (assert) {
         ["builtin:teams", "app_only", false],
         ["builtin:slack", "destination", true],
         ["builtin:jira", "destination", false],
-        ["builtin:gmail", "oauth2", false],
+        ["builtin:gmail", "oauth2", true],
         ["https://mcp.example.hana.ondemand.com/mcp", "oauth2", false],
         ["https://mcp.example.hana.ondemand.com/mcp", "app_only", true]
     ];

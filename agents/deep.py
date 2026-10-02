@@ -42,6 +42,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
+from agents.shared import run_usage_limits
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -556,6 +558,7 @@ def deep_toolset(
                         model=model,
                         deps=state,
                         usage=ctx.usage,
+                        usage_limits=run_usage_limits(),
                         toolsets=[*parent_toolsets, child_toolset],
                         event_stream_handler=handler,
                     )

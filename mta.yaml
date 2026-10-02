@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.15.0
+version: 2.16.1
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -116,7 +116,10 @@ modules:
           name: ensure-aicore-resource-group
           command: python scripts/ensure_aicore_setup.py
           memory: 512M
-          disk-quota: 1G
+          # The task container unpacks the app's whole droplet, so it needs
+          # the app's disk quota, not less: at 1G the 2.16.0 deploy failed
+          # with "No space left on device" once the droplet reached ~1G.
+          disk-quota: 2G
 
   - name: pydantic-agent-approuter
     type: nodejs

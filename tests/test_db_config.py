@@ -100,3 +100,20 @@ def test_oauth2_non_outlook_server_still_drops_send_settings():
     )
     assert "lookback" not in cleaned and "recipients" not in cleaned
     assert "allow_send" not in cleaned
+
+
+def test_oauth2_gmail_keeps_allow_send():
+    """builtin:gmail gains a send tool only with allow_send, so storage must
+    keep the switch on an oauth2 Gmail server -- and only as a real true."""
+    on = _clean_oauth({**OAUTH2_BASE, "allow_send": True}, "oauth2", None,
+                      url="builtin:gmail")
+    assert on["allow_send"] is True
+    assert on["client_secret"] == "sec"
+    off = _clean_oauth({**OAUTH2_BASE}, "oauth2", None, url="builtin:gmail")
+    assert off["allow_send"] is False
+    stringy = _clean_oauth({**OAUTH2_BASE, "allow_send": "true"}, "oauth2", None,
+                           url="builtin:gmail")
+    assert stringy["allow_send"] is False
+    assert "recipients" not in _clean_oauth(
+        {**OAUTH2_BASE, "recipients": "a@x.example"}, "oauth2", None, url="builtin:gmail"
+    )

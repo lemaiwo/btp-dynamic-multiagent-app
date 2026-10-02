@@ -72,6 +72,18 @@ current_progress: ContextVar[Callable[[ProgressUpdate], None] | None] = ContextV
 )
 
 
+def is_interactive() -> bool:
+    """True when someone is watching live and can act on a sign-in prompt.
+
+    A sink is interactive unless it says otherwise: the chat's sink is a plain
+    callable, while a background recorder (``agents.run_activity``) sets
+    ``interactive = False`` -- it wants the progress, but nobody behind it can
+    click a sign-in link, so the registry must not wait for one.
+    """
+    sink = current_progress.get()
+    return sink is not None and getattr(sink, "interactive", True)
+
+
 def _emit(update: ProgressUpdate) -> None:
     """Forward an update to the active request's sink, if any.
 

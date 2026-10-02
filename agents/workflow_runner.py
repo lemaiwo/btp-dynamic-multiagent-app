@@ -38,6 +38,7 @@ from agents.db import (
     item_succeeded_before,
 )
 from agents.registry import registry
+from agents.shared import run_usage_limits
 
 logger = logging.getLogger(__name__)
 
@@ -582,6 +583,7 @@ async def _run_step(
         )
     try:
         kwargs = {"output_type": output_type} if output_type is not None else {}
+        kwargs["usage_limits"] = run_usage_limits()
         async with run_as(effective_principal(agent_row, workflow)):
             result = await asyncio.wait_for(
                 specialist.run(prompt, **kwargs),

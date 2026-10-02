@@ -19,8 +19,10 @@ from agents.db import (
     finish_job_run,
 )
 from agents.db import DEFAULT_RUN_PROMPT, get_agent_by_name
-from agents.registry import _MAX_DELEGATION_DEPTH, registry
+from agents.registry import _MAX_DELEGATION_DEPTH, _make_progress_handler, registry
 from agents.reports import RunReport
+from agents.run_activity import final_activity, recording
+from agents.shared import run_usage_limits
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +234,7 @@ async def _finalize(run_id: str, **kwargs) -> None:
     was never retrieved" warning at GC time. Log and swallow instead.
     """
     try:
+        kwargs.setdefault("activity", final_activity(run_id))
         async with SessionLocal() as session:
             await finish_job_run(session, run_id, **kwargs)
     except Exception:  # noqa: BLE001
@@ -243,6 +246,13 @@ async def _finalize(run_id: str, **kwargs) -> None:
 
 
 async def execute_run(run_id: str, agent_id: int) -> None:
+    """Run the agent, recording what it does as it goes (agents.run_activity),
+    and record the outcome. See _execute_run."""
+    with recording(run_id):
+        await _execute_run(run_id, agent_id)
+
+
+async def _execute_run(run_id: str, agent_id: int) -> None:
     """Run the agent and record the outcome.
 
     Never raises — the row this writes to IS the overlap lock (see
@@ -301,6 +311,10 @@ async def execute_run(run_id: str, agent_id: int) -> None:
                 specialist.run(
                     agent.run_prompt or DEFAULT_RUN_PROMPT,
                     output_type=RunReport,
+                    usage_limits=run_usage_limits(),
+                    # The agent's own tool calls; delegations and deep
+                    # sub-agents report theirs through the same sink.
+                    event_stream_handler=_make_progress_handler(agent.name),
                 ),
                 timeout=agent.run_timeout_seconds,
             )

@@ -68,7 +68,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   not in repo). Auth reuses
   `PerUserOAuth2Auth`, so sign-in and refresh are unchanged. On a
   `destination`, `GmailClient(mailbox=)` switches `users/me` to
-  `users/{mailbox}` for the app-level case
+  `users/{mailbox}` for the app-level case. Drafts only by default;
+  `allow_send: true` on an oauth2 Gmail server adds `send_reply`, which
+  sends the same threaded reply `create_draft` would save
 - `agents/outlook_tools.py` — the same idea over Microsoft Graph
   (`builtin:outlook`), with an Inbox subfolder as the queue instead of a
   label. `build_http_client` picks per-user, app-only or destination auth;
@@ -178,6 +180,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   and depth. `registry.build_orchestrator` appends `deep_instructions` and
   the `deep_toolset` when the row's config is enabled; sub-agents are never
   registered as specialists or peers
+- `agents/run_activity.py` — what an API-triggered run is doing while it
+  runs: `job_runner.execute_run` installs a `RunActivity` as the
+  `agents.progress` sink, so every tool call (the agent's own, a peer's, a
+  deep sub-agent's) and every `write_todos` plan lands in it. Kept in memory
+  while live, served by `GET /admin/api/runs/{id}` as `activity`, stored in
+  `job_runs.activity_json` when the run ends. The sink sets
+  `interactive = False` (`progress.is_interactive`), so a run that needs
+  sign-in still fails fast instead of waiting for a click. Every run site
+  passes `shared.run_usage_limits()` (`AGENT_REQUEST_LIMIT`, default 200,
+  instead of pydantic-ai's 50 that deep sub-agents share with their parent)
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a

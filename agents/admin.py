@@ -1468,6 +1468,10 @@ async def api_get_run(run_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="Run not found")
         data = row.to_dict()
         data["report"] = row.report
+        # A live run's activity is only in memory; a finished one's is stored.
+        from agents.run_activity import live_activity
+
+        data["activity"] = live_activity(run_id) or row.activity
         return data
 
 

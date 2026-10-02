@@ -168,6 +168,8 @@ class Recorder:
             return httpx.Response(200, json=THREAD_FULL)
         if path.endswith("/drafts"):
             return httpx.Response(200, json={"id": "r-99", "message": {"id": "m9"}})
+        if path.endswith("/messages/send"):
+            return httpx.Response(200, json={"id": "s-42", "threadId": "t1"})
         return httpx.Response(404, json={"error": {"message": f"unmapped {path}"}})
 
     def paths(self) -> list[str]:
@@ -306,6 +308,28 @@ async def main() -> None:
           bool(msg_r and msg_r.get("In-Reply-To") == "<cust@mail.gmail.com>"),
           f"got {msg_r.get('In-Reply-To') if msg_r else None}")
 
+    # --- send_reply ---------------------------------------------------------
+    # The same reply a draft would hold, sent instead: same recipient choice,
+    # same threading headers, posted to messages.send rather than drafts.
+    print("\n== send_reply ==")
+    rec_s = Recorder()
+    res_s = await _client(rec_s).send_reply("t2", "Fixed and tested.")
+    send_call = [c for c in rec_s.calls if c[1].endswith("/messages/send")]
+    check("posts to messages.send", len(send_call) == 1, f"calls={rec_s.paths()}")
+    check("creates no draft", not any(p.endswith("/drafts") for p in rec_s.paths()))
+    check("returns the sent message id", res_s.get("message_id") == "s-42", f"got {res_s}")
+    sent_payload = send_call[0][2] if send_call else {}
+    check("send sets threadId", sent_payload.get("threadId") == "t2", f"got {sent_payload}")
+    raw_s = sent_payload.get("raw", "")
+    mime_s = base64.urlsafe_b64decode(raw_s.encode()).decode() if raw_s else ""
+    msg_s = email.message_from_string(mime_s) if mime_s else None
+    check("sends to the correspondent, not the mailbox owner",
+          bool(msg_s and "customer@example.com" in (msg_s.get("To") or "")),
+          f"got {msg_s.get('To') if msg_s else None}")
+    check("sent reply threads onto the message it answers",
+          bool(msg_s and msg_s.get("In-Reply-To") == "<cust@mail.gmail.com>"))
+    check("sent reply carries the body", "Fixed and tested." in mime_s)
+
     # --- list_labels / modify_labels ---------------------------------------
     # The REST API modifies by label ID, so names must be resolved first. This
     # is the mirror image of the MCP server, whose search wants display names.
@@ -350,6 +374,23 @@ async def main() -> None:
     expected = {"search_threads", "get_thread", "create_draft", "list_labels", "modify_labels"}
     check("exposes exactly the agreed tools", names == expected, f"got {sorted(names)}")
     check("exposes no send tool", not any("send" in n for n in names))
+
+    # Sending is a switch in the server config, never the default: a token
+    # with gmail.modify can send, so holding one must not be enough.
+    for label, cfg in [("allow_send false", {"client_id": "x", "allow_send": False}),
+                       ("allow_send as a string", {"client_id": "x", "allow_send": "true"})]:
+        ts_off = gmail_toolset(cfg, http=httpx.AsyncClient(
+            base_url="https://gmail.googleapis.com",
+            transport=httpx.MockTransport(Recorder().handler),
+        ))
+        check(f"{label}: no send tool", "send_reply" not in ts_off.tools)
+    ts_send = gmail_toolset({"client_id": "x", "allow_send": True}, http=httpx.AsyncClient(
+        base_url="https://gmail.googleapis.com",
+        transport=httpx.MockTransport(Recorder().handler),
+    ))
+    check("allow_send adds send_reply and nothing else",
+          set(ts_send.tools.keys()) == expected | {"send_reply"},
+          f"got {sorted(ts_send.tools.keys())}")
 
     # --- admin validation ---------------------------------------------------
     # builtin: has no host, so it must bypass the https + allowlist rules that

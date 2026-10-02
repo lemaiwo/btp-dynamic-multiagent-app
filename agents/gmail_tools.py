@@ -192,6 +192,34 @@ class GmailClient:
 
     async def create_draft(self, thread_id: str, body: str) -> dict[str, Any]:
         """Draft a reply to the last message in a thread. Never sends."""
+        raw, reply = await self._reply(thread_id, body)
+        created = await self._post(
+            f"/users/{self._user}/drafts", {"message": {"raw": raw, "threadId": thread_id}}
+        )
+        return {
+            "draft_id": created.get("id", ""),
+            "thread_id": thread_id,
+            "to": parseaddr(reply["To"])[1],
+            "subject": reply["Subject"],
+        }
+
+    async def send_reply(self, thread_id: str, body: str) -> dict[str, Any]:
+        """Send the reply ``create_draft`` would have saved, to the same person
+        and threaded the same way. Only reachable through a toolset whose
+        config sets ``allow_send``."""
+        raw, reply = await self._reply(thread_id, body)
+        sent = await self._post(
+            f"/users/{self._user}/messages/send", {"raw": raw, "threadId": thread_id}
+        )
+        return {
+            "message_id": sent.get("id", ""),
+            "thread_id": thread_id,
+            "to": parseaddr(reply["To"])[1],
+            "subject": reply["Subject"],
+        }
+
+    async def _reply(self, thread_id: str, body: str) -> tuple[str, EmailMessage]:
+        """The reply to a thread, as Gmail's base64url ``raw`` plus the message."""
         thread = await self._get(f"/users/{self._user}/threads/{thread_id}", format="metadata")
         messages = thread.get("messages") or []
         if not messages:
@@ -222,17 +250,7 @@ class GmailClient:
             existing = head.get("references", "")
             reply["References"] = f"{existing} {parent}".strip()
         reply.set_content(body)
-
-        raw = base64.urlsafe_b64encode(reply.as_bytes()).decode()
-        created = await self._post(
-            f"/users/{self._user}/drafts", {"message": {"raw": raw, "threadId": thread_id}}
-        )
-        return {
-            "draft_id": created.get("id", ""),
-            "thread_id": thread_id,
-            "to": parseaddr(reply["To"])[1],
-            "subject": subject,
-        }
+        return base64.urlsafe_b64encode(reply.as_bytes()).decode(), reply
 
     async def list_labels(self) -> dict[str, str]:
         """Every label as ``{display name: id}``."""
@@ -401,13 +419,31 @@ def gmail_toolset(
     async def create_draft(thread_id: str, body: str) -> dict[str, Any]:
         """Save a draft reply to the newest message in a thread.
 
-        The draft is only saved, never sent. There is no tool that can send it.
+        The draft is only saved, never sent.
 
         Args:
             thread_id: Thread id from `search_threads`.
             body: Plain-text body of the reply.
         """
         return await client.create_draft(thread_id, body)
+
+    # Sending is a switch in the server config, like Outlook's: a token with
+    # gmail.modify can send, so holding one must not be enough to give an
+    # agent a send tool. Only a real `true` counts, never the string "true".
+    if oauth.get("allow_send") is True:
+
+        @toolset.tool
+        async def send_reply(thread_id: str, body: str) -> dict[str, Any]:
+            """Send a reply to the newest message in a thread from someone else.
+
+            This sends immediately; nobody reviews it first. Use it only when
+            your instructions say to send rather than to draft.
+
+            Args:
+                thread_id: Thread id from `search_threads`.
+                body: Plain-text body of the reply.
+            """
+            return await client.send_reply(thread_id, body)
 
     @toolset.tool
     async def list_labels() -> dict[str, str]:

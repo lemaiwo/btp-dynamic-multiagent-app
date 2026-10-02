@@ -796,6 +796,9 @@ class JobRun(Base):
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # What the run did, step by step (agents.run_activity). Held in memory
+    # while the run is live and written here once, when it ends.
+    activity_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     missing_sections_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # False when the notification could not be delivered; the run itself keeps
     # its real status so a delivery problem never loses a completed run.
@@ -815,6 +818,16 @@ class JobRun(Base):
             return json.loads(self.report_json)
         except Exception:
             logger.warning("Malformed report_json on run %s", self.id)
+            return None
+
+    @property
+    def activity(self) -> dict[str, Any] | None:
+        if not self.activity_json:
+            return None
+        try:
+            return json.loads(self.activity_json)
+        except Exception:
+            logger.warning("Malformed activity_json on run %s", self.id)
             return None
 
     def to_dict(self) -> dict[str, Any]:
@@ -977,6 +990,7 @@ async def init_db() -> None:
         )
         # --- deep agents ---
         await _ensure_column(conn, "agent_configs", "deep_json", "TEXT")
+        await _ensure_column(conn, "job_runs", "activity_json", "TEXT")
         # create_all only creates indexes together with a new table; an
         # existing deployment needs them added here.
         await _ensure_index(conn, "uq_agent_configs_api_slug", "agent_configs", "api_slug")
@@ -1344,6 +1358,10 @@ def _clean_oauth_block(
             if v is not None and str(v).strip() != "":
                 cleaned[k] = str(v).strip()
         cleaned["allow_send"] = bool(src.get("allow_send"))
+    elif builtin == "builtin:gmail":
+        # Gmail replies to the thread it was given, so it pins no audience;
+        # the switch is all it keeps. Only a real true opens the send tool.
+        cleaned["allow_send"] = src.get("allow_send") is True
     if not cleaned.get("client_id"):
         raise ValueError("oauth2 server requires a client_id")
     if not cleaned.get("client_secret"):
@@ -2588,6 +2606,7 @@ async def finish_job_run(
     summary: str | None = None,
     report: dict[str, Any] | None = None,
     error: str | None = None,
+    activity: dict[str, Any] | None = None,
 ) -> None:
     row = await session.get(JobRun, run_id)
     if row is None:
@@ -2596,6 +2615,8 @@ async def finish_job_run(
     row.summary = summary
     row.report_json = json.dumps(report) if report is not None else None
     row.error = error
+    if activity is not None:
+        row.activity_json = json.dumps(activity)
     row.finished_at = datetime.now(timezone.utc)
     await session.commit()
 

@@ -47,6 +47,20 @@ const WORKFLOW_ITEM_STATUS_STATES: Record<WorkflowItemStatus, ValueState> = {
     skipped: ValueState.None
 };
 
+/** A job run's activity entry: `agents/run_activity.py` writes these. */
+const ACTIVITY_STATES: Record<string, ValueState> = {
+    running: ValueState.Information,
+    ok: ValueState.Success,
+    error: ValueState.Error
+};
+
+/** A deep agent's todo, as `write_todos` sends it. */
+const TODO_STATES: Record<string, ValueState> = {
+    completed: ValueState.Success,
+    in_progress: ValueState.Information,
+    pending: ValueState.None
+};
+
 export default {
 
     /** Maps a run status onto a semantic colour. Unknown values stay neutral. */
@@ -87,6 +101,25 @@ export default {
     runSummary(summary: string | null | undefined, error: string | null | undefined): string {
         const text = (summary || "").trim() || (error || "").trim();
         return text;
+    },
+
+    /** Colour for one activity entry of a job run; notes stay neutral. */
+    activityState(status: string | undefined): ValueState {
+        return (status && ACTIVITY_STATES[status]) || ValueState.None;
+    },
+
+    /** Colour for one item of a deep agent's plan. */
+    todoState(status: string | undefined): ValueState {
+        return (status && TODO_STATES[status]) || ValueState.None;
+    },
+
+    /** Time of day only: activity entries all belong to one run. */
+    timeOfDay(iso: string | null | undefined): string {
+        if (!iso) {
+            return EM_DASH;
+        }
+        const parsed = new Date(iso);
+        return isNaN(parsed.getTime()) ? EM_DASH : parsed.toLocaleTimeString();
     },
 
     /** Renders a null timestamp as an em dash rather than the string "null". */

@@ -41,7 +41,7 @@ const OAUTH2_BUILTIN_KEYS: Record<string, string[]> = {
 };
 
 /** Built-ins whose `allow_send` switch is shown on oauth2. */
-const OAUTH2_ALLOW_SEND_URLS = ["builtin:teams", "builtin:outlook"];
+const OAUTH2_ALLOW_SEND_URLS = ["builtin:teams", "builtin:outlook", "builtin:gmail"];
 
 // --- destinations ---
 /**
