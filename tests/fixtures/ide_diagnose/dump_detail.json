@@ -1,0 +1,19 @@
+{
+  "id": "20261003101530DEVHOST_DEMO_00",
+  "runtimeError": "COMPUTE_INT_ZERODIVIDE",
+  "exception": "CX_SY_ZERODIVIDE",
+  "program": "ZCL_DEMO_CALC=================CP",
+  "include": "ZCL_DEMO_CALC=================CM001",
+  "line": 12,
+  "user": "DEVUSER01",
+  "client": "100",
+  "timestamp": "2026-10-03T10:15:30Z",
+  "chapters": [
+    {"id": "kap0", "title": "Short text", "text": "Division by zero"},
+    {"id": "kap3", "title": "Error analysis", "text": "User DEVUSER01 triggered a division by zero while processing partner 123456789012. Please contact the user by mail jane.doe@example.com."},
+    {"id": "kap5", "title": "Information on where terminated", "text": "The termination occurred in ZCL_DEMO_CALC=================CM001 line 12."},
+    {"id": "kap8", "title": "Chosen variables", "text": "LV_DIVISOR = 0\nLV_IBAN = BE71 0961 2345 6769\nLV_RAW = RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789\nLV_MAIL = jane.doe@example.com\nSY-UNAME = DEVUSER01"},
+    {"id": "kap9", "title": "Active calls/events", "text": "1 METHOD ZCL_DEMO_CALC=>DIVIDE\n2 EVENT START-OF-SELECTION"}
+  ],
+  "formattedText": "Runtime Error: COMPUTE_INT_ZERODIVIDE\nUser: DEVUSER01\nClient: 100\nSY-UNAME = DEVUSER01\nLV_PARTNER = 123456789012\nLV_RAW = RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789\nLV_IBAN = BE71 0961 2345 6769\nContact: jane.doe@example.com"
+}

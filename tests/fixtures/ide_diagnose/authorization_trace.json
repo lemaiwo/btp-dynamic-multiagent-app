@@ -1,0 +1,28 @@
+{
+  "rows": [
+    {
+      "user": "DEVUSER01",
+      "authObject": "S_TCODE",
+      "field1": "TCD",
+      "value1": "ZDEMO",
+      "rc": 4,
+      "program": "ZDEMO_REPORT",
+      "timestamp": "2026-10-03T10:16:00Z"
+    },
+    {
+      "user": "DEVUSER01",
+      "authObject": "Z_PARTNER",
+      "field1": "PARTNER",
+      "value1": "123456789012",
+      "field2": "MAIL",
+      "value2": "jane.doe@example.com",
+      "field3": "IBAN",
+      "value3": "BE71 0961 2345 6769",
+      "field4": "RAW",
+      "value4": "RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789",
+      "rc": 12,
+      "program": "ZDEMO_REPORT",
+      "timestamp": "2026-10-03T10:16:01Z"
+    }
+  ]
+}

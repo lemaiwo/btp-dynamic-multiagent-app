@@ -1,7 +1,10 @@
 """Server-sent event framing for the IDE stage runs (contract §1.3).
 
 ``format_event`` turns one runner event into an SSE frame
-``event: <type>\\ndata: <json>\\n\\n``. The JSON is written with
+``event: <type>\\ndata: <json>\\n\\n``. The event types are the runner's:
+``run``, ``text``, ``tool``, ``plan``, ``file``, ``artifact``, ``finding``,
+``approval_required`` (the last two in diagnose sessions only), ``usage``,
+``error`` and ``done``. The JSON is written with
 ``ensure_ascii=False``; ``json.dumps`` always escapes CR and LF inside
 strings, so a multi-line text delta stays on its single ``data:`` line.
 

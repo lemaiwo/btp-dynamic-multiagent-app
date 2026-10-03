@@ -14,6 +14,7 @@ Run:  python -m pytest tests/test_ide_runner.py -q
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import sys
@@ -78,6 +79,7 @@ def _real_agent_run(monkeypatch):
 async def _clean(monkeypatch):
     monkeypatch.delenv("IDE_SESSION_REQUEST_CAP", raising=False)
     monkeypatch.delenv("IDE_ORCHESTRATOR_AGENT", raising=False)
+    monkeypatch.delenv("IDE_DIAGNOSE_AGENT", raising=False)
     await init_db()
     async with SessionLocal() as db:
         for model in (IdeWorkspaceFile, IdeArtifact, IdeMessage, IdeSession,
@@ -845,3 +847,467 @@ async def test_guard_refusal_tool_event_carries_readonly_refused():
     events = json.loads(stored.activity_json)["events"]
     refused = [e for e in events if e.get("tool") == "SAPRead"]
     assert refused and refused[-1]["code"] == "readonly_refused"
+
+
+# --- diagnose sessions (phase 1c) ---------------------------------------------
+
+from pydantic_ai.toolsets import FunctionToolset  # noqa: E402
+
+from agents.ide import diagnose  # noqa: E402
+from agents.ide.stages import (  # noqa: E402
+    DIAGNOSE_RULE,
+    READ_ONLY_RULE,
+    REPORT_REQUEST,
+    STAGE_INSTRUCTIONS,
+    Stage,
+)
+from agents.ide.store import upsert_conventions  # noqa: E402
+
+DIAG = "abap-diagnostics"
+DEST = "arc1-abap-readonly"
+
+
+@pytest.fixture
+def target_servers(monkeypatch):
+    """Stub toolsets have no destination to recognise: every toolset counts
+    as the target's ARC-1 server, or only the ones added to the list."""
+    only: list = []
+
+    def _is_target(toolset, run) -> bool:
+        return not only or any(toolset is t for t in only)
+
+    monkeypatch.setattr(diagnose, "is_target_server", _is_target)
+    return only
+
+
+def _arc1() -> FunctionToolset:
+    """Stands in for the target's ARC-1 server."""
+    ts = FunctionToolset()
+
+    @ts.tool_plain
+    def SAPDiagnose(action: str) -> str:  # noqa: N802
+        """Diagnose."""
+        return json.dumps({"dumps": []})
+
+    return ts
+
+
+def _install_agents(agents: dict, configs: list | None = None) -> None:
+    """``{name: Script | _Specialist}``; a Script gets the ARC-1 stub."""
+    specialists = {
+        name: a if isinstance(a, _Specialist) else _Specialist(a, toolsets=[_arc1()])
+        for name, a in agents.items()
+    }
+    registry._build = BuildResult(
+        orchestrator=None, specialists=specialists, mcp_clients=[],
+        configs=configs or [],
+    )
+
+
+async def _diagnose_session(non_production: bool | None = True, **values) -> str:
+    """A diagnose session on T1; ``non_production=None`` leaves T1 without a
+    conventions row."""
+    async with SessionLocal() as db:
+        if non_production is not None:
+            await upsert_conventions(db, "T1", destination=DEST,
+                                     non_production=non_production)
+        s = await create_session(db, owner="alice", title="t", target="T1",
+                                 session_type="diagnose")
+        for key, value in values.items():
+            setattr(s, key, value)
+        await db.commit()
+        return s.id
+
+
+async def _report(sid: str) -> Events:
+    ev = Events()
+    await runner.run_stage(sid, "alice", None, feedback=None, emit=ev, report=True)
+    return ev
+
+
+async def _artifacts(sid: str) -> list[IdeArtifact]:
+    async with SessionLocal() as db:
+        return list((await db.execute(
+            select(IdeArtifact).where(IdeArtifact.session_id == sid)
+            .order_by(IdeArtifact.version))).scalars())
+
+
+async def _messages(sid: str) -> list[IdeMessage]:
+    async with SessionLocal() as db:
+        return list((await db.execute(
+            select(IdeMessage).where(IdeMessage.session_id == sid)
+            .order_by(IdeMessage.created_at))).scalars())
+
+
+async def test_diagnose_run_uses_diagnose_agent(target_servers, monkeypatch):
+    orchestrator, diagnostics = Script(["from the orchestrator"]), Script(["found it"])
+    _install_agents({NAME: orchestrator, DIAG: diagnostics})
+    sid = await _diagnose_session()
+    ev = await _run(sid, "why did it dump?")
+
+    assert ev.of("error") == []
+    assert ev.of("run")[0]["stage"] == "investigate"
+    assert "".join(d["delta"] for d in ev.of("text")) == "found it"
+    assert (orchestrator.requests, diagnostics.requests) == (0, 1)
+    instructions = diagnostics.instructions[0]
+    assert "- Session type: diagnose" in instructions
+    assert "You cannot change code" in instructions
+    assert READ_ONLY_RULE not in instructions
+    assert ev.of("done")[0]["stage"] == "investigate"
+    assert (await _row(sid)).stage == "investigate"
+
+    # A change session of the same build still runs the orchestrator.
+    change = await _session("chat")
+    await _run(change, "hello")
+    assert (orchestrator.requests, diagnostics.requests) == (1, 1)
+
+    # IDE_DIAGNOSE_AGENT is honoured, and only for diagnose sessions.
+    other = Script(["from the other one"])
+    _install_agents({NAME: orchestrator, DIAG: diagnostics, "other-diag": other})
+    monkeypatch.setenv("IDE_DIAGNOSE_AGENT", "other-diag")
+    await _run(sid, "again")
+    await _run(change, "again")
+    assert (orchestrator.requests, diagnostics.requests, other.requests) == (2, 1, 1)
+
+
+async def test_diagnose_agent_missing(target_servers):
+    """The orchestrator is no fallback for a diagnose run."""
+    orchestrator = Script(["x"])
+    _install_agents({NAME: orchestrator})
+    sid = await _diagnose_session()
+    ev = await _run(sid, "x")
+    assert ev.kinds() == ["run", "error", "done"]
+    assert ev.of("error")[0]["code"] == "agent_missing"
+    assert DIAG in ev.of("error")[0]["message"]
+    assert orchestrator.requests == 0
+    assert (await _row(sid)).status == "idle"
+
+
+def test_diagnose_agent_name(monkeypatch):
+    assert runner.diagnose_agent_name() == DIAG
+    monkeypatch.setenv("IDE_DIAGNOSE_AGENT", "  my-diag ")
+    assert runner.diagnose_agent_name() == "my-diag"
+    monkeypatch.setenv("IDE_ORCHESTRATOR_AGENT", "x")
+    assert runner.diagnose_agent_name() == "my-diag"
+
+
+async def test_diagnose_message_run_stores_no_artifact(target_servers):
+    _install_agents({DIAG: Script(["It is a division by zero."])})
+    sid = await _diagnose_session()
+    ev = await _run(sid, "why?")
+    assert ev.of("error") == [] and "artifact" not in ev.kinds()
+    assert await _artifacts(sid) == []
+    user, assistant = await _messages(sid)
+    assert (user.stage, user.content) == ("investigate", "why?")
+    assert (assistant.stage, assistant.content) == (
+        "investigate", "It is a division by zero.")
+
+
+async def test_report_run_stores_report_artifact_v1_then_v2(target_servers):
+    script = Script(["# Report one"])
+    _install_agents({DIAG: script})
+    sid = await _diagnose_session()
+    await _run(sid, "why?")
+
+    ev = await _report(sid)
+    assert ev.of("error") == []
+    first = ev.of("artifact")
+    assert [(a["kind"], a["version"]) for a in first] == [("report", 1)]
+    assert ev.kinds()[-1] == "done"
+    assert script.prompts[-1].endswith(f"# Request\n{REPORT_REQUEST}")
+    assert "Previous report" not in script.prompts[-1]
+    assert STAGE_INSTRUCTIONS[Stage.investigate] not in script.instructions[-1]  # raw
+
+    script.turns = ["# Report two"]
+    ev = await _report(sid)
+    assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("report", 2)]
+    assert "## Previous report (version 1)\n# Report one" in script.prompts[-1]
+
+    arts = await _artifacts(sid)
+    assert [(a.kind, a.stage, a.version, a.content) for a in arts] == [
+        ("report", "investigate", 1, "# Report one"),
+        ("report", "investigate", 2, "# Report two"),
+    ]
+    # The request is the run's user message; the session never moves.
+    users = [m.content for m in await _messages(sid) if m.role == "user"]
+    assert users == ["why?", REPORT_REQUEST, REPORT_REQUEST]
+    row = await _row(sid)
+    assert (row.stage, row.status, row.run_id) == ("investigate", "idle", None)
+
+
+async def test_failed_report_run_stores_no_artifact(target_servers):
+    _install_agents({DIAG: Script([RuntimeError("boom")])})
+    sid = await _diagnose_session()
+    ev = await _report(sid)
+    assert ev.of("error")[0]["code"] == "run_failed"
+    assert "artifact" not in ev.kinds() and await _artifacts(sid) == []
+
+
+async def test_report_on_change_session_refused(target_servers):
+    script = Script(["x"])
+    _install_agents({NAME: script, DIAG: script})
+    sid = await _session("design")
+    ev = Events()
+    with pytest.raises(StageGateError) as exc:
+        await runner.run_stage(sid, "alice", None, feedback=None, emit=ev, report=True)
+    assert exc.value.code == "not_diagnose"
+    assert ev == [] and script.requests == 0
+    assert await _messages(sid) == []
+    assert (await _row(sid)).status == "idle"
+
+
+async def test_diagnose_revise_refused(target_servers):
+    script = Script(["x"])
+    _install_agents({DIAG: script})
+    sid = await _diagnose_session()
+    ev = Events()
+    with pytest.raises(StageGateError) as exc:
+        await runner.run_stage(sid, "alice", None, feedback="redo", emit=ev)
+    assert exc.value.code == "revise_not_allowed"
+    assert ev == [] and script.requests == 0 and await _messages(sid) == []
+
+
+@pytest.mark.parametrize("text,feedback", [("x", None), (None, "y"), ("x", "y")])
+async def test_report_run_takes_no_text(text, feedback):
+    """The report request is the app's own text, never the caller's."""
+    sid = await _diagnose_session()
+    with pytest.raises(ValueError):
+        await runner.run_stage(sid, "alice", text, feedback=feedback,
+                               emit=Events(), report=True)
+    assert await _messages(sid) == []
+
+
+@pytest.mark.parametrize("masked", [False, True])
+async def test_diagnose_prompt_wording_follows_the_masking_switch(
+    target_servers, masked
+):
+    """``masked=True`` is forced past the start: a real start on a target
+    that requires masking is refused (the tests below), but what runs behind
+    it still words the prompt from ``_Start.masked``."""
+    script = Script(["ok"])
+    _install_agents({DIAG: script})
+    sid = await _diagnose_session(True)
+    ev = Events()
+    start = await runner._start(sid, "alice", "mail jane.doe@example.com", None)
+    assert start.masked is False
+    await runner._execute(dataclasses.replace(start, masked=masked), ev)
+    assert ev.of("error") == []
+    instructions = script.instructions[0]
+    assert (DIAGNOSE_RULE in instructions) is masked
+    assert (STAGE_INSTRUCTIONS[Stage.investigate] in instructions) is masked
+    assert ("not masked" in instructions) is not masked
+
+
+@pytest.mark.parametrize("non_production", [False, None])
+@pytest.mark.parametrize("report", [False, True])
+async def test_diagnose_run_is_refused_when_the_target_lost_its_flag(
+    target_servers, non_production, report
+):
+    """Message and report runs: refused before anything is emitted, stored
+    or sent to the model."""
+    script = Script(["ok"])
+    _install_agents({DIAG: script})
+    sid = await _diagnose_session(non_production)
+    ev = Events()
+    with pytest.raises(StageGateError) as exc:
+        await runner.run_stage(
+            sid, "alice", None if report else "mail jane.doe@example.com",
+            feedback=None, emit=ev, report=report,
+        )
+    assert exc.value.code == "target_not_non_production"
+    assert list(ev) == [] and script.requests == 0
+    assert await _messages(sid) == []
+    row = await _row(sid)
+    assert (row.status, row.run_id) == ("idle", None)
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel", "report"])
+async def test_diagnose_run_never_persists_the_workspace(target_servers, outcome):
+    """D2: a diagnose scratchpad may hold dump text. The runner takes the
+    session type from the row, so no outcome saves files or todos."""
+    gate, started = asyncio.Event(), asyncio.Event()
+
+    class Blocking(Script):
+        def _turn(self, messages, info):
+            started.set()
+            return super()._turn(messages, info)
+
+    last = {"success": "done", "report": "# Report",
+            "error": RuntimeError("boom"), "cancel": ("wait", gate, "never")}[outcome]
+    _install_agents({DIAG: Blocking([
+        [("write_file", {"path": "notes/dump.md", "content": "dump text"}),
+         ("write_todos", {"todos": [{"content": "look", "status": "pending"}]})],
+        last,
+    ])})
+    sid = await _diagnose_session()
+    ev = Events()
+    task = asyncio.create_task(runner.run_stage(
+        sid, "alice", None if outcome == "report" else "x", feedback=None,
+        emit=ev, report=outcome == "report"))
+    if outcome == "cancel":
+        await started.wait()
+        while not any(k == "tool" and d["status"] == "ok" for k, d in ev):
+            await asyncio.sleep(0.01)
+        assert await runner.cancel(sid) is True
+    await asyncio.wait_for(task, timeout=5)
+
+    assert ev.kinds()[-1] == "done"
+    assert any(d["tool"] == "write_file" and d["status"] == "ok" for d in ev.of("tool"))
+    assert ev.of("file") == []
+    async with SessionLocal() as db:
+        assert (await db.execute(select(IdeWorkspaceFile))).all() == []
+    row = await _row(sid)
+    assert row.todos_json in (None, "", "[]")
+    assert (row.status, row.run_id) == ("idle", None)
+    assert diagnose.current_diagnose.get() is None and current_workspace.get() is None
+
+
+# --- carry-forward of the Task 6 review ---------------------------------------
+
+
+async def test_diagnose_run_without_target_server_says_so(target_servers, caplog):
+    """Without the target's server every diagnose read is refused or simply
+    absent, which looks like "there are no dumps": say so instead."""
+    mine = _arc1()
+    target_servers.append(mine)  # the only target server; no agent has it
+    script = Script(["nothing found"])
+    _install_agents({DIAG: script})
+    sid = await _diagnose_session()
+    with caplog.at_level("WARNING", logger="agents.ide.runner"):
+        ev = await _run(sid, "why?")
+
+    errors = ev.of("error")
+    assert [e["code"] for e in errors] == ["no_diagnose_server"]
+    assert DEST not in errors[0]["message"]  # config names stay in the log
+    assert ev.kinds()[:2] == ["run", "error"] and ev.kinds()[-1] == "done"
+    # A note, not a failure: the run still answers.
+    assert script.requests == 1
+    assert (await _messages(sid))[-1].content == "nothing found"
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"
+                and "no_diagnose_server" in r.getMessage()]
+    assert len(warnings) == 1 and DEST in warnings[0].getMessage()
+
+
+async def test_target_server_on_the_agent_or_a_peer_is_found(target_servers):
+    mine = _arc1()
+    target_servers.append(mine)
+    # On the agent itself.
+    _install_agents({DIAG: _Specialist(Script(["ok"]), toolsets=[mine])})
+    sid = await _diagnose_session()
+    assert (await _run(sid, "x")).of("error") == []
+    # On a peer of a peer (delegation reaches it).
+    _install_agents(
+        {DIAG: _Specialist(Script(["ok"])),
+         "abap-researcher": _Specialist(Script(["ok"])),
+         "abap-reader": _Specialist(Script(["ok"]), toolsets=[mine])},
+        configs=[{"name": DIAG, "peers": ["abap-researcher"]},
+                 {"name": "abap-researcher", "peers": ["abap-reader", DIAG]},
+                 {"name": "abap-reader", "peers": []}],
+    )
+    assert (await _run(sid, "x")).of("error") == []
+    # On an agent the diagnose agent cannot reach: that does not count.
+    _install_agents(
+        {DIAG: _Specialist(Script(["ok"])),
+         "abap-reader": _Specialist(Script(["ok"]), toolsets=[mine])},
+        configs=[{"name": DIAG, "peers": []}, {"name": "abap-reader", "peers": []}],
+    )
+    ev = await _run(sid, "x")
+    assert [e["code"] for e in ev.of("error")] == ["no_diagnose_server"]
+
+
+async def test_change_run_never_reports_a_missing_diagnose_server(target_servers):
+    target_servers.append(_arc1())
+    _install(Script(["ok"]))  # no toolsets at all
+    sid = await _session("chat")
+    assert (await _run(sid, "x")).of("error") == []
+
+
+def test_start_is_masked_unless_told_otherwise():
+    start = runner._Start(sid="s", run_id="r", stage=Stage.investigate,
+                          message_id="m", requests_used=0)
+    assert start.masked is True
+
+
+@pytest.mark.parametrize("session_type,non_production", [
+    ("change", False), ("change", True), ("change", None), ("diagnose", True),
+])
+async def test_start_is_raw_for_change_and_flagged_diagnose(
+    session_type, non_production
+):
+    """A change session never looks at the flag (nor needs the row)."""
+    async with SessionLocal() as db:
+        if non_production is not None:
+            await upsert_conventions(db, "T1", destination=DEST,
+                                     non_production=non_production)
+        s = await create_session(db, owner="alice", title="t", target="T1",
+                                 session_type=session_type)
+    start = await runner._start(s.id, "alice", "x", None)
+    assert start.masked is False
+    assert start.session_type == session_type
+
+
+@pytest.mark.parametrize("non_production", [False, None])
+async def test_start_refuses_diagnose_without_the_flag(non_production):
+    sid = await _diagnose_session(non_production)
+    with pytest.raises(StageGateError) as exc:
+        await runner._start(sid, "alice", "x", None)
+    assert exc.value.code == "target_not_non_production"
+    assert await _messages(sid) == []
+
+
+@pytest.mark.parametrize("broken", ["flag", "destination", "load"])
+async def test_unreadable_conventions_refuse_the_run(target_servers, monkeypatch, broken):
+    """Loading the row and reading it are one step: whatever goes wrong
+    there counts as "masking required", and such a run does not start. The
+    gate (``stages.assert_can_run``) reads the stored row and lets it
+    through; this is the runner's own check."""
+
+    class Row:
+        @property
+        def non_production(self):
+            if broken == "flag":
+                raise RuntimeError("detached row")
+            return True
+
+        @property
+        def destination(self):
+            if broken == "destination":
+                raise RuntimeError("detached row")
+            return DEST
+
+    async def get(db, target):
+        if broken == "load":
+            raise RuntimeError("database is gone")
+        return Row()
+
+    sid = await _diagnose_session()  # the stored row says non_production
+    monkeypatch.setattr(runner, "get_conventions", get)
+    with pytest.raises(StageGateError) as exc:
+        await runner._start(sid, "alice", "mail jane.doe@example.com", None)
+    assert exc.value.code == "target_not_non_production"
+    assert await _messages(sid) == []
+    row = await _row(sid)
+    assert (row.status, row.run_id) == ("idle", None)
+
+
+async def test_change_flow_unchanged(target_servers, monkeypatch):
+    """A change session next to the diagnose agent: orchestrator, stage
+    artifact, persisted workspace, no session type in the prompt."""
+    monkeypatch.setenv("IDE_DIAGNOSE_AGENT", DIAG)
+    orchestrator, diagnostics = Script([
+        [("write_file", {"path": "notes/n.md", "content": "N"})], "# Design",
+    ]), Script(["no"])
+    _install_agents({NAME: _Specialist(orchestrator), DIAG: diagnostics})
+    async with SessionLocal() as db:
+        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
+    sid = await _session("design")
+    ev = await _run(sid, "mail jane.doe@example.com")
+    assert ev.of("error") == [] and diagnostics.requests == 0
+    assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("design", 1)]
+    assert ev.of("file") == [{"path": "notes/n.md", "state": "new"}]
+    instructions = orchestrator.instructions[0]
+    assert READ_ONLY_RULE in instructions and "Session type" not in instructions
+    assert (await _messages(sid))[0].content == "mail jane.doe@example.com"
+    ev = await _run(sid, None, feedback="shorter")
+    assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("design", 2)]
+    assert (await _row(sid)).stage == "design"

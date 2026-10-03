@@ -30,6 +30,23 @@ the host; without the variable the path is ``/mcp``. Local development
 without a destination service: an empty ``destination`` falls back to
 ``auth_mode="jwt"`` against ``IDE_ARC1_URL_<TARGET>`` (424 when unset).
 
+Session type: ``policy`` is the session's type (``change`` by default) and
+selects the read-only policy, so only a diagnose session can read dumps and
+traces here. ``trace_start``/``trace_cancel`` are never run by :meth:`call`
+(decision D1). Masking: in a session that is not a ``change`` session every
+result is masked with a fresh pseudonym map per call, unless the caller
+passes ``masking=False`` -- which the routes do only for a target whose
+conventions say ``non_production`` (``agents.ide.diagnose.masking_required``).
+An ARC-1 error payload is an error, not data, and is raised before masking.
+
+Trace approvals: :meth:`Arc1Client.arm_trace` and :meth:`Arc1Client.
+cancel_trace` are the only code that sends ``trace_start``/``trace_cancel``,
+and only ``agents.ide.approvals.decide`` calls them, after the developer
+approved. They build the arguments themselves from validated parameters and
+never send a ``traceUser``, so ARC-1 traces the connected user -- under
+principal propagation the developer. They need a bound JWT and, on CF, a
+destination (:func:`require_user_context`).
+
 Seam for tests: :func:`get_arc1_client`; the routes look it up on this
 module at call time, so ``monkeypatch.setattr(arc1, "get_arc1_client", ...)``
 replaces it.
@@ -51,6 +68,8 @@ from agents.auth import current_jwt, current_principal
 from agents.destination import DestinationError
 from agents.destination_auth import PLACEHOLDER_BASE, DestinationUserRequired
 from agents.ide import readonly
+from agents.ide.diagnose import result_text as _result_text
+from agents.ide.masking import Masker
 
 logger = logging.getLogger(__name__)
 
@@ -178,30 +197,74 @@ def env_url_name(target: str) -> str:
     return "IDE_ARC1_URL_" + re.sub(r"[^A-Za-z0-9]", "_", target).upper()
 
 
-def _result_text(result: Any) -> str:
-    if result is None:
-        return ""
-    if isinstance(result, str):
-        return result
-    if isinstance(result, (dict, list)):
-        return json.dumps(result)
-    if isinstance(result, (bytes, bytearray)):
-        return bytes(result).decode("utf-8", errors="replace")
-    return str(result)
-
-
 # One MCP server object per (target, mode, url, destination). It holds no
 # identity: the auth resolves the caller per request and every call opens its
 # own session through ``for_run``.
 _SERVERS: dict[tuple[str, str, str, str], Any] = {}
 
 
+# A trace request id as ARC-1 hands it out; also the only shape accepted
+# for a cancel.
+TRACE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,100}")
+_TRACE_USER_KEYS = frozenset({"traceuser", "user"})
+TRACE_EXPIRES_RE = re.compile(r"[0-9][0-9T:+\-.Z ]{7,39}")
+
+
+def require_user_context(destination: str) -> None:
+    """Refuse a trace action that could not run in SAP as the signed-in user.
+
+    A user JWT must be bound, always. On CF the target must also have a
+    destination (built with ``user_context: true``), because only the
+    destination service exchanges that JWT for the user's SAP identity; the
+    plain jwt mode is local development only.
+    """
+    if not current_jwt.get():
+        raise Arc1UserRequired()
+    if shared.ON_CF and not (destination or "").strip():
+        raise Arc1NotConfigured(
+            "Arming a trace needs an ARC-1 destination with user context "
+            "for this target"
+        )
+
+
+def parse_trace_request(text: str) -> dict[str, str]:
+    """``{trace_request_id?, expires_at?}`` from a ``trace_start`` answer.
+
+    The live answer's shape is not known yet (plan 1c L4), so a few key
+    spellings are accepted, at the top level or one object down. Values that
+    are not a well-formed id or timestamp are dropped, not passed on.
+    """
+    data = _loads(text)
+    nodes = [data] if isinstance(data, dict) else []
+    nodes += [v for v in (data.values() if isinstance(data, dict) else []) if isinstance(v, dict)]
+    out: dict[str, str] = {}
+    for node in nodes:
+        # Not ``requestId``: ARC-1 uses that for its own call correlation id.
+        rid = _first(node, "id", "traceRequestId", "trace_request_id")
+        if "trace_request_id" not in out and isinstance(rid, str) and TRACE_ID_RE.fullmatch(rid):
+            out["trace_request_id"] = rid
+        exp = _first(node, "expiresAt", "expires_at", "expires", "expiry")
+        if "expires_at" not in out and isinstance(exp, str) and TRACE_EXPIRES_RE.fullmatch(exp):
+            out["expires_at"] = exp
+    return out
+
+
 class Arc1Client:
     """Read-only ARC-1 calls for one target, as the signed-in user."""
 
-    def __init__(self, target: str, destination: str = ""):
+    def __init__(
+        self,
+        target: str,
+        destination: str = "",
+        policy: str = readonly.CHANGE,
+        masking: bool = True,
+    ):
         self.target = target
         self.destination = (destination or "").strip()
+        self.policy = policy
+        # Masked unless the caller knows the target is non-production. A
+        # change session has no diagnose data and is never masked.
+        self.masking = masking is not False
 
     def _server(self) -> Any:
         url = os.environ.get(env_url_name(self.target), "").strip()
@@ -229,7 +292,9 @@ class Arc1Client:
         return server
 
     async def call(self, tool: str, args: dict) -> str:
-        reason = readonly.check_call(tool, args)
+        reason = readonly.check_call(tool, args, self.policy)
+        if reason is None and readonly.needs_approval(tool, args, self.policy):
+            reason = "this action runs only through an approval"
         if reason is not None:
             logger.warning(
                 "[ide] read-only policy refused direct %s for %s on %s: %s",
@@ -240,6 +305,14 @@ class Arc1Client:
         # user's SAP identity, and on CF the jwt mode forwards it.
         if (self.destination or shared.ON_CF) and not current_jwt.get():
             raise Arc1UserRequired()
+        text = await self._send(tool, args)
+        if self.policy != readonly.CHANGE and self.masking:
+            return readonly.mask_tool_result(tool, args, text, Masker())
+        return text
+
+    async def _send(self, tool: str, args: dict) -> str:
+        """Run one tool call and map every failure to an ``Arc1Error``.
+        No policy here: :meth:`call` and :meth:`_call_unchecked` own that."""
         server = self._server()
         try:
             run = await server.for_run(None)
@@ -284,10 +357,69 @@ class Arc1Client:
             raise payload
         return text
 
+    # --- trace approvals ----------------------------------------------------
 
-def get_arc1_client(target: str, destination: str = "") -> Arc1Client:
+    async def arm_trace(self, params: dict) -> dict[str, str]:
+        """Arm a trace for the signed-in user; only the approval path calls it.
+
+        The ARC-1 arguments are built here from ``params`` after they pass
+        ``approvals.normalize_request`` once more, so this method cannot send
+        a key outside the allowlist, a bound above the cap or -- above all --
+        a ``traceUser``: without one ARC-1 traces the connected user, which
+        under principal propagation is the developer who approved.
+        Returns ``{trace_request_id?, expires_at?}``; nothing else of the
+        answer is passed on.
+        """
+        from agents.ide.approvals import ApprovalError, normalize_request
+
+        try:
+            clean = normalize_request("trace_start", params)
+        except ApprovalError as exc:
+            raise Arc1Refused(f"invalid trace parameters: {exc.message}") from exc
+        text = await self._call_unchecked(
+            "SAPDiagnose", {"action": "trace_start", **clean}
+        )
+        return parse_trace_request(text)
+
+    async def cancel_trace(self, request_id: str) -> dict[str, str]:
+        """Cancel a trace request by id; only the approval path calls it."""
+        if not isinstance(request_id, str) or not TRACE_ID_RE.fullmatch(request_id):
+            raise Arc1Refused("invalid trace request id")
+        await self._call_unchecked(
+            "SAPDiagnose", {"action": "trace_cancel", "id": request_id}
+        )
+        return {"trace_request_id": request_id}
+
+    async def _call_unchecked(self, tool: str, args: dict) -> str:
+        """Send ``trace_start``/``trace_cancel`` -- the two calls :meth:`call`
+        always refuses. "Unchecked" means "not by the read-only policy"; it
+        still takes nothing but those two actions of ``SAPDiagnose`` in a
+        diagnose client, refuses any user argument, and requires a bound JWT
+        and (on CF) a user-context destination. The result is not masked:
+        callers keep only an id and an expiry of it.
+        """
+        action = args.get("action") if isinstance(args, dict) else None
+        if (
+            self.policy != readonly.DIAGNOSE
+            or tool != "SAPDiagnose"
+            or not isinstance(action, str)
+            or action not in readonly.APPROVAL_ACTIONS
+        ):
+            raise Arc1Refused("only an approved trace action of a diagnose session")
+        if any(str(key).lower() in _TRACE_USER_KEYS for key in args):
+            raise Arc1Refused("a trace is always armed for the signed-in user")
+        require_user_context(self.destination)
+        return await self._send(tool, args)
+
+
+def get_arc1_client(
+    target: str,
+    destination: str = "",
+    policy: str = readonly.CHANGE,
+    masking: bool = True,
+) -> Arc1Client:
     """The client the routes use; replace it in tests."""
-    return Arc1Client(target, destination)
+    return Arc1Client(target, destination, policy, masking)
 
 
 # --- result parsing ---------------------------------------------------------

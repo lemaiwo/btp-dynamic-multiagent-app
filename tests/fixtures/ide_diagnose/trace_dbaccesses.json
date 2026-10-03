@@ -1,0 +1,20 @@
+{
+  "id": "ATRA_20261003_101500_0001",
+  "dbAccesses": [
+    {
+      "table": "ZDEMO_T",
+      "statement": "SELECT * FROM ZDEMO_T WHERE partner = '123456789012' AND changed_by = 'DEVUSER01'",
+      "executions": 3,
+      "duration": 8900,
+      "type": "SELECT"
+    },
+    {
+      "table": "ZDEMO_ACC",
+      "statement": "UPDATE ZDEMO_ACC SET iban = 'BE71 0961 2345 6769', mail = 'jane.doe@example.com', raw = 'RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789'",
+      "executions": 1,
+      "duration": 120,
+      "type": "UPDATE"
+    }
+  ],
+  "traceUser": "DEVUSER01"
+}

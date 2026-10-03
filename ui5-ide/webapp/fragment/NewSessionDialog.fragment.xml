@@ -17,6 +17,21 @@
                 valueStateText="{i18n>titleRequired}"
                 maxLength="200"
                 submit=".onNewSessionCreate" />
+            <Label id="newSessionTypeLabel" text="{i18n>newSessionTypeLabel}" labelFor="newSessionType" />
+            <SegmentedButton
+                id="newSessionType"
+                selectedKey="{ide>/newSession/type}"
+                selectionChange=".onNewSessionTypeChange">
+                <items>
+                    <SegmentedButtonItem id="newSessionTypeChange" key="change" text="{i18n>sessionTypeChange}" />
+                    <SegmentedButtonItem
+                        id="newSessionTypeDiagnose"
+                        key="diagnose"
+                        text="{i18n>sessionTypeDiagnose}"
+                        enabled="{= ${ide>/diagnoseTargets}.length > 0 }"
+                        tooltip="{= ${ide>/diagnoseTargets}.length > 0 ? '' : ${i18n>noDiagnoseTargets} }" />
+                </items>
+            </SegmentedButton>
             <Label id="newSessionTargetLabel" text="{i18n>newSessionTargetLabel}" labelFor="newSessionTarget" required="true" />
             <Select
                 id="newSessionTarget"
@@ -25,9 +40,14 @@
                 selectedKey="{ide>/newSession/target}"
                 valueState="{ide>/newSession/targetState}"
                 valueStateText="{i18n>targetRequired}"
-                items="{ide>/targets}">
+                items="{ide>/newSession/targets}">
                 <core:Item key="{ide>}" text="{ide>}" />
             </Select>
+            <MessageStrip
+                id="newSessionDiagnoseHint"
+                visible="{= ${ide>/newSession/type} === 'diagnose' }"
+                text="{i18n>newSessionDiagnoseHint}"
+                showIcon="true" />
         </form:SimpleForm>
         <beginButton>
             <Button id="newSessionCreate" text="{i18n>create}" type="Emphasized" press=".onNewSessionCreate" />

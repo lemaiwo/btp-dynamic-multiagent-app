@@ -15,7 +15,20 @@
     <core:InvisibleText id="chatListLabel" text="{i18n>chatListLabel}" />
     <core:InvisibleText id="chatInputLabel" text="{i18n>chatInputLabel}" />
 
-    <!-- Stage bar: six tokens, done / current / upcoming -->
+    <!-- Diagnose sessions say up front what the AI model sees and what is kept: unmasked and stored
+         for 14 days by default. A session that says `masked: true` is on a target that lost its
+         non-production flag: the server refuses its runs and live reads (409
+         target_not_non_production), so the strip is a warning that says so and what stays. With
+         an icon, so its meaning does not rest on colour. -->
+    <MessageStrip
+        id="diagnoseBanner"
+        class="sapUiTinyMarginBeginEnd sapUiTinyMarginBottom"
+        type="{= ${ide>/session/masked} === true ? 'Warning' : 'Information' }"
+        showIcon="true"
+        visible="{= ${ide>/session/type} === 'diagnose' }"
+        text="{= ${ide>/session/masked} === true ? ${i18n>diagnoseBannerMasked} : ${i18n>diagnoseBanner} }" />
+
+    <!-- Stage bar: six tokens, done / current / upcoming; a diagnose session has the single step Investigate -->
     <HBox
         id="stageBar"
         class="ideStageBar sapUiTinyMarginBeginEnd"
@@ -38,6 +51,7 @@
             icon="sap-icon://accept"
             enabled="{ide>/assistant/canApprove}"
             tooltip="{ide>/assistant/approveTooltip}"
+            visible="{= ${ide>/session/type} !== 'diagnose' }"
             press=".onApprove" />
         <Button
             id="reviseButton"
@@ -45,7 +59,26 @@
             icon="sap-icon://edit"
             enabled="{ide>/assistant/canRevise}"
             tooltip="{ide>/assistant/reviseTooltip}"
+            visible="{= ${ide>/session/type} !== 'diagnose' }"
             press=".onRevise" />
+        <!-- Diagnose sessions: no stages to approve; write the report, then hand it over to a change session. -->
+        <Button
+            id="reportButton"
+            text="{i18n>reportButton}"
+            type="Emphasized"
+            icon="sap-icon://document-text"
+            enabled="{ide>/assistant/canReport}"
+            tooltip="{ide>/assistant/reportTooltip}"
+            visible="{= ${ide>/session/type} === 'diagnose' }"
+            press=".onReport" />
+        <Button
+            id="handoverButton"
+            text="{i18n>handoverButton}"
+            icon="sap-icon://forward"
+            enabled="{ide>/assistant/canHandover}"
+            tooltip="{ide>/assistant/handoverTooltip}"
+            visible="{= ${ide>/session/type} === 'diagnose' }"
+            press=".onHandover" />
         <ToolbarSpacer />
         <Button
             id="stopButton"
@@ -67,14 +100,14 @@
         <List
             id="chatList"
             showSeparators="Inner"
-            noDataText="{i18n>chatEmpty}"
+            noDataText="{= ${ide>/session/type} === 'diagnose' ? ${i18n>chatEmptyDiagnose} : ${i18n>chatEmpty} }"
             ariaLabelledBy="chatListLabel"
             items="{ path: 'ide>/messages', key: 'id' }">
             <CustomListItem class="ideChatItem">
                 <VBox class="ideChatMessage">
                     <HBox alignItems="Center">
                         <Label
-                            text="{= ${ide>isUser} ? ${i18n>roleUser} : ${i18n>roleAssistant} }"
+                            text="{= ${ide>isUser} ? ${i18n>roleUser} : ${ide>role} === 'system' ? ${i18n>roleSystem} : ${i18n>roleAssistant} }"
                             design="Bold"
                             class="sapUiTinyMarginEnd" />
                         <ObjectStatus
@@ -87,6 +120,9 @@
                 </VBox>
             </CustomListItem>
         </List>
+
+        <!-- Diagnose sessions: trace requests waiting for the user's decision, and the decided ones -->
+        <core:Fragment fragmentName="com.agent.ide.fragment.ApprovalCard" type="XML" />
 
         <!-- The answer being streamed: re-rendered at most once per animation frame -->
         <VBox id="streamBubble" class="ideChatMessage ideStreamBubble" visible="{ide>/assistant/running}">
@@ -101,6 +137,16 @@
             <core:HTML id="streamHtml" content="{ide>/run/html}" preferDOM="false" />
         </VBox>
 
+        <!-- A remark of the run that is not a failure (no diagnose server, conventions not loaded) -->
+        <MessageStrip
+            id="runWarning"
+            class="sapUiSmallMargin"
+            type="Warning"
+            showIcon="true"
+            showCloseButton="true"
+            text="{ide>/run/warning}"
+            visible="{= !!${ide>/run/warning} }"
+            close=".onRunWarningClose" />
         <MessageStrip
             id="runError"
             class="sapUiSmallMargin"
@@ -151,7 +197,7 @@
                                 tooltip="{ide>status}" />
                             <ObjectStatus
                                 class="sapUiTinyMarginEnd"
-                                text="{i18n>activityRefused}"
+                                text="{ide>refusedText}"
                                 state="Warning"
                                 visible="{ide>refused}" />
                             <Text text="{ide>agent}" class="ideActivityAgent" />

@@ -201,6 +201,11 @@ class WorkspaceScope:
     # ``[{path, state}]`` the workspace save reported, set when the binding
     # ends (``agents.ide.workspace.bound_workspace``).
     changed_files: list[dict] = field(default_factory=list)
+    # Selects the IDE read-only policy (``agents.ide.readonly.POLICIES``):
+    # ``change`` or ``diagnose``. Set by
+    # ``agents.ide.workspace.bound_workspace``; an unknown value makes the
+    # guard refuse every call (deny by default).
+    session_type: str = "change"
 
 
 current_workspace: ContextVar[WorkspaceScope | None] = ContextVar(

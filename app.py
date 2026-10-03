@@ -52,11 +52,17 @@ from agents.db import (  # noqa: E402
     sweep_stale_runs,
     sweep_stale_workflow_runs,
 )
+from agents.ide import approvals as ide_approvals  # noqa: E402
 from agents.ide import runner as ide_runner  # noqa: E402
 from agents.ide.routes import router as ide_router  # noqa: E402
 from agents.ide.seed import ensure_ide_seed  # noqa: E402
 from agents.ide.store import (  # noqa: E402
+    APPROVAL_TTL_MIN,
+    IDE_AUDIT_RETENTION_DAYS,
+    IDE_DIAGNOSE_RETENTION_DAYS,
     IDE_SESSION_RETENTION_DAYS,
+    expire_pending_approvals,
+    purge_audit_older_than,
     purge_sessions_older_than,
     reset_running_ide_sessions,
 )
@@ -138,11 +144,63 @@ async def _token_keepwarm(interval: float) -> None:
 
 
 async def _purge_ide_sessions() -> int:
-    """One retention pass; 0 days disables it."""
-    if IDE_SESSION_RETENTION_DAYS < 1:
-        return 0
-    async with SessionLocal() as session:
-        return await purge_sessions_older_than(session, IDE_SESSION_RETENTION_DAYS)
+    """One retention pass; returns the number of sessions deleted.
+
+    Change sessions age from their last activity, diagnose sessions from
+    creation (a hard data limit), the audit log has its own clock, stale
+    pending approvals are expired and approvals left without an outcome are
+    closed. Each pass has its own 0-disables switch,
+    its own DB session and its own error handling, so one failing pass cannot
+    skip the others.
+    """
+    purged = 0
+
+    async def _pass(label: str, enabled: bool, fn) -> int:
+        if not enabled:
+            return 0
+        try:
+            async with SessionLocal() as session:
+                n = await fn(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning("IDE retention pass '%s' failed", label, exc_info=True)
+            return 0
+        if n:
+            logger.info("IDE retention: %s: %d", label, n)
+        return n
+
+    purged += await _pass(
+        "change sessions purged",
+        IDE_SESSION_RETENTION_DAYS >= 1,
+        lambda s: purge_sessions_older_than(s, IDE_SESSION_RETENTION_DAYS),
+    )
+    purged += await _pass(
+        "diagnose sessions purged",
+        IDE_DIAGNOSE_RETENTION_DAYS >= 1,
+        lambda s: purge_sessions_older_than(
+            s, IDE_DIAGNOSE_RETENTION_DAYS, session_type="diagnose", by="created_at"
+        ),
+    )
+    await _pass(
+        "audit rows purged",
+        IDE_AUDIT_RETENTION_DAYS >= 1,
+        lambda s: purge_audit_older_than(s, IDE_AUDIT_RETENTION_DAYS),
+    )
+    await _pass(
+        "approvals expired",
+        APPROVAL_TTL_MIN >= 1,
+        lambda s: expire_pending_approvals(s, older_than_min=APPROVAL_TTL_MIN),
+    )
+    # Approved, but the ARC-1 call never reported back (a crash or redeploy
+    # mid-call): closed as failed/interrupted with a trace_failed audit row.
+    # Always on -- it only touches rows older than the arm timeout.
+    await _pass(
+        "interrupted approvals closed",
+        True,
+        ide_approvals.sweep_interrupted,
+    )
+    return purged
 
 
 async def _ide_purge_loop(interval: float) -> None:
@@ -181,9 +239,24 @@ async def lifespan(app: FastAPI):
         )
     if ide_reset:
         logger.info("Reset %d ghost IDE session(s) to idle", ide_reset)
-    purged = await _purge_ide_sessions()
-    if purged:
-        logger.info("Purged %d old IDE session(s) at startup", purged)
+    if IDE_DIAGNOSE_RETENTION_DAYS < 1:
+        # Allowed, but nobody should find out by accident: diagnose sessions
+        # store raw dump and trace text of their (non-production) target.
+        logger.warning(
+            "IDE_DIAGNOSE_RETENTION_DAYS is %d: diagnose sessions are never "
+            "purged, so the raw dump and trace text they store is kept until "
+            "each session is deleted by hand",
+            IDE_DIAGNOSE_RETENTION_DAYS,
+        )
+    try:
+        purged = await _purge_ide_sessions()
+        if purged:
+            logger.info("Purged %d old IDE session(s) at startup", purged)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        # Housekeeping must never keep the app from starting.
+        logger.warning("IDE startup purge failed", exc_info=True)
     if swept:
         logger.info("Marked %d ghost job run(s) as interrupted", swept)
     if swept_wf:
@@ -211,6 +284,19 @@ async def lifespan(app: FastAPI):
     await cancel_all_runs()
     await cancel_all_workflow_runs()
     await ide_runner.cancel_all()
+    # An approved trace whose ARC-1 call is in flight runs in its own task,
+    # not in a run: let it record its outcome (armed / failed) rather than
+    # leave the approval `approved` with nothing behind it. Each call is
+    # bounded by ARM_TIMEOUT_S, so this wait is too.
+    try:
+        await asyncio.wait_for(
+            ide_approvals.drain(), ide_approvals.ARM_TIMEOUT_S + 5
+        )
+    except TimeoutError:
+        logger.warning(
+            "IDE approval call(s) still running at shutdown; the next start "
+            "closes them as interrupted"
+        )
     logger.info("Application shutdown complete")
 
 

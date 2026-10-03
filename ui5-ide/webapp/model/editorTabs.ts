@@ -1,6 +1,6 @@
 import { ValueState } from "sap/ui/core/library";
 import { renderDiffHtml, sideBySide, type DiffLabels } from "./diffModel";
-import type { FileDetail, Finding } from "../service/types";
+import type { FileDetail, LintFinding } from "../service/types";
 
 export type EditorMode = "source" | "proposed" | "diff";
 
@@ -30,9 +30,15 @@ export interface EditorTab {
     text: string;
     /** The side-by-side diff, rendered only in diff mode. */
     diffHtml: string;
-    lint: Finding[];
+    lint: LintFinding[];
     lintSummary: string;
     lintState: ValueState;
+    /** The source line (one-based) of the finding this tab was opened for; `null` when none. */
+    findingLine: number | null;
+    /** The line the editor highlights right now (`findingLine` clamped, Source mode only). */
+    markedLine: number | null;
+    /** Shown above the source when the finding's line cannot be mapped to it. */
+    findingHint: string;
     // document tab
     docKind: string;
     versions: DocVersion[];
@@ -52,6 +58,7 @@ const BLANK: EditorTab = {
     key: "", kind: "file", title: "", subtitle: "", busy: false,
     path: "", mode: "source", origin: "", proposed: "", hasProposal: false, isObject: false,
     editorType: "text", text: "", diffHtml: "", lint: [], lintSummary: "", lintState: ValueState.None,
+    findingLine: null, markedLine: null, findingHint: "",
     docKind: "", versions: [], artifactId: "", html: ""
 };
 

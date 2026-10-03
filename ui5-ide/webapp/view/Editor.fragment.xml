@@ -42,9 +42,14 @@
         <TabContainerItem key="{ide>key}" name="{ide>title}" additionalText="{ide>subtitle}">
             <content>
                 <VBox class="ideEditorTab" width="100%" height="100%" busy="{ide>busy}" busyIndicatorDelay="0">
-                    <!-- File tab -->
+                    <!-- The line the editor highlights for a finding ("" when none): read by the tests. -->
+                    <customData>
+                        <core:CustomData key="finding-line" value="{= ${ide>markedLine} ? '' + ${ide>markedLine} : '' }" writeToDom="true" />
+                    </customData>
+                    <!-- File tab. A diagnose session proposes nothing: no Source / Proposed / Diff and no Lint there. -->
                     <OverflowToolbar visible="{= ${ide>kind} === 'file' }" style="Clear">
                         <SegmentedButton
+                            visible="{= ${ide>/session/type} !== 'diagnose' }"
                             selectedKey="{ide>mode}"
                             selectionChange=".onEditorModeChange"
                             ariaLabelledBy="editorTitle">
@@ -60,13 +65,14 @@
                         <ToolbarSpacer />
                         <ObjectStatus
                             text="{ path: 'ide>lintSummary' }"
-                            visible="{= !!${ide>lintSummary} }"
+                            visible="{= !!${ide>lintSummary} &amp;&amp; ${ide>/session/type} !== 'diagnose' }"
                             state="{ide>lintState}" />
                         <Button
                             id="lintButton"
                             text="{i18n>lintButton}"
                             icon="sap-icon://quality-issue"
                             tooltip="{i18n>lintTooltip}"
+                            visible="{= ${ide>/session/type} !== 'diagnose' }"
                             enabled="{ide>isObject}"
                             press=".onLintFile">
                             <layoutData>
@@ -85,6 +91,12 @@
                             </layoutData>
                         </Button>
                     </OverflowToolbar>
+                    <MessageStrip
+                        visible="{= ${ide>kind} === 'file' &amp;&amp; !!${ide>findingHint} }"
+                        text="{ide>findingHint}"
+                        type="Information"
+                        showIcon="true"
+                        class="sapUiTinyMargin" />
                     <codeeditor:CodeEditor
                         visible="{= ${ide>kind} === 'file' &amp;&amp; ${ide>mode} !== 'diff' }"
                         type="{ide>editorType}"
@@ -107,7 +119,7 @@
                         </core:layoutData>
                     </core:HTML>
 
-                    <!-- Document tab (design / plan / note / review artifact) -->
+                    <!-- Document tab (design / plan / note / review / report artifact) -->
                     <OverflowToolbar visible="{= ${ide>kind} === 'doc' }" style="Clear">
                         <Label text="{i18n>versionLabel}" />
                         <Select

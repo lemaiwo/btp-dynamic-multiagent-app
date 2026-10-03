@@ -30,3 +30,28 @@ def test_ide_env_vars_are_quoted_strings():
     assert props, "no IDE_* properties in mta.yaml"
     for key, value in props.items():
         assert isinstance(value, str), (key, value)
+
+
+def test_mta_version_is_2_18_0():
+    mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
+    assert mta["version"] == "2.18.0"
+
+
+def test_every_ide_property_is_read_by_the_app():
+    """A descriptor property nobody reads is a setting that silently does nothing."""
+    names = [k for k in _app_properties() if k.startswith("IDE_")]
+    sources = [ROOT / "app.py", *(ROOT / "agents").rglob("*.py")]
+    code = "\n".join(p.read_text() for p in sources)
+    unread = [n for n in names if n not in code]
+    assert not unread, unread
+
+
+def test_python_module_archive_excludes_local_only_folders():
+    """docs/, memory/, .sdd/ and tests/ hold landscape- and customer-specific
+    material (docs/ and memory/ are gitignored); a local ``mbt build`` must not
+    pack them into the app droplet."""
+    mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
+    module = next(m for m in mta["modules"] if m["type"] == "python")
+    ignore = module["build-parameters"]["ignore"]
+    for entry in ("docs/", "memory/", ".sdd/", "tests/", "CLAUDE.local.md"):
+        assert entry in ignore, entry

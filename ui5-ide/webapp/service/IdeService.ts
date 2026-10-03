@@ -1,7 +1,8 @@
 import SseParser from "./SseParser";
 import type {
-    AdminSessionRow, Artifact, ArtifactKind, Conventions, FileDetail, FileSummary, Finding, Me,
-    Message, ObjectHit, Session, SessionDetail, SessionSummary, SseEvent
+    AdminSessionRow, Approval, ApprovalDecision, Artifact, ArtifactKind, Conventions, DiagnoseFinding,
+    FileDetail, FileSummary, FindingDetail, FindingOpen, LintFinding, Me, Message, ObjectHit, Session,
+    SessionDetail, SessionSummary, SessionType, SseEvent
 } from "./types";
 
 /**
@@ -49,7 +50,7 @@ export type SseHandler = (event: SseEvent) => void;
  * Every path is *relative* (`backend/...`, never `/backend/...`) so the same
  * build runs behind the standalone approuter and behind a Work Zone site.
  *
- * The two run routes answer with `text/event-stream` to a POST, which
+ * The run routes answer with `text/event-stream` to a POST, which
  * `EventSource` cannot send; they are read with `fetch` and the body's
  * `ReadableStream` reader instead, through {@link SseParser}.
  */
@@ -160,8 +161,9 @@ export default class IdeService {
         return this.request<SessionSummary[]>("sessions");
     }
 
-    public createSession(title: string, target: string): Promise<Session> {
-        return this.request<Session>("sessions", { method: "POST", ...IdeService.json({ title, target }) });
+    /** A `diagnose` session needs a `non_production` target (422 `target_not_non_production`). */
+    public createSession(title: string, target: string, type: SessionType = "change"): Promise<Session> {
+        return this.request<Session>("sessions", { method: "POST", ...IdeService.json({ title, target, type }) });
     }
 
     public getSession(sid: string): Promise<SessionDetail> {
@@ -215,8 +217,8 @@ export default class IdeService {
     }
 
     /** Offline SAPLint on the proposed source. */
-    public lintFile(sid: string, path: string): Promise<Finding[]> {
-        return this.request<Finding[]>(`${IdeService.sid(sid)}/file/lint${IdeService.pathQuery(path)}`, { method: "POST" });
+    public lintFile(sid: string, path: string): Promise<LintFinding[]> {
+        return this.request<LintFinding[]>(`${IdeService.sid(sid)}/file/lint${IdeService.pathQuery(path)}`, { method: "POST" });
     }
 
     /** Reads an ABAP object into the workspace (state `read`). */
@@ -229,6 +231,66 @@ export default class IdeService {
         // URLSearchParams encodes `*` as-is and spaces as `+`; both are what
         // FastAPI's query parser expects.
         return this.request<ObjectHit[]>(`objects/search?${params.toString()}`);
+    }
+
+    // --- Diagnose: report handover, findings, approvals ------------------------
+    /**
+     * Opens a new **change** session on the same target with the diagnose
+     * session's `report` as its first artifact. Refusals are all 409, in
+     * this order: `not_diagnose`, `target_not_non_production` (the target
+     * lost its flag), `run_in_progress`, `missing_artifact` (no report yet).
+     */
+    public handover(sid: string): Promise<Session> {
+        return this.request<Session>(`${IdeService.sid(sid)}/handover`, { method: "POST" });
+    }
+
+    /** Newest first; the metadata, without the detail text. */
+    public listFindings(sid: string): Promise<DiagnoseFinding[]> {
+        return this.request<DiagnoseFinding[]>(`${IdeService.sid(sid)}/findings`);
+    }
+
+    /**
+     * The finding plus its detail text as kept with the session; `refresh`
+     * reads the text again from SAP (424/502 when ARC-1 fails, 422
+     * `no_detail` when SAP has no text for it). 409
+     * `target_not_non_production` once the target lost its flag, with or
+     * without `refresh`.
+     */
+    public getFinding(sid: string, fid: string, refresh = false): Promise<FindingDetail> {
+        return this.request<FindingDetail>(
+            `${IdeService.sid(sid)}/findings/${encodeURIComponent(fid)}${refresh ? "?refresh=true" : ""}`);
+    }
+
+    /**
+     * Reads the finding's program into the workspace; 422 `no_source` when it
+     * has none, 409 `target_not_non_production` when the target lost its flag.
+     */
+    public openFinding(sid: string, fid: string): Promise<FindingOpen> {
+        return this.request<FindingOpen>(`${IdeService.sid(sid)}/findings/${encodeURIComponent(fid)}/open`, { method: "POST" });
+    }
+
+    /** Newest first. The server may close interrupted approvals while listing: show what it answers. */
+    public listApprovals(sid: string): Promise<Approval[]> {
+        return this.request<Approval[]>(`${IdeService.sid(sid)}/approvals`);
+    }
+
+    /**
+     * Approves or denies a pending trace request and answers the decided
+     * approval: a plain JSON answer, no stream, and no run is resumed by it.
+     * The caller shows the decision from this answer (or from
+     * {@link listApprovals}). A 200 can carry `status: "failed"` with an
+     * `error_code` (arming did not work), and `approved` without a `result`
+     * (outcome unknown). Refusals carry `code`: 409 `approval_not_pending` /
+     * `not_diagnose` / `unknown_trace_request`, 403
+     * `target_not_non_production` (an approve only: a deny of a pending
+     * approval is never refused for the flag), 410 `approval_expired`, 424
+     * `user_token_required` / `arc1_not_configured` (nothing was decided).
+     * The server writes no chat message for a decision.
+     */
+    public decideApproval(sid: string, aid: string, decision: ApprovalDecision): Promise<Approval> {
+        return this.request<Approval>(`${IdeService.sid(sid)}/approvals/${encodeURIComponent(aid)}`, {
+            method: "POST", ...IdeService.json({ decision })
+        });
     }
 
     // --- Conventions ---------------------------------------------------------
@@ -279,6 +341,15 @@ export default class IdeService {
      */
     public streamRevise(sid: string, feedback: string, onEvent: SseHandler, signal?: AbortSignal): Promise<void> {
         return this.stream(`${IdeService.sid(sid)}/revise`, { feedback }, onEvent, signal);
+    }
+
+    /**
+     * Diagnose sessions only (409 `not_diagnose`): writes the `report`
+     * artifact and streams the run as {@link streamMessage} does, with the
+     * same abort caveat.
+     */
+    public streamReport(sid: string, onEvent: SseHandler, signal?: AbortSignal): Promise<void> {
+        return this.stream(`${IdeService.sid(sid)}/report`, {}, onEvent, signal);
     }
 
     private async stream(path: string, body: unknown, onEvent: SseHandler, signal?: AbortSignal): Promise<void> {

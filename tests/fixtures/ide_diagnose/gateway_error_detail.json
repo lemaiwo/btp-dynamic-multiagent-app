@@ -1,0 +1,13 @@
+{
+  "id": "0A1B2C3D4E5F",
+  "detailUrl": "/sap/bc/adt/gw/errorlog/0A1B2C3D4E5F?user=DEVUSER01&mail=jane.doe@example.com",
+  "errorType": "Frontend Error",
+  "service": "ZDEMO_SRV",
+  "user": "DEVUSER01",
+  "timestamp": "2026-10-03T10:20:00Z",
+  "message": "Partner 123456789012 not found; contact jane.doe@example.com",
+  "requestBody": "{\"Partner\":\"123456789012\",\"Iban\":\"BE71 0961 2345 6769\",\"Raw\":\"RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789\"}",
+  "callStack": [
+    {"program": "ZCL_DEMO_DPC_EXT==============CP", "include": "ZCL_DEMO_DPC_EXT==============CM002", "line": 31}
+  ]
+}

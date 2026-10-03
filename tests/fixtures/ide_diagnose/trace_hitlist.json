@@ -1,0 +1,22 @@
+{
+  "id": "ATRA_20261003_101500_0001",
+  "hitlist": [
+    {
+      "callingProgram": "ZDEMO_REPORT",
+      "calledProgram": "ZCL_DEMO_CALC=================CP",
+      "description": "Call M ZCL_DEMO_CALC=>DIVIDE (user DEVUSER01, partner 123456789012)",
+      "grossTime": 123456789,
+      "netTime": 2345,
+      "hits": 3
+    },
+    {
+      "callingProgram": "ZCL_DEMO_CALC=================CP",
+      "calledProgram": "ZDEMO_T",
+      "description": "Select ZDEMO_T where mail = jane.doe@example.com and iban = BE71 0961 2345 6769 raw RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789",
+      "grossTime": 9000,
+      "netTime": 9000,
+      "hits": 1
+    }
+  ],
+  "createdBy": "DEVUSER01"
+}

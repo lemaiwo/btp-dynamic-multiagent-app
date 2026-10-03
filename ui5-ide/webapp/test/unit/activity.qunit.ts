@@ -88,3 +88,19 @@ QUnit.test("a stored activity keeps the refusal code", function (assert) {
     state.load({ events: [{ ts: "t", agent: "a", kind: "tool", id: "1", tool: "SAPWrite", detail: "", status: "error", code: "readonly_refused" }] });
     assert.strictEqual(eventRows(state.events)[0].refused, true);
 });
+
+QUnit.test("a trace proposal that was not stored is a refusal row with its own label", function (assert) {
+    const codes = ["too_many_pending", "unknown_trace_request", "target_not_non_production", "not_diagnose", "invalid_request", "proposal_failed"];
+    const rows = eventRows(codes.map((code, i) => (
+        { ts: "t", agent: "a", kind: "tool", id: String(i), tool: "SAPDiagnose", detail: "trace_start", status: "error", output: "Proposal refused", code }
+    )));
+    assert.deepEqual(rows.map((r) => r.refused), codes.map(() => true));
+    assert.deepEqual(rows.map((r) => r.state), codes.map(() => "Warning"));
+    assert.deepEqual(rows.map((r) => r.refusedKey), [
+        "activityProposalTooManyPending", "activityProposalUnknownRequest", "activityProposalNotNonProd",
+        "activityProposalNotDiagnose", "activityProposalInvalid", "activityProposalFailed"
+    ]);
+    const guard = eventRows([{ ts: "t", agent: "a", kind: "tool", id: "g", tool: "SAPWrite", detail: "", status: "error", code: "readonly_refused" }]);
+    assert.strictEqual(guard[0].refusedKey, "activityRefused");
+    assert.strictEqual(eventRows([{ ts: "t", agent: "a", kind: "tool", id: "o", tool: "SAPRead", detail: "", status: "ok" }])[0].refusedKey, "");
+});

@@ -1,7 +1,7 @@
 import {
-    canApprove, canRevise, canSend, nextStage, stageTokens, STAGES
+    canApprove, canHandover, canReport, canRevise, canSend, nextStage, stageTokens, stagesFor, STAGES
 } from "com/agent/ide/model/stageGate";
-import type { ArtifactKind, FileState, Stage } from "com/agent/ide/service/types";
+import type { ArtifactKind, FileState, SessionType, Stage } from "com/agent/ide/service/types";
 
 function session(stage: Stage, status: "idle" | "running" = "idle"): { stage: Stage; status: "idle" | "running" } {
     return { stage, status };
@@ -90,4 +90,50 @@ QUnit.test("tokens are done before the current stage and upcoming after it", fun
     ]);
     assert.deepEqual(stageTokens("done").map((t) => t.state), ["done", "done", "done", "done", "done", "current"]);
     assert.ok(stageTokens(null).every((t) => t.state === "upcoming"), "no session: all upcoming");
+});
+
+QUnit.module("stageGate: diagnose sessions (plan 1c §1.1)");
+
+function diag(status: "idle" | "running" = "idle", stage: Stage = "investigate"): { stage: Stage; status: "idle" | "running"; type: SessionType } {
+    return { stage, status, type: "diagnose" };
+}
+
+QUnit.test("stagesFor: change walks six stages, diagnose has investigate only", function (assert) {
+    assert.deepEqual(stagesFor("change"), STAGES);
+    assert.deepEqual(stagesFor("diagnose"), ["investigate"]);
+    assert.deepEqual(stagesFor(undefined), STAGES, "no type reads as change");
+});
+
+QUnit.test("diagnose: the stage bar is the single step investigate, current", function (assert) {
+    assert.deepEqual(stageTokens("investigate", "diagnose"), [{ stage: "investigate", state: "current" }]);
+    assert.deepEqual(stageTokens(null, "diagnose"), [{ stage: "investigate", state: "upcoming" }]);
+    assert.strictEqual(stageTokens("chat", "change").length, 6, "a change session keeps its six tokens");
+});
+
+QUnit.test("diagnose: approve and revise are refused with their own reasons", function (assert) {
+    assert.deepEqual(canApprove(diag(), [], []), { ok: false, reasonKey: "gateDiagnoseNoApprove" });
+    assert.deepEqual(canRevise(diag()), { ok: false, reasonKey: "gateDiagnoseNoRevise" });
+    assert.deepEqual(canApprove(diag("running"), [], []), { ok: false, reasonKey: "gateDiagnoseNoApprove" });
+});
+
+QUnit.test("diagnose: send is allowed in investigate unless running", function (assert) {
+    assert.deepEqual(canSend(diag()), { ok: true });
+    assert.deepEqual(canSend(diag("running")), { ok: false, reasonKey: "gateRunInProgress" });
+});
+
+QUnit.test("canReport: diagnose and idle only", function (assert) {
+    assert.deepEqual(canReport(diag()), { ok: true });
+    assert.deepEqual(canReport(diag("running")), { ok: false, reasonKey: "gateRunInProgress" });
+    assert.deepEqual(canReport({ stage: "chat", status: "idle", type: "change" }), { ok: false, reasonKey: "gateNotDiagnose" });
+    assert.deepEqual(canReport(null), { ok: false, reasonKey: "gateNoSession" });
+});
+
+QUnit.test("canHandover: diagnose, idle and at least one report", function (assert) {
+    assert.deepEqual(canHandover(diag(), []), { ok: false, reasonKey: "gateNeedsReportToHandOver" });
+    assert.deepEqual(canHandover(diag(), art("note")), { ok: false, reasonKey: "gateNeedsReportToHandOver" });
+    assert.deepEqual(canHandover(diag(), art("report")), { ok: true });
+    assert.deepEqual(canHandover(diag("running"), art("report")), { ok: false, reasonKey: "gateRunInProgress" });
+    assert.deepEqual(canHandover({ stage: "chat", status: "idle", type: "change" }, art("report")),
+        { ok: false, reasonKey: "gateNotDiagnose" });
+    assert.deepEqual(canHandover(null, art("report")), { ok: false, reasonKey: "gateNoSession" });
 });

@@ -1,4 +1,4 @@
-import { errorText, gateErrorText, runErrorText } from "com/agent/ide/model/errorText";
+import { errorText, gateErrorText, runErrorText, runNoteText } from "com/agent/ide/model/errorText";
 import { IdeError } from "com/agent/ide/service/IdeService";
 import ResourceModel from "sap/ui/model/resource/ResourceModel";
 
@@ -108,4 +108,28 @@ QUnit.test("stream error events: incomplete, timeout, failed, usage, token, SAP 
     assert.strictEqual(runErrorText({ message: "Agent is missing." , code: "agent_missing" }, text), "Agent is missing.");
     assert.strictEqual(runErrorText({ message: "plain" }, text), "plain");
     assert.strictEqual(runErrorText({ message: "no", code: "readonly_refused" }, text), text("readOnlyRefused"));
+});
+
+QUnit.test("target_not_non_production has its own sentence, whatever the status; run notes have theirs", function (assert) {
+    const expected = text("targetNotNonProd");
+    assert.strictEqual(errorText(new IdeError(403, "The target is not flagged non-production.", "target_not_non_production"), text), expected);
+    assert.strictEqual(gateErrorText(new IdeError(409, "x", "target_not_non_production"), text), expected);
+    assert.strictEqual(gateErrorText(new IdeError(409, "x", "not_diagnose"), text), text("gateNotDiagnose"));
+    assert.strictEqual(runNoteText({ code: "no_diagnose_server", message: "server text" }, text),
+        "No ARC-1 server of this agent matches the session target — diagnostics tools are unavailable.");
+    assert.ok(runNoteText({ code: "conventions_unavailable", message: "server text" }, text).includes("conventions"));
+    assert.strictEqual(runNoteText({ code: "other", message: "server text" }, text), "server text");
+});
+
+QUnit.test("a 424 is mapped by its code: only a missing user token asks to sign in again", function (assert) {
+    const notConfigured = errorText(new IdeError(424, "No ARC-1 server is configured for target X", "arc1_not_configured"), text);
+    assert.strictEqual(notConfigured, text("arc1NotConfigured"));
+    assert.notOk(/reload|sign in/i.test(notConfigured), "signing in again does not help there");
+    assert.ok(/administrator/i.test(notConfigured), "it points at the administrator");
+    assert.strictEqual(errorText(new IdeError(424, "No user token"), text), text("userTokenRequired"), "a 424 without a code is the user token");
+    assert.strictEqual(errorText(new IdeError(424, "Something else", "other_dependency"), text),
+        text("requestFailed", ["Something else"]), "an unknown 424 code shows the server's detail");
+    assert.strictEqual(runErrorText({ message: "not configured", code: "arc1_not_configured" }, text), text("arc1NotConfigured"),
+        "the stream's error frame too");
+    assert.strictEqual(gateErrorText(new IdeError(424, "x", "arc1_not_configured"), text), text("arc1NotConfigured"));
 });

@@ -15,6 +15,54 @@ Authorization rules (contract §1.2):
   never messages, artifacts or sources.
 - ``StageGateError`` maps to 409 ``{"detail", "code"}`` (429 for
   ``usage_exhausted``); unknown codes keep the server message.
+- A **diagnose** session (``type`` on ``POST /sessions``) is created only on
+  a target whose conventions carry ``non_production``. The flag is read from
+  the conventions row on every create, never taken from the request: 422
+  ``target_not_non_production`` otherwise. Only an admin can set the flag
+  (``PUT /conventions/{target}``); the body takes a strict boolean.
+- ``POST .../handover`` starts a change session for the **caller** on the
+  **same target** as the owned diagnose session and copies its latest
+  ``report`` artifact, nothing else (no messages, files, findings). The
+  owner check comes first; then 409 ``not_diagnose`` / ``run_in_progress`` /
+  ``missing_artifact``.
+  A target that lost its ``non_production`` flag answers 409
+  ``target_not_non_production``: the report of a raw run stays where it is.
+- Every ``Session`` carries ``masked``: ``diagnose.masking_required`` of the
+  target's conventions as they are now, so the UI words its banner from the
+  same switch the run uses.
+- **A diagnose session whose target lost the flag** (``masked`` is true: the
+  flag was taken away, or the conventions row is gone) reads nothing from
+  SAP any more. 409 ``target_not_non_production`` (``_refuse_lost_flag``)
+  for: message and report runs (``stages.assert_can_run`` and the runner's
+  own check, both before the stream opens), the finding detail -- stored
+  text and live read alike -- and "open", and file refresh, lint and
+  ``POST .../open``. Nothing is sent to ARC-1. Still served: the session,
+  its messages, artifacts, files and the finding list (this app's own
+  rows), the approval list, a *denial*, and delete. A change session never
+  looks at the flag.
+- **Findings** (``/sessions/{sid}/findings...``): the owner check comes
+  first, then the finding is looked up by id *and* session id, so a finding
+  of any other session is 404. The list is metadata only. The detail route
+  answers only while the target is ``non_production`` (``masking_required``
+  is false *now*; 409 otherwise, see above): the text stored with the
+  finding, or -- when none is stored and on ``?refresh=true`` -- the text
+  re-read live through ``Arc1Client`` with the diagnose policy and
+  ``masking=masking_required(conventions)``, so the client's policy check
+  always applies and it fails towards masking. The ARC-1
+  arguments are built here from the finding's kind and ``ref_id`` alone. A
+  detail read writes nothing. "Open" maps the finding's program/include to
+  an object (``paths.resolve_include``) and reads it like ``POST .../open``;
+  422 ``no_source`` when there is nothing to map.
+
+- **Approvals** (``/sessions/{sid}/approvals...``): the list is owner-scoped
+  like every session route. A decision is taken as the verified caller and
+  carries nothing but ``approve`` or ``deny``; ``approvals.decide`` checks
+  owner, session type, state, age and the target's flag at that moment and
+  is the only caller of ARC-1's ``trace_start``/``trace_cancel``. No run is
+  resumed (the agent proposes and its run ends; the next run reads the
+  outcome from its instructions), so a decision is possible while a run is
+  in progress. ``ApprovalError`` and ``Arc1Error`` answer ``{detail,
+  code}`` with their own status.
 
 - Workspace files, open, search and lint call ARC-1 through
   ``agents.ide.arc1`` as the signed-in user; the client checks
@@ -25,7 +73,7 @@ Authorization rules (contract §1.2):
   refused, 424 not configured or no user token, 502 ARC-1/destination
   failure or an ARC-1 error payload, 413 source larger than 1 MB).
 
-Stage runs (``POST .../messages``, ``.../revise``) stream server-sent
+Stage runs (``POST .../messages``, ``.../revise``, ``.../report``) stream server-sent
 events (contract §1.3, ``agents.ide.sse``). Ownership is checked and the DB
 session closed before the run starts; ``runner.run_stage`` then runs in its
 own task, created inside the request context so ``current_jwt`` /
@@ -45,27 +93,39 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.auth import current_principal, get_validator, require_admin, require_developer
 from agents.db import SessionLocal
-from agents.ide import arc1, paths, runner, sse, store
+from agents.ide import approvals, arc1, findings, paths, runner, sse, store
+from agents.ide.diagnose import masking_required
 from agents.ide.models import (
     IDE_CHILD_MODELS,
     IdeArtifact,
     IdeConventions,
+    IdeFinding,
     IdeMessage,
     IdeSession,
     IdeWorkspaceFile,
 )
-from agents.ide.stages import StageGateError, approve, request_cap
+from agents.ide.stages import (
+    CHANGE,
+    DIAGNOSE,
+    REPORT_KIND,
+    StageGateError,
+    approve,
+    initial_stage,
+    lost_flag_error,
+    request_cap,
+)
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +184,7 @@ class SessionCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str
     target: str = Field(pattern=_TARGET_PATTERN)
+    type: Literal["change", "diagnose"] = "change"
 
     _title = field_validator("title")(_clean_title)
 
@@ -169,6 +230,8 @@ class ConventionsBody(BaseModel):
     atc_variant: str | None = Field(default=None, max_length=30)
     clean_core_level: str | None = Field(default=None, pattern=r"^[A-D]$")
     free_text: str | None = Field(default=None, max_length=20000)
+    # Strict: "yes" or 1 must not switch a target to raw diagnose data.
+    non_production: StrictBool | None = None
 
 
 class OpenBody(BaseModel):
@@ -184,11 +247,18 @@ def _iso(value) -> str | None:
     return value.isoformat() if value else None
 
 
-def _session_out(row: IdeSession) -> dict[str, Any]:
+def _session_json(row: IdeSession, conventions: IdeConventions | None) -> dict[str, Any]:
     out = row.meta()
     out["requests_used"] = row.requests_used or 0
     out["request_cap"] = request_cap()
+    out["masked"] = masking_required(conventions)
     return out
+
+
+async def _session_out(db: AsyncSession, row: IdeSession) -> dict[str, Any]:
+    """The ``Session`` JSON; ``masked`` follows the target's conventions as
+    they are now (missing conventions read as masked)."""
+    return _session_json(row, await store.get_conventions(db, row.target))
 
 
 def _artifact_summary(row: IdeArtifact) -> dict[str, Any]:
@@ -240,6 +310,7 @@ def _conventions_out(row: IdeConventions) -> dict[str, Any]:
         "atc_variant": row.atc_variant,
         "clean_core_level": row.clean_core_level,
         "free_text": row.free_text,
+        "non_production": row.non_production is True,
         "updated_at": _iso(row.updated_at),
     }
 
@@ -256,8 +327,17 @@ async def me(
     validator = get_validator()
     # A UI hint only; admin routes enforce require_admin themselves.
     is_admin = True if validator is None else bool(validator.has_scope(claims, "admin"))
-    targets = [c.target for c in await store.list_conventions(db)]
-    return {"principal": principal, "is_admin": is_admin, "targets": targets}
+    conventions = await store.list_conventions(db)
+    return {
+        "principal": principal,
+        "is_admin": is_admin,
+        "targets": [c.target for c in conventions],
+        # The only targets a diagnose session is accepted on (a UI hint;
+        # create_session checks the flag itself).
+        "diagnose_targets": [
+            c.target for c in conventions if c.non_production is True
+        ],
+    }
 
 
 # --- sessions ---------------------------------------------------------------
@@ -267,7 +347,9 @@ async def me(
 async def list_sessions(
     principal: str = Depends(_caller), db: AsyncSession = Depends(_db)
 ) -> list[dict[str, Any]]:
-    return [_session_out(s) for s in await store.list_owned_sessions(db, principal)]
+    rows = await store.list_owned_sessions(db, principal)
+    by_target = {c.target: c for c in await store.list_conventions(db)}
+    return [_session_json(s, by_target.get(s.target)) for s in rows]
 
 
 @router.post("/sessions", status_code=201)
@@ -276,12 +358,26 @@ async def create_session(
     principal: str = Depends(_caller),
     db: AsyncSession = Depends(_db),
 ) -> dict[str, Any]:
-    if await store.get_conventions(db, body.target) is None:
+    conv = await store.get_conventions(db, body.target)
+    if conv is None:
         raise HTTPException(status_code=422, detail=f"Unknown target {body.target!r}")
+    # The security control of diagnose sessions: runtime data (dumps, traces)
+    # is only read on a target an admin flagged non-production. Read from the
+    # conventions row just loaded; the body cannot carry the flag.
+    if body.type == DIAGNOSE and conv.non_production is not True:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "Diagnose sessions are only available on targets "
+                          "flagged non-production.",
+                "code": "target_not_non_production",
+            },
+        )
     row = await store.create_session(
-        db, owner=principal, title=body.title, target=body.target
+        db, owner=principal, title=body.title, target=body.target,
+        session_type=body.type,
     )
-    return _session_out(row)
+    return _session_json(row, conv)
 
 
 @router.get("/sessions/{sid}")
@@ -298,7 +394,7 @@ async def get_session(
         )
     ).scalars().all()
     return {
-        **_session_out(row),
+        **await _session_out(db, row),
         "artifacts": [_artifact_summary(a) for a in artifacts],
         "files": [_file_summary(f) for f in files],
     }
@@ -315,7 +411,7 @@ async def patch_session(
     row.title = body.title
     await db.commit()
     await db.refresh(row)
-    return _session_out(row)
+    return await _session_out(db, row)
 
 
 _RUN_IN_PROGRESS = StageGateError(
@@ -382,6 +478,7 @@ async def _stream_run(
     *,
     user_text: str | None,
     feedback: str | None,
+    report: bool = False,
 ):
     session = await _owned(db, sid, principal)
     sid = session.id
@@ -397,7 +494,9 @@ async def _stream_run(
     # current_jwt / current_principal are the caller's for the whole run.
     # Nothing awaits or cancels it on disconnect; it ends with the run.
     task = asyncio.create_task(
-        runner.run_stage(sid, principal, user_text, feedback=feedback, emit=emit),
+        runner.run_stage(
+            sid, principal, user_text, feedback=feedback, emit=emit, report=report
+        ),
         name=f"ide-stream:{sid}",
     )
     _streams[sid] = task
@@ -440,6 +539,91 @@ async def post_revise(
     return await _stream_run(db, sid, principal, user_text=None, feedback=body.feedback)
 
 
+@router.post("/sessions/{sid}/report")
+async def post_report(
+    sid: str, principal: str = Depends(_caller), db: AsyncSession = Depends(_db)
+):
+    """Run the report turn of a diagnose session (SSE) and store its answer
+    as the artifact ``report``. No body: the request text is the server's
+    (``stages.REPORT_REQUEST``). The runner's gate answers 409
+    ``not_diagnose`` for a change session before the stream opens."""
+    return await _stream_run(
+        db, sid, principal, user_text=None, feedback=None, report=True
+    )
+
+
+_NOT_DIAGNOSE = StageGateError(
+    "not_diagnose", "Only a diagnose session can be handed over."
+)
+_NO_REPORT = StageGateError(
+    "missing_artifact", "Create the report before handing the session over."
+)
+_HANDOVER_BUSY = StageGateError(
+    "run_in_progress", "A run is in progress for this session."
+)
+_HANDOVER_MASKED = StageGateError(
+    "target_not_non_production",
+    "The target is no longer flagged non-production; its diagnose report "
+    "cannot be handed over.",
+)
+
+
+@router.post("/sessions/{sid}/handover", status_code=201)
+async def handover_session(
+    sid: str, principal: str = Depends(_caller), db: AsyncSession = Depends(_db)
+):
+    """Start a change session from an owned diagnose session's report.
+
+    Owner and target are taken from the server's rows -- the caller and the
+    diagnose session's target -- never from the request, which has no body.
+    Only the latest report is copied: the investigation's messages, findings
+    and scratch files stay in the diagnose session (and its 14-day
+    retention). Refusals, in order: 409 ``not_diagnose``,
+    ``target_not_non_production``, ``run_in_progress``, ``missing_artifact``.
+    The three rows are written in one transaction, so a failure
+    leaves no change session without its report.
+    """
+    source = await _owned(db, sid, principal)
+    if (source.session_type or CHANGE) != DIAGNOSE:
+        return _gate_response(_NOT_DIAGNOSE)
+    # The report was written from raw diagnose data while the target was
+    # flagged non-production. If the flag is gone (or the conventions are),
+    # the target is treated as production now and that text must not be
+    # copied into a new session on it.
+    conv = await store.get_conventions(db, source.target)
+    if masking_required(conv):
+        return _gate_response(_HANDOVER_MASKED)
+    if source.status == "running":
+        # A report run may be about to replace the report being copied.
+        return _gate_response(_HANDOVER_BUSY)
+    reports = await store.list_artifacts(db, source.id, REPORT_KIND)
+    if not reports:
+        return _gate_response(_NO_REPORT)
+    report = max(reports, key=lambda a: a.version)
+    stage = initial_stage(CHANGE).value
+    new = IdeSession(
+        owner=principal,
+        title=f"Change: {source.title}"[:200],
+        target=source.target,
+        session_type=CHANGE,
+        stage=stage,
+    )
+    db.add(new)
+    await db.flush()
+    db.add(IdeArtifact(
+        session_id=new.id, stage=stage, kind=REPORT_KIND,
+        content=report.content, version=1,
+    ))
+    db.add(IdeMessage(
+        session_id=new.id, stage=stage, role="system",
+        content=f"Started from diagnose session {source.title!r} "
+                f"(report v{report.version}).",
+    ))
+    await db.commit()
+    await db.refresh(new)
+    return _session_json(new, conv)
+
+
 CANCEL_START_WAIT_S = 2.0
 
 
@@ -480,7 +664,7 @@ async def cancel_session(
                 raise HTTPException(status_code=404, detail="Session not found")
             if now.status != "running" or now.run_id != seen_run:
                 # The run the caller saw ended meanwhile: nothing to cancel.
-                return _session_out(now)
+                return await _session_out(db, now)
             # A live run held by another app instance: this instance cannot
             # reach its task, so nothing was cancelled. Say so.
             return JSONResponse(
@@ -494,7 +678,7 @@ async def cancel_session(
     row = await db.get(IdeSession, sid, populate_existing=True)
     if row is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return _session_out(row)
+    return await _session_out(db, row)
 
 
 @router.post("/sessions/{sid}/approve")
@@ -506,7 +690,7 @@ async def approve_session(
         row = await approve(db, row)
     except StageGateError as exc:
         return _gate_response(exc)
-    return _session_out(row)
+    return await _session_out(db, row)
 
 
 # --- artifacts --------------------------------------------------------------
@@ -615,12 +799,22 @@ def _clean_path(path: str) -> str:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-async def _client_for(db: AsyncSession, target: str) -> arc1.Arc1Client:
+async def _client_for(
+    db: AsyncSession, target: str, policy: str = "change"
+) -> arc1.Arc1Client:
+    """The ARC-1 client for a call on ``target``; ``policy`` is the type of
+    the session the call belongs to. Results of a diagnose session are
+    masked unless the target's conventions flag it ``non_production``."""
     conv = await store.get_conventions(db, target)
     if conv is None:
         raise HTTPException(status_code=422, detail=f"Unknown target {target!r}")
     # Looked up on the module at call time: the tests' seam.
-    return arc1.get_arc1_client(target, destination=conv.destination or "")
+    return arc1.get_arc1_client(
+        target,
+        destination=conv.destination or "",
+        policy=policy,
+        masking=masking_required(conv),
+    )
 
 
 async def _file(db: AsyncSession, sid: str, path: str) -> IdeWorkspaceFile | None:
@@ -650,6 +844,27 @@ def _refuse_while_running(session: IdeSession) -> JSONResponse | None:
     loaded as a "modified" proposal that reverts the change in SAP."""
     if session.status == "running":
         return _gate_response(_RUN_IN_PROGRESS)
+    return None
+
+
+async def _refuse_lost_flag(
+    db: AsyncSession, session: IdeSession
+) -> JSONResponse | None:
+    """409 ``target_not_non_production`` for a diagnose session whose target
+    is not flagged ``non_production`` *now*, else ``None``.
+
+    The flag is enforced when the session is created, but an admin can take
+    it away afterwards (or the conventions row can go): the target is
+    production from then on, and a session opened for runtime data must not
+    keep reading from it -- not even masked. Called by every route that
+    would call ARC-1 for the session, after the owner check and before
+    anything is sent. A change session is never refused here.
+    """
+    if (session.session_type or CHANGE) != DIAGNOSE:
+        return None
+    conv = await store.get_conventions(db, session.target)
+    if masking_required(conv):
+        return _gate_response(lost_flag_error())
     return None
 
 
@@ -713,13 +928,15 @@ async def refresh_file(
     db: AsyncSession = Depends(_db),
 ):
     session, row = await _owned_file(db, sid, path, principal)
+    if (lost := await _refuse_lost_flag(db, session)) is not None:
+        return lost
     if (busy := _refuse_while_running(session)) is not None:
         return busy
     obj = paths.object_for(row.path)
     if obj is None:
         raise HTTPException(status_code=422, detail="Not an ABAP object file")
     type_, name, include = obj
-    client = await _client_for(db, session.target)
+    client = await _client_for(db, session.target, session.session_type)
     try:
         source = await client.call("SAPRead", _read_args(type_, name, include))
     except arc1.Arc1Error as exc:
@@ -741,6 +958,8 @@ async def lint_file(
     db: AsyncSession = Depends(_db),
 ):
     session, row = await _owned_file(db, sid, path, principal)
+    if (lost := await _refuse_lost_flag(db, session)) is not None:
+        return lost
     source = row.proposed_source or row.origin_source
     if not source:
         raise HTTPException(status_code=422, detail="The file has no source to lint")
@@ -748,7 +967,7 @@ async def lint_file(
     if obj is None:
         raise HTTPException(status_code=422, detail="Not an ABAP object file")
     name = obj[1]
-    client = await _client_for(db, session.target)
+    client = await _client_for(db, session.target, session.session_type)
     try:
         out = await client.call(
             "SAPLint", {"action": "lint", "source": source, "name": name}
@@ -762,24 +981,28 @@ async def lint_file(
     return findings
 
 
-@router.post("/sessions/{sid}/open")
-async def open_object(
-    sid: str,
-    body: OpenBody,
-    principal: str = Depends(_caller),
-    db: AsyncSession = Depends(_db),
-):
-    session = await _owned(db, sid, principal)
-    if (busy := _refuse_while_running(session)) is not None:
-        return busy
-    type_, name = body.type.strip().upper(), body.name.strip().upper()
+async def _open_into_workspace(
+    db: AsyncSession,
+    session: IdeSession,
+    type_: str,
+    name: str,
+    include: str | None = None,
+) -> IdeWorkspaceFile | JSONResponse:
+    """Read an object from SAP into the session's workspace as a ``read``
+    file; shared by ``POST .../open`` and a finding's "open source".
+
+    ``include`` is a class-local section (``paths.path_for``). The caller
+    has checked the owner and that no run holds the workspace. Returns the
+    file row, or the error response of a refused or failed read -- in which
+    case nothing was stored.
+    """
     try:
-        path = paths.path_for(type_, name)
+        path = paths.path_for(type_, name, include)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    client = await _client_for(db, session.target)
+    client = await _client_for(db, session.target, session.session_type)
     try:
-        source = await client.call("SAPRead", _read_args(type_, name, None))
+        source = await client.call("SAPRead", _read_args(type_, name, include))
     except arc1.Arc1Error as exc:
         return _arc1_response(exc)
     if (refused := _too_large(source)) is not None:
@@ -799,7 +1022,294 @@ async def open_object(
     await store.touch_session(db, session.id)
     await db.commit()
     await db.refresh(row)
-    return _file_summary(row)
+    return row
+
+
+@router.post("/sessions/{sid}/open")
+async def open_object(
+    sid: str,
+    body: OpenBody,
+    principal: str = Depends(_caller),
+    db: AsyncSession = Depends(_db),
+):
+    session = await _owned(db, sid, principal)
+    if (lost := await _refuse_lost_flag(db, session)) is not None:
+        return lost
+    if (busy := _refuse_while_running(session)) is not None:
+        return busy
+    type_, name = body.type.strip().upper(), body.name.strip().upper()
+    opened = await _open_into_workspace(db, session, type_, name)
+    if isinstance(opened, JSONResponse):
+        return opened
+    return _file_summary(opened)
+
+
+# --- findings (diagnose) ----------------------------------------------------
+
+_FINDINGS_NOT_DIAGNOSE = StageGateError(
+    "not_diagnose", "Only a diagnose session has finding details."
+)
+
+# What a stored ``ref_id`` must look like before it goes back to ARC-1 as an
+# argument. The reference came out of a tool result; it is checked again
+# here rather than trusted because it was stored.
+_REF_ID = re.compile(r"[A-Za-z0-9_/$=.:<>~\-]{1,255}")
+_GATEWAY_PATH = re.compile(r"/sap/bc/adt/gw/errorlog/[A-Za-z0-9_/.\-~$=:]{1,200}")
+_GATEWAY_TYPE = re.compile(r"[A-Za-z0-9_.\-]+(?: [A-Za-z0-9_.\-]+){0,5}")
+_GATEWAY_ID = re.compile(r"[A-Za-z0-9_.\-]{1,100}")
+
+
+def _detail_args(kind: str, ref_id: str) -> dict[str, Any] | None:
+    """The ``SAPDiagnose`` arguments that re-read one finding, or ``None``
+    when its kind has no detail read (authorization checks, OData calls) or
+    its reference is not one this route sends.
+
+    Built from the kind and the reference only -- never a ``user`` filter,
+    never anything from the request.
+    """
+    # An id may hold ``/`` and ``.`` (ARC-1 puts it into an ADT path), so a
+    # traversal or a second host is refused here as for gateway paths.
+    # ``%`` and ``?`` are checked by name as well as by the patterns: a
+    # percent-encoded traversal or a smuggled query must stay refused if a
+    # pattern is ever widened.
+    if "%" in ref_id or "?" in ref_id:
+        return None
+    plain = _REF_ID.fullmatch(ref_id) and ".." not in ref_id and "//" not in ref_id
+    if kind == "dump" and plain:
+        return {"action": "dumps", "id": ref_id}
+    if kind == "trace" and plain:
+        return {"action": "traces", "id": ref_id, "analysis": "hitlist"}
+    if kind == "gateway_error":
+        if ref_id.startswith("/"):
+            # The detail link's path (stored without its query). Only the
+            # ADT error log, no ``..`` and no second host.
+            if (
+                _GATEWAY_PATH.fullmatch(ref_id)
+                and ".." not in ref_id
+                and "//" not in ref_id
+            ):
+                return {"action": "gateway_errors", "detailUrl": ref_id}
+            return None
+        error_type, sep, ident = ref_id.partition(":")
+        if sep and _GATEWAY_TYPE.fullmatch(error_type) and _GATEWAY_ID.fullmatch(ident):
+            return {"action": "gateway_errors", "id": ident, "errorType": error_type}
+    return None
+
+
+def _detail_text(args: dict[str, Any], text: str) -> str:
+    """A live detail result as the text the dialog shows: the same text a
+    run would have stored for it (``findings.extract``), else the JSON
+    indented, else the result as it is. ``text`` is what the client
+    returned, so in a masked session it is already masked."""
+    for item in findings.extract("SAPDiagnose", args, text, with_detail=True):
+        detail = item.get("detail")
+        if isinstance(detail, str) and detail:
+            return detail
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return text[: findings.MAX_DETAIL]
+    if isinstance(data, (dict, list)):
+        text = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+    return text[: findings.MAX_DETAIL]
+
+
+async def _owned_finding(
+    db: AsyncSession, sid: str, fid: str, principal: str
+) -> tuple[IdeSession, IdeFinding]:
+    """The owner check first, then the finding inside that session only."""
+    session = await _owned(db, sid, principal)
+    row = await store.get_finding(db, session.id, fid)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Finding not found")
+    return session, row
+
+
+@router.get("/sessions/{sid}/findings")
+async def list_findings(
+    sid: str, principal: str = Depends(_caller), db: AsyncSession = Depends(_db)
+) -> list[dict[str, Any]]:
+    """Newest first; metadata only, never the detail text."""
+    session = await _owned(db, sid, principal)
+    return [findings.finding_out(f) for f in await store.list_findings(db, session.id)]
+
+
+@router.get("/sessions/{sid}/findings/{fid}")
+async def get_finding(
+    sid: str,
+    fid: str = Path(max_length=64),
+    refresh: bool = Query(default=False),
+    principal: str = Depends(_caller),
+    db: AsyncSession = Depends(_db),
+):
+    """``{finding, detail}``: the text kept with the finding, or -- on
+    ``refresh`` and when none is kept -- the text re-read from SAP as the
+    signed-in user.
+
+    The stored text is raw (written by a run on a ``non_production``
+    target). It is served, and SAP is read, only while ``masking_required``
+    is false for the target's conventions as they are at this moment; a
+    target that lost its flag answers 409 ``target_not_non_production``
+    whether or not text is stored. Nothing is written.
+    """
+    session, row = await _owned_finding(db, sid, fid, principal)
+    if (session.session_type or CHANGE) != DIAGNOSE:
+        return _gate_response(_FINDINGS_NOT_DIAGNOSE)
+    if (lost := await _refuse_lost_flag(db, session)) is not None:
+        return lost
+    out = findings.finding_out(row)
+    if not refresh and row.detail:
+        return {"finding": out, "detail": row.detail}
+    args = _detail_args(row.kind, row.ref_id)
+    if args is None:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "This finding has no detail that can be read from SAP.",
+                "code": "no_detail",
+            },
+        )
+    # Always the diagnose policy (the session is a diagnose session). The
+    # client is built from the conventions as it reads them itself, so a
+    # flag taken away since the check above still means a masked result.
+    client = await _client_for(db, session.target, DIAGNOSE)
+    # Release the connection before the network round trip. ``db`` must not
+    # be used after this line: everything needed from it was read above.
+    await db.close()
+    try:
+        text = await client.call("SAPDiagnose", args)
+    except arc1.Arc1Error as exc:
+        return _arc1_response(exc)
+    return {"finding": out, "detail": _detail_text(args, text)}
+
+
+def _line_hint(include: str | None, line: int | None) -> str | None:
+    """Where the error is, for a line that does not count in the opened
+    source: ``method include CM001, line 12``."""
+    part = paths.class_include(include)
+    if part is None:
+        return None
+    suffix = part[1]
+    label = "method include" if suffix.startswith("CM") else "class include"
+    return f"{label} {suffix}" + (f", line {line}" if line is not None else "")
+
+
+@router.post("/sessions/{sid}/findings/{fid}/open")
+async def open_finding(
+    sid: str,
+    fid: str = Path(max_length=64),
+    principal: str = Depends(_caller),
+    db: AsyncSession = Depends(_db),
+):
+    """Read the source a finding points at into the workspace.
+
+    ``{file, line, hint}``: ``line`` is the finding's line when it counts
+    in the opened source; otherwise ``null`` with a ``hint`` naming the
+    include (a class method include is opened as the whole class).
+    """
+    session, row = await _owned_finding(db, sid, fid, principal)
+    if (lost := await _refuse_lost_flag(db, session)) is not None:
+        return lost
+    if (busy := _refuse_while_running(session)) is not None:
+        return busy
+    resolved = paths.resolve_include(row.program, row.include)
+    if resolved is None:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "The finding has no source that can be opened.",
+                "code": "no_source",
+            },
+        )
+    type_, name, section, exact = resolved
+    # A dump can name the method include as its program and no include.
+    line, include = row.line, row.include or row.program
+    opened = await _open_into_workspace(db, session, type_, name, section)
+    if isinstance(opened, JSONResponse):
+        return opened
+    return {
+        "file": _file_summary(opened),
+        "line": line if exact else None,
+        "hint": None if exact else _line_hint(include, line),
+    }
+
+
+# --- trace approvals (diagnose) -----------------------------------------------
+
+
+class ApprovalDecision(BaseModel):
+    """The whole body: a decision. Parameters are never taken from the
+    client; what is armed is what the stored proposal says."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    decision: Literal["approve", "deny"]
+
+
+@router.get("/sessions/{sid}/approvals")
+async def list_approvals(
+    sid: str, principal: str = Depends(_caller), db: AsyncSession = Depends(_db)
+) -> list[dict[str, Any]]:
+    """The session's trace proposals and what became of them, newest first.
+
+    Both conditional updates below touch this (owned) session only. A
+    pending approval older than ``store.approval_ttl_min()`` becomes
+    ``expired``. An approval of this session that was approved but never got an outcome
+    (the process died during the ARC-1 call) is closed first, once it is
+    older than the arm timeout: the list then says ``failed`` /
+    ``interrupted`` instead of an ``approved`` that nobody will finish.
+    """
+    session = await _owned(db, sid, principal)
+    try:
+        # Likewise a proposal nobody decided in time: listed as ``expired``,
+        # which is what a decision on it would answer (410).
+        await store.expire_pending_approvals(
+            db, older_than_min=store.approval_ttl_min(), session_id=session.id
+        )
+        await approvals.sweep_interrupted(db, session.id)
+    except Exception:  # noqa: BLE001 -- the list is still worth returning
+        log.warning("IDE session %s: closing overdue approvals failed",
+                    session.id, exc_info=True)
+        await db.rollback()
+    return [
+        approvals.approval_json(a) for a in await store.list_approvals(db, session.id)
+    ]
+
+
+@router.post("/sessions/{sid}/approvals/{aid}")
+async def decide_approval(
+    body: ApprovalDecision,
+    sid: str,
+    aid: str = Path(max_length=64),
+    principal: str = Depends(_caller),
+    db: AsyncSession = Depends(_db),
+):
+    """Approve or deny one pending trace proposal as the signed-in developer.
+
+    The only place a trace is armed or cancelled. ``principal`` is the
+    verified caller (``require_developer`` and the token the middleware
+    validated), never anything from the body. ``approvals.decide`` does the
+    checks -- owner (404, as for a forged approval id), session type,
+    pending and not expired (``store.approval_ttl_min()``), the target's
+    ``non_production`` flag as it is now -- and calls ARC-1 at most once.
+
+    Answers the ``Approval`` as it is afterwards: ``denied``; ``approved``
+    with a ``result``; or ``failed`` with an ``error_code`` (for example
+    ``arc1_timeout_unknown``, with a ``result.note``, or
+    ``audit_unavailable``). Refusals are ``{detail, code}``: 404
+    ``not_found``, 409 ``not_diagnose`` / ``approval_not_pending`` /
+    ``unknown_trace_request``, 403 ``target_not_non_production``, 410
+    ``approval_expired``, 424 ``user_token_required`` /
+    ``arc1_not_configured`` (nothing was decided; sign in and retry).
+    """
+    try:
+        row = await approvals.decide(
+            db, sid=sid, aid=aid, principal=principal, decision=body.decision
+        )
+    except approvals.ApprovalError as exc:
+        return JSONResponse(status_code=exc.status, content=exc.body())
+    except arc1.Arc1Error as exc:
+        return _arc1_response(exc)
+    return approvals.approval_json(row)
 
 
 @router.get("/objects/search")

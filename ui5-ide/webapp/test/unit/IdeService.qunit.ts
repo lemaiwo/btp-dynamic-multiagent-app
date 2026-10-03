@@ -1,5 +1,6 @@
 import IdeService, { IdeError } from "com/agent/ide/service/IdeService";
-import type { SseEvent } from "com/agent/ide/service/types";
+import type { Approval, SseEvent } from "com/agent/ide/service/types";
+import FakeBackend, { APPROVAL_EXPIRED, TARGET_NOT_NON_PRODUCTION } from "../integration/FakeBackend";
 
 /** The slice of sinon-4 (shipped by UI5 at sap/ui/thirdparty/sinon-4) these tests use. */
 interface SinonStub {
@@ -90,7 +91,7 @@ QUnit.test("createSession POSTs title and target as JSON", async function (this:
     const { url, init } = callOf(stub);
     assert.strictEqual(url, "backend/sessions", "targets the collection");
     assert.strictEqual(init.method, "POST", "uses POST");
-    assert.deepEqual(JSON.parse(init.body as string), { title: "t", target: "dev" }, "sends the body");
+    assert.deepEqual(JSON.parse(init.body as string), { title: "t", target: "dev", type: "change" }, "sends the body");
     assert.strictEqual((init.headers as Record<string, string>)["Content-Type"], "application/json", "JSON content type");
     assert.strictEqual(session.id, "s1", "returns the created session");
 });
@@ -528,4 +529,259 @@ QUnit.test("a final frame terminated by lone CRs is delivered at stream end", as
     await done;
 
     assert.deepEqual(events.map((e) => e.type), ["done"], "done delivered, no synthetic error");
+});
+
+// --- phase 1c: diagnose sessions (plan §1.2-1.3) -------------------------------------
+
+QUnit.test("createSession sends the type when given", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(201, {
+        id: "s2", title: "t", target: "DEMO", stage: "investigate", status: "idle", type: "diagnose"
+    }));
+
+    const session = await new IdeService().createSession("t", "DEMO", "diagnose");
+
+    assert.deepEqual(JSON.parse(callOf(stub).init.body as string), { title: "t", target: "DEMO", type: "diagnose" },
+        "type is in the body");
+    assert.strictEqual(session.type, "diagnose", "the session carries its type");
+});
+
+QUnit.test("createSession defaults the type to change", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(201, { id: "s1", type: "change" }));
+
+    await new IdeService().createSession("t", "DEMO");
+
+    assert.strictEqual(JSON.parse(callOf(stub).init.body as string).type, "change", "change by default");
+});
+
+QUnit.test("decideApproval POSTs the decision to the approval", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(200, {
+        id: "ap 1", action: "trace_start", params: {}, status: "approved", created_at: "x",
+        decided_at: "y", result: { trace_request_id: "T1" }, error_code: null
+    }));
+
+    const approval = await new IdeService().decideApproval("s1", "ap 1", "approve");
+
+    const { url, init } = callOf(stub);
+    assert.strictEqual(url, "backend/sessions/s1/approvals/ap%201", "the approval route, id encoded");
+    assert.strictEqual(init.method, "POST", "uses POST");
+    assert.deepEqual(JSON.parse(init.body as string), { decision: "approve" }, "the decision is sent");
+    assert.strictEqual(approval.status, "approved", "returns the decided approval");
+});
+
+QUnit.test("an expired approval (410) maps to IdeError.code", async function (this: Ctx, assert) {
+    stubFetch(this, jsonResponse(410, { detail: "The approval expired.", code: "approval_expired" }));
+
+    try {
+        await new IdeService().decideApproval("s1", "a1", "deny");
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        assert.strictEqual((e as IdeError).status, 410, "410");
+        assert.strictEqual((e as IdeError).code, "approval_expired", "code kept");
+        assert.notOk((e as IdeError).isAuth, "not an auth problem");
+    }
+});
+
+QUnit.test("a 403 target_not_non_production keeps its code", async function (this: Ctx, assert) {
+    stubFetch(this, jsonResponse(403, { detail: "Target is not non-production.", code: "target_not_non_production" }));
+
+    try {
+        await new IdeService().decideApproval("s1", "a1", "approve");
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        assert.strictEqual((e as IdeError).status, 403, "403");
+        assert.strictEqual((e as IdeError).code, "target_not_non_production", "code kept");
+    }
+});
+
+QUnit.test("streamReport POSTs to the report route and parses artifact and done", async function (this: Ctx, assert) {
+    const s = streamResponse();
+    const stub = stubFetch(this, s.response);
+    const events: SseEvent[] = [];
+
+    const done = new IdeService().streamReport("s1", (e) => events.push(e));
+    s.push('event: artifact\ndata: {"id":"a1","kind":"report","version":1}\n\n');
+    s.push('event: done\ndata: {"message_id":"m1","stage":"investigate","status":"idle"}\n\n');
+    s.close();
+    await done;
+
+    const { url, init } = callOf(stub);
+    assert.strictEqual(url, "backend/sessions/s1/report", "the report route");
+    assert.strictEqual(init.method, "POST", "a POST");
+    assert.deepEqual(events, [
+        { type: "artifact", data: { id: "a1", kind: "report", version: 1 } },
+        { type: "done", data: { message_id: "m1", stage: "investigate", status: "idle" } }
+    ], "artifact then done");
+});
+
+QUnit.test("finding and approval_required frames are delivered", async function (this: Ctx, assert) {
+    const s = streamResponse();
+    stubFetch(this, s.response);
+    const events: SseEvent[] = [];
+
+    const done = new IdeService().streamMessage("s1", "x", (e) => events.push(e));
+    s.push('event: finding\ndata: {"id":"f1","kind":"dump","ref_id":"D1","title":"t"}\n\n');
+    s.push('event: approval_required\ndata: {"id":"ap1","action":"trace_start","status":"pending"}\n\n');
+    s.push('event: approval\ndata: {"id":"ap1","action":"trace_start","status":"approved"}\n\n');
+    s.push('event: done\ndata: {"message_id":"m","stage":"investigate","status":"idle"}\n\n');
+    s.close();
+    await done;
+
+    assert.deepEqual(events.map((e) => e.type), ["finding", "approval_required", "approval", "done"], "all known");
+});
+
+QUnit.test("finding and approval routes use the session paths", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(200, []));
+    const service = new IdeService();
+
+    await service.listFindings("s1");
+    stub.returns(Promise.resolve(jsonResponse(200, { finding: {}, detail: "" })));
+    await service.getFinding("s1", "f 1");
+    stub.returns(Promise.resolve(jsonResponse(200, { finding: {}, detail: "" })));
+    await service.getFinding("s1", "f 1", true);
+    stub.returns(Promise.resolve(jsonResponse(200, { file: {}, line: 3, hint: null })));
+    await service.openFinding("s1", "f1");
+    stub.returns(Promise.resolve(jsonResponse(200, [])));
+    await service.listApprovals("s1");
+    stub.returns(Promise.resolve(jsonResponse(201, { id: "s9", type: "change" })));
+    const handed = await service.handover("s1");
+
+    assert.deepEqual([0, 1, 2, 3, 4, 5].map((n) => `${callOf(stub, n).init.method ?? "GET"} ${callOf(stub, n).url}`), [
+        "GET backend/sessions/s1/findings",
+        "GET backend/sessions/s1/findings/f%201",
+        "GET backend/sessions/s1/findings/f%201?refresh=true",
+        "POST backend/sessions/s1/findings/f1/open",
+        "GET backend/sessions/s1/approvals",
+        "POST backend/sessions/s1/handover"
+    ], "methods and paths");
+    assert.strictEqual(handed.id, "s9", "handover returns the new session");
+});
+
+// --- phase 1c: the fake backend speaks the same contract ------------------------------
+
+interface FakeCtx { fake: FakeBackend }
+
+QUnit.module("IdeService against FakeBackend (diagnose)", {
+    beforeEach: function (this: FakeCtx) {
+        this.fake = new FakeBackend();
+        this.fake.reset();
+        this.fake.install();
+    },
+    afterEach: function (this: FakeCtx) {
+        this.fake.restore();
+    }
+});
+
+async function codeOf(call: Promise<unknown>): Promise<string> {
+    try {
+        await call;
+        return "no error";
+    } catch (e) {
+        return `${(e as IdeError).status} ${(e as IdeError).code ?? ""}`;
+    }
+}
+
+QUnit.test("only a non-production target offers and accepts diagnose sessions", async function (this: FakeCtx, assert) {
+    const service = new IdeService();
+
+    assert.deepEqual((await service.getMe()).diagnose_targets, [], "none flagged yet");
+    assert.strictEqual(await codeOf(service.createSession("d", "dev-system", "diagnose")),
+        "422 target_not_non_production", "refused");
+
+    this.fake.allowDiagnose();
+    assert.deepEqual((await service.getMe()).diagnose_targets, ["dev-system"], "offered once flagged");
+    const session = await service.createSession("Slow order call", "dev-system", "diagnose");
+    assert.strictEqual(session.type, "diagnose", "typed");
+    assert.strictEqual(session.stage, "investigate", "in the single diagnose stage");
+    assert.strictEqual((await service.createSession("c", "dev-system")).type, "change", "change by default");
+    assert.strictEqual(await codeOf(service.approve(session.id)), "409 approve_not_allowed", "no stage gate");
+    assert.strictEqual(await codeOf(service.streamRevise(session.id, "x", () => undefined)),
+        "409 revise_not_allowed", "no revise");
+});
+
+QUnit.test("a scripted run emits findings and an approval, which the routes then serve", async function (this: FakeCtx, assert) {
+    const service = new IdeService();
+    // The decide and handover routes recheck the target's flag, as the server does.
+    this.fake.allowDiagnose();
+    const sid = this.fake.addSession("Dump in order class", [], [], "diagnose").id;
+    this.fake.scriptRun({
+        findings: [
+            { kind: "dump", ref_id: "D1", title: "CX_SY_ZERODIVIDE", program: "ZCL_DEMO======================CP", include: "ZCL_DEMO======================CM001", line: 12 },
+            { kind: "dump", ref_id: "D2", title: "MESSAGE_TYPE_X", program: "ZDEMO_REPORT", line: 7 },
+            { kind: "gateway_error", ref_id: "G1", title: "HTTP 500" }
+        ],
+        approval: {}
+    });
+    const events: SseEvent[] = [];
+
+    await service.streamMessage(sid, "Why does it dump?", (e) => events.push(e));
+
+    assert.deepEqual(events.filter((e) => e.type === "finding").length, 3, "one finding frame each");
+    const required = events.find((e) => e.type === "approval_required")?.data as Approval;
+    assert.strictEqual(required.status, "pending", "a pending approval is asked for");
+    assert.strictEqual(events[events.length - 1].type, "done", "done stays last");
+    assert.notOk(events.some((e) => e.type === "artifact"), "a diagnose message run writes no artifact");
+
+    const findings = await service.listFindings(sid);
+    assert.deepEqual(findings.map((f) => f.ref_id), ["G1", "D2", "D1"], "newest first");
+    const detail = await service.getFinding(sid, findings[1].id);
+    assert.strictEqual(detail.finding.ref_id, "D2", "the finding");
+    assert.ok(detail.detail.includes("DEVUSER01"), "with the stored detail, as SAP sent it");
+    assert.notOk(detail.detail.includes("re-read"), "not read again");
+    assert.ok((await service.getFinding(sid, findings[1].id, true)).detail.includes("re-read from SAP"), "a refresh reads it again");
+    this.fake.sessions[this.fake.sessions.length - 1].session.masked = true;
+    assert.strictEqual(await codeOf(service.getFinding(sid, findings[1].id)), "409 target_not_non_production",
+        "a masked diagnose session (its target lost the flag) does not serve the stored detail");
+    assert.strictEqual(await codeOf(service.getFinding(sid, findings[1].id, true)), "409 target_not_non_production",
+        "nor reads it from SAP again");
+    assert.strictEqual(await codeOf(service.openFinding(sid, findings[1].id)), "409 target_not_non_production", "nor a finding's source");
+    this.fake.sessions[this.fake.sessions.length - 1].session.masked = false;
+
+    const opened = await service.openFinding(sid, findings[1].id);
+    assert.strictEqual(opened.file.path, "src/PROG/zdemo_report.prog.abap", "the program is opened");
+    assert.strictEqual(opened.line, 7, "at the finding's line");
+    const method = await service.openFinding(sid, findings[2].id);
+    assert.strictEqual(method.file.object_name, "ZCL_DEMO", "a class pool opens the class");
+    assert.strictEqual(method.line, null, "a method include has no mapped line");
+    assert.ok(method.hint, "but a hint");
+    assert.strictEqual(await codeOf(service.openFinding(sid, findings[0].id)), "422 no_source", "no program, no source");
+
+    assert.deepEqual((await service.listApprovals(sid)).map((a) => a.id), [required.id], "the approval is listed");
+    this.fake.failNext = { path: `sessions/${sid}/approvals/${required.id}`, ...APPROVAL_EXPIRED };
+    assert.strictEqual(await codeOf(service.decideApproval(sid, required.id, "approve")), "410 approval_expired", "expired");
+    this.fake.failNext = { path: `sessions/${sid}/approvals/${required.id}`, ...TARGET_NOT_NON_PRODUCTION };
+    assert.strictEqual(await codeOf(service.decideApproval(sid, required.id, "approve")),
+        "403 target_not_non_production", "target no longer non-production");
+    const decided = await service.decideApproval(sid, required.id, "approve");
+    assert.strictEqual(decided.status, "approved", "approved");
+    assert.ok(decided.result?.trace_request_id, "with the armed trace request");
+    assert.strictEqual(await codeOf(service.decideApproval(sid, required.id, "deny")),
+        "409 approval_not_pending", "decided only once");
+});
+
+QUnit.test("report writes a report artifact and handover seeds a change session with it", async function (this: FakeCtx, assert) {
+    const service = new IdeService();
+    // The decide and handover routes recheck the target's flag, as the server does.
+    this.fake.allowDiagnose();
+    const sid = this.fake.addSession("Dump in order class", [], [], "diagnose").id;
+    const changeSid = this.fake.addSession("A change").id;
+
+    assert.strictEqual(await codeOf(service.handover(sid)), "409 missing_artifact", "no report yet");
+    assert.strictEqual(await codeOf(service.streamReport(changeSid, () => undefined)), "409 not_diagnose", "diagnose only");
+    assert.strictEqual(await codeOf(service.handover(changeSid)), "409 not_diagnose", "diagnose only");
+
+    const events: SseEvent[] = [];
+    await service.streamReport(sid, (e) => events.push(e));
+    const artifact = events.find((e) => e.type === "artifact");
+    assert.deepEqual(artifact && (artifact.data as { kind: string; version: number }).kind, "report", "a report artifact");
+    assert.strictEqual(events[events.length - 1].type, "done", "done last");
+    const report = (await service.listArtifacts(sid, "report"))[0];
+
+    const next = await service.handover(sid);
+    assert.strictEqual(next.type, "change", "a change session");
+    assert.strictEqual(next.stage, "chat", "in chat");
+    assert.strictEqual(next.title, "Change: Dump in order class", "titled after the diagnose session");
+    const copied = await service.listArtifacts(next.id, "report");
+    assert.strictEqual(copied.length, 1, "one report");
+    assert.strictEqual(copied[0].version, 1, "as version 1");
+    assert.strictEqual(copied[0].content, report.content, "with the report's content");
 });

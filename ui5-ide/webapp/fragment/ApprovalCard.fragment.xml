@@ -1,0 +1,70 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1">
+    <!-- Trace approvals of a diagnose session (plan 1c §1.2, variant B: stored rows the user decides,
+         no run waits). A pending approval is a card that lists every value the decision covers; the
+         card is the user's consent to change a runtime setting on SAP. Approve and Reject are two
+         buttons of their own type, the card never takes the focus (no default action), and both are
+         off while a decision is on its way. A request whose parameters are not valid has no Approve
+         (`canApprove`): it says so and can only be rejected. Any other status is one read-only line. -->
+    <!-- Names the list: the controller sets role="group" and aria-labelledby on the VBox's DOM
+         (a VBox has no ariaLabelledBy), as it does for the stage bar. -->
+    <core:InvisibleText id="approvalListLabel" text="{i18n>approvalListLabel}" />
+    <VBox
+        id="approvalList"
+        class="ideApprovals"
+        visible="{= ${ide>/approvalRows}.length > 0 }"
+        items="{ path: 'ide>/approvalRows', key: 'id' }">
+        <VBox>
+            <Panel
+                class="ideApprovalCard"
+                visible="{ide>pending}"
+                headerText="{ide>title}"
+                expandable="false"
+                backgroundDesign="Solid"
+                busy="{ide>busy}"
+                busyIndicatorDelay="0">
+                <VBox items="{ path: 'ide>fields', templateShareable: false }" class="sapUiTinyMarginBottom">
+                    <ObjectAttribute title="{ide>label}" text="{ide>value}" />
+                </VBox>
+                <!-- Params the card cannot show in full: no consent is asked and there is no Approve. -->
+                <MessageStrip
+                    text="{ide>invalidText}"
+                    type="Warning"
+                    showIcon="true"
+                    visible="{= !!${ide>invalidText} }"
+                    class="sapUiTinyMarginBottom" />
+                <Text text="{ide>who}" visible="{ide>canApprove}" class="sapUiTinyMarginBottom" />
+                <Text text="{i18n>approvalConsent}" visible="{ide>canApprove}" class="sapUiTinyMarginBottom" />
+                <Text text="{ide>decideBy}" visible="{= !!${ide>decideBy} }" class="sapUiTinyMarginBottom" />
+                <HBox>
+                    <Button
+                        id="approveTraceButton"
+                        text="{ide>approveText}"
+                        type="Accept"
+                        icon="sap-icon://accept"
+                        enabled="{= !${ide>busy} }"
+                        visible="{ide>canApprove}"
+                        app:decision="approve"
+                        press=".onApprovalDecide"
+                        class="sapUiTinyMarginEnd" />
+                    <Button
+                        id="denyTraceButton"
+                        text="{i18n>denyTrace}"
+                        type="Reject"
+                        icon="sap-icon://decline"
+                        enabled="{= !${ide>busy} }"
+                        app:decision="deny"
+                        press=".onApprovalDecide" />
+                </HBox>
+            </Panel>
+            <ObjectStatus
+                class="ideApprovalDecided"
+                visible="{= !${ide>pending} }"
+                text="{ide>statusText}"
+                state="{ide>statusState}"
+                icon="{ide>statusIcon}" />
+        </VBox>
+    </VBox>
+</core:FragmentDefinition>

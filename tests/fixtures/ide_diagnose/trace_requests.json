@@ -1,0 +1,16 @@
+{
+  "traceRequests": [
+    {
+      "id": "REQ_0001",
+      "traceUser": "DEVUSER01",
+      "processType": "http",
+      "objectType": "url",
+      "objectName": "/sap/opu/odata/sap/ZDEMO_SRV/Partners('123456789012')",
+      "maxExecutions": 3,
+      "executions": 1,
+      "expires": "2026-10-03T18:00:00Z",
+      "description": "Trace for jane.doe@example.com BE71 0961 2345 6769 RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789",
+      "createdBy": "DEVUSER01"
+    }
+  ]
+}

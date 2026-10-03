@@ -13,7 +13,7 @@ const NAMES = [
     "sapTextColor", "sapContent_LabelColor", "sapFontFamily", "sapFontSmallSize",
     "sapContent_MonospaceFontFamily", "sapList_HeaderBackground", "sapList_BorderColor",
     "sapGroup_ContentBackground", "sapGroup_ContentBorderColor",
-    "sapSuccessBackground", "sapErrorBackground", "sapWarningBackground",
+    "sapSuccessBackground", "sapErrorBackground", "sapWarningBackground", "sapErrorBorderColor",
     "sapPositiveElementColor", "sapNegativeElementColor", "sapCriticalElementColor"
 ];
 

@@ -1,0 +1,15 @@
+{
+  "id": "20261003101530DEVHOST_DEMO_00",
+  "runtimeError": "COMPUTE_INT_ZERODIVIDE",
+  "exception": "CX_SY_ZERODIVIDE",
+  "program": "ZCL_DEMO_CALC=================CP",
+  "include": "ZCL_DEMO_CALC=================CM001",
+  "line": 12,
+  "timestamp": "2026-10-03T10:15:30Z",
+  "customerName": "Jane Doe",
+  "chapters": [
+    {"id": "kap0", "title": "Short text", "text": "Division by zero"},
+    {"id": "kap8", "title": "Chosen variables", "text": "Name\n    Val.\nLV_NAME\n    Jane Doe\n    4A616E6520446F65\nLV_PARTNER\n    123456789012\nLV_BP\n    1234567\nLV_IBAN\n    BE71 0961 2345 6769\nLV_MAIL\n    jane.doe@example.com\nLV_RAW\n    RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789\nSY-UNAME\n    DEVUSER01\nSY-SUBRC\n    4\nLV_FLAG\n    X\nLV_COUNT\n    42"}
+  ],
+  "formattedText": "Category               ABAP programming error\nRuntime Errors         COMPUTE_INT_ZERODIVIDE\nABAP Program           ZCL_DEMO_CALC=================CP\nUser................ DEVUSER01\nClient.............. 100\n\nShort Text\n    Division by zero\n\nChosen variables\nName\n    Val.\nLV_NAME\n    Jane Doe\n    4A616E6520446F65\nLV_PARTNER\n    123456789012\nLV_BP\n    1234567\nLV_IBAN\n    BE71 0961 2345 6769\nLV_MAIL\n    jane.doe@example.com\nLV_RAW\n    RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789\nSY-SUBRC\n    4\nLV_FLAG\n    X\nLV_COUNT\n    42\n"
+}

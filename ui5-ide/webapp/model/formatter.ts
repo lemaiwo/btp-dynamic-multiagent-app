@@ -1,12 +1,14 @@
 import { ValueState } from "sap/ui/core/library";
-import type { FileState, Stage } from "../service/types";
+import DateFormat from "sap/ui/core/format/DateFormat";
+import formatMessage from "sap/base/strings/formatMessage";
+import type { FileState, FindingKind, Stage } from "../service/types";
 
 /** What the text formatters need from their `this`: the view's controller. */
 interface I18nHost {
     getModel(name?: string): unknown;
 }
 
-interface Bundle { getText(key: string): string }
+interface Bundle { getText(key: string, args?: (string | number)[]): string }
 
 const STATE_BADGES: Record<FileState, ValueState> = {
     read: ValueState.Information,
@@ -26,8 +28,34 @@ const STAGE_KEYS: Record<Stage, string> = {
     plan: "stagePlan",
     propose: "stagePropose",
     review: "stageReview",
-    done: "stageDone"
+    done: "stageDone",
+    investigate: "stageInvestigate"
 };
+
+const FINDING_KIND_KEYS: Record<FindingKind, string> = {
+    dump: "findingKindDump",
+    trace: "findingKindTrace",
+    gateway_error: "findingKindGatewayError",
+    auth_check: "findingKindAuthCheck",
+    odata_call: "findingKindOdataCall"
+};
+
+const FINDING_ICONS: Record<FindingKind, string> = {
+    dump: "sap-icon://error",
+    trace: "sap-icon://performance",
+    gateway_error: "sap-icon://chain-link",
+    auth_check: "sap-icon://locked",
+    odata_call: "sap-icon://cloud"
+};
+
+/** A finding's time for display: the locale's short date and time, or the raw value when it is no date. */
+function findingTime(value: string | null | undefined): string {
+    if (!value) {
+        return "";
+    }
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : DateFormat.getDateTimeInstance({ style: "short" }).format(date);
+}
 
 /**
  * The i18n bundle a formatter reads its texts from. A `'.formatter.x'`
@@ -70,5 +98,58 @@ export default {
     /** A finished session reads as Success; any open stage as Information. */
     stageState(stage: Stage | null | undefined): ValueState {
         return stage === "done" ? ValueState.Success : ValueState.Information;
+    },
+
+    /** A title with a count: `pattern` is an i18n text with `{0}`. */
+    countTitle(pattern: string | null | undefined, count: number | null | undefined): string {
+        return formatMessage(pattern ?? "", [count ?? 0]);
+    },
+
+    /**
+     * Where and when a diagnose finding happened: "program · include · line N · time",
+     * leaving out what the finding does not have.
+     */
+    formatFindingWhere(
+        this: I18nHost | undefined, program: string | null | undefined, include: string | null | undefined,
+        line: number | null | undefined, occurredAt?: string | null
+    ): string {
+        const bundle = bundleOf(this);
+        const parts: string[] = [];
+        if (program) {
+            parts.push(program);
+        }
+        if (include && include !== program) {
+            parts.push(include);
+        }
+        if (line !== null && line !== undefined) {
+            parts.push(bundle ? bundle.getText("findingLine", [line]) : String(line));
+        }
+        const time = findingTime(occurredAt);
+        if (time) {
+            parts.push(time);
+        }
+        if (!parts.length) {
+            return bundle ? bundle.getText("findingWhereUnknown") : "";
+        }
+        return parts.join(" \u00b7 ");
+    },
+
+    /** A finding kind's display name from i18n ("Dump", "Trace", ...). */
+    findingKindText(this: I18nHost | undefined, kind: FindingKind | null | undefined): string {
+        return translate(this, FINDING_KIND_KEYS, kind);
+    },
+
+    /**
+     * Whether SAP can be asked for a finding's text: an authorization check
+     * and an OData call are rows of a list, with nothing more to read (the
+     * detail route answers 422 `no_detail` for them).
+     */
+    findingHasDetail(kind: FindingKind | null | undefined): boolean {
+        return kind === "dump" || kind === "trace" || kind === "gateway_error";
+    },
+
+    /** A finding kind's icon (decorative: the kind is also shown as text). */
+    findingIcon(kind: FindingKind | null | undefined): string {
+        return (kind && Object.prototype.hasOwnProperty.call(FINDING_ICONS, kind) && FINDING_ICONS[kind]) || "sap-icon://inspection";
     }
 };

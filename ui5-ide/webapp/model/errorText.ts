@@ -7,13 +7,19 @@ export type TextLookup = (key: string, args?: (string | number)[]) => string;
 /**
  * The message a failed call shows, from its status and code (plan §1.1/1.2):
  *
- * - 424 `user_token_required`: the approuter did not forward the user's
- *   token, so ARC-1 cannot be called as the user. Reloading signs in again.
+ * - 424, by code: `user_token_required` (or no code): the approuter did not
+ *   forward the user's token, so ARC-1 cannot be called as the user;
+ *   reloading signs in again. `arc1_not_configured`: the target has no ARC-1
+ *   connection, which an administrator has to set up. Another 424 code shows
+ *   its detail.
  * - 502 (`sap_*` codes): ARC-1 answered, SAP refused. SAP's message is shown
  *   with a hint at the SAP user mapping and authorizations.
  * - 401 / `session_expired`: the approuter session ended.
  * - 403 `readonly_refused`: the read-only guard refused the call (a write
  *   or an unlisted tool); not a role problem.
+ * - `target_not_non_production`: the target lost its non-production flag, so
+ *   approving a trace (403), a handover and a diagnose session's runs, reports
+ *   and live reads (409) are refused.
  * - 403 without a code, or with `forbidden`: the caller lacks the developer
  *   role. Another 403 code shows its detail.
  * - 409: a stage-gate refusal; the server's sentence is already user-facing.
@@ -27,7 +33,10 @@ export function errorText(error: unknown, text: TextLookup): string {
         return text("requestFailed", [message]);
     }
     const detail = error.detail || error.message;
-    if (error.status === 424 || error.code === "user_token_required") {
+    if (error.code === "arc1_not_configured") {
+        return text("arc1NotConfigured");
+    }
+    if (error.code === "user_token_required" || (error.status === 424 && !error.code)) {
         return text("userTokenRequired");
     }
     if (error.status === 502 || error.code?.startsWith("sap_")) {
@@ -38,6 +47,9 @@ export function errorText(error: unknown, text: TextLookup): string {
     }
     if (error.code === "readonly_refused") {
         return text("readOnlyRefused");
+    }
+    if (error.code === "target_not_non_production") {
+        return text("targetNotNonProd");
     }
     if (error.status === 403 && (!error.code || error.code === "forbidden")) {
         return text("missingRole");
@@ -60,7 +72,9 @@ const GATE_KEYS: Record<string, string> = {
     revise_not_allowed: "gateReviseNotAllowed",
     stage_changed: "gateStageChanged",
     invalid_stage: "gateInvalidStage",
-    run_on_other_instance: "cancelOtherInstance"
+    run_on_other_instance: "cancelOtherInstance",
+    not_diagnose: "gateNotDiagnose",
+    target_not_non_production: "targetNotNonProd"
 };
 
 /**
@@ -79,7 +93,7 @@ export function gateErrorText(error: unknown, text: TextLookup): string {
  * The message for an `error` frame of a run's stream (plan §1.3), by code:
  * `stream_incomplete` (the stream ended without `done`, IdeService),
  * `run_timeout` and `run_failed` (the server's sentence carries the run
- * reference), `usage_exhausted`, the user-token, read-only and SAP codes as in
+ * reference), `usage_exhausted`, the user-token, not-configured, read-only and SAP codes as in
  * {@link errorText}; anything else shows the server's message.
  */
 export function runErrorText(data: ErrorEventData, text: TextLookup): string {
@@ -95,6 +109,8 @@ export function runErrorText(data: ErrorEventData, text: TextLookup): string {
             return text("usageExhausted", [message]);
         case "user_token_required":
             return text("userTokenRequired");
+        case "arc1_not_configured":
+            return text("arc1NotConfigured");
         case "readonly_refused":
             return text("readOnlyRefused");
         default:
@@ -103,4 +119,16 @@ export function runErrorText(data: ErrorEventData, text: TextLookup): string {
             }
             return message || text("requestFailed", [data.code ?? ""]);
     }
+}
+
+/** The i18n keys of the non-fatal `error` frames (model/chatRun `isRunNote`). */
+const NOTE_KEYS: Record<string, string> = {
+    no_diagnose_server: "runNoteNoDiagnoseServer",
+    conventions_unavailable: "runNoteConventionsUnavailable"
+};
+
+/** The warning for a non-fatal `error` frame; an unknown code shows the server's message. */
+export function runNoteText(data: ErrorEventData, text: TextLookup): string {
+    const key = data.code ? NOTE_KEYS[data.code] : undefined;
+    return key ? text(key) : data.message || "";
 }

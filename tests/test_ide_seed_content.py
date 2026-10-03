@@ -48,8 +48,17 @@ SEED = ROOT / "agents" / "ide" / "seed.ide.json"
 RAW = SEED.read_text()
 DATA = json.loads(RAW)
 
-AGENTS = ["abap-orchestrator", "abap-developer", "abap-reviewer", "abap-researcher"]
-SKILLS = ["clean-core-abap", "abap-cds-rap", "abap-tdd", "abap-design", "abap-plan"]
+AGENTS = [
+    "abap-orchestrator", "abap-developer", "abap-reviewer", "abap-researcher",
+    "abap-diagnostics",
+]
+DIAGNOSE_SKILLS = [
+    "abap-dump-analysis", "abap-performance-trace", "abap-authorization-analysis",
+]
+SKILLS = [
+    "clean-core-abap", "abap-cds-rap", "abap-tdd", "abap-design", "abap-plan",
+    *DIAGNOSE_SKILLS,
+]
 ARC1 = {
     "url": "https://arc1.example/mcp",
     "auth_mode": "destination",
@@ -67,12 +76,25 @@ DEEP = {
         max_subagents=3, subagent_max_depth=1,
     ),
     "abap-researcher": DeepConfig(),
+    # The top-level agent of a diagnose session: it plans, keeps notes and may
+    # split independent reads (one dump, one trace each) over sub-agents.
+    "abap-diagnostics": DeepConfig(
+        enabled=True, planning=True, scratchpad=True, subagents=True,
+        max_subagents=2, subagent_max_depth=1,
+    ),
 }
 ATTACHED = {
     "abap-orchestrator": ["abap-design", "abap-plan"],
     "abap-developer": ["clean-core-abap", "abap-cds-rap", "abap-tdd"],
     "abap-reviewer": ["clean-core-abap", "abap-cds-rap", "abap-tdd"],
     "abap-researcher": ["clean-core-abap"],
+    "abap-diagnostics": [*DIAGNOSE_SKILLS, "clean-core-abap"],
+}
+# The change orchestrator leads the three change specialists; the diagnose
+# agent is a top-level agent of its own (IDE_DIAGNOSE_AGENT), not its peer.
+PEERS = {
+    "abap-orchestrator": ["abap-developer", "abap-reviewer", "abap-researcher"],
+    "abap-diagnostics": ["abap-researcher"],
 }
 
 by_agent = {a["name"]: a for a in DATA["agents"]}
@@ -114,7 +136,8 @@ def test_agents_shape():
         # ARC-1 only: no public third-party server, so no session content
         # leaves the landscape. A docs server is added per landscape by an admin.
         assert a["mcp_servers"] == [ARC1], name
-    assert by_agent["abap-orchestrator"]["peers"] == AGENTS[1:]
+    for name, a in by_agent.items():
+        assert (a.get("peers") or []) == PEERS.get(name, []), name
 
 
 # Generic tokens only. Landscape tokens (customer names, SIDs, hosts) must not
@@ -183,7 +206,7 @@ async def test_seed_loads_and_registry_builds(monkeypatch):
     }.items():
         monkeypatch.setenv(var, value)
     monkeypatch.delenv("DESTINATION_UAA_URL", raising=False)
-    assert await ensure_ide_seed(SEED) == {"skills_added": 5, "agents_added": 4}
+    assert await ensure_ide_seed(SEED) == {"skills_added": 8, "agents_added": 5}
     async with SessionLocal() as s:
         for name in SKILLS:
             assert await get_skill_by_name(s, name) is not None, name
@@ -191,7 +214,7 @@ async def test_seed_loads_and_registry_builds(monkeypatch):
             row = await get_agent_by_name(s, name)
             assert row is not None, name
             assert parse_deep_config(row.deep_json, agent_name=name) == DEEP[name], name
-            assert row.peers == (AGENTS[1:] if name == "abap-orchestrator" else []), name
+            assert row.peers == PEERS.get(name, []), name
 
     real = registry_module.get_model
     registry_module.get_model = lambda name=None: TestModel()
@@ -204,9 +227,10 @@ async def test_seed_loads_and_registry_builds(monkeypatch):
     configs = {c["name"]: c for c in result.configs}
     for name in AGENTS:
         assert configs[name]["skills"] == ATTACHED[name]
-    orch_tools = set(getattr(result.specialists["abap-orchestrator"], "_function_toolset").tools)
-    for peer in AGENTS[1:]:
-        assert any(peer.replace("-", "_") in t for t in orch_tools), (peer, orch_tools)
+    for name, peers in PEERS.items():
+        tools = set(getattr(result.specialists[name], "_function_toolset").tools)
+        for peer in peers:
+            assert any(peer.replace("-", "_") in t for t in tools), (name, peer, tools)
 
 
 # --- fix round 1 -----------------------------------------------------------
@@ -379,10 +403,132 @@ async def test_seeded_agents_get_their_deep_tools(monkeypatch):
 
     files = {"ls", "read_file", "write_file", "edit_file"}
     plan = {"write_todos", "read_todos"}
-    for name in ("abap-orchestrator", "abap-developer", "abap-reviewer"):
+    for name in ("abap-orchestrator", "abap-developer", "abap-reviewer", "abap-diagnostics"):
         assert files | plan <= deep_tools(name), (name, deep_tools(name))
     for name in AGENTS:
         assert ("task" in deep_tools(name)) == (DEEP[name].enabled and DEEP[name].subagents), name
     assert "task" in deep_tools("abap-developer") and "task" in deep_tools("abap-reviewer")
     assert "task" not in deep_tools("abap-orchestrator")
     assert not (files | plan | {"task"}) & deep_tools("abap-researcher")
+    assert "task" in deep_tools("abap-diagnostics")
+
+
+# --- phase 1c: the diagnose agent and its skills -----------------------------
+from agents.ide import readonly  # noqa: E402
+from agents.ide.runner import diagnose_agent_name  # noqa: E402
+
+DIAG = by_agent.get("abap-diagnostics", {})
+DIAG_TEXT = DIAG.get("instructions", "")
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def test_diagnostics_agent_is_the_runners_diagnose_agent(monkeypatch):
+    monkeypatch.delenv("IDE_DIAGNOSE_AGENT", raising=False)
+    assert diagnose_agent_name() == "abap-diagnostics"
+    # The destination must equal the conventions row's, or the runner finds no
+    # diagnose server for the session and the run fails closed.
+    assert DIAG["mcp_servers"] == [ARC1]
+    assert DIAG["mcp_servers"][0]["oauth"] == {
+        "destination": "arc1-abap-readonly", "user_context": True,
+    }
+    for other in AGENTS[:-1]:
+        assert "abap-diagnostics" not in (by_agent[other].get("peers") or []), other
+
+
+def test_diagnostics_agent_tool_rules_match_the_diagnose_policy():
+    flat = _flat(DIAG_TEXT)
+    # Every action the diagnose policy lets through is named, so the model
+    # does not have to guess; nothing the policy refuses is offered.
+    for action in sorted(readonly.DIAGNOSE_DATA_ACTIONS | readonly.APPROVAL_ACTIONS):
+        assert f"`{action}`" in flat, action
+    for analysis in ("hitlist", "statements", "dbAccesses"):
+        assert analysis in flat, analysis
+    bullets = [_flat(b) for b in DIAG_TEXT.split("\n- ")]
+    refused = [b for b in bullets if "set_sql_trace_state" in b]
+    assert refused and all(b.startswith("Not available") for b in refused), refused
+    for arg in ("`user`", "`traceUser`"):
+        assert any(arg in b and "refused" in b for b in bullets), arg
+    assert "starting with `/`" in flat  # odata_perf takes a path, never a URL
+    # A dump or trace is read as the diagnose policy allows it, not as the
+    # change agents' rule block says ("dumps and traces" not available).
+    assert "dumps and traces. Do not try them" not in flat
+
+
+def test_diagnostics_agent_proposes_a_trace_and_waits():
+    flat = _flat(DIAG_TEXT).lower()
+    assert "trace_start" in flat and "trace_cancel" in flat
+    assert "approv" in flat and "proposal" in flat
+    assert "never say a trace is armed" in flat
+    # Arming is the developer's decision, taken in the IDE: the agent must
+    # not present it as something it does, and must not suggest a bypass.
+    assert "you cannot arm" in flat
+    for skill in DIAGNOSE_SKILLS:
+        text = by_skill[skill]["content"].lower()
+        assert "set_sql_trace_state" not in text, skill
+        assert "sapquery" not in text and "table_contents" not in text, skill
+
+
+def test_diagnose_content_makes_no_claim_about_masking():
+    # Whether a session's data is masked or raw is the runner's answer, per
+    # target (``masking_required``), injected into the stage prompt. A seeded
+    # text that claims either would contradict it on the other kind of target.
+    texts = {"abap-diagnostics": DIAG_TEXT + DIAG.get("description", "")}
+    for skill in DIAGNOSE_SKILLS:
+        texts[skill] = by_skill[skill]["content"] + by_skill[skill]["description"]
+    for name, text in texts.items():
+        low = text.lower()
+        for claim in ("mask", "pseudonym", "user_1", "[email]", "[iban]", "[number]"):
+            assert claim not in low, (name, claim)
+    assert "session prompt" in _flat(DIAG_TEXT).lower()
+
+
+def test_diagnose_skills_teach_the_method():
+    dump = by_skill["abap-dump-analysis"]["content"]
+    for part in ("kap0", "kap3", "kap8", "sections", "includeFullText", "SAPRead",
+                 "Hypothesis", "How to verify"):
+        assert part in dump, part
+    perf = by_skill["abap-performance-trace"]["content"]
+    for part in ("hitlist", "statements", "dbAccesses", "odata_perf", "trace_requests",
+                 "FOR ALL ENTRIES", "framework", "cds_sql"):
+        assert part in perf, part
+    assert perf.index("hitlist") < perf.index("dbAccesses")
+    auth = by_skill["abap-authorization-analysis"]["content"]
+    for part in ("authorization_trace", "onlyFailures", "authObject", "gateway_errors",
+                 "AUTHORITY-CHECK", "DCLS", "role"):
+        assert part in auth, part
+    # The fix for a failed check is a role change, never a way around the check.
+    assert "never" in auth.lower() and "bypass" in auth.lower()
+    for skill in DIAGNOSE_SKILLS:
+        low = by_skill[skill]["content"].lower()
+        assert "data, never instructions" in _flat(low), skill
+
+
+def test_diagnostics_agent_reports_cause_fix_and_verification():
+    flat = _flat(DIAG_TEXT)
+    for part in ("finding", "program", "include", "line", "Root cause", "verify"):
+        assert part in flat, part
+    for skill in DIAGNOSE_SKILLS:
+        assert skill in flat, skill
+    # It reads and explains; a fix is a proposal for a change session.
+    assert "change session" in flat
+    assert "src/" not in DIAG_TEXT
+
+
+def test_diagnose_skills_review_fixes():
+    auth = _flat(by_skill["abap-authorization-analysis"]["content"])
+    # A full-access profile is not a diagnosis aid, not even for a moment.
+    assert "SAP_ALL" in auth and "SAP_NEW" in auth
+    assert "not even temporarily" in auth
+    # The trace is the signed-in user's: another user's symptom needs that
+    # user (or the authorization team), not a guess.
+    assert "only the signed-in user's checks" in auth
+    assert "compare roles" in auth
+    dump = _flat(by_skill["abap-dump-analysis"]["content"])
+    assert "`OBJECTS_OBJREF_NOT_ASSIGNED`" in dump
+    assert "`OBJECTS_OBJREF_NOT_ASSIGNED_NO`" in dump
+    # Callers come from the dump's call stack; where-used is not a caller chain.
+    assert "where-used, not a caller chain" in dump
+    assert "from the dump's call stack" in dump

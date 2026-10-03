@@ -1,7 +1,7 @@
 import { toAceAnnotations } from "com/agent/ide/model/lintAnnotations";
-import type { Finding } from "com/agent/ide/service/types";
+import type { LintFinding } from "com/agent/ide/service/types";
 
-function finding(line: number, severity: string, message = "m", rule = "r", column = 3): Finding {
+function finding(line: number, severity: string, message = "m", rule = "r", column = 3): LintFinding {
     return { line, column, severity, message, rule };
 }
 

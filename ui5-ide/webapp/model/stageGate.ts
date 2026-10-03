@@ -1,4 +1,4 @@
-import type { ArtifactKind, FileState, SessionStatus, Stage } from "../service/types";
+import type { ArtifactKind, FileState, SessionStatus, SessionType, Stage } from "../service/types";
 
 /**
  * The client mirror of the stage gates (plan §1.1), for enabling Approve,
@@ -10,9 +10,20 @@ import type { ArtifactKind, FileState, SessionStatus, Stage } from "../service/t
  */
 export interface Gate { ok: boolean; reasonKey?: string }
 
-type SessionLike = { stage: Stage; status: SessionStatus } | null | undefined;
+type SessionLike = { stage: Stage; status: SessionStatus; type?: SessionType } | null | undefined;
 
 export const STAGES: Stage[] = ["chat", "design", "plan", "propose", "review", "done"];
+
+/** The stages per session type (plan 1c §1.1): a diagnose session never leaves `investigate`. */
+export const STAGES_BY_TYPE: Record<SessionType, Stage[]> = {
+    change: STAGES,
+    diagnose: ["investigate"]
+};
+
+/** The stage list of a session type; no type reads as `change`. */
+export function stagesFor(type: SessionType | null | undefined): Stage[] {
+    return STAGES_BY_TYPE[type ?? "change"] ?? STAGES;
+}
 
 /** The artifact each stage must have produced before it can be approved. */
 const NEEDS: Partial<Record<Stage, { kind: ArtifactKind; reasonKey: string }>> = {
@@ -32,7 +43,7 @@ function common(session: SessionLike): Gate | null {
     if (!session) {
         return refuse("gateNoSession");
     }
-    if (!STAGES.includes(session.stage)) {
+    if (!stagesFor(session.type).includes(session.stage)) {
         return refuse("gateInvalidStage");
     }
     if (session.stage === "done") {
@@ -53,6 +64,9 @@ export function nextStage(stage: Stage): Stage | null {
 export function canApprove(
     session: SessionLike, artifacts: { kind: ArtifactKind }[], files: { state: FileState }[]
 ): Gate {
+    if (session?.type === "diagnose") {
+        return refuse("gateDiagnoseNoApprove");
+    }
     const refused = common(session);
     if (refused) {
         return refused;
@@ -70,6 +84,9 @@ export function canApprove(
 
 /** Whether the current stage may be rerun with feedback. */
 export function canRevise(session: SessionLike): Gate {
+    if (session?.type === "diagnose") {
+        return refuse("gateDiagnoseNoRevise");
+    }
     const refused = common(session);
     if (refused) {
         return refused;
@@ -82,12 +99,37 @@ export function canSend(session: SessionLike): Gate {
     return common(session) ?? OK;
 }
 
+/** Whether the findings so far may be written up as a report (diagnose sessions, not while running). */
+export function canReport(session: SessionLike): Gate {
+    const refused = common(session);
+    if (refused) {
+        return refused;
+    }
+    return session!.type === "diagnose" ? OK : refuse("gateNotDiagnose");
+}
+
+/** Whether a diagnose session may be handed over to a change session: it needs a report. */
+export function canHandover(session: SessionLike, artifacts: { kind: ArtifactKind }[]): Gate {
+    const refused = canReport(session);
+    if (refused.ok === false) {
+        return refused;
+    }
+    return artifacts.some((a) => a.kind === "report") ? OK : refuse("gateNeedsReportToHandOver");
+}
+
 export type StageTokenState = "done" | "current" | "upcoming";
 
-/** The six stage-bar tokens for a session in `stage` (all upcoming without one). */
-export function stageTokens(stage: Stage | null | undefined): { stage: Stage; state: StageTokenState }[] {
-    const current = stage ? STAGES.indexOf(stage) : -1;
-    return STAGES.map((s, i) => ({
+/**
+ * The stage-bar tokens for a session of `type` in `stage` (all upcoming
+ * without one): six for a change session, the single step `investigate`
+ * for a diagnose session.
+ */
+export function stageTokens(
+    stage: Stage | null | undefined, type?: SessionType | null
+): { stage: Stage; state: StageTokenState }[] {
+    const stages = stagesFor(type);
+    const current = stage ? stages.indexOf(stage) : -1;
+    return stages.map((s, i) => ({
         stage: s,
         state: current < 0 ? "upcoming" : i < current ? "done" : i === current ? "current" : "upcoming"
     }));

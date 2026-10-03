@@ -23,6 +23,10 @@ sap.ui.define(function () {
             "unit/chatRun": { title: "Unit: chatRun" },
             "unit/activity": { title: "Unit: activity" },
             "unit/runWatch": { title: "Unit: runWatch" },
+            "unit/approvals": { title: "Unit: approvals" },
+            "unit/findings": { title: "Unit: findings" },
+            "unit/findingHighlight": { title: "Unit: findingHighlight" },
+            "unit/FakeBackend": { title: "Unit: FakeBackend (approvals)" },
             "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }
     };

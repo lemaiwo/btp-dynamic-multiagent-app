@@ -19,6 +19,8 @@ export interface RunState {
     todos: Todo[];
     usage: UsageEventData | null;
     error: ErrorEventData | null;
+    /** `error` frames that are remarks, not failures ({@link isRunNote}): the run went on. */
+    notes: ErrorEventData[];
     artifacts: ArtifactEventData[];
     /** One entry per changed workspace path. */
     files: FileEventData[];
@@ -27,9 +29,20 @@ export interface RunState {
     finished: boolean;
 }
 
+/**
+ * `error` frames that do not fail the run: the diagnose agent has no server
+ * for the session's target, or the target's conventions could not be read.
+ * The run carries on without its diagnostics tools; the UI shows a warning.
+ */
+const NOTE_CODES = ["no_diagnose_server", "conventions_unavailable"];
+
+export function isRunNote(code: string | null | undefined): boolean {
+    return !!code && NOTE_CODES.includes(code);
+}
+
 export function newRun(): RunState {
     return {
-        runId: "", stage: "", text: "", tools: [], todos: [], usage: null, error: null,
+        runId: "", stage: "", text: "", tools: [], todos: [], usage: null, error: null, notes: [],
         artifacts: [], files: [], done: null, finished: false
     };
 }
@@ -62,7 +75,9 @@ export function reduceRun(state: RunState, event: SseEvent): RunState {
                 files: [...state.files.filter((f) => f.path !== event.data.path), event.data]
             };
         case "error":
-            return { ...state, error: event.data };
+            return isRunNote(event.data.code)
+                ? { ...state, notes: [...state.notes, event.data] }
+                : { ...state, error: event.data };
         case "done":
             return { ...state, done: event.data, finished: true };
         default:

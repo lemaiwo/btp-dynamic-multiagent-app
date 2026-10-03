@@ -98,7 +98,7 @@ class FakeArc1:
         self.answers: dict[str, list[str]] = {}
         self.raise_exc: Exception | None = None
 
-    def factory(self, target: str, destination: str = ""):
+    def factory(self, target: str, destination: str = "", **_kwargs):
         fake = self
 
         class _Client:

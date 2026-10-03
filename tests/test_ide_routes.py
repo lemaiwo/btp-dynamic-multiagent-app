@@ -262,6 +262,8 @@ SID_ROUTES = [
     ("POST", "/ide/api/sessions/{sid}/messages", {"text": "hi"}),
     ("POST", "/ide/api/sessions/{sid}/revise", {"feedback": "f"}),
     ("POST", "/ide/api/sessions/{sid}/cancel", None),
+    ("POST", "/ide/api/sessions/{sid}/report", None),
+    ("POST", "/ide/api/sessions/{sid}/handover", None),
 ]
 
 
@@ -408,6 +410,311 @@ async def test_admin_sessions_metadata_only(client):
     assert r.status_code == 200
     rows = r.json()
     assert len(rows) == 1
-    assert set(rows[0]) == {"id", "owner", "title", "target", "stage", "status",
+    assert set(rows[0]) == {"id", "owner", "title", "target", "type", "stage", "status",
                             "created_at", "updated_at"}
     assert "secret" not in r.text
+
+
+# --- diagnose sessions (phase 1c): create, me, conventions, handover ----------
+
+from sqlalchemy import func, select  # noqa: E402
+
+from agents.ide.stages import build_prompt  # noqa: E402
+
+
+async def _flag(target: str = "T1", value: bool = True) -> None:
+    async with SessionLocal() as db:
+        await upsert_conventions(db, target, non_production=value)
+
+
+async def _count(model) -> int:
+    async with SessionLocal() as db:
+        return (await db.execute(select(func.count()).select_from(model))).scalar_one()
+
+
+async def _diagnose(client, user="alice", title="Dump in ZREPORT", target="T1"):
+    r = await client.post(
+        "/ide/api/sessions",
+        json={"title": title, "target": target, "type": "diagnose"},
+        headers=_as(user),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def test_create_diagnose_requires_non_production_target(client):
+    body = {"title": "d", "target": "T1", "type": "diagnose"}
+    r = await client.post("/ide/api/sessions", json=body, headers=_as("alice"))
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "target_not_non_production"
+    assert await _count(IdeSession) == 0
+    # The flag is the server's, never the caller's.
+    r = await client.post("/ide/api/sessions", json={**body, "non_production": True},
+                          headers=_as("alice"))
+    assert r.status_code == 422 and await _count(IdeSession) == 0
+    # A target without conventions stays "unknown", whatever the type.
+    r = await client.post("/ide/api/sessions", json={**body, "target": "NOPE"},
+                          headers=_as("alice"))
+    assert r.status_code == 422 and "code" not in r.json()
+    r = await client.post("/ide/api/sessions", json={**body, "type": "other"},
+                          headers=_as("alice"))
+    assert r.status_code == 422 and await _count(IdeSession) == 0
+
+
+async def test_create_diagnose_flag_is_reread_on_every_create(client):
+    await _flag()
+    await _diagnose(client)
+    await _flag(value=False)
+    r = await client.post("/ide/api/sessions",
+                          json={"title": "d", "target": "T1", "type": "diagnose"},
+                          headers=_as("alice"))
+    assert r.status_code == 422 and r.json()["code"] == "target_not_non_production"
+    assert await _count(IdeSession) == 1
+
+
+async def test_create_diagnose_ok(client):
+    await _flag()
+    s = await _diagnose(client)
+    assert s["type"] == "diagnose" and s["stage"] == "investigate"
+    assert s["owner"] == "alice" and s["target"] == "T1" and s["status"] == "idle"
+    assert s["masked"] is False  # non-production target: raw
+    r = await client.get(f"/ide/api/sessions/{s['id']}", headers=_as("alice"))
+    assert r.status_code == 200 and r.json()["type"] == "diagnose"
+    assert r.json()["masked"] is False
+    r = await client.get("/ide/api/sessions", headers=_as("alice"))
+    assert [(x["type"], x["masked"]) for x in r.json()] == [("diagnose", False)]
+    # The flag is read per response: taken away, the session reads as masked.
+    await _flag(value=False)
+    r = await client.get(f"/ide/api/sessions/{s['id']}", headers=_as("alice"))
+    assert r.json()["masked"] is True
+    r = await client.get("/ide/api/sessions", headers=_as("alice"))
+    assert r.json()[0]["masked"] is True
+
+
+async def test_create_defaults_to_change_and_accepts_explicit_change(client):
+    s = await _create(client)
+    assert s["type"] == "change" and s["stage"] == "chat" and s["masked"] is True
+    r = await client.post("/ide/api/sessions",
+                          json={"title": "c", "target": "T1", "type": "change"},
+                          headers=_as("alice"))
+    assert r.status_code == 201 and r.json()["type"] == "change"
+
+
+async def test_me_lists_diagnose_targets(client):
+    async with SessionLocal() as db:
+        await upsert_conventions(db, "T2", label="Two", non_production=True)
+        await upsert_conventions(db, "T3", label="Three")
+    r = await client.get("/ide/api/me", headers=_as("alice"))
+    assert r.status_code == 200
+    assert r.json()["targets"] == ["T1", "T2", "T3"]
+    assert r.json()["diagnose_targets"] == ["T2"]
+
+
+async def test_conventions_non_production_admin_only(client):
+    r = await client.get("/ide/api/conventions/T1", headers=_as("alice"))
+    assert r.json()["non_production"] is False
+    r = await client.put("/ide/api/conventions/T1", json={"non_production": True},
+                         headers=_as("alice"))
+    assert r.status_code == 403
+    r = await client.get("/ide/api/conventions/T1", headers=_as("alice"))
+    assert r.json()["non_production"] is False
+    r = await client.get("/ide/api/me", headers=_as("alice"))
+    assert r.json()["diagnose_targets"] == []
+
+    r = await client.put("/ide/api/conventions/T1", json={"non_production": True},
+                         headers=_as("admin"))
+    assert r.status_code == 200 and r.json()["non_production"] is True
+    # Omitted: the stored value stays.
+    r = await client.put("/ide/api/conventions/T1", json={"label": "L"},
+                         headers=_as("admin"))
+    assert r.status_code == 200 and r.json()["non_production"] is True
+    r = await client.get("/ide/api/conventions", headers=_as("alice"))
+    assert [c["non_production"] for c in r.json()] == [True]
+    r = await client.put("/ide/api/conventions/T1", json={"non_production": False},
+                         headers=_as("admin"))
+    assert r.status_code == 200 and r.json()["non_production"] is False
+
+
+@pytest.mark.parametrize("value", ["true", "yes", 1, 0, [True], {"a": 1}])
+async def test_conventions_non_production_must_be_a_real_boolean(client, value):
+    r = await client.put("/ide/api/conventions/T1", json={"non_production": value},
+                         headers=_as("admin"))
+    assert r.status_code == 422, r.text
+    r = await client.get("/ide/api/conventions/T1", headers=_as("alice"))
+    assert r.json()["non_production"] is False
+
+
+async def test_handover_creates_change_session_with_report(client):
+    await _flag()
+    d = await _diagnose(client, title="Dump in ZREPORT")
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="report",
+                           content="OLD REPORT")
+        await add_artifact(db, d["id"], stage="investigate", kind="report",
+                           content="## Summary\nDivision by zero in ZREPORT")
+        await add_message(db, d["id"], stage="investigate", role="user",
+                          content="private investigation chat")
+        db.add(IdeWorkspaceFile(session_id=d["id"], path="src/zreport.prog.abap",
+                                state="read", origin_source="REPORT zreport."))
+        await db.commit()
+
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover",
+                          headers=_as("alice"))
+    assert r.status_code == 201, r.text
+    new = r.json()
+    assert new["id"] != d["id"]
+    assert new["type"] == "change" and new["stage"] == "chat"
+    assert new["owner"] == "alice" and new["target"] == "T1"
+    assert new["title"] == "Change: Dump in ZREPORT" and new["status"] == "idle"
+
+    r = await client.get(f"/ide/api/sessions/{new['id']}", headers=_as("alice"))
+    body = r.json()
+    assert [(a["kind"], a["stage"], a["version"]) for a in body["artifacts"]] == [
+        ("report", "chat", 1)]
+    assert body["files"] == []  # only the report travels
+    r = await client.get(f"/ide/api/sessions/{new['id']}/artifacts?kind=report",
+                         headers=_as("alice"))
+    assert [a["content"] for a in r.json()] == [
+        "## Summary\nDivision by zero in ZREPORT"]
+    r = await client.get(f"/ide/api/sessions/{new['id']}/messages",
+                         headers=_as("alice"))
+    assert [(m["stage"], m["role"], m["content"]) for m in r.json()] == [
+        ("chat", "system",
+         "Started from diagnose session 'Dump in ZREPORT' (report v2).")]
+    assert "private investigation chat" not in r.text
+
+    # The new session is the owner's alone; the diagnose session is unchanged.
+    r = await client.get(f"/ide/api/sessions/{new['id']}", headers=_as("bob"))
+    assert r.status_code == 404
+    r = await client.get(f"/ide/api/sessions/{d['id']}", headers=_as("alice"))
+    assert r.json()["type"] == "diagnose" and r.json()["stage"] == "investigate"
+    assert len(r.json()["artifacts"]) == 2
+
+    # The change session's chat prompt shows the handed-over report.
+    async with SessionLocal() as db:
+        row = await db.get(IdeSession, new["id"])
+        _, prompt = await build_prompt(db, row, "Fix it")
+    assert "### Diagnosis report (version 1)\n## Summary\nDivision by zero" in prompt
+    assert "OLD REPORT" not in prompt
+
+
+async def test_handover_owner_is_the_caller_not_the_token_name(client):
+    await _flag()
+    headers = {**_as("bob"), "x-test-principal": "alice"}
+    d = await _diagnose(client)
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="report", content="R")
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover", headers=headers)
+    assert r.status_code == 201 and r.json()["owner"] == "alice"
+
+
+async def test_handover_title_is_cut_to_200(client):
+    await _flag()
+    d = await _diagnose(client, title="x" * 200)
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="report", content="R")
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover",
+                          headers=_as("alice"))
+    assert r.status_code == 201
+    assert r.json()["title"] == ("Change: " + "x" * 200)[:200]
+
+
+async def test_handover_refusals(client):
+    await _flag()
+    before = None
+
+    async def refused(sid, code, user="alice"):
+        r = await client.post(f"/ide/api/sessions/{sid}/handover", headers=_as(user))
+        assert r.status_code == 409, r.text
+        assert r.json()["code"] == code
+        assert await _count(IdeSession) == before
+
+    # A change session, even one that holds a report.
+    c = await _create(client)
+    async with SessionLocal() as db:
+        await add_artifact(db, c["id"], stage="chat", kind="report", content="R")
+    d = await _diagnose(client)
+    before = await _count(IdeSession)
+    await refused(c["id"], "not_diagnose")
+
+    # No report yet (another kind does not count).
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="note", content="N")
+    await refused(d["id"], "missing_artifact")
+
+    # Another user's session: 404 before any gate, with or without a report.
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="report",
+                           content="secret report")
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover", headers=_as("bob"))
+    assert r.status_code == 404 and "secret" not in r.text
+    r = await client.post("/ide/api/sessions/nope/handover", headers=_as("alice"))
+    assert r.status_code == 404
+    assert await _count(IdeSession) == before
+    r = await client.get("/ide/api/sessions", headers=_as("bob"))
+    assert r.json() == []
+
+    # While a run is in progress.
+    async with SessionLocal() as db:
+        row = await db.get(IdeSession, d["id"])
+        row.status = "running"
+        await db.commit()
+    await refused(d["id"], "run_in_progress")
+    assert await _count(IdeArtifact) == 3
+
+
+async def test_handover_refused_when_target_lost_non_production(client):
+    """The report of a raw run must not move into a change session on a
+    target that is now treated as production (masking required)."""
+    await _flag()
+    d = await _diagnose(client)
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="report",
+                           content="raw report")
+    await _flag(value=False)
+    before = (await _count(IdeSession), await _count(IdeArtifact),
+              await _count(IdeMessage))
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover",
+                          headers=_as("alice"))
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "target_not_non_production"
+    assert "raw report" not in r.text
+    assert (await _count(IdeSession), await _count(IdeArtifact),
+            await _count(IdeMessage)) == before
+
+    # Conventions gone altogether read the same way.
+    async with SessionLocal() as db:
+        await db.execute(IdeConventions.__table__.delete())
+        await db.commit()
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover",
+                          headers=_as("alice"))
+    assert r.status_code == 409 and r.json()["code"] == "target_not_non_production"
+
+    # A change session still answers not_diagnose first; another user 404.
+    await _flag(value=False)
+    c = await _create(client)
+    r = await client.post(f"/ide/api/sessions/{c['id']}/handover", headers=_as("alice"))
+    assert r.json()["code"] == "not_diagnose"
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover", headers=_as("bob"))
+    assert r.status_code == 404
+
+    # Flagged again: the handover works.
+    await _flag()
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover",
+                          headers=_as("alice"))
+    assert r.status_code == 201, r.text
+
+
+async def test_handover_needs_the_developer_scope(client):
+    r = await client.post("/ide/api/sessions/x/handover", headers=_as("nobody"))
+    assert r.status_code == 403
+    r = await client.post("/ide/api/sessions/x/report", headers=_as("nobody"))
+    assert r.status_code == 403
+
+
+async def test_report_on_a_change_session_is_409_json(client):
+    s = await _create(client)
+    r = await client.post(f"/ide/api/sessions/{s['id']}/report", headers=_as("alice"))
+    assert r.status_code == 409 and r.json()["code"] == "not_diagnose"
+    assert r.headers["content-type"].startswith("application/json")
+    assert await _count(IdeMessage) == 0

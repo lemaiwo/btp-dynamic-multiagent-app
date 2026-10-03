@@ -13,14 +13,19 @@ import BaseController from "./BaseController";
 import formatter from "../model/formatter";
 import { buildTree, OBJECT_TYPES } from "../model/workspaceTree";
 import IdeService from "../service/IdeService";
+import DateFormat from "sap/ui/core/format/DateFormat";
 import type {
-    ArtifactKind, ArtifactEventData, FileSummary, ObjectHit, SessionDetail, SessionSummary, SseEvent, Stage
+    Approval, ApprovalDecision, ArtifactKind, ArtifactEventData, DiagnoseFinding, FileSummary, FindingOpen, ObjectHit,
+    SessionDetail, SessionSummary, SessionType, SseEvent, Stage
 } from "../service/types";
-import { canApprove, canRevise, canSend, nextStage, stageTokens, type Gate } from "../model/stageGate";
-import { activeTool, newRun, reduceRun, toChatItem, type ChatItem, type RunState } from "../model/chatRun";
+import { approvalErrorKey, approvalErrorText, approvalRow, paramsText, reduceApprovals, type ApprovalRow } from "../model/approvals";
+import { canApprove, canHandover, canReport, canRevise, canSend, nextStage, stageTokens, type Gate } from "../model/stageGate";
+import { activeTool, isRunNote, newRun, reduceRun, toChatItem, type ChatItem, type RunState } from "../model/chatRun";
 import ActivityState, { eventRows, lastActivity, todoView } from "../model/activity";
-import { gateErrorText, runErrorText } from "../model/errorText";
+import { errorText, gateErrorText, runErrorText, runNoteText } from "../model/errorText";
 import RunWatch from "../model/runWatch";
+import { upsertFinding } from "../model/findings";
+import { markerRange, targetLine, type AceRangeArgs } from "../model/findingHighlight";
 import { IdeError } from "../service/IdeService";
 import type TabContainer from "sap/m/TabContainer";
 import type TabContainerItem from "sap/m/TabContainerItem";
@@ -45,20 +50,53 @@ interface KeyDownEvent { ctrlKey: boolean; metaKey: boolean; key?: string; preve
 /** The operations on an editor tab; each has its own request token. */
 type TabOp = "open" | "lint" | "refresh";
 
-/** The slice of the Ace editor behind sap.ui.codeeditor.CodeEditor that the lint markers use. */
-interface AceEditor { getSession?(): { setAnnotations(annotations: AceAnnotation[]): void } | undefined }
+/** The slice of the Ace editor behind sap.ui.codeeditor.CodeEditor that the lint and finding markers use. */
+interface AceSession {
+    setAnnotations(annotations: AceAnnotation[]): void;
+    /** The number of lines Ace holds. */
+    getLength(): number;
+    getMarkers(inFront?: boolean): Record<string, { id: number; clazz: string }>;
+    addMarker(range: unknown, clazz: string, type: string): number;
+    removeMarker(id: number): void;
+    /** The gutter classes per zero-based row (Ace keeps them as one string per row). */
+    $decorations?: (string | undefined)[];
+    addGutterDecoration(row: number, className: string): void;
+    removeGutterDecoration(row: number, className: string): void;
+    getScrollTop(): number;
+    setScrollTop(top: number): void;
+}
+interface AceEditor {
+    getSession?(): AceSession | undefined;
+    resize(force?: boolean): void;
+    gotoLine(line: number, column: number, animate: boolean): void;
+}
+/** Ace as sap.ui.codeeditor loads it: a global with its own module registry. */
+interface AceGlobal { require(name: "ace/range"): { Range: new (...args: AceRangeArgs) => unknown } | undefined }
+/** The CSS class of the Ace marker on a finding's line (css/style.css). */
+const FINDING_MARKER = "ideFindingLine";
+/** The CSS class of the same line's gutter cell: the highlight does not rest on the marker's colour. */
+const FINDING_GUTTER = "ideFindingGutter";
+const NO_FINDING_DETAIL = { id: "", title: "", text: "", busy: false, canRefresh: true };
 
-const DOC_KINDS: ArtifactKind[] = ["design", "plan", "note", "review"];
+const DOC_KINDS: ArtifactKind[] = ["design", "plan", "note", "review", "report"];
 const DOC_KIND_KEYS: Record<ArtifactKind, string> = {
-    design: "docKindDesign", plan: "docKindPlan", note: "docKindNote", review: "docKindReview"
+    design: "docKindDesign", plan: "docKindPlan", note: "docKindNote", review: "docKindReview", report: "docKindReport"
 };
 const STAGE_KEYS: Record<Stage, string> = {
     chat: "stageChat", design: "stageDesign", plan: "stagePlan",
-    propose: "stagePropose", review: "stageReview", done: "stageDone"
+    propose: "stagePropose", review: "stageReview", done: "stageDone",
+    investigate: "stageInvestigate"
 };
 const TOKEN_KEYS = { done: "stageTokenDone", current: "stageTokenCurrent", upcoming: "stageTokenUpcoming" };
-/** The document a stage's run delivers (its Approve gate needs it); a run brings that tab to the front. */
-const STAGE_DELIVERABLE: Partial<Record<Stage, ArtifactKind>> = { design: "design", plan: "plan", review: "review" };
+/**
+ * The document a stage's run delivers (its Approve gate needs it, or, for a
+ * diagnose session, the report its Report button asked for); a run brings
+ * that tab to the front.
+ */
+const STAGE_DELIVERABLE: Partial<Record<Stage, ArtifactKind>> = {
+    design: "design", plan: "plan", review: "review", investigate: "report"
+};
+const NO_RUN = { html: "", status: "", error: "", warning: "", usageText: "" };
 /** At most one re-parse of the streamed markdown per this many ms (it re-parses the whole answer). */
 const RENDER_INTERVAL_MS = 100;
 
@@ -66,13 +104,17 @@ const RENDER_INTERVAL_MS = 100;
  * The workbench: explorer, editor and assistant panes side by side.
  *
  * The explorer (view/Explorer.fragment.xml) lists the caller's sessions,
- * shows the selected session's workspace as a tree and opens ABAP objects
+ * shows the selected session's workspace as a tree (a diagnose session's
+ * findings instead, each leading to its source line) and opens ABAP objects
  * into it. The editor (view/Editor.fragment.xml) opens a workspace file as a
  * read-only tab with Source / Proposed / Diff and lint markers, and the
- * session's documents (design, plan, note, review) as rendered markdown.
- * The assistant (view/Assistant.fragment.xml) shows the stage bar with
- * Approve / Revise / Stop and the chat, whose runs stream over SSE
- * (model/chatRun folds the events; model/stageGate mirrors the gates).
+ * session's documents (design, plan, note, review, report) as rendered
+ * markdown. The assistant (view/Assistant.fragment.xml) shows the stage bar
+ * with Approve / Revise / Stop (Report / Hand over in a diagnose session) and
+ * the chat, whose runs stream over SSE (model/chatRun folds the events;
+ * model/stageGate mirrors the gates). A diagnose session's trace approvals
+ * are cards in the chat (fragment/ApprovalCard, model/approvals): stored rows
+ * the user decides through the approval route; no run waits for them.
  * Everything they show lives in the view-local `ide` model; the shell's
  * `appView` model gets the open session's title and target.
  *
@@ -106,6 +148,19 @@ export default class Ide extends BaseController {
 
     // --- Assistant state (not in the model: rendered from it) -------------
     private reviseDialog?: Promise<Dialog>;
+    private findingDetailDialog?: Promise<Dialog>;
+    /** Bumped per finding-detail request and on close: a late answer is dropped. */
+    private detailSeq = 0;
+    /** The tab editors that re-apply their finding line after a rendering. */
+    private hookedEditors = new WeakSet<CodeEditor>();
+    /** Where each tab editor was scrolled to before a rendering, put back after it. */
+    private editorScroll = new WeakMap<CodeEditor, number>();
+    /**
+     * The tabs (by key) a finding was just pressed for: their editor jumps to
+     * the finding line once, when it has the text. Later renderings keep the
+     * reader's own position.
+     */
+    private pendingReveal = new Set<string>();
     /** Aborts reading the current run's stream (Stop, or a session switch). */
     private runAbort?: AbortController;
     /** A run this page started is streaming. */
@@ -135,10 +190,19 @@ export default class Ide extends BaseController {
     private afterRunFailedSid = "";
     /** When the streamed answer was last re-rendered (performance.now()). */
     private lastRender = 0;
+    /**
+     * Ids of the approvals whose decision is on its way. An id is added in
+     * the same turn as the press, so a second press (a double click, or
+     * Reject right after Approve) finds it and sends nothing.
+     */
+    private deciding = new Set<string>();
+    /** A handover is on its way: a second confirm sends nothing. */
+    private handingOver = false;
 
     public onInit(): void {
         this.setModel(new JSONModel({
             targets: [] as string[],
+            diagnoseTargets: [] as string[],
             sessions: [] as SessionSummary[],
             sessionsBusy: false,
             selectedId: "",
@@ -146,19 +210,28 @@ export default class Ide extends BaseController {
             fileList: [] as FileSummary[],
             files: [],
             filesBusy: false,
+            findings: [] as DiagnoseFinding[],
+            findingsBusy: false,
+            findingDetail: { ...NO_FINDING_DETAIL },
+            approvals: [] as Approval[],
+            approvalRows: [] as ApprovalRow[],
             selectedPath: "",
             objectTypes: [...OBJECT_TYPES],
-            newSession: { title: "", target: "", titleState: ValueState.None, targetState: ValueState.None },
+            newSession: {
+                title: "", type: "change" as SessionType, targets: [] as string[], target: "",
+                titleState: ValueState.None, targetState: ValueState.None
+            },
             openObject: { type: "CLAS", name: "", results: [] as ObjectHit[], searching: false },
             tabs: [] as EditorTab[],
             docKinds: [] as { kind: ArtifactKind; label: string }[],
             messages: [] as ChatItem[],
             draft: "",
             activity: { title: "", todos: [], events: [] },
-            run: { html: "", status: "", error: "", usageText: "" },
+            run: { ...NO_RUN },
             assistant: {
                 stages: [], running: false,
-                canApprove: false, approveTooltip: "", canRevise: false, reviseTooltip: "", canSend: false
+                canApprove: false, approveTooltip: "", canRevise: false, reviseTooltip: "", canSend: false,
+                canReport: false, reportTooltip: "", canHandover: false, handoverTooltip: ""
             },
             revise: { title: "", feedback: "", state: ValueState.None, stateText: "" }
         }), "ide");
@@ -181,6 +254,15 @@ export default class Ide extends BaseController {
                 const dom = stageBar.getDomRef();
                 dom?.setAttribute("role", "group");
                 dom?.setAttribute("aria-labelledby", this.createId("stageBarLabel") ?? "stageBarLabel");
+            }
+        });
+        // The approvals list is a VBox too: a group named by its label.
+        const approvalList = this.byId("approvalList");
+        approvalList?.addEventDelegate({
+            onAfterRendering: () => {
+                const dom = approvalList.getDomRef();
+                dom?.setAttribute("role", "group");
+                dom?.setAttribute("aria-labelledby", this.createId("approvalListLabel") ?? "approvalListLabel");
             }
         });
         void this.loadInitial();
@@ -206,6 +288,7 @@ export default class Ide extends BaseController {
         try {
             const [me, sessions] = await Promise.all([this.service.getMe(), this.service.listSessions()]);
             this.ide().setProperty("/targets", me.targets);
+            this.ide().setProperty("/diagnoseTargets", me.diagnose_targets ?? []);
             this.ide().setProperty("/sessions", sessions);
             if (sessions.length) {
                 await this.selectSession(sessions[0].id);
@@ -235,9 +318,14 @@ export default class Ide extends BaseController {
         this.ide().setProperty("/selectedPath", "");
         // Nothing of the previous session stays on screen while the new one loads.
         this.applyDetail(null);
+        this.ide().setProperty("/findings", []);
+        this.ide().setProperty("/findingsBusy", false);
+        this.deciding.clear();
+        this.setApprovals([]);
         this.resetOpenObject();
         this.ide().setProperty("/tabs", []);
         this.tabRequests.clear();
+        this.pendingReveal.clear();
         this.resetChat();
         if (!sid) {
             return;
@@ -248,6 +336,14 @@ export default class Ide extends BaseController {
             if (seq === this.loadSeq) {
                 this.applyDetail(detail);
                 void this.loadMessages(sid, seq);
+                if (detail.type === "diagnose") {
+                    void this.loadFindings(sid, seq);
+                    void this.loadApprovals(sid, seq).catch((e) => {
+                        if (seq === this.loadSeq) {
+                            this.showError(e);
+                        }
+                    });
+                }
             }
         } catch (e) {
             if (seq === this.loadSeq) {
@@ -258,6 +354,305 @@ export default class Ide extends BaseController {
                 this.ide().setProperty("/filesBusy", false);
             }
         }
+    }
+
+    // --- Diagnose: trace approvals -------------------------------------------
+
+    /** A timestamp of the API (UTC, with or without a zone) as the user's date and time; the raw value when it is none. */
+    private formatTime(iso: string): string {
+        const date = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`);
+        return Number.isNaN(date.getTime()) ? iso : DateFormat.getDateTimeInstance({ style: "medium" }).format(date);
+    }
+
+    /** Sets the approvals of the open session and what the cards show of them. */
+    private setApprovals(list: Approval[]): void {
+        const target = String(this.ide().getProperty("/session/target") ?? "");
+        this.ide().setProperty("/approvals", list);
+        this.ide().setProperty("/approvalRows", list.map((approval) => ({
+            ...approvalRow(approval, target, (key, args) => this.text(key, args), (iso) => this.formatTime(iso)),
+            busy: this.deciding.has(approval.id)
+        })));
+    }
+
+    /**
+     * Reads the approvals of a diagnose session and shows exactly what the
+     * server answers: listing can change rows (it closes interrupted ones),
+     * and a decision taken elsewhere arrives this way.
+     */
+    private async loadApprovals(sid: string, seq: number): Promise<void> {
+        const list = await this.service.listApprovals(sid);
+        if (seq !== this.loadSeq) {
+            return;
+        }
+        const known = new Set((this.ide().getProperty("/approvals") as Approval[]).map((a) => a.id));
+        this.setApprovals(list);
+        // A card that was not on screen before (the session was just opened, or the request was
+        // stored while no stream was read) is announced like one a run brings; the focus stays.
+        for (const row of this.ide().getProperty("/approvalRows") as ApprovalRow[]) {
+            const approval = list.find((a) => a.id === row.id);
+            if (row.pending && approval && !known.has(row.id)) {
+                this.announce(this.text("approvalAnnounce",
+                    [row.title, paramsText(approval.params, (key, args) => this.text(key, args))]));
+            }
+        }
+    }
+
+    /**
+     * Approve or Reject on an approval card: the user's decision on a trace
+     * request, sent once. Only a row that is pending in the model and has no
+     * decision on its way is sent; the card's buttons are off until the
+     * answer is there. The row then shows what the server answered: armed
+     * with the request id and expiry, rejected, failed with its reason (a
+     * 200 with status `failed` is a failed arming, said in a message box
+     * too), or "outcome unknown". Refusals: 410 marks the card expired,
+     * 403 `target_not_non_production` (an approve only; a deny is never
+     * refused for the flag) is a message box, 409 `approval_not_pending`
+     * reloads the list (decided elsewhere). The chat is left alone: the
+     * server writes no message for a decision, the row is the record.
+     */
+    public onApprovalDecide(event: UI5Event): void {
+        const source = event.getSource() as Control;
+        const id = source.getBindingContext("ide")?.getProperty("id") as string | undefined;
+        const decision = source.data("decision") as ApprovalDecision | undefined;
+        if (id && (decision === "approve" || decision === "deny")) {
+            void this.decideApproval(id, decision);
+        }
+    }
+
+    private async decideApproval(aid: string, decision: ApprovalDecision): Promise<void> {
+        const sid = this.ide().getProperty("/selectedId") as string;
+        const seq = this.loadSeq;
+        const current = (): Approval[] => this.ide().getProperty("/approvals") as Approval[];
+        const approval = current().find((a) => a.id === aid);
+        if (!sid || !approval || approval.status !== "pending" || this.deciding.has(aid)) {
+            return;
+        }
+        const shown = (this.ide().getProperty("/approvalRows") as ApprovalRow[]).find((r) => r.id === aid);
+        if (decision === "approve" && !shown?.canApprove) {
+            // Only what the card lists in full can be approved; the button is not there either.
+            return;
+        }
+        this.deciding.add(aid);
+        this.setApprovals(current());
+        const text = (key: string, args?: (string | number)[]): string => this.text(key, args);
+        let reload = false;
+        try {
+            const decided = await this.service.decideApproval(sid, aid, decision);
+            if (seq !== this.loadSeq) {
+                return;
+            }
+            this.deciding.delete(aid);
+            this.setApprovals(reduceApprovals(current(), { type: "decided", data: decided }));
+            const line = (this.ide().getProperty("/approvalRows") as ApprovalRow[]).find((r) => r.id === aid)?.statusText ?? "";
+            this.announce(line);
+            if (decided.status === "failed") {
+                MessageBox.error(approvalErrorText(decided.error_code, decided.result?.note, text));
+            }
+        } catch (e) {
+            if (seq !== this.loadSeq) {
+                return;
+            }
+            this.deciding.delete(aid);
+            reload = true;
+            const code = e instanceof IdeError ? e.code : undefined;
+            if (code === "approval_expired" || (e instanceof IdeError && e.status === 410)) {
+                // Too late: the card becomes the expired line. Nothing was sent to SAP.
+                this.setApprovals(reduceApprovals(current(), {
+                    type: "decided", data: { ...approval, status: "expired", error_code: "approval_expired" }
+                }));
+                this.announce(this.text("approvalExpired"));
+            } else if (code === "approval_not_pending") {
+                MessageToast.show(this.text("approvalAlreadyDecided"));
+            } else {
+                const key = approvalErrorKey(code);
+                MessageBox.error(key ? this.text(key) : gateErrorText(e, text));
+            }
+        } finally {
+            this.deciding.delete(aid);
+            if (seq === this.loadSeq) {
+                this.setApprovals(current());
+                if (reload) {
+                    await this.loadApprovals(sid, seq).catch(() => undefined);
+                }
+                if (seq === this.loadSeq) {
+                    // The buttons that had the focus are gone or changed: back to the input.
+                    this.focusInput();
+                }
+            }
+        }
+    }
+
+    /**
+     * Loads the findings of a diagnose session (metadata only, newest first).
+     * A `finding` frame that arrived meanwhile is kept: it is newer than the answer.
+     */
+    private async loadFindings(sid: string, seq: number): Promise<void> {
+        this.ide().setProperty("/findingsBusy", true);
+        try {
+            const loaded = await this.service.listFindings(sid);
+            if (seq === this.loadSeq) {
+                const streamed = this.ide().getProperty("/findings") as DiagnoseFinding[];
+                this.ide().setProperty("/findings",
+                    streamed.slice().reverse().reduce((list, finding) => upsertFinding(list, finding), loaded));
+            }
+        } catch (e) {
+            if (seq === this.loadSeq) {
+                this.showError(e);
+            }
+        } finally {
+            if (seq === this.loadSeq) {
+                this.ide().setProperty("/findingsBusy", false);
+            }
+        }
+    }
+
+    /** A finding leads to its source. */
+    public onFindingPress(event: UI5Event): void {
+        const finding = (event.getSource() as Control).getBindingContext("ide")?.getObject() as DiagnoseFinding | undefined;
+        if (finding?.id) {
+            void this.openFinding(finding.id);
+        }
+    }
+
+    /**
+     * Opens the finding's source as an editor tab and highlights its line.
+     * The server reads the program into the workspace and answers the line,
+     * or a hint when the line is in an include that does not map to the
+     * opened source (a class method include, plan Q9): then nothing is
+     * highlighted and the hint is shown. A finding without a program has no
+     * source (422 `no_source`).
+     */
+    private async openFinding(fid: string): Promise<void> {
+        const sid = this.ide().getProperty("/selectedId") as string;
+        const seq = this.loadSeq;
+        if (!sid) {
+            return;
+        }
+        let opened: FindingOpen;
+        try {
+            opened = await this.service.openFinding(sid, fid);
+        } catch (e) {
+            if (seq !== this.loadSeq) {
+                return;
+            }
+            if (e instanceof IdeError && e.code === "no_source") {
+                MessageBox.information(this.text("findingNoSource"));
+            } else {
+                this.showError(e);
+            }
+            return;
+        }
+        if (seq !== this.loadSeq || !opened?.file?.path) {
+            return;
+        }
+        const path = opened.file.path;
+        const key = fileKey(path);
+        const files = this.ide().getProperty("/fileList") as FileSummary[];
+        this.setFiles([...files.filter((f) => f.path !== path), opened.file]);
+        const hint = opened.hint ? this.text("findingLineHint", [opened.hint]) : "";
+        const mark = { findingLine: opened.line ?? null, findingHint: hint };
+        this.pendingReveal.add(key);
+        if (this.tab(key)) {
+            // The server read the program again: the open tab takes the source as it is now,
+            // or the line would be highlighted in a text it does not belong to.
+            this.selectTab(key);
+            this.patchTab(key, mark);
+            await this.rereadTab(sid, key, path).catch((e) => {
+                if (seq === this.loadSeq) {
+                    this.showError(e);
+                }
+            });
+        } else {
+            // openFile adds the tab before its first await: the mark is on it when the source arrives.
+            const loading = this.openFile(path);
+            this.patchTab(key, mark);
+            await loading;
+        }
+        if (seq !== this.loadSeq || !this.tab(key)) {
+            return;
+        }
+        // A finding's line is a line of the source as it is in SAP, not of a proposal.
+        this.patchTab(key, { ...mark, mode: "source" });
+        await this.showTab(key);
+        if (hint && seq === this.loadSeq) {
+            MessageToast.show(this.text("findingLineHintToast"));
+        }
+    }
+
+    /** Show details: the finding's dump or trace text in a dialog. */
+    public onFindingDetails(event: UI5Event): void {
+        const finding = (event.getSource() as Control).getBindingContext("ide")?.getObject() as DiagnoseFinding | undefined;
+        if (!finding?.id) {
+            return;
+        }
+        this.ide().setProperty("/findingDetail", { ...NO_FINDING_DETAIL, id: finding.id, title: finding.title });
+        void this.dialog("findingDetail").then((dialog) => dialog.open());
+        void this.loadFindingDetail(false);
+    }
+
+    public onFindingDetailRefresh(): void {
+        void this.loadFindingDetail(true);
+    }
+
+    /**
+     * Reads the text of the finding the dialog shows: as kept with the
+     * session, or (`refresh`) again from SAP. The text goes to a read-only
+     * code editor as plain text and stays in the model only while the dialog
+     * is open.
+     */
+    private async loadFindingDetail(refresh: boolean): Promise<void> {
+        const sid = this.ide().getProperty("/selectedId") as string;
+        const fid = this.ide().getProperty("/findingDetail/id") as string;
+        const token = ++this.detailSeq;
+        if (!sid || !fid) {
+            return;
+        }
+        this.ide().setProperty("/findingDetail/busy", true);
+        try {
+            const answer = await this.service.getFinding(sid, fid, refresh);
+            if (token === this.detailSeq) {
+                this.ide().setProperty("/findingDetail/text", String(answer.detail ?? ""));
+                if (refresh) {
+                    MessageToast.show(this.text("findingDetailRefreshed"));
+                }
+            }
+        } catch (e) {
+            if (token !== this.detailSeq) {
+                return;
+            }
+            if (e instanceof IdeError && e.code === "no_detail") {
+                // Nothing to read for this finding, and Refresh is off. Said where the text would
+                // be; a text that is already shown stays, the notice is a toast then.
+                if (refresh && this.ide().getProperty("/findingDetail/text")) {
+                    MessageToast.show(this.text("findingNoDetail"));
+                } else {
+                    this.ide().setProperty("/findingDetail/text", this.text("findingNoDetail"));
+                }
+                this.ide().setProperty("/findingDetail/canRefresh", false);
+            } else if (!refresh && e instanceof IdeError && e.code === "target_not_non_production") {
+                // The target lost its flag: the server serves no detail any more, stored or not.
+                // Said where the text would be, as for no_detail; there is nothing to refresh.
+                this.ide().setProperty("/findingDetail/text", errorText(e, (key, args) => this.text(key, args)));
+                this.ide().setProperty("/findingDetail/canRefresh", false);
+            } else {
+                // A refused refresh included: the text already shown stays.
+                this.showError(e);
+            }
+        } finally {
+            if (token === this.detailSeq) {
+                this.ide().setProperty("/findingDetail/busy", false);
+            }
+        }
+    }
+
+    public onFindingDetailClose(): void {
+        void this.dialog("findingDetail").then((dialog) => dialog.close());
+    }
+
+    public onFindingDetailAfterClose(): void {
+        // Nothing of the text stays behind, and an answer still on its way is dropped.
+        this.detailSeq++;
+        this.ide().setProperty("/findingDetail", { ...NO_FINDING_DETAIL });
     }
 
     private applyDetail(detail: SessionDetail | null): void {
@@ -315,12 +710,24 @@ export default class Ide extends BaseController {
         const targets = this.ide().getProperty("/targets") as string[];
         this.ide().setProperty("/newSession", {
             title: "",
+            type: "change",
+            targets,
             // One target is the common case; preselect it.
             target: targets.length === 1 ? targets[0] : "",
             titleState: ValueState.None,
             targetState: ValueState.None
         });
         void this.dialog("newSession").then((dialog) => dialog.open());
+    }
+
+    /** Switches the target list to the type's targets; keeps a valid choice, preselects a single one. */
+    public onNewSessionTypeChange(): void {
+        const type = String(this.ide().getProperty("/newSession/type") ?? "change") as SessionType;
+        const targets = (this.ide().getProperty(type === "diagnose" ? "/diagnoseTargets" : "/targets") as string[]) ?? [];
+        const current = String(this.ide().getProperty("/newSession/target") ?? "");
+        this.ide().setProperty("/newSession/targets", targets);
+        this.ide().setProperty("/newSession/target", targets.includes(current) ? current : targets.length === 1 ? targets[0] : "");
+        this.ide().setProperty("/newSession/targetState", ValueState.None);
     }
 
     public async onNewSessionCreate(): Promise<void> {
@@ -334,7 +741,8 @@ export default class Ide extends BaseController {
         const dialog = await this.dialog("newSession");
         dialog.setBusy(true);
         try {
-            const session = await this.service.createSession(title, target);
+            const type = String(this.ide().getProperty("/newSession/type") ?? "change") as SessionType;
+            const session = await this.service.createSession(title, target, type);
             dialog.close();
             await this.reloadSessions();
             await this.selectSession(session.id);
@@ -511,7 +919,7 @@ export default class Ide extends BaseController {
         const current = (): boolean => seq === this.loadSeq && this.tabRequests.get(id) === token;
         return {
             current,
-            finish: () => {
+            finish: (): void => {
                 if (current()) {
                     this.tabRequests.delete(id);
                     this.patchTab(key, { busy: [...this.tabRequests.keys()].some((k) => k.startsWith(`${key}#`)) });
@@ -582,6 +990,102 @@ export default class Ide extends BaseController {
         if (current) {
             this.patchTab(key, withView(current, this.diffLabels(current)));
             this.applyAnnotations(key);
+            this.applyFindingLine(key);
+        }
+    }
+
+    /** The Ace editor of the tab `key`; not there while the CodeEditor has not created it (or failed to load it). */
+    private aceOf(key: string): AceEditor | undefined {
+        const editor = this.tabItem(key)?.findAggregatedObjects(true, (c) => c.isA("sap.ui.codeeditor.CodeEditor"))[0] as
+            CodeEditor | undefined;
+        if (editor && !this.hookedEditors.has(editor)) {
+            // The CodeEditor hands its value to Ace on every rendering, which puts the view back
+            // at the top: the finding line is set and revealed again after each one.
+            this.hookedEditors.add(editor);
+            editor.addEventDelegate({
+                onBeforeRendering: () => {
+                    const session = this.aceInstance(editor)?.getSession?.();
+                    if (session) {
+                        this.editorScroll.set(editor, session.getScrollTop());
+                    }
+                },
+                onAfterRendering: () => {
+                    const top = this.editorScroll.get(editor);
+                    this.editorScroll.delete(editor);
+                    // The marker comes back after every rendering; the jump to it happens once.
+                    if (!this.applyFindingLine(this.tabKeyOf(editor)) && top !== undefined) {
+                        this.aceInstance(editor)?.getSession?.()?.setScrollTop(top);
+                    }
+                }
+            });
+        }
+        return this.aceInstance(editor);
+    }
+
+    private aceInstance(editor: CodeEditor | undefined): AceEditor | undefined {
+        return (editor as unknown as { getInternalEditorInstance(): AceEditor | undefined } | undefined)?.getInternalEditorInstance();
+    }
+
+    /**
+     * Highlights the line of the finding the tab was opened for (an Ace
+     * `fullLine` marker plus a gutter decoration, so the highlight does not
+     * rest on a background colour), only while the editor shows the source.
+     * When the finding was just pressed (`pendingReveal`) the line is
+     * scrolled into view and announced, once: true when that happened. The
+     * markers are looked up on the Ace session, not remembered here: a tab's
+     * editor can be handed to another tab when the tab list changes, so
+     * every call first removes what is there.
+     */
+    private applyFindingLine(key: string): boolean {
+        const tab = this.tab(key);
+        const ace = this.aceOf(key);
+        const session = ace?.getSession?.();
+        if (!tab || !ace || !session) {
+            return false;
+        }
+        let revealed = false;
+        Object.values(session.getMarkers(false) ?? {})
+            .filter((marker) => marker.clazz === FINDING_MARKER)
+            .forEach((marker) => session.removeMarker(marker.id));
+        (session.$decorations ?? []).forEach((classes, row) => {
+            if ((classes ?? "").includes(FINDING_GUTTER)) {
+                session.removeGutterDecoration(row, FINDING_GUTTER);
+            }
+        });
+        const Range = (globalThis as { ace?: AceGlobal }).ace?.require("ace/range")?.Range;
+        const line = tab.kind === "file" && tab.mode === "source" && tab.text && Range
+            ? targetLine(tab.findingLine, tab.text.split("\n").length) : null;
+        if (line !== null && Range) {
+            session.addMarker(new Range(...markerRange(line)), FINDING_MARKER, "fullLine");
+            session.addGutterDecoration(line - 1, FINDING_GUTTER);
+            if (this.pendingReveal.has(key) && !tab.busy && session.getLength() >= line) {
+                // Ace has the text (it gets it when the CodeEditor is rendered) and may not be measured yet.
+                this.pendingReveal.delete(key);
+                ace.resize(true);
+                ace.gotoLine(line, 0, false);
+                this.announce(this.text("findingLineAnnounce", [line]));
+                revealed = true;
+            }
+        }
+        if (tab.markedLine !== line) {
+            this.patchTab(key, { markedLine: line });
+        }
+        return revealed;
+    }
+
+    /** Reads the file of an open tab again, keeping the tab's mode (a diff stays a diff). */
+    private async rereadTab(sid: string, key: string, path: string): Promise<void> {
+        const request = this.tabRequest(key, "refresh");
+        this.patchTab(key, { busy: true });
+        try {
+            const file = await this.service.getFile(sid, path);
+            const tab = this.tab(key);
+            if (request.current() && tab) {
+                this.patchTab(key, withFile(tab, file, true));
+                await this.showTab(key);
+            }
+        } finally {
+            request.finish();
         }
     }
 
@@ -591,14 +1095,10 @@ export default class Ide extends BaseController {
      */
     private applyAnnotations(key: string): void {
         const tab = this.tab(key);
-        const editor = this.tabItem(key)?.findAggregatedObjects(true, (c) => c.isA("sap.ui.codeeditor.CodeEditor"))[0] as
-            CodeEditor | undefined;
-        if (!tab || !editor) {
+        if (!tab) {
             return;
         }
-        // Not there yet while the CodeEditor has not created Ace (or failed to load it).
-        const ace = (editor as unknown as { getInternalEditorInstance(): AceEditor | undefined }).getInternalEditorInstance();
-        ace?.getSession?.()?.setAnnotations(showsLintedText(tab) ? toAceAnnotations(tab.lint) : []);
+        this.aceOf(key)?.getSession?.()?.setAnnotations(showsLintedText(tab) ? toAceAnnotations(tab.lint) : []);
     }
 
     private lintPatch(lint: EditorTab["lint"]): Partial<EditorTab> {
@@ -648,6 +1148,7 @@ export default class Ide extends BaseController {
         const key = event.getParameter("item")?.getKey();
         if (key) {
             this.applyAnnotations(key);
+            this.applyFindingLine(key);
         }
     }
 
@@ -656,6 +1157,8 @@ export default class Ide extends BaseController {
         event.preventDefault();
         const key = event.getParameter("item")?.getKey();
         this.ide().setProperty("/tabs", this.tabs().filter((t) => t.key !== key));
+        // The remaining tabs may sit on other editors now: each gets its own finding line back.
+        this.tabs().forEach((t) => this.applyFindingLine(t.key));
     }
 
     public async onLintFile(event: UI5Event): Promise<void> {
@@ -786,13 +1289,17 @@ export default class Ide extends BaseController {
     /** Recomputes the stage bar and the Approve / Revise / Send gates (model/stageGate). */
     private updateAssistant(): void {
         const session = this.ide().getProperty("/session") as SessionDetail | null;
-        const gated = session ? { stage: session.stage, status: this.running() ? "running" as const : session.status } : null;
+        const gated = session
+            ? { stage: session.stage, status: this.running() ? "running" as const : session.status, type: session.type }
+            : null;
         const reason = (gate: Gate, okText: string): string => (gate.ok ? okText : this.text(gate.reasonKey ?? "gateNoSession"));
         const approve = canApprove(gated, session?.artifacts ?? [], session?.files ?? []);
         const revise = canRevise(gated);
+        const report = canReport(gated);
+        const handover = canHandover(gated, session?.artifacts ?? []);
         const next = session ? nextStage(session.stage) : null;
         this.ide().setProperty("/assistant", {
-            stages: stageTokens(session?.stage).map((t) => ({
+            stages: stageTokens(session?.stage, session?.type).map((t) => ({
                 stage: t.stage,
                 state: t.state,
                 label: this.stageLabel(t.stage),
@@ -803,8 +1310,68 @@ export default class Ide extends BaseController {
             approveTooltip: reason(approve, this.text("approveTooltip", [this.stageLabel(next)])),
             canRevise: revise.ok,
             reviseTooltip: reason(revise, this.text("reviseTooltip")),
-            canSend: canSend(gated).ok
+            canSend: canSend(gated).ok,
+            canReport: report.ok,
+            reportTooltip: reason(report, this.text("reportTooltip")),
+            canHandover: handover.ok,
+            handoverTooltip: reason(handover, this.text("handoverTooltip"))
         });
+    }
+
+    /** Diagnose sessions: writes the findings up as the `report` artifact, streamed like a message run. */
+    public onReport(): void {
+        if (this.ide().getProperty("/assistant/canReport")) {
+            void this.startRun("report", "");
+        }
+    }
+
+    /**
+     * Diagnose sessions: hands the report over to a new change session,
+     * after a confirmation that says what is created. The new session is
+     * selected and opens with the report in front.
+     */
+    public onHandover(): void {
+        const session = this.ide().getProperty("/session") as SessionDetail | null;
+        const sid = this.ide().getProperty("/selectedId") as string;
+        if (!sid || !session || !this.ide().getProperty("/assistant/canHandover") || this.handingOver) {
+            return;
+        }
+        MessageBox.confirm(this.text("handoverConfirm", [session.title, session.target]), {
+            onClose: (action: string) => {
+                if (action === MessageBox.Action.OK) {
+                    void this.handover(sid);
+                }
+            }
+        });
+    }
+
+    private async handover(sid: string): Promise<void> {
+        if (this.handingOver || sid !== this.ide().getProperty("/selectedId")) {
+            return;
+        }
+        const seq = this.loadSeq;
+        this.handingOver = true;
+        this.ide().setProperty("/sessionsBusy", true);
+        try {
+            const created = await this.service.handover(sid);
+            await this.reloadSessions();
+            if (seq !== this.loadSeq) {
+                // The user moved on meanwhile: the new session is in the list, the selection stays theirs.
+                return;
+            }
+            await this.selectSession(created.id);
+            if (this.ide().getProperty("/selectedId") === created.id) {
+                MessageToast.show(this.text("handoverDone", [created.title]));
+                await this.openDocument("report");
+            }
+        } catch (e) {
+            if (seq === this.loadSeq) {
+                this.showGateError(e, sid, seq);
+            }
+        } finally {
+            this.handingOver = false;
+            this.ide().setProperty("/sessionsBusy", false);
+        }
     }
 
     public async onApprove(): Promise<void> {
@@ -962,6 +1529,10 @@ export default class Ide extends BaseController {
         this.ide().setProperty("/run/error", "");
     }
 
+    public onRunWarningClose(): void {
+        this.ide().setProperty("/run/warning", "");
+    }
+
     private resetChat(): void {
         // Stop reading the old session's stream; its run goes on server-side.
         this.runAbort?.abort();
@@ -978,7 +1549,7 @@ export default class Ide extends BaseController {
         this.filesRefresh = undefined;
         this.cancelRender();
         this.ide().setProperty("/messages", []);
-        this.ide().setProperty("/run", { html: "", status: "", error: "", usageText: "" });
+        this.ide().setProperty("/run", { ...NO_RUN });
     }
 
     private async loadMessages(sid: string, seq: number): Promise<void> {
@@ -1009,11 +1580,11 @@ export default class Ide extends BaseController {
     }
 
     /**
-     * Sends a message or a revise and follows its stream (plan §1.3). A
+     * Sends a message, a revise or a report request and follows its stream (plan §1.3). A
      * refusal before the stream gives the text back: a message to the
      * input, a revise to its dialog.
      */
-    private async startRun(kind: "message" | "revise", text: string): Promise<void> {
+    private async startRun(kind: "message" | "revise" | "report", text: string): Promise<void> {
         const sid = this.ide().getProperty("/selectedId") as string;
         if (!sid || this.running()) {
             return;
@@ -1024,14 +1595,17 @@ export default class Ide extends BaseController {
         const local: ChatItem = {
             id: `local-${Date.now()}`, role: "user", isUser: true, content: text, html: "", cancelled: false
         };
-        this.ide().setProperty("/messages", [...this.ide().getProperty("/messages") as ChatItem[], local]);
+        if (kind !== "report") {
+            // A report run has no user message: the button is the request.
+            this.ide().setProperty("/messages", [...this.ide().getProperty("/messages") as ChatItem[], local]);
+        }
         this.run = newRun();
         this.activity = new ActivityState();
         this.expandedOutputs.clear();
         this.renderActivity();
         this.localRunning = true;
         this.ide().setProperty("/run", {
-            html: "", status: this.text("assistantThinking"), error: "",
+            ...NO_RUN, status: this.text("assistantThinking"),
             usageText: this.ide().getProperty("/run/usageText")
         });
         this.updateAssistant();
@@ -1045,6 +1619,8 @@ export default class Ide extends BaseController {
             const onEvent = (event: SseEvent): void => this.onRunEvent(sid, seq, event);
             if (kind === "message") {
                 await this.service.streamMessage(sid, text, onEvent, abort.signal);
+            } else if (kind === "report") {
+                await this.service.streamReport(sid, onEvent, abort.signal);
             } else {
                 await this.service.streamRevise(sid, text, onEvent, abort.signal);
             }
@@ -1098,6 +1674,16 @@ export default class Ide extends BaseController {
         }
     }
 
+    /** Non-fatal remarks of a run, one per line when there is more than one. */
+    private showRunWarning(text: string): void {
+        const shown = String(this.ide().getProperty("/run/warning") ?? "");
+        if (text && !shown.split("\n").includes(text)) {
+            this.ide().setProperty("/run/warning", shown ? `${shown}\n${text}` : text);
+            this.announce(text);
+            this.scrollChat();
+        }
+    }
+
     private showRunError(text: string): void {
         this.ide().setProperty("/run/error", text);
         this.announce(text);
@@ -1121,10 +1707,16 @@ export default class Ide extends BaseController {
             return false;
         }
         try {
-            // Settle all three before deciding: a late session refresh must not
+            // Settle them all before deciding: a late session refresh must not
             // stop the watch that a failure below re-arms.
-            const results = await Promise.allSettled(
-                [this.refreshSession(sid, seq), this.loadMessages(sid, seq), this.reloadSessions()]);
+            // A diagnose run stores findings whether or not their frames were seen
+            // (Stop, a broken stream, a run this page only polled): read them again.
+            const diagnose = (this.ide().getProperty("/session/type") as SessionType | undefined) === "diagnose";
+            // The same goes for trace proposals: the approvals are read again too.
+            const results = await Promise.allSettled([
+                this.refreshSession(sid, seq), this.loadMessages(sid, seq), this.reloadSessions(),
+                ...(diagnose ? [this.loadFindings(sid, seq), this.loadApprovals(sid, seq)] : [])
+            ]);
             const failed = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
             if (failed) {
                 throw failed.reason;
@@ -1177,10 +1769,30 @@ export default class Ide extends BaseController {
                     this.text("usageText", [event.data.requests_used, event.data.request_cap]));
                 break;
             case "error":
-                this.showRunError(runErrorText(event.data, (key, args) => this.text(key, args)));
+                if (isRunNote(event.data.code)) {
+                    // A remark, not a failure: the run goes on without its diagnostics tools.
+                    this.showRunWarning(runNoteText(event.data, (key, args) => this.text(key, args)));
+                } else {
+                    this.showRunError(runErrorText(event.data, (key, args) => this.text(key, args)));
+                }
                 break;
+            case "approval_required": {
+                // A trace proposal: a card to decide. The run does not wait for it.
+                this.setApprovals(reduceApprovals(this.ide().getProperty("/approvals") as Approval[], event));
+                const row = (this.ide().getProperty("/approvalRows") as ApprovalRow[]).find((r) => r.id === event.data.id);
+                if (row?.pending) {
+                    this.announce(this.text("approvalAnnounce",
+                        [row.title, paramsText(event.data.params, (key, args) => this.text(key, args))]));
+                    this.scrollChat();
+                }
+                break;
+            }
             case "artifact":
                 void this.showArtifact(sid, seq, event.data);
+                break;
+            case "finding":
+                this.ide().setProperty("/findings",
+                    upsertFinding(this.ide().getProperty("/findings") as DiagnoseFinding[], event.data));
                 break;
             case "file":
                 this.pendingFiles.add(event.data.path);
@@ -1244,7 +1856,8 @@ export default class Ide extends BaseController {
     private renderActivity(): void {
         const todos = todoView(this.activity.todos);
         const events = eventRows(this.activity.events).map((row) => ({
-            ...row, expanded: this.expandedOutputs.has(row.id)
+            ...row, expanded: this.expandedOutputs.has(row.id),
+            refusedText: row.refusedKey ? this.text(row.refusedKey) : ""
         }));
         const done = this.activity.todos.filter((t) => t.status === "completed").length;
         this.ide().setProperty("/activity", {
@@ -1271,9 +1884,9 @@ export default class Ide extends BaseController {
     }
 
     /**
-     * A new design / plan / note / review version. The current stage's own
-     * deliverable (design, plan, review: what Approve needs) comes to the
-     * front; anything else (a propose run's note) opens or refreshes behind
+     * A new design / plan / note / review / report version. The current
+     * stage's own deliverable (design, plan, review: what Approve needs; a
+     * diagnose session's report) comes to the front; anything else (a propose run's note) opens or refreshes behind
      * the tab the user looks at, with a toast. An open tab moves to the new
      * version only when it showed the latest one: a version the user chose
      * stays.
@@ -1326,20 +1939,8 @@ export default class Ide extends BaseController {
         if (!await this.reloadFiles(sid, seq)) {
             return;
         }
-        await Promise.all(paths.filter((path) => this.tab(fileKey(path))).map(async (path) => {
-            const key = fileKey(path);
-            const request = this.tabRequest(key, "refresh");
-            try {
-                const file = await this.service.getFile(sid, path);
-                const tab = this.tab(key);
-                if (request.current() && tab) {
-                    this.patchTab(key, withFile(tab, file, true));
-                    await this.showTab(key);
-                }
-            } finally {
-                request.finish();
-            }
-        }));
+        await Promise.all(paths.filter((path) => this.tab(fileKey(path)))
+            .map((path) => this.rereadTab(sid, fileKey(path), path)));
     }
 
     /**
@@ -1407,7 +2008,22 @@ export default class Ide extends BaseController {
     // --- Helpers -------------------------------------------------------------
 
     /** Loads a dialog fragment once; loadFragment prefixes ids and adds it as a dependent. */
-    private dialog(which: "newSession" | "openObject" | "revise"): Promise<Dialog> {
+    private dialog(which: "newSession" | "openObject" | "revise" | "findingDetail"): Promise<Dialog> {
+        if (which === "findingDetail") {
+            this.findingDetailDialog ??= (this.loadFragment({
+                name: "com.agent.ide.fragment.FindingDetailDialog"
+            }) as Promise<Dialog>).then((dialog) => {
+                // Ace's text input has no name of its own: a screen reader would announce a bare text field.
+                const editor = this.byId("findingDetailEditor");
+                const name = (): void => {
+                    editor?.getDomRef()?.querySelector("textarea")?.setAttribute("aria-label", this.text("findingDetailEditorLabel"));
+                };
+                editor?.addEventDelegate({ onAfterRendering: name });
+                dialog.attachAfterOpen(name);
+                return dialog;
+            });
+            return this.findingDetailDialog;
+        }
         if (which === "revise") {
             this.reviseDialog ??= this.loadFragment({
                 name: "com.agent.ide.fragment.ReviseDialog"

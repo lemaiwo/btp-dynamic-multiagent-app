@@ -183,6 +183,10 @@ async def _save(sid: str, state: DeepState) -> list[dict]:
 
 DEFAULT_SAVE_TIMEOUT_S = 30.0
 
+# The one session type whose workspace is written back. Everything else --
+# ``diagnose`` and any type added later -- stays in memory until reviewed.
+_PERSISTED_SESSION_TYPE = "change"
+
 
 def save_timeout() -> float:
     """``IDE_SAVE_TIMEOUT_S``: how long a cancelled run waits for its save."""
@@ -232,7 +236,12 @@ async def _save_to_completion(sid: str, state: DeepState) -> tuple[bool, list[di
 
 @asynccontextmanager
 async def bound_workspace(
-    sid: str, *, allow_subagents: bool, request_limit: int | None
+    sid: str,
+    *,
+    allow_subagents: bool,
+    request_limit: int | None,
+    session_type: str = "change",
+    persist: bool | None = None,
 ) -> AsyncIterator[WorkspaceScope]:
     """Bind the session's workspace on ``current_workspace`` for one run.
 
@@ -243,12 +252,29 @@ async def bound_workspace(
     save (at most ``IDE_SAVE_TIMEOUT_S``) and is re-raised afterwards. A save
     failure after a failing block is logged and the block's error wins. The
     save's ``[{path, state}]`` list is left on ``scope.changed_files``.
+
+    ``session_type`` lands on ``scope.session_type`` and selects the
+    read-only policy (``agents.ide.readonly``). It also decides whether the
+    state is saved: only a ``change`` session persists by default. A
+    ``diagnose`` scratchpad may hold dump or trace text, which must never
+    reach ``ide_workspace_files`` (plan 1c, D2), so it is never saved and
+    ``persist=True`` with that type raises ``ValueError`` instead of being
+    honoured. ``persist=False`` skips the save (files and todos) for any
+    type and leaves ``changed_files`` empty.
     """
+    if persist is None:
+        persist = session_type == _PERSISTED_SESSION_TYPE
+    elif persist and session_type != _PERSISTED_SESSION_TYPE:
+        raise ValueError(
+            f"an IDE session of type {session_type!r} never persists its "
+            "workspace (diagnose data must not be stored)"
+        )
     scope = WorkspaceScope(
         session_id=sid,
         state=await _load(sid),
         allow_subagents=allow_subagents,
         request_limit=request_limit,
+        session_type=session_type,
     )
     token = current_workspace.set(scope)
     failed = False
@@ -260,12 +286,13 @@ async def bound_workspace(
     finally:
         cancelled_again = False
         save_error: BaseException | None = None
-        try:
-            cancelled_again, scope.changed_files = await _save_to_completion(
-                sid, scope.state
-            )
-        except BaseException as exc:  # noqa: BLE001 -- re-raised below
-            save_error = exc
+        if persist:
+            try:
+                cancelled_again, scope.changed_files = await _save_to_completion(
+                    sid, scope.state
+                )
+            except BaseException as exc:  # noqa: BLE001 -- re-raised below
+                save_error = exc
         try:
             current_workspace.reset(token)
         except ValueError:

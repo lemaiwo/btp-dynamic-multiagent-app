@@ -993,6 +993,14 @@ async def init_db() -> None:
         # --- deep agents ---
         await _ensure_column(conn, "agent_configs", "deep_json", "TEXT")
         await _ensure_column(conn, "job_runs", "activity_json", "TEXT")
+        # --- IDE phase 1c: diagnose sessions ---
+        await _ensure_column(
+            conn, "ide_sessions", "session_type", "VARCHAR(16) NOT NULL DEFAULT 'change'"
+        )
+        await _ensure_column(
+            conn, "ide_conventions", "non_production", "BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        await _ensure_column(conn, "ide_findings", "detail", "TEXT")
         # create_all only creates indexes together with a new table; an
         # existing deployment needs them added here.
         await _ensure_index(conn, "uq_agent_configs_api_slug", "agent_configs", "api_slug")

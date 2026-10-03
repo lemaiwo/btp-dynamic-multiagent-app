@@ -437,6 +437,8 @@ def test_no_route_relies_on_a_trailing_slash():
     assert "/ide/api/sessions/{sid}/messages" in paths
     assert "/ide/api/sessions/{sid}/revise" in paths
     assert "/ide/api/sessions/{sid}/cancel" in paths
+    assert "/ide/api/sessions/{sid}/report" in paths
+    assert "/ide/api/sessions/{sid}/handover" in paths
     assert not [p for p in paths if p.endswith("/")]
 
 
@@ -623,3 +625,110 @@ async def test_cancel_when_another_run_started_meanwhile_is_not_409(client, monk
     # The run the caller saw is gone; the session is returned as it is now.
     assert r.status_code == 200
     assert r.json()["status"] == "running"
+
+
+# --- report run of a diagnose session ------------------------------------------
+
+DIAG = "abap-diagnostics"
+
+
+def _install_diagnose(script: Script) -> None:
+    registry._build = BuildResult(
+        orchestrator=None, specialists={DIAG: _Specialist(script)},
+        mcp_clients=[], configs=[],
+    )
+
+
+async def _diagnose_session(client, user: str = "alice") -> str:
+    async with SessionLocal() as db:
+        await upsert_conventions(db, "T1", non_production=True)
+    r = await client.post("/ide/api/sessions",
+                          json={"title": "d", "target": "T1", "type": "diagnose"},
+                          headers=_as(user))
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+async def test_report_route_streams_and_stores_report(client, monkeypatch):
+    monkeypatch.delenv("IDE_DIAGNOSE_AGENT", raising=False)
+    _install_diagnose(Script(["## Summary\nZero divide"]))
+    sid = await _diagnose_session(client)
+    r = await client.post(f"/ide/api/sessions/{sid}/report", headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("text/event-stream")
+    assert r.headers["cache-control"] == "no-cache"
+    assert r.headers["x-accel-buffering"] == "no"
+    frames = parse(r.text)
+    ks = kinds(frames)
+    assert ks[0] == "run" and ks[-1] == "done"
+    assert of(frames, "run")[0]["stage"] == "investigate"
+    assert "".join(d["delta"] for d in of(frames, "text")) == "## Summary\nZero divide"
+    # No ARC-1 server in this build: a note, and the run still completes.
+    assert [e["code"] for e in of(frames, "error")] in ([], ["no_diagnose_server"])
+    assert of(frames, "done")[0]["status"] == "idle"
+
+    r = await client.get(f"/ide/api/sessions/{sid}/artifacts?kind=report",
+                         headers=_as("alice"))
+    assert [(a["kind"], a["stage"], a["version"], a["content"]) for a in r.json()] == [
+        ("report", "investigate", 1, "## Summary\nZero divide")]
+    row = await _row(sid)
+    assert row.status == "idle" and row.stage == "investigate"
+
+    # The stored report is what a handover then copies.
+    r = await client.post(f"/ide/api/sessions/{sid}/handover", headers=_as("alice"))
+    assert r.status_code == 201 and r.json()["type"] == "change"
+
+
+async def test_report_route_takes_no_text_from_the_client(client):
+    """The request of a report run is the server's; a body is ignored."""
+    script = Script(["R"])
+    _install_diagnose(script)
+    sid = await _diagnose_session(client)
+    r = await client.post(f"/ide/api/sessions/{sid}/report",
+                          json={"text": "INJECTED-REQUEST"}, headers=_as("alice"))
+    assert r.status_code == 200
+    r = await client.get(f"/ide/api/sessions/{sid}/messages", headers=_as("alice"))
+    assert "INJECTED-REQUEST" not in r.text
+
+
+async def test_report_on_change_session_is_409_json_and_nothing_runs(client):
+    _install(Script(["x"]))
+    sid = await _session(client)
+    r = await client.post(f"/ide/api/sessions/{sid}/report", headers=_as("alice"))
+    assert r.status_code == 409 and r.json()["code"] == "not_diagnose"
+    assert r.headers["content-type"].startswith("application/json")
+    async with SessionLocal() as db:
+        assert (await db.execute(select(IdeMessage))).first() is None
+        assert (await db.execute(select(IdeArtifact))).first() is None
+    assert (await _row(sid)).status == "idle"
+
+
+async def test_report_while_running_is_409_json(client):
+    _install_diagnose(Script(["x"]))
+    sid = await _diagnose_session(client)
+    async with SessionLocal() as db:
+        row = await db.get(IdeSession, sid)
+        row.status = "running"
+        await db.commit()
+    r = await client.post(f"/ide/api/sessions/{sid}/report", headers=_as("alice"))
+    assert r.status_code == 409 and r.json()["code"] == "run_in_progress"
+    r = await client.post(f"/ide/api/sessions/{sid}/handover", headers=_as("alice"))
+    assert r.status_code == 409 and r.json()["code"] == "run_in_progress"
+
+
+@pytest.mark.parametrize("path", ["report", "handover"])
+async def test_other_user_cannot_report_or_hand_over(client, path):
+    _install_diagnose(Script(["x"]))
+    sid = await _diagnose_session(client)
+    async with SessionLocal() as db:
+        db.add(IdeArtifact(session_id=sid, stage="investigate", kind="report",
+                           content="secret report", version=1))
+        await db.commit()
+    r = await client.post(f"/ide/api/sessions/{sid}/{path}", headers=_as("bob"))
+    assert r.status_code == 404 and "secret" not in r.text
+    assert r.headers["content-type"].startswith("application/json")
+    async with SessionLocal() as db:
+        assert (await db.execute(select(IdeMessage))).first() is None
+        sessions = (await db.execute(select(IdeSession))).scalars().all()
+        assert [s.id for s in sessions] == [sid]
+    assert (await _row(sid)).status == "idle"

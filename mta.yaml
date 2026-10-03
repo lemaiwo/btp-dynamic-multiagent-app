@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.17.0
+version: 2.18.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -48,6 +48,36 @@ modules:
         - "approuter/"
         - "ui5-admin/"
         - "ui5-ide/"
+        # Local-only material: landscape/customer specific or dev tooling.
+        # Nothing here is read by app.py, agents/ or the before-start hook.
+        - ".sdd/"
+        - "docs/"
+        - "memory/"
+        - "tests/"
+        - "e2e/"
+        - "test-results/"
+        - "tmp/"
+        - "resources/"
+        - ".claude/"
+        - ".mcp.json"
+        - ".github/"
+        - ".pytest_cache/"
+        - ".ruff_cache/"
+        - "CLAUDE.md"
+        - "CLAUDE.local.md"
+        - "README.md"
+        - "JOULE_A2A.md"
+        - "SLACK_SETUP.md"
+        - "*.mtaext"
+        - "ruff.toml"
+        - "pytest.ini"
+        - "*.db"
+        - ".env.*"
+        - "client_secret_*.json"
+        - "*.pfx"
+        - "*.p12"
+        - "*.pem"
+        - "*.key"
     parameters:
       memory: 1G
       disk-quota: 2G
@@ -83,6 +113,15 @@ modules:
       IDE_SESSION_RETENTION_DAYS: "90"
       IDE_SESSION_REQUEST_CAP: "1000"
       IDE_ORCHESTRATOR_AGENT: abap-orchestrator
+      # Diagnose sessions: values are the code defaults; a landscape
+      # overrides them in its .mtaext.
+      IDE_DIAGNOSE_AGENT: abap-diagnostics
+      IDE_DIAGNOSE_RETENTION_DAYS: "14"
+      IDE_AUDIT_RETENTION_DAYS: "365"
+      IDE_APPROVAL_TTL_MIN: "15"
+      IDE_TRACE_MAX_EXECUTIONS: "3"
+      IDE_TRACE_MAX_HOURS: "8"
+      IDE_TRACE_ARM_TIMEOUT_S: "60"
       # A landscape turns the IDE seed on in its .mtaext.
       IDE_SEED: "false"
     requires:

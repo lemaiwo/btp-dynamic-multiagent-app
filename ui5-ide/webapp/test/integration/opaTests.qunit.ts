@@ -19,3 +19,8 @@ import "./ChatJourney";
 import "./AssistantRunJourney";
 import "./ActivityJourney";
 import "./ConventionsJourney";
+import "./DiagnoseSessionJourney";
+import "./FindingsJourney";
+import "./ApprovalJourney";
+import "./ApprovalGuardJourney";
+import "./ReportJourney";

@@ -206,11 +206,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   instead of pydantic-ai's 50 that deep sub-agents share with their parent)
 - `agents/ide/` — the ABAP IDE assistant: a staged chat that analyses,
   designs, plans and **proposes** ABAP changes in a per-session workspace.
-  **Phase 1a is read-only: nothing is ever written to or activated in the
-  ABAP system.** Setup guide: `docs/IDE_SETUP.md` (local, not in repo)
+  **Phases 1a/1c are read-only for source: nothing is ever written to or
+  activated in the ABAP system** (the one runtime setting a developer can
+  approve is arming a trace, see `approvals.py`). A session has a type:
+  `change` (the staged chat above, default) or `diagnose` (phase 1c: stage
+  `investigate` only, it never moves; `revise`/`approve` answer 409). A
+  diagnose run uses the agent `IDE_DIAGNOSE_AGENT` (`abap-diagnostics`),
+  `POST .../report` captures a `report` artifact and `POST .../handover`
+  opens a new `change` session carrying that report. Setup guide: `docs/IDE_SETUP.md` (local, not in repo)
   - `models.py` — `IdeSession` (owner, target, stage, status, todos),
     `IdeMessage`, `IdeArtifact`, `IdeWorkspaceFile`, `IdeConventions`
-    (per-target conventions, optional ARC-1 destination)
+    (per-target conventions, optional ARC-1 destination, `non_production`
+    flag), `IdeFinding`, `IdeApproval` and `IdeAuditLog` (`ide_audit_log`,
+    not a session child: it survives a session purge)
   - `store.py` — owner-scoped persistence; a session that is not the
     caller's answers 404; `list_all_sessions_meta` is metadata only
   - `paths.py` — abapGit-style paths `src/<TYPE>/<name>.<ext>`; any other
@@ -221,7 +229,36 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `registry.build_orchestrator` wraps around every toolset while a
     workspace is bound: default-deny by tool name, then argument checks (no
     data preview, SQL, traces, transport mutations). Enforced in code, not
-    by prompt
+    by prompt. The policy follows the session type: `diagnose` adds the
+    `SAPDiagnose` data actions (dumps, traces, gateway errors, OData
+    performance, authorization trace) with `user`/`traceUser` filters
+    refused; `trace_start`/`trace_cancel` are never forwarded, the guard
+    turns them into a stored proposal; `set_sql_trace_state` stays refused.
+    Diagnose rights apply to the session target's ARC-1 server only
+  - `diagnose.py` — `masking_required(conventions)`, the ONE switch for
+    masking: masking applies only when the target is NOT flagged
+    `non_production` (missing or unreadable conventions mean masked). On a
+    `non_production` target tool results, user messages, run activity and
+    finding detail are raw and may be stored. `DiagnoseRun` is bound on the
+    `current_diagnose` contextvar by the run task (set and reset there);
+    a diagnose call without a binding is refused
+  - `masking.py` — used only when masking is required: allowlist-first
+    (known shapes keep listed fields, the rest is dropped and counted),
+    fail-safe metadata for unknown shapes, per-run pseudonyms held in
+    memory only, dump variable values cut to `[VALUE len=N]`
+  - `findings.py` — turns data results into `IdeFinding` metadata (kind,
+    ref id, program, include, line, time); a dump/gateway-error read also
+    yields `detail` text, stored only for a `non_production` target
+  - `approvals.py` — variant B: the agent only proposes (a pending
+    `IdeApproval` + `approval_required` event); arming happens solely in
+    `POST /ide/api/sessions/{id}/approvals/{aid}` with server-built args
+    (allowlisted keys, bounds `IDE_TRACE_MAX_EXECUTIONS`/`IDE_TRACE_MAX_HOURS`,
+    `traceUser` dropped so ARC-1 traces the signed-in user). Checks run at
+    decision time (owner, diagnose, pending, TTL, `non_production` re-read,
+    user JWT); a conditional UPDATE makes arming exactly-once; an intent
+    audit row is written before the ARC-1 call; a timeout ends as
+    `arc1_timeout_unknown`; `mark_interrupted` closes rows left by a crash.
+    Audit rows go to `ide_audit_log` and the `agents.ide.audit` logger
   - `stages.py` — `chat -> design -> plan -> propose -> review -> done`, one
     `approve` per step, gates raise `StageGateError` (409, 429 for
     `usage_exhausted`); `IdeSession.status` is the run lock
@@ -229,21 +266,50 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     captures the artifact, saves the workspace, emits events; stale-run
     reaper
   - `sse.py` — frames the events (`run`, `text`, `tool`, `plan`, `file`,
-    `artifact`, `usage`, `error`, `done`) with a `: ping` heartbeat
+    `artifact`, `finding`, `approval_required`, `usage`, `error`, `done`)
+    with a `: ping` heartbeat
   - `routes.py` — REST under `/ide/api`, all behind `require_developer`;
-    conventions writes need `require_admin`
+    conventions writes need `require_admin`. Diagnose adds `POST
+    /sessions/{id}/report`, `/handover`, `GET .../findings[/{fid}]`
+    (stored detail, live refresh), `POST .../findings/{fid}/open` (finding
+    to source) and `GET .../approvals`, `POST .../approvals/{aid}`; `type:
+    diagnose` is accepted only for a `non_production` target (422). A
+    diagnose session whose target lost the flag afterwards (or its
+    conventions row) answers 409 `target_not_non_production` for message
+    and report runs (`stages.assert_can_run`, again in `runner._start`),
+    finding detail and open, file refresh/lint and `POST .../open`; stored
+    messages, artifacts, the finding list, the approval list, a denial and
+    delete keep working. Change sessions never look at the flag.
+    Retention: change sessions `IDE_SESSION_RETENTION_DAYS` from last
+    update, diagnose `IDE_DIAGNOSE_RETENTION_DAYS` (14) from creation, audit
+    rows `IDE_AUDIT_RETENTION_DAYS`; pending approvals expire after
+    `IDE_APPROVAL_TTL_MIN`. These are read at import through
+    `store.env_int` (a non-integer falls back to the default with a
+    warning); `IDE_DIAGNOSE_RETENTION_DAYS=0` keeps raw diagnose text
+    forever and is logged as a WARNING at startup; `IDE_TRACE_ARM_TIMEOUT_S`
+    is floored at 5
   - `arc1.py` — direct ARC-1 calls (open, refresh, lint, search) as the
     signed-in user through the target's destination; runs the read-only
-    check first; no user token means 424. Without a destination the URL
+    check first; no user token means 424; `arm_trace`/`cancel_trace` are
+    the only way `trace_start`/`trace_cancel` reach ARC-1. Without a destination the URL
     comes from `IDE_ARC1_URL_<TARGET>`
   - `seed.py` + `seed.ide.json` — `ensure_ide_seed` inserts the IDE agents
     and skills whose name does not exist yet and never touches existing
     rows; `IDE_SEED=false` disables it (the code default is on; `mta.yaml`
-    sets it `false`, a landscape turns it on in its `.mtaext`)
+    sets it `false`, a landscape turns it on in its `.mtaext`). Seeds the
+    `abap-diagnostics` agent and the skills `abap-dump-analysis`,
+    `abap-performance-trace`, `abap-authorization-analysis`
 - `ui5-ide/` — freestyle SAPUI5 (TypeScript) ABAP developer workbench built
   like `ui5-admin/`, deployed to the HTML5 Application Repository and served
   at `/ui5ide`; its backend is `/ide/api` (approuter `/ui5ide/backend/...`).
-  Needs the `developer` scope
+  Needs the `developer` scope. The new-session dialog offers the type
+  (diagnose only for `non_production` targets from `GET /me`); a diagnose
+  session shows an information banner, a findings list that opens the source
+  with the line highlighted, and Report / Handover buttons in place of Approve.
+  A proposed trace (`approval_required`, or a pending row from `GET
+  .../approvals`) appears as an approval card that lists every server-built
+  value the decision covers, with separate Approve and Reject buttons and no
+  default action; a decided approval is one read-only status line
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
@@ -291,7 +357,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `IDE_SESSION_RETENTION_DAYS` (0 disables cleanup), `IDE_SESSION_REQUEST_CAP`,
   `IDE_ORCHESTRATOR_AGENT` and `IDE_SEED`. Not in the descriptor (set per
   landscape in an `.mtaext`): `IDE_RUN_TIMEOUT_S`, `IDE_RUN_STALE_S`,
-  `IDE_RUN_HEARTBEAT_S`, `IDE_SAVE_TIMEOUT_S`, `IDE_ARC1_URL_<TARGET>`
+  `IDE_RUN_HEARTBEAT_S`, `IDE_SAVE_TIMEOUT_S`, `IDE_ARC1_URL_<TARGET>`;
+  2.18.0 adds `IDE_DIAGNOSE_AGENT`, `IDE_DIAGNOSE_RETENTION_DAYS`,
+  `IDE_AUDIT_RETENTION_DAYS`, `IDE_APPROVAL_TTL_MIN`, `IDE_TRACE_MAX_EXECUTIONS`,
+  `IDE_TRACE_MAX_HOURS`, `IDE_TRACE_ARM_TIMEOUT_S`
 - `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
   resource group if missing, idempotent, no-op for `default`. Creates the
   group only; model deployments stay in `scripts/deploy_claude.py` because
@@ -321,6 +390,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    stream: the route takes the session's run lock, `run_stage` binds the
    `WorkspaceScope`, runs the orchestrator with read-only-guarded toolsets
    and relays events until `done`. `approve` moves the stage on
+6. A diagnose run may end with `approval_required` (a proposed trace): the
+   developer answers with `POST /ide/api/sessions/{id}/approvals/{aid}`
+   (`approve`/`deny`); only that route arms the trace
 
 ## Running locally
 ```bash
@@ -349,6 +421,7 @@ bump a pin, rerun the suites, then deploy.
   (`ruff.toml`, advisory in CI). Script-style suites patch
   `create_mcp_server` and `Agent.__init__` at import; `tests/conftest.py`'s
   `real_agents_and_mcp` fixture restores the real ones for tests that build
-  real agents
+  real agents. After a pydantic-ai bump rerun the deferred-tool spike with
+  `IDE_SPIKE_ALL=1 .venv/bin/python -m pytest tests/test_ide_deferred_spike.py`
 - `@ui5/cli`, `ui5-tooling-transpile`, `@sapui5/types`, `karma-ui5`,
   `@playwright/test` — UI5 admin app (dev-only; not in `requirements.txt`)

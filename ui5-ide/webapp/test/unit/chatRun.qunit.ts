@@ -1,4 +1,4 @@
-import { newRun, reduceRun, activeTool, isCancelled, toChatItem } from "com/agent/ide/model/chatRun";
+import { newRun, reduceRun, activeTool, isCancelled, isRunNote, toChatItem } from "com/agent/ide/model/chatRun";
 import type { SseEvent } from "com/agent/ide/service/types";
 
 const tool = (id: string, status: string, toolName = "SAPRead"): SseEvent => ({
@@ -86,4 +86,16 @@ QUnit.test("toChatItem renders assistant markdown and keeps user text plain", fu
     assert.strictEqual(bot.cancelled, true);
     assert.strictEqual(bot.isUser, false);
     assert.strictEqual(user.isUser, true);
+});
+
+QUnit.test("a non-fatal note (no_diagnose_server, conventions_unavailable) is kept apart from the run's error", function (assert) {
+    let run = reduceRun(newRun(), { type: "error", data: { code: "no_diagnose_server", message: "no server" } });
+    run = reduceRun(run, { type: "error", data: { code: "conventions_unavailable", message: "no conventions" } });
+    assert.strictEqual(run.error, null, "the run did not fail");
+    assert.deepEqual(run.notes.map((n) => n.code), ["no_diagnose_server", "conventions_unavailable"]);
+    run = reduceRun(run, { type: "error", data: { code: "run_failed", message: "boom" } });
+    assert.strictEqual(run.error?.code, "run_failed", "a real error still is one");
+    assert.strictEqual(isRunNote("no_diagnose_server"), true);
+    assert.strictEqual(isRunNote("run_failed"), false);
+    assert.strictEqual(isRunNote(undefined), false);
 });

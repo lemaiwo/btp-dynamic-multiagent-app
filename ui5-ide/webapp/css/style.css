@@ -178,3 +178,52 @@
 .ideActivityAgent {
     color: var(--sapContent_LabelColor);
 }
+
+/* The source line a finding points at (an Ace fullLine marker, model/findingHighlight); theme colours, so it follows dark themes. */
+.ideFindingLine {
+    position: absolute;
+    /* Above Ace's own active-line band (z-index 2), which sits on the same row after the jump. */
+    z-index: 3;
+    box-sizing: border-box;
+    background: var(--sapErrorBackground);
+    /* Not by colour alone: the line also carries a bar at its start. */
+    border-left: 0.25rem solid var(--sapErrorBorderColor);
+}
+
+/* The same line in the gutter (an Ace gutter decoration): its number stands out in weight and by a bar, not by colour alone. */
+.ace_gutter-cell.ideFindingGutter {
+    font-weight: bold;
+    color: var(--sapNegativeTextColor);
+    background: var(--sapErrorBackground);
+    box-shadow: inset 0.25rem 0 0 var(--sapErrorBorderColor);
+}
+
+/* Findings list: the row is title, position and kind, with the details button at its end. */
+.ideFinding {
+    padding: 0.5rem 0 0.5rem 1rem;
+}
+.ideFindingTitle {
+    font-family: var(--sapFontBoldFamily);
+    color: var(--sapList_TextColor);
+}
+.ideFindingWhere,
+.ideFindingKind {
+    font-size: var(--sapFontSmallSize);
+    color: var(--sapContent_LabelColor);
+}
+
+/* Trace approvals: a pending request is a bordered card inside the chat, a decided one a line. */
+.ideApprovals {
+    padding: 0.5rem;
+}
+.ideApprovalCard {
+    border: 1px solid var(--sapContent_ForegroundBorderColor);
+    border-left: 0.25rem solid var(--sapInformationBorderColor);
+    border-radius: 0.25rem;
+    margin-bottom: 0.5rem;
+}
+.ideApprovalDecided {
+    display: block;
+    padding: 0.25rem 0.5rem;
+    white-space: normal;
+}

@@ -427,6 +427,121 @@ async def test_hung_save_does_not_make_the_run_uncancellable(monkeypatch, caplog
     assert "abandoned" in caplog.text
 
 
+async def test_bound_workspace_sets_session_type():
+    sid = await _session_with_files()
+    async with bound_workspace(sid, allow_subagents=True, request_limit=None) as s:
+        assert s.session_type == "change"
+    async with bound_workspace(
+        sid, allow_subagents=True, request_limit=None, session_type="diagnose",
+        persist=False,
+    ) as s:
+        assert s.session_type == "diagnose"
+        assert current_workspace.get() is s
+    assert current_workspace.get() is None
+
+
+async def test_bound_workspace_persist_false_writes_nothing():
+    """Decision D2: a diagnose scratchpad may hold dump text; never stored."""
+    sid = await _session_with_files()
+    before = {p: (r.state, r.proposed_source) for p, r in (await _files(sid)).items()}
+    async with bound_workspace(
+        sid, allow_subagents=True, request_limit=None, session_type="diagnose",
+        persist=False,
+    ) as s:
+        s.state.put(NEW_PATH, "dump text from SAPDiagnose")
+        s.state.put(EDIT_PATH, "edited")
+        s.state.todos = [TodoItem(content="look at the dump")]
+    assert s.changed_files == []
+    files = await _files(sid)
+    assert NEW_PATH not in files
+    assert {p: (r.state, r.proposed_source) for p, r in files.items()} == before
+    async with SessionLocal() as db:
+        assert (await db.get(IdeSession, sid)).todos_json is None
+
+
+async def test_bound_workspace_persist_false_writes_nothing_on_error():
+    sid = await _session_with_files()
+    with pytest.raises(RuntimeError, match="boom"):
+        async with bound_workspace(
+            sid, allow_subagents=True, request_limit=None, session_type="diagnose",
+            persist=False,
+        ) as s:
+            s.state.put(NEW_PATH, "dump text")
+            raise RuntimeError("boom")
+    assert current_workspace.get() is None
+    assert NEW_PATH not in await _files(sid)
+
+
+async def test_diagnose_never_persists_by_default():
+    """The type decides: a caller that forgets ``persist`` still stores nothing."""
+    sid = await _session_with_files()
+    async with bound_workspace(
+        sid, allow_subagents=True, request_limit=None, session_type="diagnose",
+    ) as s:
+        s.state.put(NEW_PATH, "dump text")
+        s.state.todos = [TodoItem(content="x")]
+    assert s.changed_files == []
+    assert NEW_PATH not in await _files(sid)
+    async with SessionLocal() as db:
+        assert (await db.get(IdeSession, sid)).todos_json is None
+
+
+async def test_diagnose_with_persist_true_is_refused():
+    sid = await _session_with_files()
+    entered = False
+    with pytest.raises(ValueError, match="diagnose"):
+        async with bound_workspace(
+            sid, allow_subagents=True, request_limit=None,
+            session_type="diagnose", persist=True,
+        ):
+            entered = True
+    assert not entered
+    assert current_workspace.get() is None
+
+
+async def test_unknown_session_type_does_not_persist_by_default():
+    sid = await _session_with_files()
+    async with bound_workspace(
+        sid, allow_subagents=True, request_limit=None, session_type="nonsense",
+    ) as s:
+        s.state.put(NEW_PATH, "text")
+    assert NEW_PATH not in await _files(sid)
+
+
+async def test_change_default_still_persists():
+    sid = await _session_with_files()
+    async with bound_workspace(
+        sid, allow_subagents=True, request_limit=None, session_type="change",
+    ) as s:
+        s.state.put(NEW_PATH, "fresh")
+    assert (await _files(sid))[NEW_PATH].proposed_source == "fresh"
+
+
+async def test_diagnose_writes_nothing_on_cancel():
+    import asyncio
+
+    sid = await _session_with_files()
+    started = asyncio.Event()
+
+    async def run():
+        async with bound_workspace(
+            sid, allow_subagents=True, request_limit=None, session_type="diagnose",
+        ) as s:
+            s.state.put(NEW_PATH, "dump text")
+            s.state.todos = [TodoItem(content="x")]
+            started.set()
+            await asyncio.sleep(60)
+
+    task = asyncio.create_task(run())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert NEW_PATH not in await _files(sid)
+    async with SessionLocal() as db:
+        assert (await db.get(IdeSession, sid)).todos_json is None
+
+
 async def test_bound_workspace_reports_changed_files():
     sid = await _session_with_files()
     async with bound_workspace(sid, allow_subagents=True, request_limit=None) as s:

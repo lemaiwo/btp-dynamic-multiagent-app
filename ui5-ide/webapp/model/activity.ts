@@ -79,14 +79,27 @@ export interface EventRow {
     status: string;
     output: string;
     hasOutput: boolean;
-    /** The read-only guard refused the call (code `readonly_refused`), not a failing tool. */
+    /** The call was refused (the read-only guard, or a trace proposal that was not stored), not a failing tool. */
     refused: boolean;
+    /** The i18n key of the refusal's label; "" when the call was not refused. */
+    refusedKey: string;
 }
+
+/** Refusal codes of a `tool` event and the i18n keys of their labels. */
+const REFUSED_KEYS: Record<string, string> = {
+    readonly_refused: "activityRefused",
+    too_many_pending: "activityProposalTooManyPending",
+    unknown_trace_request: "activityProposalUnknownRequest",
+    target_not_non_production: "activityProposalNotNonProd",
+    not_diagnose: "activityProposalNotDiagnose",
+    invalid_request: "activityProposalInvalid",
+    proposal_failed: "activityProposalFailed"
+};
 
 /**
  * One timeline row per event: running / ok / error get an icon, notes none.
- * A call the read-only guard refused is a warning with a lock, labelled
- * "refused (read-only)" by the view.
+ * A call the read-only guard refused, or a trace proposal the server did not
+ * store, is a warning with a lock; the view shows the label of `refusedKey`.
  */
 export function eventRows(events: ToolEventData[]): EventRow[] {
     return events.map((e) => {
@@ -94,10 +107,11 @@ export function eventRows(events: ToolEventData[]): EventRow[] {
         const base = {
             id: e.id, agent: e.agent, status: e.status, output,
             title: e.tool || e.detail, detail: e.tool ? e.detail : "",
-            hasOutput: !!output, refused: false
+            hasOutput: !!output, refused: false, refusedKey: ""
         };
-        if (e.code === "readonly_refused") {
-            return { ...base, refused: true, icon: "sap-icon://locked", state: "Warning" };
+        const refusedKey = e.code && Object.prototype.hasOwnProperty.call(REFUSED_KEYS, e.code) ? REFUSED_KEYS[e.code] : "";
+        if (refusedKey) {
+            return { ...base, refused: true, refusedKey, icon: "sap-icon://locked", state: "Warning" };
         }
         switch (e.status) {
             case "running":

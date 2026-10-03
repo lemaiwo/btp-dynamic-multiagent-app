@@ -1,0 +1,41 @@
+{
+  "dumps": [
+    {
+      "id": "20261003101530DEVHOST_DEMO_00",
+      "runtimeError": "COMPUTE_INT_ZERODIVIDE",
+      "exception": "CX_SY_ZERODIVIDE",
+      "program": "ZCL_DEMO_CALC=================CP",
+      "include": "ZCL_DEMO_CALC=================CM001",
+      "line": 12,
+      "user": "DEVUSER01",
+      "client": "100",
+      "timestamp": "2026-10-03T10:15:30Z",
+      "shortText": "Division by zero for partner 123456789012 (mail jane.doe@example.com)"
+    },
+    {
+      "id": "20261003111045DEVHOST_DEMO_00",
+      "runtimeError": "MESSAGE_TYPE_X",
+      "exception": "",
+      "program": "ZDEMO_REPORT",
+      "include": "ZDEMO_REPORT",
+      "line": 48,
+      "user": "devuser01",
+      "client": "100",
+      "timestamp": "2026-10-03T11:10:45Z",
+      "shortText": "Account BE71 0961 2345 6769 rejected: RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789"
+    },
+    {
+      "id": "20261003120000DEVHOST_DEMO_00",
+      "runtimeError": "OBJECTS_OBJREF_NOT_ASSIGNED",
+      "exception": "CX_SY_REF_IS_INITIAL",
+      "program": "ZDEMO_REPORT",
+      "include": "ZDEMO_REPORT",
+      "line": 77,
+      "user": "DEVUSER02",
+      "client": "100",
+      "timestamp": "2026-10-03T12:00:00Z",
+      "shortText": "Reference is initial"
+    }
+  ],
+  "total": 3
+}
