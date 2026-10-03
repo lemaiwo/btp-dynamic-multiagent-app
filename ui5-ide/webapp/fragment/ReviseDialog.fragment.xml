@@ -1,0 +1,31 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <Dialog
+        id="reviseDialog"
+        title="{ide>/revise/title}"
+        contentWidth="32rem"
+        initialFocus="reviseFeedback"
+        afterClose=".onReviseAfterClose">
+        <VBox class="sapUiSmallMargin">
+            <Label id="reviseFeedbackLabel" text="{i18n>reviseFeedbackLabel}" labelFor="reviseFeedback" required="true" />
+            <TextArea
+                id="reviseFeedback"
+                value="{ide>/revise/feedback}"
+                valueLiveUpdate="true"
+                placeholder="{i18n>reviseFeedbackPlaceholder}"
+                required="true"
+                valueState="{ide>/revise/state}"
+                valueStateText="{ide>/revise/stateText}"
+                rows="6"
+                maxLength="20000"
+                width="100%" />
+        </VBox>
+        <beginButton>
+            <Button id="reviseSendButton" text="{i18n>reviseSend}" type="Emphasized" press=".onReviseSend" />
+        </beginButton>
+        <endButton>
+            <Button id="reviseCancelButton" text="{i18n>cancel}" press=".onReviseCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

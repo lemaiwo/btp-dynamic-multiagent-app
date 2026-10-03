@@ -38,7 +38,10 @@ class _FakeModel:
 
 
 shared.get_model = lambda name=None: _FakeModel()  # type: ignore[assignment]
+_real_create_mcp_server = shared.create_mcp_server
 shared.create_mcp_server = lambda name, base_url, *a, **k: object()  # type: ignore[assignment]
+# Kept so tests/conftest.py can undo this stub for suites that need the real one.
+shared.create_mcp_server._unpatched = _real_create_mcp_server  # type: ignore[attr-defined]
 
 from httpx import ASGITransport, AsyncClient  # noqa: E402
 

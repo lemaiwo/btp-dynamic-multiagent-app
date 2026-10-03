@@ -582,17 +582,11 @@ class McpServerPayload(BaseModel):
                 )
         elif self.auth_mode == AUTH_MODE_DESTINATION:
             cfg = self.oauth.to_config() if self.oauth else {}
-            if not is_builtin_url(self.url):
-                # Nothing reads the destination for a real MCP URL: the
-                # transport falls through to JWT forwarding, so the user's
-                # XSUAA token would go to that host while the UI reported the
-                # server as connected by configuration.
-                raise ValueError(
-                    "auth_mode=destination is only supported for built-in "
-                    f"toolsets ({', '.join(sorted(BUILTIN_URLS))}); an MCP "
-                    "server over HTTP cannot be reached through a destination, "
-                    "so use auth_mode=jwt, oauth2 or none for this URL"
-                )
+            # A remote MCP URL is allowed too: `create_mcp_server` sends it
+            # through `DestinationAuth`, so the destination names the host and
+            # the credential, and the configured URL contributes only its
+            # path. That is why `_validate_url` skips the host allow-list for
+            # this mode.
             if cfg.get("dcr"):
                 raise ValueError(
                     "a destination server cannot use DCR: the destination "
@@ -670,7 +664,11 @@ class McpServerPayload(BaseModel):
         # `https://evil.com#.hana.ondemand.com` and
         # `https://allowed.hana.ondemand.com.evil.com` both used to pass, and
         # a jwt server sends every chat user's XSUAA token to that host.
-        if not public:
+        # A destination server sends nothing to this host: DestinationAuth
+        # rewrites every request onto the host the BTP destination names and
+        # refuses any other, so the allow-list guards nothing here. https is
+        # still required above.
+        if not public and self.auth_mode != AUTH_MODE_DESTINATION:
             allowlist = os.environ.get("MCP_URL_ALLOWLIST", "").strip()
             if allowlist:
                 if not _allowlist_permits(parts, allowlist):
@@ -2184,6 +2182,10 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
             "digits, '_', '.' or '-'"
         )
     user_context = cfg.get("user_context") is True
+    if not is_builtin_url(key):
+        # A remote MCP server: name and user context are all it has. With
+        # user context the user's JWT goes to the destination service only.
+        return
     if user_context and key not in _DESTINATION_USER_CONTEXT_URLS:
         raise ValueError(
             f"{key} has no signed-in user to act as; turn oauth.user_context off "

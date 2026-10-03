@@ -239,6 +239,35 @@ QUnit.test("validateServers accepts a destination on every built-in", (assert) =
     assert.deepEqual(errors, {});
 });
 
+// --- destinations: a remote MCP server ---
+QUnit.module("validators.validateOAuth on a destination, remote MCP server");
+
+QUnit.test("a remote server may act as the signed-in user", (assert) => {
+    assert.strictEqual(validators.validateOAuth(
+        { destination: "arc1-abap-readonly", user_context: true }, "destination",
+        "https://arc1.example.com/mcp"), "");
+});
+
+QUnit.test("a remote server on an app-level destination is fine too", (assert) => {
+    assert.strictEqual(validators.validateOAuth(
+        { destination: "arc1-abap-readonly" }, "destination", "https://arc1.example.com/mcp"), "");
+});
+
+QUnit.test("a remote server still requires a destination name", (assert) => {
+    const error = validators.validateOAuth({ user_context: true }, "destination", "https://arc1.example.com/mcp");
+    assert.ok(error.toLowerCase().indexOf("destination name") > -1, error);
+});
+
+QUnit.test("a remote server's destination name follows the naming rule", (assert) => {
+    assert.notStrictEqual(validators.validateOAuth(
+        { destination: "bad name/x", user_context: true }, "destination", "https://arc1.example.com/mcp"), "");
+});
+
+QUnit.test("Jira still has no signed-in user to act as", (assert) => {
+    assert.notStrictEqual(validators.validateOAuth(
+        { destination: "MY_JIRA_DESTINATION", user_context: true }, "destination", "builtin:jira"), "");
+});
+
 QUnit.module("validators.validateServers");
 
 QUnit.test("duplicate urls are reported on the later entry", function (assert) {

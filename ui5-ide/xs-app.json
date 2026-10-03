@@ -1,0 +1,29 @@
+{
+  "welcomeFile": "/index.html",
+  "authenticationMethod": "route",
+  "routes": [
+    {
+      "source": "^/backend/(.*)$",
+      "target": "/ide/api/$1",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.developer",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/resources/(.*)$",
+      "target": "/1.120.50/resources/$1",
+      "destination": "ui5",
+      "authenticationType": "none"
+    },
+    {
+      "source": "^(.*)$",
+      "target": "$1",
+      "service": "html5-apps-repo-rt",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.developer",
+      "_comment": "Same reason as ui5-admin/xs-app.json: the repo sends no Cache-Control, so without this a returning user boots a stale Component-preload.js. no-cache revalidates (304 via ETag) rather than forbidding storage.",
+      "cacheControl": "no-cache, must-revalidate"
+    }
+  ]
+}

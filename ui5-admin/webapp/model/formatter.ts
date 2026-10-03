@@ -3,6 +3,8 @@ import type {
     McpServer, RunStatus, TokenState, WorkflowItemStatus, WorkflowRunStatus
 } from "../service/types";
 
+import oauthConfig from "./oauthConfig";
+
 const EM_DASH = "—";
 
 const STATUS_STATES: Record<string, ValueState> = {
@@ -140,6 +142,16 @@ export default {
             return ValueState.None;
         }
         return TOKEN_STATES[tokenState] ?? ValueState.Warning;
+    },
+
+    /**
+     * Visibility of the server dialog's "Act as signed-in user" switch: a
+     * destination server whose url may act as the user. Goes through
+     * `oauthConfig.supportsUserContext` (the shared http(s) helper for remote
+     * urls), so the switch shows exactly where `cleanOAuth` keeps the value.
+     */
+    userContextVisible(authMode: string | null | undefined, url: string | null | undefined): boolean {
+        return authMode === "destination" && oauthConfig.supportsUserContext(url || "");
     },
 
     /** One-line description of an agent's toolsets for the list view. */

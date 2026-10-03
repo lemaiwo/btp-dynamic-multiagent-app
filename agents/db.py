@@ -937,6 +937,8 @@ DEFAULT_RUN_PROMPT = (
 # ---------------------------------------------------------------------------
 async def init_db() -> None:
     """Create tables and ensure an orchestrator config row exists."""
+    import agents.ide.models  # noqa: F401  (registers the IDE tables on Base)
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Lightweight migrations: SQLAlchemy create_all doesn't add columns
@@ -1252,6 +1254,18 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
         # The built-ins that gained destination mode later keep their own
         # pinned keys plus the user-context switch; see `# --- destinations ---`.
         return _clean_builtin_destination(src, builtin)
+    if builtin and not builtin.startswith("builtin:"):
+        # A remote MCP server through a destination: the destination holds
+        # URL and credential, so only its name and the user-context switch
+        # are stored. ``is True``: the string "false" must not decide whose
+        # token a request carries.
+        name = str(src.get("destination") or "").strip()
+        if not name:
+            raise ValueError("destination server requires a destination name")
+        remote: dict[str, Any] = {"destination": name}
+        if src.get("user_context") is True:
+            remote["user_context"] = True
+        return remote
     slack = builtin == "builtin:slack"
     for k in _SLACK_DEST_KEYS if slack else _DEST_KEYS:
         v = src.get(k)

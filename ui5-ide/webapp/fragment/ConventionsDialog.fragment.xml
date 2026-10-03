@@ -1,0 +1,71 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:form="sap.ui.layout.form">
+    <Dialog
+        id="conventionsDialog"
+        title="{i18n>conventionsTitle}"
+        contentWidth="36rem"
+        busy="{conv>/busy}">
+        <MessageStrip
+            id="conventionsReadOnly"
+            class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+            type="Information"
+            showIcon="true"
+            text="{i18n>conventionsReadOnly}"
+            visible="{= !${conv>/isAdmin} }" />
+        <form:SimpleForm id="conventionsForm" editable="true" layout="ResponsiveGridLayout">
+            <Label id="convTargetLabel" text="{i18n>conventionsTarget}" labelFor="convTarget" />
+            <Select
+                id="convTarget"
+                width="100%"
+                selectedKey="{conv>/target}"
+                change=".onConventionsTarget"
+                items="{conv>/targets}">
+                <core:Item key="{conv>}" text="{conv>}" />
+            </Select>
+            <Label id="convLabelLabel" text="{i18n>conventionsLabel}" labelFor="convLabel" />
+            <Input id="convLabel" value="{conv>/form/label}" editable="{conv>/isAdmin}" maxLength="120" />
+            <Label id="convNamespaceLabel" text="{i18n>conventionsNamespace}" labelFor="convNamespace" />
+            <Input id="convNamespace" value="{conv>/form/namespace}" editable="{conv>/isAdmin}" maxLength="30" />
+            <Label id="convPackageLabel" text="{i18n>conventionsPackage}" labelFor="convPackage" />
+            <Input id="convPackage" value="{conv>/form/package}" editable="{conv>/isAdmin}" maxLength="30" />
+            <Label id="convAtcLabel" text="{i18n>conventionsAtc}" labelFor="convAtc" />
+            <Input id="convAtc" value="{conv>/form/atc_variant}" editable="{conv>/isAdmin}" maxLength="30" />
+            <Label id="convCleanCoreLabel" text="{i18n>conventionsCleanCore}" labelFor="convCleanCore" />
+            <Select
+                id="convCleanCore"
+                width="100%"
+                forceSelection="false"
+                editable="{conv>/isAdmin}"
+                selectedKey="{conv>/form/clean_core_level}">
+                <core:Item key="" text="" />
+                <core:Item key="A" text="{i18n>cleanCoreA}" />
+                <core:Item key="B" text="{i18n>cleanCoreB}" />
+                <core:Item key="C" text="{i18n>cleanCoreC}" />
+                <core:Item key="D" text="{i18n>cleanCoreD}" />
+            </Select>
+            <Label id="convDestinationLabel" text="{i18n>conventionsDestination}" labelFor="convDestination" />
+            <Input id="convDestination" value="{conv>/form/destination}" editable="{conv>/isAdmin}" maxLength="200" />
+            <Label id="convFreeTextLabel" text="{i18n>conventionsFreeText}" labelFor="convFreeText" />
+            <TextArea
+                id="convFreeText"
+                value="{conv>/form/free_text}"
+                editable="{conv>/isAdmin}"
+                rows="6"
+                maxLength="20000"
+                width="100%" />
+        </form:SimpleForm>
+        <beginButton>
+            <Button
+                id="convSaveButton"
+                text="{i18n>save}"
+                type="Emphasized"
+                visible="{conv>/isAdmin}"
+                press=".onConventionsSave" />
+        </beginButton>
+        <endButton>
+            <Button id="convCloseButton" text="{i18n>close}" press=".onConventionsClose" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

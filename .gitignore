@@ -42,6 +42,9 @@ docs/
 # AI Core resource groups). They still run locally -- they sit under tests/,
 # so pytest finds them -- but they are not ours to publish.
 tests/local/
+# Landscape tokens (customer names, SIDs, hosts) the seed tests must not find
+# in committed files; listing them in the repo would publish them.
+tests/.forbidden_tokens.local
 
 # Fetched SAP note payloads and other scratch artifacts. Note content is
 # SAP-licensed material and support-backbone output; it is not ours to commit.

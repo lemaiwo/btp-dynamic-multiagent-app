@@ -54,7 +54,10 @@ class _FakeModel:
 
 
 shared.get_model = lambda name=None: _FakeModel()  # type: ignore[assignment]
+_real_create_mcp_server = shared.create_mcp_server
 shared.create_mcp_server = lambda name, base_url, *a, **k: object()  # type: ignore[assignment]
+# Kept so tests/conftest.py can undo this stub for suites that need the real one.
+shared.create_mcp_server._unpatched = _real_create_mcp_server  # type: ignore[attr-defined]
 
 import pydantic_ai  # noqa: E402
 
@@ -66,6 +69,7 @@ def _patched_init(self, model=None, **kwargs):  # type: ignore[no-untyped-def]
     _orig_init(self, model="test", **kwargs)
 
 
+_patched_init._unpatched = _orig_init  # type: ignore[attr-defined]  # see tests/conftest.py
 pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
 
 
@@ -1778,6 +1782,58 @@ assert.throws(() => collectMcpServers(), /JSON object/);
     oauth: { destination: 'JIRA', theme: { band: '#102030' } } }));
 assert.strictEqual(row.querySelector('.dest-field-theme').style.display, 'none');
 assert.ok(!('theme' in out.oauth), 'jira sends no mail, so no theme');
+
+// 8. A remote MCP server through a destination: the destination names the
+//    host and holds the credential, so only {destination, user_context} is
+//    stored (_clean_destination in agents/db.py). A round-trip edit must keep
+//    user_context, or every caller silently becomes the technical user.
+({ row, out } = addAndCollect({ url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
+    oauth: { destination: 'arc1-abap-readonly', user_context: true } }));
+assert.strictEqual(row.querySelector('.dest-field-user_context').style.display, '',
+    'the act-as-user switch is shown for a remote url');
+assert.strictEqual(row.querySelector('.dest-user_context').checked, true,
+    'and loaded from the stored server');
+assert.strictEqual(row.querySelector('.dest-field-lookback').style.display, 'none',
+    'no field the server would drop');
+assert.ok(!row.querySelector('.dest-hint').textContent.includes('built-in toolsets only'),
+    'no claim that only built-ins work');
+assert.deepStrictEqual(out, { url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
+    oauth: { destination: 'arc1-abap-readonly', user_context: true } });
+({ row, out } = addAndCollect({ url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
+    oauth: { destination: 'arc1-abap-readonly', project: 'ABC', lookback: '1d', allow_send: true } }));
+assert.deepStrictEqual(out.oauth, { destination: 'arc1-abap-readonly' },
+    'an app-level destination posts the name alone');
+row.querySelector('.dest-user_context').checked = true;
+syncDestinationFields(row);
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { destination: 'arc1-abap-readonly', user_context: true });
+
+// 9. A NEW remote destination server defaults to acting as the user; a
+//    built-in does not, a touched switch is respected, a stored false stays.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-url').value = 'https://arc1.example.com/mcp';
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.strictEqual(row.querySelector('.dest-user_context').checked, true, 'new remote destination: on');
+row.querySelector('.dest-destination').value = 'D';
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { destination: 'D', user_context: true });
+row.querySelector('.mcp-url').value = 'builtin:jira';
+syncDestinationFields(row);
+assert.strictEqual(row.querySelector('.dest-user_context').checked, false, 'built-in: unchanged default');
+row.querySelector('.mcp-url').value = 'https://arc1.example.com/mcp';
+syncDestinationFields(row);
+const cb = row.querySelector('.dest-user_context');
+cb.checked = false;
+userContextToggled(row);
+row.querySelector('.mcp-url').value = 'https://other.example.com/mcp';
+syncDestinationFields(row);
+assert.strictEqual(cb.checked, false, 'a touched switch is not overridden');
+({ row, out } = addAndCollect({ url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
+    oauth: { destination: 'D', user_context: false } }));
+assert.strictEqual(row.querySelector('.dest-user_context').checked, false, 'stored false stays false');
+assert.deepStrictEqual(out.oauth, { destination: 'D' });
 
 console.log('destination server round-trip scenarios passed');
 """

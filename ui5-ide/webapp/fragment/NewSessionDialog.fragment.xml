@@ -1,0 +1,39 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:form="sap.ui.layout.form">
+    <Dialog
+        id="newSessionDialog"
+        title="{i18n>newSessionDialogTitle}"
+        contentWidth="28rem"
+        afterClose=".onNewSessionAfterClose">
+        <form:SimpleForm id="newSessionForm" editable="true" layout="ResponsiveGridLayout">
+            <Label id="newSessionTitleLabel" text="{i18n>newSessionTitleLabel}" labelFor="newSessionTitle" required="true" />
+            <Input
+                id="newSessionTitle"
+                value="{ide>/newSession/title}"
+                placeholder="{i18n>newSessionTitlePlaceholder}"
+                valueState="{ide>/newSession/titleState}"
+                valueStateText="{i18n>titleRequired}"
+                maxLength="200"
+                submit=".onNewSessionCreate" />
+            <Label id="newSessionTargetLabel" text="{i18n>newSessionTargetLabel}" labelFor="newSessionTarget" required="true" />
+            <Select
+                id="newSessionTarget"
+                forceSelection="false"
+                width="100%"
+                selectedKey="{ide>/newSession/target}"
+                valueState="{ide>/newSession/targetState}"
+                valueStateText="{i18n>targetRequired}"
+                items="{ide>/targets}">
+                <core:Item key="{ide>}" text="{ide>}" />
+            </Select>
+        </form:SimpleForm>
+        <beginButton>
+            <Button id="newSessionCreate" text="{i18n>create}" type="Emphasized" press=".onNewSessionCreate" />
+        </beginButton>
+        <endButton>
+            <Button id="newSessionCancel" text="{i18n>cancel}" press=".onNewSessionCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

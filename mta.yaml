@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.16.1
+version: 2.17.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -47,6 +47,7 @@ modules:
         - "*.mtar"
         - "approuter/"
         - "ui5-admin/"
+        - "ui5-ide/"
     parameters:
       memory: 1G
       disk-quota: 2G
@@ -77,6 +78,13 @@ modules:
       PUBLIC_BASE_URL: ~{pydantic-agent-approuter-api/url}
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
+      # ABAP IDE assistant (agents/ide). Landscape-specific values (ARC-1
+      # destination, targets) are set in conventions / an .mtaext, not here.
+      IDE_SESSION_RETENTION_DAYS: "90"
+      IDE_SESSION_REQUEST_CAP: "1000"
+      IDE_ORCHESTRATOR_AGENT: abap-orchestrator
+      # A landscape turns the IDE seed on in its .mtaext.
+      IDE_SEED: "false"
     requires:
       - name: aicore-service
       - name: uaa-service
@@ -159,6 +167,17 @@ modules:
       supported-platforms: []
       build-result: dist
 
+  - name: ui5-ide
+    type: html5
+    path: ui5-ide
+    build-parameters:
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build:ui5
+      supported-platforms: []
+      build-result: dist
+
   - name: ui5-admin-deployer
     type: com.sap.application.content
     path: .
@@ -172,6 +191,10 @@ modules:
         - name: ui5-admin
           artifacts:
             - ui5-admin-content.zip
+          target-path: resources/
+        - name: ui5-ide
+          artifacts:
+            - ui5-ide-content.zip
           target-path: resources/
 
 resources:

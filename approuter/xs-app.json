@@ -65,6 +65,47 @@
       "csrfProtection": false
     },
     {
+      "source": "^/ui5ide/resources/(.*)$",
+      "target": "/1.120.50/resources/$1",
+      "destination": "ui5",
+      "authenticationType": "none",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5ide/backend/(.*)$",
+      "target": "/ide/api/$1",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.developer",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ide/api/(.*)$",
+      "target": "/ide/api/$1",
+      "destination": "pydantic-agent-backend",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.developer",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5ide/?$",
+      "target": "/comagentide/index.html",
+      "service": "html5-apps-repo-rt",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.developer",
+      "cacheControl": "no-cache, must-revalidate",
+      "csrfProtection": false
+    },
+    {
+      "source": "^/ui5ide/(.*)$",
+      "target": "/comagentide/$1",
+      "service": "html5-apps-repo-rt",
+      "authenticationType": "xsuaa",
+      "scope": "$XSAPPNAME.developer",
+      "cacheControl": "no-cache, must-revalidate",
+      "csrfProtection": false
+    },
+    {
       "source": "^(.*)$",
       "target": "$1",
       "destination": "pydantic-agent-backend",

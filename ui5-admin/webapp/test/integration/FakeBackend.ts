@@ -82,6 +82,13 @@ export default class FakeBackend {
         this.agents[0].peers = ["gmail-agent"];
         this.agents[0].model_name = "gpt-4o";
         this.agents[1].model_name = "retired-model";
+        // --- destinations --- gmail-agent also reaches a remote MCP server
+        // through a user-propagating destination, so a journey can check that
+        // a round-trip edit keeps acting as the signed-in user.
+        this.agents[1].mcp_servers = this.agents[1].mcp_servers.concat([{
+            url: "https://arc1.example.com/mcp", auth_mode: "destination",
+            oauth: { destination: "arc1-abap-readonly", user_context: true }
+        }]);
         // --- deep agents --- btp-agent carries a non-default config so a
         // journey can check it is shown and resent unchanged; gmail-agent
         // keeps the defaults (GET always returns the object).

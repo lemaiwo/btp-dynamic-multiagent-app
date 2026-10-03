@@ -56,9 +56,15 @@ class _FakeMCP:
         self.kwargs = kwargs
 
 
-shared.create_mcp_server = lambda name, base_url, *a, **k: _FakeMCP(  # type: ignore[assignment]
-    name, base_url, **k
-)
+def _fake_create_mcp_server(name, base_url, *a, **k):  # type: ignore[no-untyped-def]
+    return _FakeMCP(name, base_url, **k)
+
+
+# These stubs are installed at import time and so leak into every suite in
+# the same pytest process; ``_unpatched`` lets a suite that needs the real
+# thing put it back for its own tests (tests/test_ide_readonly.py).
+_fake_create_mcp_server._unpatched = shared.create_mcp_server  # type: ignore[attr-defined]
+shared.create_mcp_server = _fake_create_mcp_server  # type: ignore[assignment]
 
 # Patch pydantic_ai.Agent so it accepts our fake model + fake toolsets
 # without touching a real LLM or MCP process. We keep the Agent.tool
@@ -75,6 +81,7 @@ def _patched_init(self, model=None, **kwargs):  # type: ignore[no-untyped-def]
     _orig_agent_init(self, model="test", **kwargs)
 
 
+_patched_init._unpatched = _orig_agent_init  # type: ignore[attr-defined]
 pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
 
 

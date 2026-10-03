@@ -477,7 +477,8 @@ async def check_deep_registry_wiring() -> None:
           any(not isinstance(ts, FunctionToolset) for ts in user_toolsets(on)))
     # Agent keeps its instructions as a list of strings/callables.
     def prompt_text(agent) -> str:
-        return "\n".join(str(i) for i in (agent._instructions or []))
+        return "\n".join(i() if callable(i) else str(i)
+                         for i in (agent._instructions or []))
 
     check("enabled agent's prompt explains the working method",
           "## Working method (deep agent)" in prompt_text(on))

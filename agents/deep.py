@@ -19,9 +19,20 @@ State is one :class:`DeepState` per *run*, keyed by ``RunContext.run_id`` and
 kept in a module-level table with a TTL, so it works from chat, A2A, scheduled
 runs and workflows alike without the runners knowing about it. A sub-agent
 receives the parent's state as its ``deps``, so parent and children share one
-plan and one scratchpad; a peer specialist reached through delegation does not
-(its run has its own ``run_id`` and ``deps=None``), which keeps every agent's
-scratchpad its own.
+plan and one scratchpad. Outside an IDE session, a peer specialist reached
+through delegation does not (its run has its own ``run_id`` and ``deps=None``),
+which keeps every agent's scratchpad its own.
+
+An IDE session instead binds a :class:`WorkspaceScope` to
+:data:`current_workspace` around its runs. While bound, every run and agent in
+that context (without ``DeepState`` deps) shares the scope's state, so the plan
+and scratchpad persist across the session's runs and stages. That includes
+peers and specialists reached by delegation: they run in the same context and
+so inherit the binding, which is intended -- a session has exactly one
+workspace, and the developer delegated to writes into it. The state is loaded
+and saved by the session runner and never enters the per-run table. The
+binding is a ``ContextVar``, set and reset inside the task that runs the
+session's agent, so concurrent sessions each see only their own scope.
 
 Sub-agent concurrency is bounded per state *and per depth*: children hold a
 slot on the depth-1 semaphore while their own grandchildren queue on the
@@ -35,6 +46,7 @@ import asyncio
 import json
 import logging
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Sequence
 
@@ -169,6 +181,36 @@ class DeepState:
         return size
 
 
+@dataclass
+class WorkspaceScope:
+    """Binds deep state to an IDE session instead of a run.
+
+    Set on :data:`current_workspace` by the session runner (``agents.ide``)
+    around a run. ``state`` is the session's own :class:`DeepState` (loaded
+    from the database by the runner); it is shared by every run and agent in
+    the session and is deliberately never stored in the per-run table.
+    """
+
+    session_id: str
+    state: DeepState
+    # False in stages where the agent must do the work itself (plan, propose).
+    allow_subagents: bool = True
+    # Requests this session may still make, read by ``shared.run_usage_limits``
+    # for the top-level run, its delegations and its sub-agents alike.
+    request_limit: int | None = None
+    # ``[{path, state}]`` the workspace save reported, set when the binding
+    # ends (``agents.ide.workspace.bound_workspace``).
+    changed_files: list[dict] = field(default_factory=list)
+
+
+current_workspace: ContextVar[WorkspaceScope | None] = ContextVar(
+    "current_workspace", default=None
+)
+
+SUBAGENTS_OFF_MESSAGE = (
+    "Error: sub-agents are not available in this stage; do the work yourself."
+)
+
 _states: dict[str, DeepState] = {}
 _last_sweep = 0.0
 
@@ -191,8 +233,10 @@ def state_for(ctx: RunContext[Any]) -> DeepState:
     """The :class:`DeepState` for this tool call.
 
     A sub-agent carries its parent's state as ``deps`` and so shares the
-    parent's plan and scratchpad; anything else (a specialist run from chat,
-    A2A, a scheduled run or a workflow step) is keyed by its own ``run_id``.
+    parent's plan and scratchpad. Otherwise, when a :class:`WorkspaceScope`
+    is bound, the session's state is returned, whatever the ``run_id``.
+    Anything else (a specialist run from chat, A2A, a scheduled run or a
+    workflow step) is keyed by its own ``run_id``.
     """
     now = time.monotonic()
     _sweep(now)
@@ -200,6 +244,10 @@ def state_for(ctx: RunContext[Any]) -> DeepState:
     if isinstance(deps, DeepState):
         deps.last_used = now
         return deps
+    scope = current_workspace.get()
+    if scope is not None:
+        scope.state.last_used = now
+        return scope.state
     run_id = str(getattr(ctx, "run_id", None) or "no-run-id")
     state = _states.get(run_id)
     if state is None:
@@ -282,8 +330,19 @@ def _has_task_tool(config: DeepConfig, depth: int) -> bool:
     return config.subagents and depth < config.subagent_max_depth
 
 
-def deep_instructions(config: DeepConfig, *, depth: int = 0) -> str:
+_SUBAGENTS_OFF_BULLET = "- **No sub-agents in this stage.**"
+
+
+def deep_instructions(
+    config: DeepConfig, *, depth: int = 0, workspace: bool = False
+) -> str:
     """System-prompt section describing the deep tools this agent has.
+
+    ``workspace=True`` is the IDE-session variant: the scratchpad is the
+    session workspace the user sees as a file tree and every agent in the
+    session (delegated specialists and peers included) shares, not a private
+    per-run pad. With sub-agents switched off it says so explicitly, because
+    the agent's own instructions may still advertise ``task``.
 
     Returns ``""`` when nothing is enabled at this depth, so callers can
     append it unconditionally.
@@ -298,7 +357,18 @@ def deep_instructions(config: DeepConfig, *, depth: int = 0) -> str:
             "previous one). `read_todos` shows the current plan. Keep the plan "
             "short and concrete; revise it when you learn something new."
         )
-    if config.scratchpad:
+    if config.scratchpad and workspace:
+        parts.append(
+            "- **Work in the session workspace.** `ls`, `read_file`, "
+            "`write_file` and `edit_file` work on the **session workspace, "
+            "which the user sees as a file tree**. It is shared by every agent "
+            "in this session, including the specialists you delegate to, so "
+            "what they write is there for you to read. Put proposed ABAP "
+            "sources at abapGit paths (`src/CLAS/zcl_x.clas.abap`, "
+            "`src/DDLS/zi_x.ddls.asddls`); put notes under `notes/`. Files "
+            "persist across the session's stages."
+        )
+    elif config.scratchpad:
         parts.append(
             "- **Use the scratchpad for long intermediate results.** `ls`, "
             "`read_file`, `write_file` and `edit_file` work on a private, "
@@ -320,12 +390,49 @@ def deep_instructions(config: DeepConfig, *, depth: int = 0) -> str:
             "output to a file and return a short summary with the path. At most "
             f"{config.max_subagents} sub-agents run at once."
         )
+    elif workspace and not config.subagents:
+        parts.append(
+            _SUBAGENTS_OFF_BULLET + " The `task` tool is switched off "
+            "and every call to it is refused: do the work yourself, or hand it "
+            "to a named specialist through its delegation tool."
+        )
     if not parts:
         return ""
     return (
         "\n\n## Working method (deep agent)\n"
         "You work like a deep agent: plan, keep bulky intermediate results out "
         "of your context, and split off isolated work.\n" + "\n".join(parts)
+    )
+
+
+def scoped_deep_instructions(config: DeepConfig, *, depth: int = 0) -> str:
+    """The deep section for ``config`` as the agent runs *now*.
+
+    Registered as an instructions callable at build time
+    (``registry.build_orchestrator``), so it is resolved per run: outside an
+    IDE session it is the per-run text; with a session bound
+    (:data:`current_workspace`) it describes the shared session workspace the
+    user sees, for the top-level agent and every delegate alike. ``task`` is
+    only described when this agent was built with it *and* the stage allows
+    sub-agents, so no agent is invited to call a tool it does not have.
+    """
+    scope = current_workspace.get()
+    if scope is None:
+        return deep_instructions(config, depth=depth)
+    if config.subagents and not scope.allow_subagents:
+        # The tool exists but the stage refuses it: say so.
+        effective = config.model_copy(update={"subagents": False})
+        return deep_instructions(effective, depth=depth, workspace=True)
+    if not config.subagents:
+        # Never built: nothing to advertise or to switch off.
+        text = deep_instructions(config, depth=depth, workspace=True)
+        return _drop_subagents_off_line(text)
+    return deep_instructions(config, depth=depth, workspace=True)
+
+
+def _drop_subagents_off_line(text: str) -> str:
+    return "\n".join(
+        ln for ln in text.split("\n") if not ln.startswith(_SUBAGENTS_OFF_BULLET)
     )
 
 
@@ -515,6 +622,9 @@ def deep_toolset(
                 instructions: Optional extra guidance for this sub-agent (tone,
                     constraints, which tools to prefer).
             """
+            scope = current_workspace.get()
+            if scope is not None and not scope.allow_subagents:
+                return SUBAGENTS_OFF_MESSAGE
             state = state_for(ctx)
             state.subagent_count += 1
             n = state.subagent_count
@@ -524,7 +634,9 @@ def deep_toolset(
             extra = (instructions or "").strip()
             if extra:
                 system_text += "\n\n" + extra
-            system_text += deep_instructions(config, depth=child_depth)
+            system_text += deep_instructions(
+                config, depth=child_depth, workspace=scope is not None
+            )
 
             child = Agent(
                 instructions=system_text,

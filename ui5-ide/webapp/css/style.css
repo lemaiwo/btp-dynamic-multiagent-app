@@ -1,0 +1,180 @@
+/* The three workbench panes fill the splitter height and scroll on their own. */
+.agentIdePane {
+    height: 100%;
+    overflow: auto;
+}
+
+/* A tree row spans the item so the state badge sits on the right edge. */
+.agentIdeTreeRow {
+    min-width: 0;
+}
+
+/* Editor pane: the tab container grows (FlexItemData) into the pane below its toolbar. */
+.ideEditorTabs {
+    height: 100%;
+}
+
+/*
+ * The tab content is a flex column: the toolbar keeps its height and the
+ * editor, diff or document takes the rest (FlexItemData growFactor=1), so no
+ * height depends on the shell around the app.
+ */
+.ideEditorTabs .sapMTabContainerContent,
+.ideEditorTabs .sapMTabContainerInner {
+    height: 100%;
+}
+
+/* Rendered documents scroll inside their tab. */
+.ideEditorTab .ideMarkdown {
+    height: 100%;
+    overflow: auto;
+    box-sizing: border-box;
+}
+
+/* Side-by-side diff. Source text is escaped (model/diffModel), never rendered. */
+.ideDiff {
+    overflow: auto;
+    height: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--sapGroup_ContentBorderColor);
+    background: var(--sapGroup_ContentBackground);
+}
+.ideDiffTable {
+    border-collapse: collapse;
+    width: 100%;
+    table-layout: fixed;
+    font-family: var(--sapContent_MonospaceFontFamily, monospace);
+    font-size: var(--sapFontSmallSize);
+    color: var(--sapTextColor);
+}
+.ideDiffTable th {
+    text-align: start;
+    padding: 0.25rem 0.5rem;
+    font-family: var(--sapFontFamily);
+    background: var(--sapList_HeaderBackground);
+    border-bottom: 1px solid var(--sapList_BorderColor);
+}
+.ideDiffNoCol {
+    width: 3.5rem;
+}
+.ideDiffNo {
+    padding: 0 0.5rem;
+    text-align: end;
+    color: var(--sapContent_LabelColor);
+    user-select: none;
+    vertical-align: top;
+}
+.ideDiffCode {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding: 0 0.5rem;
+    vertical-align: top;
+}
+/*
+ * Row state is told three ways: the +/−/~ marker (with hidden text, see
+ * model/diffModel), a coloured left border, and a background. The marker
+ * and border survive high-contrast themes, whose backgrounds are plain.
+ */
+.ideDiffMarkCol {
+    width: 1.5rem;
+}
+.ideDiffMark {
+    text-align: center;
+    font-weight: bold;
+    vertical-align: top;
+    border-left: 0.25rem solid transparent;
+    user-select: none;
+}
+.ideDiffAdd .ideDiffMark {
+    border-left-color: var(--sapPositiveElementColor, currentColor);
+}
+.ideDiffDel .ideDiffMark {
+    border-left-color: var(--sapNegativeElementColor, currentColor);
+}
+.ideDiffChg .ideDiffMark {
+    border-left-color: var(--sapCriticalElementColor, currentColor);
+}
+.ideDiffAdd .ideDiffRight {
+    background: var(--sapSuccessBackground);
+}
+.ideDiffDel .ideDiffLeft {
+    background: var(--sapErrorBackground);
+}
+.ideDiffChg .ideDiffCode {
+    background: var(--sapWarningBackground);
+}
+/* A removed line is struck through, readable without colour. */
+.ideDiffDel .ideDiffLeft {
+    text-decoration: line-through;
+}
+
+/* A folded run of unchanged lines: a native disclosure with a nested table. */
+.ideDiffFold > td {
+    padding: 0;
+}
+.ideDiffFold summary {
+    cursor: pointer;
+    padding: 0.125rem 0.5rem;
+    font-family: var(--sapFontFamily);
+    color: var(--sapContent_LabelColor);
+    background: var(--sapList_HeaderBackground);
+}
+.ideDiffFold summary:focus-visible {
+    outline: 1px dotted var(--sapTextColor);
+}
+.ideDiffTooLarge {
+    margin: 0;
+    padding: 1rem;
+    font-family: var(--sapFontFamily);
+    color: var(--sapTextColor);
+}
+
+/* Rendered markdown documents (sanitized in model/markdown). */
+.ideMarkdown {
+    padding: 0.5rem 1rem;
+    color: var(--sapTextColor);
+    font-family: var(--sapFontFamily);
+}
+
+/* Assistant pane: stage bar and actions on top, the chat grows, the composer stays at the bottom. */
+.ideStageBar {
+    padding-top: 0.25rem;
+}
+.ideStageToken.sapMObjStatus {
+    padding: 0.125rem 0.375rem;
+    border: 1px solid var(--sapList_BorderColor);
+    border-radius: 0.5rem;
+}
+.ideChatMessage {
+    padding: 0.5rem 0.75rem;
+    width: 100%;
+    box-sizing: border-box;
+}
+.ideChatItem .sapMLIBContent {
+    width: 100%;
+}
+.ideChatMessage .ideMarkdown {
+    padding: 0;
+}
+.ideStreamBubble {
+    border-top: 1px solid var(--sapList_BorderColor);
+}
+.ideChatComposer {
+    padding: 0.5rem;
+    border-top: 1px solid var(--sapGroup_ContentBorderColor);
+}
+.agentIdePane > .sapMFlexItem:has(> .ideChatScroll) {
+    min-height: 0;
+}
+
+/* Activity panel: the tool output keeps its line breaks and wraps long tokens. */
+.ideActivityOutput {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--sapFontMonospaceFamily, monospace);
+    font-size: var(--sapFontSmallSize);
+}
+
+.ideActivityAgent {
+    color: var(--sapContent_LabelColor);
+}

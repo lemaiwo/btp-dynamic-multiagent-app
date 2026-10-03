@@ -143,12 +143,12 @@
                 valueStateText="{server>/errors/theme}"
                 visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
 
-            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+                visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
 
             <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:gmail')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:smtp' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
             <CheckBox
@@ -170,24 +170,31 @@
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
-                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
+                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
                 visible="{= ${server>/auth_mode} === 'destination' }" />
 
             <!-- destinations: whose credential the destination hands back.
-                 Whatever is visible here must be kept by cleanOAuth too. -->
+                 Whatever is visible here must be kept by cleanOAuth too:
+                 formatter.userContextVisible uses the same isRemote helper. -->
             <Label text="{i18n>userContext}"
-                   visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:gmail' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:teams') }" />
+                   visible="{ parts: ['server>/auth_mode', 'server>/url'], formatter: '.formatter.userContextVisible' }" />
             <CheckBox
                 id="oauthUserContext"
                 selected="{server>/oauth/user_context}"
+                select=".onUserContextToggle"
                 text="{i18n>userContextHint}"
                 wrapping="true"
-                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:gmail' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:teams') }" />
+                visible="{ parts: ['server>/auth_mode', 'server>/url'], formatter: '.formatter.userContextVisible' }" />
 
             <Label text=""
                    visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:gmail' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:teams') }" />
             <Text id="destinationGraphHint" text="{i18n>destinationGraphHint}"
                   visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:gmail' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:teams') }" />
+
+            <Label text=""
+                   visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} === 'mcp' }" />
+            <Text id="destinationMcpHint" text="{i18n>destinationMcpHint}"
+                  visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} === 'mcp' }" />
 
             <Label text=""
                    visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:sapnotedetail' }" />

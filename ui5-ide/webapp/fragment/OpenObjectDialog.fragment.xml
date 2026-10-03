@@ -1,0 +1,59 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:form="sap.ui.layout.form">
+    <Dialog
+        id="openObjectDialog"
+        title="{i18n>openObjectDialogTitle}"
+        contentWidth="32rem"
+        contentHeight="28rem">
+        <form:SimpleForm id="openObjectForm" editable="true" layout="ResponsiveGridLayout">
+            <Label id="openObjectTypeLabel" text="{i18n>objectTypeLabel}" labelFor="openObjectType" />
+            <Select
+                id="openObjectType"
+                width="100%"
+                selectedKey="{ide>/openObject/type}"
+                items="{ide>/objectTypes}">
+                <core:Item key="{ide>}" text="{ide>}" />
+            </Select>
+            <Label id="openObjectNameLabel" text="{i18n>objectNameLabel}" labelFor="openObjectName" required="true" />
+            <Input
+                id="openObjectName"
+                value="{ide>/openObject/name}"
+                placeholder="{i18n>objectNamePlaceholder}"
+                valueLiveUpdate="true"
+                submit=".onObjectSearch" />
+            <Button id="openObjectSearchButton" text="{i18n>search}" icon="sap-icon://search" press=".onObjectSearch" />
+        </form:SimpleForm>
+        <List
+            id="openObjectResults"
+            busy="{ide>/openObject/searching}"
+            busyIndicatorDelay="0"
+            noDataText="{i18n>noSearchResults}"
+            ariaLabelledBy="openObjectResultsTitle"
+            items="{ide>/openObject/results}"
+            itemPress=".onObjectHitPress">
+            <headerToolbar>
+                <Toolbar id="openObjectResultsToolbar">
+                    <Title id="openObjectResultsTitle" text="{i18n>searchResultsTitle}" level="H3" />
+                </Toolbar>
+            </headerToolbar>
+            <StandardListItem
+                type="Active"
+                title="{ide>name}"
+                description="{ide>description}"
+                info="{ parts: ['ide>type', 'ide>package'], formatter: '.formatHitInfo' }" />
+        </List>
+        <beginButton>
+            <Button
+                id="openObjectOpen"
+                text="{i18n>open}"
+                type="Emphasized"
+                enabled="{= !!${ide>/openObject/name} }"
+                press=".onOpenObject" />
+        </beginButton>
+        <endButton>
+            <Button id="openObjectCancel" text="{i18n>cancel}" press=".onOpenObjectCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

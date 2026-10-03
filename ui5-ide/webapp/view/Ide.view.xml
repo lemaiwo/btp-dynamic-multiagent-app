@@ -1,0 +1,31 @@
+<mvc:View
+    controllerName="com.agent.ide.controller.Ide"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:layout="sap.ui.layout"
+    displayBlock="true"
+    height="100%">
+    <Page id="idePage" showHeader="false" enableScrolling="false">
+        <layout:Splitter id="ideSplitter" height="100%" width="100%">
+            <VBox id="explorerPane" class="agentIdePane">
+                <layoutData>
+                    <layout:SplitterLayoutData size="22%" minSize="200" />
+                </layoutData>
+                <core:Fragment fragmentName="com.agent.ide.view.Explorer" type="XML" />
+            </VBox>
+            <VBox id="editorPane" class="agentIdePane">
+                <layoutData>
+                    <layout:SplitterLayoutData size="auto" minSize="300" />
+                </layoutData>
+                <core:Fragment fragmentName="com.agent.ide.view.Editor" type="XML" />
+            </VBox>
+            <VBox id="assistantPane" class="agentIdePane">
+                <layoutData>
+                    <layout:SplitterLayoutData size="30%" minSize="280" />
+                </layoutData>
+                <core:Fragment fragmentName="com.agent.ide.view.Assistant" type="XML" />
+            </VBox>
+        </layout:Splitter>
+    </Page>
+</mvc:View>

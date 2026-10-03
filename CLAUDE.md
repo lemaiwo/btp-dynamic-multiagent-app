@@ -42,13 +42,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the save-time gate that rejects a definition that cannot run
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
-  `require_user`/`require_admin` FastAPI dependencies
+  `require_user`/`require_admin`/`require_developer` FastAPI dependencies
+  (`require_developer` = the `$XSAPPNAME.developer` scope, for the ABAP IDE)
 - `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
   on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`.
   `create_mcp_server` returns a `PerRunMCPServer`: the registry shares one
   server object across all users, so each agent run must open its own MCP
   session, or overlapping runs send requests with whichever user opened the
-  shared session (`tests/test_mcp_user_isolation.py`)
+  shared session (`tests/test_mcp_user_isolation.py`). A remote MCP URL can be
+  reached through a BTP destination (`auth_mode="destination"`,
+  `_destination_mcp_server`): the destination names the host and holds the
+  credential, as the signed-in user when `user_context` is true; no JWT bound
+  means a refusal, never an app-level fallback
 - `agents/oauth2.py` — per-user OAuth2 authorization_code for
   `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
   refreshes the user's token, raises `OAuthAuthorizationRequired`),
@@ -177,9 +182,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   sub-agent gets the parent's state as `deps`, so the two share a plan and
   scratchpad while a peer reached by delegation does not. `task` is omitted
   once `depth >= subagent_max_depth`; concurrency is a semaphore per state
-  and depth. `registry.build_orchestrator` appends `deep_instructions` and
-  the `deep_toolset` when the row's config is enabled; sub-agents are never
-  registered as specialists or peers
+  and depth. `registry.build_orchestrator` adds the `deep_toolset` and, as a
+  zero-argument instructions callable, `scoped_deep_instructions` when the
+  row's config is enabled, so the text is resolved per run from that agent's
+  own config: `task` is described only if the agent was built with it and
+  (in an IDE session) the stage allows it. Sub-agents are never registered
+  as specialists or peers
+  An IDE session binds a `WorkspaceScope` (session id, the session's own
+  `DeepState`, `allow_subagents`, `request_limit`, `changed_files`) to the
+  `current_workspace` contextvar: while bound, the scratchpad and plan belong
+  to the session instead of the run and are shared by every run and agent in it;
+  the instructions then describe that shared workspace for the top-level agent
+  and every delegate, and `agents/ide/runner.py` adds no deep section of its own
 - `agents/run_activity.py` — what an API-triggered run is doing while it
   runs: `job_runner.execute_run` installs a `RunActivity` as the
   `agents.progress` sink, so every tool call (the agent's own, a peer's, a
@@ -190,6 +204,46 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   sign-in still fails fast instead of waiting for a click. Every run site
   passes `shared.run_usage_limits()` (`AGENT_REQUEST_LIMIT`, default 200,
   instead of pydantic-ai's 50 that deep sub-agents share with their parent)
+- `agents/ide/` — the ABAP IDE assistant: a staged chat that analyses,
+  designs, plans and **proposes** ABAP changes in a per-session workspace.
+  **Phase 1a is read-only: nothing is ever written to or activated in the
+  ABAP system.** Setup guide: `docs/IDE_SETUP.md` (local, not in repo)
+  - `models.py` — `IdeSession` (owner, target, stage, status, todos),
+    `IdeMessage`, `IdeArtifact`, `IdeWorkspaceFile`, `IdeConventions`
+    (per-target conventions, optional ARC-1 destination)
+  - `store.py` — owner-scoped persistence; a session that is not the
+    caller's answers 404; `list_all_sessions_meta` is metadata only
+  - `paths.py` — abapGit-style paths `src/<TYPE>/<name>.<ext>`; any other
+    path is a scratch note
+  - `workspace.py` — loads the session's files and plan into a `DeepState`
+    around a run and saves them back (`new`/`modified`/`read` states)
+  - `readonly.py` — `READONLY_POLICY` allowlist and `ReadOnlyGuard`, which
+    `registry.build_orchestrator` wraps around every toolset while a
+    workspace is bound: default-deny by tool name, then argument checks (no
+    data preview, SQL, traces, transport mutations). Enforced in code, not
+    by prompt
+  - `stages.py` — `chat -> design -> plan -> propose -> review -> done`, one
+    `approve` per step, gates raise `StageGateError` (409, 429 for
+    `usage_exhausted`); `IdeSession.status` is the run lock
+  - `runner.py` — `run_stage` runs one message/revise turn in its own task,
+    captures the artifact, saves the workspace, emits events; stale-run
+    reaper
+  - `sse.py` — frames the events (`run`, `text`, `tool`, `plan`, `file`,
+    `artifact`, `usage`, `error`, `done`) with a `: ping` heartbeat
+  - `routes.py` — REST under `/ide/api`, all behind `require_developer`;
+    conventions writes need `require_admin`
+  - `arc1.py` — direct ARC-1 calls (open, refresh, lint, search) as the
+    signed-in user through the target's destination; runs the read-only
+    check first; no user token means 424. Without a destination the URL
+    comes from `IDE_ARC1_URL_<TARGET>`
+  - `seed.py` + `seed.ide.json` — `ensure_ide_seed` inserts the IDE agents
+    and skills whose name does not exist yet and never touches existing
+    rows; `IDE_SEED=false` disables it (the code default is on; `mta.yaml`
+    sets it `false`, a landscape turns it on in its `.mtaext`)
+- `ui5-ide/` — freestyle SAPUI5 (TypeScript) ABAP developer workbench built
+  like `ui5-admin/`, deployed to the HTML5 Application Repository and served
+  at `/ui5ide`; its backend is `/ide/api` (approuter `/ui5ide/backend/...`).
+  Needs the `developer` scope
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
@@ -233,17 +287,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   AI Core resource group the `aicore-resource-group` parameter (override
   per landscape in an `.mtaext`) and adds a `before-start` hook running
   `scripts/ensure_aicore_setup.py`. Needs `_schema-version: "3.2"` for
-  `hooks`
+  `hooks`; 2.17.0 adds the `ui5-ide` HTML5 module and the IDE env vars
+  `IDE_SESSION_RETENTION_DAYS` (0 disables cleanup), `IDE_SESSION_REQUEST_CAP`,
+  `IDE_ORCHESTRATOR_AGENT` and `IDE_SEED`. Not in the descriptor (set per
+  landscape in an `.mtaext`): `IDE_RUN_TIMEOUT_S`, `IDE_RUN_STALE_S`,
+  `IDE_RUN_HEARTBEAT_S`, `IDE_SAVE_TIMEOUT_S`, `IDE_ARC1_URL_<TARGET>`
 - `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
   resource group if missing, idempotent, no-op for `default`. Creates the
   group only; model deployments stay in `scripts/deploy_claude.py` because
   they bill and take minutes. Deployments are per group, so a fresh group
   has no models until that script runs against it. See
   `docs/AICORE_RESOURCE_GROUP.md`
-- `xs-security.json` — `admin`, `user`, and `a2a` scopes with matching
-  role templates and role collections
+- `xs-security.json` — `admin`, `user`, `a2a` and `developer` scopes with
+  matching role templates and role collections
 - `approuter/xs-app.json` — `/admin` requires admin scope, `/a2a`
-  requires `a2a` scope, `/.well-known/agent-card.json` is anonymous
+  requires `a2a` scope, `/ui5ide` and `/ide/api` require `developer`, `/.well-known/agent-card.json` is anonymous
 - `JOULE_A2A.md` — configuration guide for BTP + Joule Agent Hub
 
 ## Runtime flow
@@ -259,6 +317,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 4. `POST /api/workflows/{slug}/run` is the second scheduler entry point
    alongside `POST /api/agents/{slug}/run`: both acknowledge within the BTP
    Job Scheduling Service's 15s synchronous budget and run in the background
+5. `POST /ide/api/sessions/{id}/messages` (and `/revise`) answers with an SSE
+   stream: the route takes the session's run lock, `run_stage` binds the
+   `WorkspaceScope`, runs the orchestrator with read-only-guarded toolsets
+   and relays events until `done`. `approve` moves the stage on
 
 ## Running locally
 ```bash
@@ -284,6 +346,9 @@ bump a pin, rerun the suites, then deploy.
 - `pyjwt[crypto]` — XSUAA JWT validation
 - Test-only: `pytest`, `pytest-asyncio` (`pytest.ini` sets
   `asyncio_mode = auto`), `jsdom` via the root `package.json`, `ruff`
-  (`ruff.toml`, advisory in CI)
+  (`ruff.toml`, advisory in CI). Script-style suites patch
+  `create_mcp_server` and `Agent.__init__` at import; `tests/conftest.py`'s
+  `real_agents_and_mcp` fixture restores the real ones for tests that build
+  real agents
 - `@ui5/cli`, `ui5-tooling-transpile`, `@sapui5/types`, `karma-ui5`,
   `@playwright/test` — UI5 admin app (dev-only; not in `requirements.txt`)

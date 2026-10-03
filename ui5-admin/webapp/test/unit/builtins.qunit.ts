@@ -20,9 +20,9 @@ QUnit.test("findBuiltin normalises case and a trailing slash", function (assert)
     assert.strictEqual(findBuiltin("https://a.hana.ondemand.com/mcp"), undefined);
 });
 
-QUnit.test("a remote server is offered neither destination nor session", function (assert) {
+QUnit.test("a remote server is offered destination but not session", function (assert) {
     const modes = authModesFor("https://a.hana.ondemand.com/mcp");
-    assert.strictEqual(modes.indexOf("destination"), -1);
+    assert.ok(modes.indexOf("destination") > -1);
     assert.strictEqual(modes.indexOf("session"), -1);
     assert.ok(modes.indexOf("jwt") > -1);
 });

@@ -414,9 +414,10 @@ def test_admin_refuses_destination_misconfiguration(url, oauth, message):
         _payload(url, **oauth)
 
 
-def test_admin_still_refuses_destination_on_a_remote_url_and_keeps_old_rules():
-    with pytest.raises(ValidationError, match="only supported for built-in"):
-        _payload("https://x.hana.ondemand.com/mcp", destination="D")
+def test_admin_accepts_destination_on_a_remote_url_and_keeps_old_rules():
+    # A remote MCP URL through a destination is covered by
+    # tests/test_mcp_destination.py; it is no longer refused.
+    assert _payload("https://x.hana.ondemand.com/mcp", destination="D").auth_mode == "destination"
     with pytest.raises(ValidationError, match="requires auth_mode=session"):
         from agents.admin import McpServerPayload
 

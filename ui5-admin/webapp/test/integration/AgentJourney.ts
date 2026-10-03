@@ -3,7 +3,9 @@ import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
 import HashChanger from "sap/ui/core/routing/HashChanger";
+import Element from "sap/ui/core/Element";
 import type Button from "sap/m/Button";
+import type CheckBox from "sap/m/CheckBox";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type CustomListItem from "sap/m/CustomListItem";
 import type HBox from "sap/m/HBox";
@@ -271,6 +273,83 @@ opaTest("an invalid server url is refused inline and the dialog stays open", fun
         }
     });
 
+    Then.iStopTheApp();
+});
+
+// --- destinations: user_context default ---
+opaTest("a new remote destination server starts acting as the signed-in user and posts user_context true", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    When.waitFor({ id: "addServerButton", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({ id: "serverUrl", viewName: "AgentDetail", searchOpenDialogs: true, actions: new EnterText({ text: "https://new.example.com/mcp" }) });
+    When.waitFor({
+        id: "serverAuthMode",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            select.setSelectedKey("destination");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+    Then.waitFor({
+        id: "oauthUserContext",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as CheckBox).getSelected(), true, "on by default for a new remote server");
+        }
+    });
+    When.waitFor({ id: "oauthDestination", viewName: "AgentDetail", searchOpenDialogs: true, actions: new EnterText({ text: "NEWDEST" }) });
+    When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const saved = backend.agents.find((a) => a.id === 101);
+            Opa5.assert.deepEqual(
+                saved?.mcp_servers[2],
+                { url: "https://new.example.com/mcp", auth_mode: "destination", oauth: { destination: "NEWDEST", user_context: true } },
+                "posted user_context true"
+            );
+        }
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("an existing remote destination server stored with user_context false stays false", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+    // reset() runs when the app starts, so change the stored server after it.
+    When.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const stored = backend.agents.find((a) => a.id === 101)!.mcp_servers[1];
+            (stored.oauth as Record<string, unknown>).user_context = false;
+            HashChanger.getInstance().setHash("agents/101");
+        }
+    });
+
+    When.waitFor({
+        id: "serversTable",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return ((element as Table).getItems() as ColumnListItem[]).length === 2;
+        },
+        actions: function (element: UI5Element | null) {
+            const row = (element as Table).getItems()[1] as ColumnListItem;
+            ((row.getCells()[2] as HBox).getItems()[0] as Button).firePress();
+        }
+    });
+    Then.waitFor({
+        id: "oauthUserContext",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as CheckBox).getSelected(), false, "the stored false is kept");
+        }
+    });
     Then.iStopTheApp();
 });
 
@@ -611,6 +690,64 @@ opaTest("a new agent has neither the header buttons nor the last-runs panel", fu
         visible: false,
         success: function (element: UI5Element) {
             Opa5.assert.notOk((element as Panel).getVisible(), "no runs to list yet");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- destinations: a remote MCP server ---
+// gmail-agent's second server (FakeBackend.reset) is a remote MCP url behind a
+// user-propagating destination. Opening it and pressing OK must not turn it
+// into an app-level destination: that would swap every caller's identity for
+// the destination's technical credential without a word.
+opaTest("a remote server on a user-context destination keeps acting as the user across an edit", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    When.waitFor({
+        id: "serversTable",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            const rows = (element as Table).getItems() as ColumnListItem[];
+            return rows.length === 2;
+        },
+        actions: function (element: UI5Element | null) {
+            const row = (element as Table).getItems()[1] as ColumnListItem;
+            ((row.getCells()[2] as HBox).getItems()[0] as Button).firePress();
+        }
+    });
+
+    Then.waitFor({
+        id: "oauthUserContext",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const box = element as CheckBox;
+            Opa5.assert.ok(box.getVisible(), "the switch is shown for a remote url");
+            Opa5.assert.strictEqual(box.getSelected(), true, "and loaded from the stored server");
+            // Whatever the dialog shows is kept by cleanOAuth; the window is not.
+            const lookback = Element.getElementById(
+                box.getId().replace(/oauthUserContext$/, "oauthLookback")) as Input | undefined;
+            Opa5.assert.ok(lookback, "the lookback field exists");
+            Opa5.assert.notOk(lookback?.getVisible(), "but is hidden for a remote destination");
+        }
+    });
+    When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const saved = backend.agents.find((a) => a.id === 101);
+            Opa5.assert.deepEqual(
+                saved?.mcp_servers[1],
+                {
+                    url: "https://arc1.example.com/mcp", auth_mode: "destination",
+                    oauth: { destination: "arc1-abap-readonly", user_context: true }
+                },
+                "posted exactly {destination, user_context}"
+            );
         }
     });
 

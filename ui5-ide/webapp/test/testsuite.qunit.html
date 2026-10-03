@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>ABAP Workbench - Test Suite</title>
+    <!--
+        Same set-up as ui5-admin's test page: this project is UI5-Tooling type
+        "application", served "flat" (no namespaced test-resources prefix) by
+        both `ui5 serve` and karma-ui5, so the generic UI5 test starter would
+        404 here. This page boots UI5 directly and reads the suite list from
+        testsuite.qunit.js itself.
+
+        Careful when editing this comment: karma-ui5's discovery step sniffs
+        this file's raw text for the substring that names that starter's
+        create-suite module, and would otherwise wait forever for a
+        window.suite() it will never get from this page.
+    -->
+    <script
+        id="sap-ui-bootstrap"
+        src="../resources/sap-ui-core.js"
+        data-sap-ui-theme="sap_horizon"
+        data-sap-ui-language="EN"
+        data-sap-ui-compat-version="edge"
+        data-sap-ui-async="true"
+        data-sap-ui-resource-roots='{"com.agent.ide": "../"}'
+    ></script>
+    <script>
+        sap.ui.require([
+            "sap/ui/thirdparty/qunit-2",
+            "com/agent/ide/test/testsuite.qunit"
+        ], function (_qunit, oSuite) {
+            "use strict";
+            QUnit.config.autostart = false;
+            var aModules = Object.keys(oSuite.tests).map(function (sName) {
+                return "com/agent/ide/test/" + sName + ".qunit";
+            });
+            sap.ui.require(aModules, function () {
+                QUnit.start();
+            });
+        });
+    </script>
+</head>
+<body>
+    <div id="qunit"></div>
+    <div id="qunit-fixture"></div>
+</body>
+</html>

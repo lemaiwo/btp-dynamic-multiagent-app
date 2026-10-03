@@ -52,6 +52,14 @@ from agents.db import (  # noqa: E402
     sweep_stale_runs,
     sweep_stale_workflow_runs,
 )
+from agents.ide import runner as ide_runner  # noqa: E402
+from agents.ide.routes import router as ide_router  # noqa: E402
+from agents.ide.seed import ensure_ide_seed  # noqa: E402
+from agents.ide.store import (  # noqa: E402
+    IDE_SESSION_RETENTION_DAYS,
+    purge_sessions_older_than,
+    reset_running_ide_sessions,
+)
 from agents.job_runner import cancel_all_runs  # noqa: E402
 from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
@@ -59,6 +67,7 @@ from agents.registry import registry  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
 
 SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
+IDE_SEED_FILE = Path(__file__).resolve().parent / "agents" / "ide" / "seed.ide.json"
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +137,29 @@ async def _token_keepwarm(interval: float) -> None:
             logger.warning("Token keep-warm pass failed", exc_info=True)
 
 
+async def _purge_ide_sessions() -> int:
+    """One retention pass; 0 days disables it."""
+    if IDE_SESSION_RETENTION_DAYS < 1:
+        return 0
+    async with SessionLocal() as session:
+        return await purge_sessions_older_than(session, IDE_SESSION_RETENTION_DAYS)
+
+
+async def _ide_purge_loop(interval: float) -> None:
+    """Purge old IDE sessions every ``interval`` seconds (the startup pass is
+    run by the lifespan itself)."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            n = await _purge_ide_sessions()
+            if n:
+                logger.info("Purged %d old IDE session(s)", n)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.warning("IDE session purge failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail closed before anything is served: with AUTH_REQUIRED on (the
@@ -142,11 +174,22 @@ async def lifespan(app: FastAPI):
     async with SessionLocal() as session:
         swept = await sweep_stale_runs(session, all_running=True)
         swept_wf = await sweep_stale_workflow_runs(session, all_running=True)
+        # Only IDE rows past the ghost age: a fresh one may be another
+        # instance's live run (its heartbeat keeps it fresh).
+        ide_reset = await reset_running_ide_sessions(
+            session, min_age_s=ide_runner.ghost_age()
+        )
+    if ide_reset:
+        logger.info("Reset %d ghost IDE session(s) to idle", ide_reset)
+    purged = await _purge_ide_sessions()
+    if purged:
+        logger.info("Purged %d old IDE session(s) at startup", purged)
     if swept:
         logger.info("Marked %d ghost job run(s) as interrupted", swept)
     if swept_wf:
         logger.info("Swept %d stale workflow run(s) at startup", swept_wf)
     await seed_from_file_if_empty(SEED_FILE)
+    await ensure_ide_seed(IDE_SEED_FILE)
     await registry.reload()
     dynamic_chat_app.refresh()
     heartbeat: asyncio.Task | None = None
@@ -155,17 +198,19 @@ async def lifespan(app: FastAPI):
     keepwarm: asyncio.Task | None = None
     if TOKEN_KEEPWARM_SECONDS > 0:
         keepwarm = asyncio.create_task(_token_keepwarm(TOKEN_KEEPWARM_SECONDS))
+    ide_purge = asyncio.create_task(_ide_purge_loop(86400))
     logger.info("Application startup complete")
     yield
     # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
     # rather than being killed mid-await and leaving its row `running`.
-    for task in (heartbeat, keepwarm):
+    for task in (heartbeat, keepwarm, ide_purge):
         if task is not None:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
     await cancel_all_runs()
     await cancel_all_workflow_runs()
+    await ide_runner.cancel_all()
     logger.info("Application shutdown complete")
 
 
@@ -379,6 +424,8 @@ app.include_router(oauth_router)
 # before the chat mount so it resolves here rather than falling through to
 # the catch-all.
 app.include_router(runs_router)
+# ABAP IDE API (/ide/api/...), developer scope; before the chat mount.
+app.include_router(ide_router)
 
 
 @app.get("/healthz")
