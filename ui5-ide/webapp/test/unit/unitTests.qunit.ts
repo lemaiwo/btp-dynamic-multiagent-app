@@ -1,4 +1,6 @@
 import Component from "com/agent/ide/Component";
+// The missingRole text test (review follow-ups 4) runs with this scaffold module.
+import "./missingRole.qunit";
 
 QUnit.module("Scaffold");
 

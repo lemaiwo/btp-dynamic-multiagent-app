@@ -7,7 +7,14 @@
         title="{i18n>newSessionDialogTitle}"
         contentWidth="28rem"
         afterClose=".onNewSessionAfterClose">
-        <form:SimpleForm id="newSessionForm" editable="true" layout="ResponsiveGridLayout">
+        <!--
+            The layout module is required up front: otherwise the form renders
+            once without a layout while SimpleForm loads it ("Layout missing!").
+            The diagnose hint sits below the form (a MessageStrip is no form
+            content); the type field names it as its description.
+        -->
+        <form:SimpleForm id="newSessionForm" editable="true" layout="ResponsiveGridLayout"
+            core:require="{ ResponsiveGridLayout: 'sap/ui/layout/form/ResponsiveGridLayout' }">
             <Label id="newSessionTitleLabel" text="{i18n>newSessionTitleLabel}" labelFor="newSessionTitle" required="true" />
             <Input
                 id="newSessionTitle"
@@ -20,6 +27,7 @@
             <Label id="newSessionTypeLabel" text="{i18n>newSessionTypeLabel}" labelFor="newSessionType" />
             <SegmentedButton
                 id="newSessionType"
+                ariaDescribedBy="newSessionDiagnoseHint"
                 selectedKey="{ide>/newSession/type}"
                 selectionChange=".onNewSessionTypeChange">
                 <items>
@@ -43,12 +51,13 @@
                 items="{ide>/newSession/targets}">
                 <core:Item key="{ide>}" text="{ide>}" />
             </Select>
-            <MessageStrip
-                id="newSessionDiagnoseHint"
-                visible="{= ${ide>/newSession/type} === 'diagnose' }"
-                text="{i18n>newSessionDiagnoseHint}"
-                showIcon="true" />
         </form:SimpleForm>
+        <MessageStrip
+            id="newSessionDiagnoseHint"
+            class="sapUiSmallMarginBeginEnd sapUiSmallMarginBottom"
+            visible="{= ${ide>/newSession/type} === 'diagnose' }"
+            text="{i18n>newSessionDiagnoseHint}"
+            showIcon="true" />
         <beginButton>
             <Button id="newSessionCreate" text="{i18n>create}" type="Emphasized" press=".onNewSessionCreate" />
         </beginButton>

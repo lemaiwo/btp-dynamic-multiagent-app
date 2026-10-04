@@ -1,8 +1,9 @@
 import SseParser from "./SseParser";
 import type {
-    AdminSessionRow, Approval, ApprovalDecision, Artifact, ArtifactKind, Conventions, DiagnoseFinding,
-    FileDetail, FileSummary, FindingDetail, FindingOpen, LintFinding, Me, Message, ObjectHit, Session,
-    SessionDetail, SessionSummary, SessionType, SseEvent
+    Activity, AdminSessionRow, Approval, ApprovalDecision, Artifact, ArtifactKind, Comment, CommentCreate,
+    CommentState, Conventions, ConventionsChange, ConventionsClearable, ConventionsCreate, DiagnoseFinding, FileDetail, FileRevision,
+    FileSummary, FindingDetail, FindingOpen, LintFinding, Me, Message, Session, SessionDetail,
+    SessionSummary, SessionType, SseEvent, SyntaxResult
 } from "./types";
 
 /**
@@ -14,7 +15,8 @@ import type {
  * FastAPI 422 `detail` array into dotted keys, as AdminError does.
  * `status` is 0 when the network failed rather than the server answering.
  *
- * `isAuth` is true for 401, 403 and `session_expired`, the last being what an
+ * `isAuth` is true for 401, 403 (except `csrf_failed`, the approuter's
+ * refused security token: reload, not a role problem) and `session_expired`, the last being what an
  * expired approuter session looks like from here: a redirect to the identity
  * provider or its HTML login page instead of JSON. The UI shows a "reload to
  * sign in again" hint for it.
@@ -35,6 +37,10 @@ export class IdeError extends Error {
     }
 
     public get isAuth(): boolean {
+        // A refused CSRF token is a stale page, not a missing sign-in or role.
+        if (this.code === "csrf_failed") {
+            return false;
+        }
         return this.status === 401 || this.status === 403 || this.code === "session_expired";
     }
 }
@@ -57,9 +63,13 @@ export type SseHandler = (event: SseEvent) => void;
 export default class IdeService {
 
     private static readonly PREFIX = "backend/";
+    private static readonly CSRF_HEADER = "X-CSRF-Token";
+
+    /** The token fetch in flight or done; unset until the first non-GET call and after a refusal. */
+    private csrfPending?: Promise<string | null>;
 
     private async request<T>(path: string, init?: RequestInit): Promise<T> {
-        const response = await IdeService.send(path, {
+        const response = await this.send(path, {
             ...init,
             headers: {
                 Accept: "application/json",
@@ -85,17 +95,108 @@ export default class IdeService {
      * the API never redirects, so one is the approuter sending an expired
      * session to the identity provider (and following it cross-origin would
      * only fail as an opaque network error). Non-2xx becomes an IdeError.
+     *
+     * A non-GET call carries the approuter's CSRF token (`csrfProtection` on
+     * the backend routes), fetched once per service with `X-CSRF-Token: Fetch`
+     * on `GET backend/me` and shared by concurrent first calls. Locally there
+     * is no approuter and no token: nothing is sent. A 403 with
+     * `X-CSRF-Token: Required` (the approuter refused before the backend saw
+     * the call, so nothing ran) fetches a new token and retries exactly once;
+     * a second one is `csrf_failed`. The token never goes into a URL, a log
+     * or an error text.
      */
-    private static async send(path: string, init: RequestInit): Promise<Response> {
-        let response: Response;
+    private async send(path: string, init: RequestInit): Promise<Response> {
+        const method = (init.method ?? "GET").toUpperCase();
+        if (method === "GET" || method === "HEAD") {
+            return IdeService.check(await IdeService.raw(path, init));
+        }
+        for (let attempt = 0; ; attempt++) {
+            const pending = this.csrfToken();
+            const token = await IdeService.unlessAborted(pending, init.signal);
+            const headers = { ...(init.headers as Record<string, string> | undefined) };
+            if (token !== null) {
+                headers[IdeService.CSRF_HEADER] = token;
+            }
+            const response = await IdeService.raw(path, { ...init, headers });
+            if (!IdeService.isCsrfRequired(response)) {
+                return IdeService.check(response);
+            }
+            response.body?.cancel().catch(() => undefined);
+            // Forget the refused token, unless a concurrent call already did.
+            if (this.csrfPending === pending) {
+                this.csrfPending = undefined;
+            }
+            if (attempt > 0) {
+                throw new IdeError(403,
+                    "The server did not accept the request's security token. Reload the page and try again.", "csrf_failed");
+            }
+        }
+    }
+
+    /** The cached token (null: none, as locally), or the one fetch every caller shares. */
+    private csrfToken(): Promise<string | null> {
+        if (!this.csrfPending) {
+            const pending = IdeService.fetchCsrfToken();
+            this.csrfPending = pending;
+            pending.catch(() => {
+                if (this.csrfPending === pending) {
+                    this.csrfPending = undefined;
+                }
+            });
+        }
+        return this.csrfPending;
+    }
+
+    /** Never aborted by a caller's signal: other callers may share it. */
+    private static async fetchCsrfToken(): Promise<string | null> {
+        const checked = await IdeService.check(await IdeService.raw("me", {
+            method: "GET", headers: { Accept: "application/json", [IdeService.CSRF_HEADER]: "Fetch" }
+        }));
+        checked.body?.cancel().catch(() => undefined);
+        if (IdeService.isHtml(checked)) {
+            throw IdeService.sessionExpired(checked.status);
+        }
+        const token = checked.headers.get(IdeService.CSRF_HEADER);
+        return token && token.toLowerCase() !== "required" ? token : null;
+    }
+
+    private static isCsrfRequired(response: Response): boolean {
+        return response.status === 403
+            && (response.headers.get(IdeService.CSRF_HEADER) ?? "").toLowerCase() === "required";
+    }
+
+    /** `promise`, unless `signal` aborts first: then an AbortError, as fetch would. */
+    private static unlessAborted<T>(promise: Promise<T>, signal?: AbortSignal | null): Promise<T> {
+        if (!signal) {
+            return promise;
+        }
+        const abortError = (): DOMException => new DOMException("The operation was aborted.", "AbortError");
+        if (signal.aborted) {
+            return Promise.reject(abortError());
+        }
+        return new Promise<T>((resolve, reject) => {
+            const onAbort = (): void => reject(abortError());
+            signal.addEventListener("abort", onAbort, { once: true });
+            promise.then(
+                (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+                (e: unknown) => { signal.removeEventListener("abort", onAbort); reject(e); }
+            );
+        });
+    }
+
+    /** fetch, a network failure as an IdeError (status 0); an abort rethrown as it is. */
+    private static async raw(path: string, init: RequestInit): Promise<Response> {
         try {
-            response = await fetch(IdeService.PREFIX + path, { ...init, redirect: "manual" });
+            return await fetch(IdeService.PREFIX + path, { ...init, credentials: "same-origin", redirect: "manual" });
         } catch (e) {
             if (init.signal?.aborted) {
                 throw e;
             }
             throw new IdeError(0, (e as Error).message || "Network error", "network");
         }
+    }
+
+    private static async check(response: Response): Promise<Response> {
         if (response.type === "opaqueredirect" || (response.status >= 300 && response.status < 400)) {
             throw IdeService.sessionExpired(response.status);
         }
@@ -147,8 +248,8 @@ export default class IdeService {
         return `sessions/${encodeURIComponent(sid)}`;
     }
 
-    private static pathQuery(path: string): string {
-        return `?path=${encodeURIComponent(path)}`;
+    private static pathQuery(path: string, revision?: number): string {
+        return `?path=${encodeURIComponent(path)}${revision === undefined ? "" : `&revision=${encodeURIComponent(revision)}`}`;
     }
 
     // --- Identity ------------------------------------------------------------
@@ -182,13 +283,70 @@ export default class IdeService {
         return this.request<Message[]>(`${IdeService.sid(sid)}/messages`);
     }
 
-    /** Moves to the next stage; 409 `IdeError` with `code` when the gate refuses. */
-    public approve(sid: string): Promise<Session> {
-        return this.request<Session>(`${IdeService.sid(sid)}/approve`, { method: "POST" });
+    /**
+     * Moves to the next stage and pins what it approves; 409 `IdeError` with
+     * `code` when the gate refuses: `open_comments` while a comment is open or
+     * sent, `version_changed` when `version` (the document version the UI
+     * shows) is no longer the latest of the stage's kind, `missing_artifact`,
+     * `no_proposals`, ... Without `version` no body is sent.
+     */
+    /**
+     * Approves the stage. `version` is the document version on screen; in
+     * propose `revisions` maps each proposed path to the revision on screen.
+     * Either one the server no longer has as the latest answers 409
+     * `version_changed`, so nothing is approved that the user did not see.
+     */
+    public approve(sid: string, version?: number, revisions?: Record<string, number>): Promise<Session> {
+        const body = {
+            ...(version === undefined ? {} : { version }),
+            ...(revisions === undefined ? {} : { revisions })
+        };
+        return this.request<Session>(`${IdeService.sid(sid)}/approve`, {
+            method: "POST", ...(Object.keys(body).length ? IdeService.json(body) : {})
+        });
     }
 
     public cancel(sid: string): Promise<Session> {
         return this.request<Session>(`${IdeService.sid(sid)}/cancel`, { method: "POST" });
+    }
+
+    /** The tool timeline and plan of a message's run; 404 `no_activity` when it has none. */
+    public getActivity(sid: string, mid: string): Promise<Activity> {
+        return this.request<Activity>(`${IdeService.sid(sid)}/messages/${encodeURIComponent(mid)}/activity`);
+    }
+
+    // --- Review comments -----------------------------------------------------
+    /** Oldest first; `state` filters to one state. */
+    public listComments(sid: string, state?: CommentState): Promise<Comment[]> {
+        const query = state ? `?state=${encodeURIComponent(state)}` : "";
+        return this.request<Comment[]>(`${IdeService.sid(sid)}/comments${query}`);
+    }
+
+    /** Created `open`; 422 `invalid_anchor` when the anchor names nothing in the session. */
+    public createComment(sid: string, body: CommentCreate): Promise<Comment> {
+        return this.request<Comment>(`${IdeService.sid(sid)}/comments`, { method: "POST", ...IdeService.json(body) });
+    }
+
+    /** Only an `open` comment's text can change (409 `comment_not_editable`). */
+    public editComment(sid: string, cid: string, body: string): Promise<Comment> {
+        return this.request<Comment>(IdeService.commentPath(sid, cid), { method: "PATCH", ...IdeService.json({ body }) });
+    }
+
+    /**
+     * The user's transitions: dismiss an open or addressed comment, reopen an
+     * addressed or dismissed one; anything else is 409 `invalid_transition`.
+     */
+    public setCommentState(sid: string, cid: string, state: "open" | "dismissed"): Promise<Comment> {
+        return this.request<Comment>(IdeService.commentPath(sid, cid), { method: "PATCH", ...IdeService.json({ state }) });
+    }
+
+    /** Only an `open` comment can be deleted (409 `comment_not_editable`). */
+    public deleteComment(sid: string, cid: string): Promise<void> {
+        return this.request<void>(IdeService.commentPath(sid, cid), { method: "DELETE" });
+    }
+
+    private static commentPath(sid: string, cid: string): string {
+        return `${IdeService.sid(sid)}/comments/${encodeURIComponent(cid)}`;
     }
 
     // --- Artifacts -----------------------------------------------------------
@@ -207,8 +365,24 @@ export default class IdeService {
         return this.request<FileSummary[]>(`${IdeService.sid(sid)}/files`);
     }
 
-    public getFile(sid: string, path: string): Promise<FileDetail> {
-        return this.request<FileDetail>(`${IdeService.sid(sid)}/file${IdeService.pathQuery(path)}`);
+    /** The latest revision, or `revision` (404 `unknown_revision`). */
+    public getFile(sid: string, path: string, revision?: number): Promise<FileDetail> {
+        return this.request<FileDetail>(`${IdeService.sid(sid)}/file${IdeService.pathQuery(path, revision)}`);
+    }
+
+    /** The proposal's revisions, newest first. */
+    public listRevisions(sid: string, path: string): Promise<FileRevision[]> {
+        return this.request<FileRevision[]>(`${IdeService.sid(sid)}/file/revisions${IdeService.pathQuery(path)}`);
+    }
+
+    /**
+     * Runs the syntax dry run now, as the signed-in user, on `revision` (the
+     * latest when left out). An ARC-1 failure is a 200 with status
+     * `unavailable`, never `ok`; 409 `run_in_progress`, 422 `not_an_object` /
+     * `no_proposal`.
+     */
+    public checkSyntax(sid: string, path: string, revision?: number): Promise<SyntaxResult> {
+        return this.request<SyntaxResult>(`${IdeService.sid(sid)}/file/syntax${IdeService.pathQuery(path, revision)}`, { method: "POST" });
     }
 
     /** Re-reads `origin_source` (the diff base) from the ABAP system. */
@@ -219,18 +393,6 @@ export default class IdeService {
     /** Offline SAPLint on the proposed source. */
     public lintFile(sid: string, path: string): Promise<LintFinding[]> {
         return this.request<LintFinding[]>(`${IdeService.sid(sid)}/file/lint${IdeService.pathQuery(path)}`, { method: "POST" });
-    }
-
-    /** Reads an ABAP object into the workspace (state `read`). */
-    public openObject(sid: string, type: string, name: string): Promise<FileSummary> {
-        return this.request<FileSummary>(`${IdeService.sid(sid)}/open`, { method: "POST", ...IdeService.json({ type, name }) });
-    }
-
-    public searchObjects(target: string, q: string): Promise<ObjectHit[]> {
-        const params = new URLSearchParams({ target, q });
-        // URLSearchParams encodes `*` as-is and spaces as `+`; both are what
-        // FastAPI's query parser expects.
-        return this.request<ObjectHit[]>(`objects/search?${params.toString()}`);
     }
 
     // --- Diagnose: report handover, findings, approvals ------------------------
@@ -302,10 +464,19 @@ export default class IdeService {
         return this.request<Conventions>(`conventions/${encodeURIComponent(target)}`);
     }
 
-    /** Admin only (403 otherwise). */
-    public putConventions(target: string, conventions: Conventions): Promise<Conventions> {
+    /** Admin only (403 otherwise): a new target; 409 `target_exists`. */
+    public createConventions(body: ConventionsCreate): Promise<Conventions> {
+        return this.request<Conventions>("conventions", { method: "POST", ...IdeService.json(body) });
+    }
+
+    /**
+     * Admin only (403 otherwise). Updates an existing target (404
+     * `unknown_target`; creating is {@link createConventions}); `clear` empties
+     * those fields, and a field both sent and cleared is 422.
+     */
+    public putConventions(target: string, conventions: ConventionsChange, clear?: ConventionsClearable[]): Promise<Conventions> {
         return this.request<Conventions>(`conventions/${encodeURIComponent(target)}`, {
-            method: "PUT", ...IdeService.json(conventions)
+            method: "PUT", ...IdeService.json(clear?.length ? { ...conventions, clear } : conventions)
         });
     }
 
@@ -336,11 +507,15 @@ export default class IdeService {
     }
 
     /**
-     * As {@link streamMessage}, rerunning the current stage with `feedback`.
-     * The same abort caveat applies: call {@link cancel} to stop the run.
+     * Sends the open comments (and the optional `note`) and streams the
+     * rework run as {@link streamMessage} does, with the same abort caveat.
+     * The stream adds `comments` frames: `sent` at the start, `addressed` per
+     * answer. Refused before the stream: 409 `nothing_to_send` (no open
+     * comment and no note), `revise_not_allowed`, `run_in_progress`,
+     * `stage_done`; 429 `usage_exhausted`.
      */
-    public streamRevise(sid: string, feedback: string, onEvent: SseHandler, signal?: AbortSignal): Promise<void> {
-        return this.stream(`${IdeService.sid(sid)}/revise`, { feedback }, onEvent, signal);
+    public streamRequestChanges(sid: string, note: string | undefined, onEvent: SseHandler, signal?: AbortSignal): Promise<void> {
+        return this.stream(`${IdeService.sid(sid)}/request-changes`, note ? { note } : {}, onEvent, signal);
     }
 
     /**
@@ -358,7 +533,7 @@ export default class IdeService {
         }
         let response: Response;
         try {
-            response = await IdeService.send(path, {
+            response = await this.send(path, {
                 method: "POST",
                 headers: { Accept: "text/event-stream", "Content-Type": "application/json" },
                 body: JSON.stringify(body),

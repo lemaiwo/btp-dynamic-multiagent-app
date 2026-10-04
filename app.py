@@ -54,6 +54,8 @@ from agents.db import (  # noqa: E402
 )
 from agents.ide import approvals as ide_approvals  # noqa: E402
 from agents.ide import runner as ide_runner  # noqa: E402
+from agents.ide.review_routes import router as ide_review_router  # noqa: E402
+from agents.ide.routes import install_validation_handler  # noqa: E402
 from agents.ide.routes import router as ide_router  # noqa: E402
 from agents.ide.seed import ensure_ide_seed  # noqa: E402
 from agents.ide.store import (  # noqa: E402
@@ -511,7 +513,12 @@ app.include_router(oauth_router)
 # the catch-all.
 app.include_router(runs_router)
 # ABAP IDE API (/ide/api/...), developer scope; before the chat mount.
+# The two routers share no path, so their order does not matter.
+app.include_router(ide_review_router)
 app.include_router(ide_router)
+# A refused IDE request is a 422 that never echoes the input (a lone
+# surrogate in it made FastAPI's own 422 a 500).
+install_validation_handler(app)
 
 
 @app.get("/healthz")

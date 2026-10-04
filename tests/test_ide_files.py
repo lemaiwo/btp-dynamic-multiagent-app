@@ -112,6 +112,19 @@ class FakeArc1:
         return _Client()
 
 
+# A file opened by the route has no revision and nothing checked yet.
+UNCHECKED = {"revision": 0, "base_status": None, "syntax_status": None}
+# B10: ... but its SAP base is known (``base_status="sap"``).
+OPENED = {**UNCHECKED, "base_status": "sap"}
+VERSIONS_CALL = ("SAPRead", {"type": "VERSIONS", "objectType": "CLAS",
+                             "name": "ZCL_X"}, "T1", "arc1-abap-readonly")
+
+
+def _reads(fake) -> list:
+    """The source reads, without the version-marker reads."""
+    return [c for c in fake.calls if c[1].get("type") != "VERSIONS"]
+
+
 def _fake_developer(request: Request) -> dict:
     user = request.headers.get("x-test-user", "")
     if user not in USERS:
@@ -177,21 +190,60 @@ async def test_open_stores_read_file_at_abapgit_path(client, fake, sid):
     r = await _open(client, sid, name="zcl_x")
     assert r.status_code == 200, r.text
     assert r.json() == {"path": PATH, "state": "read",
-                        "object_type": "CLAS", "object_name": "ZCL_X"}
+                        "object_type": "CLAS", "object_name": "ZCL_X", **OPENED}
     assert fake.calls == [("SAPRead", {"type": "CLAS", "name": "ZCL_X"},
-                           "T1", "arc1-abap-readonly")]
+                           "T1", "arc1-abap-readonly"), VERSIONS_CALL]
 
     r = await client.get(f"/ide/api/sessions/{sid}/files", headers=_as("alice"))
     assert r.status_code == 200
     assert r.json() == [{"path": PATH, "state": "read",
-                         "object_type": "CLAS", "object_name": "ZCL_X"}]
+                         "object_type": "CLAS", "object_name": "ZCL_X", **OPENED}]
 
     r = await client.get(f"/ide/api/sessions/{sid}/file", params={"path": PATH},
                          headers=_as("alice"))
     assert r.status_code == 200
     assert r.json() == {"path": PATH, "state": "read",
+                        "object_type": "CLAS", "object_name": "ZCL_X",
+                        # the fake's VERSIONS answer is not a revision list
+                        **OPENED, "origin_version": None, "syntax": [],
                         "origin_source": "* source of ZCL_X",
                         "proposed_source": None, "lint": []}
+
+
+async def test_open_and_refresh_store_the_version_marker(client, fake, sid):
+    """B10: the user-side open and refresh set the base as the agent's
+    ``open_object`` does: source, version marker, ``base_status="sap"`` and
+    when it was checked."""
+    versions = json.dumps([{"id": "rev-7", "date": "2026-10-01T00:00:00Z"}])
+    fake.answers["SAPRead"] = ["origin v1", versions]
+    r = await _open(client, sid)
+    assert r.status_code == 200, r.text
+    r = await client.get(f"/ide/api/sessions/{sid}/file", params={"path": PATH},
+                         headers=_as("alice"))
+    assert (r.json()["origin_version"], r.json()["base_status"]) == ("rev-7", "sap")
+    async with SessionLocal() as db:
+        row = (await db.execute(IdeWorkspaceFile.__table__.select())).first()
+    assert row.base_checked_at is not None
+    fake.answers["SAPRead"] = ["origin v2", json.dumps([{"id": "rev-8"}])]
+    r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert (r.json()["origin_source"], r.json()["origin_version"]) == (
+        "origin v2", "rev-8")
+
+
+async def test_refresh_gives_a_new_file_its_base(client, fake, sid):
+    """A file a run created (``new``, no base) that exists in SAP becomes
+    ``modified`` on refresh."""
+    async with SessionLocal() as db:
+        db.add(IdeWorkspaceFile(session_id=sid, path=PATH, object_type="CLAS",
+                                object_name="ZCL_X", state="new",
+                                proposed_source="mine", revision=1))
+        await db.commit()
+    r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    assert (r.json()["state"], r.json()["base_status"],
+            r.json()["proposed_source"]) == ("modified", "sap", "mine")
 
 
 async def test_open_again_keeps_a_proposal(client, fake, sid):
@@ -242,7 +294,8 @@ async def test_refresh_updates_origin_and_keeps_proposal(client, fake, sid):
     assert body["origin_source"] == "origin v2"
     assert body["proposed_source"] == "proposal"
     assert body["state"] == "modified"
-    assert fake.calls[-1][:2] == ("SAPRead", {"type": "CLAS", "name": "ZCL_X"})
+    assert _reads(fake)[-1][:2] == ("SAPRead", {"type": "CLAS", "name": "ZCL_X"})
+    assert fake.calls[-1] == VERSIONS_CALL
 
 
 async def test_refresh_reads_class_include(client, fake, sid):
@@ -254,8 +307,8 @@ async def test_refresh_reads_class_include(client, fake, sid):
     r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
                           params={"path": path}, headers=_as("alice"))
     assert r.status_code == 200, r.text
-    assert fake.calls[-1][1] == {"type": "CLAS", "name": "ZCL_X",
-                                 "include": "testclasses"}
+    assert _reads(fake)[-1][1] == {"type": "CLAS", "name": "ZCL_X",
+                                   "include": "testclasses"}
 
 
 async def test_refresh_scratch_file_is_422(client, fake, sid):
@@ -729,6 +782,95 @@ async def test_refresh_while_running_is_409_and_keeps_origin(client, fake, sid):
 
 
 
+# --- review minors: base writes outside a run vs. a propose approve ----------
+#
+# Open, refresh and a finding's "open source" change a file's ``state``
+# (a proposal byte-equal to SAP's source is dropped) outside any run. A
+# propose approve pins the proposed revisions under the session row lock,
+# so these writers take the same lock -- after their ARC-1 read, which may
+# take seconds -- and check the run lock again under it.
+
+
+def _racing_factory(fake, sid, monkeypatch, *, start_run=False):
+    """A fake ARC-1 whose source read starts a run meanwhile (or not), and
+    a spy that records when the session row lock is taken."""
+    from agents.ide import store as store_module
+
+    events: list[str] = []
+    real_lock = store_module.lock_session_row
+
+    async def lock(db, session_id):
+        events.append("lock")
+        await real_lock(db, session_id)
+
+    monkeypatch.setattr(store_module, "lock_session_row", lock)
+    inner = fake.factory
+
+    def factory(target, destination="", **kw):
+        client = inner(target, destination, **kw)
+        real_call = client.call
+
+        async def call(tool, args):
+            events.append(f"{tool}:{args.get('type')}")
+            if start_run and tool == "SAPRead" and args.get("type") != "VERSIONS":
+                await _set_running(sid)
+            return await real_call(tool, args)
+
+        client.call = call
+        return client
+
+    monkeypatch.setattr(arc1, "get_arc1_client", factory)
+    return events
+
+
+async def _proposal_equal_to_sap(sid):
+    async with SessionLocal() as db:
+        await db.execute(IdeWorkspaceFile.__table__.update().values(
+            proposed_source="same as SAP", state="modified", revision=2))
+        await db.commit()
+
+
+@pytest.mark.parametrize("route", ["open", "refresh"])
+async def test_base_write_takes_the_session_lock_after_the_read(
+        client, fake, sid, monkeypatch, route):
+    await _open(client, sid)
+    await _proposal_equal_to_sap(sid)
+    events = _racing_factory(fake, sid, monkeypatch)
+    fake.answers["SAPRead"] = ["same as SAP"]
+    if route == "open":
+        r = await _open(client, sid)
+    else:
+        r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
+                              params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    assert "lock" in events
+    assert events.index("lock") > events.index("SAPRead:CLAS")
+    async with SessionLocal() as db:
+        row = (await db.execute(IdeWorkspaceFile.__table__.select())).one()
+    assert (row.state, row.proposed_source) == ("read", None)
+
+
+@pytest.mark.parametrize("route", ["open", "refresh"])
+async def test_run_started_during_the_read_is_409_and_nothing_written(
+        client, fake, sid, monkeypatch, route):
+    await _open(client, sid)
+    await _proposal_equal_to_sap(sid)
+    _racing_factory(fake, sid, monkeypatch, start_run=True)
+    fake.answers["SAPRead"] = ["same as SAP"]
+    if route == "open":
+        r = await _open(client, sid)
+    else:
+        r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
+                              params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "run_in_progress"
+    async with SessionLocal() as db:
+        row = (await db.execute(IdeWorkspaceFile.__table__.select())).one()
+    assert (row.state, row.proposed_source, row.revision) == (
+        "modified", "same as SAP", 2)
+    assert row.origin_source == "* source of ZCL_X"
+
+
 # --- final fix round: refusals carry their own code on every route (FIX-10) ---
 
 
@@ -783,3 +925,115 @@ def test_arc1_find_survives_a_cyclic_cause_chain():
     a.__context__ = group  # a cycle through the group
     assert arc1._find(a, KeyError) is None
     assert arc1._find(group, RuntimeError) is a
+
+
+# --- B10 fix round 1: a "found" source that is no source ------------------------
+
+
+@pytest.mark.parametrize("answer", ["", "  \n", "Class ZCL_X does not exist"])
+async def test_open_unusable_source_is_refused_and_nothing_stored(client, fake, sid,
+                                                                  answer):
+    fake.answers["SAPRead"] = [answer]
+    r = await _open(client, sid)
+    assert r.status_code == 502, r.text
+    assert r.json()["code"] == "no_source"
+    # No marker read for an object that was not found.
+    assert [c[1].get("type") for c in fake.calls] == ["CLAS"]
+    r = await client.get(f"/ide/api/sessions/{sid}/files", headers=_as("alice"))
+    assert r.json() == []
+
+
+async def test_refresh_unusable_source_keeps_the_base(client, fake, sid):
+    assert (await _open(client, sid)).status_code == 200
+    fake.answers["SAPRead"] = ["Object ZCL_X not found"]
+    r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 502
+    assert r.json()["code"] == "no_source"
+    r = await client.get(f"/ide/api/sessions/{sid}/file", params={"path": PATH},
+                         headers=_as("alice"))
+    assert r.json()["origin_source"] == "* source of ZCL_X"
+
+
+def _during_sap_read(monkeypatch, fake, write) -> None:
+    """Run ``write`` (an async callable) inside every source SAPRead: the
+    ARC-1 read can take seconds, and a run can start and end meanwhile."""
+    inner = fake.factory
+
+    def factory(target, destination="", **kw):
+        client_ = inner(target, destination, **kw)
+        real_call = client_.call
+
+        async def call(tool, args):
+            if tool == "SAPRead" and args.get("type") != "VERSIONS":
+                await write()
+            return await real_call(tool, args)
+
+        client_.call = call
+        return client_
+
+    monkeypatch.setattr(arc1, "get_arc1_client", factory)
+
+
+async def _run_writes_revision_3() -> None:
+    async with SessionLocal() as db:
+        await db.execute(IdeWorkspaceFile.__table__.update().values(
+            proposed_source="NEW proposal from the run", revision=3))
+        await db.commit()
+
+
+async def test_refresh_keeps_a_proposal_a_run_wrote_during_the_read(
+    client, fake, sid, monkeypatch
+):
+    """The row is read again under the session lock: a stale identity-mapped
+    copy (loaded before the ARC-1 read) would drop the run's new proposal."""
+    await _open(client, sid)
+    async with SessionLocal() as db:
+        await db.execute(IdeWorkspaceFile.__table__.update().values(
+            proposed_source="old proposal", state="modified", revision=2))
+        await db.commit()
+    _during_sap_read(monkeypatch, fake, _run_writes_revision_3)
+    # SAP's source now equals the proposal the stale copy still holds.
+    fake.answers["SAPRead"] = ["old proposal"]
+    r = await client.post(f"/ide/api/sessions/{sid}/file/refresh",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    async with SessionLocal() as db:
+        row = (await db.execute(IdeWorkspaceFile.__table__.select())).one()
+    assert row.proposed_source == "NEW proposal from the run"
+    assert row.state == "modified"
+    assert row.revision == 3
+
+
+async def test_open_keeps_a_proposal_a_run_wrote_during_the_read(
+    client, fake, sid, monkeypatch
+):
+    """``POST .../open`` (and a finding's open, same helper) re-reads the
+    row under the lock too."""
+    await _open(client, sid)
+    async with SessionLocal() as db:
+        await db.execute(IdeWorkspaceFile.__table__.update().values(
+            proposed_source="old proposal", state="modified", revision=2))
+        await db.commit()
+    _during_sap_read(monkeypatch, fake, _run_writes_revision_3)
+    fake.answers["SAPRead"] = ["old proposal"]
+    r = await client.post(f"/ide/api/sessions/{sid}/open",
+                          json={"type": "CLAS", "name": "ZCL_X"},
+                          headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    async with SessionLocal() as db:
+        row = (await db.execute(IdeWorkspaceFile.__table__.select())).one()
+    assert row.proposed_source == "NEW proposal from the run"
+    assert row.revision == 3
+
+
+async def test_lint_locks_the_session_before_the_file_row(client, fake, sid, lock_trail):
+    """Order session row -> file row, like refresh/open: a lint and a refresh
+    of the same file cannot deadlock on Postgres."""
+    await _open(client, sid)
+    fake.answers["SAPLint"] = [CANNED_LINT]
+    lock_trail.clear()
+    r = await client.post(f"/ide/api/sessions/{sid}/file/lint",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    lock_trail.assert_lock_before_writes_to("ide_workspace_files")

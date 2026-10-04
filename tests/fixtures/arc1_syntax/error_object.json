@@ -1,0 +1,7 @@
+{
+  "_note": "synthetic, replace with the real payload from L1",
+  "payload": {
+    "error": "syntax_check_failed",
+    "message": "The syntax check could not run."
+  }
+}

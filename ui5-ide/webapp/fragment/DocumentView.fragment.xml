@@ -1,0 +1,100 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!--
+        The document view (Task U9). The document reaches the page only as
+        docView.renderDocument output (sanitised markdown), one block per row;
+        comment bodies and answers are Text controls bound to model values:
+        never HTML, never parsed as binding syntax.
+    -->
+    <VBox id="documentView" class="ideDocView" visible="{= ${s>/artifact/view} === 'document' }">
+        <FlexBox
+            id="docVersionBar"
+            class="ideDocVersionBar"
+            alignItems="Center"
+            wrap="Wrap"
+            visible="{= ${s>/artifact/doc/versions}.length > 0 || !!${s>/artifact/doc/newer} }">
+            <SegmentedButton
+                id="docVersions"
+                selectedKey="{s>/artifact/doc/selected}"
+                ariaLabelledBy="docVersionsLabel"
+                selectionChange=".onDocVersionChange"
+                items="{path: 's>/artifact/doc/versions', templateShareable: false}"
+                class="sapUiSmallMarginEnd">
+                <items>
+                    <SegmentedButtonItem key="{s>key}" text="{s>text}" tooltip="{s>tooltip}" />
+                </items>
+            </SegmentedButton>
+            <Link
+                id="docBasedOn"
+                text="{s>/artifact/doc/basedOn/text}"
+                visible="{= !!${s>/artifact/doc/basedOn} }"
+                press=".onBasedOnPress"
+                class="sapUiSmallMarginEnd" />
+            <Link
+                id="docNewer"
+                text="{s>/artifact/doc/newer/text}"
+                visible="{= !!${s>/artifact/doc/newer} }"
+                press=".onDocNewerPress" />
+        </FlexBox>
+        <core:InvisibleText id="docVersionsLabel" text="{i18n>docVersions}" />
+        <core:InvisibleText id="docHint" text="{i18n>docParagraphHint}" />
+        <core:InvisibleText id="docBlockHint" text="{i18n>docBlockHint}" />
+        <VBox
+            id="artifactContent"
+            class="ideMarkdown ideDocument"
+            items="{path: 's>/artifact/doc/blocks', templateShareable: false}">
+            <VBox id="docRow" class="ideDocRow">
+                <customData>
+                    <core:CustomData key="comments" value="{= ${s>comments}.length > 0 ? 'yes' : 'no' }" writeToDom="true" />
+                </customData>
+                <HBox id="docLine" class="ideDocLine" alignItems="Start">
+                    <core:HTML id="docBlock" content="{s>html}" preferDOM="false" afterRendering=".onDocBlockRendered">
+                        <core:layoutData>
+                            <FlexItemData growFactor="1" shrinkFactor="1" minWidth="0" />
+                        </core:layoutData>
+                    </core:HTML>
+                    <core:InvisibleText id="docMarkerLabel" text="{s>markerLabel}" />
+                    <Button
+                        id="docMarker"
+                        class="ideDocMarker"
+                        icon="sap-icon://comment"
+                        type="Transparent"
+                        text="{s>markerText}"
+                        tooltip="{s>markerLabel}"
+                        ariaLabelledBy="docMarkerLabel"
+                        visible="{s>/artifact/doc/commentable}"
+                        press=".onDocMarkerPress" />
+                </HBox>
+                <VBox
+                    id="docBlockComments"
+                    class="ideDocComments"
+                    visible="{= ${s>comments}.length > 0 }"
+                    items="{path: 's>comments', templateShareable: false}">
+                    <VBox id="docComment" class="ideDocComment">
+                        <ObjectStatus id="docCommentState" text="{s>stateText}" state="{s>stateValue}" stateAnnouncementText="" icon="{s>icon}" />
+                        <Text id="docCommentHint" class="ideDocCommentAnswer" text="{s>hint}" visible="{= !!${s>hint} }" />
+                        <Text id="docCommentBody" text="{s>body}" renderWhitespace="true" />
+                        <Text id="docCommentAnswer" class="ideDocCommentAnswer" text="{s>answerText}" visible="{s>hasAnswer}" />
+                    </VBox>
+                </VBox>
+            </VBox>
+        </VBox>
+        <VBox
+            id="docOtherComments"
+            class="ideDocOther"
+            visible="{= ${s>/artifact/doc/others}.length > 0 }">
+            <Title id="docOtherTitle" text="{i18n>docOtherComments}" level="H4" class="sapUiTinyMarginBottom" />
+            <VBox id="docOtherList" items="{path: 's>/artifact/doc/others', templateShareable: false}">
+                <VBox id="docOther" class="ideDocComment">
+                    <HBox id="docOtherHead" alignItems="Center" wrap="Wrap">
+                        <Link id="docOtherLink" text="{s>anchorText}" press=".onOtherCommentPress" class="sapUiSmallMarginEnd" />
+                        <ObjectStatus id="docOtherState" text="{s>stateText}" state="{s>stateValue}" stateAnnouncementText="" icon="{s>icon}" />
+                    </HBox>
+                    <Text id="docOtherBody" text="{s>body}" renderWhitespace="true" />
+                    <Text id="docOtherAnswer" class="ideDocCommentAnswer" text="{s>answerText}" visible="{s>hasAnswer}" />
+                </VBox>
+            </VBox>
+        </VBox>
+    </VBox>
+</core:FragmentDefinition>

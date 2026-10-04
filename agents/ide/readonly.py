@@ -17,8 +17,9 @@ wraps every MCP server and built-in of every specialist in
 The policy is chosen by the bound scope's ``session_type`` (:data:`POLICIES`):
 ``change`` sessions keep :data:`READONLY_POLICY`; ``diagnose`` sessions use
 :data:`DIAGNOSE_POLICY`, which adds the ``SAPDiagnose`` data actions (dumps,
-traces, ...) with the ``user``/``traceUser`` filters refused, because the
-model only sees pseudonyms and a real-name filter would undo the masking.
+traces, ...) with the ``user``/``traceUser`` filters refused (kept from
+phase 1c: a run looks at the developer's own reproduction, not at other
+users' activity; opening them up is a separate decision).
 ``trace_start``/``trace_cancel`` pass the policy in ``diagnose`` only to be
 recognised as approval actions: the guard never forwards them to ARC-1
 (:func:`needs_approval`). It turns such a call into a *proposal*
@@ -35,20 +36,16 @@ An unknown session type refuses everything.
 
 A session that is not a ``change`` session also needs its run bound on
 ``agents.ide.diagnose.current_diagnose``; without it every call is refused
-and no tool is offered. The run says two things:
-
-- which wrapped server is the session target's ARC-1 server. Only that one
-  gets the diagnose policy; any other server of the agent stays under the
-  ``change`` policy, whatever its tools are called;
-- whether results are masked (``agents.ide.diagnose.masking_required``,
-  evaluated once when the run starts). If so, *every* result this guard
-  returns is masked first (:func:`mask_tool_result`); if not -- a
-  ``non_production`` target -- results pass as ARC-1 sent them.
+and no tool is offered. The run says which wrapped server is the session
+target's ARC-1 server. Only that one gets the diagnose policy; any other
+server of the agent stays under the ``change`` policy, whatever its tools
+are called. A diagnose run exists only for a ``non_production`` target
+(``agents.ide.runner`` refuses to start one otherwise), so results pass as
+ARC-1 sent them.
 
 What a ``SAPDiagnose`` data action of the target's server returned is then
-handed to ``agents.ide.findings.collect``, which notes the findings in it on
-the run -- from the text as the model gets it, so metadata only in a masked
-run.
+handed to ``agents.ide.findings.collect``, which notes the findings (with
+detail text) on the run.
 
 A ``ModelRetry`` raised by the wrapped call (an MCP ``isError`` result) is
 an ARC-1 error object, not data, and propagates unchanged in both cases.
@@ -75,7 +72,7 @@ from pydantic_ai.toolsets.abstract import ToolsetTool
 from agents.auth import current_principal
 from agents.db import SessionLocal
 from agents.deep import WorkspaceScope, current_workspace
-from agents.ide import diagnose, findings, masking
+from agents.ide import diagnose, findings
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +157,7 @@ READONLY_POLICY: dict[str, tuple[ArgRule, ...]] = {
 }
 
 # Diagnose sessions (plan 1c, table 1.4). Data actions return runtime data
-# that is masked before the model sees it. ``set_sql_trace_state`` is in no
+# of the target system. ``set_sql_trace_state`` is in no
 # set: refused in every session type.
 DIAGNOSE_DATA_ACTIONS = _set(
     "dumps", "traces", "gateway_errors", "odata_perf", "authorization_trace",
@@ -357,32 +354,11 @@ def needs_approval(tool_name: str, args: dict[str, Any] | None, policy: str) -> 
 
 
 def is_diagnose_data(tool_name: str, args: dict[str, Any] | None) -> bool:
-    """True for a ``SAPDiagnose`` data action, whose result must be masked."""
+    """True for a ``SAPDiagnose`` data action, whose result yields findings."""
     return (
         policy_name(tool_name, DIAGNOSE) == "SAPDiagnose"
         and _action(args) in DIAGNOSE_DATA_ACTIONS
     )
-
-
-def mask_tool_result(
-    tool_name: str, args: dict[str, Any] | None, result: Any, masker: masking.Masker
-) -> str:
-    """One tool result of a masked diagnose session, masked.
-
-    Fail safe on the kind of result: every ``SAPDiagnose`` call goes through
-    the allowlist-first ``masking.mask_result`` (metadata only for a shape it
-    does not know) *unless* its action is one of the reviewed phase 1a source
-    checks. Those, and every other tool, go through ``diagnose.mask_plain``.
-    """
-    text = diagnose.result_text(result)
-    if (
-        policy_name(tool_name, DIAGNOSE) == "SAPDiagnose"
-        and _action(args) not in READONLY_POLICY_SAPDIAGNOSE_ACTIONS
-    ):
-        return masking.mask_result(
-            tool_name, args if isinstance(args, dict) else {}, text, masker
-        )
-    return diagnose.mask_plain(text, masker)
 
 
 NO_RUN_REASON = "no diagnose run is bound to this session"
@@ -523,7 +499,7 @@ class ReadOnlyGuard(WrapperToolset[Any]):
             policy, run = self._bound(scope)
             reason = check_call(name, tool_args, policy)
             if reason is None and scope.session_type != CHANGE and run is None:
-                # Nobody said whether this session's results are masked.
+                # No run bound for this session: nobody checked its target.
                 reason = NO_RUN_REASON
             if reason is not None:
                 logger.warning(
@@ -552,10 +528,7 @@ class ReadOnlyGuard(WrapperToolset[Any]):
         result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
         if run is None:
             return result
-        if run.masking is not False:
-            result = mask_tool_result(name, tool_args, result, run.masker)
         if policy == DIAGNOSE and is_diagnose_data(name, tool_args):
-            # After the switch: in a masked run the findings are taken from
-            # the masked text and carry no detail. Never raises.
+            # Never raises; the result reaches the model unchanged.
             findings.collect(run, name, tool_args, result)
         return result

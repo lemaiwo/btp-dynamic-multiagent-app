@@ -9,17 +9,7 @@
         <tnt:header>
             <tnt:ToolHeader id="toolHeader" visible="{appView>/showHeader}">
                 <Title id="appTitle" text="{i18n>appTitle}" level="H1" />
-                <ToolbarSeparator />
-                <Text
-                    id="sessionTitle"
-                    text="{= ${appView>/sessionTitle} || ${i18n>noSessionTitle} }"
-                    wrapping="false" />
                 <ToolbarSpacer />
-                <ObjectStatus
-                    id="targetStatus"
-                    icon="sap-icon://it-system"
-                    text="{= ${appView>/target} || ${i18n>noTarget} }"
-                    tooltip="{i18n>targetTooltip}" />
                 <Button
                     id="conventionsButton"
                     text="{i18n>conventionsButton}"

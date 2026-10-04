@@ -26,7 +26,7 @@
     },
     {
       "name": "$XSAPPNAME.developer",
-      "description": "Use the ABAP IDE (sessions, read-only SAP access)"
+      "description": "Use the ABAP Assistant (sessions, read-only SAP access)"
     },
     {
       "name": "$XSAPPNAME.a2a",
@@ -52,7 +52,7 @@
     },
     {
       "name": "AbapIdeDeveloper",
-      "description": "Use the ABAP IDE",
+      "description": "Use the ABAP Assistant",
       "scope-references": ["$XSAPPNAME.user", "$XSAPPNAME.developer"]
     },
     {
@@ -74,7 +74,7 @@
     },
     {
       "name": "ABAP IDE Developer",
-      "description": "Developers who use the ABAP IDE",
+      "description": "Developers who use the ABAP Assistant",
       "role-template-references": ["$XSAPPNAME.AbapIdeDeveloper"]
     },
     {

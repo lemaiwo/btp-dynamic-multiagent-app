@@ -2,7 +2,7 @@ import type { SseEvent, SseEventType } from "./types";
 
 const KNOWN: ReadonlySet<string> = new Set<SseEventType>([
     "run", "text", "tool", "plan", "file", "artifact", "usage", "error", "done",
-    "finding", "approval_required", "approval"
+    "finding", "approval_required", "approval", "comments"
 ]);
 
 /**

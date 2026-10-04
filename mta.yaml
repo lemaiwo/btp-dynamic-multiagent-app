@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.18.0
+version: 2.19.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -45,6 +45,7 @@ modules:
         - "package-lock.json"
         - "mta_archives/"
         - "*.mtar"
+        - "Makefile_*.mta"
         - "approuter/"
         - "ui5-admin/"
         - "ui5-ide/"
@@ -108,7 +109,7 @@ modules:
       PUBLIC_BASE_URL: ~{pydantic-agent-approuter-api/url}
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
-      # ABAP IDE assistant (agents/ide). Landscape-specific values (ARC-1
+      # ABAP Assistant (agents/ide). Landscape-specific values (ARC-1
       # destination, targets) are set in conventions / an .mtaext, not here.
       IDE_SESSION_RETENTION_DAYS: "90"
       IDE_SESSION_REQUEST_CAP: "1000"

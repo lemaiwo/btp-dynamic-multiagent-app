@@ -19,10 +19,24 @@
  * session stays in stage `investigate`, `report` streams a `report` artifact,
  * `handover` opens a change session seeded with it, and `scriptRun()` makes
  * the next run of a diagnose session emit `finding` and `approval_required`
- * frames. Every session JSON carries `masked`, computed from the conventions
- * as they are now; a diagnose session that reads `masked: true` (its target
- * lost the flag) is refused with 409 `target_not_non_production` on runs,
+ * frames. A diagnose session whose target lost the flag (`target_non_production`
+ * false in the JSON, computed from the conventions as they are now) is refused with 409 `target_not_non_production` on runs,
  * reports, finding details and reads from SAP (`DIAGNOSE_BLOCKED`).
+ *
+ * Review contract (comments, revisions, pins; plan §1.1-1.3): every session
+ * JSON also carries `target_non_production`, `pins`, `waiting`,
+ * `open_comments` and `unresolved_comments`, computed as the server does.
+ * Comments follow the server's state machine (`open` -> `sent` by a
+ * request-changes start -> `addressed` by the run; whatever the run did not
+ * resolve is `open` again when it ends, so `sent` exists only in flight; the
+ * user dismisses or reopens). Every proposal a run writes is a numbered file revision with its
+ * own syntax result (`scriptSyntax`: `ok`, `errors` with lines, or
+ * `unavailable`, never shown as ok). `approve` pins the document version or
+ * the file revisions it approves, refuses `open_comments` while a comment is
+ * open or sent, and `version_changed` for a stale `version` or, in propose,
+ * `revisions` that are not the latest of every proposed path. There is no `revise`
+ * route (the server replaced it by `request-changes`) and no object search or
+ * open (objects enter a session through the agent or a finding).
  *
  * Approvals are stored rows, as on the server (variant B: nothing waits for
  * a decision). What the decide route answers follows from the stored state:
@@ -34,7 +48,8 @@
  */
 
 import type {
-    Approval, ApprovalAction, ApprovalStatus, DiagnoseFinding, TraceParams
+    Approval, ApprovalAction, ApprovalStatus, ArtifactKind, BaseStatus, Comment, CommentState, DiagnoseFinding,
+    Pins, SyntaxItem, SyntaxStatus, TraceParams, WaitingReason
 } from "com/agent/ide/service/types";
 
 export type Stage = "chat" | "design" | "plan" | "propose" | "review" | "done" | "investigate";
@@ -52,19 +67,37 @@ export interface Session {
     created_at: string;
     updated_at: string;
     /**
-     * Forces `masked: true` in the session JSON. Without it the JSON says what
-     * the server computes on every read: masked unless the target's
-     * conventions are flagged `non_production` now.
+     * Test knob, never served: treats a diagnose session as if its target lost
+     * the `non_production` flag (runs and live reads refused).
      */
-    masked?: boolean;
+    flagLost?: boolean;
+    /** Model requests this session used (`SessionOut.requests_used`); every run adds one. Default 0. */
+    requests_used?: number;
+    /** The cap the session JSON reports (`SessionOut.request_cap`). Default 200. */
+    request_cap?: number;
 }
 
 export interface Artifact {
     id: string;
+    /** The stage that wrote it (`ArtifactSummaryOut.stage`); served from the kind when a journey seeds none. */
+    stage?: Stage;
     kind: "design" | "plan" | "note" | "review" | "report";
     version: number;
     content: string;
     created_at: string;
+    /** The pins the document was written against; `null`/absent when none apply. */
+    based_on?: Record<string, number> | null;
+}
+
+/** One stored proposal of a file (`IdeFileRevision`), oldest first in `WorkspaceFile.revisions`. */
+export interface FileRevisionRow {
+    revision: number;
+    proposed_source: string;
+    run_id: string | null;
+    created_at: string;
+    syntax_status: SyntaxStatus | null;
+    syntax: SyntaxItem[];
+    checked_at: string | null;
 }
 
 export interface WorkspaceFile {
@@ -77,6 +110,11 @@ export interface WorkspaceFile {
     /** What `POST file/lint` answers (and `GET file` echoes once linted). */
     lint?: LintFinding[];
     linted?: boolean;
+    /** The proposal's revisions, oldest first; none for a file that was only read. */
+    revisions?: FileRevisionRow[];
+    /** Overrides the computed base status (object with a source: `sap`, without: `absent`, scratch: `null`). */
+    base_status?: BaseStatus | null;
+    origin_version?: string | null;
 }
 
 export interface LintFinding { line: number; column: number; severity: string; message: string; rule: string }
@@ -115,7 +153,7 @@ export const TARGET_NOT_NON_PRODUCTION = {
 };
 /**
  * A diagnose session whose target lost its `non_production` flag (session JSON
- * `masked: true`): message and report runs, a finding's detail (the stored
+ * `target_non_production: false`): message and report runs, a finding's detail (the stored
  * text and a live read alike) and its source, and the file routes that read
  * SAP answer 409, as agents/ide/routes.py `_refuse_lost_flag` and the
  * runner's gate do. The session, its messages, artifacts, files and the
@@ -162,7 +200,35 @@ interface SessionData {
     findings: DiagnoseFinding[];
     /** Newest first, as `GET approvals` answers. */
     approvals: Approval[];
+    /** Oldest first, as `GET comments` answers. */
+    comments: Comment[];
+    pins: Pins;
 }
+
+/** The document kind a stage writes (`stages.document_kind` of a change session). */
+const DOC_KIND: Partial<Record<Stage, ArtifactKind>> = { design: "design", plan: "plan", propose: "note", review: "review" };
+/** The stage whose document a kind is (the inverse of DOC_KIND, plus the diagnose report). */
+const KIND_STAGE: Record<ArtifactKind, Stage> = {
+    design: "design", plan: "plan", note: "propose", review: "review", report: "investigate"
+};
+/** The stages a request-changes run may rework (`stages.REVISABLE`). */
+const REVISABLE: Stage[] = ["design", "plan", "propose", "review"];
+const ARTIFACT_KINDS: ArtifactKind[] = ["design", "plan", "note", "review", "report"];
+const COMMENT_STATES: CommentState[] = ["open", "sent", "addressed", "dismissed"];
+/** The user's own comment transitions (contract §1.1); the others belong to runs. */
+const USER_TRANSITIONS: Record<CommentState, CommentState[]> = {
+    open: ["dismissed"], sent: [], addressed: ["open", "dismissed"], dismissed: ["open"]
+};
+const CLEARABLE = ["label", "destination", "namespace", "package", "atc_variant", "free_text"];
+/** `schemas.ConventionsBody` max_length per text field (characters). */
+const CONVENTIONS_MAX: Record<string, number> = {
+    label: 120, destination: 200, namespace: 30, package: 30, atc_variant: 30, free_text: 20000
+};
+/** The server's `schemas.TARGET_PATTERN` (Task B7). */
+const TARGET_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+/** What `scriptSyntax` sets up for a path: the verdict of every later check of it. */
+interface SyntaxScript { status: SyntaxStatus; items: SyntaxItem[] }
 
 /** The `trace_start` parameters a scripted approval asks for unless told otherwise. */
 export const DEFAULT_TRACE_PARAMS: TraceParams = {
@@ -179,8 +245,45 @@ const NOW = "2026-10-03T10:00:00";
 
 export default class FakeBackend {
 
+    /**
+     * Every route the fake serves, in the backend's `x-routes` key format
+     * ("METHOD /path/{param}", below /ide/api). The dispatcher answers 404
+     * for a call that matches none of them, so this table is exactly what
+     * the fake serves; the contract test checks it against `x-routes`.
+     */
+    public static readonly ROUTES: readonly string[] = [
+        "GET /me",
+        "GET /sessions", "POST /sessions",
+        "GET /conventions", "POST /conventions", "GET /conventions/{target}", "PUT /conventions/{target}",
+        "GET /admin/sessions",
+        "GET /sessions/{sid}", "PATCH /sessions/{sid}", "DELETE /sessions/{sid}",
+        "GET /sessions/{sid}/messages", "POST /sessions/{sid}/messages", "GET /sessions/{sid}/messages/{mid}/activity",
+        "POST /sessions/{sid}/request-changes", "POST /sessions/{sid}/report",
+        "POST /sessions/{sid}/approve", "POST /sessions/{sid}/cancel", "POST /sessions/{sid}/handover",
+        "GET /sessions/{sid}/artifacts", "GET /sessions/{sid}/artifacts/{aid}",
+        "GET /sessions/{sid}/files", "GET /sessions/{sid}/file", "POST /sessions/{sid}/file/refresh",
+        "POST /sessions/{sid}/file/lint", "GET /sessions/{sid}/file/revisions", "POST /sessions/{sid}/file/syntax",
+        "GET /sessions/{sid}/findings", "GET /sessions/{sid}/findings/{fid}", "POST /sessions/{sid}/findings/{fid}/open",
+        "GET /sessions/{sid}/approvals", "POST /sessions/{sid}/approvals/{aid}",
+        "GET /sessions/{sid}/comments", "POST /sessions/{sid}/comments",
+        "PATCH /sessions/{sid}/comments/{cid}", "DELETE /sessions/{sid}/comments/{cid}"
+    ];
+
+    /** The ROUTES entry a call ("GET", "sessions/s-1") matches, if any. */
+    public static routeOf(method: string, path: string): string | undefined {
+        return FakeBackend.ROUTES.find((route) => {
+            const [m, template] = route.split(" ");
+            const re = new RegExp(`^${template.slice(1).replace(/\{[^}]+\}/g, "[^/]+")}$`);
+            return m === method && re.test(path);
+        });
+    }
+
     public principal = "developer@example.com";
     public isAdmin = false;
+    /** `MeOut.diagnose_retention_days`: days a diagnose session is kept from creation; 0 = until deleted. */
+    public diagnoseRetentionDays = 14;
+    /** `ApprovalOut.ttl_min` (the server's `approval_ttl_min()`), unless a seeded row sets its own. */
+    public approvalTtlMin = 60;
     public conventions: Conventions[] = [];
     public sessions: SessionData[] = [];
     /** Set to force the next matching call to fail. */
@@ -189,6 +292,8 @@ export default class FakeBackend {
     public requests: string[] = [];
     /** Every call answered so far, same format; a held call appears once it is released. */
     public responses: string[] = [];
+    /** The JSON body of every intercepted call that sent one, in order. */
+    public bodies: { key: string; body: unknown }[] = [];
 
     /** Run streams leave out the final `done` frame (the `stream_incomplete` case). */
     public omitDone = false;
@@ -196,16 +301,49 @@ export default class FakeBackend {
     public withActivity = false;
     /** A run streams this `error` frame before its end (run_timeout, run_failed, ...). */
     public errorFrame?: { message: string; code?: string };
+    /** The answer of the next message runs (default: one short sentence naming the stage). */
+    public answer?: string;
     /** Run streams whose last frame was handed to the stream (or dropped by a cancelled reader). */
     public streamsFlushed = 0;
     /** An approve fails to arm: the decide route answers 200 with `status: "failed"` and this `error_code`. */
     public failArming?: string;
     /** An approve is stored as `approved` with `result: null` (the outcome is unknown). */
     public armingWithoutResult = false;
+    /**
+     * A request-changes run sends the comments but resolves none of them: at
+     * its end they return to `open`, as on the server (`sent` exists only
+     * while the run is in flight).
+     */
+    public resolveNoComments = false;
+    /** The session used its model requests: request-changes answers 429 `usage_exhausted`. */
+    public exhaustUsage = false;
+    /**
+     * The server's send cap (`store.MAX_SENT_COMMENTS`): a request-changes
+     * run sends at most this many open comments (oldest first); the rest
+     * stay open and the `sent` frame says how many in `left`. 0 = no cap.
+     */
+    public sendCap = 0;
+    /**
+     * Simulates the approuter's `csrfProtection`: a GET with `X-CSRF-Token:
+     * Fetch` gets the token in the response header, and a non-GET without
+     * it answers 403 `X-CSRF-Token: Required`. Off by default, as locally.
+     */
+    public csrf = false;
+    /** Token fetches answered while `csrf` is on. */
+    public csrfFetches = 0;
+    /** The token the simulated approuter accepts; empty until fetched or after expireCsrfToken(). */
+    private csrfToken = "";
+    private csrfIssued = 0;
+    /** refuseCsrf(): changes still to answer 403 Required whatever token they carry. */
+    private csrfRefusals = 0;
+    /** Scripted syntax verdicts by path; a path without one checks `ok`. */
+    private syntaxScripts = new Map<string, SyntaxScript>();
     /** When each stored approval stops being decidable (ISO time), by approval id. */
     private approvalExpiry = new Map<string, string>();
 
     private holds: { key: string; gate: Promise<void> }[] = [];
+    /** Set by holdResponse(): answered at once, delivered only when released. */
+    private lateHolds: { key: string; gate: Promise<void> }[] = [];
     /** Set by pauseStream(): the next run stream stops after its first text delta until released. */
     private streamPause?: Promise<void>;
     /** Set by splitFiles(): a propose run proposes every file and stops after the first `file` frame. */
@@ -217,6 +355,8 @@ export default class FakeBackend {
 
     private originalFetch?: typeof fetch;
     private nextId = 1;
+    /** Seconds after NOW of the last stamp(): rows a run writes get increasing times. */
+    private clock = 0;
 
     public install(): void {
         this.originalFetch = window.fetch;
@@ -283,6 +423,18 @@ export default class FakeBackend {
         return release;
     }
 
+    /**
+     * The next "METHOD path" call is answered from the state at request time,
+     * but the answer reaches the app only when the returned function runs
+     * (a slow network: a read that left before a local change arrives after it).
+     */
+    public holdResponse(key: string): () => void {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        this.lateHolds.push({ key, gate });
+        return release;
+    }
+
     /** Adds a session owned by the caller; it becomes the newest one. */
     public addSession(
         title: string, files: WorkspaceFile[] = [], artifacts: Artifact[] = [], type: SessionType = "change"
@@ -292,8 +444,112 @@ export default class FakeBackend {
             stage: type === "diagnose" ? "investigate" : "chat", status: "idle",
             owner: this.principal, created_at: NOW, updated_at: NOW
         };
-        this.sessions.push({ session, messages: [], artifacts, files, findings: [], approvals: [] });
+        this.sessions.push(FakeBackend.newData(session, artifacts, files));
         return session;
+    }
+
+    private static newData(session: Session, artifacts: Artifact[] = [], files: WorkspaceFile[] = []): SessionData {
+        return { session, messages: [], artifacts, files, findings: [], approvals: [], comments: [], pins: {} };
+    }
+
+    /**
+     * Stores the next version of `kind` for `sid`, newest first, with
+     * `based_on` from the session's pins as `submit_document` sets it.
+     */
+    public addArtifact(sid: string, kind: ArtifactKind, content?: string): Artifact {
+        const data = this.mustData(sid);
+        return this.storeArtifact(data, kind, content);
+    }
+
+    /**
+     * Stores `source` as the next revision of the workspace file `path`
+     * (created as a new object file when missing) and answers its number.
+     */
+    public addRevision(sid: string, path: string, source: string): number {
+        const data = this.mustData(sid);
+        let file = data.files.find((f) => f.path === path);
+        if (!file) {
+            const m = /^src\/([A-Z]+)\/([^.]+)\./.exec(path);
+            file = {
+                path, state: "new", object_type: m ? m[1] : null, object_name: m ? m[2].toUpperCase() : null,
+                origin_source: "", proposed_source: ""
+            };
+            data.files.push(file);
+        }
+        return this.propose(file, source, null).revision;
+    }
+
+    /** Sets a comment's state directly, as a run does (`sent`, `addressed`). */
+    public setCommentState(sid: string, cid: string, state: CommentState, answer?: string): void {
+        const comment = this.mustData(sid).comments.find((c) => c.id === cid);
+        if (!comment) {
+            throw new Error(`No comment ${cid}`);
+        }
+        comment.state = state;
+        comment.answer = state === "addressed" ? (answer ?? comment.answer ?? "Addressed by the fake.") : comment.answer;
+        comment.updated_at = NOW;
+    }
+
+    /** Every later syntax check of `path` (route and run end) answers this verdict. */
+    public scriptSyntax(path: string, status: SyntaxStatus, items: SyntaxItem[] = []): void {
+        this.syntaxScripts.set(path, { status, items });
+    }
+
+    private mustData(sid: string): SessionData {
+        const data = this.dataOf(sid);
+        if (!data) {
+            throw new Error(`No session ${sid}`);
+        }
+        return data;
+    }
+
+    private storeArtifact(data: SessionData, kind: ArtifactKind, content?: string): Artifact {
+        const version = data.artifacts.filter((a) => a.kind === kind).length + 1;
+        const basedOnKind = ({ plan: "design", review: "plan", note: "plan" } as Partial<Record<ArtifactKind, "design" | "plan">>)[kind];
+        const pin = basedOnKind ? data.pins[basedOnKind] : undefined;
+        const artifact: Artifact = {
+            id: this.id("a"), stage: KIND_STAGE[kind], kind, version, created_at: NOW,
+            content: content ?? `# ${kind} v${version}\n\nWritten by the fake.`,
+            based_on: basedOnKind && pin !== undefined ? { [basedOnKind]: pin } : null
+        };
+        data.artifacts.unshift(artifact);
+        return artifact;
+    }
+
+    /** A new revision of `file` holding `source`, unchecked. */
+    private propose(file: WorkspaceFile, source: string, runId: string | null): FileRevisionRow {
+        file.revisions ??= [];
+        const row: FileRevisionRow = {
+            revision: file.revisions.length + 1, proposed_source: source, run_id: runId, created_at: NOW,
+            syntax_status: null, syntax: [], checked_at: null
+        };
+        file.revisions.push(row);
+        file.proposed_source = source;
+        file.state = file.origin_source ? "modified" : "new";
+        return row;
+    }
+
+    /** The syntax dry run on `row`: the scripted verdict (default ok), stored on the revision. */
+    private checkSyntax(file: WorkspaceFile, row: FileRevisionRow): void {
+        const script = this.syntaxScripts.get(file.path) ?? { status: "ok", items: [] };
+        row.syntax_status = script.status;
+        // An unavailable check never carries messages: there is nothing it could vouch for.
+        row.syntax = script.status === "unavailable" ? [] : script.items.map((i) => ({ ...i }));
+        row.checked_at = NOW;
+    }
+
+    private static latest(file: WorkspaceFile): FileRevisionRow | undefined {
+        return file.revisions?.[file.revisions.length - 1];
+    }
+
+    private static baseStatus(file: WorkspaceFile): BaseStatus | null {
+        if (file.base_status !== undefined) {
+            return file.base_status;
+        }
+        if (!file.object_type) {
+            return null;
+        }
+        return file.origin_source ? "sap" : "absent";
     }
 
     /** Flags `target`'s conventions `non_production`, so `/me` offers it for diagnose sessions. */
@@ -344,21 +600,37 @@ export default class FakeBackend {
         this.runScript = script;
     }
 
+    /** The approuter session lost its token: the next change answers 403 Required until a new fetch. */
+    public expireCsrfToken(): void {
+        this.csrfToken = "";
+    }
+
+    /** The approuter refuses the next `count` changes (403 Required) even with a fresh token: the csrf_failed case. */
+    public refuseCsrf(count: number): void {
+        this.csrfRefusals = count;
+    }
+
     /** Findings and approvals of a session, for journeys to inspect or seed. */
     public dataOf(sid: string): SessionData | undefined {
         return this.sessions.find((d) => d.session.id === sid);
     }
 
     public reset(): void {
+        this.clock = 0;
         this.nextId = 1;
         this.requests = [];
         this.responses = [];
+        this.bodies = [];
         this.holds = [];
+        this.lateHolds = [];
         this.failNext = undefined;
         this.isAdmin = false;
+        this.diagnoseRetentionDays = 14;
+        this.approvalTtlMin = 60;
         this.omitDone = false;
         this.withActivity = false;
         this.errorFrame = undefined;
+        this.answer = undefined;
         this.streamsFlushed = 0;
         this.filesGap = undefined;
         this.streamPause = undefined;
@@ -366,6 +638,14 @@ export default class FakeBackend {
         this.runScript = undefined;
         this.failArming = undefined;
         this.armingWithoutResult = false;
+        this.resolveNoComments = false;
+        this.exhaustUsage = false;
+        this.sendCap = 0;
+        this.csrf = false;
+        this.csrfFetches = 0;
+        this.csrfToken = "";
+        this.csrfRefusals = 0;
+        this.syntaxScripts.clear();
         this.approvalExpiry.clear();
         this.conventions = [
             { target: "dev-system", naming: { prefix: "Z" }, package: "ZLOCAL" }
@@ -386,8 +666,20 @@ export default class FakeBackend {
                 proposed_source: ""
             }],
             findings: [],
-            approvals: []
+            approvals: [],
+            comments: [],
+            pins: {}
         }];
+    }
+
+    /**
+     * A time after every earlier stamp, in the API's format (UTC, no zone):
+     * a run's question, the approvals it proposes and its answer are stored in
+     * that order, as on the server (the answer is written when the run ends).
+     */
+    private stamp(): string {
+        this.clock++;
+        return new Date(Date.parse(`${NOW}Z`) + this.clock * 1000).toISOString().replace(/\.\d{3}Z$/, "");
     }
 
     private id(prefix: string): string {
@@ -436,8 +728,14 @@ export default class FakeBackend {
         });
     }
 
-    private fileSummary(f: WorkspaceFile): Pick<WorkspaceFile, "path" | "state" | "object_type" | "object_name"> {
-        return { path: f.path, state: f.state, object_type: f.object_type, object_name: f.object_name };
+    /** `FileSummaryOut`: revision, base and syntax status of the latest revision. */
+    private fileSummary(f: WorkspaceFile): Record<string, unknown> {
+        const latest = FakeBackend.latest(f);
+        return {
+            path: f.path, state: f.state, object_type: f.object_type, object_name: f.object_name,
+            revision: latest?.revision ?? 0, base_status: FakeBackend.baseStatus(f),
+            syntax_status: latest?.syntax_status ?? null
+        };
     }
 
     private gateError(code: string, message: string): Response {
@@ -451,12 +749,43 @@ export default class FakeBackend {
         const params = new URLSearchParams(query);
         const key = `${method} ${path}`;
         this.requests.push(key);
+        if (typeof init?.body === "string") {
+            try {
+                this.bodies.push({ key, body: JSON.parse(init.body) });
+            } catch {
+                this.bodies.push({ key, body: init.body });
+            }
+        }
+        const headers = new Headers(init?.headers);
+        const csrfHeader = headers.get("X-CSRF-Token");
+        const wantsToken = this.csrf && (method === "GET" || method === "HEAD") && csrfHeader?.toLowerCase() === "fetch";
+        const refused = this.csrfRefusals > 0 && method !== "GET" && method !== "HEAD";
+        if (refused) {
+            this.csrfRefusals--;
+        }
+        if (refused || (this.csrf && method !== "GET" && method !== "HEAD" && (!this.csrfToken || csrfHeader !== this.csrfToken))) {
+            // The approuter refuses before the backend sees the call.
+            this.responses.push(key);
+            return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain", "X-CSRF-Token": "Required" } });
+        }
         const held = this.holds.findIndex((h) => h.key === key);
         if (held >= 0) {
             const { gate } = this.holds.splice(held, 1)[0];
             await gate;
         }
         const response = await this.route(method, path, params, init);
+        const late = this.lateHolds.findIndex((h) => h.key === key);
+        if (late >= 0) {
+            const { gate } = this.lateHolds.splice(late, 1)[0];
+            await gate;
+        }
+        if (wantsToken) {
+            if (!this.csrfToken) {
+                this.csrfToken = `fake-csrf-${++this.csrfIssued}`;
+            }
+            this.csrfFetches++;
+            response.headers.set("X-CSRF-Token", this.csrfToken);
+        }
         this.responses.push(key);
         return response;
     }
@@ -471,12 +800,16 @@ export default class FakeBackend {
             this.failNext = undefined;
             return this.json(fail.status, fail.body);
         }
+        if (!FakeBackend.routeOf(method, path)) {
+            return this.json(404, { detail: `No fake for ${method} ${path}` });
+        }
 
         if (method === "GET" && path === "me") {
             return this.json(200, {
                 principal: this.principal, is_admin: this.isAdmin,
                 targets: this.conventions.map((c) => c.target),
-                diagnose_targets: this.conventions.filter((c) => c.non_production === true).map((c) => c.target)
+                diagnose_targets: this.conventions.filter((c) => c.non_production === true).map((c) => c.target),
+                diagnose_retention_days: this.diagnoseRetentionDays
             });
         }
         if (path === "sessions") {
@@ -503,40 +836,32 @@ export default class FakeBackend {
                     stage: type === "diagnose" ? "investigate" : "chat", status: "idle", owner: this.principal,
                     created_at: NOW, updated_at: NOW
                 };
-                this.sessions.push({ session, messages: [], artifacts: [], files: [], findings: [], approvals: [] });
+                this.sessions.push(FakeBackend.newData(session));
                 return this.json(201, this.sessionJson(session));
             }
         }
-        if (method === "GET" && path === "objects/search") {
-            const q = (params.get("q") || "").toUpperCase();
-            return this.json(200, [
-                { type: "CLAS", name: "ZCL_DEMO", package: "ZLOCAL", description: "Demo class" },
-                { type: "DDLS", name: "ZI_DEMO", package: "ZLOCAL", description: "Demo view" }
-            ].filter((o) => o.name.includes(q.replace(/\*/g, ""))));
-        }
         if (path === "conventions" && method === "GET") {
-            return this.json(200, this.conventions);
+            return this.json(200, this.conventions.map(FakeBackend.conventionsJson));
+        }
+        if (path === "conventions" && method === "POST") {
+            return this.createConventions(body);
         }
         const conv = /^conventions\/([^/]+)$/.exec(path);
         if (conv) {
             const target = decodeURIComponent(conv[1]);
             if (method === "GET") {
                 const found = this.conventions.find((c) => c.target === target);
-                return found ? this.json(200, found) : this.json(404, { detail: "Not found" });
+                return found ? this.json(200, FakeBackend.conventionsJson(found)) : this.json(404, { detail: "Not found" });
             }
             if (method === "PUT") {
-                if (!this.isAdmin) {
-                    return this.json(403, { detail: "Admin scope required" });
-                }
-                const next = { ...body, target } as Conventions;
-                this.conventions = this.conventions.filter((c) => c.target !== target).concat(next);
-                return this.json(200, next);
+                return this.putConventions(target, body);
             }
         }
         if (method === "GET" && path === "admin/sessions") {
             if (!this.isAdmin) {
                 return this.json(403, { detail: "Admin scope required" });
             }
+            // AdminSessionRowOut: metadata only, never content or computed state.
             return this.json(200, this.sessions.map(({ session: s }) => ({
                 id: s.id, owner: s.owner, title: s.title, target: s.target, type: s.type,
                 stage: s.stage, status: s.status, created_at: s.created_at, updated_at: s.updated_at
@@ -564,7 +889,8 @@ export default class FakeBackend {
             if (method === "GET") {
                 return this.json(200, {
                     ...this.sessionJson(s),
-                    artifacts: data.artifacts.map(({ id, kind, version, created_at }) => ({ id, kind, version, created_at })),
+                    artifacts: data.artifacts.map(({ id, stage, kind, version, created_at, based_on }) =>
+                        ({ id, stage: stage ?? KIND_STAGE[kind], kind, version, created_at, based_on: based_on ?? null })),
                     files: data.files.map((f) => this.fileSummary(f))
                 });
             }
@@ -578,26 +904,42 @@ export default class FakeBackend {
             }
         }
         if (sub === "messages" && method === "GET") {
-            return this.json(200, data.messages);
+            // The activity is served per message (`.../activity`), never inline.
+            return this.json(200, data.messages.map(({ activity, ...m }) => ({ ...m, has_activity: !!activity })));
         }
-        if ((sub === "messages" || sub === "revise") && method === "POST") {
-            if (sub === "messages" && this.blocked(s)) {
+        const act = /^messages\/([^/]+)\/activity$/.exec(sub);
+        if (act && method === "GET") {
+            const message = data.messages.find((m) => m.id === decodeURIComponent(act[1]));
+            if (!message) {
+                return this.json(404, { detail: "Message not found" });
+            }
+            if (!message.activity) {
+                return this.json(404, { detail: "The message has no activity.", code: "no_activity" });
+            }
+            return this.json(200, { events: message.activity.events, plan: message.activity.plan, dropped: 0 });
+        }
+        if (sub === "request-changes" && method === "POST") {
+            return this.requestChanges(data, body);
+        }
+        const comments = this.handleComments(method, sub, data, body, params);
+        if (comments) {
+            return comments;
+        }
+        if (sub === "messages" && method === "POST") {
+            if (this.blocked(s)) {
                 return this.json(DIAGNOSE_BLOCKED.status, DIAGNOSE_BLOCKED.body);
             }
             if (s.status === "running") {
                 return this.gateError("run_in_progress", "A run is already in progress.");
             }
-            if (sub === "revise" && (s.stage === "chat" || s.stage === "done" || s.type === "diagnose")) {
-                return this.gateError("revise_not_allowed", `Revise is not allowed in stage ${s.stage}.`);
-            }
             if (s.stage === "done") {
                 return this.gateError("stage_done", "The session is done.");
             }
             const userMsg: Message = {
-                id: this.id("m"), role: "user", stage: s.stage, created_at: NOW,
-                content: String(sub === "revise" ? body.feedback : body.text)
+                id: this.id("m"), role: "user", stage: s.stage, created_at: this.stamp(),
+                content: String(body.text)
             };
-            const answer = `Fake answer in stage **${s.stage}**.`;
+            const answer = this.answer ?? `Fake answer in stage **${s.stage}**.`;
             const reply: Message = {
                 id: this.id("m"), role: "assistant", stage: s.stage, created_at: NOW, content: answer
             };
@@ -610,8 +952,9 @@ export default class FakeBackend {
             if (this.withActivity) {
                 reply.activity = { events: [read], plan };
             }
+            const runId = this.id("r");
             const frames: [string, unknown][] = [
-                ["run", { run_id: this.id("r"), stage: s.stage, message_id: userMsg.id }],
+                ["run", { run_id: runId, stage: s.stage, message_id: userMsg.id }],
                 ...(this.withActivity ? [
                     ["plan", { todos: plan }] as [string, unknown],
                     ["tool", { ...read, status: "running", output: "" }] as [string, unknown],
@@ -620,31 +963,24 @@ export default class FakeBackend {
                 ...chunks.map((delta): [string, unknown] => ["text", { delta }]),
                 ...this.scriptedFrames(data)
             ];
+            reply.created_at = this.stamp();
             const kind = ({ design: "design", plan: "plan", propose: "note", review: "review" } as const)[
                 s.stage as "design" | "plan" | "propose" | "review"
             ];
             if (kind) {
-                const version = data.artifacts.filter((a) => a.kind === kind).length + 1;
-                const artifact: Artifact = {
-                    id: this.id("a"), kind, version, content: `# ${kind} v${version}\n\nWritten by the fake.`, created_at: NOW
-                };
-                data.artifacts.unshift(artifact);
-                frames.push(["artifact", { id: artifact.id, kind, version }]);
+                const artifact = this.storeArtifact(data, kind);
+                frames.push(["artifact", { id: artifact.id, kind, version: artifact.version }]);
             }
             const firstFile = frames.length;
             if (s.stage === "propose" && data.files.length) {
                 // A proposal for the first workspace file (every file after
                 // splitFiles()), as a propose run writes them.
-                for (const file of this.filesGap ? data.files : data.files.slice(0, 1)) {
-                    file.proposed_source = `${file.origin_source}\n* proposed by the fake`;
-                    file.state = "modified";
-                    frames.push(["file", { path: file.path, state: file.state }]);
-                }
+                frames.push(...this.proposeFrames(this.filesGap ? data.files : data.files.slice(0, 1), runId));
             }
             if (this.errorFrame) {
                 frames.push(["error", this.errorFrame]);
             }
-            frames.push(["usage", { requests_used: 1, request_cap: 200 }]);
+            frames.push(["usage", this.useRequest(s)]);
             const done = (): [string, unknown] => ["done", { message_id: reply.id, stage: s.stage, status: "idle" }];
             if (this.filesGap && frames[firstFile]?.[0] === "file") {
                 const gate = this.filesGap;
@@ -682,22 +1018,53 @@ export default class FakeBackend {
             });
         }
         if (sub === "approve" && method === "POST") {
-            if (s.status === "running") {
-                return this.gateError("run_in_progress", "A run is already in progress.");
+            if (body.version !== undefined && body.version !== null && !Number.isInteger(body.version)) {
+                // Request validation (pydantic) comes before every gate.
+                return this.json(422, { detail: [{ loc: ["body", "version"], msg: "Input should be a valid integer" }] });
             }
+            // The refusals in `stages.approve`'s order: diagnose, revisions outside propose (stage_changed),
+            // done, running, comments, then the stage's own rule (no_proposals / version_changed in propose,
+            // missing_artifact / version_changed for a document stage).
             if (s.type === "diagnose") {
-                return this.gateError("approve_not_allowed", "A diagnose session has no stages to approve.");
+                return this.gateError("approve_not_allowed", "Diagnose sessions have no stages to approve.");
+            }
+            const revisions = body.revisions === null ? undefined : body.revisions;
+            if (revisions !== undefined && s.stage !== "propose") {
+                // `revisions` belong to propose only (backend cbd4da4).
+                return this.gateError("stage_changed", "The session is no longer in the propose stage; reload and try again.");
             }
             const next = NEXT_STAGE[s.stage];
             if (!next) {
-                return this.gateError("stage_done", "The session is done.");
+                return this.gateError("stage_done", "This session is done; start a new session.");
             }
-            const need = ({ design: "design", plan: "plan", review: "review" } as Partial<Record<Stage, string>>)[s.stage];
-            if (need && !data.artifacts.some((a) => a.kind === need)) {
-                return this.gateError("missing_artifact", `Approve needs a ${need} artifact.`);
+            if (s.status === "running") {
+                return this.gateError("run_in_progress", "A run is in progress for this session.");
             }
-            if (s.stage === "propose" && !data.files.some((f) => f.state === "modified" || f.state === "new")) {
-                return this.gateError("no_proposals", "Approve needs at least one proposed file.");
+            if (data.comments.some((c) => c.state === "open" || c.state === "sent")) {
+                return this.gateError("open_comments", "Resolve or dismiss the open review comments first.");
+            }
+            if (s.stage === "propose") {
+                if (!data.files.some((f) => FakeBackend.isProposedObject(f))) {
+                    return this.gateError("no_proposals", "Propose at least one new or modified workspace file first.");
+                }
+                const proposed = this.proposedRevisions(data);
+                if (revisions !== undefined && !this.sameRevisions(data, revisions)) {
+                    // What the user saw is not what would be pinned (contract fix round U7).
+                    return this.gateError("version_changed", "The proposals changed since they were shown. Review them and approve again.");
+                }
+                data.pins.files = proposed;
+            } else {
+                const need = ({ design: "design", plan: "plan", review: "review" } as Partial<Record<Stage, "design" | "plan" | "review">>)[s.stage];
+                if (need) {
+                    const latest = this.latestVersion(data, need);
+                    if (latest < 1) {
+                        return this.gateError("missing_artifact", `Submit a ${need} in the ${s.stage} stage first.`);
+                    }
+                    if (body.version !== undefined && body.version !== null && body.version !== latest) {
+                        return this.gateError("version_changed", `The ${need} changed: version ${latest} is the latest. Review it and approve again.`);
+                    }
+                    data.pins[need] = latest;
+                }
             }
             s.stage = next;
             return this.json(200, this.sessionJson(s));
@@ -713,56 +1080,64 @@ export default class FakeBackend {
         }
         if (sub === "artifacts" && method === "GET") {
             const kind = params.get("kind");
-            return this.json(200, data.artifacts.filter((a) => !kind || a.kind === kind));
+            return this.json(200, data.artifacts.filter((a) => !kind || a.kind === kind).map(FakeBackend.artifactJson));
         }
         const art = /^artifacts\/([^/]+)$/.exec(sub);
         if (art && method === "GET") {
             const found = data.artifacts.find((a) => a.id === art[1]);
-            return found ? this.json(200, found) : this.json(404, { detail: "Artifact not found" });
+            return found ? this.json(200, FakeBackend.artifactJson(found)) : this.json(404, { detail: "Artifact not found" });
         }
         if (sub === "files" && method === "GET") {
             return this.json(200, data.files.map((f) => this.fileSummary(f)));
         }
-        if (sub === "file" || sub === "file/refresh" || sub === "file/lint") {
+        if (sub === "file" || sub === "file/refresh" || sub === "file/lint" || sub === "file/revisions" || sub === "file/syntax") {
             const file = data.files.find((f) => f.path === params.get("path"));
             if (!file) {
                 return this.json(404, { detail: "File not found" });
             }
-            if (sub !== "file" && this.blocked(s)) {
+            if (sub !== "file" && sub !== "file/revisions" && this.blocked(s)) {
                 return this.json(DIAGNOSE_BLOCKED.status, DIAGNOSE_BLOCKED.body);
             }
             if (sub === "file/lint" && method === "POST") {
                 file.linted = true;
                 return this.json(200, file.lint ?? []);
             }
+            if (sub === "file/revisions" && method === "GET") {
+                return this.json(200, (file.revisions ?? []).slice().reverse().map((r) => ({
+                    revision: r.revision, run_id: r.run_id, created_at: r.created_at,
+                    chars: r.proposed_source.length, syntax_status: r.syntax_status
+                })));
+            }
+            const wanted = params.get("revision");
+            const row = wanted === null ? FakeBackend.latest(file) : file.revisions?.find((r) => String(r.revision) === wanted);
+            if (wanted !== null && !row) {
+                return this.json(404, { detail: `No revision ${wanted} of ${file.path}.`, code: "unknown_revision" });
+            }
+            if (sub === "file/syntax" && method === "POST") {
+                if (s.status === "running") {
+                    return this.gateError("run_in_progress", "A run is already in progress.");
+                }
+                if (!file.object_type) {
+                    return this.json(422, { detail: "Only an ABAP object has a syntax check.", code: "not_an_object" });
+                }
+                if (!row) {
+                    return this.json(422, { detail: "There is no proposal to check.", code: "no_proposal" });
+                }
+                this.checkSyntax(file, row);
+                return this.json(200, {
+                    path: file.path, revision: row.revision, status: row.syntax_status, items: row.syntax, checked_at: row.checked_at
+                });
+            }
             return this.json(200, {
-                path: file.path, state: file.state, origin_source: file.origin_source,
-                proposed_source: file.proposed_source, lint: file.linted ? file.lint ?? [] : []
+                ...this.fileSummary(file),
+                revision: row?.revision ?? 0,
+                syntax_status: row?.syntax_status ?? null,
+                origin_source: file.origin_source,
+                proposed_source: row ? row.proposed_source : file.proposed_source,
+                origin_version: file.origin_version ?? null,
+                lint: file.linted ? file.lint ?? [] : [],
+                syntax: row?.syntax ?? []
             });
-        }
-        if (sub === "open" && method === "POST") {
-            if (this.blocked(s)) {
-                return this.json(DIAGNOSE_BLOCKED.status, DIAGNOSE_BLOCKED.body);
-            }
-            const type = String(body.type || "").toUpperCase();
-            const name = String(body.name || "");
-            const ext: Record<string, string> = {
-                CLAS: "clas.abap", INTF: "intf.abap", PROG: "prog.abap", DDLS: "ddls.asddls",
-                BDEF: "bdef.asbdef", DCLS: "dcls.asdcls", DDLX: "ddlx.asddlxs", SRVD: "srvd.srvdsrv", FUNC: "func.abap"
-            };
-            if (!ext[type]) {
-                return this.json(422, { detail: `Unsupported object type '${type}'` });
-            }
-            const filePath = `src/${type}/${name.toLowerCase()}.${ext[type]}`;
-            let file = data.files.find((f) => f.path === filePath);
-            if (!file) {
-                file = {
-                    path: filePath, state: "read", object_type: type, object_name: name.toUpperCase(),
-                    origin_source: `* ${name.toUpperCase()}`, proposed_source: ""
-                };
-                data.files.push(file);
-            }
-            return this.json(200, this.fileSummary(file));
         }
         const diagnose = this.handleDiagnose(method, sub, data, body, params);
         if (diagnose) {
@@ -794,9 +1169,9 @@ export default class FakeBackend {
             frames.push(["finding", { ...finding }]);
         }
         if (script.approval) {
-            const approval = this.storeApproval(data, script.approval);
+            const approval = this.storeApproval(data, { created_at: this.stamp(), ...script.approval });
             // The frame of a new proposal is always pending, whatever becomes of the stored row.
-            frames.push(["approval_required", { ...approval, status: "pending" }]);
+            frames.push(["approval_required", { ...this.approvalJson(approval), status: "pending" }]);
         }
         if (script.proposalRefused) {
             // A proposal that was not stored: the tool call ends in error with the refusal code.
@@ -828,7 +1203,7 @@ export default class FakeBackend {
             }
             const version = data.artifacts.filter((a) => a.kind === "report").length + 1;
             const artifact: Artifact = {
-                id: this.id("a"), kind: "report", version, created_at: NOW,
+                id: this.id("a"), stage: "investigate", kind: "report", version, created_at: NOW,
                 content: `# Diagnose report v${version}\n\nRoot cause found by the fake.`
             };
             data.artifacts.unshift(artifact);
@@ -840,7 +1215,7 @@ export default class FakeBackend {
                 ["run", { run_id: this.id("r"), stage: s.stage, message_id: reply.id }],
                 ["text", { delta: reply.content }],
                 ["artifact", { id: artifact.id, kind: "report", version }],
-                ["usage", { requests_used: 1, request_cap: 200 }],
+                ["usage", this.useRequest(s)],
                 ["done", { message_id: reply.id, stage: s.stage, status: "idle" }]
             ]);
         }
@@ -863,11 +1238,9 @@ export default class FakeBackend {
                 id: this.id("s"), title: `Change: ${s.title}`.slice(0, 200), target: s.target, type: "change",
                 stage: "chat", status: "idle", owner: s.owner, created_at: NOW, updated_at: NOW
             };
-            this.sessions.push({
-                session, messages: [], files: [], findings: [], approvals: [],
-                artifacts: [{ id: this.id("a"), kind: "report", version: 1, content: report.content, created_at: NOW }]
-            });
-            return this.json(201, session);
+            this.sessions.push(FakeBackend.newData(session,
+                [{ id: this.id("a"), kind: "report", version: 1, content: report.content, created_at: NOW, based_on: null }]));
+            return this.json(201, this.sessionJson(session));
         }
         if (sub === "findings" && method === "GET") {
             return this.json(200, data.findings);
@@ -896,7 +1269,7 @@ export default class FakeBackend {
             }
         }
         if (sub === "approvals" && method === "GET") {
-            return this.json(200, data.approvals);
+            return this.json(200, data.approvals.map((a) => this.approvalJson(a)));
         }
         const am = /^approvals\/([^/]+)$/.exec(sub);
         if (am && method === "POST") {
@@ -929,7 +1302,7 @@ export default class FakeBackend {
             if (decision === "deny") {
                 approval.status = "denied";
                 approval.decided_at = NOW;
-                return this.json(200, approval);
+                return this.json(200, this.approvalJson(approval));
             }
             if (!this.nonProduction(s.target)) {
                 // Nothing was decided: the row stays pending.
@@ -942,7 +1315,7 @@ export default class FakeBackend {
                 approval.error_code = this.failArming;
                 approval.result = this.failArming === "arc1_timeout_unknown"
                     ? { note: "may have been armed; check trace_requests" } : null;
-                return this.json(200, approval);
+                return this.json(200, this.approvalJson(approval));
             }
             approval.status = "approved";
             if (this.armingWithoutResult) {
@@ -952,23 +1325,497 @@ export default class FakeBackend {
             } else {
                 approval.result = { trace_request_id: (approval.params as { id: string }).id };
             }
-            return this.json(200, approval);
+            return this.json(200, this.approvalJson(approval));
         }
         return undefined;
     }
 
-    /** `masked` as the server computes it on every read: true unless the target is non-production now. */
-    private isMasked(s: Session): boolean {
-        return s.masked === true || !this.nonProduction(s.target);
+    /** A proposal of an ABAP object: state `modified`/`new` and an object path (`stages._proposed_paths`). */
+    private static isProposedObject(f: WorkspaceFile): boolean {
+        return !!f.object_name && (f.state === "modified" || f.state === "new");
+    }
+
+    /**
+     * What a propose approve pins (`stages._proposed_revisions`): the latest
+     * revision of every proposed object file; a `read` file keeps its
+     * revisions but is no proposal, a note is no object, and a proposal
+     * without a revision has nothing to pin.
+     */
+    private proposedRevisions(data: SessionData): Record<string, number> {
+        const current: Record<string, number> = {};
+        data.files.forEach((f) => {
+            const latest = FakeBackend.latest(f);
+            if (latest && FakeBackend.isProposedObject(f)) {
+                current[f.path] = latest.revision;
+            }
+        });
+        return current;
+    }
+
+    /** `revisions` of an approve equal {@link proposedRevisions}, no more, no less. */
+    private sameRevisions(data: SessionData, revisions: unknown): boolean {
+        if (typeof revisions !== "object" || revisions === null || Array.isArray(revisions)) {
+            return false;
+        }
+        const sent = revisions as Record<string, unknown>;
+        const current = this.proposedRevisions(data);
+        const keys = Object.keys(current);
+        return keys.length === Object.keys(sent).length && keys.every((k) => sent[k] === current[k]);
+    }
+
+    /** A diagnose session's target lost the flag now (or a test forced it with `Session.flagLost`). */
+    private flagLost(s: Session): boolean {
+        return s.flagLost === true || !this.nonProduction(s.target);
     }
 
     /** A diagnose session on a target that lost its flag: nothing more is read from SAP or sent to the model. */
     private blocked(s: Session): boolean {
-        return s.type === "diagnose" && this.isMasked(s);
+        return s.type === "diagnose" && this.flagLost(s);
     }
 
-    private sessionJson(s: Session): Session {
-        return { ...s, masked: this.isMasked(s) };
+    /** `SessionOut`, computed from the stored rows on every read as the server does. */
+    private sessionJson(s: Session): Record<string, unknown> {
+        const data = this.sessions.find((d) => d.session === s);
+        const comments = data?.comments ?? [];
+        const objects = data ? FakeBackend.objectNames(data) : [];
+        const { flagLost: _knob, ...served } = s;
+        return {
+            ...served,
+            requests_used: s.requests_used ?? 0,
+            request_cap: s.request_cap ?? 200,
+            objects: objects.slice(0, 5),
+            objects_total: objects.length,
+            changed_objects: data ? new Set(data.files.filter((f) => f.object_name && (f.state === "modified" || f.state === "new"))
+                .map((f) => f.object_name)).size : 0,
+            findings_count: s.type === "diagnose" ? data?.findings.length ?? 0 : null,
+            target_non_production: this.nonProduction(s.target),
+            pins: data ? FakeBackend.copyPins(data.pins) : {},
+            waiting: data ? this.waiting(data) : null,
+            open_comments: comments.filter((c) => c.state === "open").length,
+            unresolved_comments: comments.filter((c) => c.state === "open" || c.state === "sent").length
+        };
+    }
+
+    /** Every object name of the session's files, first seen first (`SessionOut.objects`, B10). */
+    private static objectNames(data: SessionData): string[] {
+        const names: string[] = [];
+        data.files.forEach((f) => {
+            if (f.object_name && !names.includes(f.object_name)) {
+                names.push(f.object_name);
+            }
+        });
+        return names;
+    }
+
+    /** A run used one model request: counted on the session, reported in the `usage` frame. */
+    private useRequest(s: Session): { requests_used: number; request_cap: number } {
+        s.requests_used = (s.requests_used ?? 0) + 1;
+        return { requests_used: s.requests_used, request_cap: s.request_cap ?? 200 };
+    }
+
+    private static copyPins(pins: Pins): Pins {
+        return { ...pins, ...(pins.files ? { files: { ...pins.files } } : {}) };
+    }
+
+    /** The worklist marker, first match wins (contract §1.2). */
+    private waiting(data: SessionData): WaitingReason | null {
+        const s = data.session;
+        if (s.stage === "done") {
+            // A finished session waits for nothing (backend e021a23).
+            return null;
+        }
+        if (s.type === "diagnose" && data.approvals.some((a) => a.status === "pending")) {
+            return "approval";
+        }
+        if (data.comments.some((c) => c.state === "addressed")) {
+            return "comments";
+        }
+        if (s.type !== "change" || s.status !== "idle") {
+            return null;
+        }
+        if (s.stage === "propose" && data.files.some((f) => {
+            const latest = FakeBackend.latest(f);
+            return !!latest && data.pins.files?.[f.path] !== latest.revision;
+        })) {
+            return "changes";
+        }
+        const kind = ({ design: "design", plan: "plan", review: "review" } as Partial<Record<Stage, "design" | "plan" | "review">>)[s.stage];
+        if (kind) {
+            const latest = this.latestVersion(data, kind);
+            if (latest > 0 && latest !== data.pins[kind]) {
+                return "document";
+            }
+        }
+        return null;
+    }
+
+    private latestVersion(data: SessionData, kind: ArtifactKind): number {
+        return data.artifacts.filter((a) => a.kind === kind).reduce((max, a) => Math.max(max, a.version), 0);
+    }
+
+    /**
+     * One new revision per file, checked at run end (base check, then syntax),
+     * and its `file` frame with revision, base and syntax status.
+     */
+    private proposeFrames(files: WorkspaceFile[], runId: string): [string, unknown][] {
+        return files.map((file): [string, unknown] => {
+            const row = this.propose(file, `${file.origin_source}\n* proposed by the fake`, runId);
+            if (file.object_type) {
+                this.checkSyntax(file, row);
+            }
+            return ["file", {
+                path: file.path, state: file.state, revision: row.revision,
+                base_status: FakeBackend.baseStatus(file), syntax_status: row.syntax_status
+            }];
+        });
+    }
+
+    // --- review comments (contract §1.1-1.2) ---------------------------------
+
+    private handleComments(
+        method: string, sub: string, data: SessionData, body: Record<string, unknown>, params: URLSearchParams
+    ): Response | undefined {
+        if (sub === "comments" && method === "GET") {
+            const state = params.get("state");
+            if (state !== null && !COMMENT_STATES.includes(state as CommentState)) {
+                return this.json(422, { detail: [{ loc: ["query", "state"], msg: "Input should be 'open', 'sent', 'addressed' or 'dismissed'" }] });
+            }
+            return this.json(200, data.comments.filter((c) => state === null || c.state === state).map(FakeBackend.commentJson));
+        }
+        if (sub === "comments" && method === "POST") {
+            return this.createComment(data, body);
+        }
+        const cm = /^comments\/([^/]+)$/.exec(sub);
+        if (!cm) {
+            return undefined;
+        }
+        const comment = data.comments.find((c) => c.id === decodeURIComponent(cm[1]));
+        if (!comment) {
+            return this.json(404, { detail: "Comment not found" });
+        }
+        const notEditable = (): Response => this.gateError("comment_not_editable", "Only an open comment can be changed or deleted.");
+        if (method === "DELETE") {
+            if (comment.state !== "open") {
+                return notEditable();
+            }
+            data.comments = data.comments.filter((c) => c !== comment);
+            return this.json(204);
+        }
+        if (method === "PATCH") {
+            const hasBody = body.body !== undefined;
+            const hasState = body.state !== undefined;
+            const hasQuote = Object.prototype.hasOwnProperty.call(body, "quote");
+            if (hasQuote && (hasState || (body.quote !== null && typeof body.quote !== "string"))) {
+                return this.json(422, { detail: "A quote goes with a body edit only.", code: "invalid_quote" });
+            }
+            if (!hasState && !hasBody && !hasQuote) {
+                return this.json(422, { detail: "Send either body or state." });
+            }
+            if (hasBody && hasState) {
+                return this.json(422, { detail: "Send either body or state." });
+            }
+            if (hasQuote && !hasBody) {
+                if (comment.state !== "open") {
+                    return notEditable();
+                }
+                comment.quote = FakeBackend.cleanQuote(body.quote);
+            } else if (hasBody) {
+                const text = FakeBackend.commentBody(body.body);
+                if (text === null) {
+                    return this.json(422, { detail: [{ loc: ["body", "body"], msg: "String should have 1 to 4000 characters" }] });
+                }
+                if (comment.state !== "open") {
+                    return notEditable();
+                }
+                comment.body = text;
+                if (hasQuote) {
+                    comment.quote = FakeBackend.cleanQuote(body.quote);
+                }
+            } else {
+                const next = body.state as CommentState;
+                if (next !== "open" && next !== "dismissed") {
+                    return this.json(422, { detail: [{ loc: ["body", "state"], msg: "Input should be 'open' or 'dismissed'" }] });
+                }
+                if (!USER_TRANSITIONS[comment.state].includes(next)) {
+                    return this.gateError("invalid_transition", `A ${comment.state} comment cannot become ${next}.`);
+                }
+                comment.state = next;
+            }
+            comment.updated_at = NOW;
+            return this.json(200, FakeBackend.commentJson(comment));
+        }
+        return undefined;
+    }
+
+    /** `CommentOut`: `quote` is required (null when none), as the contract says (backend a0f37aa). */
+    private static commentJson(c: Comment): Comment {
+        return { ...c, quote: c.quote ?? null };
+    }
+
+    /**
+     * As the server cleans a quote (`store._comment_quote`): control
+     * characters other than tab/newline/CR and Unicode format characters
+     * (Cf) removed, whitespace runs collapsed, cut to 200 code points, then
+     * trimmed; nothing left is null. Callers refuse a non-string first.
+     */
+    private static cleanQuote(value: unknown): string | null {
+        if (typeof value !== "string") {
+            return null;
+        }
+        // eslint-disable-next-line no-control-regex
+        const plain = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "").replace(/\p{Cf}/gu, "");
+        // Python's str.split() also splits on U+0085 (NEL), which JS's \s does not know.
+        const line = Array.from(plain.replace(/[\s\u0085]+/g, " ").trim()).slice(0, 200).join("").trim();
+        return line || null;
+    }
+
+    private static commentBody(value: unknown): string | null {
+        return typeof value === "string" && value.length >= 1 && value.length <= 4000 ? value : null;
+    }
+
+    private createComment(data: SessionData, body: Record<string, unknown>): Response {
+        const text = FakeBackend.commentBody(body.body);
+        if (text === null) {
+            return this.json(422, { detail: [{ loc: ["body", "body"], msg: "String should have 1 to 4000 characters" }] });
+        }
+        if (body.quote !== undefined && body.quote !== null && typeof body.quote !== "string") {
+            return this.json(422, { detail: "The quote must be text", code: "invalid_quote" });
+        }
+        const int = (v: unknown): v is number => Number.isInteger(v);
+        const invalid = (why: string): Response => this.json(422, { detail: `Invalid anchor: ${why}.`, code: "invalid_anchor" });
+        const comment: Comment = {
+            id: this.id("c"), anchor: "file", path: null, revision: null, line_start: null, line_end: null,
+            kind: null, version: null, paragraph: null, body: text, state: "open", answer: null,
+            // The backend's coming `quote` (plain text, at most 200 characters): stored and echoed.
+            quote: FakeBackend.cleanQuote(body.quote),
+            created_at: NOW, updated_at: NOW
+        };
+        if (body.anchor === "file") {
+            const file = data.files.find((f) => f.path === body.path);
+            if (!file) {
+                return invalid("the file is not in the session");
+            }
+            const { revision, line_start: start, line_end: end } = body;
+            if (!int(revision) || revision < 0 || revision > (FakeBackend.latest(file)?.revision ?? 0)) {
+                return invalid("unknown revision");
+            }
+            if (!int(start) || !int(end) || start < 1 || end < start) {
+                return invalid("bad line range");
+            }
+            Object.assign(comment, { path: file.path, revision, line_start: start, line_end: end });
+        } else if (body.anchor === "document") {
+            const { kind, version, paragraph } = body;
+            if (!ARTIFACT_KINDS.includes(kind as ArtifactKind) || !int(version)
+                || !data.artifacts.some((a) => a.kind === kind && a.version === version)) {
+                return invalid("unknown document version");
+            }
+            if (!int(paragraph) || paragraph < 0) {
+                return invalid("bad paragraph");
+            }
+            Object.assign(comment, { anchor: "document", kind, version, paragraph });
+        } else {
+            return this.json(422, { detail: [{ loc: ["body", "anchor"], msg: "Input should be 'file' or 'document'" }] });
+        }
+        data.comments.push(comment);
+        return this.json(201, FakeBackend.commentJson(comment));
+    }
+
+    /**
+     * `POST request-changes`: refusals before the stream, then `run`,
+     * `comments` (sent), the text, `comments` (addressed), the reworked
+     * document (or file revisions in `propose`), `usage`, `done`.
+     */
+    private requestChanges(data: SessionData, body: Record<string, unknown>): Response {
+        const s = data.session;
+        const note = body.note === undefined || body.note === null ? "" : body.note;
+        if (typeof note !== "string" || note.length > 4000) {
+            return this.json(422, { detail: [{ loc: ["body", "note"], msg: "String should have at most 4000 characters" }] });
+        }
+        // The server's gate order (stages.assert_can_run), then nothing_to_send.
+        if (s.type === "diagnose") {
+            return this.gateError("revise_not_allowed", "Changes cannot be requested in a diagnose session.");
+        }
+        if (s.stage === "done") {
+            return this.gateError("stage_done", "The session is done.");
+        }
+        if (s.status === "running") {
+            return this.gateError("run_in_progress", "A run is already in progress.");
+        }
+        if (!REVISABLE.includes(s.stage)) {
+            return this.gateError("revise_not_allowed", `Changes cannot be requested in stage ${s.stage}.`);
+        }
+        if (this.exhaustUsage) {
+            return this.gateError("usage_exhausted", "This session has used its model requests.");
+        }
+        const allOpen = data.comments.filter((c) => c.state === "open");
+        const open = this.sendCap > 0 ? allOpen.slice(0, this.sendCap) : allOpen;
+        const left = allOpen.length - open.length;
+        if (!open.length && !note.trim()) {
+            return this.gateError("nothing_to_send", "Write a comment or a note first.");
+        }
+        const runId = this.id("r");
+        open.forEach((c) => { c.state = "sent"; c.updated_at = NOW; });
+        const ids = open.map((c) => c.id);
+        const userMsg: Message = {
+            id: this.id("m"), role: "user", stage: s.stage, created_at: NOW,
+            // As the server stores it (B9): the count, then the note.
+            content: [ids.length ? `Request changes: ${ids.length} comment(s)` : "", note].filter(Boolean).join("\n\n")
+        };
+        const reply: Message = {
+            id: this.id("m"), role: "assistant", stage: s.stage, created_at: NOW, content: `Reworked the ${s.stage}.`
+        };
+        data.messages.push(userMsg, reply);
+        const frames: [string, unknown][] = [["run", { run_id: runId, stage: s.stage, message_id: userMsg.id }]];
+        if (ids.length) {
+            frames.push(["comments", { ids, state: "sent", left }]);
+        }
+        frames.push(["text", { delta: reply.content }]);
+        // What the run does after its first text: resolve, store the rework, end. Applied only
+        // when the stream gets there, so a paused stream (pauseStream) shows the comments `sent`.
+        const rest = (): [string, unknown][] => {
+            const tail: [string, unknown][] = [];
+            if (ids.length && !this.resolveNoComments) {
+                open.forEach((c) => {
+                    c.state = "addressed";
+                    c.answer = `Addressed: ${c.body}`.slice(0, 500);
+                    c.updated_at = NOW;
+                });
+                tail.push(["comments", { ids, state: "addressed" }]);
+            }
+            if (s.stage === "propose") {
+                const proposed = data.files.filter((f) => f.revisions?.length);
+                tail.push(...this.proposeFrames(proposed.length ? proposed : data.files.slice(0, 1), runId));
+            } else {
+                const artifact = this.storeArtifact(data, DOC_KIND[s.stage] as ArtifactKind);
+                tail.push(["artifact", { id: artifact.id, kind: artifact.kind, version: artifact.version }]);
+            }
+            tail.push(["usage", this.useRequest(s)]);
+            // The run is over: whatever it did not resolve goes back to open, and the server says so (B9).
+            const unresolved = open.filter((c) => c.state === "sent");
+            unresolved.forEach((c) => { c.state = "open"; c.updated_at = NOW; });
+            if (unresolved.length) {
+                tail.push(["comments", { ids: unresolved.map((c) => c.id), state: "open" }]);
+            }
+            tail.push(["done", { message_id: reply.id, stage: s.stage, status: "idle" }]);
+            return tail;
+        };
+        const gate = this.streamPause;
+        if (gate) {
+            this.streamPause = undefined;
+            return this.sse(frames, { after: frames.length, gate, rest });
+        }
+        frames.push(...rest());
+        return this.sse(frames);
+    }
+
+    // --- conventions (contract §1.2, D4) -------------------------------------
+
+    private createConventions(body: Record<string, unknown>): Response {
+        if (!this.isAdmin) {
+            return this.json(403, { detail: "Admin scope required" });
+        }
+        const target = body.target;
+        if (typeof target !== "string" || !TARGET_PATTERN.test(target)) {
+            return this.json(422, { detail: [{ loc: ["body", "target"], msg: "String should match the target pattern" }] });
+        }
+        const strict = FakeBackend.strictBool(body);
+        if (strict) {
+            return strict;
+        }
+        if (this.conventions.some((c) => c.target === target)) {
+            return this.json(409, { detail: `Target '${target}' exists.`, code: "target_exists" });
+        }
+        const created = { ...body, target } as Conventions;
+        this.conventions.push(created);
+        return this.json(201, FakeBackend.conventionsJson(created));
+    }
+
+    /** Updates an existing target only (404 `unknown_target`); `clear` removes fields. */
+    private putConventions(target: string, body: Record<string, unknown>): Response {
+        if (!this.isAdmin) {
+            return this.json(403, { detail: "Admin scope required" });
+        }
+        const found = this.conventions.find((c) => c.target === target);
+        if (!found) {
+            return this.json(404, { detail: `Unknown target '${target}'.`, code: "unknown_target" });
+        }
+        const strict = FakeBackend.strictBool(body);
+        if (strict) {
+            return strict;
+        }
+        const invalid = FakeBackend.conventionsUpdateErrors(body);
+        if (invalid.length) {
+            return this.json(422, { detail: invalid });
+        }
+        const { clear = [], ...fields } = body;
+        if (!Array.isArray(clear) || clear.some((k) => !CLEARABLE.includes(String(k)))) {
+            return this.json(422, { detail: [{ loc: ["body", "clear"], msg: "Unknown field to clear" }] });
+        }
+        const both = (clear as string[]).filter((k) => fields[k] !== undefined && fields[k] !== null);
+        if (both.length) {
+            return this.json(422, { detail: `Set and cleared at once: ${both.join(", ")}.` });
+        }
+        const next = { ...found, ...fields, target } as Conventions;
+        // The columns are NOT NULL with "" as their empty value: a cleared field is stored as "".
+        (clear as string[]).forEach((k) => { next[k] = ""; });
+        this.conventions = this.conventions.map((c) => (c === found ? next : c));
+        return this.json(200, FakeBackend.conventionsJson(next));
+    }
+
+    /**
+     * What the server's `ConventionsUpdate` (extra=forbid) refuses besides the flag's StrictBool:
+     * unknown keys, a text field that is not a string or longer than its `max_length`, and a
+     * `clean_core_level` outside A-D. FastAPI's 422 shape, one item per refusal.
+     */
+    private static conventionsUpdateErrors(body: Record<string, unknown>): { loc: string[]; msg: string }[] {
+        const errors: { loc: string[]; msg: string }[] = [];
+        for (const [key, value] of Object.entries(body)) {
+            if (key === "clear" || key === "non_production") {
+                continue;
+            }
+            if (!(key in CONVENTIONS_MAX) && key !== "clean_core_level") {
+                errors.push({ loc: ["body", key], msg: "Extra inputs are not permitted" });
+                continue;
+            }
+            if (value === null || value === undefined) {
+                continue;
+            }
+            if (typeof value !== "string") {
+                errors.push({ loc: ["body", key], msg: "Input should be a valid string" });
+            } else if (key === "clean_core_level" && !/^[A-D]$/.test(value)) {
+                errors.push({ loc: ["body", key], msg: "String should match pattern '^[A-D]$'" });
+            } else if (key !== "clean_core_level" && Array.from(value).length > CONVENTIONS_MAX[key]) {
+                errors.push({ loc: ["body", key], msg: `String should have at most ${CONVENTIONS_MAX[key]} characters` });
+            }
+        }
+        return errors;
+    }
+
+    /** `ConventionsOut`: every field present (null when not set), `non_production` a boolean. */
+    private static conventionsJson(c: Conventions): Record<string, unknown> {
+        const fields = ["label", "destination", "namespace", "package", "atc_variant", "clean_core_level", "free_text", "updated_at"];
+        const out: Record<string, unknown> = { ...c, non_production: c.non_production === true };
+        fields.forEach((k) => { out[k] = (c as Record<string, unknown>)[k] ?? null; });
+        return out;
+    }
+
+    /** `ApprovalOut`: with the server's `ttl_min`. */
+    private approvalJson(a: Approval): Approval {
+        return { ...a, ttl_min: a.ttl_min ?? this.approvalTtlMin };
+    }
+
+    /** `ArtifactOut`: every field, `stage` and `based_on` always present. */
+    private static artifactJson(a: Artifact): Artifact {
+        return { ...a, stage: a.stage ?? KIND_STAGE[a.kind], based_on: a.based_on ?? null };
+    }
+
+    /** `non_production` is a StrictBool on the server: "true" or 1 is 422, `null` means not sent. */
+    private static strictBool(body: Record<string, unknown>): Response | undefined {
+        if (body.non_production !== undefined && body.non_production !== null && typeof body.non_production !== "boolean") {
+            return new Response(JSON.stringify({ detail: [{ loc: ["body", "non_production"], msg: "Input should be a valid boolean" }] }),
+                { status: 422, headers: { "Content-Type": "application/json" } });
+        }
+        return undefined;
     }
 
     private nonProduction(target: string): boolean {

@@ -77,7 +77,7 @@
       "destination": "pydantic-agent-backend",
       "authenticationType": "xsuaa",
       "scope": "$XSAPPNAME.developer",
-      "csrfProtection": false
+      "csrfProtection": true
     },
     {
       "source": "^/ide/api/(.*)$",
@@ -85,7 +85,7 @@
       "destination": "pydantic-agent-backend",
       "authenticationType": "xsuaa",
       "scope": "$XSAPPNAME.developer",
-      "csrfProtection": false
+      "csrfProtection": true
     },
     {
       "source": "^/ui5ide/?$",

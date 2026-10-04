@@ -10,9 +10,21 @@ interface SinonStub {
     getCall: (n: number) => { args: unknown[] };
     restore: () => void;
 }
-interface SinonLike { stub: (obj: object, method: string) => SinonStub }
+interface SinonFake {
+    callsFake: (fn: (url: string, init?: RequestInit) => Promise<Response>) => SinonFake;
+    callCount: number;
+    getCall: (n: number) => { args: unknown[] };
+    restore: () => void;
+}
+interface SinonLike { stub: (obj: object, method: string) => SinonFake }
 
 let sinon: SinonLike;
+
+/** True for the CSRF token fetch (`X-CSRF-Token: Fetch`), which the service sends before its first non-GET call. */
+function isTokenFetch(init?: RequestInit): boolean {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    return Object.keys(headers).some((k) => k.toLowerCase() === "x-csrf-token" && headers[k].toLowerCase() === "fetch");
+}
 
 interface Ctx { fetchStub?: SinonStub }
 
@@ -60,9 +72,30 @@ function streamResponse(): {
     };
 }
 
+/**
+ * Stubs fetch with one answer for every API call. A token fetch is answered
+ * apart (200, no token: what the app sees locally, without an approuter) and
+ * is not counted by `getCall`/`callCount`, so these tests see API calls only.
+ */
 function stubFetch(ctx: Ctx, response: Response | Promise<Response>): SinonStub {
-    ctx.fetchStub = sinon.stub(window, "fetch").returns(Promise.resolve(response));
-    return ctx.fetchStub;
+    let next: Promise<Response> = Promise.resolve(response);
+    const api: unknown[][] = [];
+    const fake = sinon.stub(window, "fetch").callsFake((url: string, init?: RequestInit) => {
+        if (isTokenFetch(init)) {
+            return Promise.resolve(jsonResponse(200, {}));
+        }
+        api.push([url, init]);
+        return next;
+    });
+    const stub: SinonStub = {
+        resolves: (value) => { next = Promise.resolve(value as Response); return stub; },
+        returns: (value) => { next = value as Promise<Response>; return stub; },
+        get callCount() { return api.length; },
+        getCall: (n) => ({ args: api[n] }),
+        restore: () => fake.restore()
+    };
+    ctx.fetchStub = stub;
+    return stub;
 }
 
 function callOf(stub: SinonStub, n = 0): { url: string; init: RequestInit } {
@@ -123,12 +156,18 @@ QUnit.test("listArtifacts passes the optional kind filter", async function (this
     assert.strictEqual(callOf(stub).url, "backend/sessions/s1/artifacts?kind=design", "kind filter in the query");
 });
 
-QUnit.test("searchObjects sends target and q", async function (this: Ctx, assert) {
-    const stub = stubFetch(this, jsonResponse(200, []));
-
-    await new IdeService().searchObjects("dev", "ZCL_*");
-
-    assert.strictEqual(callOf(stub).url, "backend/objects/search?target=dev&q=ZCL_*", "both parameters");
+QUnit.test("approve sends the version, or in propose the revisions the user saw (U7 fix round)", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(200, {}));
+    await new IdeService().approve("s1", 2);
+    assert.deepEqual(JSON.parse(String(callOf(stub).init.body)), { version: 2 });
+    stub.restore();
+    const stub2 = stubFetch(this, jsonResponse(200, {}));
+    await new IdeService().approve("s1", undefined, { "src/CLAS/zcl_a.clas.abap": 3 });
+    assert.deepEqual(JSON.parse(String(callOf(stub2).init.body)), { revisions: { "src/CLAS/zcl_a.clas.abap": 3 } });
+    stub2.restore();
+    const stub3 = stubFetch(this, jsonResponse(200, {}));
+    await new IdeService().approve("s1");
+    assert.strictEqual(callOf(stub3).init.body, undefined, "nothing to send: no body");
 });
 
 // --- errors -------------------------------------------------------------------
@@ -240,20 +279,6 @@ QUnit.test("a multi-byte character split across chunks decodes intact", async fu
     assert.deepEqual(events[0], { type: "text", data: { delta: "été" } }, "decoded as one string");
 });
 
-QUnit.test("streamRevise POSTs the feedback to the revise route", async function (this: Ctx, assert) {
-    const s = streamResponse();
-    const stub = stubFetch(this, s.response);
-
-    const done = new IdeService().streamRevise("s1", "Use a CDS view", () => undefined);
-    s.push('event: done\ndata: {"message_id":"m","stage":"design","status":"idle"}\n\n');
-    s.close();
-    await done;
-
-    const { url, init } = callOf(stub);
-    assert.strictEqual(url, "backend/sessions/s1/revise", "the revise route");
-    assert.deepEqual(JSON.parse(init.body as string), { feedback: "Use a CDS view" }, "the feedback is sent");
-});
-
 QUnit.test("a refused stream (409) rejects with an IdeError and delivers no events", async function (this: Ctx, assert) {
     stubFetch(this, jsonResponse(409, { detail: "A run is already in progress.", code: "run_in_progress" }));
     const events: SseEvent[] = [];
@@ -272,7 +297,7 @@ QUnit.test("a 429 usage refusal keeps its code", async function (this: Ctx, asse
     stubFetch(this, jsonResponse(429, { detail: "Request budget used up.", code: "usage_exhausted" }));
 
     try {
-        await new IdeService().streamRevise("s1", "more", () => undefined);
+        await new IdeService().streamRequestChanges("s1", "more", () => undefined);
         assert.ok(false, "should have thrown");
     } catch (e) {
         assert.strictEqual((e as IdeError).status, 429, "429");
@@ -498,7 +523,7 @@ QUnit.test("a stream with a non-SSE content type is invalid_response", async fun
     const events: SseEvent[] = [];
 
     try {
-        await new IdeService().streamRevise("s1", "x", (e) => events.push(e));
+        await new IdeService().streamRequestChanges("s1", "x", (e) => events.push(e));
         assert.ok(false, "should have thrown");
     } catch (e) {
         assert.strictEqual((e as IdeError).code, "invalid_response", "invalid_response");
@@ -694,8 +719,8 @@ QUnit.test("only a non-production target offers and accepts diagnose sessions", 
     assert.strictEqual(session.stage, "investigate", "in the single diagnose stage");
     assert.strictEqual((await service.createSession("c", "dev-system")).type, "change", "change by default");
     assert.strictEqual(await codeOf(service.approve(session.id)), "409 approve_not_allowed", "no stage gate");
-    assert.strictEqual(await codeOf(service.streamRevise(session.id, "x", () => undefined)),
-        "409 revise_not_allowed", "no revise");
+    assert.strictEqual(await codeOf(service.streamRequestChanges(session.id, "x", () => undefined)),
+        "409 revise_not_allowed", "no request-changes round");
 });
 
 QUnit.test("a scripted run emits findings and an approval, which the routes then serve", async function (this: FakeCtx, assert) {
@@ -728,13 +753,13 @@ QUnit.test("a scripted run emits findings and an approval, which the routes then
     assert.ok(detail.detail.includes("DEVUSER01"), "with the stored detail, as SAP sent it");
     assert.notOk(detail.detail.includes("re-read"), "not read again");
     assert.ok((await service.getFinding(sid, findings[1].id, true)).detail.includes("re-read from SAP"), "a refresh reads it again");
-    this.fake.sessions[this.fake.sessions.length - 1].session.masked = true;
+    this.fake.sessions[this.fake.sessions.length - 1].session.flagLost = true;
     assert.strictEqual(await codeOf(service.getFinding(sid, findings[1].id)), "409 target_not_non_production",
-        "a masked diagnose session (its target lost the flag) does not serve the stored detail");
+        "a diagnose session whose target lost the flag does not serve the stored detail");
     assert.strictEqual(await codeOf(service.getFinding(sid, findings[1].id, true)), "409 target_not_non_production",
         "nor reads it from SAP again");
     assert.strictEqual(await codeOf(service.openFinding(sid, findings[1].id)), "409 target_not_non_production", "nor a finding's source");
-    this.fake.sessions[this.fake.sessions.length - 1].session.masked = false;
+    this.fake.sessions[this.fake.sessions.length - 1].session.flagLost = false;
 
     const opened = await service.openFinding(sid, findings[1].id);
     assert.strictEqual(opened.file.path, "src/PROG/zdemo_report.prog.abap", "the program is opened");
@@ -784,4 +809,479 @@ QUnit.test("report writes a report artifact and handover seeds a change session 
     assert.strictEqual(copied.length, 1, "one report");
     assert.strictEqual(copied[0].version, 1, "as version 1");
     assert.strictEqual(copied[0].content, report.content, "with the report's content");
+});
+
+// --- comments, revisions, pins and request changes (contract §1.2) --------------
+
+QUnit.module("IdeService: comments, revisions, pins", {
+    before: function () {
+        return new Promise<void>((resolve) => {
+            sap.ui.require(["sap/ui/thirdparty/sinon-4"], function (lib: SinonLike) {
+                sinon = lib;
+                resolve();
+            });
+        });
+    },
+    afterEach: function (this: Ctx) {
+        this.fetchStub?.restore();
+    }
+});
+
+/** method, url and parsed body of the first fetch call. */
+function sent(stub: SinonStub): { method: string; url: string; body: unknown } {
+    const { url, init } = callOf(stub);
+    return { method: init.method ?? "GET", url, body: init.body === undefined ? undefined : JSON.parse(init.body as string) };
+}
+
+QUnit.test("listComments GETs the comments, with the optional state filter", async function (this: Ctx, assert) {
+    const service = new IdeService();
+    let stub = stubFetch(this, jsonResponse(200, []));
+    await service.listComments("s 1");
+    assert.deepEqual(sent(stub), { method: "GET", url: "backend/sessions/s%201/comments", body: undefined }, "all comments");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, []));
+    await service.listComments("s1", "sent");
+    assert.strictEqual(callOf(stub).url, "backend/sessions/s1/comments?state=sent", "filtered by state");
+});
+
+QUnit.test("createComment POSTs the anchor and body", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(201, { id: "c1", state: "open" }));
+    const body = { anchor: "file" as const, path: "src/CLAS/zcl_x.clas.abap", revision: 2, line_start: 3, line_end: 4, body: "Why?" };
+
+    const comment = await new IdeService().createComment("s1", body);
+
+    assert.deepEqual(sent(stub), { method: "POST", url: "backend/sessions/s1/comments", body }, "anchor and body sent");
+    assert.strictEqual(comment.id, "c1", "returns the stored comment");
+});
+
+QUnit.test("editComment and setCommentState PATCH either the body or the state", async function (this: Ctx, assert) {
+    const service = new IdeService();
+    let stub = stubFetch(this, jsonResponse(200, { id: "c 1" }));
+    await service.editComment("s1", "c 1", "Better text");
+    assert.deepEqual(sent(stub), { method: "PATCH", url: "backend/sessions/s1/comments/c%201", body: { body: "Better text" } }, "body only");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, { id: "c1" }));
+    await service.setCommentState("s1", "c1", "dismissed");
+    assert.deepEqual(sent(stub), { method: "PATCH", url: "backend/sessions/s1/comments/c1", body: { state: "dismissed" } }, "state only");
+});
+
+QUnit.test("deleteComment DELETEs the comment and resolves on 204", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(204));
+    const result = await new IdeService().deleteComment("s1", "c1");
+    assert.deepEqual(sent(stub), { method: "DELETE", url: "backend/sessions/s1/comments/c1", body: undefined });
+    assert.strictEqual(result, undefined);
+});
+
+QUnit.test("streamRequestChanges POSTs the note (or nothing) to request-changes and delivers comments frames", async function (this: Ctx, assert) {
+    const s = streamResponse();
+    const stub = stubFetch(this, s.response);
+    const events: SseEvent[] = [];
+
+    const done = new IdeService().streamRequestChanges("s1", "Keep the API", (e) => events.push(e));
+    s.push('event: comments\ndata: {"ids":["c1"],"state":"sent"}\n\n');
+    s.push('event: done\ndata: {"message_id":"m1","stage":"design","status":"idle"}\n\n');
+    s.close();
+    await done;
+
+    const { url, init } = callOf(stub);
+    assert.strictEqual(url, "backend/sessions/s1/request-changes", "the request-changes route");
+    assert.strictEqual(init.method, "POST", "POST");
+    assert.deepEqual(JSON.parse(init.body as string), { note: "Keep the API" }, "the note");
+    assert.deepEqual(events[0], { type: "comments", data: { ids: ["c1"], state: "sent" } }, "comments frame delivered");
+
+    const empty = streamResponse();
+    stub.restore();
+    const stub2 = stubFetch(this, empty.response);
+    const again = new IdeService().streamRequestChanges("s1", "", () => undefined);
+    empty.push('event: done\ndata: {"message_id":"m2","stage":"design","status":"idle"}\n\n');
+    empty.close();
+    await again;
+    assert.deepEqual(JSON.parse(callOf(stub2).init.body as string), {}, "no note: an empty body");
+});
+
+QUnit.test("getActivity GETs a message's activity", async function (this: Ctx, assert) {
+    const stub = stubFetch(this, jsonResponse(200, { events: [], plan: [], dropped: 0 }));
+    const activity = await new IdeService().getActivity("s1", "m 1");
+    assert.deepEqual(sent(stub), { method: "GET", url: "backend/sessions/s1/messages/m%201/activity", body: undefined });
+    assert.strictEqual(activity.dropped, 0);
+});
+
+QUnit.test("listRevisions, getFile with a revision and checkSyntax use the file routes", async function (this: Ctx, assert) {
+    const service = new IdeService();
+    const path = "src/CLAS/zcl_x.clas.abap";
+    let stub = stubFetch(this, jsonResponse(200, []));
+    await service.listRevisions("s1", path);
+    assert.deepEqual(sent(stub), { method: "GET", url: "backend/sessions/s1/file/revisions?path=src%2FCLAS%2Fzcl_x.clas.abap", body: undefined },
+        "revisions of the path");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, {}));
+    await service.getFile("s1", path, 3);
+    assert.strictEqual(callOf(stub).url, "backend/sessions/s1/file?path=src%2FCLAS%2Fzcl_x.clas.abap&revision=3", "a given revision");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, { status: "ok", items: [] }));
+    await service.checkSyntax("s1", path);
+    assert.deepEqual(sent(stub), { method: "POST", url: "backend/sessions/s1/file/syntax?path=src%2FCLAS%2Fzcl_x.clas.abap", body: undefined },
+        "latest revision by default");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, { status: "ok", items: [] }));
+    await service.checkSyntax("s1", path, 2);
+    assert.strictEqual(callOf(stub).url, "backend/sessions/s1/file/syntax?path=src%2FCLAS%2Fzcl_x.clas.abap&revision=2", "a given revision");
+});
+
+QUnit.test("approve sends the version it shows, or no body", async function (this: Ctx, assert) {
+    const service = new IdeService();
+    let stub = stubFetch(this, jsonResponse(200, { id: "s1" }));
+    await service.approve("s1", 2);
+    assert.deepEqual(sent(stub), { method: "POST", url: "backend/sessions/s1/approve", body: { version: 2 } }, "with the version");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, { id: "s1" }));
+    await service.approve("s1");
+    assert.deepEqual(sent(stub), { method: "POST", url: "backend/sessions/s1/approve", body: undefined }, "without a version");
+});
+
+QUnit.test("createConventions POSTs; putConventions sends clear only when given", async function (this: Ctx, assert) {
+    const service = new IdeService();
+    let stub = stubFetch(this, jsonResponse(201, { target: "DEMO" }));
+    await service.createConventions({ target: "DEMO", package: "ZDEMO", non_production: true });
+    assert.deepEqual(sent(stub), { method: "POST", url: "backend/conventions", body: { target: "DEMO", package: "ZDEMO", non_production: true } });
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, { target: "DEMO" }));
+    await service.putConventions("DEMO", { package: "ZNEW" }, ["namespace"]);
+    assert.deepEqual(sent(stub), { method: "PUT", url: "backend/conventions/DEMO", body: { package: "ZNEW", clear: ["namespace"] } },
+        "clear sent");
+    stub.restore();
+    stub = stubFetch(this, jsonResponse(200, { target: "DEMO" }));
+    await service.putConventions("DEMO", { package: "ZNEW" });
+    assert.deepEqual(sent(stub).body, { package: "ZNEW" }, "no clear key without a list");
+});
+
+QUnit.module("IdeService against FakeBackend (comments)", {
+    beforeEach: function (this: FakeCtx) {
+        this.fake = new FakeBackend();
+        this.fake.reset();
+        this.fake.install();
+    },
+    afterEach: function (this: FakeCtx) {
+        this.fake.restore();
+    }
+});
+
+QUnit.test("a request-changes run sends, resolves and re-submits; approve then pins the shown version", async function (this: FakeCtx, assert) {
+    const service = new IdeService();
+    const sid = this.fake.sessions[0].session.id;
+    this.fake.sessions[0].session.stage = "design";
+    this.fake.addArtifact(sid, "design");
+
+    assert.strictEqual(await codeOf(service.streamRequestChanges(sid, "", () => undefined)), "409 nothing_to_send", "nothing to send");
+    const comment = await service.createComment(sid, { anchor: "document", kind: "design", version: 1, paragraph: 0, body: "Too vague" });
+    assert.strictEqual((await service.getSession(sid)).open_comments, 1, "one open comment");
+    assert.strictEqual(await codeOf(service.approve(sid, 1)), "409 open_comments", "open comments block approve");
+
+    const events: SseEvent[] = [];
+    await service.streamRequestChanges(sid, "", (e) => events.push(e));
+    assert.deepEqual(events.map((e) => e.type).filter((t) => t !== "text"),
+        ["run", "comments", "comments", "artifact", "usage", "done"], "sent, addressed, the new version, done");
+    assert.deepEqual(events.find((e) => e.type === "comments")?.data, { ids: [comment.id], state: "sent", left: 0 }, "sent first, with the number left out by the cap");
+    const [stored] = await service.listComments(sid);
+    assert.strictEqual(stored.state, "addressed", "addressed by the run");
+    assert.ok(stored.answer, "with an answer");
+    const session = await service.getSession(sid);
+    assert.strictEqual(session.waiting, "comments", "the worklist shows answered comments");
+    assert.strictEqual(session.unresolved_comments, 0, "nothing unresolved");
+
+    assert.strictEqual(await codeOf(service.approve(sid, 1)), "409 version_changed", "v1 is no longer the latest");
+    const approved = await service.approve(sid, 2);
+    assert.strictEqual(approved.stage, "plan", "moved on");
+    assert.strictEqual(approved.pins.design, 2, "design v2 pinned");
+});
+
+// --- CSRF token (approuter csrfProtection) -----------------------------------------
+
+/** One fetch call as the CSRF tests see it: method, url, the token header sent, credentials. */
+interface Seen { method: string; url: string; token: string | undefined; credentials: RequestCredentials | undefined }
+
+interface CsrfCtx {
+    fake?: SinonFake;
+    seen: Seen[];
+    /** Token fetches answered so far. */
+    fetches: number;
+}
+
+function tokenOf(init?: RequestInit): string | undefined {
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === "x-csrf-token");
+    return key === undefined ? undefined : headers[key];
+}
+
+function tokenResponse(token: string | null): Response {
+    return new Response("{}", {
+        status: 200, headers: token === null ? { "Content-Type": "application/json" } : { "Content-Type": "application/json", "X-CSRF-Token": token }
+    });
+}
+
+function csrfRequired(): Response {
+    return new Response("Forbidden", { status: 403, headers: { "Content-Type": "text/plain", "X-CSRF-Token": "Required" } });
+}
+
+/**
+ * Stubs fetch with a handler; `tokens` are what successive token fetches
+ * answer (`null` = no header, as locally). Every call is recorded in `seen`.
+ */
+function stubCsrf(
+    ctx: CsrfCtx, tokens: (string | null)[], api: (url: string, init: RequestInit, n: number) => Response | Promise<Response>
+): void {
+    ctx.seen = [];
+    ctx.fetches = 0;
+    let apiCalls = 0;
+    ctx.fake = sinon.stub(window, "fetch").callsFake((url: string, init?: RequestInit) => {
+        const i = init ?? {};
+        ctx.seen.push({ method: i.method ?? "GET", url, token: tokenOf(i), credentials: i.credentials });
+        if (isTokenFetch(i)) {
+            const token = tokens[Math.min(ctx.fetches, tokens.length - 1)];
+            ctx.fetches++;
+            return Promise.resolve(tokenResponse(token));
+        }
+        return Promise.resolve(api(url, i, apiCalls++));
+    });
+}
+
+QUnit.module("IdeService: CSRF token", {
+    before: function () {
+        return new Promise<void>((resolve) => {
+            sap.ui.require(["sap/ui/thirdparty/sinon-4"], function (lib: SinonLike) {
+                sinon = lib;
+                resolve();
+            });
+        });
+    },
+    afterEach: function (this: CsrfCtx) {
+        this.fake?.restore();
+    }
+});
+
+QUnit.test("two concurrent first POSTs share one token fetch and both send the token", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, ["tok-1"], () => jsonResponse(201, { id: "c1" }));
+    const service = new IdeService();
+
+    await Promise.all([
+        service.createComment("s1", { anchor: "document", kind: "design", version: 1, paragraph: 0, body: "a" }),
+        service.createSession("t", "DEMO")
+    ]);
+
+    assert.strictEqual(this.fetches, 1, "one token fetch");
+    const fetch = this.seen.find((s) => s.token === "Fetch");
+    assert.deepEqual(fetch && { method: fetch.method, url: fetch.url }, { method: "GET", url: "backend/me" }, "fetched with a GET on me");
+    const posts = this.seen.filter((s) => s.method === "POST");
+    assert.deepEqual(posts.map((s) => s.token), ["tok-1", "tok-1"], "both POSTs carry the token");
+    assert.ok(posts.every((s) => s.credentials === "same-origin"), "with same-origin credentials");
+});
+
+QUnit.test("PUT, PATCH, DELETE and the run streams carry the token; GETs never do", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, ["tok-1"], (url, init) => {
+        if (url.endsWith("/messages") && init.method === "POST" || url.endsWith("/report") || url.endsWith("/request-changes")) {
+            return new Response('event: done\ndata: {"message_id":"m","stage":"chat","status":"idle"}\n\n',
+                { status: 200, headers: { "Content-Type": "text/event-stream" } });
+        }
+        return init.method === "DELETE" ? jsonResponse(204) : jsonResponse(200, {});
+    });
+    const service = new IdeService();
+
+    await service.getMe();
+    await service.listSessions();
+    await service.renameSession("s1", "x");
+    await service.putConventions("DEMO", { package: "ZDEMO" });
+    await service.deleteComment("s1", "c1");
+    await service.streamMessage("s1", "hi", () => undefined);
+    await service.streamReport("s1", () => undefined);
+    await service.streamRequestChanges("s1", "note", () => undefined);
+    await service.getSession("s1");
+
+    const api = this.seen.filter((s) => s.token !== "Fetch");
+    assert.deepEqual(api.filter((s) => s.method === "GET").map((s) => s.token), [undefined, undefined, undefined], "no GET carries a token");
+    assert.deepEqual(api.filter((s) => s.method !== "GET").map((s) => `${s.method} ${s.token}`), [
+        "PATCH tok-1", "PUT tok-1", "DELETE tok-1", "POST tok-1", "POST tok-1", "POST tok-1"
+    ], "every change and every stream POST carries it");
+    assert.strictEqual(this.fetches, 1, "fetched once, then cached");
+});
+
+QUnit.test("no token locally: no header, no second fetch, and a plain 403 is not retried", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, [null], (url, init, n) => n === 1
+        ? jsonResponse(403, { detail: "Admin scope required" })
+        : jsonResponse(200, {}));
+    const service = new IdeService();
+
+    await service.renameSession("s1", "x");
+    try {
+        await service.putConventions("DEMO", { package: "ZDEMO" });
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        assert.strictEqual((e as IdeError).status, 403, "the 403 as it came");
+        assert.notStrictEqual((e as IdeError).code, "csrf_failed", "not a token failure");
+    }
+
+    const api = this.seen.filter((s) => s.token !== "Fetch");
+    assert.deepEqual(api.map((s) => s.token), [undefined, undefined], "no token header is sent");
+    assert.strictEqual(api.length, 2, "no retry");
+    assert.strictEqual(this.fetches, 1, "the empty answer is cached too");
+});
+
+QUnit.test("a 403 X-CSRF-Token: Required refetches once and retries once", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, ["old", "new"], (url, init) => init.headers && tokenOf(init) === "old" ? csrfRequired() : jsonResponse(200, { id: "s1" }));
+    const service = new IdeService();
+
+    const session = await service.renameSession("s1", "x");
+
+    assert.strictEqual(session.id, "s1", "the retry's answer");
+    assert.strictEqual(this.fetches, 2, "one refetch");
+    assert.deepEqual(this.seen.filter((s) => s.token !== "Fetch").map((s) => s.token), ["old", "new"], "retried once with the new token");
+    await service.renameSession("s1", "y");
+    assert.strictEqual(this.fetches, 2, "the new token is cached");
+});
+
+QUnit.test("a second Required 403 is csrf_failed, without the token in its text, and the next call starts over", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, ["secret-1", "secret-2", "secret-3"], (url, init) => tokenOf(init) === "secret-3" ? jsonResponse(200, {}) : csrfRequired());
+    const service = new IdeService();
+
+    try {
+        await service.renameSession("s1", "x");
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        const err = e as IdeError;
+        assert.strictEqual(err.status, 403, "403");
+        assert.strictEqual(err.code, "csrf_failed", "csrf_failed");
+        assert.notOk(err.isAuth, "a refused security token is not a sign-in or role problem");
+        assert.notOk(/secret/.test(`${err.message} ${err.detail} ${JSON.stringify(err.fieldErrors)}`), "no token in the error");
+    }
+    assert.strictEqual(this.seen.filter((s) => s.token !== "Fetch").length, 2, "one try and one retry, no loop");
+    assert.strictEqual(this.fetches, 2, "two token fetches");
+
+    await service.renameSession("s1", "x");
+    assert.strictEqual(this.fetches, 3, "the failed token is not kept");
+});
+
+QUnit.test("a Required 403 on a stream refetches and retries once, then streams", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, ["old", "new"], (url, init) => tokenOf(init) === "old"
+        ? csrfRequired()
+        : new Response('event: text\ndata: {"delta":"a"}\n\nevent: done\ndata: {"message_id":"m","stage":"chat","status":"idle"}\n\n',
+            { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+    const events: SseEvent[] = [];
+
+    await new IdeService().streamMessage("s1", "hi", (e) => events.push(e));
+
+    assert.deepEqual(events.map((e) => e.type), ["text", "done"], "the retry's stream");
+    assert.deepEqual(this.seen.filter((s) => s.token !== "Fetch").map((s) => s.token), ["old", "new"], "two POSTs");
+});
+
+QUnit.test("a stream that is not refused by a Required 403 is never retried", async function (this: CsrfCtx, assert) {
+    stubCsrf(this, ["tok"], () => jsonResponse(409, { detail: "busy", code: "run_in_progress" }));
+
+    try {
+        await new IdeService().streamMessage("s1", "hi", () => undefined);
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        assert.strictEqual((e as IdeError).code, "run_in_progress", "the refusal");
+    }
+    assert.strictEqual(this.seen.filter((s) => s.token !== "Fetch").length, 1, "sent once");
+});
+
+QUnit.test("aborting a stream during the token fetch sends nothing; the fetch is reused later", async function (this: CsrfCtx, assert) {
+    let releaseToken!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseToken = resolve; });
+    this.seen = [];
+    this.fetches = 0;
+    this.fake = sinon.stub(window, "fetch").callsFake(async (url: string, init?: RequestInit) => {
+        this.seen.push({ method: init?.method ?? "GET", url, token: tokenOf(init), credentials: init?.credentials });
+        if (isTokenFetch(init)) {
+            this.fetches++;
+            await gate;
+            return tokenResponse("tok");
+        }
+        return jsonResponse(200, { id: "s1" });
+    });
+    const service = new IdeService();
+    const controller = new AbortController();
+    const events: SseEvent[] = [];
+
+    const run = service.streamMessage("s1", "hi", (e) => events.push(e), controller.signal);
+    await Promise.resolve();
+    controller.abort();
+    await run;
+    assert.deepEqual(this.seen.map((s) => s.token), ["Fetch"], "only the token fetch went out");
+    assert.strictEqual(events.length, 0, "no events");
+
+    releaseToken();
+    await service.renameSession("s1", "x");
+    assert.strictEqual(this.fetches, 1, "the pending fetch was shared, not repeated");
+    assert.strictEqual(this.seen[this.seen.length - 1].token, "tok", "and its token used");
+});
+
+QUnit.test("a failed token fetch fails the call and is not cached", async function (this: CsrfCtx, assert) {
+    let fail = true;
+    this.seen = [];
+    this.fetches = 0;
+    this.fake = sinon.stub(window, "fetch").callsFake((url: string, init?: RequestInit) => {
+        this.seen.push({ method: init?.method ?? "GET", url, token: tokenOf(init), credentials: init?.credentials });
+        if (isTokenFetch(init)) {
+            this.fetches++;
+            return fail ? Promise.reject(new TypeError("Failed to fetch")) : Promise.resolve(tokenResponse("tok"));
+        }
+        return Promise.resolve(jsonResponse(200, {}));
+    });
+    const service = new IdeService();
+
+    try {
+        await service.renameSession("s1", "x");
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        assert.strictEqual((e as IdeError).code, "network", "a network IdeError");
+    }
+    assert.strictEqual(this.seen.length, 1, "the change was not sent");
+
+    fail = false;
+    await service.renameSession("s1", "x");
+    assert.strictEqual(this.fetches, 2, "fetched again");
+    assert.strictEqual(this.seen[this.seen.length - 1].token, "tok", "sent with the token");
+});
+
+QUnit.test("a token fetch answered by the login page is session_expired", async function (this: CsrfCtx, assert) {
+    this.fake = sinon.stub(window, "fetch").callsFake((url: string, init?: RequestInit) => Promise.resolve(isTokenFetch(init)
+        ? new Response("<html>Sign in</html>", { status: 200, headers: { "Content-Type": "text/html" } })
+        : jsonResponse(200, {})));
+
+    try {
+        await new IdeService().renameSession("s1", "x");
+        assert.ok(false, "should have thrown");
+    } catch (e) {
+        assert.strictEqual((e as IdeError).code, "session_expired", "session_expired");
+    }
+});
+
+// --- CSRF against the FakeBackend's approuter simulation ---------------------------
+
+QUnit.module("IdeService against FakeBackend (CSRF)", {
+    beforeEach: function (this: FakeCtx) {
+        this.fake = new FakeBackend();
+        this.fake.reset();
+        this.fake.csrf = true;
+        this.fake.install();
+    },
+    afterEach: function (this: FakeCtx) {
+        this.fake.restore();
+    }
+});
+
+QUnit.test("with csrf on, changes and runs work; an expired token is refetched once", async function (this: FakeCtx, assert) {
+    const service = new IdeService();
+    const sid = this.fake.sessions[0].session.id;
+
+    await service.renameSession(sid, "renamed");
+    assert.strictEqual(this.fake.csrfFetches, 1, "one token fetch");
+    const events: SseEvent[] = [];
+    await service.streamMessage(sid, "hi", (e) => events.push(e));
+    assert.strictEqual(events[events.length - 1].type, "done", "the run streamed");
+
+    this.fake.expireCsrfToken();
+    await service.renameSession(sid, "again");
+    assert.strictEqual(this.fake.csrfFetches, 2, "refetched after the token expired");
+    assert.strictEqual((await service.getSession(sid)).title, "again", "the retried change landed");
 });

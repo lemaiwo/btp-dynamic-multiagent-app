@@ -8,7 +8,7 @@
       "destination": "pydantic-agent-backend",
       "authenticationType": "xsuaa",
       "scope": "$XSAPPNAME.developer",
-      "csrfProtection": false
+      "csrfProtection": true
     },
     {
       "source": "^/resources/(.*)$",

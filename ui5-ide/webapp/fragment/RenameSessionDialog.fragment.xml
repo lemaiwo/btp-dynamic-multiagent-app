@@ -1,0 +1,26 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <Dialog
+        id="renameDialog"
+        title="{i18n>renameDialogTitle}"
+        contentWidth="24rem"
+        initialFocus="renameInput">
+        <VBox id="renameBox" class="sapUiSmallMargin">
+            <Label id="renameLabel" text="{i18n>newSessionTitleLabel}" labelFor="renameInput" required="true" />
+            <Input
+                id="renameInput"
+                value="{wl>/rename/title}"
+                valueState="{wl>/rename/state}"
+                valueStateText="{i18n>titleRequired}"
+                maxLength="200"
+                submit=".onRenameSave" />
+        </VBox>
+        <beginButton>
+            <Button id="renameSave" text="{i18n>save}" type="Emphasized" press=".onRenameSave" />
+        </beginButton>
+        <endButton>
+            <Button id="renameCancel" text="{i18n>cancel}" press=".onRenameCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

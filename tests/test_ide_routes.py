@@ -28,13 +28,18 @@ from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 from agents.auth import current_principal, require_admin, require_developer  # noqa: E402
 from agents.db import SessionLocal, init_db  # noqa: E402
+from agents.ide import store as ide_store  # noqa: E402
 from agents.ide.models import (  # noqa: E402
+    IdeApproval,
     IdeArtifact,
+    IdeComment,
     IdeConventions,
+    IdeFileRevision,
     IdeMessage,
     IdeSession,
     IdeWorkspaceFile,
 )
+from agents.ide.review_routes import router as review_router  # noqa: E402
 from agents.ide.routes import _principal  # noqa: E402
 from agents.ide.routes import router as ide_router  # noqa: E402
 from agents.ide.store import add_artifact, add_message, upsert_conventions  # noqa: E402
@@ -79,6 +84,7 @@ class _PrincipalMiddleware:
 
 def _app() -> FastAPI:
     app = FastAPI()
+    app.include_router(review_router)
     app.include_router(ide_router)
     app.dependency_overrides[require_developer] = _fake_developer
     app.dependency_overrides[require_admin] = _fake_admin
@@ -90,8 +96,8 @@ def _app() -> FastAPI:
 async def _clean_db():
     await init_db()
     async with SessionLocal() as db:
-        for model in (IdeWorkspaceFile, IdeArtifact, IdeMessage, IdeSession,
-                      IdeConventions):
+        for model in (IdeComment, IdeFileRevision, IdeApproval, IdeWorkspaceFile,
+                      IdeArtifact, IdeMessage, IdeSession, IdeConventions):
             await db.execute(model.__table__.delete())
         await db.commit()
         await upsert_conventions(db, "T1", label="Target one", namespace="Z")
@@ -158,6 +164,21 @@ async def test_me_lists_targets(client):
     assert body["principal"] == "alice"
     assert body["targets"] == ["T1"]
     assert isinstance(body["is_admin"], bool)
+
+
+async def test_me_reports_diagnose_retention_days_default(client):
+    r = await client.get("/ide/api/me", headers=_as("alice"))
+    assert r.status_code == 200
+    assert r.json()["diagnose_retention_days"] == 14
+
+
+@pytest.mark.parametrize("days", [30, 0])
+async def test_me_reports_diagnose_retention_days_override(client, monkeypatch, days):
+    # 0 means diagnose sessions are kept until deleted; the UI says so.
+    monkeypatch.setattr(ide_store, "IDE_DIAGNOSE_RETENTION_DAYS", days)
+    r = await client.get("/ide/api/me", headers=_as("alice"))
+    assert r.status_code == 200
+    assert r.json()["diagnose_retention_days"] == days
 
 
 # --- sessions CRUD ----------------------------------------------------------
@@ -245,8 +266,10 @@ async def test_messages_use_content_field(client):
     msgs = r.json()
     assert [(m["role"], m["content"]) for m in msgs] == [
         ("user", "hi"), ("assistant", "hello")]
-    assert set(msgs[0]) == {"id", "stage", "role", "content", "created_at"}
-    assert msgs[1]["activity"] == {"events": []}
+    keys = {"id", "stage", "role", "content", "created_at", "has_activity"}
+    assert [set(m) for m in msgs] == [keys, keys]
+    # The activity itself is served per message, not in the list.
+    assert [m["has_activity"] for m in msgs] == [False, True]
 
 
 # --- ownership: 404 on every {sid} route -----------------------------------
@@ -260,7 +283,7 @@ SID_ROUTES = [
     ("GET", "/ide/api/sessions/{sid}/artifacts/{aid}", None),
     ("GET", "/ide/api/sessions/{sid}/messages", None),
     ("POST", "/ide/api/sessions/{sid}/messages", {"text": "hi"}),
-    ("POST", "/ide/api/sessions/{sid}/revise", {"feedback": "f"}),
+    ("POST", "/ide/api/sessions/{sid}/request-changes", {"note": "f"}),
     ("POST", "/ide/api/sessions/{sid}/cancel", None),
     ("POST", "/ide/api/sessions/{sid}/report", None),
     ("POST", "/ide/api/sessions/{sid}/handover", None),
@@ -377,9 +400,10 @@ async def test_conventions_write_needs_admin(client):
     r = await client.put("/ide/api/conventions/T1", json=body, headers=_as("admin"))
     assert r.status_code == 200
     assert r.json()["label"] == "Changed" and r.json()["namespace"] == "Z"
+    # D4: PUT no longer creates a target (POST /conventions does).
     r = await client.put("/ide/api/conventions/T2", json={"label": "New"},
                          headers=_as("admin"))
-    assert r.status_code == 200 and r.json()["target"] == "T2"
+    assert r.status_code == 404 and r.json()["code"] == "unknown_target"
 
 
 async def test_conventions_write_rejects_bad_values(client):
@@ -424,7 +448,7 @@ from agents.ide.stages import build_prompt  # noqa: E402
 
 async def _flag(target: str = "T1", value: bool = True) -> None:
     async with SessionLocal() as db:
-        await upsert_conventions(db, target, non_production=value)
+        await upsert_conventions(db, target, actor="test-admin", non_production=value)
 
 
 async def _count(model) -> int:
@@ -477,23 +501,25 @@ async def test_create_diagnose_ok(client):
     s = await _diagnose(client)
     assert s["type"] == "diagnose" and s["stage"] == "investigate"
     assert s["owner"] == "alice" and s["target"] == "T1" and s["status"] == "idle"
-    assert s["masked"] is False  # non-production target: raw
+    assert s["target_non_production"] is True and "masked" not in s
     r = await client.get(f"/ide/api/sessions/{s['id']}", headers=_as("alice"))
     assert r.status_code == 200 and r.json()["type"] == "diagnose"
-    assert r.json()["masked"] is False
+    assert r.json()["target_non_production"] is True
     r = await client.get("/ide/api/sessions", headers=_as("alice"))
-    assert [(x["type"], x["masked"]) for x in r.json()] == [("diagnose", False)]
-    # The flag is read per response: taken away, the session reads as masked.
+    assert [(x["type"], x["target_non_production"]) for x in r.json()] == [
+        ("diagnose", True)]
+    # The flag is read per response: taken away, the session reads as production.
     await _flag(value=False)
     r = await client.get(f"/ide/api/sessions/{s['id']}", headers=_as("alice"))
-    assert r.json()["masked"] is True
+    assert r.json()["target_non_production"] is False
     r = await client.get("/ide/api/sessions", headers=_as("alice"))
-    assert r.json()[0]["masked"] is True
+    assert r.json()[0]["target_non_production"] is False
 
 
 async def test_create_defaults_to_change_and_accepts_explicit_change(client):
     s = await _create(client)
-    assert s["type"] == "change" and s["stage"] == "chat" and s["masked"] is True
+    assert s["type"] == "change" and s["stage"] == "chat"
+    assert s["target_non_production"] is False
     r = await client.post("/ide/api/sessions",
                           json={"title": "c", "target": "T1", "type": "change"},
                           headers=_as("alice"))
@@ -502,7 +528,7 @@ async def test_create_defaults_to_change_and_accepts_explicit_change(client):
 
 async def test_me_lists_diagnose_targets(client):
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T2", label="Two", non_production=True)
+        await upsert_conventions(db, "T2", label="Two", actor="test-admin", non_production=True)
         await upsert_conventions(db, "T3", label="Three")
     r = await client.get("/ide/api/me", headers=_as("alice"))
     assert r.status_code == 200
@@ -665,7 +691,7 @@ async def test_handover_refusals(client):
 
 async def test_handover_refused_when_target_lost_non_production(client):
     """The report of a raw run must not move into a change session on a
-    target that is now treated as production (masking required)."""
+    target that is now treated as production."""
     await _flag()
     d = await _diagnose(client)
     async with SessionLocal() as db:
@@ -718,3 +744,203 @@ async def test_report_on_a_change_session_is_409_json(client):
     assert r.status_code == 409 and r.json()["code"] == "not_diagnose"
     assert r.headers["content-type"].startswith("application/json")
     assert await _count(IdeMessage) == 0
+
+
+# --- worklist fields (Task B7): waiting, open_comments, unresolved_comments ------
+
+from sqlalchemy import event  # noqa: E402
+
+from agents.db import engine  # noqa: E402
+
+PROP_PATH = "src/CLAS/zcl_demo.clas.abap"
+
+
+async def _worklist_session(user: str, *, session_type: str = "change",
+                            stage: str = "chat") -> str:
+    async with SessionLocal() as db:
+        row = IdeSession(owner=user, title=f"{session_type}-{stage}", target="T1",
+                         session_type=session_type, stage=stage, status="idle")
+        db.add(row)
+        await db.commit()
+        return row.id
+
+
+async def _comment(sid: str, state: str) -> None:
+    async with SessionLocal() as db:
+        db.add(IdeComment(session_id=sid, anchor="document", kind="design",
+                          version=1, paragraph=0, body="please rename", state=state))
+        await db.commit()
+
+
+async def _worklist_fixture() -> dict[str, str]:
+    """One alice session per ``waiting`` reason, one without, one of bob's."""
+    await _flag()
+    ids = {
+        "approval": await _worklist_session("alice", session_type="diagnose",
+                                            stage="investigate"),
+        "comments": await _worklist_session("alice", stage="chat"),
+        "changes": await _worklist_session("alice", stage="propose"),
+        "document": await _worklist_session("alice", stage="design"),
+        "none": await _worklist_session("alice", stage="chat"),
+        "bob": await _worklist_session("bob", stage="design"),
+    }
+    async with SessionLocal() as db:
+        db.add(IdeApproval(session_id=ids["approval"], action="trace_start",
+                           params_json="{}", status="pending"))
+        db.add(IdeWorkspaceFile(session_id=ids["changes"], path=PROP_PATH,
+                                object_type="CLAS", object_name="ZCL_DEMO",
+                                state="new", proposed_source="CLASS zcl_demo.",
+                                revision=1))
+        await db.commit()
+    for sid in (ids["document"], ids["bob"]):
+        async with SessionLocal() as db:
+            await add_artifact(db, sid, stage="design", kind="design", content="d1")
+    await _comment(ids["comments"], "addressed")
+    await _comment(ids["comments"], "open")
+    await _comment(ids["none"], "open")
+    await _comment(ids["none"], "open")
+    await _comment(ids["none"], "sent")
+    await _comment(ids["none"], "dismissed")
+    await _comment(ids["bob"], "open")
+    return ids
+
+
+async def test_list_sessions_carries_worklist_fields(client):
+    ids = await _worklist_fixture()
+    r = await client.get("/ide/api/sessions", headers=_as("alice"))
+    assert r.status_code == 200, r.text
+    got = {s["id"]: (s["waiting"], s["open_comments"], s["unresolved_comments"])
+           for s in r.json()}
+    assert got == {
+        ids["approval"]: ("approval", 0, 0),
+        ids["comments"]: ("comments", 1, 1),
+        ids["changes"]: ("changes", 0, 0),
+        ids["document"]: ("document", 0, 0),
+        ids["none"]: (None, 2, 3),
+    }
+    # Bob sees only his own session, with his own counts.
+    r = await client.get("/ide/api/sessions", headers=_as("bob"))
+    assert [(s["id"], s["waiting"], s["open_comments"]) for s in r.json()] == [
+        (ids["bob"], "document", 1)]
+
+
+async def test_get_session_carries_worklist_fields(client):
+    ids = await _worklist_fixture()
+    for reason in ("approval", "comments", "changes", "document"):
+        r = await client.get(f"/ide/api/sessions/{ids[reason]}", headers=_as("alice"))
+        assert r.status_code == 200 and r.json()["waiting"] == reason
+    r = await client.get(f"/ide/api/sessions/{ids['none']}", headers=_as("alice"))
+    assert (r.json()["waiting"], r.json()["open_comments"],
+            r.json()["unresolved_comments"]) == (None, 2, 3)
+    # PATCH answers the same Session shape.
+    r = await client.patch(f"/ide/api/sessions/{ids['none']}", json={"title": "x"},
+                           headers=_as("alice"))
+    assert r.status_code == 200 and r.json()["unresolved_comments"] == 3
+    r = await client.get(f"/ide/api/sessions/{ids['bob']}", headers=_as("alice"))
+    assert r.status_code == 404
+
+
+async def test_list_sessions_uses_a_fixed_number_of_queries(client):
+    await _worklist_fixture()
+    for _ in range(10):
+        await _worklist_session("alice", stage="design")
+
+    statements: list[str] = []
+
+    def _count_select(conn, cursor, statement, *args):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _count_select)
+    try:
+        r = await client.get("/ide/api/sessions", headers=_as("alice"))
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _count_select)
+    assert r.status_code == 200 and len(r.json()) == 15
+    # sessions + conventions + waiting_for (<= 4) + comment counts (1)
+    # + object summaries (1) + findings counts (1, only with a diagnose
+    # session in the list).
+    assert len(statements) <= 9, statements
+
+
+async def test_admin_sessions_stay_metadata_only_with_worklist(client):
+    await _worklist_fixture()
+    r = await client.get("/ide/api/admin/sessions", headers=_as("admin"))
+    assert r.status_code == 200
+    for row in r.json():
+        assert set(row) == {"id", "owner", "title", "target", "type", "stage",
+                            "status", "created_at", "updated_at"}
+    assert "please rename" not in r.text
+
+
+async def test_revise_route_is_removed(client):
+    """B9: ``/revise`` is replaced by ``/request-changes``; the old path no
+    longer exists for anyone (404/405, never a run)."""
+    s = await _create(client, user="alice")
+    r = await client.post(f"/ide/api/sessions/{s['id']}/revise",
+                          json={"feedback": "f"}, headers=_as("alice"))
+    assert r.status_code in (404, 405)
+    assert "/ide/api/sessions/{sid}/revise" not in [r.path for r in ide_router.routes]
+
+
+# --- timestamps: always UTC with an explicit offset ----------------------
+#
+# SQLite hands ``DateTime(timezone=True)`` back naive. Every stored value is
+# UTC, so a naive one must still be served with an offset: a browser reads an
+# offset-less ISO string as local time.
+
+
+def _iso_helpers():
+    from agents.ide import approvals, findings, models, routes
+
+    return {
+        "models.iso_utc": lambda v: models.iso_utc(v),
+        "routes._iso": routes._iso,
+        "approvals._iso": approvals._iso,
+        "findings.finding_out": lambda v: findings.finding_out(
+            type("Row", (), {"id": "f", "kind": "dump", "ref_id": "r",
+                             "title": "t", "program": None, "include": None,
+                             "line": None, "occurred_at": None,
+                             "created_at": v})()
+        )["created_at"],
+        "IdeSession.meta": lambda v: IdeSession(
+            id="s", owner="o", title="t", target="T1", created_at=v,
+            updated_at=v,
+        ).meta()["updated_at"],
+    }
+
+
+_ISO_HELPERS = ["models.iso_utc", "routes._iso", "approvals._iso",
+                "findings.finding_out", "IdeSession.meta"]
+
+
+@pytest.mark.parametrize("name", _ISO_HELPERS)
+def test_naive_datetime_is_served_as_utc_with_offset(name):
+    from datetime import datetime
+
+    out = _iso_helpers()[name](datetime(2026, 10, 4, 12, 30, 5, 123456))
+    assert out == "2026-10-04T12:30:05.123456+00:00", (name, out)
+
+
+@pytest.mark.parametrize("name", _ISO_HELPERS)
+def test_aware_datetime_is_served_unchanged(name):
+    from datetime import datetime, timedelta, timezone
+
+    value = datetime(2026, 10, 4, 14, 30, 5, tzinfo=timezone(timedelta(hours=2)))
+    assert _iso_helpers()[name](value) == value.isoformat(), name
+    assert _iso_helpers()[name](None) is None, name
+
+
+async def test_fresh_session_updated_at_parses_to_now_utc(client):
+    from datetime import datetime, timezone
+
+    sid = (await _create(client))["id"]
+    for url in ("/ide/api/sessions", f"/ide/api/sessions/{sid}"):
+        r = await client.get(url, headers=_as("alice"))
+        assert r.status_code == 200, r.text
+        body = r.json()
+        row = body[0] if isinstance(body, list) else body
+        row = row.get("session", row)
+        stamp = datetime.fromisoformat(row["updated_at"])
+        assert stamp.tzinfo is not None, row["updated_at"]
+        assert abs((datetime.now(timezone.utc) - stamp).total_seconds()) < 5

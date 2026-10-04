@@ -1,5 +1,6 @@
 import {
-    canApprove, canHandover, canReport, canRevise, canSend, nextStage, stageTokens, stagesFor, STAGES
+    canApprove, canHandover, canReport, canRevise, canSend, nextStage, primaryAction, stageTokens, stagesFor, STAGES,
+    type PrimarySession
 } from "com/agent/ide/model/stageGate";
 import type { ArtifactKind, FileState, SessionType, Stage } from "com/agent/ide/service/types";
 
@@ -136,4 +137,94 @@ QUnit.test("canHandover: diagnose, idle and at least one report", function (asse
     assert.deepEqual(canHandover({ stage: "chat", status: "idle", type: "change" }, art("report")),
         { ok: false, reasonKey: "gateNotDiagnose" });
     assert.deepEqual(canHandover(null, art("report")), { ok: false, reasonKey: "gateNoSession" });
+});
+
+// --- primaryAction (Task U7) -------------------------------------------------
+
+function ps(stage: Stage, extra: Partial<PrimarySession> = {}): PrimarySession {
+    return {
+        type: "change", stage, status: "idle", unresolved_comments: 0, requests_used: 3, request_cap: 200,
+        target_non_production: false, ...extra
+    };
+}
+const docs = (...list: [ArtifactKind, number][]): { kind: ArtifactKind; version: number }[] =>
+    list.map(([kind, version]) => ({ kind, version }));
+const obj = (state: FileState, objectType: string | null = "CLAS"): { state: FileState; object_type: string | null } =>
+    ({ state, object_type: objectType });
+
+QUnit.module("stageGate: primaryAction (Task U7)");
+
+QUnit.test("each change stage names its effect, with the version it approves", function (assert) {
+    assert.deepEqual(primaryAction(ps("chat"), []),
+        { key: "startDesign", enabled: true, textKey: "primaryStartDesign", textArgs: [] });
+    assert.deepEqual(primaryAction(ps("design"), docs(["design", 1], ["design", 2])),
+        { key: "approveDesign", enabled: true, textKey: "primaryApproveDesign", textArgs: [2], version: 2 },
+        "the latest design version, whatever the list order");
+    assert.deepEqual(primaryAction(ps("plan"), docs(["design", 2], ["plan", 1])),
+        { key: "approvePlan", enabled: true, textKey: "primaryApprovePlan", textArgs: [1], version: 1 });
+    assert.deepEqual(primaryAction(ps("propose"), docs(["note", 1]), [obj("modified")]),
+        { key: "approveChanges", enabled: true, textKey: "primaryApproveChanges", textArgs: [] });
+    assert.deepEqual(primaryAction(ps("review"), docs(["review", 3])),
+        { key: "finish", enabled: true, textKey: "primaryFinish", textArgs: [], version: 3 });
+});
+
+QUnit.test("missing_artifact: a document stage without its document is disabled with the reason", function (assert) {
+    assert.deepEqual(primaryAction(ps("design"), docs(["plan", 1])), {
+        key: "approveDesign", enabled: false, textKey: "primaryApproveDesignNoVersion", textArgs: [],
+        reason: "missing_artifact", reasonKey: "gateNeedsDesign", reasonArgs: []
+    });
+    assert.strictEqual(primaryAction(ps("plan"), docs(["design", 1])).reasonKey, "gateNeedsPlan");
+    assert.strictEqual(primaryAction(ps("review"), []).reasonKey, "gateNeedsReview");
+});
+
+QUnit.test("no_proposals: propose needs a new or modified object file (a note is not one)", function (assert) {
+    const refused = primaryAction(ps("propose"), [], [obj("read"), obj("new", null)]);
+    assert.deepEqual([refused.enabled, refused.reason, refused.reasonKey], [false, "no_proposals", "gateNoProposals"]);
+    assert.ok(primaryAction(ps("propose"), [], [obj("new")]).enabled, "a new object is a proposal");
+});
+
+QUnit.test("open_comments: unresolved comments block, with their number, before any artifact rule", function (assert) {
+    const blocked = primaryAction(ps("design", { unresolved_comments: 2 }), []);
+    assert.deepEqual([blocked.enabled, blocked.reason, blocked.reasonKey, blocked.reasonArgs],
+        [false, "open_comments", "gateOpenComments", [2]], "comments are named before the missing design");
+    assert.strictEqual(primaryAction(ps("design", { unresolved_comments: 1 }), []).reasonKey, "gateOpenCommentsOne",
+        "one comment has its own sentence");
+    assert.strictEqual(primaryAction(ps("chat", { unresolved_comments: 1 }), []).reason, "open_comments", "in chat too");
+});
+
+QUnit.test("run_in_progress comes before comments; stage_done before everything", function (assert) {
+    const running = primaryAction(ps("design", { status: "running", unresolved_comments: 1 }), docs(["design", 1]));
+    assert.deepEqual([running.enabled, running.reason, running.reasonKey], [false, "run_in_progress", "gateRunInProgress"]);
+    const done = primaryAction(ps("done", { status: "running" }), docs(["review", 1]));
+    assert.deepEqual([done.key, done.enabled, done.reason, done.reasonKey, done.textKey],
+        ["done", false, "stage_done", "gateStageDone", "primaryDone"]);
+});
+
+QUnit.test("approve does not use the model: an exhausted request cap does not block it", function (assert) {
+    assert.ok(primaryAction(ps("design", { requests_used: 200 }), docs(["design", 1])).enabled);
+});
+
+QUnit.test("diagnose: Create report until a report exists, then Hand over to a change", function (assert) {
+    const d = (extra: Partial<PrimarySession> = {}): PrimarySession =>
+        ps("investigate", { type: "diagnose", target_non_production: true, ...extra });
+    assert.deepEqual(primaryAction(d(), []),
+        { key: "report", enabled: true, textKey: "primaryReport", textArgs: [] });
+    assert.deepEqual(primaryAction(d(), docs(["report", 1])),
+        { key: "handover", enabled: true, textKey: "primaryHandover", textArgs: [], version: 1 });
+    const exhausted = primaryAction(d({ requests_used: 200 }), []);
+    assert.deepEqual([exhausted.enabled, exhausted.reason, exhausted.reasonKey, exhausted.reasonArgs],
+        [false, "usage_exhausted", "gateUsageExhausted", [200]], "a report run needs a model request");
+    assert.ok(primaryAction(d({ requests_used: 200 }), docs(["report", 1])).enabled, "the handover runs no model");
+    const running = primaryAction(d({ status: "running" }), docs(["report", 1]));
+    assert.strictEqual(running.reason, "run_in_progress");
+    const lost = primaryAction(d({ target_non_production: false }), []);
+    assert.deepEqual([lost.enabled, lost.reason, lost.reasonKey], [false, "target_not_non_production", "targetNotNonProd"],
+        "a target that lost its flag refuses the report");
+});
+
+QUnit.test("stageTokens of the session page leave out `done` for a change session", function (assert) {
+    assert.deepEqual(stageTokens("done", "change", { withDone: false }).map((t) => t.state),
+        ["done", "done", "done", "done", "done"], "five tokens, all done once the session is finished");
+    assert.deepEqual(stageTokens("plan", "change", { withDone: false }).map((t) => t.stage),
+        ["chat", "design", "plan", "propose", "review"]);
 });

@@ -5,9 +5,9 @@ module.exports = function (config) {
             configPath: "ui5-local.yaml",
             testpage: "webapp/test/testsuite.qunit.html"
         },
-        // A desktop-sized window: the workbench is a three-pane desktop
-        // layout, and at the 800x600 default the editor pane's toolbar moves
-        // its buttons into the overflow menu.
+        // A desktop-sized window: the session page shows the conversation and
+        // the artifact column side by side, and at the 800x600 default its
+        // toolbars move buttons into the overflow menu.
         customLaunchers: {
             ChromeHeadlessDesktop: {
                 base: "ChromeHeadless",

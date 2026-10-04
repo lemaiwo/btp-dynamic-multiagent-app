@@ -14,6 +14,8 @@ export type TextLookup = (key: string, args?: (string | number)[]) => string;
  *   its detail.
  * - 502 (`sap_*` codes): ARC-1 answered, SAP refused. SAP's message is shown
  *   with a hint at the SAP user mapping and authorizations.
+ * - 403 `csrf_failed`: the approuter refused the security token twice; a
+ *   reload fetches a new one. Never worded as a missing role.
  * - 401 / `session_expired`: the approuter session ended.
  * - 403 `readonly_refused`: the read-only guard refused the call (a write
  *   or an unlisted tool); not a role problem.
@@ -41,6 +43,9 @@ export function errorText(error: unknown, text: TextLookup): string {
     }
     if (error.status === 502 || error.code?.startsWith("sap_")) {
         return text("sapError", [detail]);
+    }
+    if (error.code === "csrf_failed") {
+        return text("csrfFailed");
     }
     if (error.status === 401 || error.code === "session_expired") {
         return text("sessionExpired");
@@ -74,7 +79,13 @@ const GATE_KEYS: Record<string, string> = {
     invalid_stage: "gateInvalidStage",
     run_on_other_instance: "cancelOtherInstance",
     not_diagnose: "gateNotDiagnose",
-    target_not_non_production: "targetNotNonProd"
+    target_not_non_production: "targetNotNonProd",
+    open_comments: "gateOpenCommentsNoCount",
+    version_changed: "gateVersionChanged",
+    pin_conflict: "gatePinConflict",
+    approve_not_allowed: "gateDiagnoseNoApprove",
+    nothing_to_send: "gateNothingToSend",
+    syntax_check_running: "gateSyntaxCheckRunning"
 };
 
 /**
@@ -83,7 +94,9 @@ const GATE_KEYS: Record<string, string> = {
  * sentence, anything else the {@link errorText} wording.
  */
 export function gateErrorText(error: unknown, text: TextLookup): string {
-    if (error instanceof IdeError && error.status === 409 && error.code && GATE_KEYS[error.code]) {
+    // Own properties only: a code such as "constructor" must not find Object.prototype's members.
+    if (error instanceof IdeError && error.status === 409 && error.code
+        && Object.prototype.hasOwnProperty.call(GATE_KEYS, error.code)) {
         return text(GATE_KEYS[error.code]);
     }
     return errorText(error, text);

@@ -3,6 +3,9 @@ import DateFormat from "sap/ui/core/format/DateFormat";
 import formatMessage from "sap/base/strings/formatMessage";
 import type { FileState, FindingKind, Stage } from "../service/types";
 
+/** Entries a JSONModel list binding shows at most (UI5's default of 100 would cut long lists silently). */
+export const MODEL_SIZE_LIMIT = 5000;
+
 /** What the text formatters need from their `this`: the view's controller. */
 interface I18nHost {
     getModel(name?: string): unknown;

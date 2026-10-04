@@ -1,0 +1,166 @@
+<mvc:View
+    controllerName="com.agent.ide.controller.Worklist"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.f"
+    height="100%">
+    <f:DynamicPage id="worklistPage" toggleHeaderOnTitleClick="false" fitContent="false">
+        <f:title>
+            <f:DynamicPageTitle id="worklistPageTitle">
+                <f:heading>
+                    <Title id="worklistTitle" text="{i18n>worklistTitle}" level="H2" />
+                </f:heading>
+                <f:expandedContent>
+                    <Text id="worklistSummary" text="{wl>/summary}" />
+                </f:expandedContent>
+            </f:DynamicPageTitle>
+        </f:title>
+        <f:content>
+            <Table
+                id="worklistTable"
+                items="{wl>/rows}"
+                mode="SingleSelectLeft"
+                rememberSelections="false"
+                growing="true"
+                growingThreshold="30"
+                growingScrollToLoad="true"
+                sticky="ColumnHeaders,HeaderToolbar"
+                busy="{wl>/busy}"
+                busyIndicatorDelay="0"
+                ariaLabelledBy="worklistTitle"
+                selectionChange=".onSelectionChange"
+                updateFinished=".onUpdateFinished">
+                <dependents>
+                    <core:InvisibleText id="worklistSearchLabel" text="{i18n>worklistSearchLabel}" />
+                    <core:InvisibleText id="worklistTypeLabel" text="{i18n>worklistTypeLabel}" />
+                    <core:InvisibleText id="worklistStageLabel" text="{i18n>worklistStageLabel}" />
+                </dependents>
+                <headerToolbar>
+                    <OverflowToolbar id="worklistToolbar">
+                        <SearchField
+                            id="worklistSearch"
+                            width="16rem"
+                            value="{wl>/query}"
+                            placeholder="{i18n>worklistSearchPlaceholder}"
+                            tooltip="{i18n>worklistSearchPlaceholder}"
+                            ariaLabelledBy="worklistSearchLabel"
+                            liveChange=".onSearch"
+                            search=".onSearch">
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="10rem" />
+                            </layoutData>
+                        </SearchField>
+                        <SegmentedButton
+                            id="worklistTypeFilter"
+                            selectedKey="{wl>/type}"
+                            ariaLabelledBy="worklistTypeLabel"
+                            selectionChange=".onFilter">
+                            <items>
+                                <SegmentedButtonItem id="worklistTypeAll" key="all" text="{i18n>worklistTypeAll}" />
+                                <SegmentedButtonItem id="worklistTypeChange" key="change" text="{i18n>sessionTypeChange}" />
+                                <SegmentedButtonItem id="worklistTypeDiagnose" key="diagnose" text="{i18n>sessionTypeDiagnose}" />
+                            </items>
+                        </SegmentedButton>
+                        <Select
+                            id="worklistStageFilter"
+                            selectedKey="{wl>/stage}"
+                            items="{wl>/stages}"
+                            ariaLabelledBy="worklistStageLabel"
+                            tooltip="{i18n>worklistStageLabel}"
+                            change=".onFilter">
+                            <core:Item key="{wl>key}" text="{wl>text}" />
+                        </Select>
+                        <ToggleButton
+                            id="worklistWaitingToggle"
+                            text="{i18n>worklistWaitingForMe}"
+                            icon="sap-icon://alert"
+                            pressed="{wl>/waitingOnly}"
+                            press=".onFilter" />
+                        <ToolbarSpacer />
+                        <Button
+                            id="worklistNewButton"
+                            text="{i18n>worklistNewSession}"
+                            icon="sap-icon://add"
+                            type="Emphasized"
+                            press=".onNewSession" />
+                        <Button
+                            id="worklistRenameButton"
+                            text="{i18n>worklistRename}"
+                            icon="sap-icon://edit"
+                            enabled="{= !!${wl>/selectedId} }"
+                            press=".onRename" />
+                        <Button
+                            id="worklistDeleteButton"
+                            text="{i18n>worklistDelete}"
+                            icon="sap-icon://delete"
+                            enabled="{= !!${wl>/selectedId} }"
+                            press=".onDelete" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <noData>
+                    <IllustratedMessage
+                        id="worklistNoData"
+                        illustrationType="{= ${wl>/loadFailed} ? 'sapIllus-UnableToLoad' : ${wl>/filtered} ? 'sapIllus-NoSearchResults' : 'sapIllus-NoEntries' }"
+                        title="{= ${wl>/loadFailed} ? ${i18n>worklistLoadFailedTitle} : ${wl>/filtered} ? ${i18n>worklistNoMatchTitle} : ${i18n>worklistEmptyTitle} }"
+                        description="{= ${wl>/loadFailed} ? ${i18n>worklistLoadFailedText} : ${wl>/filtered} ? ${i18n>worklistNoMatchText} : ${i18n>worklistEmptyText} }"
+                        enableDefaultTitleAndDescription="false">
+                        <additionalContent>
+                            <Button
+                                id="worklistRetry"
+                                text="{i18n>worklistRetry}"
+                                icon="sap-icon://refresh"
+                                visible="{wl>/loadFailed}"
+                                press=".onRetryLoad" />
+                        </additionalContent>
+                    </IllustratedMessage>
+                </noData>
+                <columns>
+                    <Column id="colType" width="7rem">
+                        <Text id="colTypeHeader" text="{i18n>worklistColType}" />
+                    </Column>
+                    <Column id="colTitle">
+                        <Text id="colTitleHeader" text="{i18n>worklistColTitle}" />
+                    </Column>
+                    <Column id="colSystem" width="9rem" minScreenWidth="Tablet" demandPopin="true">
+                        <Text id="colSystemHeader" text="{i18n>worklistColSystem}" />
+                    </Column>
+                    <Column id="colStage" width="8rem" minScreenWidth="Tablet" demandPopin="true">
+                        <Text id="colStageHeader" text="{i18n>worklistColStage}" />
+                    </Column>
+                    <Column id="colStatus" width="16rem">
+                        <Text id="colStatusHeader" text="{i18n>worklistColStatus}" />
+                    </Column>
+                    <Column id="colChanged" width="9rem" minScreenWidth="Desktop" demandPopin="true">
+                        <Text id="colChangedHeader" text="{i18n>worklistColChanged}" />
+                    </Column>
+                    <Column id="colUpdated" width="9rem" minScreenWidth="Desktop" demandPopin="true">
+                        <Text id="colUpdatedHeader" text="{i18n>worklistColUpdated}" />
+                    </Column>
+                </columns>
+                <items>
+                    <ColumnListItem id="worklistRow" type="Navigation" press=".onRowPress" vAlign="Middle">
+                        <cells>
+                            <ObjectStatus id="rowType" text="{wl>typeText}" state="{wl>typeState}" stateAnnouncementText="" inverted="true" />
+                            <ObjectIdentifier id="rowTitle" title="{wl>title}" text="{wl>objects}" />
+                            <Text id="rowSystem" text="{wl>target}" />
+                            <Text id="rowStage" text="{wl>stageText}" />
+                            <VBox id="rowStatusBox">
+                                <ObjectStatus
+                                    id="rowStatus"
+                                    text="{wl>statusText}"
+                                    state="{wl>statusState}"
+                                    stateAnnouncementText=""
+                                    inverted="{wl>statusInverted}"
+                                    icon="{wl>statusIcon}" />
+                                <Text id="rowReason" text="{wl>reason}" visible="{= !!${wl>reason} }" class="ideWorklistReason" />
+                            </VBox>
+                            <Text id="rowChanged" text="{wl>changedText}" />
+                            <Text id="rowUpdated" text="{wl>updatedText}" tooltip="{wl>updatedTooltip}" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </f:content>
+    </f:DynamicPage>
+</mvc:View>

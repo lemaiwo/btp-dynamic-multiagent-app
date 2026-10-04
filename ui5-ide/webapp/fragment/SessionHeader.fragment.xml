@@ -1,0 +1,105 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <VBox id="sessionHeaderBox" class="ideSessionHeader">
+        <FlexBox id="sessionHeaderRow" justifyContent="SpaceBetween" alignItems="Center" wrap="Wrap">
+            <HBox
+                id="stageTimeline"
+                class="ideStageTimeline"
+                alignItems="Center"
+                wrap="Wrap"
+                visible="{= !${s>/isDiagnose} }"
+                items="{path: 's>/tokens', templateShareable: false}">
+                <HBox id="stageTokenBox" class="ideStageToken" alignItems="Center">
+                    <customData>
+                        <core:CustomData key="current" value="{= ${s>current} ? 'step' : 'none' }" writeToDom="true" />
+                    </customData>
+                    <ObjectStatus
+                        id="stageToken"
+                        text="{s>text}"
+                        icon="{s>icon}"
+                        state="{s>state}"
+                        stateAnnouncementText="{s>stateText}"
+                        tooltip="{s>tooltip}"
+                        active="{s>active}"
+                        press=".onStageTokenPress" />
+                    <Text id="stagePin" text="{s>pin}" visible="{= !!${s>pin} }" class="ideStagePin sapUiTinyMarginBegin" />
+                </HBox>
+            </HBox>
+            <HBox
+                id="diagnoseLinks"
+                class="ideDiagnoseLinks"
+                alignItems="Center"
+                wrap="Wrap"
+                visible="{s>/isDiagnose}">
+                <Link
+                    id="diagnoseFindingsLink"
+                    text="{s>/diagnose/findingsText}"
+                    press=".onShowFindings"
+                    class="sapUiSmallMarginEnd" />
+                <Link
+                    id="diagnoseReportLink"
+                    text="{s>/diagnose/reportText}"
+                    visible="{= !!${s>/diagnose/reportText} }"
+                    press=".onShowReport" />
+            </HBox>
+            <HBox id="sessionActions" class="ideSessionActions" alignItems="Center" wrap="Wrap">
+                <Text id="usageText" text="{s>/usageText}" class="sapUiSmallMarginEnd" />
+                <Button
+                    id="stopButton"
+                    text="{i18n>sessionStop}"
+                    icon="sap-icon://stop"
+                    visible="{s>/running}"
+                    press=".onStop"
+                    class="sapUiTinyMarginEnd" />
+                <Button
+                    id="requestChangesButton"
+                    text="{s>/requestChanges/text}"
+                    visible="{s>/requestChanges/visible}"
+                    enabled="{s>/requestChanges/enabled}"
+                    ariaDescribedBy="requestChangesReason"
+                    press=".onRequestChanges"
+                    class="sapUiTinyMarginEnd" />
+                <Button
+                    id="createReportButton"
+                    text="{i18n>primaryReport}"
+                    visible="{s>/reportAgain/visible}"
+                    enabled="{s>/reportAgain/enabled}"
+                    press=".onCreateReport"
+                    class="sapUiTinyMarginEnd" />
+                <Button
+                    id="primaryAction"
+                    type="Emphasized"
+                    text="{s>/primary/text}"
+                    enabled="{s>/primary/enabled}"
+                    busy="{s>/primary/busy}"
+                    busyIndicatorDelay="0"
+                    ariaDescribedBy="primaryReason"
+                    press=".onPrimaryAction" />
+            </HBox>
+        </FlexBox>
+        <!-- What a diagnose session sends and keeps; on a target that lost its flag, what is blocked. -->
+        <Text
+            id="diagnoseBannerText"
+            class="ideSessionBanner sapUiTinyMarginTop"
+            text="{s>/banner}"
+            visible="{= ${s>/isDiagnose} &amp;&amp; !${s>/lostFlag} }" />
+        <MessageStrip
+            id="lostFlagStrip"
+            class="sapUiTinyMarginTop"
+            type="Warning"
+            showIcon="true"
+            text="{i18n>diagnoseLostFlagStrip}"
+            visible="{s>/lostFlag}" />
+        <Text
+            id="primaryReason"
+            class="ideGateReason sapUiTinyMarginTop"
+            text="{s>/primary/reason}"
+            visible="{= !!${s>/primary/reason} }" />
+        <Text
+            id="requestChangesReason"
+            class="ideGateReason sapUiTinyMarginTop"
+            text="{s>/requestChanges/reason}"
+            visible="{= !!${s>/requestChanges/reason} }" />
+    </VBox>
+</core:FragmentDefinition>

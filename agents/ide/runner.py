@@ -1,19 +1,32 @@
-"""Run one IDE stage turn (a message, a revise or a report) and stream what
-happens.
+"""Run one IDE stage turn (a message, a request-changes or a report) and
+stream what happens.
 
-:func:`run_stage` is what the message, revise and report routes call. It reports
+:func:`run_stage` is what the message, request-changes and report routes
+call. It reports
 through ``emit(event, data)`` using the SSE vocabulary of the IDE contract
-(``run``, ``text``, ``tool``, ``plan``, ``file``, ``artifact``, ``finding``,
-``approval_required``, ``usage``, ``error``, ``done``); turning those into
+(``run``, ``text``, ``tool``, ``plan``, ``file``, ``artifact``, ``comments``,
+``finding``, ``approval_required``, ``usage``, ``error``, ``done``); turning those into
 frames is the route's job.
 
 1. **Start.** In one transaction the session row is read (``SELECT ... FOR
    UPDATE`` on Postgres), :func:`agents.ide.stages.assert_can_run` checks
    *that* row, and a conditional ``UPDATE ... WHERE status != 'running'``
    takes the run lock, so two concurrent starts cannot both win even on
-   SQLite. The user message (or the revise feedback) is saved in the same
-   transaction. A refusal raises :class:`StageGateError` before anything is
-   emitted.
+   SQLite. The user message is saved in the same transaction. A refusal
+   raises :class:`StageGateError` before anything is emitted.
+   A **request-changes** run (:class:`RequestChanges`) is gated as
+   ``assert_can_run(revise=True)``; in the same transaction, after the lock,
+   every ``open`` comment of the session becomes ``sent`` (tagged with the
+   run, ``store.mark_comments_sent``). No comment and no note is
+   ``nothing_to_send``: the transaction rolls back, lock included. The user
+   message is ``"Request changes: <n> comment(s)"`` plus the note, and
+   ``comments {ids, state: "sent", left}`` is the first event after ``run``.
+   At most ``store.MAX_SENT_COMMENTS`` comments / ``MAX_SENT_CHARS``
+   characters are sent (oldest first); ``left`` counts the open comments
+   held back for the next round, and the prompt and the user message say so. The
+   comment bodies reach the model as data in the user prompt
+   (``stages.build_prompt``); the agent's ``resolve_comments`` tool moves
+   them to ``addressed``.
 2. **Run.** The agent runs in its own task (registered in ``_tasks`` for
    :func:`cancel`). That task binds the session workspace
    (``bound_workspace``), the run's activity recorder and the IDE progress
@@ -28,7 +41,12 @@ frames is the route's job.
 4. **Finish.** Whatever happened (success, error, usage exhausted, cancel)
    the assistant message is saved, requests are added to ``requests_used``,
    the lock is released (``status='idle'``, ``run_id=NULL``) and ``done`` is
-   the last event. The finish runs to completion even when cancelled again,
+   the last event. A request-changes run returns every comment still
+   ``sent`` to ``open`` in the same transaction as the release (``comments
+   {ids, state: "open"}``): ``sent`` exists only while its run is in flight.
+   Reclaiming a stale lock does the same. Both are scoped to the run's own
+   comments (``sent_run_id``), so a reclaimed run that ends late never
+   reopens what a newer run sent. The finish runs to completion even when cancelled again,
    bounded by ``IDE_SAVE_TIMEOUT_S``. The release is retried once.
 5. **Liveness.** A run touches its row every ``IDE_RUN_HEARTBEAT_S`` and is
    stopped after ``IDE_RUN_TIMEOUT_S``. A ``running`` row with no task in this
@@ -39,19 +57,16 @@ frames is the route's job.
 6. **Session type.** The scope is bound with the session's type, which
    selects the read-only policy. A session that is not a ``change`` session
    also gets a ``DiagnoseRun`` bound on ``current_diagnose`` (set and reset
-   in the run task), carrying the answer of the one masking switch,
-   ``agents.ide.diagnose.masking_required(conventions)``, taken when the run
-   starts. Masking required (the target is not, or no longer, flagged
-   ``non_production``, or its conventions could not be loaded): the run is
-   **refused** with ``target_not_non_production`` -- by
-   ``stages.assert_can_run`` and again by :func:`_start` from its own read
-   of the conventions -- before anything is stored or emitted. Raw (a
-   ``non_production`` target): nothing is masked and the activity is stored
-   as produced. What runs behind :func:`_start` still honours
-   ``_Start.masked`` (the guard masks every tool result, the stored
-   activity carries no tool output, no finding detail is kept): it defaults
-   to masked, so a start that did not say "raw" never leaks.
-   Either way a diagnose workspace is never persisted.
+   in the run task). A diagnose run starts only while
+   ``agents.ide.diagnose.is_non_production(conventions)`` is true: a target
+   that is not (or no longer) flagged ``non_production``, or whose
+   conventions could not be loaded, is **refused** with
+   ``target_not_non_production`` -- by ``stages.assert_can_run`` and again by
+   :func:`_start` from its own read of the conventions -- before anything is
+   stored or emitted. :func:`_start` is the only place a ``_Start`` is
+   built, so no diagnose run exists for an unflagged target. Tool results,
+   the stored activity and finding detail are kept as produced.
+   A diagnose workspace is never persisted.
    The top-level agent of such a run is :func:`diagnose_agent_name`
    (``IDE_DIAGNOSE_AGENT``), never the change orchestrator. When neither it
    nor a peer it can delegate to has the target's ARC-1 server, the run says
@@ -63,16 +78,31 @@ frames is the route's job.
    the run is stored as a proposal by the guard, which emits
    ``approval_required`` through the run's ``emit``; a proposal that was not
    stored puts its code on the ``tool`` event. Nothing pauses.
-7. **Report.** ``report=True`` (diagnose only) runs the stage with the app's
-   own ``REPORT_REQUEST`` as the user text and captures the answer as the
-   artifact ``report``. A diagnose message run captures nothing. Which
-   artifact a run captures is decided once, at the start
-   (``stages.artifact_kind``), and carried on the run.
-8. **Findings.** What the guard noted on the diagnose run while its agents
+7. **Documents.** Nothing is captured from the final answer. A stage
+   document (design, plan, note, review, report) exists only when an agent
+   of the run calls ``submit_document`` (``agents.ide.session_tools``),
+   which stores the version and emits ``artifact`` at that moment. The run
+   task binds an ``IdeRunContext`` on ``session_tools.current_ide_run`` next
+   to ``current_diagnose`` (set and reset there); it carries the stage and
+   whether this is a report run, which decide the one kind the tool takes
+   (``stages.document_kind``). ``report=True`` (diagnose only) runs the
+   stage with the app's own ``REPORT_REQUEST`` as the user text; a diagnose
+   message run can submit nothing.
+8. **Base check.** After the workspace save of a successful change run,
+   :func:`_check_bases` asks SAP for the base of every object file still
+   without one (``agents.ide.basecheck``: ``sap`` -> ``modified``/``read``,
+   ``absent`` -> stays ``new``, ``unknown``), at most ``BASE_CHECK_MAX`` per
+   run, and merges the result into the run's ``file`` events. Skipped when
+   the run failed or was cancelled; the next run picks the rows up. The
+   session's destination is read at start for change sessions too, for this
+   and for ``open_object``. Then :func:`_check_syntax` runs the ARC-1 syntax
+   dry run of every proposal whose latest revision is unchecked
+   (``agents.ide.syntaxcheck``; ``ok``/``errors``/``unavailable``, never
+   ``ok`` on a failure), stored on the revision and merged the same way.
+9. **Findings.** What the guard noted on the diagnose run while its agents
    read dumps, traces and errors (``agents.ide.findings``) is stored when
    the run ends -- also when it failed or was cancelled -- and emitted as
-   one ``finding`` event per row. The detail text of a finding is stored
-   only when the run was not masked.
+   one ``finding`` event per row, with its detail text.
 
 ``instructions=`` is passed to ``Agent.run`` at run time, which pydantic-ai
 1.72 treats as *additional* instructions: the specialist keeps its own. The
@@ -101,31 +131,32 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.db import SessionLocal
 from agents.destination_auth import DestinationUserRequired
-from agents.ide import diagnose
-from agents.ide.diagnose import (
-    DiagnoseRun,
-    current_diagnose,
-    masking_required,
-    strip_activity,
-)
+from agents.ide import basecheck, diagnose, syntaxcheck
+from agents.ide.diagnose import DiagnoseRun, current_diagnose, is_non_production
 from agents.ide.findings import finding_out
 from agents.ide.models import IdeMessage, IdeSession, utcnow
 from agents.ide.readonly import CHANGE, REFUSED_PREFIX, proposal_refusal_code
+from agents.ide.session_tools import IdeRunContext, current_ide_run
 from agents.ide.stages import (
     REPORT_REQUEST,
     SUBAGENTS_ALLOWED,
     Stage,
     StageGateError,
-    artifact_kind,
     assert_can_run,
     build_prompt,
+    held_back_text,
     lost_flag_error,
     request_cap,
 )
 from agents.ide.store import (
-    add_artifact,
     add_message,
+    count_open_comments,
     get_conventions,
+    list_comments,
+    lock_session_row,
+    mark_comments_sent,
+    plain_text,
+    reopen_sent_comments,
     upsert_findings,
 )
 from agents.ide.workspace import bound_workspace, save_timeout
@@ -144,6 +175,14 @@ DEFAULT_DIAGNOSE_AGENT = "abap-diagnostics"
 # sid -> the task running that session's agent. One run per session (the
 # status row is the lock), so the session id is the key.
 _tasks: dict[str, asyncio.Task] = {}
+
+
+@dataclass(frozen=True)
+class RequestChanges:
+    """A request-changes run: the session's open review comments plus an
+    optional note from the developer (plain text, at most 4000 chars)."""
+
+    note: str | None = None
 
 
 class SessionNotFound(LookupError):
@@ -190,21 +229,21 @@ class _Start:
     owner: str = ""
     target: str = ""
     session_type: str = CHANGE
-    # The target's ARC-1 destination (diagnose: recognises the target's server).
+    # The target's ARC-1 destination (diagnose: recognises the target's
+    # server; change: ``open_object`` and the base check read SAP through it).
     destination: str = ""
     # False when the target's conventions could not be read (diagnose only):
-    # the run is masked and nobody knows which server is the target's.
+    # nobody knows which server is the target's. ``_start`` refuses such a
+    # diagnose run, so in practice this is always True.
     conventions_known: bool = True
-    # The run's answer of ``masking_required``. Masked unless ``_start`` says
-    # otherwise, which it does only for a change session (never masked, as in
-    # phase 1a) or a diagnose target the switch calls raw.
-    masked: bool = True
-    # What the run works with: the caller's text, masked when ``masked``.
+    # What the run works with: the caller's text.
     user_text: str | None = None
-    feedback: str | None = None
+    request_changes: RequestChanges | None = None
+    # The comments this request-changes run sent, oldest first.
+    comment_ids: tuple[str, ...] = ()
+    # Open comments held back by the send caps (``store.MAX_SENT_*``).
+    comments_left: int = 0
     report: bool = False
-    # What a successful run captures from its final answer, if anything.
-    artifact_kind: str | None = None
 
 
 def _is_postgres(db: AsyncSession) -> bool:
@@ -308,6 +347,8 @@ async def _reclaim(db: AsyncSession, row: IdeSession) -> bool:
     )
     if result.rowcount != 1:
         return False
+    # The dead run will never resolve what it sent -- only what it sent.
+    await reopen_sent_comments(db, row.id, run_id=row.run_id)
     log.warning(
         "IDE session %s: reclaimed a stale run lock (run %s, %.0fs old)",
         row.id, row.run_id, _age_seconds(row),
@@ -337,33 +378,53 @@ async def release_stale(sid: str) -> bool:
 
 
 async def _diagnose_settings(target: str) -> tuple[bool, str, bool]:
-    """``(masked, destination, known)`` of a diagnose run on ``target``.
+    """``(non_production, destination, known)`` of a diagnose run on ``target``.
 
     The row is loaded *and read* inside one ``try``: a missing row, a failing
-    load and a row whose attributes cannot be read all end as "masked, no
-    destination, not known". Read in a session of its own, so a failure
-    cannot break the start transaction. ``known`` is False when there was no
+    load and a row whose attributes cannot be read all end as "not
+    non-production, no destination, not known" -- which ``_start`` refuses.
+    Read in a session of its own, so a failure cannot break the start
+    transaction. ``known`` is False when there was no
     row to read: then nobody can say which server is the target's.
     """
     try:
         async with SessionLocal() as db:
             conventions = await get_conventions(db, target)
-            masked = masking_required(conventions)
+            non_production = is_non_production(conventions)
             destination = (getattr(conventions, "destination", "") or "").strip()
-        return masked, destination, conventions is not None
-    except Exception:  # noqa: BLE001 -- fail safe: unknown means masked
+        return non_production, destination, conventions is not None
+    except Exception:  # noqa: BLE001 -- fail safe: unknown means refused
         log.warning(
-            "IDE: conventions of target %r could not be read; masking", target,
-            exc_info=True,
+            "IDE: conventions of target %r could not be read; refusing the "
+            "diagnose run", target, exc_info=True,
         )
-        return True, "", False
+        return False, "", False
+
+
+async def _change_destination(target: str) -> str:
+    """The ARC-1 destination of a change session's target, or ``""``.
+
+    Read in a session of its own, so a failure cannot break the start
+    transaction; ``""`` makes ``Arc1Client`` fall back to
+    ``IDE_ARC1_URL_<TARGET>`` (and refuse when that is unset), never to an
+    app-level identity."""
+    try:
+        async with SessionLocal() as db:
+            conventions = await get_conventions(db, target)
+            return (getattr(conventions, "destination", "") or "").strip()
+    except Exception:  # noqa: BLE001 -- the run still starts
+        log.warning(
+            "IDE: conventions of target %r could not be read; SAP reads of "
+            "this run use no destination", target, exc_info=True,
+        )
+        return ""
 
 
 async def _start(
     sid: str,
     owner: str,
     user_text: str | None,
-    feedback: str | None,
+    request_changes: RequestChanges | None = None,
     report: bool = False,
 ) -> _Start:
     async with SessionLocal() as db:
@@ -379,7 +440,7 @@ async def _start(
             await _reclaim(db, session)
         # The row just read (and locked on Postgres) is what the gate checks.
         await assert_can_run(
-            db, session, revise=feedback is not None, report=report
+            db, session, revise=request_changes is not None, report=report
         )
         stage = Stage(session.stage)
         run_id = str(uuid.uuid4())
@@ -387,14 +448,15 @@ async def _start(
         session_type = session.session_type or CHANGE
         if report:
             user_text = REPORT_REQUEST
-        masked, destination, conventions_known = True, "", True
+        destination, conventions_known = "", True
         if session_type == CHANGE:
-            masked = False
+            # For ``open_object`` and the base check at run end.
+            destination = await _change_destination(session.target)
         else:
-            masked, destination, conventions_known = await _diagnose_settings(
-                session.target
+            non_production, destination, conventions_known = (
+                await _diagnose_settings(session.target)
             )
-            if masked:
+            if not non_production:
                 # Defence in depth behind ``assert_can_run``: the target is
                 # not (or no longer) flagged non-production, or nobody could
                 # read its conventions. Such a session starts no run at all;
@@ -423,13 +485,34 @@ async def _start(
                 "stage_changed",
                 "The session changed in the meantime; reload and try again.",
             )
-        # The feedback of a revise is saved as the run's user message; the
-        # prompt carries it once, in the revision block (stages.build_prompt).
+        comment_ids: tuple[str, ...] = ()
+        comments_left = 0
+        if request_changes is not None:
+            # Plain text; a blank note is no note.
+            note = request_changes.note
+            note = plain_text(note).strip() if isinstance(note, str) else ""
+            request_changes = RequestChanges(note=note or None)
+            # Same transaction as the lock: both commit, or neither does.
+            sent = await mark_comments_sent(db, sid, run_id)
+            comment_ids = tuple(c.id for c in sent)
+            if not comment_ids and not request_changes.note:
+                await db.rollback()
+                raise StageGateError(
+                    "nothing_to_send",
+                    "There are no open comments and no note to send.",
+                )
+            if comment_ids:
+                comments_left = (await count_open_comments(db, [sid]))[sid][0]
+            user_text = None
+            content = f"Request changes: {len(comment_ids)} comment(s)"
+            if comments_left:
+                content += f" ({held_back_text(comments_left)})"
+            if request_changes.note:
+                content += f"\n\n{request_changes.note}"
+        else:
+            content = user_text
         message = IdeMessage(
-            session_id=sid,
-            stage=stage.value,
-            role="user",
-            content=user_text if user_text is not None else feedback,
+            session_id=sid, stage=stage.value, role="user", content=content,
         )
         db.add(message)
         await db.commit()
@@ -444,11 +527,11 @@ async def _start(
             session_type=session_type,
             destination=destination,
             conventions_known=conventions_known,
-            masked=masked,
             user_text=user_text,
-            feedback=feedback,
+            request_changes=request_changes,
+            comment_ids=comment_ids,
+            comments_left=comments_left,
             report=report,
-            artifact_kind=artifact_kind(session_type, stage, report),
         )
 
 
@@ -567,10 +650,27 @@ async def _complete(coro: Awaitable[Any], what: str, sid: str) -> bool:
             return True
 
 
-async def _release(start: _Start, usage: RunUsage) -> IdeSession | None:
+async def _release(
+    start: _Start, usage: RunUsage
+) -> tuple[IdeSession | None, list[str]]:
     """Release the run lock and count the run's requests; the session row
-    afterwards (None when the session is gone)."""
+    afterwards (None when the session is gone) and the comments returned to
+    ``open``.
+
+    A request-changes run returns every comment still ``sent`` to ``open``
+    in the same transaction: whatever the outcome, nothing stays ``sent``
+    once the lock is gone (what the agent resolved is ``addressed``)."""
     async with SessionLocal() as db:
+        # Session row first, comments second (``store.lock_session_row``):
+        # the order ``_start`` uses, so a comment edit never deadlocks this.
+        await lock_session_row(db, start.sid)
+        reopened: list[str] = []
+        if start.request_changes is not None:
+            # Only this run's: after a reclaim a newer run may hold the
+            # session and have comments of its own in flight.
+            reopened = await reopen_sent_comments(
+                db, start.sid, run_id=start.run_id
+            )
         await db.execute(
             update(IdeSession)
             .where(IdeSession.id == start.sid, IdeSession.run_id == start.run_id)
@@ -583,7 +683,7 @@ async def _release(start: _Start, usage: RunUsage) -> IdeSession | None:
             .execution_options(synchronize_session=False)
         )
         await db.commit()
-        return await db.get(IdeSession, start.sid)
+        return await db.get(IdeSession, start.sid), reopened
 
 
 async def _heartbeat(sid: str, run_id: str) -> None:
@@ -608,23 +708,16 @@ async def _save_findings(start: _Start, out: _Outcome, emit: Emit) -> None:
     """Store what a diagnose run found and emit one ``finding`` per row.
 
     Also after a failed or cancelled run: what was read was read. Runs while
-    the session's run lock is still held, so there is one writer. A masked
-    run stores metadata only -- the guard collects no detail text for it,
-    and here it is dropped again and cleared on the rows (the target may
-    have lost its ``non_production`` flag since an earlier run). Guarded: a
-    failing write is logged and the run still ends normally.
+    the session's run lock is still held, so there is one writer. Detail
+    text is kept: a diagnose run exists only for a ``non_production``
+    target. Guarded: a failing write is logged and the run still ends
+    normally.
     """
     if start.session_type == CHANGE or not out.findings:
         return
     try:
-        items = [
-            {k: v for k, v in item.items() if not (start.masked and k == "detail")}
-            for item in out.findings
-        ]
         async with SessionLocal() as db:
-            rows = await upsert_findings(
-                db, start.sid, items, clear_detail=start.masked
-            )
+            rows = await upsert_findings(db, start.sid, list(out.findings))
             events = [finding_out(row) for row in rows]
     except Exception as exc:  # noqa: BLE001
         # No traceback: SQL parameters would carry the finding's values.
@@ -661,33 +754,31 @@ async def _finish(start: _Start, out: _Outcome, usage: RunUsage, emit: Emit) -> 
                 msg = await add_message(
                     db, sid, stage=stage_value, role="assistant", content=content,
                     activity_json=(
-                        json.dumps(
-                            strip_activity(out.activity) if start.masked
-                            else out.activity
-                        )
+                        json.dumps(out.activity)
                         if out.activity is not None else None
                     ),
                 )
                 message_id = msg.id
-                kind = start.artifact_kind
-                if succeeded and kind and (out.final_text or "").strip():
-                    art = await add_artifact(
-                        db, sid, stage=stage_value, kind=kind, content=out.final_text
-                    )
-                    emit("artifact", {"id": art.id, "kind": art.kind,
-                                      "version": art.version})
     except Exception:  # noqa: BLE001
         log.exception("IDE session %s: saving the run outcome failed", sid)
 
     for changed in out.changed or []:
-        emit("file", {"path": changed["path"], "state": changed["state"]})
+        # A revision this run wrote has not been syntax-checked yet.
+        emit("file", {
+            "path": changed["path"],
+            "state": changed["state"],
+            "revision": changed.get("revision", 0),
+            "base_status": changed.get("base_status"),
+            "syntax_status": changed.get("syntax_status"),
+        })
 
     await _save_findings(start, out, emit)
 
     row = None
+    reopened: list[str] = []
     for attempt in (1, 2):
         try:
-            row = await _release(start, usage)
+            row, reopened = await _release(start, usage)
             break
         except Exception:  # noqa: BLE001
             log.exception(
@@ -700,6 +791,8 @@ async def _finish(start: _Start, out: _Outcome, usage: RunUsage, emit: Emit) -> 
         status = "running"
     else:
         stage_value, status = row.stage, row.status
+        if reopened:
+            emit("comments", {"ids": reopened, "state": "open"})
         if out.error_code != "agent_missing":
             emit("usage", {"requests_used": row.requests_used,
                            "request_cap": request_cap()})
@@ -708,6 +801,110 @@ async def _finish(start: _Start, out: _Outcome, usage: RunUsage, emit: Emit) -> 
         emit("error", {"message": out.error_message or out.error_code,
                        "code": out.error_code})
     emit("done", {"message_id": message_id, "stage": stage_value, "status": status})
+
+
+class _RunEndStep:
+    """A run-end check shown as one tool-style event: ``running`` when it
+    starts (with how many objects it checks), ``ok``/``error`` when it ends,
+    so the wait between the agent's last answer and ``done`` is visible. The
+    final event is appended to the run's stored activity as well."""
+
+    def __init__(self, start: _Start, out: _Outcome, emit: Emit, tool: str,
+                 label: str) -> None:
+        self.out, self.emit, self.tool, self.label = out, emit, tool, label
+        self.event_id = f"{tool}-{start.run_id}"
+        self.event: dict | None = None
+
+    def started(self, n: int) -> None:
+        noun = "object" if n == 1 else "objects"
+        self.event = {
+            "ts": utcnow().isoformat(), "agent": None, "kind": "tool",
+            "id": self.event_id, "tool": self.tool,
+            "detail": f"{self.label} of {n} {noun}", "status": "running",
+            "output": "",
+        }
+        self._send()
+
+    def ended(self, ok: bool, output: str) -> None:
+        if self.event is None:
+            return
+        self.event.update(status="ok" if ok else "error", output=output,
+                          ended=utcnow().isoformat())
+        self._send()
+        if isinstance(self.out.activity, dict):
+            self.out.activity.setdefault("events", []).append(dict(self.event))
+
+    def _send(self) -> None:
+        try:
+            self.emit("tool", dict(self.event or {}))
+        except Exception:  # noqa: BLE001 -- a closed stream is not the check's error
+            log.debug("IDE run-end event dropped", exc_info=True)
+
+
+async def _check_bases(start: _Start, out: _Outcome, emit: Emit) -> None:
+    """The SAP base of every object file the run left without one
+    (``agents.ide.basecheck``), merged into the run's changed files so each
+    path gets one ``file`` event with its final state.
+
+    After the workspace save, while the run still holds the lock (one
+    writer), as the signed-in user (this task carries the request's JWT).
+    Never fails the run: an error is logged and the files keep
+    ``base_status`` null. A cancel propagates (the run's cancel path).
+    """
+    step = _RunEndStep(start, out, emit, "check_sap_base", "Checking SAP base")
+    try:
+        # Looked up on the module at call time: the tests' seam.
+        checked = await basecheck.check_bases(
+            start.sid, start.target, start.destination, on_start=step.started
+        )
+    except asyncio.CancelledError:
+        # The run is being cancelled: close the event, so the UI does not
+        # show the check as running forever, and let the cancel go on.
+        step.ended(False, "Cancelled.")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "IDE session %s: base check failed: %s", start.sid, type(exc).__name__,
+            exc_info=True,
+        )
+        step.ended(False, "The SAP base check failed.")
+        return
+    step.ended(True, f"{len(checked)} checked.")
+    if checked:
+        out.changed = basecheck.merge_changed(out.changed, checked)
+
+
+async def _check_syntax(start: _Start, out: _Outcome, emit: Emit) -> None:
+    """The ARC-1 syntax dry run of every proposal whose latest revision is
+    unchecked (``agents.ide.syntaxcheck``), merged into the run's changed
+    files like the base check, after it (a base can turn a file from
+    ``new`` into ``modified``; the dry run checks the proposal either way).
+
+    Never fails the run: an error is logged and the revisions stay
+    unchecked for the next run. A cancel propagates.
+    """
+    step = _RunEndStep(start, out, emit, "check_syntax", "Checking syntax")
+    try:
+        # Looked up on the module at call time: the tests' seam.
+        checked = await syntaxcheck.check_syntax(
+            start.sid, start.target, start.destination, None,
+            on_start=step.started,
+        )
+    except asyncio.CancelledError:
+        # The run is being cancelled: close the event, so the UI does not
+        # show the check as running forever, and let the cancel go on.
+        step.ended(False, "Cancelled.")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "IDE session %s: syntax check failed: %s", start.sid,
+            type(exc).__name__, exc_info=True,
+        )
+        step.ended(False, "The syntax check failed.")
+        return
+    step.ended(True, f"{len(checked)} checked.")
+    if checked:
+        out.changed = basecheck.merge_changed(out.changed, checked)
 
 
 def _reaches_target_server(build: Any, name: str, run: DiagnoseRun) -> bool:
@@ -747,7 +944,7 @@ def _reaches_target_server(build: Any, name: str, run: DiagnoseRun) -> bool:
 
 async def _execute(start: _Start, emit: Emit) -> None:
     """The run task: everything bound here is reset here."""
-    user_text, feedback = start.user_text, start.feedback
+    user_text = start.user_text
     out = _Outcome()
     usage = RunUsage()
     parts: list[str] = []
@@ -762,15 +959,32 @@ async def _execute(start: _Start, emit: Emit) -> None:
         agent = build.specialists.get(name) if build is not None else None
         if agent is None:
             out.error_code = "agent_missing"
-            out.error_message = f"The IDE agent {name!r} is not available."
+            out.error_message = (
+                f"The assistant agent {name!r} is not available. Ask an "
+                "administrator to check the agent configuration."
+            )
             return
 
         async with SessionLocal() as db:
             session = await db.get(IdeSession, start.sid)
+            comments = None
+            if start.request_changes is not None:
+                # What this run sent, as stored (state may have moved since).
+                by_id = {
+                    c.id: c for c in await list_comments(db, start.sid)
+                    if c.sent_run_id == start.run_id
+                }
+                comments = [by_id[i] for i in start.comment_ids if i in by_id]
             extra, prompt = await build_prompt(
-                db, session, user_text, feedback=feedback,
+                db, session, user_text,
+                comments=comments,
+                note=(
+                    start.request_changes.note
+                    if start.request_changes is not None else None
+                ),
+                comments_left=start.comments_left,
                 exclude_message_id=start.message_id,
-                report=start.report, masked=start.masked,
+                report=start.report,
             )
 
         allow = SUBAGENTS_ALLOWED.get(start.stage, False)
@@ -789,15 +1003,15 @@ async def _execute(start: _Start, emit: Emit) -> None:
             diagnose_run = DiagnoseRun(
                 session_id=start.sid, owner=start.owner, target=start.target,
                 run_id=start.run_id, destination=start.destination,
-                masking=start.masked, emit=emit,
+                emit=emit,
             )
             if not start.conventions_known:
                 # Not the agent's fault: without the conventions there is no
                 # destination to recognise any server by.
                 log.warning(
                     "IDE session %s: conventions_unavailable -- the "
-                    "conventions of target %r are missing or unreadable; the "
-                    "run is masked and its diagnose reads may be refused",
+                    "conventions of target %r are missing or unreadable; "
+                    "its diagnose reads may be refused",
                     start.sid, start.target,
                 )
                 emit("error", {
@@ -834,10 +1048,20 @@ async def _execute(start: _Start, emit: Emit) -> None:
             async with bound_workspace(
                 start.sid, allow_subagents=allow, request_limit=remaining,
                 session_type=start.session_type,
+                # File revisions record the run that wrote them.
+                run_id=start.run_id,
             ) as scope:
                 with recording(start.run_id) as activity:
                     token = current_progress.set(_EmitSink(activity, emit))
                     diagnose_token = current_diagnose.set(diagnose_run)
+                    ide_run_token = current_ide_run.set(IdeRunContext(
+                        sid=start.sid, owner=start.owner, target=start.target,
+                        destination=start.destination,
+                        session_type=start.session_type,
+                        stage=start.stage.value, report=start.report,
+                        run_id=start.run_id, emit=emit,
+                        request_changes=start.request_changes is not None,
+                    ))
                     try:
                         async with deadline:
                             result = await agent.run(
@@ -850,6 +1074,7 @@ async def _execute(start: _Start, emit: Emit) -> None:
                                 ),
                             )
                     finally:
+                        current_ide_run.reset(ide_run_token)
                         current_diagnose.reset(diagnose_token)
                         current_progress.reset(token)
                         # Calls cut off by a cancel or an error are stored
@@ -863,6 +1088,9 @@ async def _execute(start: _Start, emit: Emit) -> None:
                 out.changed = scope.changed_files
             if diagnose_run is not None:
                 out.findings = list(diagnose_run.findings)
+        if start.session_type == CHANGE:
+            await _check_bases(start, out, emit)
+            await _check_syntax(start, out, emit)
     except UsageLimitExceeded:
         log.info("IDE session %s: request cap reached", start.sid, exc_info=True)
         out.error_code = "usage_exhausted"
@@ -914,6 +1142,15 @@ async def _execute(start: _Start, emit: Emit) -> None:
                 raise asyncio.CancelledError()
 
 
+def _emit_sent(start: _Start, emit: Emit) -> None:
+    """``comments {ids, state: "sent", left}`` after ``run`` when the run sent
+    comments; ``left`` is how many open comments the send caps held back
+    for the next round."""
+    if start.comment_ids:
+        emit("comments", {"ids": list(start.comment_ids), "state": "sent",
+                          "left": start.comments_left})
+
+
 def _caused_by(exc: BaseException, cls: type[BaseException]) -> bool:
     """``exc``, a leaf of an exception group or a link of its ``__cause__``
     chain is a ``cls``. Iterative with a seen-set: chains can loop."""
@@ -940,16 +1177,16 @@ async def run_stage(
     owner: str,
     user_text: str | None,
     *,
-    feedback: str | None,
     emit: Emit,
+    request_changes: RequestChanges | None = None,
     report: bool = False,
 ) -> None:
-    """Run one message (``user_text``), revise (``feedback``) or report
-    (``report=True``, neither text) turn.
+    """Run one message (``user_text``), request-changes
+    (``request_changes``, no text) or report (``report=True``, no text) turn.
 
     A report run is for diagnose sessions only (``StageGateError``
-    ``not_diagnose`` otherwise); its request is ``stages.REPORT_REQUEST`` and
-    its answer is stored as the artifact ``report``.
+    ``not_diagnose`` otherwise); its request is ``stages.REPORT_REQUEST``, and
+    the report exists once the agent submits it (``submit_document``).
 
     Raises :class:`SessionNotFound` or :class:`StageGateError` before any
     event when the run may not start. Otherwise returns after ``done`` was
@@ -957,14 +1194,15 @@ async def run_stage(
     cancelling the caller cancels the run and re-raises after its cleanup.
     """
     if report:
-        if user_text is not None or feedback is not None:
-            raise ValueError("a report run takes neither user_text nor feedback")
-    elif (user_text is None) == (feedback is None):
-        raise ValueError("exactly one of user_text and feedback is required")
+        if user_text is not None or request_changes is not None:
+            raise ValueError("a report run takes neither user_text nor changes")
+    elif (user_text is None) == (request_changes is None):
+        raise ValueError("exactly one of user_text and request_changes is required")
     emit = _safe(emit)
-    start = await _start(sid, owner, user_text, feedback, report)
+    start = await _start(sid, owner, user_text, request_changes, report)
     emit("run", {"run_id": start.run_id, "stage": start.stage.value,
                  "message_id": start.message_id})
+    _emit_sent(start, emit)
     task = asyncio.create_task(
         _execute(start, emit), name=f"ide-run:{sid}"
     )

@@ -24,8 +24,7 @@
         "sap.ui.core": {},
         "sap.f": {},
         "sap.tnt": {},
-        "sap.ui.layout": {},
-        "sap.ui.codeeditor": { "lazy": true }
+        "sap.ui.layout": {}
       }
     },
     "rootView": {
@@ -43,10 +42,12 @@
         "controlAggregation": "pages"
       },
       "routes": [
-        { "pattern": "", "name": "ide", "target": "ide" }
+        { "pattern": ["sessions", ""], "name": "sessions", "target": "sessions" },
+        { "pattern": "sessions/{id}:?query:", "name": "session", "target": "session" }
       ],
       "targets": {
-        "ide": { "id": "ide", "name": "Ide" }
+        "sessions": { "id": "sessions", "name": "Worklist" },
+        "session": { "id": "session", "name": "Session" }
       }
     },
     "models": {

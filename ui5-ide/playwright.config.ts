@@ -10,14 +10,24 @@ import { defineConfig } from "@playwright/test";
  * database (the reasoning of ui5-admin/playwright.config.ts). No browsers are
  * downloaded: run with the local Chrome (`channel: "chrome"`).
  *
+ * The SQLite file is removed before the backend starts and again by
+ * e2e/global-teardown.ts, so every run starts empty and leaves nothing behind;
+ * the specs write the rows a model run or an SAP read would leave straight
+ * into it (e2e/support/backend.ts).
+ *
  * PYTHON overrides the interpreter; the default is the repo's POSIX venv.
  */
+const DB_FILES = "_e2e_registry.db _e2e_registry.db-journal _e2e_registry.db-wal _e2e_registry.db-shm";
+
 export default defineConfig({
     testDir: "./e2e",
+    // The real-stream spec needs the scripted-model backend (playwright.stream.config.ts).
+    testIgnore: "**/real-stream.spec.ts",
     timeout: 60_000,
     fullyParallel: false,
     workers: 1,
     reporter: [["list"]],
+    globalTeardown: "./e2e/global-teardown.ts",
     use: {
         baseURL: "http://localhost:8080",
         channel: "chrome",
@@ -25,7 +35,7 @@ export default defineConfig({
     },
     webServer: [
         {
-            command: `${process.env.PYTHON ?? "../.venv/bin/python"} ../app.py`,
+            command: `rm -f ${DB_FILES} && exec ${process.env.PYTHON ?? "../.venv/bin/python"} ../app.py`,
             url: "http://127.0.0.1:7932/healthz",
             reuseExistingServer: false,
             timeout: 60_000,

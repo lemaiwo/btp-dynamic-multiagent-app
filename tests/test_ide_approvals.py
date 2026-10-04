@@ -108,7 +108,7 @@ def test_bounds_cannot_be_configured_above_the_hard_caps(monkeypatch):
     assert out["expiresHours"] == 8
 
 
-def test_normalize_masks_and_cuts_description():
+def test_normalize_redacts_emails_and_cuts_description():
     out = normalize_request("trace_start", {
         "description": "for jane.doe@example.com " + "x" * 200,
     })
@@ -122,7 +122,8 @@ def test_normalize_is_idempotent():
     once = normalize_request("trace_start", {
         **TRACE, "description": "User: DEVUSER01 mail jane.doe@example.com",
     })
-    assert "DEVUSER01" not in once["description"]
+    # Only e-mail addresses are redacted; user names stay (masking is gone).
+    assert once["description"] == "User: DEVUSER01 mail [EMAIL]"
     assert normalize_request("trace_start", once) == once
 
 
@@ -179,7 +180,7 @@ class FakeArc1:
         self.exc: BaseException | None = None
         self.result = {"trace_request_id": "REQ-1", "expires_at": "2026-10-03T18:00:00Z"}
 
-    def factory(self, target, destination="", policy=readonly.CHANGE, masking=True):
+    def factory(self, target, destination="", policy=readonly.CHANGE):
         self.built.append((target, destination, policy))
         return self
 
@@ -204,7 +205,10 @@ async def _clean_db():
             await db.execute(model.__table__.delete())
         await db.commit()
         await upsert_conventions(db, TARGET, label="Demo", destination=DEST,
-                                 non_production=True)
+                                 actor="test-admin", non_production=True)
+        # The setup's own flag audit row is not what these tests count.
+        await db.execute(IdeAuditLog.__table__.delete())
+        await db.commit()
     arc1._SERVERS.clear()
     yield
     arc1._SERVERS.clear()
@@ -699,7 +703,7 @@ async def test_unusual_arc1_result_is_not_stored_verbatim(fake, jwt):
 def _run(sid, events=None, target=TARGET) -> DiagnoseRun:
     return DiagnoseRun(
         session_id=sid, owner=OWNER, target=target, run_id="run-1",
-        destination=DEST, masking=False,
+        destination=DEST,
         emit=None if events is None else (lambda e, d: events.append((e, d))),
     )
 

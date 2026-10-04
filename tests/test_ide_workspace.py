@@ -132,9 +132,11 @@ async def test_round_trip_modified_new_read():
         changed = await save_state(db, sid, st)
 
     assert sorted(changed, key=lambda c: c["path"]) == [
-        {"path": "notes/impact.md", "state": "new"},
-        {"path": EDIT_PATH, "state": "modified"},
-        {"path": NEW_PATH, "state": "new"},
+        {"path": "notes/impact.md", "state": "new", "revision": 1,
+         "base_status": None},
+        {"path": EDIT_PATH, "state": "modified", "revision": 1,
+         "base_status": None},
+        {"path": NEW_PATH, "state": "new", "revision": 1, "base_status": None},
     ]
     files = await _files(sid)
     assert files[READ_PATH].state == "read"
@@ -165,7 +167,8 @@ async def test_revert_to_origin_returns_to_read():
     st.put(EDIT_PATH, "origin ZCL_EDIT")
     async with SessionLocal() as db:
         changed = await save_state(db, sid, st)
-    assert changed == [{"path": EDIT_PATH, "state": "read"}]
+    assert changed == [{"path": EDIT_PATH, "state": "read", "revision": 1,
+                        "base_status": None}]
     row = (await _files(sid))[EDIT_PATH]
     assert row.state == "read" and row.proposed_source is None
 
@@ -357,10 +360,10 @@ async def test_second_cancel_waits_for_save(monkeypatch, caplog):
     save_started = asyncio.Event()
     finished = []
 
-    async def slow_save(s, state):
+    async def slow_save(s, state, run_id=None):
         save_started.set()
         await asyncio.sleep(0.2)
-        result = await real_save(s, state)
+        result = await real_save(s, state, run_id)
         finished.append(True)
         return result
 
@@ -398,7 +401,7 @@ async def test_hung_save_does_not_make_the_run_uncancellable(monkeypatch, caplog
     save_started = asyncio.Event()
     save_cancelled = []
 
-    async def hung_save(s, state):
+    async def hung_save(s, state, run_id=None):
         save_started.set()
         try:
             await asyncio.sleep(60)
@@ -547,4 +550,5 @@ async def test_bound_workspace_reports_changed_files():
     async with bound_workspace(sid, allow_subagents=True, request_limit=None) as s:
         s.state.put(NEW_PATH, "fresh")
         assert s.changed_files == []
-    assert s.changed_files == [{"path": NEW_PATH, "state": "new"}]
+    assert s.changed_files == [{"path": NEW_PATH, "state": "new", "revision": 1,
+                                "base_status": None}]

@@ -41,7 +41,7 @@ QUnit.test("401 and an expired session ask to reload; 403 names the missing role
     assert.strictEqual(errorText(new IdeError(302, "x", "session_expired"), text), text("sessionExpired"));
     const forbidden = errorText(new IdeError(403, "Forbidden"), text);
     assert.strictEqual(forbidden, text("missingRole"));
-    assert.ok(forbidden.includes("ABAP IDE Developer"), "names the role to ask for");
+    assert.ok(forbidden.includes("\"ABAP IDE Developer\" role collection"), "names the role collection to ask for");
 });
 
 QUnit.test("anything else falls back to requestFailed with the detail", function (assert) {
@@ -64,7 +64,7 @@ QUnit.test("a 403 readonly_refused is the read-only guard, not a missing role", 
     assert.notStrictEqual(text("readOnlyRefused"), "readOnlyRefused", "readOnlyRefused exists in i18n");
     assert.strictEqual(text("activityRefused"), "refused (read-only)", "the activity panel's label for a refused tool");
     assert.notStrictEqual(msg, text("missingRole"));
-    assert.ok(/read-only IDE/.test(msg), "says the read-only IDE refused it");
+    assert.strictEqual(msg, "This action is not allowed in the ABAP Assistant (read-only).", "names the app as it is called (no \"IDE\")");
     assert.strictEqual(
         gateErrorText(new IdeError(403, "x", "readonly_refused"), text), text("readOnlyRefused"), "same text on a gate call"
     );
@@ -132,4 +132,33 @@ QUnit.test("a 424 is mapped by its code: only a missing user token asks to sign 
     assert.strictEqual(runErrorText({ message: "not configured", code: "arc1_not_configured" }, text), text("arc1NotConfigured"),
         "the stream's error frame too");
     assert.strictEqual(gateErrorText(new IdeError(424, "x", "arc1_not_configured"), text), text("arc1NotConfigured"));
+});
+
+QUnit.test("csrf_failed asks to reload the page, never names a missing role (Task U7)", function (assert) {
+    const err = new IdeError(403, "The server did not accept the request's security token.", "csrf_failed");
+    assert.notOk(err.isAuth, "not isAuth");
+    const msg = errorText(err, text);
+    assert.strictEqual(msg, "The request was refused by the security check — reload the page.");
+    assert.notStrictEqual(msg, text("missingRole"));
+    assert.strictEqual(gateErrorText(err, text), msg, "the gate wording falls back to the same text");
+});
+
+QUnit.test("approve and request-changes refusals are worded per code, not by the server (U7 fix round)", function (assert) {
+    for (const code of ["version_changed", "pin_conflict", "approve_not_allowed", "nothing_to_send", "stage_changed", "syntax_check_running"]) {
+        const msg = gateErrorText(new IdeError(409, "server sentence", code), text);
+        assert.notStrictEqual(msg, "server sentence", `${code} has its own text`);
+        assert.ok(msg && !/^gate/.test(msg), `${code}: ${msg}`);
+    }
+});
+
+QUnit.test("409 open_comments has the primary action's own sentence (Task U7)", function (assert) {
+    const msg = gateErrorText(new IdeError(409, "Resolve or dismiss the open review comments first.", "open_comments"), text);
+    assert.strictEqual(msg, "Resolve or dismiss the open review comments first.");
+});
+
+QUnit.test("gateErrorText: a 409 code that names an Object.prototype member is not a gate key", function (assert) {
+    ["constructor", "toString", "__proto__", "hasOwnProperty"].forEach((code) => {
+        const e = new IdeError(409, "The server's own sentence.", code);
+        assert.strictEqual(gateErrorText(e, text), "The server's own sentence.", `${code}: the server's sentence, no crash`);
+    });
 });

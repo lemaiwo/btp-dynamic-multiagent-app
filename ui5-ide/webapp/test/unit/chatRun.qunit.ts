@@ -78,10 +78,10 @@ QUnit.test("a cancelled answer is recognised by its '(cancelled)' tail", functio
 
 QUnit.test("toChatItem renders assistant markdown and keeps user text plain", function (assert) {
     const render = (md: string): string => `<div>${md.toUpperCase()}</div>`;
-    const user = toChatItem({ id: "m-1", role: "user", stage: "chat", content: "<b>hi</b>", created_at: null }, render);
+    const user = toChatItem({ id: "m-1", role: "user", stage: "chat", content: "<b>hi</b>", created_at: null, has_activity: false }, render);
     assert.strictEqual(user.html, "", "a user message is never rendered as HTML");
     assert.strictEqual(user.content, "<b>hi</b>");
-    const bot = toChatItem({ id: "m-2", role: "assistant", stage: "chat", content: "ok\n(cancelled)", created_at: null }, render);
+    const bot = toChatItem({ id: "m-2", role: "assistant", stage: "chat", content: "ok\n(cancelled)", created_at: null, has_activity: false }, render);
     assert.strictEqual(bot.html, "<div>OK\n(CANCELLED)</div>");
     assert.strictEqual(bot.cancelled, true);
     assert.strictEqual(bot.isUser, false);

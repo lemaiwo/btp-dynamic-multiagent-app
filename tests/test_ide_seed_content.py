@@ -472,9 +472,9 @@ def test_diagnostics_agent_proposes_a_trace_and_waits():
 
 
 def test_diagnose_content_makes_no_claim_about_masking():
-    # Whether a session's data is masked or raw is the runner's answer, per
-    # target (``masking_required``), injected into the stage prompt. A seeded
-    # text that claims either would contradict it on the other kind of target.
+    # What a diagnose run sees is described by the stage prompt
+    # (``stages.DIAGNOSE_RULE``), not by seeded text: the phase 1c masking is
+    # gone, and a seed that still talked about pseudonyms would mislead.
     texts = {"abap-diagnostics": DIAG_TEXT + DIAG.get("description", "")}
     for skill in DIAGNOSE_SKILLS:
         texts[skill] = by_skill[skill]["content"] + by_skill[skill]["description"]
@@ -532,3 +532,72 @@ def test_diagnose_skills_review_fixes():
     # Callers come from the dump's call stack; where-used is not a caller chain.
     assert "where-used, not a caller chain" in dump
     assert "from the dump's call stack" in dump
+
+
+# --- seed version 2: the session tools and the syntax dry run (B11) ----------
+
+CHANGE_AGENTS = ("abap-orchestrator", "abap-developer", "abap-reviewer")
+
+
+def test_seed_is_version_2():
+    assert DATA["version"] == 2
+
+
+def test_change_agents_name_submit_document():
+    for name in CHANGE_AGENTS:
+        assert "`submit_document" in by_agent[name]["instructions"], name
+
+
+def test_orchestrator_submits_stage_documents_and_resolves_comments():
+    flat = _flat(by_agent["abap-orchestrator"]["instructions"])
+    for kind in ("design", "plan", "review", "note"):
+        assert f'kind="{kind}"' in flat, kind
+    assert "`resolve_comments" in flat
+    # Offered only in a request-changes run: the prompt must say so rather
+    # than promise the tool in every run.
+    assert "only in a request-changes run" in flat
+    assert "every comment" in flat
+
+
+def test_developer_opens_objects_and_dry_runs_its_proposals():
+    flat = _flat(by_agent["abap-developer"]["instructions"])
+    assert "`open_object(type, name)`" in flat
+    assert "never invent a base" in flat.lower()
+    assert 'SAPDiagnose(action="syntax", type, name, source=' in flat
+    assert "writes nothing" in flat
+    assert "'unavailable' means not checked, never 'ok'" in flat
+
+
+def test_reviewer_reads_syntax_results_and_references_revisions():
+    flat = _flat(by_agent["abap-reviewer"]["instructions"])
+    assert 'submit_document(kind="review"' in flat
+    assert "(revision n)" in flat
+    assert 'action="syntax"' in flat
+    assert "unavailable" in flat and "not verified" in flat
+
+
+def test_diagnostics_submits_the_report():
+    assert 'submit_document(kind="report"' in _flat(DIAG_TEXT)
+
+
+def test_no_agent_says_proposals_cannot_be_syntax_checked():
+    """Version 1 said every SAPDiagnose check runs on existing objects
+    only; the dry run checks a proposal's text, so the change agents must
+    not say the opposite."""
+    for name in CHANGE_AGENTS:
+        flat = _flat(by_agent[name]["instructions"])
+        assert "not on proposals" not in flat, name
+    for skill in ("abap-tdd", "abap-plan"):
+        assert 'action="syntax"' in _flat(by_skill[skill]["content"]), skill
+
+
+def test_no_masking_wording_anywhere():
+    low = RAW.lower()
+    for word in ("mask", "pseudonym", "placeholder", "redact"):
+        assert word not in low, word
+
+
+def test_researcher_is_promised_no_session_tool():
+    text = by_agent["abap-researcher"]["instructions"]
+    for tool in ("submit_document", "open_object", "resolve_comments"):
+        assert tool not in text, tool

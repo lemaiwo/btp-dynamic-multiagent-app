@@ -1,10 +1,9 @@
 """Findings: what a diagnose run came across, as metadata.
 
 The read-only guard hands every ``SAPDiagnose`` data result of the session
-target's server to :func:`collect`, *after* the masking switch was applied.
-So :func:`extract` reads what the model was given: masked text in a masked
-run, ARC-1's own text on a ``non_production`` target. It does not mask and
-it does not need to know which of the two it got.
+target's server to :func:`collect`: the text the model was given, which is
+ARC-1's own text (a diagnose run exists only for a ``non_production``
+target).
 
 **Metadata.** A finding is the seven keys of :data:`FINDING_KEYS`. Every
 value is taken from a field that names something (an id, a program, a
@@ -15,10 +14,9 @@ it. A payload whose identity (``ref_id``) is not an identifier yields no
 finding.
 
 **Detail.** With ``with_detail=True`` a dump or gateway-error *detail* read
-also carries the text itself under ``detail``. The guard asks for it only
-when the run is not masked, and ``agents.ide.runner`` stores it only then
-(``store.upsert_findings(clear_detail=...)``): raw text may be kept for a
-``non_production`` target and for nothing else.
+also carries the text itself under ``detail``. :func:`collect` always asks
+for it and ``agents.ide.runner`` stores it with the finding; the routes
+serve it only while the target is still flagged ``non_production``.
 
 **Never in the way.** Nothing here raises into the run. A result that does
 not parse, has an unknown shape or holds a value of the wrong type gives no
@@ -32,7 +30,9 @@ import logging
 import re
 from typing import Any, Callable
 
-from agents.ide import diagnose, masking
+from agents.ide import diagnose, shapes
+from agents.ide.models import iso_utc
+from agents.ide.schemas import FindingKind, coerce_member
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +48,7 @@ _MAX_REF = 255
 _MAX_NAME = 40
 _MAX_TITLE = 200
 
-# An ABAP-side name or id: no blanks, no quotes, no brackets. A masked value
-# that masking replaced by a placeholder (``[NUMBER]``) does not match.
+# An ABAP-side name or id: no blanks, no quotes, no brackets.
 _IDENT = re.compile(r"[A-Za-z0-9_/$=.:<>~\-]+")
 # The same, with single blanks between words ("Frontend Error").
 _LABEL = re.compile(r"[A-Za-z0-9_/$=.:<>~\-]+(?: [A-Za-z0-9_/$=.:<>~\-]+){0,5}")
@@ -276,7 +275,7 @@ def _odata(data: dict[str, Any], args: dict[str, Any], detail: bool) -> list[dic
 
 _Extractor = Callable[[dict[str, Any], dict[str, Any], bool], list[dict]]
 
-# By the name of the shape ``masking`` recognises. A shape that is not here
+# By the name of the shape ``agents.ide.shapes`` recognises. A shape that is not here
 # (trace analyses, trace requests, SQL trace state) yields no finding.
 _EXTRACTORS: dict[str, _Extractor] = {
     "dumps_list": _dumps_list,
@@ -299,22 +298,21 @@ def extract(
 
     ``text`` is the result as the model got it. Each finding has exactly the
     keys of :data:`FINDING_KEYS`; with ``with_detail`` a detail read adds
-    ``detail`` (the text, cut to :data:`MAX_DETAIL`). Pass ``with_detail``
-    only when masking is not required for the run.
+    ``detail`` (the text, cut to :data:`MAX_DETAIL`).
     """
     try:
         if (
             not isinstance(text, str)
             or not isinstance(args, dict)
             or not text
-            or len(text) > masking.MAX_INPUT
+            or len(text) > shapes.MAX_INPUT
         ):
             return []
         try:
             data = json.loads(text)
         except (ValueError, RecursionError):
             return []
-        shape = masking.match_shape(tool, args, data)
+        shape = shapes.match_shape(tool, args, data)
         extractor = _EXTRACTORS.get(shape) if shape else None
         if extractor is None:
             return []
@@ -362,14 +360,11 @@ def collect(run: Any, tool: Any, args: Any, result: Any) -> None:
     Called by the guard with the result it is about to return. Every agent
     of a run -- the top-level one, a delegate, a deep sub-agent -- runs in a
     context that holds the same ``DiagnoseRun``, so all of them add to the
-    same list. Detail text is asked for only when the run is not masked.
-    Never raises.
+    same list, detail text included. Never raises.
     """
     try:
-        # Same form as the guard: anything but a real ``False`` is masked.
-        masked = getattr(run, "masking", True) is not False
         found = extract(
-            tool, args, diagnose.result_text(result), with_detail=not masked,
+            tool, args, diagnose.result_text(result), with_detail=True,
         )
         if found:
             merge(run.findings, found)
@@ -378,16 +373,19 @@ def collect(run: Any, tool: Any, args: Any, result: Any) -> None:
 
 
 def finding_out(row: Any) -> dict[str, Any]:
-    """An ``IdeFinding`` row as the contract's ``Finding`` (no detail text)."""
+    """An ``IdeFinding`` row as the contract's ``Finding`` (no detail text).
+
+    A stored kind outside the contract (an older version, a hand edit) is
+    served as ``trace`` with a WARNING rather than failing the whole list."""
     created = getattr(row, "created_at", None)
     return {
         "id": row.id,
-        "kind": row.kind,
+        "kind": coerce_member(row.kind, FindingKind, "trace", "finding kind"),
         "ref_id": row.ref_id,
         "title": row.title,
         "program": row.program,
         "include": row.include,
         "line": row.line,
         "occurred_at": row.occurred_at,
-        "created_at": created.isoformat() if created else None,
+        "created_at": iso_utc(created),
     }

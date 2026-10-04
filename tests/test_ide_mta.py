@@ -32,9 +32,9 @@ def test_ide_env_vars_are_quoted_strings():
         assert isinstance(value, str), (key, value)
 
 
-def test_mta_version_is_2_18_0():
+def test_mta_version_is_2_19_0():
     mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
-    assert mta["version"] == "2.18.0"
+    assert mta["version"] == "2.19.0"
 
 
 def test_every_ide_property_is_read_by_the_app():
@@ -53,5 +53,8 @@ def test_python_module_archive_excludes_local_only_folders():
     mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
     module = next(m for m in mta["modules"] if m["type"] == "python")
     ignore = module["build-parameters"]["ignore"]
-    for entry in ("docs/", "memory/", ".sdd/", "tests/", "CLAUDE.local.md"):
+    # Makefile_*.mta: mbt's temporary makefile, written into the module path
+    # (".") during a build; it holds a local absolute path.
+    for entry in ("docs/", "memory/", ".sdd/", "tests/", "CLAUDE.local.md",
+                  "Makefile_*.mta"):
         assert entry in ignore, entry

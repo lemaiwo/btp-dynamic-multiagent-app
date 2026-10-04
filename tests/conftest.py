@@ -42,3 +42,52 @@ def real_agents_and_mcp(monkeypatch):
         real = unpatched(module.create_mcp_server)
         if real is not module.create_mcp_server:
             monkeypatch.setattr(module, "create_mcp_server", real)
+
+
+class LockTrail(list):
+    """SQL statements sent, with :data:`LOCK` where ``lock_session_row`` was
+    called (the spy runs before the real lock's own SELECT)."""
+
+    LOCK = "<lock_session_row>"
+
+    def assert_lock_before_writes_to(self, table: str) -> None:
+        """The session row is locked before the first write to ``table``
+        (order session row -> child row, so no deadlock on Postgres)."""
+        writes = [i for i, s in enumerate(self)
+                  if s.startswith((f"UPDATE {table} ", f"INSERT INTO {table} "))]
+        assert writes, f"nothing was written to {table}: {self[:5]}"
+        assert self.LOCK in self, f"no session lock before {table}: {self[:5]}"
+        assert self.index(self.LOCK) < writes[0], self[: writes[0] + 1]
+
+
+@pytest.fixture
+def lock_trail(monkeypatch):
+    """Spy on ``agents.ide.store.lock_session_row`` (and every IDE module
+    that imported it by name) plus a cursor listener on the app engine.
+    SQLite cannot show a lock-order deadlock; the order of statements can."""
+    from sqlalchemy import event
+
+    from agents import db as db_module
+    from agents.ide import store
+
+    seen = LockTrail()
+    real = store.lock_session_row
+
+    async def spy(db, sid):
+        seen.append(LockTrail.LOCK)
+        await real(db, sid)
+
+    for name in ("agents.ide.store", "agents.ide.runner", "agents.ide.routes",
+                 "agents.ide.session_tools", "agents.ide.workspace",
+                 "agents.ide.stages"):
+        module = sys.modules.get(name)
+        if module is not None and getattr(module, "lock_session_row", None) is real:
+            monkeypatch.setattr(module, "lock_session_row", spy)
+
+    def record(conn, cursor, statement, *a):
+        seen.append(statement)
+
+    engine = db_module.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", record)
+    yield seen
+    event.remove(engine, "before_cursor_execute", record)

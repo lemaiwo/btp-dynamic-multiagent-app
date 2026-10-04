@@ -21,6 +21,8 @@ dist/
 node_modules/
 agents_registry.db
 tests/_*.db
+# The real-stream e2e backend's throw-away database (tests/e2e/ide_stream_server.py).
+_e2e_stream.db*
 
 ui5-admin/node_modules/
 ui5-admin/dist/

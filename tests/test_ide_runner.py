@@ -14,7 +14,6 @@ Run:  python -m pytest tests/test_ide_runner.py -q
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import os
 import sys
@@ -60,6 +59,7 @@ from agents.ide.models import (  # noqa: E402
     IdeSession,
     IdeWorkspaceFile,
 )
+from agents.ide.session_tools import ide_session_toolset  # noqa: E402
 from agents.ide.stages import StageGateError  # noqa: E402
 from agents.ide.store import create_session  # noqa: E402
 from agents.progress import current_progress  # noqa: E402
@@ -169,7 +169,16 @@ class _Specialist:
                           lambda: scoped_deep_instructions(cfg)],
             retries=1,
         )
-        return await agent.run(prompt, model=model, toolsets=[*self.toolsets, ts], **kwargs)
+        # As the registry attaches it: the IDE session tools on every agent.
+        return await agent.run(
+            prompt, model=model,
+            toolsets=[*self.toolsets, ide_session_toolset(), ts], **kwargs,
+        )
+
+
+def submit(kind: str, content: str) -> list:
+    """A model turn that submits a document."""
+    return [("submit_document", {"kind": kind, "content": content})]
 
 
 def _install(script: Script | None, cfg: DeepConfig | None = None, toolsets=()) -> None:
@@ -207,9 +216,12 @@ class Events(list):
         return [d for k, d in self if k == kind]
 
 
-async def _run(sid, text="go", *, feedback=None) -> Events:
+async def _run(sid, text="go", *, note=None) -> Events:
+    """A message run (``text``), or a request-changes run with ``note``
+    when ``text`` is None."""
     ev = Events()
-    await runner.run_stage(sid, "alice", text, feedback=feedback, emit=ev)
+    changes = runner.RequestChanges(note=note) if text is None else None
+    await runner.run_stage(sid, "alice", text, request_changes=changes, emit=ev)
     return ev
 
 
@@ -225,7 +237,9 @@ def test_run_usage_limits_unbound_is_global_limit():
 
 
 async def test_design_run_streams_and_versions_the_artifact():
-    script = Script(["# Design\nGoal: X"])
+    """B8: the design is the document the agent submitted (``artifact`` is
+    emitted when the tool stores it, mid-run); the final answer is chat."""
+    script = Script([submit("design", "# Design\nGoal: X"), "Submitted the design."])
     _install(script)
     sid = await _session("design")
 
@@ -233,37 +247,42 @@ async def test_design_run_streams_and_versions_the_artifact():
     kinds = ev.kinds()
     assert kinds[0] == "run" and kinds[-1] == "done"
     assert "text" in kinds
-    assert kinds.index("run") < kinds.index("text") < kinds.index("artifact") \
+    assert kinds.index("run") < kinds.index("artifact") < kinds.index("text") \
         < kinds.index("done")
-    assert "".join(d["delta"] for d in ev.of("text")) == "# Design\nGoal: X"
+    assert "".join(d["delta"] for d in ev.of("text")) == "Submitted the design."
     run = ev.of("run")[0]
     assert run["stage"] == "design" and run["run_id"] and run["message_id"]
     art = ev.of("artifact")[0]
     assert (art["kind"], art["version"]) == ("design", 1)
-    assert ev.of("usage") == [{"requests_used": 1, "request_cap": 1000}]
+    async with SessionLocal() as db:
+        stored = (await db.execute(select(IdeArtifact).where(
+            IdeArtifact.session_id == sid))).scalar_one()
+    assert (stored.id, stored.content) == (art["id"], "# Design\nGoal: X")
+    assert ev.of("usage") == [{"requests_used": 2, "request_cap": 1000}]
     done = ev.of("done")[0]
     assert done["stage"] == "design" and done["status"] == "idle"
 
     row = await _row(sid)
-    assert (row.status, row.run_id, row.requests_used) == ("idle", None, 1)
+    assert (row.status, row.run_id, row.requests_used) == ("idle", None, 2)
     async with SessionLocal() as db:
         msgs = list((await db.execute(
             select(IdeMessage).where(IdeMessage.session_id == sid)
             .order_by(IdeMessage.created_at))).scalars())
     assert [(m.role, m.content) for m in msgs] == [
-        ("user", "design it"), ("assistant", "# Design\nGoal: X")]
+        ("user", "design it"), ("assistant", "Submitted the design.")]
     assert done["message_id"] == msgs[1].id
-    assert json.loads(msgs[1].activity_json)["events"] == []
+    events = json.loads(msgs[1].activity_json)["events"]
+    assert [e["tool"] for e in events] == ["submit_document"]
 
     # Run-time instructions: stage text plus the workspace deep section.
     assert "Produce a design in markdown" in script.instructions[0]
     assert "session workspace" in script.instructions[0]
     assert "base orchestrator instructions" in script.instructions[0]
 
-    _install(Script(["# Design v2"]))
+    _install(Script([submit("design", "# Design v2"), "ok"]))
     ev2 = await _run(sid, "again")
     assert ev2.of("artifact")[0]["version"] == 2
-    assert (await _row(sid)).requests_used == 2
+    assert (await _row(sid)).requests_used == 4
 
 
 async def test_chat_run_has_no_artifact():
@@ -286,11 +305,14 @@ async def test_propose_write_file_emits_file_and_persists():
     _install(script)
     sid = await _session("propose")
     ev = await _run(sid, "propose")
-    assert ev.of("file") == [{"path": path, "state": "new"}]
-    assert ev.of("artifact")[0]["kind"] == "note"
+    # No ARC-1 configured here: the base stays unchecked (the next run
+    # retries), the syntax dry run is stored as "unavailable" -- never "ok" (B12).
+    assert ev.of("file") == [{"path": path, "state": "new", "revision": 1,
+                              "base_status": None, "syntax_status": "unavailable"}]
+    # B8: the summary answer is no note; only submit_document makes one.
+    assert "artifact" not in ev.kinds()
     kinds = ev.kinds()
-    assert kinds.index("artifact") < kinds.index("file") < kinds.index("usage") \
-        < kinds.index("done")
+    assert kinds.index("file") < kinds.index("usage") < kinds.index("done")
     tools = ev.of("tool")
     assert [t["status"] for t in tools if t["tool"] == "write_file"] == ["running", "ok"]
     async with SessionLocal() as db:
@@ -300,6 +322,24 @@ async def test_propose_write_file_emits_file_and_persists():
         (path, "new", "ZCL_NEW")]
     # Sub-agents are off in propose: the instructions say so.
     assert "No sub-agents in this stage" in script.instructions[0]
+
+
+async def test_file_revisions_record_the_run_that_wrote_them():
+    from agents.ide.models import IdeFileRevision
+
+    path = "src/CLAS/zcl_rev.clas.abap"
+    _install(Script([[("write_file", {"path": path, "content": "v1"})], "ok"]))
+    sid = await _session("propose")
+    ev = await _run(sid, "write")
+    _install(Script([[("write_file", {"path": path, "content": "v2"})], "ok"]))
+    ev2 = await _run(sid, "edit")
+    assert [f["revision"] for f in ev2.of("file")] == [2]
+    async with SessionLocal() as db:
+        revs = list((await db.execute(select(IdeFileRevision).where(
+            IdeFileRevision.session_id == sid).order_by(IdeFileRevision.revision)
+        )).scalars())
+    assert [(r.revision, r.run_id) for r in revs] == [
+        (1, ev.of("run")[0]["run_id"]), (2, ev2.of("run")[0]["run_id"])]
 
 
 async def test_workspace_is_shared_across_runs():
@@ -367,6 +407,10 @@ async def test_agent_missing():
     ev = await _run(sid, "x")
     assert ev.kinds() == ["run", "error", "done"]
     assert ev.of("error")[0]["code"] == "agent_missing"
+    assert ev.of("error")[0]["message"] == (
+        f"The assistant agent {NAME!r} is not available. Ask an administrator "
+        "to check the agent configuration."
+    )
     assert ev.of("done")[0]["message_id"] == ev.of("run")[0]["message_id"]
     assert (await _row(sid)).status == "idle"
 
@@ -392,10 +436,10 @@ async def test_concurrent_second_run_is_refused():
     sid = await _session("chat")
     ev = Events()
     first = asyncio.create_task(
-        runner.run_stage(sid, "alice", "one", feedback=None, emit=ev))
+        runner.run_stage(sid, "alice", "one", emit=ev))
     await started.wait()
     with pytest.raises(StageGateError) as exc:
-        await runner.run_stage(sid, "alice", "two", feedback=None, emit=Events())
+        await runner.run_stage(sid, "alice", "two", emit=Events())
     assert exc.value.code == "run_in_progress"
     gate.set()
     await first
@@ -412,7 +456,7 @@ async def test_other_owner_cannot_run():
     _install(Script(["x"]))
     sid = await _session("chat")
     with pytest.raises(runner.SessionNotFound):
-        await runner.run_stage(sid, "mallory", "x", feedback=None, emit=Events())
+        await runner.run_stage(sid, "mallory", "x", emit=Events())
 
 
 async def test_gate_refusal_from_locked_row():
@@ -448,17 +492,17 @@ async def test_cap_counts_previous_runs(monkeypatch):
     assert (await _row(sid)).requests_used == 3
 
 
-async def test_revise_saves_feedback_once_and_reruns_stage():
-    script = Script(["# Design v2"])
+async def test_request_changes_note_saved_once_and_reruns_stage():
+    script = Script([submit("design", "# Design v2"), "Revised."])
     _install(script)
     sid = await _session("design")
     async with SessionLocal() as db:
         db.add(IdeArtifact(session_id=sid, stage="design", kind="design",
                            content="v1", version=1))
         await db.commit()
-    ev = await _run(sid, None, feedback="SPLIT-IT")
+    ev = await _run(sid, None, note="SPLIT-IT")
     assert ev.of("artifact")[0]["version"] == 2
-    # The feedback is the run's request: in the prompt once, not in the
+    # The note is part of the run's request: in the prompt once, not in the
     # instructions; the previous version rides along as data.
     assert "SPLIT-IT" not in script.instructions[0]
     assert script.prompts[0].count("SPLIT-IT") == 1
@@ -466,7 +510,7 @@ async def test_revise_saves_feedback_once_and_reruns_stage():
     async with SessionLocal() as db:
         users = [m.content for m in (await db.execute(select(IdeMessage).where(
             IdeMessage.session_id == sid, IdeMessage.role == "user"))).scalars()]
-    assert users == ["SPLIT-IT"]
+    assert users == ["Request changes: 0 comment(s)\n\nSPLIT-IT"]
 
 
 # --- cancellation ------------------------------------------------------------
@@ -488,7 +532,7 @@ async def test_cancel_marks_message_and_resets():
     sid = await _session("design")
     ev = Events()
     task = asyncio.create_task(
-        runner.run_stage(sid, "alice", "x", feedback=None, emit=ev))
+        runner.run_stage(sid, "alice", "x", emit=ev))
     await started.wait()
     while not any(k == "tool" and d["status"] == "ok" for k, d in ev):
         await asyncio.sleep(0.01)
@@ -496,7 +540,9 @@ async def test_cancel_marks_message_and_resets():
     await asyncio.wait_for(task, timeout=5)  # cancel(sid) ends the run cleanly
     assert ev.kinds()[-1] == "done"
     assert "artifact" not in ev.kinds()
-    assert ev.of("file") == [{"path": "notes/partial.md", "state": "new"}]
+    assert ev.of("file") == [{"path": "notes/partial.md", "state": "new",
+                              "revision": 1, "base_status": None,
+                              "syntax_status": None}]
     row = await _row(sid)
     assert (row.status, row.run_id) == ("idle", None)
     async with SessionLocal() as db:
@@ -520,7 +566,7 @@ async def test_caller_cancel_propagates_after_cleanup():
     sid = await _session("chat")
     ev = Events()
     task = asyncio.create_task(
-        runner.run_stage(sid, "alice", "x", feedback=None, emit=ev))
+        runner.run_stage(sid, "alice", "x", emit=ev))
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -541,7 +587,7 @@ async def test_cancel_all():
     _install(Blocking([("wait", gate, "never")]))
     sid = await _session("chat")
     task = asyncio.create_task(
-        runner.run_stage(sid, "alice", "x", feedback=None, emit=Events()))
+        runner.run_stage(sid, "alice", "x", emit=Events()))
     await started.wait()
     await runner.cancel_all()
     await asyncio.wait_for(task, timeout=5)
@@ -595,7 +641,7 @@ async def test_cancelled_run_stores_no_running_calls():
     sid = await _session("chat")
     ev = Events()
     task = asyncio.create_task(
-        runner.run_stage(sid, "alice", "x", feedback=None, emit=ev))
+        runner.run_stage(sid, "alice", "x", emit=ev))
     await started.wait()
     assert await runner.cancel(sid) is True
     await asyncio.wait_for(task, timeout=5)
@@ -676,14 +722,14 @@ async def test_live_long_run_with_heartbeat_is_not_reclaimed(monkeypatch):
     sid = await _session("chat")
     ev = Events()
     task = asyncio.create_task(
-        runner.run_stage(sid, "alice", "x", feedback=None, emit=ev))
+        runner.run_stage(sid, "alice", "x", emit=ev))
     await started.wait()
     await asyncio.sleep(0.5)  # well past the stale age
     # Seen from another instance: no local task, only the row's age counts.
     live = runner._tasks.pop(sid)
     try:
         with pytest.raises(StageGateError) as exc:
-            await runner.run_stage(sid, "alice", "y", feedback=None, emit=Events())
+            await runner.run_stage(sid, "alice", "y", emit=Events())
         assert exc.value.code == "run_in_progress"
         assert await runner.release_stale(sid) is False
     finally:
@@ -706,12 +752,12 @@ async def test_local_live_task_is_never_reclaimed(monkeypatch):
     _install(_blocking(gate, started, [("wait", gate, "ok")]))
     sid = await _session("chat")
     task = asyncio.create_task(
-        runner.run_stage(sid, "alice", "x", feedback=None, emit=Events()))
+        runner.run_stage(sid, "alice", "x", emit=Events()))
     await started.wait()
     await asyncio.sleep(0.1)  # stale by age, but this process runs it
     assert await runner.release_stale(sid) is False
     with pytest.raises(StageGateError):
-        await runner.run_stage(sid, "alice", "y", feedback=None, emit=Events())
+        await runner.run_stage(sid, "alice", "y", emit=Events())
     gate.set()
     await asyncio.wait_for(task, timeout=5)
 
@@ -910,7 +956,7 @@ async def _diagnose_session(non_production: bool | None = True, **values) -> str
     async with SessionLocal() as db:
         if non_production is not None:
             await upsert_conventions(db, "T1", destination=DEST,
-                                     non_production=non_production)
+                                     actor="test-admin", non_production=non_production)
         s = await create_session(db, owner="alice", title="t", target="T1",
                                  session_type="diagnose")
         for key, value in values.items():
@@ -921,7 +967,7 @@ async def _diagnose_session(non_production: bool | None = True, **values) -> str
 
 async def _report(sid: str) -> Events:
     ev = Events()
-    await runner.run_stage(sid, "alice", None, feedback=None, emit=ev, report=True)
+    await runner.run_stage(sid, "alice", None, emit=ev, report=True)
     return ev
 
 
@@ -1004,7 +1050,7 @@ async def test_diagnose_message_run_stores_no_artifact(target_servers):
 
 
 async def test_report_run_stores_report_artifact_v1_then_v2(target_servers):
-    script = Script(["# Report one"])
+    script = Script([submit("report", "# Report one"), "Report submitted."])
     _install_agents({DIAG: script})
     sid = await _diagnose_session()
     await _run(sid, "why?")
@@ -1016,9 +1062,9 @@ async def test_report_run_stores_report_artifact_v1_then_v2(target_servers):
     assert ev.kinds()[-1] == "done"
     assert script.prompts[-1].endswith(f"# Request\n{REPORT_REQUEST}")
     assert "Previous report" not in script.prompts[-1]
-    assert STAGE_INSTRUCTIONS[Stage.investigate] not in script.instructions[-1]  # raw
+    assert STAGE_INSTRUCTIONS[Stage.investigate] in script.instructions[-1]
 
-    script.turns = ["# Report two"]
+    script.turns = [submit("report", "# Report two"), "Report submitted."]
     ev = await _report(sid)
     assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("report", 2)]
     assert "## Previous report (version 1)\n# Report one" in script.prompts[-1]
@@ -1043,59 +1089,73 @@ async def test_failed_report_run_stores_no_artifact(target_servers):
     assert "artifact" not in ev.kinds() and await _artifacts(sid) == []
 
 
+async def test_report_answer_without_submission_stores_no_artifact(target_servers):
+    """B8: a long report written as the final answer is not a report."""
+    _install_agents({DIAG: Script(["# Report\n" + "x" * 5000])})
+    sid = await _diagnose_session()
+    ev = await _report(sid)
+    assert ev.of("error") == []
+    assert "artifact" not in ev.kinds() and await _artifacts(sid) == []
+
+
+async def test_failed_run_keeps_a_document_submitted_before_the_failure(target_servers):
+    """What was submitted was submitted: the version stays after a later
+    failure of the same run."""
+    _install_agents({DIAG: Script([submit("report", "# R"), RuntimeError("boom")])})
+    sid = await _diagnose_session()
+    ev = await _report(sid)
+    assert ev.of("error")[0]["code"] == "run_failed"
+    assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("report", 1)]
+    assert [a.content for a in await _artifacts(sid)] == ["# R"]
+
+
 async def test_report_on_change_session_refused(target_servers):
     script = Script(["x"])
     _install_agents({NAME: script, DIAG: script})
     sid = await _session("design")
     ev = Events()
     with pytest.raises(StageGateError) as exc:
-        await runner.run_stage(sid, "alice", None, feedback=None, emit=ev, report=True)
+        await runner.run_stage(sid, "alice", None, emit=ev, report=True)
     assert exc.value.code == "not_diagnose"
     assert ev == [] and script.requests == 0
     assert await _messages(sid) == []
     assert (await _row(sid)).status == "idle"
 
 
-async def test_diagnose_revise_refused(target_servers):
+async def test_diagnose_request_changes_refused(target_servers):
     script = Script(["x"])
     _install_agents({DIAG: script})
     sid = await _diagnose_session()
     ev = Events()
     with pytest.raises(StageGateError) as exc:
-        await runner.run_stage(sid, "alice", None, feedback="redo", emit=ev)
+        await runner.run_stage(sid, "alice", None, emit=ev,
+                               request_changes=runner.RequestChanges(note="redo"))
     assert exc.value.code == "revise_not_allowed"
     assert ev == [] and script.requests == 0 and await _messages(sid) == []
 
 
-@pytest.mark.parametrize("text,feedback", [("x", None), (None, "y"), ("x", "y")])
-async def test_report_run_takes_no_text(text, feedback):
+@pytest.mark.parametrize("text,note", [("x", None), (None, "y"), ("x", "y")])
+async def test_report_run_takes_no_text(text, note):
     """The report request is the app's own text, never the caller's."""
     sid = await _diagnose_session()
+    changes = runner.RequestChanges(note=note) if note is not None else None
     with pytest.raises(ValueError):
-        await runner.run_stage(sid, "alice", text, feedback=feedback,
+        await runner.run_stage(sid, "alice", text, request_changes=changes,
                                emit=Events(), report=True)
     assert await _messages(sid) == []
 
 
-@pytest.mark.parametrize("masked", [False, True])
-async def test_diagnose_prompt_wording_follows_the_masking_switch(
-    target_servers, masked
-):
-    """``masked=True`` is forced past the start: a real start on a target
-    that requires masking is refused (the tests below), but what runs behind
-    it still words the prompt from ``_Start.masked``."""
+async def test_diagnose_prompt_has_the_one_diagnose_wording(target_servers):
     script = Script(["ok"])
     _install_agents({DIAG: script})
     sid = await _diagnose_session(True)
-    ev = Events()
-    start = await runner._start(sid, "alice", "mail jane.doe@example.com", None)
-    assert start.masked is False
-    await runner._execute(dataclasses.replace(start, masked=masked), ev)
+    ev = await _run(sid, "mail jane.doe@example.com")
     assert ev.of("error") == []
     instructions = script.instructions[0]
-    assert (DIAGNOSE_RULE in instructions) is masked
-    assert (STAGE_INSTRUCTIONS[Stage.investigate] in instructions) is masked
-    assert ("not masked" in instructions) is not masked
+    assert DIAGNOSE_RULE in instructions
+    assert STAGE_INSTRUCTIONS[Stage.investigate] in instructions
+    # The user's text is stored as typed.
+    assert (await _messages(sid))[0].content == "mail jane.doe@example.com"
 
 
 @pytest.mark.parametrize("non_production", [False, None])
@@ -1112,7 +1172,7 @@ async def test_diagnose_run_is_refused_when_the_target_lost_its_flag(
     with pytest.raises(StageGateError) as exc:
         await runner.run_stage(
             sid, "alice", None if report else "mail jane.doe@example.com",
-            feedback=None, emit=ev, report=report,
+            emit=ev, report=report,
         )
     assert exc.value.code == "target_not_non_production"
     assert list(ev) == [] and script.requests == 0
@@ -1142,8 +1202,7 @@ async def test_diagnose_run_never_persists_the_workspace(target_servers, outcome
     sid = await _diagnose_session()
     ev = Events()
     task = asyncio.create_task(runner.run_stage(
-        sid, "alice", None if outcome == "report" else "x", feedback=None,
-        emit=ev, report=outcome == "report"))
+        sid, "alice", None if outcome == "report" else "x", emit=ev, report=outcome == "report"))
     if outcome == "cancel":
         await started.wait()
         while not any(k == "tool" and d["status"] == "ok" for k, d in ev):
@@ -1222,28 +1281,26 @@ async def test_change_run_never_reports_a_missing_diagnose_server(target_servers
     assert (await _run(sid, "x")).of("error") == []
 
 
-def test_start_is_masked_unless_told_otherwise():
-    start = runner._Start(sid="s", run_id="r", stage=Stage.investigate,
-                          message_id="m", requests_used=0)
-    assert start.masked is True
+def test_start_has_no_masking_field():
+    assert "masked" not in runner._Start.__dataclass_fields__
 
 
 @pytest.mark.parametrize("session_type,non_production", [
     ("change", False), ("change", True), ("change", None), ("diagnose", True),
 ])
-async def test_start_is_raw_for_change_and_flagged_diagnose(
+async def test_start_for_change_and_flagged_diagnose(
     session_type, non_production
 ):
     """A change session never looks at the flag (nor needs the row)."""
     async with SessionLocal() as db:
         if non_production is not None:
             await upsert_conventions(db, "T1", destination=DEST,
-                                     non_production=non_production)
+                                     actor="test-admin", non_production=non_production)
         s = await create_session(db, owner="alice", title="t", target="T1",
                                  session_type=session_type)
     start = await runner._start(s.id, "alice", "x", None)
-    assert start.masked is False
     assert start.session_type == session_type
+    assert start.conventions_known is True
 
 
 @pytest.mark.parametrize("non_production", [False, None])
@@ -1258,7 +1315,7 @@ async def test_start_refuses_diagnose_without_the_flag(non_production):
 @pytest.mark.parametrize("broken", ["flag", "destination", "load"])
 async def test_unreadable_conventions_refuse_the_run(target_servers, monkeypatch, broken):
     """Loading the row and reading it are one step: whatever goes wrong
-    there counts as "masking required", and such a run does not start. The
+    there counts as "not non-production", and such a run does not start. The
     gate (``stages.assert_can_run``) reads the stored row and lets it
     through; this is the runner's own check."""
 
@@ -1295,19 +1352,104 @@ async def test_change_flow_unchanged(target_servers, monkeypatch):
     artifact, persisted workspace, no session type in the prompt."""
     monkeypatch.setenv("IDE_DIAGNOSE_AGENT", DIAG)
     orchestrator, diagnostics = Script([
-        [("write_file", {"path": "notes/n.md", "content": "N"})], "# Design",
+        [("write_file", {"path": "notes/n.md", "content": "N"})],
+        submit("design", "# Design"), "Submitted.",
     ]), Script(["no"])
     _install_agents({NAME: _Specialist(orchestrator), DIAG: diagnostics})
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
+        await upsert_conventions(db, "T1", destination=DEST,
+                                 actor="test-admin", non_production=True)
     sid = await _session("design")
     ev = await _run(sid, "mail jane.doe@example.com")
     assert ev.of("error") == [] and diagnostics.requests == 0
     assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("design", 1)]
-    assert ev.of("file") == [{"path": "notes/n.md", "state": "new"}]
+    assert ev.of("file") == [{"path": "notes/n.md", "state": "new", "revision": 1,
+                              "base_status": None, "syntax_status": None}]
     instructions = orchestrator.instructions[0]
     assert READ_ONLY_RULE in instructions and "Session type" not in instructions
     assert (await _messages(sid))[0].content == "mail jane.doe@example.com"
-    ev = await _run(sid, None, feedback="shorter")
+    ev = await _run(sid, None, note="shorter")
     assert [(a["kind"], a["version"]) for a in ev.of("artifact")] == [("design", 2)]
     assert (await _row(sid)).stage == "design"
+
+
+# --- B12 review, fix round 1: the run-end checks ------------------------------
+from agents.ide import basecheck, syntaxcheck  # noqa: E402
+
+
+class _CheckSpy:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def patch(self, monkeypatch):
+        async def bases(sid, *a, **kw):
+            self.calls.append("check_bases")
+            return []
+
+        async def syntax(sid, *a, **kw):
+            self.calls.append("check_syntax")
+            return []
+
+        monkeypatch.setattr(basecheck, "check_bases", bases)
+        monkeypatch.setattr(syntaxcheck, "check_syntax", syntax)
+        return self
+
+
+async def test_diagnose_run_runs_no_run_end_check(target_servers, monkeypatch):
+    spy = _CheckSpy().patch(monkeypatch)
+    _install_agents({DIAG: Script(["ok"])})
+    sid = await _diagnose_session()
+    ev = await _run(sid, "why")
+    assert ev.of("error") == []
+    assert spy.calls == []
+    assert not [e for e in ev.of("tool") if e["tool"] in ("check_sap_base", "check_syntax")]
+
+
+async def test_cancelled_run_runs_no_run_end_check(monkeypatch):
+    spy = _CheckSpy().patch(monkeypatch)
+    gate, started = asyncio.Event(), asyncio.Event()
+
+    class Blocking(Script):
+        def _turn(self, messages, info):
+            started.set()
+            return super()._turn(messages, info)
+
+    _install(Blocking([("wait", gate, "never")]))
+    sid = await _session("design")
+    task = asyncio.create_task(runner.run_stage(sid, "alice", "x", emit=Events()))
+    await started.wait()
+    assert await runner.cancel(sid) is True
+    await asyncio.wait_for(task, timeout=5)
+    assert spy.calls == []
+
+
+@pytest.mark.parametrize("tool", ["check_sap_base", "check_syntax"])
+async def test_cancel_during_a_run_end_check_ends_its_event(monkeypatch, tool):
+    in_check = asyncio.Event()
+
+    async def hang(sid, *a, on_start=None, **kw):
+        if on_start is not None:
+            on_start(1)
+        in_check.set()
+        await asyncio.Event().wait()
+
+    async def nothing(sid, *a, **kw):
+        return []
+
+    if tool == "check_sap_base":
+        monkeypatch.setattr(basecheck, "check_bases", hang)
+        monkeypatch.setattr(syntaxcheck, "check_syntax", nothing)
+    else:
+        monkeypatch.setattr(basecheck, "check_bases", nothing)
+        monkeypatch.setattr(syntaxcheck, "check_syntax", hang)
+    _install(Script(["done"]))
+    sid = await _session("design")
+    ev = Events()
+    task = asyncio.create_task(runner.run_stage(sid, "alice", "x", emit=ev))
+    await asyncio.wait_for(in_check.wait(), timeout=5)
+    assert await runner.cancel(sid) is True
+    await asyncio.wait_for(task, timeout=5)
+    events = [e for e in ev.of("tool") if e["tool"] == tool]
+    assert events[0]["status"] == "running"
+    assert events[-1]["status"] == "error"
+    assert ev.kinds()[-1] == "done"

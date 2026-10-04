@@ -342,13 +342,41 @@ async def test_conventions_non_production_roundtrip():
     async with SessionLocal() as db:
         await upsert_conventions(db, "T_NP", label="Dev")
         assert (await get_conventions(db, "T_NP")).non_production is False
-        await upsert_conventions(db, "T_NP", non_production=True)
+        await upsert_conventions(db, "T_NP", actor="test-admin", non_production=True)
         assert (await get_conventions(db, "T_NP")).non_production is True
         # Other fields leave the flag alone; False switches it back off.
         await upsert_conventions(db, "T_NP", label="Dev 2")
         assert (await get_conventions(db, "T_NP")).non_production is True
-        await upsert_conventions(db, "T_NP", non_production=False)
+        await upsert_conventions(db, "T_NP", actor="test-admin", non_production=False)
         assert (await get_conventions(db, "T_NP")).non_production is False
+
+
+async def test_upsert_conventions_audits_every_flag_change():
+    """No helper flips ``non_production`` without an audit row: the upsert
+    refuses a flag change without an actor and audits one with an actor."""
+    async with SessionLocal() as db:
+        with pytest.raises(ValueError):
+            await upsert_conventions(db, "T_UPA", non_production=True)
+        assert await get_conventions(db, "T_UPA") is None
+        await upsert_conventions(db, "T_UPA", label="x")
+        with pytest.raises(ValueError):
+            await upsert_conventions(db, "T_UPA", non_production=True)
+        await db.rollback()
+        assert (await get_conventions(db, "T_UPA")).non_production is False
+
+        await upsert_conventions(db, "T_UPA", actor="test-admin", non_production=True)
+        # Unchanged value: no second row.
+        await upsert_conventions(db, "T_UPA", actor="test-admin", non_production=True)
+        await upsert_conventions(db, "T_UPA2", actor="test-admin", non_production=True)
+        rows = (await db.execute(
+            select(IdeAuditLog).where(
+                IdeAuditLog.action == "conventions_flag",
+                IdeAuditLog.target.in_(("T_UPA", "T_UPA2")),
+            )
+        )).scalars().all()
+        assert sorted((r.target, r.principal) for r in rows) == [
+            ("T_UPA", "test-admin"), ("T_UPA2", "test-admin"),
+        ]
 
 
 async def test_upsert_findings_updates_in_place():
@@ -430,13 +458,6 @@ async def test_upsert_findings_keeps_metadata_a_later_read_does_not_know():
                 by_ref["D2"].line) == ("T2", "ZP2", "ZI2", 5)
         assert by_ref["D3"].title == ""
 
-        # A masked run still clears the text, and only the text.
-        await upsert_findings(
-            db, s.id, [{"kind": "dump", "ref_id": "D1"}], clear_detail=True
-        )
-        by_ref = {r.ref_id: r for r in await list_findings(db, s.id)}
-        assert by_ref["D1"].detail is None
-        assert by_ref["D1"].program == "ZNEW"
 
 
 async def test_upsert_findings_rejects_bad_items():

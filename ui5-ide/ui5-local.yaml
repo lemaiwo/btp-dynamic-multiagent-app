@@ -11,7 +11,6 @@ framework:
     - name: sap.f
     - name: sap.tnt
     - name: sap.ui.layout
-    - name: sap.ui.codeeditor
     - name: themelib_sap_horizon
 server:
   customMiddleware:

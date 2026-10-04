@@ -547,8 +547,14 @@ async def test_registry_wraps_every_server():
 
     agent = build.specialists["ro-agent"]
     user_toolsets = list(getattr(agent, "_user_toolsets", ()) or ())
-    assert len(user_toolsets) == 2
-    assert all(isinstance(ts, ReadOnlyGuard) for ts in user_toolsets)
+    # Every server and built-in is guarded; the one other toolset is the
+    # app's own IDE session toolset (submit_document, Task B8), which is
+    # not an MCP server and lists nothing outside an IDE session run.
+    guarded = [ts for ts in user_toolsets if isinstance(ts, ReadOnlyGuard)]
+    others = [ts for ts in user_toolsets if not isinstance(ts, ReadOnlyGuard)]
+    assert len(guarded) == 2
+    assert len(others) == 1
+    assert "submit_document" in getattr(others[0].wrapped, "tools", {})
     assert not any(isinstance(c, ReadOnlyGuard) for c in build.mcp_clients)
 
 
@@ -583,15 +589,14 @@ def target_server(monkeypatch):
 @contextmanager
 def _scope(sid: str, session_type: str):
     """Bind an IDE scope as the runner does: a session that is not a change
-    session also gets its diagnose run (raw here: these tests are about the
-    policy; masking is covered in ``test_ide_masking_wiring.py``)."""
+    session also gets its diagnose run (these tests are about the policy)."""
     from agents.ide.diagnose import DiagnoseRun, current_diagnose
 
     scope = WorkspaceScope(
         session_id=sid, state=DeepState(run_id=sid), session_type=session_type
     )
     run = None if session_type == "change" else DiagnoseRun(
-        session_id=sid, owner="alice", target="T1", run_id="r", masking=False
+        session_id=sid, owner="alice", target="T1", run_id="r"
     )
     token = current_workspace.set(scope)
     run_token = current_diagnose.set(run)

@@ -35,7 +35,9 @@ export default abstract class BaseController extends Controller {
         const model = this.getOwnerComponentTyped().getModel("i18n") as unknown as {
             getResourceBundle(): { getText(k: string, a?: (string | number)[]): string };
         };
-        return model.getResourceBundle().getText(key, args);
+        // Formatted only with arguments: an empty list would run the text through MessageFormat,
+        // which drops a single apostrophe ("target's" -> "targets").
+        return model.getResourceBundle().getText(key, args?.length ? args : undefined);
     }
 
     /** Shows a failed call as a message box, worded by its status and code (model/errorText). */

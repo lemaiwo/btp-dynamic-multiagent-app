@@ -8,13 +8,10 @@ What this suite pins:
 * the list never carries the detail text;
 * on a ``non_production`` target the detail route serves the text stored
   with the finding, and ``?refresh=true`` re-reads it live;
-* on a target that is *not* (or no longer) ``non_production`` the stored
-  text is never served: the detail is re-read live through ``Arc1Client``
-  with the diagnose policy and masking on, and comes back without a
-  sentinel of the fixture;
+* on a target that is *not* (or no longer) ``non_production`` neither the
+  stored text is served nor SAP read: 409 ``target_not_non_production``;
 * a detail read writes nothing (row counts and the stored text unchanged);
-* the live re-read always uses ``policy="diagnose"`` and
-  ``masking=masking_required(conventions)``, and its arguments are built
+* the live re-read always uses ``policy="diagnose"``, and its arguments are built
   from the finding's kind and ``ref_id`` only;
 * "open source" maps program/include to a workspace file through
   ``paths.resolve_include`` and reads it with SAPRead and an explicit type;
@@ -22,7 +19,7 @@ What this suite pins:
 
 No network: either ``arc1.get_arc1_client`` is replaced (a recording fake),
 or the real ``Arc1Client`` runs with its ``_send`` replaced, so its policy
-check and masking are the real ones.
+check is the real one.
 
 Run:  python -m pytest tests/test_ide_findings_routes.py -q
 """
@@ -75,7 +72,7 @@ DUMP_DETAIL = (FIXTURES / "dump_detail.json").read_text()
 GATEWAY_DETAIL = (FIXTURES / "gateway_error_detail.json").read_text()
 ARC1_ERROR = (FIXTURES / "arc1_error.json").read_text()
 
-# What must never leave a masked target (the fixtures carry all of them).
+# What must never leave a target that lost its flag (the fixtures carry them).
 SENTINELS = [
     "DEVUSER01", "jane.doe@example.com", "123456789012",
     "BE71 0961 2345 6769", "RAWSENTINEL",
@@ -89,6 +86,10 @@ USERS = {
     "alice": {"user_name": "alice", "scope": ["developer"]},
     "bob": {"user_name": "bob", "scope": ["developer"]},
 }
+
+
+# A file opened by the route has no revision and nothing checked yet.
+UNCHECKED = {"revision": 0, "base_status": None, "syntax_status": None}
 
 
 def _pool(cls: str, suffix: str) -> str:
@@ -133,11 +134,10 @@ class FakeArc1:
         self.answer: str | None = None
         self.raise_exc: Exception | None = None
 
-    def factory(self, target: str, destination: str = "", policy: str = "change",
-                masking: bool = True):
+    def factory(self, target: str, destination: str = "", policy: str = "change"):
         fake = self
         fake.built.append({"target": target, "destination": destination,
-                           "policy": policy, "masking": masking})
+                           "policy": policy})
 
         class _Client:
             async def call(self, tool, args):
@@ -160,7 +160,7 @@ async def _clean_db():
         await db.commit()
         await upsert_conventions(db, "T1", label="Target one",
                                  destination="arc1-abap-readonly",
-                                 non_production=True)
+                                 actor="test-admin", non_production=True)
     arc1._SERVERS.clear()
     yield
     arc1._SERVERS.clear()
@@ -175,17 +175,17 @@ def fake(monkeypatch):
 
 @pytest.fixture
 def wire(monkeypatch):
-    """The real ``Arc1Client`` (policy check, JWT check, masking) with only
+    """The real ``Arc1Client`` (policy check, JWT check) with only
     the MCP round trip replaced. ``sent`` is what would have gone to ARC-1."""
     state = {"sent": [], "built": [], "answer": DUMP_DETAIL}
     real_factory = arc1.get_arc1_client
 
-    def factory(target, destination="", policy="change", masking=True):
-        state["built"].append({"policy": policy, "masking": masking})
-        return real_factory(target, destination, policy, masking)
+    def factory(target, destination="", policy="change"):
+        state["built"].append({"policy": policy})
+        return real_factory(target, destination, policy)
 
     async def _send(self, tool, args):
-        state["sent"].append((tool, dict(args), self.policy, self.masking))
+        state["sent"].append((tool, dict(args), self.policy))
         return state["answer"]
 
     monkeypatch.setattr(arc1, "get_arc1_client", factory)
@@ -228,7 +228,7 @@ async def _finding(sid: str, **fields) -> str:
 
 async def _flag(value: bool) -> None:
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", non_production=value)
+        await upsert_conventions(db, "T1", actor="test-admin", non_production=value)
 
 
 async def _counts() -> dict[str, int]:
@@ -366,7 +366,7 @@ async def test_detail_refresh_rereads_live_and_writes_nothing(client, fake):
     assert "DEVUSER01" in detail
     assert fake.calls == [("SAPDiagnose", {"action": "dumps", "id": DUMP_REF})]
     assert fake.built == [{"target": "T1", "destination": "arc1-abap-readonly",
-                           "policy": "diagnose", "masking": False}]
+                           "policy": "diagnose"}]
     assert await _counts() == before
     assert (await _stored(fid)).detail == STORED_RAW  # not replaced
 
@@ -385,7 +385,7 @@ async def test_detail_without_stored_text_reads_live(client, fake):
 @pytest.mark.parametrize("refresh", ["", "?refresh=true"])
 async def test_detail_is_refused_once_the_flag_is_gone(client, wire, refresh):
     """The target lost its ``non_production`` flag after a raw run stored
-    text: the stored text is not served and SAP is not read, masked or not."""
+    text: the stored text is not served and SAP is not read."""
     sid = await _session()
     fid = await _finding(sid, program=CALC_CP, line=12, detail=STORED_RAW)
     await _flag(False)
@@ -404,7 +404,7 @@ async def test_detail_is_refused_once_the_flag_is_gone(client, wire, refresh):
 
 
 async def test_detail_refused_when_conventions_are_gone(client, wire):
-    """No conventions row reads as "masking required": the same refusal, and
+    """No conventions row reads as production: the same refusal, and
     the stored text is not served."""
     sid = await _session()
     fid = await _finding(sid, detail=STORED_RAW)
@@ -426,9 +426,7 @@ async def test_detail_uses_diagnose_policy(client, fake):
     r = await client.get(_url(sid, fid), headers=_as("alice"))
     assert r.status_code == 409
     # The second read built no client at all.
-    assert [(b["policy"], b["masking"]) for b in fake.built] == [
-        ("diagnose", False),
-    ]
+    assert [b["policy"] for b in fake.built] == ["diagnose"]
 
 
 @pytest.mark.parametrize("kind,ref,expected", [
@@ -525,7 +523,7 @@ async def test_detail_never_sends_a_user_filter(client, wire):
     sid = await _session()
     fid = await _finding(sid, program="DEVUSER01", include="DEVUSER01")
     await client.get(_url(sid, fid), headers=_as("alice"))
-    [(tool, args, policy, _)] = wire["sent"]
+    [(tool, args, policy)] = wire["sent"]
     assert tool == "SAPDiagnose" and policy == "diagnose"
     assert set(args) == {"action", "id"}
 
@@ -537,6 +535,15 @@ async def _open(client, sid, fid, user="alice"):
     return await client.post(_url(sid, fid, "/open"), headers=_as(user))
 
 
+# B10: an opened file has its SAP base; the version-marker read is not a
+# source read.
+OPENED = {**UNCHECKED, "base_status": "sap"}
+
+
+def _reads(fake) -> list:
+    return [c for c in fake.calls if c[1].get("type") != "VERSIONS"]
+
+
 async def test_open_class_main_line_exact(client, fake):
     sid = await _session()
     fid = await _finding(sid, program=CALC_CP, include=CALC_CP, line=12)
@@ -544,13 +551,16 @@ async def test_open_class_main_line_exact(client, fake):
     assert r.status_code == 200, r.text
     assert r.json() == {
         "file": {"path": "src/CLAS/zcl_demo_calc.clas.abap", "state": "read",
-                 "object_type": "CLAS", "object_name": "ZCL_DEMO_CALC"},
+                 "object_type": "CLAS", "object_name": "ZCL_DEMO_CALC", **OPENED},
         "line": 12, "hint": None,
     }
-    assert fake.calls == [("SAPRead", {"type": "CLAS", "name": "ZCL_DEMO_CALC"})]
+    assert _reads(fake) == [("SAPRead", {"type": "CLAS", "name": "ZCL_DEMO_CALC"})]
+    # B10: the version marker is read too, through the same client.
+    assert ("SAPRead", {"type": "VERSIONS", "objectType": "CLAS",
+                        "name": "ZCL_DEMO_CALC"}) in fake.calls
     # The read belongs to the session: its type is the policy.
     assert fake.built == [{"target": "T1", "destination": "arc1-abap-readonly",
-                           "policy": "diagnose", "masking": False}]
+                           "policy": "diagnose"}]
     r = await client.get(f"/ide/api/sessions/{sid}/file",
                          params={"path": "src/CLAS/zcl_demo_calc.clas.abap"},
                          headers=_as("alice"))
@@ -567,7 +577,7 @@ async def test_open_method_include_gives_hint(client, fake):
     assert body["file"]["path"] == "src/CLAS/zcl_demo_calc.clas.abap"
     assert body["line"] is None
     assert body["hint"] == "method include CM001, line 12"
-    assert fake.calls == [("SAPRead", {"type": "CLAS", "name": "ZCL_DEMO_CALC"})]
+    assert _reads(fake) == [("SAPRead", {"type": "CLAS", "name": "ZCL_DEMO_CALC"})]
 
 
 async def test_open_method_include_without_line(client, fake):
@@ -600,10 +610,10 @@ async def test_open_local_implementations_section(client, fake):
     assert r.json() == {
         "file": {"path": "src/CLAS/zcl_demo_calc.clas.implementations.abap",
                  "state": "read", "object_type": "CLAS",
-                 "object_name": "ZCL_DEMO_CALC"},
+                 "object_name": "ZCL_DEMO_CALC", **OPENED},
         "line": 7, "hint": None,
     }
-    assert fake.calls == [("SAPRead", {"type": "CLAS", "name": "ZCL_DEMO_CALC",
+    assert _reads(fake) == [("SAPRead", {"type": "CLAS", "name": "ZCL_DEMO_CALC",
                                       "include": "implementations"})]
 
 
@@ -616,17 +626,17 @@ async def test_open_program_and_include(client, fake):
     r = await _open(client, sid, prog)
     assert r.json() == {
         "file": {"path": "src/PROG/zdemo_report.prog.abap", "state": "read",
-                 "object_type": "PROG", "object_name": "ZDEMO_REPORT"},
+                 "object_type": "PROG", "object_name": "ZDEMO_REPORT", **OPENED},
         "line": 4, "hint": None,
     }
     r = await _open(client, sid, incl)
     assert r.status_code == 200, r.text
     assert r.json() == {
         "file": {"path": "src/INCL/lzdemo_fgu01.prog.abap", "state": "read",
-                 "object_type": "INCL", "object_name": "LZDEMO_FGU01"},
+                 "object_type": "INCL", "object_name": "LZDEMO_FGU01", **OPENED},
         "line": 9, "hint": None,
     }
-    assert fake.calls == [
+    assert _reads(fake) == [
         ("SAPRead", {"type": "PROG", "name": "ZDEMO_REPORT"}),
         ("SAPRead", {"type": "INCL", "name": "LZDEMO_FGU01"}),
     ]
@@ -635,7 +645,7 @@ async def test_open_program_and_include(client, fake):
                           params={"path": "src/INCL/lzdemo_fgu01.prog.abap"},
                           headers=_as("alice"))
     assert r.status_code == 200, r.text
-    assert fake.calls[-1] == ("SAPRead", {"type": "INCL", "name": "LZDEMO_FGU01"})
+    assert _reads(fake)[-1] == ("SAPRead", {"type": "INCL", "name": "LZDEMO_FGU01"})
 
 
 @pytest.mark.parametrize("fields", [

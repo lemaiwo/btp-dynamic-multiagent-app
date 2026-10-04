@@ -94,7 +94,7 @@ async def _clean_db():
         await db.commit()
         await upsert_conventions(db, "T1", label="Target one",
                                  destination="arc1-abap-readonly",
-                                 non_production=True)
+                                 actor="test-admin", non_production=True)
     arc1._SERVERS.clear()
     saved = registry_module.registry._build
     registry_module.registry._build = None  # a run that starts ends agent_missing
@@ -108,8 +108,8 @@ def sent(monkeypatch):
     """Every ARC-1 client built and every call made; none reaches a network."""
     seen: list = []
 
-    def factory(target, destination="", policy="change", masking=True):
-        seen.append(("built", policy, masking))
+    def factory(target, destination="", policy="change"):
+        seen.append(("built", policy))
 
         class _Client:
             async def call(self, tool, args):
@@ -160,7 +160,7 @@ async def _finding(sid: str, **fields) -> str:
 async def _lose_flag(how: str) -> None:
     async with SessionLocal() as db:
         if how == "flag_off":
-            await upsert_conventions(db, "T1", non_production=False)
+            await upsert_conventions(db, "T1", actor="test-admin", non_production=False)
         else:  # the conventions row is gone
             await db.execute(IdeConventions.__table__.delete())
             await db.commit()
@@ -316,7 +316,9 @@ async def test_direct_reads_work_while_the_target_is_flagged(client, sent):
     ):
         assert r.status_code == 200, r.text
     assert [s[0] for s in sent if s[0] != "built"] == [
-        "SAPDiagnose", "SAPRead", "SAPRead", "SAPLint", "SAPRead",
+        # B10: open and refresh also read the version marker (SAPRead VERSIONS).
+        "SAPDiagnose", "SAPRead", "SAPRead", "SAPRead", "SAPRead", "SAPLint",
+        "SAPRead", "SAPRead",
     ]
 
 
@@ -390,7 +392,7 @@ async def test_change_session_is_unaffected(client, sent, how):
         ):
             assert r.status_code == 200, r.text
         assert [s[0] for s in sent if s[0] != "built"] == [
-            "SAPRead", "SAPLint", "SAPRead",
+            "SAPRead", "SAPRead", "SAPLint", "SAPRead", "SAPRead",
         ]
         assert {s[1] for s in sent if s[0] == "built"} == {"change"}
     async with SessionLocal() as db:

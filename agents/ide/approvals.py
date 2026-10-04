@@ -57,8 +57,9 @@ principal (the approval row has no ``decided_by``) and comes with one INFO
 line on the ``agents.ide.audit`` logger.
 
 Audit rows hold the parameters without the free-text description, plus the
-approval id. The description lives only on the approval row -- masked and
-cut to 60 characters whatever the target -- and goes with the session.
+approval id. The description lives only on the approval row -- control
+characters removed, e-mail addresses replaced by ``[EMAIL]`` and cut to 60
+characters whatever the target -- and goes with the session.
 
 **Timeouts.** When ARC-1 does not answer in time nobody knows whether the
 trace was armed. The approval fails with ``arc1_timeout_unknown`` and a note
@@ -80,8 +81,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agents.db import SessionLocal
 from agents.ide import arc1, readonly, store
 from agents.ide.diagnose import DiagnoseRun
-from agents.ide.masking import mask_text
-from agents.ide.models import IdeApproval, IdeSession, utcnow
+from agents.ide.models import IdeApproval, IdeSession, iso_utc, utcnow
+from agents.ide.schemas import ApprovalAction, ApprovalStatus, coerce_member
 from agents.ide.store import approval_ttl_min
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,12 @@ AUDIT_OUTCOMES = ("approved", "ok", "denied", "failed", "expired", "cancelled")
 TIMEOUT_NOTE = "may have been armed; check trace_requests"
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\s]+")
+# E-mail addresses in a description: found from the ``@`` (also URL-encoded,
+# ``%40``/``%2540``) and widened to the address, which is linear; a pattern
+# that starts at the local part is quadratic on a long token.
+_AT_RE = re.compile(r"@|%(?:25){0,8}40")
+_DOMAIN_RE = re.compile(r"[\w\-]{1,63}(?:\.[\w\-]{1,63}){1,8}")
+_LOCAL_EXTRA = frozenset("._%+-")
 _CODE_RE = re.compile(r"[a-z0-9_]{1,64}")
 
 
@@ -183,13 +190,45 @@ def _flag(args: dict, key: str) -> bool:
     return value
 
 
+def _redact_emails(text: str) -> str:
+    """``text`` with every e-mail address replaced by ``[EMAIL]``."""
+    out: list[str] = []
+    done = 0
+    for m in _AT_RE.finditer(text):
+        if m.start() < done:
+            continue
+        domain = _DOMAIN_RE.match(text, m.end())
+        if domain is None:
+            continue
+        start = m.start()
+        while start > done and (
+            text[start - 1].isalnum() or text[start - 1] in _LOCAL_EXTRA
+        ):
+            start -= 1
+        if start == m.start():
+            continue
+        out.append(text[done:start])
+        out.append("[EMAIL]")
+        done = domain.end()
+    if not out:
+        return text
+    out.append(text[done:])
+    return "".join(out)
+
+
 def _description(args: dict) -> str:
+    """The proposal's free text, as it may be shown and stored.
+
+    Control characters go, and e-mail addresses are replaced whatever the
+    target (decision D6 of the IDE redesign): the description is kept with
+    the approval and the developer sees it in the decision card, and an
+    address there is never needed to arm a trace. Redacted before the cut,
+    so a cut cannot leave half an address behind.
+    """
     value = args.get("description", "")
     if not isinstance(value, str):
         raise _invalid("description must be text")
-    text = _CONTROL_RE.sub(" ", value).strip()
-    # Masked whatever the target: this text is stored in the audit trail.
-    text = _CONTROL_RE.sub(" ", mask_text(text)).strip()
+    text = _CONTROL_RE.sub(" ", _redact_emails(value)).strip()
     return text[:DESCRIPTION_MAX].strip()
 
 
@@ -226,7 +265,7 @@ def normalize_request(action: str, args: Any) -> dict[str, Any]:
 
 
 def _iso(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    return iso_utc(value)
 
 
 def _loads(text: str | None) -> Any:
@@ -247,9 +286,15 @@ def approval_json(row: IdeApproval) -> dict[str, Any]:
     result = _loads(row.result_json)
     return {
         "id": row.id,
-        "action": row.action,
+        # Values outside the contract are coerced (WARNING), never a 500:
+        # ``failed`` offers no decision, ``trace_cancel`` arms nothing.
+        "action": coerce_member(
+            row.action, ApprovalAction, "trace_cancel", "approval action"
+        ),
         "params": params if isinstance(params, dict) else {},
-        "status": row.status,
+        "status": coerce_member(
+            row.status, ApprovalStatus, "failed", "approval status"
+        ),
         "created_at": _iso(row.created_at),
         "ttl_min": approval_ttl_min(),
         "decided_at": _iso(row.decided_at),

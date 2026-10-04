@@ -2,7 +2,8 @@
 
 ``format_event`` turns one runner event into an SSE frame
 ``event: <type>\\ndata: <json>\\n\\n``. The event types are the runner's:
-``run``, ``text``, ``tool``, ``plan``, ``file``, ``artifact``, ``finding``,
+``run``, ``text``, ``tool``, ``plan``, ``file``, ``artifact``, ``comments``
+(request-changes runs: ``{ids, state}``), ``finding``,
 ``approval_required`` (the last two in diagnose sessions only), ``usage``,
 ``error`` and ``done``. The JSON is written with
 ``ensure_ascii=False``; ``json.dumps`` always escapes CR and LF inside

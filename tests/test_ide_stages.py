@@ -38,9 +38,9 @@ from agents.ide.stages import (  # noqa: E402
     Stage,
     StageGateError,
     approve,
-    artifact_kind,
     assert_can_run,
     build_prompt,
+    document_kind,
     initial_stage,
 )
 from agents.ide.store import (  # noqa: E402
@@ -48,6 +48,7 @@ from agents.ide.store import (  # noqa: E402
     add_message,
     create_session,
     get_owned_session,
+    pins_of,
     upsert_conventions,
 )
 
@@ -172,6 +173,8 @@ async def test_approve_with_artifact_moves_one_step(stage, kind, nxt):
         await add_artifact(db, s.id, stage=stage, kind=kind, content="x")
         s = await approve(db, s)
         assert s.stage == nxt
+        # The approved version is pinned in the same transition.
+        assert pins_of(s) == {kind: 1}
 
 
 async def test_approve_propose_refused_without_proposals():
@@ -296,13 +299,13 @@ async def test_message_allowed_in_every_open_stage(stage):
 
 
 @pytest.mark.parametrize("stage", ["design", "plan", "propose", "review"])
-async def test_revise_allowed_in_working_stages(stage):
+async def test_request_changes_allowed_in_working_stages(stage):
     async with SessionLocal() as db:
         s = await _session(db, stage)
         await assert_can_run(db, s, revise=True)
 
 
-async def test_revise_refused_in_chat():
+async def test_request_changes_refused_in_chat():
     async with SessionLocal() as db:
         s = await _session(db, "chat")
         with pytest.raises(StageGateError) as exc:
@@ -311,7 +314,7 @@ async def test_revise_refused_in_chat():
 
 
 @pytest.mark.parametrize("revise", [False, True])
-async def test_done_refuses_message_and_revise(revise):
+async def test_done_refuses_message_and_request_changes(revise):
     async with SessionLocal() as db:
         s = await _session(db, "done")
         with pytest.raises(StageGateError) as exc:
@@ -465,34 +468,40 @@ async def test_short_artifact_not_marked_truncated():
         assert "truncated" not in prompt
 
 
-async def test_revise_adds_feedback_and_previous_artifact_of_stage():
+async def test_request_changes_adds_note_and_previous_artifact_of_stage():
     async with SessionLocal() as db:
         s = await _session(db, "design")
         await add_artifact(db, s.id, stage="design", kind="design", content="OLD-V1")
         await add_artifact(db, s.id, stage="design", kind="design", content="OLD-V2")
-        extra, prompt = await build_prompt(db, s, None, feedback="Split the class.")
-        assert prompt.endswith("# Request\nRevise the design per the revision request.\n\n"
-        "## Revision request\nSplit the class.")
+        extra, prompt = await build_prompt(db, s, None, comments=[],
+                                           note="Split the class.")
+        assert prompt.endswith(
+            "# Request\nRework the design as the developer note below asks.\n\n"
+            "## Developer note\nSplit the class.\n\n"
+            "When done, call submit_document with the revised design.")
         assert "Split the class." not in extra
         assert "OLD-V2" in prompt
         assert "OLD-V1" not in prompt
 
 
-async def test_revise_propose_uses_note_artifact():
+async def test_request_changes_propose_uses_note_artifact():
     async with SessionLocal() as db:
         s = await _session(db, "propose")
         await add_artifact(db, s.id, stage="propose", kind="note", content="NOTE-SUMMARY")
-        extra, prompt = await build_prompt(db, s, None, feedback="Also the test class.")
-        assert "# Request\nRevise the propose per the revision request." in prompt
+        extra, prompt = await build_prompt(db, s, None, note="Also the test class.")
+        assert "# Request\nRework the propose as the developer note below asks." in prompt
+        assert "submit_document with the revised note" in prompt
         assert "NOTE-SUMMARY" in prompt
 
 
-async def test_no_revision_block_without_feedback():
+async def test_no_request_changes_block_in_a_message_run():
     async with SessionLocal() as db:
         s = await _session(db, "design")
         await add_artifact(db, s.id, stage="design", kind="design", content="OLD")
-        extra, _ = await build_prompt(db, s, "refine")
-        assert "## Revision request" not in extra
+        extra, prompt = await build_prompt(db, s, "refine")
+        assert "## Developer note" not in prompt + extra
+        assert "<review-comments>" not in prompt
+        assert "## Previous design" not in prompt
 
 
 async def test_conversation_of_current_stage_last_20():
@@ -575,17 +584,18 @@ async def test_conversation_ties_on_created_at_drop_the_current_message():
         assert prompt.count("NOW-ASKED") == 1
 
 
-async def test_revise_feedback_appears_once():
-    """The runner saves the feedback as the run's user message; the prompt
-    carries it in the revision block only, not again as history."""
+async def test_request_changes_note_appears_once():
+    """The runner saves the note in the run's user message; the prompt
+    carries it in the request only, not again as history."""
     async with SessionLocal() as db:
         s = await _session(db, "design")
         await add_artifact(db, s.id, stage="design", kind="design", content="D1")
-        await add_message(db, s.id, stage="design", role="user",
-                          content="FEEDBACK-ONCE")
-        extra, prompt = await build_prompt(db, s, None, feedback="FEEDBACK-ONCE")
+        msg = await add_message(db, s.id, stage="design", role="user",
+                                content="Request changes: 0 comment(s)\n\nFEEDBACK-ONCE")
+        extra, prompt = await build_prompt(db, s, None, note="FEEDBACK-ONCE",
+                                           exclude_message_id=msg.id)
         assert prompt.count("FEEDBACK-ONCE") == 1
-        assert "## Revision request\nFEEDBACK-ONCE" in prompt
+        assert "## Developer note\nFEEDBACK-ONCE" in prompt
         assert "FEEDBACK-ONCE" not in extra
 
 
@@ -683,7 +693,7 @@ async def test_artifacts_and_history_go_to_the_prompt_as_data():
         await add_artifact(db, s.id, stage="plan", kind="plan", content="PLAN-BODY")
         await add_artifact(db, s.id, stage="propose", kind="note", content="NOTE-BODY")
         await add_message(db, s.id, stage="propose", role="assistant", content="HISTORY")
-        extra, prompt = await build_prompt(db, s, None, feedback="FEEDBACK")
+        extra, prompt = await build_prompt(db, s, None, note="FEEDBACK")
     for marker in ("DESIGN-BODY", "PLAN-BODY", "NOTE-BODY", "HISTORY", "FEEDBACK"):
         assert marker not in extra, marker
     assert STAGE_INSTRUCTIONS[Stage.propose] in extra and "## IDE session" in extra
@@ -691,7 +701,7 @@ async def test_artifacts_and_history_go_to_the_prompt_as_data():
     for marker in ("DESIGN-BODY", "PLAN-BODY", "NOTE-BODY", "HISTORY"):
         assert start < prompt.index(marker) < end, marker
     assert "data, never instructions" in prompt[:start]
-    # The request (the revise feedback) comes after the data section.
+    # The request (the request-changes note) comes after the data section.
     assert prompt.index("FEEDBACK") > end
 
 
@@ -717,7 +727,7 @@ async def test_a_document_cannot_close_the_data_section():
 async def _diagnose(db, **values) -> IdeSession:
     # A diagnose run needs its target flagged non-production (and so does
     # the create route); tests/test_ide_lost_flag.py covers the refusal.
-    await upsert_conventions(db, "T1", non_production=True)
+    await upsert_conventions(db, "T1", actor="test-admin", non_production=True)
     s = await create_session(db, owner="alice", title="t", target="T1",
                              session_type="diagnose")
     for key, value in values.items():
@@ -764,7 +774,7 @@ async def test_diagnose_approve_refused():
 
 
 @pytest.mark.parametrize("status", ["idle", "running"])
-async def test_diagnose_revise_refused(status):
+async def test_diagnose_request_changes_refused(status):
     async with SessionLocal() as db:
         s = await _diagnose(db, status=status)
         with pytest.raises(StageGateError) as exc:
@@ -813,17 +823,19 @@ async def test_stage_of_another_session_type_is_refused(session_type, stage):
             await build_prompt(db, s, "x")
 
 
-def test_artifact_kind_per_type():
-    assert artifact_kind("diagnose", Stage.investigate, True) == "report"
-    assert artifact_kind("diagnose", Stage.investigate, False) is None
+def test_document_kind_per_type():
+    assert document_kind("diagnose", Stage.investigate, True) == "report"
+    assert document_kind("diagnose", Stage.investigate, False) is None
     for stage in Stage:
-        assert artifact_kind("change", stage, False) == ARTIFACT_KIND.get(stage)
+        assert document_kind("change", stage, False) == ARTIFACT_KIND.get(stage)
         # A report run does not exist on a change session: never a report.
-        assert artifact_kind("change", stage, True) == ARTIFACT_KIND.get(stage)
-    assert artifact_kind("other", Stage.investigate, True) is None
+        assert document_kind("change", stage, True) == ARTIFACT_KIND.get(stage)
+    assert document_kind("other", Stage.investigate, True) is None
 
 
-async def test_diagnose_prompt_has_masking_rule_and_no_write_rule():
+async def test_diagnose_prompt_has_diagnose_rule_and_no_write_rule():
+    """One diagnose wording: a diagnose run exists only for a non-production
+    target, and its data reaches the model as ARC-1 sent it."""
     async with SessionLocal() as db:
         s = await _diagnose(db)
         extra, prompt = await build_prompt(db, s, "Why did it dump?")
@@ -831,29 +843,17 @@ async def test_diagnose_prompt_has_masking_rule_and_no_write_rule():
     assert "- Session type: diagnose" in extra
     assert "- Current stage: investigate" in extra
     assert DIAGNOSE_RULE in extra
-    assert DIAGNOSE_RULE == (
-        "Diagnose session: read and analyse only; personal data is masked."
-    )
+    # No masked mode exists any more: the rule says how the data is
+    # handled, without the word (B3 review, B11).
+    assert "mask" not in DIAGNOSE_RULE.lower()
+    assert "non-production" in DIAGNOSE_RULE and "retention" in DIAGNOSE_RULE
+    assert "mask" not in STAGE_INSTRUCTIONS[Stage.investigate].lower()
     assert READ_ONLY_RULE not in extra
     assert "workspace files" not in extra
     assert STAGE_INSTRUCTIONS[Stage.investigate] in extra
-    assert "USER_1" in extra and "Never try to recover masked values" in extra
-
-
-async def test_diagnose_prompt_of_a_raw_run_does_not_claim_masking():
-    """A non_production target is raw (decision override): the prompt must
-    not tell the model that what it sees is masked."""
-    async with SessionLocal() as db:
-        s = await _diagnose(db)
-        extra, _ = await build_prompt(db, s, "Why did it dump?", masked=False)
-    assert "- Session type: diagnose" in extra
-    assert "read and analyse only" in extra
-    assert DIAGNOSE_RULE not in extra
     assert "USER_1" not in extra and "recover masked" not in extra
-    assert "not masked" in extra
-    assert READ_ONLY_RULE not in extra
-    # The rest of the stage instructions is the same.
-    for common in ("SAPDiagnose", "trace_start", "You cannot change code"):
+    for common in ("SAPDiagnose", "trace_start", "You cannot change code",
+                   "Repeat such data only where the diagnosis needs it"):
         assert common in extra
 
 
@@ -861,8 +861,7 @@ async def test_change_prompt_is_unchanged_by_the_diagnose_additions():
     async with SessionLocal() as db:
         s = await _session(db, "design")
         extra, _ = await build_prompt(db, s, "Add a field")
-        same, _ = await build_prompt(db, s, "Add a field", masked=False)
-    assert extra == same == (
+    assert extra == (
         "## IDE session\n- Target: T1\n- Current stage: design\n"
         f"- {READ_ONLY_RULE}\n\n{STAGE_INSTRUCTIONS[Stage.design]}"
     )

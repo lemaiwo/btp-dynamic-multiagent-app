@@ -2,7 +2,7 @@
   "name": "ui5-ide",
   "version": "1.0.0",
   "private": true,
-  "description": "SAPUI5 ABAP developer workbench for the dynamic multi-agent app",
+  "description": "ABAP Assistant: SAPUI5 app for the dynamic multi-agent app",
   "scripts": {
     "start": "ui5 serve --config ui5-local.yaml --open index.html",
     "build:ui5": "ui5 build --config ui5.yaml --clean-dest --dest dist && node -e \"require('fs').copyFileSync('xs-app.json','dist/xs-app.json')\"",
@@ -10,6 +10,7 @@
     "test": "npm run ts:check && karma start karma.conf.js --single-run",
     "test:watch": "karma start karma.conf.js",
     "test:e2e": "playwright test",
+    "test:e2e:stream": "playwright test -c playwright.stream.config.ts",
     "vendor:diff": "node -e \"require('fs').copyFileSync('node_modules/diff/dist/diff.min.js','webapp/vendor/diff.min.js')\""
   },
   "devDependencies": {

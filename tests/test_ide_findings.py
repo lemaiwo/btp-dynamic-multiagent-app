@@ -1,10 +1,10 @@
 """Findings from diagnose tool results (plan 1c Task 8, override 2026-10-03).
 
 ``agents.ide.findings.extract`` turns one ``SAPDiagnose`` data result into
-finding metadata. The guard calls it on what the model was given: the masked
-text in a masked run, ARC-1's own text on a ``non_production`` target. The
-raw detail text is collected only in the second case, and the runner stores
-it only then.
+finding metadata. The guard calls it on what the model was given -- ARC-1's
+own text (a diagnose run exists only for a ``non_production`` target) -- and
+collects the detail text, which the runner stores with the finding. The
+metadata itself never carries free text or personal data.
 
 Run:  python -m pytest tests/test_ide_findings.py -q
 """
@@ -12,7 +12,6 @@ Run:  python -m pytest tests/test_ide_findings.py -q
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import json
 import logging
 import os
@@ -47,9 +46,8 @@ from pydantic_ai.models.function import (  # noqa: E402
     FunctionModel,
 )
 from pydantic_ai.toolsets import FunctionToolset  # noqa: E402
-from sqlalchemy import select  # noqa: E402
 
-from agents.db import Base, SessionLocal, init_db  # noqa: E402
+from agents.db import SessionLocal, init_db  # noqa: E402
 from agents.deep import (  # noqa: E402
     DeepConfig,
     DeepState,
@@ -59,7 +57,6 @@ from agents.deep import (  # noqa: E402
 )
 from agents.ide import diagnose, findings, runner  # noqa: E402
 from agents.ide.diagnose import DiagnoseRun, current_diagnose  # noqa: E402
-from agents.ide.masking import Masker, mask_result  # noqa: E402
 from agents.ide.models import (  # noqa: E402
     IdeApproval,
     IdeArtifact,
@@ -100,10 +97,6 @@ T = "SAPDiagnose"
 
 def load(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8")
-
-
-def masked(args: dict, text: str, tool: str = T) -> str:
-    return mask_result(tool, args, text, Masker())
 
 
 def assert_clean(text: str, where: str = "") -> None:
@@ -159,33 +152,23 @@ EXPECTED = {
 
 
 @pytest.mark.parametrize("fixture", sorted(EXPECTED))
-@pytest.mark.parametrize("mode", ["masked", "raw"])
-def test_shape_yields_metadata(fixture, mode):
-    """The metadata is the same whether the text was masked or not: it is
-    built from identifiers, numbers and timestamps, which masking keeps."""
+def test_shape_yields_metadata(fixture):
+    """Metadata is built from identifiers, numbers and timestamps only."""
     args, expected = EXPECTED[fixture]
-    text = load(fixture)
-    if mode == "masked":
-        text = masked(args, text)
-    got = findings.extract(T, args, text)
+    got = findings.extract(T, args, load(fixture))
     assert got == expected
     assert all(set(f) == KEYS for f in got)
-    assert_clean(json.dumps(got), f"in {fixture} metadata ({mode})")
+    assert_clean(json.dumps(got), f"in {fixture} metadata")
 
 
-def test_odata_perf_masked_and_raw():
+def test_odata_perf():
     args = {"action": "odata_perf", "url": "/sap/opu/odata/sap/ZDEMO_SRV/Partners"}
     raw = findings.extract(T, args, load("odata_perf.json"))
     assert raw == [meta(
         "odata_call", "/sap/opu/odata/sap/ZDEMO_SRV/Partners('123456789012')",
         "OData timing", occurred_at="2026-10-03T10:22:00Z",
     )]
-    [got] = findings.extract(T, args, masked(args, load("odata_perf.json")))
-    assert set(got) == KEYS
-    assert (got["kind"], got["title"]) == ("odata_call", "OData timing")
-    assert got["ref_id"].startswith("/sap/opu/odata/sap/ZDEMO_SRV/Partners")
-    assert "?" not in got["ref_id"] and "filter" not in got["ref_id"]
-    assert_clean(json.dumps(got), "in the odata finding")
+    assert "?" not in raw[0]["ref_id"] and "filter" not in raw[0]["ref_id"]
 
 
 def test_auth_rows_that_passed_are_no_finding():
@@ -202,19 +185,6 @@ def test_auth_rows_that_passed_are_no_finding():
 def test_prefixed_tool_name_is_recognised():
     got = findings.extract("arc1_SAPDiagnose", {"action": "dumps"}, load("dumps_list.json"))
     assert len(got) == 3
-
-
-def test_titles_are_masked():
-    """Extraction runs on what masking left, so a user name that sits where
-    a title comes from is a pseudonym by the time it is a title."""
-    args = {"action": "traces"}
-    payload = json.dumps({"traces": [{
-        "id": "ATRA_1", "objectName": "DEVUSER01", "user": "DEVUSER01",
-        "timestamp": "2026-10-03T10:15:00Z",
-    }]})
-    [got] = findings.extract(T, args, masked(args, payload))
-    assert got["title"] == "USER_1"
-    assert_clean(json.dumps(got))
 
 
 def test_titles_never_carry_free_text():
@@ -236,7 +206,6 @@ def test_titles_never_carry_free_text():
     ({"action": "dumps"}, load("unknown_shape.json")),
     ({"action": "dumps"}, load("not_json.txt")),
     ({"action": "dumps"}, load("arc1_error.json")),
-    ({"action": "dumps"}, masked({"action": "dumps"}, load("unknown_shape.json"))),
     ({"action": "sql_trace_state"}, json.dumps({"active": True})),
     ({"action": "trace_requests"}, load("trace_requests.json")),
     ({"action": "traces", "id": "A1", "analysis": "hitlist"}, load("trace_hitlist.json")),
@@ -415,21 +384,6 @@ async def test_store_detail_upsert_and_read(clean_db):
         assert (await list_findings(db, sid))[0].detail == "the dump text"
 
 
-async def test_store_clear_detail_never_writes_and_removes(clean_db):
-    """What a masked run passes: no detail is written, and text an earlier
-    raw run stored for the same finding is removed."""
-    sid = await _session()
-    async with SessionLocal() as db:
-        await upsert_findings(db, sid, [{**DUMP_1, "detail": "raw text"}])
-        [row] = await upsert_findings(
-            db, sid, [{**DUMP_1, "detail": "must not land"}], clear_detail=True)
-        assert row.detail is None
-        [new] = await upsert_findings(
-            db, sid, [{**meta("dump", "D2", "X"), "detail": "nor this"}],
-            clear_detail=True)
-        assert new.detail is None
-
-
 def test_finding_out_is_the_contract():
     from datetime import datetime, timezone
 
@@ -472,13 +426,13 @@ def target_servers(monkeypatch):
 
 
 class bound:
-    def __init__(self, session_type="diagnose", masking: bool | None = True):
+    def __init__(self, session_type="diagnose"):
         self.scope = WorkspaceScope(
             session_id=SID, state=DeepState(run_id=SID), session_type=session_type
         )
-        self.run = None if masking is None else DiagnoseRun(
+        self.run = DiagnoseRun(
             session_id=SID, owner="alice", target="T1", run_id="r-1",
-            destination=DEST, masking=masking,
+            destination=DEST,
         )
 
     def __enter__(self):
@@ -506,21 +460,9 @@ LIST = (T, {"action": "dumps"})
 DETAIL = (T, {"action": "dumps", "id": DUMP_ID})
 
 
-async def test_guard_collects_metadata_only_in_a_masked_run(target_servers):
+async def test_guard_collects_detail(target_servers):
     calls: list = []
-    with bound(masking=True) as b:
-        await Agent().run("go", model=scripted([[LIST], [DETAIL], "done"]),
-                          toolsets=[ReadOnlyGuard(arc1_toolset(calls))])
-    assert calls == ["dumps", "dumps"]
-    assert len(b.run.findings) == 3
-    assert b.run.findings[0] == DUMP_1
-    assert all("detail" not in f for f in b.run.findings)
-    assert_clean(json.dumps(b.run.findings), "in a masked run's findings")
-
-
-async def test_guard_collects_detail_in_a_raw_run(target_servers):
-    calls: list = []
-    with bound(masking=False) as b:
+    with bound() as b:
         await Agent().run("go", model=scripted([[DETAIL], [LIST], "done"]),
                           toolsets=[ReadOnlyGuard(arc1_toolset(calls))])
     assert len(b.run.findings) == 3
@@ -533,7 +475,7 @@ async def test_guard_collects_detail_in_a_raw_run(target_servers):
 async def test_guard_collects_nothing_from_other_calls(target_servers):
     """Source checks, unknown shapes, another server and change sessions."""
     calls: list = []
-    with bound(masking=False) as b:
+    with bound() as b:
         await Agent().run(
             "go",
             model=scripted([[(T, {"action": "atc"})],
@@ -543,7 +485,7 @@ async def test_guard_collects_nothing_from_other_calls(target_servers):
 
     other = arc1_toolset(calls)
     target_servers.append(arc1_toolset([]))  # the target is some other toolset
-    with bound(masking=False) as b:
+    with bound() as b:
         await Agent().run("go", model=scripted([[LIST], "done"]),
                           toolsets=[ReadOnlyGuard(other)])
     assert b.run.findings == []  # refused under the change policy
@@ -564,7 +506,7 @@ async def test_extraction_failure_does_not_break_the_call(target_servers, monkey
         seen.append(type(back[-1]).__name__)
         return ModelResponse(parts=[TextPart("done")])
 
-    with bound(masking=False) as b:
+    with bound() as b:
         result = await Agent().run("go", model=FunctionModel(fn),
                                    toolsets=[ReadOnlyGuard(arc1_toolset([]))])
     assert result.output == "done" and seen == ["ToolReturnPart"]
@@ -587,8 +529,7 @@ async def _child_stream(messages: list[ModelMessage], info: AgentInfo):
         yield part.content
 
 
-@pytest.mark.parametrize("masking", [True, False])
-async def test_delegate_findings_land_in_the_same_run(target_servers, masking):
+async def test_delegate_findings_land_in_the_same_run(target_servers):
     from agents.registry import _attach_delegation_tool, _sanitize_tool_name
 
     specialist = Agent(
@@ -605,14 +546,13 @@ async def test_delegate_findings_land_in_the_same_run(target_servers, masking):
 
     parent = Agent(FunctionModel(parent_fn))
     _attach_delegation_tool(parent, specialist, row)  # type: ignore[arg-type]
-    with bound(masking=masking) as b:
+    with bound() as b:
         await parent.run("hi")
     assert [f["ref_id"] for f in b.run.findings] == [DUMP_ID]
-    assert ("detail" in b.run.findings[0]) is (not masking)
+    assert "User: DEVUSER01" in b.run.findings[0]["detail"]
 
 
-@pytest.mark.parametrize("masking", [True, False])
-async def test_deep_subagent_findings_land_in_the_same_run(target_servers, masking):
+async def test_deep_subagent_findings_land_in_the_same_run(target_servers):
     def fn(messages, info):
         if "task" not in {t.name for t in info.function_tools}:  # the sub-agent
             return _child_fn(messages, info)
@@ -624,11 +564,11 @@ async def test_deep_subagent_findings_land_in_the_same_run(target_servers, maski
     servers = [ReadOnlyGuard(arc1_toolset([]))]
     cfg = DeepConfig(enabled=True, subagent_max_depth=1, subagent_instructions="")
     ts = deep_toolset(cfg, parent_toolsets=servers, model=model, agent_name="p")
-    with bound(masking=masking) as b:
+    with bound() as b:
         result = await Agent().run("go", model=model, toolsets=[*servers, ts])
     assert result.output == "done"
     assert [f["ref_id"] for f in b.run.findings] == [DUMP_ID]
-    assert ("detail" in b.run.findings[0]) is (not masking)
+    assert "User: DEVUSER01" in b.run.findings[0]["detail"]
 
 
 async def test_calls_from_other_tasks_land_in_the_same_run(target_servers):
@@ -638,7 +578,7 @@ async def test_calls_from_other_tasks_land_in_the_same_run(target_servers):
     async def one(turns):
         await Agent().run("go", model=scripted(turns), toolsets=[guard])
 
-    with bound(masking=True) as b:
+    with bound() as b:
         await asyncio.gather(
             asyncio.create_task(one([[LIST], "a"])),
             asyncio.create_task(one([[(T, {"action": "gateway_errors"})], "b"])),
@@ -705,44 +645,20 @@ class Events(list):
         return [d for k, d in self if k == kind]
 
 
-async def _forced_masked_run(sid: str, text: str, ev, *, known: bool = True) -> None:
-    """Run what is behind ``runner._start`` as a *masked* run.
-
-    A diagnose run on a target that requires masking is refused at the start
-    (``target_not_non_production``), so no caller reaches this any more. The
-    pipeline behind the start still fails towards masking -- ``_Start.masked``
-    defaults to true -- and these tests keep that covered: the start is taken
-    while the target is flagged, then run as if it had said "masked"
-    (``known=False``: as if the conventions could not be read either).
-    """
-    start = await runner._start(sid, "alice", text, None)
-    start = dataclasses.replace(start, masked=True, conventions_known=known)
-    await runner._execute(start, ev)
-
-
 async def _rows(sid: str) -> list[IdeFinding]:
     async with SessionLocal() as db:
         return await list_findings(db, sid)
 
 
-async def _everything_stored() -> str:
-    parts: list[str] = []
-    tables = [t for name, t in Base.metadata.tables.items() if name.startswith("ide_")]
-    async with SessionLocal() as db:
-        for table in tables:
-            for row in (await db.execute(select(table))).all():
-                parts.extend(str(value) for value in row)
-    return "\n".join(parts)
-
-
 async def test_run_persists_findings_and_emits_events(clean_db, target_servers):
     """Raw run on a non_production target: rows, events, detail text."""
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
+        await upsert_conventions(db, "T1", destination=DEST,
+                                 actor="test-admin", non_production=True)
     _install()
     sid = await _session()
     ev = Events()
-    await runner.run_stage(sid, "alice", "why the dump?", feedback=None, emit=ev)
+    await runner.run_stage(sid, "alice", "why the dump?", emit=ev)
 
     assert ev.of("error") == [] and ev[-1][0] == "done"
     rows = await _rows(sid)
@@ -763,7 +679,7 @@ async def test_run_persists_findings_and_emits_events(clean_db, target_servers):
 
     # A second run over the same dumps updates the rows, it adds none.
     ev2 = Events()
-    await runner.run_stage(sid, "alice", "again", feedback=None, emit=ev2)
+    await runner.run_stage(sid, "alice", "again", emit=ev2)
     again = await _rows(sid)
     assert {r.id for r in again} == {r.id for r in rows}
     assert {e["id"] for e in ev2.of("finding")} == {r.id for r in rows}
@@ -774,80 +690,25 @@ async def test_run_persists_findings_and_emits_events(clean_db, target_servers):
 async def test_run_is_refused_without_the_flag(clean_db, target_servers, conventions):
     if conventions == "flag_off":
         async with SessionLocal() as db:
-            await upsert_conventions(db, "T1", destination=DEST, non_production=False)
+            await upsert_conventions(db, "T1", destination=DEST,
+                                     actor="test-admin", non_production=False)
     calls = _install()
     sid = await _session()
     ev = Events()
     with pytest.raises(StageGateError) as e:
-        await runner.run_stage(sid, "alice", "why the dump?", feedback=None, emit=ev)
+        await runner.run_stage(sid, "alice", "why the dump?", emit=ev)
     assert e.value.code == "target_not_non_production"
     assert list(ev) == [] and calls == [] and await _rows(sid) == []
 
 
-@pytest.mark.parametrize("known", [True, False])
-async def test_masked_run_stores_metadata_only(clean_db, target_servers, known):
-    async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
-    _install()
-    sid = await _session()
-    ev = Events()
-    await _forced_masked_run(sid, "why the dump?", ev, known=known)
-
-    # Unknown conventions get a note of their own (not a failure).
-    assert [e["code"] for e in ev.of("error")] == (
-        [] if known else ["conventions_unavailable"]
-    )
-    rows = await _rows(sid)
-    assert len(rows) == 3 and len(ev.of("finding")) == 3
-    assert all(r.detail is None for r in rows)
-    assert_clean(json.dumps(list(ev)), "in the stream")
-    assert_clean(await _everything_stored(), "in the database")
-
-
-async def test_masked_run_removes_detail_an_earlier_raw_run_stored(
-    clean_db, target_servers
-):
-    """A masked run after a raw one leaves no detail text behind."""
-    async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
-    _install()
-    sid = await _session()
-    await runner.run_stage(sid, "alice", "one", feedback=None, emit=Events())
-    assert any(r.detail for r in await _rows(sid))
-    await _forced_masked_run(sid, "two", Events())
-    assert all(r.detail is None for r in await _rows(sid))
-
-
-async def test_masked_run_drops_detail_even_if_the_run_carries_it(
-    clean_db, target_servers, monkeypatch
-):
-    """Second line of defence: whatever is on the run, the runner stores no
-    detail text for a masked run."""
-    real = findings.extract
-
-    def leaky(tool, args, text, *, with_detail=False):
-        return [{**f, "detail": "RAW DEVUSER01"} for f in real(tool, args, text)]
-
-    monkeypatch.setattr(findings, "extract", leaky)
-    async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
-    _install()
-    sid = await _session()
-    ev = Events()
-    await _forced_masked_run(sid, "why?", ev)
-    rows = await _rows(sid)
-    assert len(rows) == 3 and all(r.detail is None for r in rows)
-    assert_clean(await _everything_stored(), "in the database")
-    assert_clean(json.dumps(list(ev)), "in the stream")
-
-
 async def test_failed_run_still_stores_what_was_read(clean_db, target_servers):
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
+        await upsert_conventions(db, "T1", destination=DEST,
+                                 actor="test-admin", non_production=True)
     _install(fail=True)
     sid = await _session()
     ev = Events()
-    await runner.run_stage(sid, "alice", "why?", feedback=None, emit=ev)
+    await runner.run_stage(sid, "alice", "why?", emit=ev)
     assert [e["code"] for e in ev.of("error")] == ["run_failed"]
     assert len(await _rows(sid)) == 3 and len(ev.of("finding")) == 3
     assert ev[-1][0] == "done"
@@ -861,11 +722,12 @@ async def test_storing_findings_failing_does_not_break_the_run(
 
     monkeypatch.setattr(runner, "upsert_findings", broken)
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", destination=DEST, non_production=True)
+        await upsert_conventions(db, "T1", destination=DEST,
+                                 actor="test-admin", non_production=True)
     _install()
     sid = await _session()
     ev = Events()
-    await runner.run_stage(sid, "alice", "why?", feedback=None, emit=ev)
+    await runner.run_stage(sid, "alice", "why?", emit=ev)
     assert ev.of("finding") == []
     assert ev.of("error") == []
     assert ev[-1] == ("done", {**ev[-1][1], "status": "idle"})
@@ -875,5 +737,5 @@ async def test_change_session_has_no_findings(clean_db, target_servers):
     _install([[(T, {"action": "atc"})], "ok"])
     sid = await _session("change")
     ev = Events()
-    await runner.run_stage(sid, "alice", "check", feedback=None, emit=ev)
+    await runner.run_stage(sid, "alice", "check", emit=ev)
     assert ev.of("finding") == [] and await _rows(sid) == []

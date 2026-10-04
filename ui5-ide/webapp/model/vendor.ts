@@ -21,8 +21,10 @@ export interface DiffLib {
 export interface MarkedLib { parse(md: string, options: { gfm: boolean; async?: false }): string }
 export interface PurifyAttrData { attrName: string; attrValue: string; keepAttr: boolean }
 export interface PurifyLib {
+    sanitize(html: string, options: { RETURN_DOM_FRAGMENT: true }): DocumentFragment;
     sanitize(html: string, options: object): string;
     addHook(entryPoint: "uponSanitizeAttribute", hook: (node: Element, data: PurifyAttrData) => void): void;
+    addHook(entryPoint: "afterSanitizeAttributes", hook: (node: Element) => void): void;
 }
 
 declare global {

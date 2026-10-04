@@ -1,0 +1,74 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!-- A paragraph's comments (Task U9). Bodies and answers are Text: plain text only. -->
+    <Popover
+        id="commentPopover"
+        title="{s>/pop/title}"
+        placement="Auto"
+        contentWidth="26rem"
+        initialFocus="commentDraft"
+        beforeOpen=".onCommentPopoverBeforeOpen"
+        afterOpen=".onCommentPopoverOpened"
+        beforeClose=".onCommentPopoverBeforeClose"
+        afterClose=".onCommentPopoverClosed">
+        <content>
+            <VBox id="commentPopoverBox" class="sapUiSmallMargin">
+                <List
+                    id="commentPopoverList"
+                    visible="{= ${s>/pop/comments}.length > 0 }"
+                    showSeparators="Inner"
+                    items="{path: 's>/pop/comments', templateShareable: false}"
+                    class="sapUiSmallMarginBottom">
+                    <CustomListItem id="commentPopoverItem">
+                        <VBox id="commentPopoverRow" class="sapUiTinyMargin">
+                            <ObjectStatus id="commentPopoverState" text="{s>stateText}" state="{s>stateValue}" stateAnnouncementText="" icon="{s>icon}" />
+                            <Text id="commentPopoverBody" text="{s>body}" renderWhitespace="true" />
+                            <Text id="commentPopoverAnswer" class="ideDocCommentAnswer" text="{s>answerText}" visible="{s>hasAnswer}" />
+                            <HBox id="commentPopoverActions" wrap="Wrap">
+                                <Button id="commentEdit" text="{i18n>commentEdit}" type="Transparent" visible="{s>canEdit}"
+                                    enabled="{= !${s>/pop/busy} }" press=".onCommentEdit" />
+                                <Button id="commentDelete" text="{i18n>commentDelete}" type="Transparent" visible="{s>canDelete}"
+                                    enabled="{= !${s>/pop/busy} }" press=".onCommentDelete" />
+                                <Button id="commentReopen" text="{i18n>commentReopen}" type="Transparent" visible="{s>canReopen}"
+                                    enabled="{= !${s>/pop/busy} }" press=".onCommentReopen" />
+                                <Button id="commentDismiss" text="{i18n>commentDismiss}" type="Transparent" visible="{s>canDismiss}"
+                                    enabled="{= !${s>/pop/busy} }" press=".onCommentDismiss" />
+                            </HBox>
+                        </VBox>
+                    </CustomListItem>
+                </List>
+                <Label id="commentDraftLabel" text="{s>/pop/draftLabel}" labelFor="commentDraft" />
+                <TextArea
+                    id="commentDraft"
+                    value="{s>/pop/draft}"
+                    maxLength="4000"
+                    rows="4"
+                    width="100%"
+                    valueLiveUpdate="true"
+                    liveChange=".onCommentDraftChange"
+                    ariaDescribedBy="commentDraftCounter" />
+                <Text id="commentDraftCounter" class="ideGateReason" text="{s>/pop/counter}" />
+                <MessageStrip
+                    id="commentPopoverError"
+                    text="{s>/pop/error}"
+                    type="Error"
+                    showIcon="true"
+                    visible="{= !!${s>/pop/error} }"
+                    class="sapUiTinyMarginTop" />
+            </VBox>
+        </content>
+        <footer>
+            <Toolbar id="commentPopoverFooter">
+                <ToolbarSpacer />
+                <Button
+                    id="commentSave"
+                    type="Emphasized"
+                    text="{i18n>commentSave}"
+                    enabled="{= ${s>/pop/canSave} &amp;&amp; !${s>/pop/busy} }"
+                    press=".onCommentSave" />
+                <Button id="commentCancel" text="{i18n>commentCancel}" press=".onCommentCancel" />
+            </Toolbar>
+        </footer>
+    </Popover>
+</core:FragmentDefinition>

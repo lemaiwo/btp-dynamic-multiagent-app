@@ -634,6 +634,14 @@ async def build_orchestrator() -> BuildResult:
             row, default_model=model, default_name=model_name, cache=model_cache
         )
         toolsets = list(servers)
+        # The IDE session tools (submit_document): the app's own toolset, not
+        # an MCP server, so not behind ReadOnlyGuard. Every specialist has
+        # it, so delegates of an IDE run can submit too; it lists no tool
+        # unless an IDE session run is bound (chat, A2A, jobs, workflows).
+        # Deep sub-agents get `servers` only, never this toolset.
+        from agents.ide.session_tools import ide_session_toolset
+
+        toolsets.append(ide_session_toolset())
         # --- deep agents --- opt-in planning / scratchpad / sub-agent tools.
         # Sub-agents get `servers` (this agent's MCP servers and built-ins)
         # and are never registered: not a specialist, not a peer.

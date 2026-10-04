@@ -14,6 +14,10 @@ File states after a save:
 - a path with no origin (new object or scratch note) -> ``new``, with
   ``object_type``/``object_name`` from :func:`agents.ide.paths.object_for`.
 
+Each new proposal of a path is also kept as an ``IdeFileRevision`` (1, 2,
+...; ``IdeWorkspaceFile.revision`` is the latest), at most one per path per
+save, so review comments keep pointing at the text they were made on.
+
 Paths missing from the scratchpad are kept: the scratchpad has no delete
 tool, so a missing path means the state was trimmed (caps), not a decision.
 
@@ -32,6 +36,7 @@ from typing import AsyncIterator
 
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.db import SessionLocal
@@ -42,14 +47,23 @@ from agents.deep import (
     WorkspaceScope,
     current_workspace,
 )
-from agents.ide.models import IdeSession, IdeWorkspaceFile
+from agents.ide.models import IdeFileRevision, IdeSession, IdeWorkspaceFile
 from agents.ide.paths import clean_workspace_path, object_for
-from agents.ide.store import touch_session
+from agents.ide.store import lock_session_row, touch_session
 
 log = logging.getLogger(__name__)
 
 _TODOS = TypeAdapter(list[TodoItem])
 _MAX_OBJECT_NAME = 40  # IdeWorkspaceFile.object_name column length
+
+
+class RevisionConflict(RuntimeError):
+    """A file revision this save wanted to write already exists.
+
+    The session's run lock (``IdeSession.status``) is the guard: only one
+    run, and so one save, writes a session's workspace at a time, so this
+    means that guard was bypassed. The save is rolled back as a whole.
+    """
 
 
 def run_id_for(sid: str) -> str:
@@ -119,23 +133,59 @@ def _cleaned_files(sid: str, state: DeepState) -> dict[str, str]:
     return out
 
 
-async def save_state(db: AsyncSession, sid: str, state: DeepState) -> list[dict]:
-    """Write the state back; return ``[{path, state}]`` for changed files.
+async def _latest_revision_source(
+    db: AsyncSession, sid: str, row: IdeWorkspaceFile
+) -> str | None:
+    """``proposed_source`` of the row's latest revision (None: there is none)."""
+    if row.revision < 1:
+        return None
+    return (
+        await db.execute(
+            select(IdeFileRevision.proposed_source).where(
+                IdeFileRevision.session_id == sid,
+                IdeFileRevision.path == row.path,
+                IdeFileRevision.revision == row.revision,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def save_state(
+    db: AsyncSession, sid: str, state: DeepState, run_id: str | None = None
+) -> list[dict]:
+    """Write the state back; return ``[{path, state, revision, base_status}]``
+    for changed files.
+
+    A changed file whose proposal differs from its latest revision (or that
+    has none yet) gets a new ``IdeFileRevision`` tagged with ``run_id``:
+    comments point at a revision, so the text they were written on must
+    stay readable after the next run rewrites the file. An unchanged file,
+    a revert to the origin and a proposal equal to the latest revision add
+    nothing. Scratch notes get revisions too (they are reviewable). The
+    session's run lock keeps a second save from racing this one; if it
+    happens anyway, the unique revision key turns it into
+    ``RevisionConflict`` and nothing of this save is written.
 
     A session deleted mid-run is not resurrected: nothing is written.
+
+    The session row is locked first (``store.lock_session_row``), then the
+    file rows: the order every other writer of these rows uses (lint,
+    refresh, open), so none of them can deadlock with a save on Postgres.
     """
+    await lock_session_row(db, sid)
     session = await db.get(IdeSession, sid)
     if session is None:
         log.warning("IDE session %s: gone before its workspace was saved", sid)
         return []
-    existing = {row.path: row for row in await _rows(db, sid)}
-    changed: list[dict] = []
-    for path, content in sorted(_cleaned_files(sid, state).items()):
-        row = existing.get(path)
-        if row is None:
-            object_type, object_name = _object_columns(path)
-            db.add(
-                IdeWorkspaceFile(
+    try:
+        run_tag = run_id[:36] if run_id else None
+        existing = {row.path: row for row in await _rows(db, sid)}
+        changed: list[dict] = []
+        for path, content in sorted(_cleaned_files(sid, state).items()):
+            row = existing.get(path)
+            if row is None:
+                object_type, object_name = _object_columns(path)
+                row = IdeWorkspaceFile(
                     session_id=sid,
                     path=path,
                     object_type=object_type,
@@ -143,31 +193,63 @@ async def save_state(db: AsyncSession, sid: str, state: DeepState) -> list[dict]
                     origin_source=None,
                     proposed_source=content,
                     state="new",
+                    revision=1,
                 )
-            )
-            changed.append({"path": path, "state": "new"})
-            continue
+                db.add(row)
+                db.add(IdeFileRevision(
+                    session_id=sid, path=path, revision=1,
+                    proposed_source=content, run_id=run_tag,
+                ))
+                changed.append(
+                    {"path": path, "state": "new", "revision": 1, "base_status": None}
+                )
+                continue
 
-        if row.origin_source is None:
-            new_state, proposed = "new", content
-        elif content == row.origin_source:
-            new_state, proposed = "read", None
-        else:
-            new_state, proposed = "modified", content
-        if row.state != new_state or row.proposed_source != proposed:
-            row.state = new_state
-            row.proposed_source = proposed
-            changed.append({"path": path, "state": new_state})
+            if row.origin_source is None:
+                new_state, proposed = "new", content
+            elif content == row.origin_source:
+                new_state, proposed = "read", None
+            else:
+                new_state, proposed = "modified", content
+            if row.state != new_state or row.proposed_source != proposed:
+                row.state = new_state
+                row.proposed_source = proposed
+                if proposed is not None and proposed != await _latest_revision_source(
+                    db, sid, row
+                ):
+                    row.revision = (row.revision or 0) + 1
+                    db.add(IdeFileRevision(
+                        session_id=sid, path=path, revision=row.revision,
+                        proposed_source=proposed, run_id=run_tag,
+                    ))
+                changed.append({
+                    "path": path,
+                    "state": new_state,
+                    "revision": row.revision,
+                    "base_status": row.base_status,
+                })
 
-    if changed:
-        # Purge reads updated_at as the activity clock; file edits count.
-        await touch_session(db, sid)
-    todos_json = (
-        json.dumps([t.model_dump() for t in state.todos]) if state.todos else None
-    )
-    if session.todos_json != todos_json:
-        session.todos_json = todos_json
-    await db.commit()
+        if changed:
+            # Purge reads updated_at as the activity clock; file edits count.
+            await touch_session(db, sid)
+        todos_json = (
+            json.dumps([t.model_dump() for t in state.todos]) if state.todos else None
+        )
+        if session.todos_json != todos_json:
+            session.todos_json = todos_json
+        await db.commit()
+    except IntegrityError:
+        # uq_ide_file_revision (or the file's own path key): a second writer
+        # saved the same revision or path. No exception text or chaining:
+        # the statement parameters hold source.
+        await db.rollback()
+        log.error(
+            "IDE session %s: file revision or path already exists; workspace save "
+            "rolled back (concurrent save despite the run lock)", sid,
+        )
+        raise RevisionConflict(
+            f"IDE session {sid}: concurrent workspace save, revision conflict"
+        ) from None
     return changed
 
 
@@ -176,9 +258,9 @@ async def _load(sid: str) -> DeepState:
         return await load_state(db, sid)
 
 
-async def _save(sid: str, state: DeepState) -> list[dict]:
+async def _save(sid: str, state: DeepState, run_id: str | None = None) -> list[dict]:
     async with SessionLocal() as db:
-        return await save_state(db, sid, state)
+        return await save_state(db, sid, state, run_id=run_id)
 
 
 DEFAULT_SAVE_TIMEOUT_S = 30.0
@@ -198,7 +280,9 @@ def save_timeout() -> float:
     return value if value > 0 else DEFAULT_SAVE_TIMEOUT_S
 
 
-async def _save_to_completion(sid: str, state: DeepState) -> tuple[bool, list[dict]]:
+async def _save_to_completion(
+    sid: str, state: DeepState, run_id: str | None = None
+) -> tuple[bool, list[dict]]:
     """Run the save in its own task and wait for it to finish.
 
     Returns ``(cancelled, changed)``. A cancellation while the save runs is
@@ -208,7 +292,7 @@ async def _save_to_completion(sid: str, state: DeepState) -> tuple[bool, list[di
     uncancellable, so on timeout the save is abandoned (cancelled and logged)
     and ``(True, [])`` returned. The save's own error propagates.
     """
-    task = asyncio.ensure_future(_save(sid, state))
+    task = asyncio.ensure_future(_save(sid, state, run_id))
     try:
         return False, await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -242,6 +326,7 @@ async def bound_workspace(
     request_limit: int | None,
     session_type: str = "change",
     persist: bool | None = None,
+    run_id: str | None = None,
 ) -> AsyncIterator[WorkspaceScope]:
     """Bind the session's workspace on ``current_workspace`` for one run.
 
@@ -289,7 +374,7 @@ async def bound_workspace(
         if persist:
             try:
                 cancelled_again, scope.changed_files = await _save_to_completion(
-                    sid, scope.state
+                    sid, scope.state, run_id
                 )
             except BaseException as exc:  # noqa: BLE001 -- re-raised below
                 save_error = exc

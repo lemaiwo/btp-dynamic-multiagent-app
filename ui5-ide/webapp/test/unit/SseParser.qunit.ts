@@ -150,3 +150,9 @@ QUnit.test("data that is not a JSON object is dropped", function (assert) {
 
     assert.deepEqual(events, [{ type: "text", data: { delta: "obj" } }], "only the object survives");
 });
+
+QUnit.test("a comments frame is accepted", function (assert) {
+    const events = new SseParser().push('event: comments\ndata: {"ids":["c1","c2"],"state":"addressed"}\n\n');
+
+    assert.deepEqual(events, [{ type: "comments", data: { ids: ["c1", "c2"], state: "addressed" } }], "comments parsed");
+});

@@ -30,7 +30,6 @@ Run:  python -m pytest tests/test_ide_approval_flow.py -q
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import os
 import sys
@@ -77,8 +76,6 @@ from agents.ide import (  # noqa: E402
     approvals,
     arc1,
     diagnose,
-    findings,
-    masking,
     readonly,
     runner,
     stages,
@@ -145,7 +142,7 @@ class FakeArc1:
         self.delay = 0.0
         self.result = {"trace_request_id": "REQ-1", "expires_at": "2026-10-03T18:00:00Z"}
 
-    def factory(self, target, destination="", policy=readonly.CHANGE, masking=True):
+    def factory(self, target, destination="", policy=readonly.CHANGE):
         self.built.append((target, destination, policy))
         return self
 
@@ -299,7 +296,10 @@ async def _clean(monkeypatch):
         await db.execute(SkillConfig.__table__.delete())
         await db.commit()
         await upsert_conventions(db, TARGET, label="Target one", destination=DEST,
-                                 non_production=True)
+                                 actor="test-admin", non_production=True)
+        # The setup's own flag audit row is not what these tests count.
+        await db.execute(IdeAuditLog.__table__.delete())
+        await db.commit()
     arc1._SERVERS.clear()
     saved = registry._build
     yield
@@ -366,7 +366,7 @@ def _install(script: Script, executed: list) -> None:
 
 async def _run(sid: str, text: str = "why is the list slow?") -> Events:
     ev = Events()
-    await runner.run_stage(sid, "alice", text, feedback=None, emit=ev)
+    await runner.run_stage(sid, "alice", text, emit=ev)
     return ev
 
 
@@ -509,7 +509,7 @@ async def test_decided_proposal_can_be_proposed_again_in_the_same_run(fake, fake
     is final, and asking again is a new approval."""
     sid = await _session()
     run = DiagnoseRun(session_id=sid, owner="alice", target=TARGET, run_id="r1",
-                      destination=DEST, masking=False)
+                      destination=DEST)
     async with SessionLocal() as db:
         first = await approvals.request(db, run, "trace_start", dict(TRACE), "c1")
         same = await approvals.request(db, run, "trace_start", dict(TRACE), "c2")
@@ -611,7 +611,7 @@ async def test_target_that_lost_its_flag_cannot_propose(fake, fake_target):
     async def _raw_then_flag_removed(target):
         out = await real(target)
         async with SessionLocal() as db:
-            await upsert_conventions(db, TARGET, non_production=False)
+            await upsert_conventions(db, TARGET, actor="test-admin", non_production=False)
         return out
 
     runner._diagnose_settings = _raw_then_flag_removed
@@ -635,7 +635,7 @@ async def test_approval_in_change_session_impossible(fake, fake_target):
                            session_type="change")
     # Even with a diagnose run bound for the session by mistake.
     run = DiagnoseRun(session_id=sid, owner="alice", target=TARGET, run_id="r",
-                      destination=DEST, masking=False)
+                      destination=DEST)
     token, run_token = current_workspace.set(scope), current_diagnose.set(run)
     try:
         for action in ("trace_start", "trace_cancel"):
@@ -868,11 +868,11 @@ async def test_route_refusals_carry_stable_codes(client, fake):
     sid = await _session()
     aid = await _pending(sid)
     async with SessionLocal() as db:
-        await upsert_conventions(db, TARGET, non_production=False)
+        await upsert_conventions(db, TARGET, actor="test-admin", non_production=False)
     r = await _decide(client, sid, aid)
     assert (r.status_code, r.json()["code"]) == (403, "target_not_non_production")
     async with SessionLocal() as db:
-        await upsert_conventions(db, TARGET, non_production=True)
+        await upsert_conventions(db, TARGET, actor="test-admin", non_production=True)
     # 409 unknown_trace_request
     cancel = await _pending(sid, "trace_cancel", {"id": "REQ-77"})
     r = await _decide(client, sid, cancel)
@@ -961,7 +961,7 @@ async def test_cancel_route_for_a_trace_this_session_armed(client, fake):
 async def _prompt(sid: str) -> str:
     async with SessionLocal() as db:
         session = await db.get(IdeSession, sid)
-        extra, prompt = await stages.build_prompt(db, session, "and now?", masked=False)
+        extra, prompt = await stages.build_prompt(db, session, "and now?")
     return extra + "\n\n" + prompt
 
 
@@ -1012,7 +1012,7 @@ async def test_prompt_lists_decided_approvals(fake):
     # description (model-written) is not repeated there.
     async with SessionLocal() as db:
         session = await db.get(IdeSession, sid)
-        extra, prompt = await stages.build_prompt(db, session, "and now?", masked=False)
+        extra, prompt = await stages.build_prompt(db, session, "and now?")
     assert stages.APPROVALS_HEADING in extra and stages.APPROVALS_HEADING not in prompt
     assert TRACE["description"] not in extra
 
@@ -1211,19 +1211,6 @@ async def test_store_helpers_live_in_store(fake):
         assert await store.expire_approval(db, sid, old) is False
         assert (await get_approval(db, sid, old)).status == "expired"
         assert await store.list_unfinished_approvals(db, older_than_s=0.0) == []
-
-
-# --- masking aliases (Task 8 review) -------------------------------------------------
-
-
-def test_masking_public_aliases_are_what_findings_uses():
-    assert masking.match_shape is masking._match_shape
-    assert masking.MAX_INPUT == masking._MAX_INPUT
-    source = inspect.getsource(findings)
-    assert "masking._" not in source
-    for module in (findings, readonly):
-        text = inspect.getsource(module)
-        assert "masking is False" not in text and "masking is True" not in text
 
 
 # --- real registry build: the target's server is recognised (Task 7 review) ----------

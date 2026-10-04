@@ -1,7 +1,8 @@
 /**
  * Shapes of the /ide/api REST contract (plan §1.2) and of the SSE stream
- * that `POST .../messages`, `POST .../revise` and `POST .../report` answer
- * with (plan §1.3), including the phase 1c diagnose additions.
+ * that `POST .../messages`, `POST .../request-changes` and `POST .../report`
+ * answer with (plan §1.3), including the phase 1c diagnose additions and the
+ * review additions: comments, file revisions, pins and syntax results.
  *
  * Types only: nothing here runs, so the module is erased by the transpiler.
  */
@@ -13,6 +14,28 @@ export type SessionStatus = "idle" | "running";
 export type ArtifactKind = "design" | "plan" | "note" | "review" | "report";
 export type FileState = "read" | "modified" | "new";
 export type MessageRole = "user" | "assistant" | "system";
+/** Where the base of a workspace file came from: read from SAP, known to be new, or the check failed. */
+export type BaseStatus = "sap" | "absent" | "unknown";
+/** A syntax dry run's verdict; `unavailable` is never shown as OK (assumption A5). */
+export type SyntaxStatus = "ok" | "errors" | "unavailable";
+/**
+ * What a session waits for, first match wins (server-computed): a pending
+ * trace approval, addressed comments, proposals not yet pinned, a document
+ * version not yet approved.
+ */
+export type WaitingReason = "approval" | "comments" | "changes" | "document";
+
+/**
+ * The versions approved so far: a document kind's version, and per path the
+ * file revision approved in `propose`.
+ */
+export interface Pins {
+    design?: number;
+    plan?: number;
+    review?: number;
+    report?: number;
+    files?: Record<string, number>;
+}
 
 /** `GET /me` */
 export interface Me {
@@ -22,6 +45,8 @@ export interface Me {
     targets: string[];
     /** The subset of `targets` flagged `non_production`: the only ones a diagnose session may use. */
     diagnose_targets: string[];
+    /** Days a diagnose session is kept from its creation; 0 = kept until it is deleted. */
+    diagnose_retention_days: number;
 }
 
 /** One row of `GET /sessions`. */
@@ -36,15 +61,29 @@ export interface SessionSummary {
     created_at: string | null;
     updated_at: string | null;
     /**
-     * `true` when the target's conventions are not flagged `non_production`
-     * now. A diagnose session is only created on a flagged target, so `true`
-     * on one means the flag was removed since: its runs, reports, finding
-     * details and reads from SAP answer 409 `target_not_non_production`. The
-     * session, its messages, documents, files and finding list are still
-     * served. Absent or `false`: dumps and traces are sent to the model as
-     * they are and kept with the session.
+     * The target's conventions carry `non_production: true` now. A diagnose
+     * session is only created on a flagged target, so `false` on one means the
+     * flag was removed since: its runs, reports, finding details and reads
+     * from SAP answer 409 `target_not_non_production`; the stored data stays
+     * readable.
      */
-    masked?: boolean;
+    target_non_production: boolean;
+    pins: Pins;
+    waiting: WaitingReason | null;
+    /** Comments in state `open` (the "Request changes (n)" badge). */
+    open_comments: number;
+    /** Comments in state `open` or `sent`: more than 0 blocks approve (409 `open_comments`). */
+    unresolved_comments: number;
+    /** Model requests used so far and the session's cap (`usage` events update them during a run). */
+    requests_used: number;
+    request_cap: number;
+    /** Up to five object names of the session's files (B10); optional until every server sends them. */
+    objects?: string[];
+    objects_total?: number;
+    /** Objects with a proposed change. */
+    changed_objects?: number;
+    /** Findings of a diagnose session; `null` for a change session. */
+    findings_count?: number | null;
 }
 
 /** What `POST /sessions`, `PATCH`, `approve` and `cancel` return. */
@@ -53,15 +92,17 @@ export type Session = SessionSummary;
 /** An artifact listed inside `GET /sessions/{sid}` (no content). */
 export interface ArtifactSummary {
     id: string;
+    stage: Stage;
     kind: ArtifactKind;
     version: number;
     created_at: string | null;
+    /** The pins the document was written against (`{"design": 2}` on a plan); `null` when none apply. */
+    based_on: Record<string, number> | null;
 }
 
 /** `GET /sessions/{sid}/artifacts[/{aid}]` */
 export interface Artifact extends ArtifactSummary {
     content: string;
-    stage?: Stage;
 }
 
 /** `GET /sessions/{sid}/files`, `POST /sessions/{sid}/open` */
@@ -71,34 +112,64 @@ export interface FileSummary {
     /** `null` for a free scratch file such as `notes/impact.md`. */
     object_type: string | null;
     object_name: string | null;
+    /** The latest revision of the proposal; 0 = none yet. */
+    revision: number;
+    /** `null` = never checked (a legacy row or a scratch file). */
+    base_status: BaseStatus | null;
+    /** Of the latest revision; `null` = not checked yet. */
+    syntax_status: SyntaxStatus | null;
+}
+
+/** One message of a syntax dry run. */
+export interface SyntaxItem {
+    line: number | null;
+    message: string;
+    severity: "error" | "warning";
+}
+
+/** `POST /sessions/{sid}/file/syntax?path=&revision=` */
+export interface SyntaxResult {
+    path: string;
+    revision: number;
+    status: SyntaxStatus;
+    items: SyntaxItem[];
+    checked_at: string | null;
+}
+
+/** One row of `GET /sessions/{sid}/file/revisions?path=`, newest first. */
+export interface FileRevision {
+    revision: number;
+    run_id: string | null;
+    created_at: string | null;
+    /** Length of the revision's proposed source. */
+    chars: number;
+    syntax_status: SyntaxStatus | null;
 }
 
 /** One SAPLint finding. */
 export interface LintFinding {
-    line: number;
-    column: number;
+    /** `null` when the linter could not place the finding. */
+    line: number | null;
+    column: number | null;
     severity: string;
     message: string;
     rule: string;
 }
 
-/** `GET /sessions/{sid}/file?path=` and `POST .../file/refresh?path=` */
-export interface FileDetail {
-    path: string;
-    state: FileState;
+/**
+ * `GET /sessions/{sid}/file?path=&revision=` and `POST .../file/refresh?path=`.
+ * With `revision`, `proposed_source` and `syntax` are that revision's.
+ */
+export interface FileDetail extends FileSummary {
     /** The diff base: the source as ARC-1 last returned it. */
     origin_source: string | null;
     proposed_source: string | null;
+    /** SAP's version marker of `origin_source`; `null` = version unknown. */
+    origin_version: string | null;
     lint: LintFinding[];
+    /** The syntax messages of the revision served. */
+    syntax: SyntaxItem[];
 }
-
-/**
- * @deprecated Use {@link LintFinding}. The phase 1a name of the SAPLint
- * finding; plan 1c's `Finding` is the diagnose finding, here
- * {@link DiagnoseFinding}, so the bare name says nothing any more. Nothing in
- * the app imports it.
- */
-export type Finding = LintFinding;
 
 /** `GET /sessions/{sid}`: the session plus its artifact and file lists. */
 export interface SessionDetail extends Session {
@@ -113,20 +184,103 @@ export interface Message {
     stage: Stage;
     content: string;
     created_at: string | null;
-    /** Only on an assistant message: the run's tool timeline and plan (`RunActivity.to_dict`). */
-    activity?: { events?: ToolEventData[]; plan?: Todo[]; dropped?: number };
+    /** The run's tool timeline and plan are served by `GET .../messages/{mid}/activity`. */
+    has_activity: boolean;
 }
 
-/** `GET /objects/search?target=&q=` */
-export interface ObjectHit {
-    type: string;
-    name: string;
-    package: string;
-    description: string;
+/** `GET /sessions/{sid}/messages/{mid}/activity`; 404 `no_activity`. */
+export interface Activity {
+    events: ToolEventData[];
+    plan: Todo[];
+    dropped: number;
 }
 
-/** `GET|PUT /conventions/{target}` */
+// --- Review comments (contract §1.1-1.2) -----------------------------------
+
+/**
+ * `open` (written, editable) → `sent` (a request-changes run took it) →
+ * `addressed` (the agent answered it); `dismissed` by the user. The user may
+ * reopen an addressed or dismissed comment. `sent` exists only while the run
+ * is in flight: when it ends (done, failed or cancelled) every comment it did
+ * not address is `open` again.
+ */
+export type CommentState = "open" | "sent" | "addressed" | "dismissed";
+
+/** A comment on lines of one revision of a workspace file (1-based, inclusive). */
+export interface FileCommentCreate {
+    anchor: "file";
+    path: string;
+    revision: number;
+    line_start: number;
+    line_end: number;
+    /** 1..4000 characters, plain text. */
+    body: string;
+    /** The first selected line, trimmed to 200 characters (plain text). */
+    quote?: string;
+}
+
+/** A comment on a paragraph (0-based block index) of one version of a document. */
+export interface DocumentCommentCreate {
+    anchor: "document";
+    kind: ArtifactKind;
+    version: number;
+    paragraph: number;
+    body: string;
+    /** The start of the commented block, trimmed to 200 characters (plain text). */
+    quote?: string;
+}
+
+/** `POST /sessions/{sid}/comments`; 422 `invalid_anchor`. */
+export type CommentCreate = FileCommentCreate | DocumentCommentCreate;
+
+/** `GET|POST|PATCH /sessions/{sid}/comments[/{cid}]`: both anchors' fields, the unused ones `null`. */
+export interface Comment {
+    id: string;
+    anchor: "file" | "document";
+    path: string | null;
+    revision: number | null;
+    line_start: number | null;
+    line_end: number | null;
+    kind: ArtifactKind | null;
+    version: number | null;
+    paragraph: number | null;
+    body: string;
+    state: CommentState;
+    /** The agent's one-line answer once `addressed`. */
+    answer: string | null;
+    /** What the anchor pointed at when the comment was written (plain text); absent from older servers. */
+    quote?: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+}
+
+/** `GET|PUT /conventions/{target}`; `PUT` takes `clear` as well and no longer creates (404 `unknown_target`). */
 export interface Conventions {
+    target: string;
+    label?: string | null;
+    destination?: string | null;
+    namespace?: string | null;
+    package?: string | null;
+    atc_variant?: string | null;
+    clean_core_level?: string | null;
+    free_text?: string | null;
+    /** Only a non-production target accepts diagnose sessions and trace approvals. */
+    non_production?: boolean;
+    updated_at?: string | null;
+}
+
+/** A conventions field `PUT /conventions/{target}` can empty through `clear`. */
+export type ConventionsClearable = "label" | "destination" | "namespace" | "package" | "atc_variant" | "free_text";
+
+/**
+ * The body of `PUT /conventions/{target}` (without `clear`, which
+ * IdeService adds): never the target itself, which the server refuses as an
+ * unknown key. Omitted fields keep their stored value.
+ */
+export type ConventionsChange = Omit<ConventionsCreate, "target">;
+
+/** `POST /conventions` (admin): 201, 409 `target_exists`, 422 for a bad target name. */
+export interface ConventionsCreate {
     target: string;
     label?: string;
     destination?: string;
@@ -135,9 +289,8 @@ export interface Conventions {
     atc_variant?: string;
     clean_core_level?: string;
     free_text?: string;
-    /** Only a non-production target accepts diagnose sessions and trace approvals. */
+    /** Strictly a boolean: the server refuses `"true"`. */
     non_production?: boolean;
-    updated_at?: string | null;
 }
 
 // --- Diagnose sessions (plan 1c §1.2) --------------------------------------
@@ -237,7 +390,17 @@ export interface Approval {
 }
 
 /** `GET /admin/sessions`: metadata only, never content. */
-export type AdminSessionRow = SessionSummary;
+export interface AdminSessionRow {
+    id: string;
+    owner: string;
+    title: string;
+    target: string;
+    type: SessionType;
+    stage: Stage;
+    status: SessionStatus;
+    created_at: string | null;
+    updated_at: string | null;
+}
 
 // --- SSE stream (plan §1.3) ------------------------------------------------
 
@@ -245,13 +408,15 @@ export interface RunEventData { run_id: string; stage: Stage; message_id: string
 export interface TextEventData { delta: string }
 /** One RunActivity event; start and end share `id`, so the UI upserts by it. */
 export interface ToolEventData {
-    ts: string;
-    agent: string;
+    ts?: string | null;
+    agent?: string | null;
+    /** `tool` for a call (with `id`/`tool`/`status`); a note, message or delegation carries none of those. */
     kind: string;
-    id: string;
-    tool: string;
+    id?: string | null;
+    tool?: string | null;
     detail: string;
-    status: string;
+    status?: string | null;
+    ended?: string | null;
     output?: string | null;
     /**
      * Why a call was refused (status `error`): `readonly_refused` by the
@@ -259,11 +424,24 @@ export interface ToolEventData {
      * (`too_many_pending`, `unknown_trace_request`, `target_not_non_production`,
      * `not_diagnose`, `invalid_request`, `proposal_failed`).
      */
-    code?: string;
+    code?: string | null;
 }
 export interface Todo { content: string; status: string }
 export interface PlanEventData { todos: Todo[] }
-export interface FileEventData { path: string; state: FileState }
+export interface FileEventData {
+    path: string;
+    state: FileState;
+    revision?: number;
+    base_status?: BaseStatus | null;
+    syntax_status?: SyntaxStatus | null;
+}
+/**
+ * After a request-changes start (`sent`, with `left`: open comments not sent
+ * this round because of the server's cap; 0 = none), per `resolve_comments`
+ * call (`addressed`), and at the end of the run for comments still `sent`
+ * (`open` again).
+ */
+export interface CommentsEventData { ids: string[]; state: "sent" | "addressed" | "open"; left?: number }
 export interface ArtifactEventData { id: string; kind: ArtifactKind; version: number }
 export interface UsageEventData { requests_used: number; request_cap: number }
 export interface ErrorEventData { message: string; code?: string }
@@ -291,6 +469,7 @@ export type SseEvent =
     | { type: "finding"; data: FindingEventData }
     | { type: "approval_required"; data: ApprovalEventData }
     | { type: "approval"; data: ApprovalEventData }
+    | { type: "comments"; data: CommentsEventData }
     | { type: "done"; data: DoneEventData };
 
 export type SseEventType = SseEvent["type"];

@@ -1,4 +1,5 @@
-"""IDE stage runs over SSE (contract §1.2/§1.3): messages, revise, cancel.
+"""IDE stage runs over SSE (contract §1.2/§1.3): messages, request-changes,
+cancel.
 
 The routes check ownership and the stage gates *before* the stream opens, so
 404/409/429 come back as plain JSON. The run itself is
@@ -46,7 +47,7 @@ from agents.auth import (  # noqa: E402
 )
 from agents.db import SessionLocal, init_db  # noqa: E402
 from agents.deep import DeepConfig, deep_toolset  # noqa: E402
-from agents.ide import routes, runner, sse  # noqa: E402
+from agents.ide import review_routes, routes, runner, sse  # noqa: E402
 from agents.ide.models import (  # noqa: E402
     IdeArtifact,
     IdeConventions,
@@ -54,6 +55,7 @@ from agents.ide.models import (  # noqa: E402
     IdeSession,
     IdeWorkspaceFile,
 )
+from agents.ide.session_tools import ide_session_toolset  # noqa: E402
 from agents.ide.store import upsert_conventions  # noqa: E402
 from agents.registry import BuildResult, registry  # noqa: E402
 
@@ -162,8 +164,10 @@ class _Specialist:
             parent_toolsets=[], model=model, agent_name=NAME,
         )
         agent = Agent(instructions="base", retries=1)
+        # As the registry attaches it: the IDE session tools (B8).
         return await agent.run(
-            prompt, model=model, toolsets=[ts, _identity_toolset()], **kwargs
+            prompt, model=model,
+            toolsets=[ts, _identity_toolset(), ide_session_toolset()], **kwargs
         )
 
 
@@ -206,6 +210,7 @@ class _FakeJWTMiddleware:
 
 def _app() -> FastAPI:
     app = FastAPI()
+    app.include_router(review_routes.router)
     app.include_router(routes.router)
     app.dependency_overrides[require_developer] = _fake_developer
     app.dependency_overrides[require_admin] = _fake_developer
@@ -332,8 +337,9 @@ async def test_message_stream_order_headers_and_persisted_messages(client):
     assert msgs[1]["id"] == done["message_id"]
     assert set(msgs[0]) >= {"id", "stage", "role", "content", "created_at"}
     assert "text" not in msgs[0]
-    assert msgs[1]["activity"]["events"] == []
-    assert "activity" not in msgs[0]
+    # The list carries a flag; the activity body has its own route.
+    assert [m["has_activity"] for m in msgs] == [False, True]
+    assert all("activity" not in m for m in msgs)
     assert (await _row(sid)).status == "idle"
 
 
@@ -351,11 +357,14 @@ async def test_identity_propagates_into_tools(client):
     assert tool_events, frames
 
 
-async def test_revise_streams_in_design_stage(client):
-    _install(Script(["# Design v2"]))
+async def test_request_changes_streams_in_design_stage(client):
+    _install(Script([
+        [("submit_document", {"kind": "design", "content": "# Design v2"})],
+        "Revised.",
+    ]))
     sid = await _session(client, "design")
-    r = await client.post(f"/ide/api/sessions/{sid}/revise",
-                          json={"feedback": "more detail"}, headers=_as("alice"))
+    r = await client.post(f"/ide/api/sessions/{sid}/request-changes",
+                          json={"note": "more detail"}, headers=_as("alice"))
     assert r.status_code == 200
     frames = parse(r.text)
     assert kinds(frames)[0] == "run" and kinds(frames)[-1] == "done"
@@ -365,11 +374,11 @@ async def test_revise_streams_in_design_stage(client):
 # --- refusals as JSON, before the stream -------------------------------------
 
 
-async def test_revise_in_chat_is_409_json(client):
+async def test_request_changes_in_chat_is_409_json(client):
     _install(Script(["x"]))
     sid = await _session(client)
-    r = await client.post(f"/ide/api/sessions/{sid}/revise",
-                          json={"feedback": "f"}, headers=_as("alice"))
+    r = await client.post(f"/ide/api/sessions/{sid}/request-changes",
+                          json={"note": "f"}, headers=_as("alice"))
     assert r.status_code == 409
     assert r.headers["content-type"].startswith("application/json")
     assert r.json()["code"] == "revise_not_allowed" and r.json()["detail"]
@@ -406,7 +415,7 @@ async def test_usage_exhausted_is_429_json(client, monkeypatch):
 
 @pytest.mark.parametrize("path,body", [
     ("messages", {"text": "hi"}),
-    ("revise", {"feedback": "f"}),
+    ("request-changes", {"note": "f"}),
     ("cancel", None),
 ])
 async def test_other_user_gets_404_and_nothing_runs(client, path, body):
@@ -433,9 +442,9 @@ async def test_message_body_is_validated(client, body):
 def test_no_route_relies_on_a_trailing_slash():
     # The client treats any 3xx as an expired session: every IDE route is
     # declared without a trailing slash, and the client calls it that way.
-    paths = [r.path for r in routes.router.routes]
+    paths = [r.path for r in (*routes.router.routes, *review_routes.router.routes)]
     assert "/ide/api/sessions/{sid}/messages" in paths
-    assert "/ide/api/sessions/{sid}/revise" in paths
+    assert "/ide/api/sessions/{sid}/request-changes" in paths
     assert "/ide/api/sessions/{sid}/cancel" in paths
     assert "/ide/api/sessions/{sid}/report" in paths
     assert "/ide/api/sessions/{sid}/handover" in paths
@@ -641,7 +650,7 @@ def _install_diagnose(script: Script) -> None:
 
 async def _diagnose_session(client, user: str = "alice") -> str:
     async with SessionLocal() as db:
-        await upsert_conventions(db, "T1", non_production=True)
+        await upsert_conventions(db, "T1", actor="test-admin", non_production=True)
     r = await client.post("/ide/api/sessions",
                           json={"title": "d", "target": "T1", "type": "diagnose"},
                           headers=_as(user))
@@ -651,7 +660,10 @@ async def _diagnose_session(client, user: str = "alice") -> str:
 
 async def test_report_route_streams_and_stores_report(client, monkeypatch):
     monkeypatch.delenv("IDE_DIAGNOSE_AGENT", raising=False)
-    _install_diagnose(Script(["## Summary\nZero divide"]))
+    _install_diagnose(Script([
+        [("submit_document", {"kind": "report", "content": "## Summary\nZero divide"})],
+        "Report submitted.",
+    ]))
     sid = await _diagnose_session(client)
     r = await client.post(f"/ide/api/sessions/{sid}/report", headers=_as("alice"))
     assert r.status_code == 200, r.text
@@ -662,7 +674,9 @@ async def test_report_route_streams_and_stores_report(client, monkeypatch):
     ks = kinds(frames)
     assert ks[0] == "run" and ks[-1] == "done"
     assert of(frames, "run")[0]["stage"] == "investigate"
-    assert "".join(d["delta"] for d in of(frames, "text")) == "## Summary\nZero divide"
+    assert "".join(d["delta"] for d in of(frames, "text")) == "Report submitted."
+    # Emitted when the tool stored it, before the run ended.
+    assert ks.index("artifact") < ks.index("done")
     # No ARC-1 server in this build: a note, and the run still completes.
     assert [e["code"] for e in of(frames, "error")] in ([], ["no_diagnose_server"])
     assert of(frames, "done")[0]["status"] == "idle"

@@ -1,4 +1,4 @@
-import ActivityState, { MAX_EVENTS, todoView, eventRows } from "com/agent/ide/model/activity";
+import ActivityState, { ACTIVITY_ROW_LIMIT, MAX_EVENTS, eventRows, isLongOutput, todoView, visibleRows } from "com/agent/ide/model/activity";
 import type { SseEvent } from "com/agent/ide/service/types";
 
 const tool = (id: string, status: string, output = ""): SseEvent => ({
@@ -103,4 +103,48 @@ QUnit.test("a trace proposal that was not stored is a refusal row with its own l
     const guard = eventRows([{ ts: "t", agent: "a", kind: "tool", id: "g", tool: "SAPWrite", detail: "", status: "error", code: "readonly_refused" }]);
     assert.strictEqual(guard[0].refusedKey, "activityRefused");
     assert.strictEqual(eventRows([{ ts: "t", agent: "a", kind: "tool", id: "o", tool: "SAPRead", detail: "", status: "ok" }])[0].refusedKey, "");
+});
+
+QUnit.test("a note event (no id, tool, status, agent or ts) becomes a plain row with empty strings", function (assert) {
+    const [row] = eventRows([{ kind: "note", detail: "Delegating to abap" }]);
+    assert.deepEqual([row.id, row.agent, row.status, row.title, row.detail, row.icon, row.state],
+        ["", "", "", "Delegating to abap", "", "", "None"]);
+});
+
+QUnit.test("the run-end checks get readable labels; other tools keep their name (Task U8)", function (assert) {
+    const rows = eventRows([
+        { ts: "t", agent: "ide", kind: "tool", id: "1", tool: "check_sap_base", detail: "Checking SAP base", status: "ok" },
+        { ts: "t", agent: "ide", kind: "tool", id: "2", tool: "check_syntax", detail: "Checking syntax", status: "ok" },
+        { ts: "t", agent: "abap", kind: "tool", id: "3", tool: "SAPRead", detail: "ZCL_A", status: "ok" }
+    ]);
+    assert.deepEqual(rows.map((r) => r.labelKey), ["activityToolCheckSapBase", "activityToolCheckSyntax", ""]);
+    assert.strictEqual(rows[2].title, "SAPRead");
+});
+
+QUnit.module("activity rows on screen (U8 review)");
+
+QUnit.test("visibleRows: the first 50 until all are asked for", function (assert) {
+    const rows = Array.from({ length: 60 }, (_, i) => i);
+    assert.deepEqual(visibleRows(rows, false), { rows: rows.slice(0, 50), hidden: 10 });
+    assert.deepEqual(visibleRows(rows, true), { rows, hidden: 0 });
+    assert.deepEqual(visibleRows(rows.slice(0, 50), false), { rows: rows.slice(0, 50), hidden: 0 }, "exactly 50: nothing hidden");
+    assert.strictEqual(ACTIVITY_ROW_LIMIT, 50);
+});
+
+QUnit.test("isLongOutput: more than 3 lines or more than 240 characters", function (assert) {
+    assert.notOk(isLongOutput(""));
+    assert.notOk(isLongOutput("a\nb\nc"));
+    assert.ok(isLongOutput("a\nb\nc\nd"));
+    assert.ok(isLongOutput("x".repeat(241)));
+    assert.notOk(isLongOutput("x".repeat(240)));
+});
+
+QUnit.test("eventRows: a status key per row, so the state can be read as text", function (assert) {
+    const rows = eventRows([
+        { ts: "t", agent: "a", kind: "tool", id: "1", tool: "T", detail: "", status: "ok", output: "" },
+        { ts: "t", agent: "a", kind: "tool", id: "2", tool: "T", detail: "", status: "running", output: "" },
+        { ts: "t", agent: "a", kind: "tool", id: "3", tool: "T", detail: "", status: "error", output: "" },
+        { ts: "t", agent: "a", kind: "tool", id: "4", tool: "T", detail: "", status: "ok", output: "", code: "readonly_refused" }
+    ]);
+    assert.deepEqual(rows.map((r) => r.statusKey), ["activityStatusOk", "activityStatusRunning", "activityStatusError", "activityStatusRefused"]);
 });

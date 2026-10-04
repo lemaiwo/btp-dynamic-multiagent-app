@@ -33,11 +33,10 @@ without a destination service: an empty ``destination`` falls back to
 Session type: ``policy`` is the session's type (``change`` by default) and
 selects the read-only policy, so only a diagnose session can read dumps and
 traces here. ``trace_start``/``trace_cancel`` are never run by :meth:`call`
-(decision D1). Masking: in a session that is not a ``change`` session every
-result is masked with a fresh pseudonym map per call, unless the caller
-passes ``masking=False`` -- which the routes do only for a target whose
-conventions say ``non_production`` (``agents.ide.diagnose.masking_required``).
-An ARC-1 error payload is an error, not data, and is raised before masking.
+(decision D1). Results are returned as ARC-1 sent them: the routes build a
+diagnose client only while the target's conventions say ``non_production``
+(``agents.ide.diagnose.is_non_production``) and refuse otherwise. An ARC-1
+error payload is an error, not data, and is raised.
 
 Trace approvals: :meth:`Arc1Client.arm_trace` and :meth:`Arc1Client.
 cancel_trace` are the only code that sends ``trace_start``/``trace_cancel``,
@@ -58,6 +57,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -69,7 +69,6 @@ from agents.destination import DestinationError
 from agents.destination_auth import PLACEHOLDER_BASE, DestinationUserRequired
 from agents.ide import readonly
 from agents.ide.diagnose import result_text as _result_text
-from agents.ide.masking import Masker
 
 logger = logging.getLogger(__name__)
 
@@ -257,14 +256,10 @@ class Arc1Client:
         target: str,
         destination: str = "",
         policy: str = readonly.CHANGE,
-        masking: bool = True,
     ):
         self.target = target
         self.destination = (destination or "").strip()
         self.policy = policy
-        # Masked unless the caller knows the target is non-production. A
-        # change session has no diagnose data and is never masked.
-        self.masking = masking is not False
 
     def _server(self) -> Any:
         url = os.environ.get(env_url_name(self.target), "").strip()
@@ -305,10 +300,7 @@ class Arc1Client:
         # user's SAP identity, and on CF the jwt mode forwards it.
         if (self.destination or shared.ON_CF) and not current_jwt.get():
             raise Arc1UserRequired()
-        text = await self._send(tool, args)
-        if self.policy != readonly.CHANGE and self.masking:
-            return readonly.mask_tool_result(tool, args, text, Masker())
-        return text
+        return await self._send(tool, args)
 
     async def _send(self, tool: str, args: dict) -> str:
         """Run one tool call and map every failure to an ``Arc1Error``.
@@ -395,8 +387,8 @@ class Arc1Client:
         always refuses. "Unchecked" means "not by the read-only policy"; it
         still takes nothing but those two actions of ``SAPDiagnose`` in a
         diagnose client, refuses any user argument, and requires a bound JWT
-        and (on CF) a user-context destination. The result is not masked:
-        callers keep only an id and an expiry of it.
+        and (on CF) a user-context destination. Callers keep only an id and
+        an expiry of the result.
         """
         action = args.get("action") if isinstance(args, dict) else None
         if (
@@ -416,10 +408,9 @@ def get_arc1_client(
     target: str,
     destination: str = "",
     policy: str = readonly.CHANGE,
-    masking: bool = True,
 ) -> Arc1Client:
     """The client the routes use; replace it in tests."""
-    return Arc1Client(target, destination, policy, masking)
+    return Arc1Client(target, destination, policy)
 
 
 # --- result parsing ---------------------------------------------------------
@@ -487,6 +478,154 @@ def parse_findings(text: str) -> list[dict[str, Any]]:
             "rule": str(_first(item, "rule", "key", "ruleKey", "code", default="")),
         })
     return out
+
+
+# --- SAP version marker and "does not exist" --------------------------------
+
+# ``IdeWorkspaceFile.origin_version`` column length.
+MAX_VERSION_CHARS = 255
+_VERSION_LIST_KEYS = ("revisions", "versions", "entries", "items", "results")
+
+
+def _iso_key(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else stamp.replace(tzinfo=timezone.utc)
+
+
+def _newest(entries: list[dict]) -> dict:
+    """The newest revision: by ``date`` when every entry carries a readable
+    ISO date, else the first one (ADT lists revisions newest first)."""
+    keyed = [(_iso_key(_first(e, "date", "created", "timestamp")), e) for e in entries]
+    if all(stamp is not None for stamp, _ in keyed):
+        return max(keyed, key=lambda pair: pair[0])[1]
+    return entries[0]
+
+
+def parse_version(text: str) -> str | None:
+    """The version marker of a ``SAPRead type=VERSIONS`` answer, else ``None``.
+
+    The live payload is unverified (plan A1): a list of revisions, at the top
+    level or under one of a few keys, whose newest entry's ``id``, else
+    ``uri``, else ``date`` is the marker. Anything else -- not JSON, no
+    entries, a marker that is not a short string or number -- is ``None``
+    ("version unknown"), never a guess.
+    """
+    data = _loads(text)
+    entries = [e for e in _items(data, *_VERSION_LIST_KEYS) if isinstance(e, dict)]
+    if not entries:
+        return None
+    newest = _newest(entries)
+    for key in ("id", "uri", "date"):
+        value = newest.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            value = str(value)
+        if isinstance(value, str) and value.strip():
+            marker = value.strip()
+            if len(marker) <= MAX_VERSION_CHARS and marker.isprintable():
+                return marker
+            return None
+    return None
+
+
+async def read_version(client: Any, type_: str, name: str) -> str | None:
+    """The SAP version marker of an object, read as the client's user.
+
+    Best effort: the marker only labels the base ("version unknown" when
+    absent), so any error or an answer of an unknown shape is ``None``,
+    logged at INFO -- never a failure of the open it belongs to.
+    """
+    try:
+        text = await client.call(
+            "SAPRead", {"type": "VERSIONS", "objectType": type_, "name": name}
+        )
+    except Exception as exc:  # noqa: BLE001 -- best effort, see above
+        logger.info(
+            "[ide] version marker of %s %s not read: %s",
+            type_, name, getattr(exc, "code", type(exc).__name__),
+        )
+        return None
+    marker = parse_version(text)
+    if marker is None:
+        logger.info(
+            "[ide] version marker of %s %s: answer of an unknown shape", type_, name
+        )
+    return marker
+
+
+# "Not found" counts only when the message is about the object itself:
+# "<object word or type> <NAME> does not exist / doesn't exist / (was|is)
+# not found / could not be found", optionally behind up to three "<prefix>: "
+# segments (ARC-1 wraps SAP's text as "ARC-1 SAPRead failed: <text>", and an
+# ADT status as "ADT HTTP 404: <text>", which does not count towards the
+# three) and nothing after it but a full stop. "Method FOO of class ZCL_X not
+# found", "Version 3 of class ZCL_X not found" and "Include ZX_TOP not found in
+# class ZCL_X" are about something else and do not count. The name slot must
+# look like an object name -- quoted, or with no lowercase letter, or with a
+# digit, "_", "/" or "$" -- so "Class method not found" or "Function module
+# not found" (an English word where the name belongs) do not count. The
+# message must also say nothing about a user, an authorisation, a
+# destination, a target, a tool or a token: a wrong "absent" makes the
+# reviewer read a change to an existing object as a new one. This applies to
+# a 404 status and a not-found code too.
+# L1 (the live check, plan A2) replaces this with ARC-1's real payload.
+_OBJECT_WORDS = (
+    r"object|class|interface|program|report|include|function(?:\s+module)?"
+    r"|function\s+group|cds(?:\s+view)?|view|ddl\s+source|access\s+control"
+    r"|metadata\s+extension|behaviou?r\s+definition|service\s+definition"
+    r"|service\s+binding|data\s+definition|data\s+element|domain|table"
+    r"|structure"
+    r"|CLAS|INTF|PROG|INCL|FUNC|FUGR|DDLS|DCLS|DDLX|BDEF|SRVD|SRVB|TABL|DTEL"
+    r"|DOMA|STRU"
+)
+# Quoted, or (case-sensitively) no lowercase letter, or a digit/_///$ in it.
+_OBJECT_NAME = (
+    r"(?:(['\"])[A-Za-z0-9_/$]+\1"
+    r"|(?-i:[A-Z0-9_/$]+)(?=\s)"
+    r"|(?=[A-Za-z0-9_/$]*[0-9_/$])[A-Za-z0-9_/$]+)"
+)
+_NOT_FOUND_OBJECT = re.compile(
+    r"^(?:[^:\n]{1,120}:\s+){0,3}"
+    r"(?:ADT\s+HTTP\s+\d{3}:\s+)?"
+    rf"(?:the\s+)?(?:{_OBJECT_WORDS})\s+{_OBJECT_NAME}\s+"
+    r"(?:does\s+not\s+exist|doesn['\u2019]t\s+exist|(?:was\s+|is\s+)?not\s+found"
+    r"|could\s+not\s+be\s+found)\s*\.?$",
+    re.IGNORECASE,
+)
+_NOT_FOUND_DENY = re.compile(
+    r"\b(?:users?|authori[sz]\w*|destinations?|targets?|tools?|tokens?|logon|"
+    r"credentials?|permissions?|principal)\b",
+    re.IGNORECASE,
+)
+
+
+def is_not_found(exc: Arc1Error) -> bool:
+    """Did ARC-1 say the object does not exist (plan A2)?
+
+    Only when the message is object-shaped (see ``_NOT_FOUND_OBJECT``) and
+    mentions no user, authorisation, destination, target, tool or token --
+    whatever the status or code says; or when there is no message at all
+    and the status is 404. A status 404 or a not-found code next to a
+    message about a target, a tool or a user is not about the object.
+    Anything else is not "not found" -- the base check then stores
+    ``unknown``. A refusal, a missing user token or a missing configuration
+    never counts: those calls did not reach SAP, so they say nothing about
+    the object.
+    """
+    if isinstance(exc, (Arc1Refused, Arc1UserRequired, Arc1NotConfigured)):
+        return False
+    detail = str(exc.detail or "").strip()
+    if not detail:
+        return exc.status_code == 404
+    if _NOT_FOUND_DENY.search(detail):
+        return False
+    return bool(_NOT_FOUND_OBJECT.match(detail))
 
 
 def parse_search(text: str) -> list[dict[str, str]]:
