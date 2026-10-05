@@ -923,3 +923,146 @@ async def test_resolver_errors_carry_neither_the_user_token_nor_a_secret():
     with pytest.raises(DestinationError, match="returned 500") as props_err:
         await resolver_with(echo_find).resolve_properties()
     assert not leaks(props_err.value)
+
+
+# --- review follow-up 3 ------------------------------------------------------
+
+
+async def test_a_token_error_from_the_destination_service_is_scrubbed_and_cut():
+    user_jwt = "eyJ.user-jwt-distinctive.sig"
+    payload = {
+        "destinationConfiguration": {
+            "URL": "https://api.example",
+            "Authentication": "OAuth2UserTokenExchange",
+        },
+        "authTokens": [
+            {
+                "type": "",
+                "value": "",
+                "error": f"token exchange failed for assertion {user_jwt} with secret "
+                f"{CONFIG.client_secret}: " + "x" * 2000,
+            }
+        ],
+    }
+    with pytest.raises(DestinationError, match="for the signed-in user") as err:
+        await _resolver(payload).resolve(user_token=user_jwt, principal="alice@example.com")
+    text = str(err.value)
+    assert "token exchange failed" in text and user_jwt not in text
+    assert f"secret {CONFIG.client_secret}:" not in text
+    assert len(text) < 600
+    # The app-level path keeps its wording and is cut the same way.
+    with pytest.raises(DestinationError, match="from the target") as app_err:
+        await _resolver(payload).resolve()
+    assert len(str(app_err.value)) < 600
+    # A non-string error (the service's own JSON object) is still reported.
+    payload["authTokens"][0]["error"] = {"code": 401, "detail": user_jwt}
+    with pytest.raises(DestinationError, match="could not obtain a token") as obj_err:
+        await _resolver(payload).resolve(user_token=user_jwt, principal="alice@example.com")
+    assert user_jwt not in str(obj_err.value) and "401" in str(obj_err.value)
+
+
+async def test_a_non_json_answer_is_a_destination_error_without_the_body():
+    page = "<html><body>Please sign in: session-cookie-distinctive</body></html>"
+
+    def login_page_on_find(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(200, json={"access_token": "svc-token"})
+        return httpx.Response(200, text=page)
+
+    def login_page_on_token(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=page)
+
+    def wrong_shape(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(200, json={"access_token": "svc-token"})
+        return httpx.Response(200, json=["not", "an", "object"])
+
+    def wrong_token_shape(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=["not", "an", "object"])
+
+    def resolver_with(handler) -> DestinationResolver:
+        return DestinationResolver("S4_ODATA_USER", CONFIG, transport=httpx.MockTransport(handler))
+
+    cases = [
+        (login_page_on_find, "destination service answer for 'S4_ODATA_USER' is not JSON"),
+        (wrong_shape, "destination service answer for 'S4_ODATA_USER' is not JSON"),
+        (login_page_on_token, "destination service token response is not JSON"),
+        (wrong_token_shape, "destination service token response is not JSON"),
+    ]
+    for handler, message in cases:
+        for call in (
+            lambda r: r.resolve(),
+            lambda r: r.resolve(user_token="jwt-a", principal="alice@example.com"),
+            lambda r: r.resolve_properties(),
+        ):
+            with pytest.raises(DestinationError) as err:
+                await call(resolver_with(handler))
+            assert message in str(err.value), handler.__name__
+            assert "session-cookie-distinctive" not in str(err.value)
+            assert err.value.__cause__ is None and err.value.__context__ is None
+
+
+async def test_a_percent_encoded_secret_echoed_from_the_form_body_is_scrubbed():
+    from urllib.parse import quote_plus
+
+    secret = "p@ss+w/rd="
+    assert quote_plus(secret) != secret
+
+    def echo(request: httpx.Request) -> httpx.Response:
+        # The form body as sent (percent-encoded), and the decoded value.
+        return httpx.Response(401, text=f"bad client: {request.content.decode()} / {secret}")
+
+    config = DestinationServiceConfig(
+        client_id="sb-dest",
+        client_secret=secret,
+        token_url="https://uaa.example/oauth/token",
+        api_url="https://destination.example",
+    )
+    resolver = DestinationResolver("S4_ODATA_USER", config, transport=httpx.MockTransport(echo))
+    with pytest.raises(DestinationError, match="token request returned 401") as err:
+        await resolver.resolve()
+    assert "client_secret=***" in str(err.value)
+    assert secret not in str(err.value) and quote_plus(secret) not in str(err.value)
+
+    cconfig = ConnectivityConfig(
+        client_id="sb-conn",
+        client_secret=secret,
+        token_url="https://conn-uaa.example/oauth/token",
+        proxy_host="proxy.internal",
+        proxy_port=20003,
+    )
+    tokens = ConnectivityTokens(cconfig, transport=httpx.MockTransport(echo))
+    user_jwt = "eyJ.a+b/c=.sig"  # not what a JWT looks like, but the scrub must not care
+    with pytest.raises(DestinationError, match="returned 401") as user_err:
+        await tokens.user_token(user_jwt, "alice@example.com")
+    text = str(user_err.value)
+    assert "client_secret=***" in text and "assertion=***" in text
+    for value in (secret, quote_plus(secret), user_jwt, quote_plus(user_jwt)):
+        assert value not in text
+
+
+async def test_a_cancelled_waiter_leaves_the_holders_lock_alone():
+    svc = GatedService(slow="jwt-alice")
+    resolver = svc.resolver()
+
+    def call():
+        return resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+
+    holder = asyncio.create_task(call())
+    await svc.entered.wait()
+    waiter = asyncio.create_task(call())
+    await asyncio.sleep(0)  # the waiter is now queued on the key's lock
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    # The holder still owns the key's lock: a third caller queues behind it
+    # instead of starting a second fetch.
+    assert not resolver._user_locks.idle
+    third = asyncio.create_task(call())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not third.done() and svc.user_tokens == []
+    svc.release.set()
+    assert await holder is await third
+    assert svc.user_tokens == ["jwt-alice"] and resolver._user_locks.idle

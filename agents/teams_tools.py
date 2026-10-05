@@ -65,6 +65,7 @@ from agents.outlook_tools import (
     _text_to_html,
     _truncate,
     owner_cache_key,
+    store_bounded,
 )
 from agents.outlook_tools import build_http_client as graph_http_client
 
@@ -219,10 +220,10 @@ class TeamsClient:
                 if c.get("id")
             ]
             channels = [c for c in every if self._permitted(c)]
-            self._channels.pop(key, None)
-            self._channels[key] = (time.monotonic() + CHANNEL_CACHE_TTL_SECONDS, channels)
-            while len(self._channels) > CHANNEL_CACHE_MAX_PRINCIPALS:
-                self._channels.pop(next(iter(self._channels)))
+            store_bounded(
+                self._channels, key, channels,
+                ttl=CHANNEL_CACHE_TTL_SECONDS, limit=CHANNEL_CACHE_MAX_PRINCIPALS,
+            )
         return channels
 
     @staticmethod

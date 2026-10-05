@@ -681,3 +681,34 @@ async def test_graph_caches_expire(monkeypatch, signed_in):
         await outlook._folder_id("agent")
         await teams.list_channels()
     assert fetches[2:] == ["childFolders", "channels", "childFolders", "channels"]
+
+
+async def test_graph_caches_drop_expired_entries_on_insert():
+    """A refreshed JWT leaves a dead entry behind under user_context; those
+    must not fill the slots that live entries need."""
+    from agents.outlook_tools import OutlookClient
+    from agents.teams_tools import TeamsClient
+
+    def graph(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [{"id": "X", "displayName": "agent"}]})
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                             transport=httpx.MockTransport(graph))
+    outlook = OutlookClient(http, token_bound=True)
+    teams = TeamsClient(http, "team-1", token_bound=True)
+
+    async def touch():
+        await outlook._folder_id("agent")
+        await teams.list_channels()
+
+    await _as("jwt-bob-1", "bob@example.com", touch)
+    await _as("jwt-alice", "alice@example.com", touch)
+    assert len(outlook._folders) == 2 and len(teams._channels) == 2
+    bob_old = next(iter(outlook._folders))
+    for cache in (outlook._folders, teams._channels):
+        first = next(iter(cache))
+        cache[first] = (0.0, cache[first][1])  # Bob's first entry has expired
+    await _as("jwt-bob-2", "bob@example.com", touch)
+    for cache in (outlook._folders, teams._channels):
+        assert [k[0] for k in cache] == ["alice@example.com", "bob@example.com"]
+    assert bob_old not in outlook._folders

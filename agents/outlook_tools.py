@@ -95,6 +95,24 @@ def owner_cache_key(owner: str | None, token_bound: bool) -> Any:
     token = current_jwt.get() or ""
     return (owner, hashlib.sha256(token.encode("utf-8")).hexdigest())
 
+
+def store_bounded(
+    cache: dict[Any, tuple[float, Any]], key: Any, value: Any, *, ttl: float, limit: int
+) -> None:
+    """Put ``value`` last in a ``{key: (deadline, value)}`` cache, bounded.
+
+    Expired entries go first, whoever they belong to: under a token-bound key
+    every refreshed JWT leaves a dead entry behind, and those must not take
+    the slots live ones need. Then the oldest entries are evicted.
+    """
+    now = time.monotonic()
+    for stale in [k for k, (deadline, _) in cache.items() if deadline <= now]:
+        del cache[stale]
+    cache.pop(key, None)
+    cache[key] = (now + ttl, value)
+    while len(cache) > limit:
+        cache.pop(next(iter(cache)))
+
 # Graph accepts these names wherever a folder id is expected, so they must not
 # be looked up among the Inbox's children -- "inbox" is not its own child.
 WELL_KNOWN_FOLDERS = {
@@ -259,11 +277,10 @@ class OutlookClient:
                 for f in data.get("value") or []
                 if f.get("displayName") and f.get("id")
             }
-            # Re-insert so the newest entry is last; evict from the front.
-            self._folders.pop(key, None)
-            self._folders[key] = (time.monotonic() + FOLDER_CACHE_TTL_SECONDS, folders)
-            while len(self._folders) > FOLDER_CACHE_MAX_OWNERS:
-                self._folders.pop(next(iter(self._folders)))
+            store_bounded(
+                self._folders, key, folders,
+                ttl=FOLDER_CACHE_TTL_SECONDS, limit=FOLDER_CACHE_MAX_OWNERS,
+            )
         return folders
 
     @staticmethod

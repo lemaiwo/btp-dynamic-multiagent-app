@@ -45,8 +45,9 @@ the principal read by ``DestinationAuth._user`` can name **different
 identities** -- the destination is resolved with the trigger's token under the
 run-as principal. That is why every per-user cache behind this auth
 (``DestinationResolver``, ``ConnectivityTokens``, the Outlook and Teams
-caches) keys on the principal AND a digest of the token: an entry is only
-served to a caller presenting the token it was obtained with.
+caches, the OData CSRF session store in ``agents/odata/session.py``) keys on
+the principal AND a digest of the token: an entry is only served to a caller
+presenting the token it was obtained with.
 """
 
 from __future__ import annotations

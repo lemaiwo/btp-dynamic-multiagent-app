@@ -444,7 +444,9 @@ async def run_as(principal: str) -> AsyncIterator[None]:
       app-level credential; "jwt" servers and destinations with
       ``user_context`` refuse it;
     * a run started from a request is a task created inside that request
-      (``job_runner.start_run``), so it inherits whatever bearer token the
+      (``job_runner.start_run``; a workflow run behaves the same:
+      ``workflow_runner.start_workflow_run`` creates its task in the request
+      and each agent step enters ``run_as``), so it inherits whatever bearer token the
       request carried: the admin's own JWT for "Run now", the caller's token
       for an API trigger. In such a run ``current_principal`` is the agent's
       run-as user while ``current_jwt`` is the token of whoever triggered

@@ -558,7 +558,11 @@ class DestinationResolver:
 
     async def _fetch(self, *, user_token: str | None = None) -> Destination:
         payload = await self._fetch_payload(user_token=user_token)
-        return self._destination_from(payload, per_user=bool(user_token))
+        return self._destination_from(
+            payload,
+            per_user=bool(user_token),
+            secrets=(user_token, self._config.client_secret),
+        )
 
     async def _fetch_payload(self, *, user_token: str | None = None) -> Any:
         """The destination service's "find destination" response, as JSON."""
@@ -594,7 +598,18 @@ class DestinationResolver:
                     f"destination service returned {response.status_code} for "
                     f"{self.name!r}: {_scrub(response.text, *secrets)[:400]}"
                 )
-            return response.json()
+            # A 200 that is not the service's JSON object -- a proxy's login
+            # page, say -- is reported as such, without the body: it is
+            # somebody else's page and may carry anything.
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if not isinstance(payload, dict):
+                raise DestinationError(
+                    f"destination service answer for {self.name!r} is not JSON"
+                )
+            return payload
 
     async def _service_token(self, http: httpx.AsyncClient) -> str:
         secret = self._config.client_secret
@@ -620,14 +635,28 @@ class DestinationResolver:
                 f"destination service token request returned "
                 f"{response.status_code}: {_scrub(response.text, secret)[:400]}"
             )
-        token = str((response.json() or {}).get("access_token") or "")
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise DestinationError("destination service token response is not JSON")
+        token = str(body.get("access_token") or "")
         if not token:
             raise DestinationError(
                 "destination service token response carried no access_token"
             )
         return token
 
-    def _destination_from(self, payload: Any, *, per_user: bool = False) -> Destination:
+    def _destination_from(
+        self,
+        payload: Any,
+        *,
+        per_user: bool = False,
+        secrets: tuple[str | None, ...] = (),
+    ) -> Destination:
+        # `secrets` is what the service was sent and might echo in an error
+        # text: the user's token and the client secret.
         config = (payload or {}).get("destinationConfiguration") or {}
         url = str(config.get("URL") or "").strip().rstrip("/")
         if not url:
@@ -705,9 +734,13 @@ class DestinationResolver:
         token = tokens[0] or {}
         if token.get("error"):
             what = "for the signed-in user" if per_user else "from the target"
+            # The service's own text, which says what to fix -- but it is
+            # remote text that gets logged and may reach a model, so it is
+            # scrubbed and cut like every other echoed message here.
+            detail = _scrub(str(token["error"]), *secrets)[:400]
             raise DestinationError(
                 f"destination {self.name!r} could not obtain a token {what}: "
-                f"{token['error']}"
+                f"{detail}"
             )
         header = token.get("http_header") or {}
         key = str(header.get("key") or "").strip()
