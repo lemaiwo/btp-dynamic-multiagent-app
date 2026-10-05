@@ -19,10 +19,11 @@ This module imports ``agents.auth`` and ``agents.db`` only, never
 from __future__ import annotations
 
 import json
+import re
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints, ValidationError
 
 from agents.auth import require_admin
 from agents.db import (
@@ -35,7 +36,7 @@ from agents.db import (
     update_odata_service,
     validate_odata_service,
 )
-from agents.odata.models import DESTINATION_NAME_RE, SERVICE_NAME_RE
+from agents.odata.models import DESTINATION_NAME_RE, MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 
 router = APIRouter(prefix="/api/odata", tags=["odata"])
 
@@ -43,6 +44,11 @@ _NOT_FOUND = "Service not found"
 _TITLE_MAX = 120  # ODataServicePayload.title
 _COPY_SUFFIX = " (copy)"
 _MAX_REPORTED_ERRORS = 20
+# The largest definition the gate accepts plus room for the other fields.
+# Checked before anything is parsed: without it an admin token could make the
+# worker buffer and parse a body of any size.
+MAX_BODY_BYTES = MAX_DEFINITION_BYTES + 64 * 1024
+_TOO_LARGE = "Request body too large"
 
 
 class DuplicateBody(BaseModel):
@@ -58,17 +64,54 @@ class DuplicateBody(BaseModel):
         | None
     ) = None
     destination: Annotated[str, StringConstraints(pattern=DESTINATION_NAME_RE)] | None = None
-    user_context: bool | None = None
+    # Strict: this flag decides whose identity reaches SAP, so only a JSON
+    # boolean sets it -- never "true", 1 or anything else that coerces.
+    user_context: StrictBool | None = None
 
 
 def _refuse(detail: str) -> HTTPException:
     return HTTPException(status_code=422, detail=detail)
 
 
+def _service_name(name: str) -> str:
+    """The path's ``name`` if it can be a service name, else the same 404 an
+    unknown name gets.
+
+    Checked before any lookup or log line: a NUL byte or an oversized value
+    is a driver error on Postgres, i.e. a 500 whose SQLAlchemy text carries
+    the bound parameter into the log.
+    """
+    if not re.fullmatch(SERVICE_NAME_RE, name):
+        raise HTTPException(status_code=404, detail=_NOT_FOUND)
+    return name
+
+
+async def _bounded_body(request: Request) -> bytes:
+    """The raw body, at most ``MAX_BODY_BYTES``; 413 beyond that.
+
+    The declared length is refused before a byte is read. The stream is
+    counted as well, because a chunked body declares nothing and a declared
+    length is only a claim.
+    """
+    too_large = HTTPException(status_code=413, detail=_TOO_LARGE)
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        raise too_large
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            raise too_large
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _json_object(request: Request) -> dict[str, Any]:
     """The request body as a JSON object, or a 422 that says only that."""
+    raw = await _bounded_body(request)
     try:
-        data = json.loads(await request.body())
+        data = json.loads(raw)
     except (ValueError, RecursionError):
         # ValueError covers JSONDecodeError and a body that is not UTF-8;
         # RecursionError is a body nested deeper than the parser goes.
@@ -130,6 +173,7 @@ async def api_create_odata_service(request: Request) -> dict[str, Any]:
 
 @router.get("/services/{name}", dependencies=[Depends(require_admin)])
 async def api_get_odata_service(name: str) -> dict[str, Any]:
+    name = _service_name(name)
     async with SessionLocal() as session:
         row = await get_odata_service(session, name)
         if row is None:
@@ -140,6 +184,7 @@ async def api_get_odata_service(name: str) -> dict[str, Any]:
 
 @router.put("/services/{name}", dependencies=[Depends(require_admin)])
 async def api_update_odata_service(name: str, request: Request) -> dict[str, Any]:
+    name = _service_name(name)
     data = _validated(await _json_object(request))
     async with SessionLocal() as session:
         row = await get_odata_service(session, name)
@@ -166,6 +211,7 @@ async def api_delete_odata_service(name: str) -> None:
     The admin removes it from the agents first; disabled agents count,
     because turning one back on would break it.
     """
+    name = _service_name(name)
     async with SessionLocal() as session:
         row = await get_odata_service(session, name)
         if row is None:
@@ -189,6 +235,7 @@ async def api_duplicate_odata_service(name: str, request: Request) -> dict[str, 
     """Copy a service under a new name, e.g. the same definition through a
     technical-user destination for scheduled runs. The copy goes through the
     same gate as a new service."""
+    name = _service_name(name)
     body = _duplicate_body(await _json_object(request))
     async with SessionLocal() as session:
         source = await get_odata_service(session, name)

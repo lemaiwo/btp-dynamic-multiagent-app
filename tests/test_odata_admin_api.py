@@ -274,6 +274,120 @@ async def test_a_refused_put_changes_nothing(client, created):
     assert (await client.get(ONE)).json()["purpose"] == GOOD["purpose"]
 
 
+# --- hardening: path name, body size, strict flag --------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw_name",
+    ["bad%00name", "a" * 1000, "purchase-requisitions%0A", "Purchase", "a%20b", "-a"],
+    ids=["nul", "oversized", "newline", "uppercase", "space", "leading-dash"],
+)
+async def test_a_name_that_is_no_slug_is_404_before_any_lookup(
+    client, created, monkeypatch, raw_name
+):
+    """A value that cannot be a service name never reaches the database: on
+    Postgres a NUL byte is a driver error whose text carries the parameter."""
+    from agents.odata import admin_routes
+
+    async def no_lookup(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("looked up a name that is no slug")
+
+    monkeypatch.setattr(admin_routes, "get_odata_service", no_lookup)
+    monkeypatch.setattr(admin_routes, "odata_service_referrers", no_lookup)
+    url = f"{BASE}/{raw_name}"
+    for r in (
+        await client.get(url),
+        await client.put(url, json=GOOD),
+        await client.delete(url),
+        await client.post(f"{url}/duplicate", json={"name": "pr-copy"}),
+    ):
+        assert r.status_code == 404, (r.request.method, r.status_code)
+        assert r.json() == {"detail": "Service not found"}
+
+
+def _too_large() -> bytes:
+    from agents.odata import admin_routes
+
+    return b'{"name": "' + b"a" * admin_routes.MAX_BODY_BYTES + b'"}'
+
+
+async def test_an_oversized_body_is_413_by_its_content_length(client, created, monkeypatch):
+    from agents.odata import admin_routes
+
+    async def no_stream(self):
+        raise AssertionError("read a body its Content-Length already refused")
+        yield b""  # pragma: no cover
+
+    monkeypatch.setattr(admin_routes.Request, "stream", no_stream)
+    raw = _too_large()
+    headers = {"content-type": "application/json"}
+    for r in (
+        await client.post(BASE, content=raw, headers=headers),
+        await client.put(ONE, content=raw, headers=headers),
+        await client.post(f"{ONE}/duplicate", content=raw, headers=headers),
+    ):
+        assert int(r.request.headers["content-length"]) == len(raw)
+        assert r.status_code == 413, r.status_code
+        assert r.json() == {"detail": "Request body too large"}
+
+
+async def test_an_oversized_chunked_body_is_413_without_a_content_length(client, created):
+    raw = _too_large()
+
+    async def chunks():
+        for start in range(0, len(raw), 256 * 1024):
+            yield raw[start : start + 256 * 1024]
+
+    headers = {"content-type": "application/json"}
+    for method, url in (("POST", BASE), ("PUT", ONE), ("POST", f"{ONE}/duplicate")):
+        r = await client.request(method, url, content=chunks(), headers=headers)
+        assert "content-length" not in r.request.headers
+        assert r.status_code == 413, r.status_code
+        assert r.json() == {"detail": "Request body too large"}
+    assert len((await client.get(BASE)).json()) == 1
+
+
+async def test_a_lying_content_length_does_not_lift_the_cap(client):
+    raw = _too_large()
+
+    async def chunks():
+        yield raw
+
+    for declared in ("10", "not-a-number", "-5"):
+        r = await client.post(
+            BASE,
+            content=chunks(),
+            headers={"content-type": "application/json", "content-length": declared},
+        )
+        assert r.status_code == 413, (declared, r.status_code)
+
+
+async def test_a_body_at_the_limit_is_still_read(client):
+    """The cap leaves room for the largest definition the gate accepts: a
+    body just under it is parsed and refused on its content (422), not 413."""
+    from agents.odata import admin_routes
+    from agents.odata.models import MAX_DEFINITION_BYTES
+
+    assert admin_routes.MAX_BODY_BYTES == MAX_DEFINITION_BYTES + 64 * 1024
+    pad = admin_routes.MAX_BODY_BYTES - len(b'{"name": ""}')
+    raw = b'{"name": "' + b"a" * pad + b'"}'
+    assert len(raw) == admin_routes.MAX_BODY_BYTES
+    r = await client.post(BASE, content=raw, headers={"content-type": "application/json"})
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, "false", SECRET, [True], None])
+async def test_duplicate_user_context_takes_only_a_json_boolean(client, created, value):
+    r = await client.post(f"{ONE}/duplicate", json={"name": "pr-copy", "user_context": value})
+    if value is None:  # "not given": the source's flag is kept
+        assert r.status_code == 201 and r.json()["user_context"] is True
+        return
+    assert r.status_code == 422, r.text
+    assert "user_context" in r.json()["detail"]
+    assert SECRET not in r.text and str(value) not in r.json()["detail"].replace("user_context", "")
+    assert len((await client.get(BASE)).json()) == 1
+
+
 # --- duplicate ----------------------------------------------------------------
 
 
