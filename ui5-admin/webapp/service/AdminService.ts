@@ -1,6 +1,8 @@
 import type {
     Agent, AgentInput, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
-    JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
+    JobRun, JobRunDetail, ModelInfo, ODataDuplicateRequest, ODataMetadataPreview, ODataMetadataRequest,
+    ODataService, ODataServiceInput, ODataServiceSummary, ODataTestResult,
+    OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
 
@@ -249,5 +251,59 @@ export default class AdminService {
      * disabled ones included and flagged. */
     public getAgentWhereUsed(id: number): Promise<AgentWhereUsed> {
         return this.request<AgentWhereUsed>(`agents/${id}/where-used`);
+    }
+
+    // --- odata ---
+    // The catalogue of OData services (`/admin/api/odata/...`). A service is
+    // addressed by its name, the slug agents use, not by an id.
+    private static odataServicePath(name: string): string {
+        return `odata/services/${encodeURIComponent(name)}`;
+    }
+
+    /** The list carries no definitions; `getODataService` does. */
+    public listODataServices(): Promise<ODataServiceSummary[]> {
+        return this.request<ODataServiceSummary[]>("odata/services");
+    }
+
+    public getODataService(name: string): Promise<ODataService> {
+        return this.request<ODataService>(AdminService.odataServicePath(name));
+    }
+
+    public createODataService(input: ODataServiceInput): Promise<ODataService> {
+        return this.request<ODataService>("odata/services", { method: "POST", ...AdminService.json(input) });
+    }
+
+    /** The name is immutable: `input.name` must be `name`, or the server
+     * answers 422. */
+    public updateODataService(name: string, input: ODataServiceInput): Promise<ODataService> {
+        return this.request<ODataService>(AdminService.odataServicePath(name), {
+            method: "PUT", ...AdminService.json(input)
+        });
+    }
+
+    /** Rejects with a 409 while an agent, enabled or not, uses the service. */
+    public deleteODataService(name: string): Promise<void> {
+        return this.request<void>(AdminService.odataServicePath(name), { method: "DELETE" });
+    }
+
+    /** A copy with the same definition under another name, e.g. the same
+     * service through a technical-user destination for jobs. */
+    public duplicateODataService(name: string, body: ODataDuplicateRequest): Promise<ODataService> {
+        return this.request<ODataService>(`${AdminService.odataServicePath(name)}/duplicate`, {
+            method: "POST", ...AdminService.json(body)
+        });
+    }
+
+    /** Reads a service's $metadata through its destination. Stores nothing. */
+    public readODataMetadata(body: ODataMetadataRequest): Promise<ODataMetadataPreview> {
+        return this.request<ODataMetadataPreview>("odata/metadata", { method: "POST", ...AdminService.json(body) });
+    }
+
+    /** One read of one row through the stored service; the answer says
+     * whether it worked and as whom, never what was read. */
+    public testODataService(name: string): Promise<ODataTestResult> {
+        return this.request<ODataTestResult>(`${AdminService.odataServicePath(name)}/test`, {
+            method: "POST", ...AdminService.json({})
+        });
     }
 }

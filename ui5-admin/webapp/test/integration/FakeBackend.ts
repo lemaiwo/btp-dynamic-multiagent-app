@@ -1,5 +1,7 @@
 import type {
-    Agent, CredentialStatus, JobRunDetail, Skill, WorkflowDetail, WorkflowRunDetail
+    Agent, CredentialStatus, JobRunDetail, ODataDefinition, ODataEntityOp, ODataEntitySet, ODataField,
+    ODataMetadataPreview, ODataPreviewEntitySet, ODataService, ODataServiceInput, ODataServiceSummary,
+    ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 
@@ -22,6 +24,15 @@ export default class FakeBackend {
     public workflowRuns: WorkflowRunDetail[] = [];
     /** Credential rows served for agent 100 — one server per token state. */
     public credentials: CredentialStatus[] = [];
+    // --- odata ---
+    /** The OData catalogue. `counts` and `has_write` are recomputed from the
+     * definition on every answer, as the server does; `used_by` is kept on
+     * the row, and a non-empty one refuses a delete. */
+    public odataServices: ODataService[] = [];
+    /** What POST odata/metadata answers, whatever the request names. */
+    public metadataPreview!: ODataMetadataPreview;
+    /** What POST odata/services/{name}/test answers. */
+    public testResult!: ODataTestResult;
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
     /** Every intercepted call as "METHOD path" (query string dropped), in
@@ -220,6 +231,7 @@ export default class FakeBackend {
             items: [],
             steps: []
         }];
+        this.seedOData();
         this.failNext = undefined;
     }
 
@@ -290,6 +302,396 @@ export default class FakeBackend {
             skip_seen_items: true, max_parallel_items: 1, on_unknown_branch: "fail",
             enabled: true, branches: [], steps: []
         };
+    }
+
+    // --- odata ---
+    /** `named` first, then filler fields up to `total`; the first
+     * `selectable` of the whole list are readable and filterable. */
+    private static odataFields(
+        named: Partial<ODataField>[], selectable: number, total: number, writable: string[] = []
+    ): ODataField[] {
+        const fields: ODataField[] = [];
+        for (let i = 0; i < total; i++) {
+            const name = named[i]?.name ?? `Field${String(i + 1).padStart(3, "0")}`;
+            fields.push({
+                name, type: "Edm.String", label: "", selectable: i < selectable, filterable: i < selectable,
+                writable: writable.indexOf(name) !== -1, hint: "", values: [], personal_data: false,
+                ...(named[i] ?? {})
+            });
+        }
+        return fields;
+    }
+
+    private static odataEntitySet(
+        name: string, title: string, description: string, keys: string[],
+        operations: ODataEntityOp[], fields: ODataField[]
+    ): ODataEntitySet {
+        return {
+            name, title, path: "", entity_type: `${name}Type`, description,
+            keys: keys.map((key) => ({ name: key, type: "Edm.String" })),
+            operations, fields, navigations: [], examples: []
+        };
+    }
+
+    /** The five entity sets of the purchase requisition service. `write`
+     * adds the write operations the jobs copy enables. */
+    private static requisitionEntitySets(write: boolean): ODataEntitySet[] {
+        const itemKeys = ["PurchaseRequisition", "PurchaseRequisitionItem"];
+        const item = FakeBackend.odataEntitySet(
+            "A_PurchaseRequisitionItem", "Requisition item",
+            "Central entity for approval decisions: release status, quantity, value, plant, supplier.",
+            itemKeys, write ? ["list", "get", "update"] : ["list", "get"],
+            FakeBackend.odataFields([
+                { name: "PurchaseRequisition", label: "Purchase requisition", hint: "Key, 10 digits with leading zeros" },
+                { name: "PurchaseRequisitionItem", label: "Requisition item" },
+                {
+                    name: "PurReqnReleaseStatus", label: "Release status", values: [
+                        { value: "B", meaning: "awaiting release" },
+                        { value: "05", meaning: "released" },
+                        { value: "08", meaning: "rejected" }
+                    ]
+                },
+                { name: "RequestedQuantity", label: "Requested quantity", type: "Edm.Decimal", hint: "In BaseUnit" },
+                { name: "ItemNetAmount", label: "Net amount", type: "Edm.Decimal", hint: "In PurReqnItemCurrency" },
+                { name: "Plant", label: "Plant" },
+                { name: "DeliveryDate", label: "Delivery date", type: "Edm.DateTime" }
+            ], 24, 88, write ? ["RequestedQuantity", "DeliveryDate"] : [])
+        );
+        // Personal data: known to the catalogue, never readable.
+        item.fields.push({
+            name: "CreatedByUser", type: "Edm.String", label: "Created by", selectable: false,
+            filterable: false, writable: false, hint: "", values: [], personal_data: true
+        });
+        item.navigations = [
+            { name: "to_PurchaseReqnItemText", target: "A_PurchaseReqnItemText", collection: true, description: "" },
+            { name: "to_PurchaseReqnAcctAssgmt", target: "A_PurReqnAcctAssgmt", collection: true, description: "" },
+            { name: "to_PurchaseReqnDeliveryAddress", target: "A_PurReqAddDelivery", collection: false, description: "" },
+            {
+                name: "to_PurchaseRequisition", target: "A_PurchaseRequisitionHeader", collection: false,
+                description: "The header of this item."
+            }
+        ];
+        item.examples = [
+            {
+                description: "Items awaiting release in one plant",
+                filter: "PurReqnReleaseStatus eq 'B' and Plant eq '1010'",
+                select: ["PurchaseRequisition", "PurchaseRequisitionItem", "ItemNetAmount"], orderby: "", top: 20
+            },
+            {
+                description: "All items of one requisition", filter: "PurchaseRequisition eq '0010000123'",
+                select: [], orderby: "PurchaseRequisitionItem", top: null
+            }
+        ];
+        return [
+            item,
+            FakeBackend.odataEntitySet(
+                "A_PurchaseRequisitionHeader", "Requisition header",
+                "Number, document type and description only. Everything else is on the items.",
+                ["PurchaseRequisition"], ["list", "get"],
+                FakeBackend.odataFields([{ name: "PurchaseRequisition", label: "Purchase requisition" }], 4, 4)
+            ),
+            FakeBackend.odataEntitySet(
+                "A_PurReqnAcctAssgmt", "Account assignment",
+                "Cost centre, G/L account, WBS element and order per item.",
+                itemKeys.concat(["PurchaseReqnAcctAssgmtNumber"]), ["list"],
+                FakeBackend.odataFields([
+                    { name: "PurchaseRequisition" }, { name: "PurchaseRequisitionItem" },
+                    { name: "PurchaseReqnAcctAssgmtNumber" }
+                ], 11, 37)
+            ),
+            FakeBackend.odataEntitySet(
+                "A_PurchaseReqnItemText", "Item text", "The requester's justification text for one item.",
+                itemKeys.concat(["DocumentText"]), write ? ["list", "get", "create", "update"] : ["list", "get"],
+                FakeBackend.odataFields([
+                    { name: "PurchaseRequisition" }, { name: "PurchaseRequisitionItem" }, { name: "DocumentText" },
+                    { name: "Language" }, { name: "NoteDescription", label: "Text" }
+                ], 5, 5, write ? ["NoteDescription"] : [])
+            ),
+            // Imported but not described yet: no readable field, so no operation.
+            FakeBackend.odataEntitySet(
+                "A_PurReqAddDelivery", "Delivery address", "", itemKeys, [],
+                FakeBackend.odataFields([{ name: "PurchaseRequisition" }, { name: "PurchaseRequisitionItem" }], 0, 31)
+            )
+        ];
+    }
+
+    private makeODataService(
+        input: ODataServiceInput, usedBy: ODataUsedBy[] = []
+    ): ODataService {
+        return {
+            ...input, id: this.nextId++, created_at: "2026-10-05T08:00:00+00:00",
+            updated_at: "2026-10-05T08:00:00+00:00",
+            counts: { entity_sets: 0, operations: 0 }, has_write: false, used_by: usedBy
+        };
+    }
+
+    /** `ODataService.to_dict()`: counts and has_write follow the definition. */
+    private static odataDict(service: ODataService): ODataService {
+        const definition: ODataDefinition = service.definition;
+        const writes: ODataEntityOp[] = ["create", "update", "delete"];
+        return {
+            ...service,
+            counts: { entity_sets: definition.entity_sets.length, operations: definition.operations.length },
+            has_write: definition.entity_sets.some((e) => e.operations.some((op) => writes.indexOf(op) !== -1))
+                || definition.operations.some((o) => o.enabled && o.changes_data)
+        };
+    }
+
+    /** `ODataService.to_summary()`: the same without the definition. */
+    private static odataSummary(service: ODataService): ODataServiceSummary {
+        const { definition, ...summary } = FakeBackend.odataDict(service);
+        void definition;
+        return summary;
+    }
+
+    /** Stored like the server stores a payload: only its fields, defaults
+     * filled in, so an unknown or read-only key never reaches a row. */
+    private static odataInput(body: Record<string, unknown> | undefined): ODataServiceInput {
+        const input = (body ?? {}) as Partial<ODataServiceInput>;
+        return {
+            name: String(input.name ?? ""), title: String(input.title ?? ""),
+            purpose: String(input.purpose ?? ""), not_for: String(input.not_for ?? ""),
+            destination: String(input.destination ?? ""), user_context: input.user_context === true,
+            odata_version: input.odata_version === "v4" ? "v4" : "v2",
+            service_path: String(input.service_path ?? ""), enabled: input.enabled !== false,
+            definition: {
+                entity_sets: input.definition?.entity_sets ?? [],
+                operations: input.definition?.operations ?? []
+            },
+            metadata_fetched_at: input.metadata_fetched_at ?? null
+        };
+    }
+
+    private seedOData(): void {
+        const user = (agent: Agent, allowWrite = false): ODataUsedBy => ({
+            agent_id: agent.id, agent: agent.name, enabled: agent.enabled,
+            expose_api: agent.expose_api, api_slug: agent.api_slug, allow_write: allowWrite
+        });
+        const [btp, gmail] = this.agents;
+        const path = "/sap/opu/odata/sap/API_PURCHASEREQ_PROCESS_SRV";
+        const partnerKeys = ["BusinessPartner"];
+
+        this.odataServices = [
+            // Signed-in user, read-only: what a chat agent uses.
+            this.makeODataService({
+                name: "purchase-requisitions", title: "Purchase requisitions",
+                purpose: "Read requisitions and their items to judge an approval", not_for: "",
+                destination: "S4_ODATA_USER", user_context: true, odata_version: "v2", service_path: path,
+                enabled: true, metadata_fetched_at: "2026-10-05T07:30:00+00:00",
+                definition: { entity_sets: FakeBackend.requisitionEntitySets(false), operations: [] }
+            }, [user(gmail)]),
+            // The same service through a technical user, with writes: for jobs.
+            this.makeODataService({
+                name: "purchase-requisitions-jobs", title: "Purchase requisitions (jobs)",
+                purpose: "Nightly checks and release of requisitions",
+                not_for: "Purchase orders, contracts or supplier master data: use the matching service",
+                destination: "S4_ODATA_TECH", user_context: false, odata_version: "v2", service_path: path,
+                enabled: true, metadata_fetched_at: "2026-10-05T07:30:00+00:00",
+                definition: {
+                    entity_sets: FakeBackend.requisitionEntitySets(true),
+                    operations: [{
+                        name: "ReleaseItem", qualified_name: "", title: "Release item", kind: "function_import",
+                        http_method: "POST", bound_to: "A_PurchaseRequisitionItem",
+                        parameters: [
+                            { name: "PurchaseRequisition", type: "Edm.String", required: true },
+                            { name: "PurchaseRequisitionItem", type: "Edm.String", required: true },
+                            { name: "ReleaseCode", type: "Edm.String", required: true }
+                        ],
+                        description: "Releases one requisition item with a release code.",
+                        enabled: true, changes_data: true
+                    }]
+                }
+            }, [user(btp, true)]),
+            this.makeODataService({
+                name: "business-partners", title: "Business partners",
+                purpose: "Look up suppliers and their addresses", not_for: "",
+                destination: "S4_ODATA_USER", user_context: true, odata_version: "v2",
+                service_path: "/sap/opu/odata/sap/API_BUSINESS_PARTNER", enabled: true,
+                metadata_fetched_at: "2026-10-04T15:00:00+00:00",
+                definition: {
+                    entity_sets: [
+                        FakeBackend.odataEntitySet(
+                            "A_BusinessPartner", "Business partner", "Name, category and grouping of a partner.",
+                            partnerKeys, ["list", "get"],
+                            FakeBackend.odataFields([{ name: "BusinessPartner", label: "Business partner" }], 6, 20)
+                        ),
+                        FakeBackend.odataEntitySet(
+                            "A_Supplier", "Supplier", "Supplier-specific data of a partner.",
+                            ["Supplier"], ["list", "get"],
+                            FakeBackend.odataFields([{ name: "Supplier", label: "Supplier" }], 5, 12)
+                        ),
+                        FakeBackend.odataEntitySet(
+                            "A_BusinessPartnerAddress", "Address", "Postal addresses of a partner.",
+                            partnerKeys.concat(["AddressID"]), ["list"],
+                            FakeBackend.odataFields([{ name: "BusinessPartner" }, { name: "AddressID" }], 8, 30)
+                        )
+                    ],
+                    operations: []
+                }
+            }, [user(btp), user(gmail)]),
+            // Disabled, V4, used by nobody: the one a journey can delete.
+            this.makeODataService({
+                name: "purchase-requisitions-v4", title: "Purchase requisitions (V4)",
+                purpose: "Same object over the V4 API", not_for: "",
+                destination: "S4_ODATA_USER", user_context: true, odata_version: "v4",
+                service_path: "/sap/opu/odata4/sap/api_purchaserequisition_2/srvd_a2x/sap/purchaserequisition/0001",
+                enabled: false, metadata_fetched_at: null,
+                definition: {
+                    entity_sets: [
+                        FakeBackend.odataEntitySet(
+                            "PurchaseReqn", "Requisition", "The requisition header.",
+                            ["PurchaseRequisition"], ["list", "get"],
+                            FakeBackend.odataFields([{ name: "PurchaseRequisition" }], 4, 9)
+                        ),
+                        FakeBackend.odataEntitySet(
+                            "PurchaseReqnItem", "Requisition item", "The items of a requisition.",
+                            ["PurchaseRequisition", "PurchaseRequisitionItem"], ["list", "get"],
+                            FakeBackend.odataFields(
+                                [{ name: "PurchaseRequisition" }, { name: "PurchaseRequisitionItem" }], 10, 60
+                            )
+                        )
+                    ],
+                    operations: [
+                        {
+                            name: "Release", qualified_name: "com.sap.gateway.srvd_a2x.purchaserequisition.v0001.Release",
+                            title: "Release", kind: "action", http_method: "POST", bound_to: "PurchaseReqnItem",
+                            parameters: [{ name: "ReleaseCode", type: "Edm.String", required: true }],
+                            description: "", enabled: false, changes_data: true
+                        },
+                        {
+                            name: "Reject", qualified_name: "com.sap.gateway.srvd_a2x.purchaserequisition.v0001.Reject",
+                            title: "Reject", kind: "action", http_method: "POST", bound_to: "PurchaseReqnItem",
+                            parameters: [], description: "", enabled: false, changes_data: true
+                        },
+                        {
+                            name: "GetReleaseStrategy",
+                            qualified_name: "com.sap.gateway.srvd_a2x.purchaserequisition.v0001.GetReleaseStrategy",
+                            title: "Release strategy", kind: "function", http_method: "GET",
+                            bound_to: "PurchaseReqnItem", parameters: [], description: "",
+                            enabled: false, changes_data: false
+                        }
+                    ]
+                }
+            })
+        ];
+
+        // What $metadata of the requisition service offers, compared with the
+        // jobs service: four entity sets in it (one with two new fields), one
+        // new, and the function import it already has.
+        const jobs = this.odataServices[1].definition;
+        const labels: Record<string, string> = {
+            A_PurchaseRequisitionItem: "Purchase requisition item",
+            A_PurchaseRequisitionHeader: "Purchase requisition",
+            A_PurReqnAcctAssgmt: "Account assignment",
+            A_PurchaseReqnItemText: "Item text",
+            A_PurReqAddDelivery: "Delivery address"
+        };
+        const previewSets: ODataPreviewEntitySet[] = jobs.entity_sets.map((e) => ({
+            name: e.name, entity_type: e.entity_type, label: labels[e.name], keys: e.keys,
+            fields: e.fields.map((f) => ({
+                name: f.name, type: f.type, label: f.label, filterable: true, creatable: false, updatable: false
+            })),
+            navigations: e.navigations.map((n) => ({ name: n.name, target: n.target, collection: n.collection })),
+            capabilities: { creatable: false, updatable: e.name !== "A_PurReqAddDelivery", deletable: false },
+            status: e.name === "A_PurReqAddDelivery" ? "new" : "in_service",
+            new_fields: [], removed_fields: []
+        }));
+        previewSets[0].status = "changed";
+        previewSets[0].new_fields = ["PurReqnOrigin", "LastChangeDateTime"];
+        previewSets[0].fields = previewSets[0].fields.concat([
+            { name: "PurReqnOrigin", type: "Edm.String", label: "Origin of requisition",
+              filterable: true, creatable: false, updatable: false },
+            { name: "LastChangeDateTime", type: "Edm.DateTimeOffset", label: "Last changed on",
+              filterable: true, creatable: false, updatable: false }
+        ]);
+        this.metadataPreview = {
+            fetched_at: "2026-10-05T09:00:00+00:00",
+            entity_sets: previewSets,
+            operations: jobs.operations.map((o) => ({
+                name: o.name, qualified_name: o.qualified_name, kind: o.kind, http_method: o.http_method,
+                bound_to: o.bound_to, parameters: o.parameters, label: "", status: "in_service"
+            })),
+            summary: { entity_sets: 5, operations: 1, in_service: 4, changed: 1 }
+        };
+        this.testResult = {
+            ok: true, status: 200, duration_ms: 412, target: "A_PurchaseRequisitionItem", rows: 1,
+            identity: "technical", destination: "S4_ODATA_TECH", auth_type: "BasicAuthentication",
+            proxy_type: "OnPremise", message: ""
+        };
+    }
+
+    /** The eight routes of /admin/api/odata. Undefined: not an OData call. */
+    private handleOData(
+        path: string, method: string, body: Record<string, unknown> | undefined
+    ): Promise<Response> | undefined {
+        if (path === "odata/metadata" && method === "POST") {
+            return this.json(this.metadataPreview);
+        }
+        if (path === "odata/services" && method === "GET") {
+            const sorted = this.odataServices.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+            return this.json(sorted.map((s) => FakeBackend.odataSummary(s)));
+        }
+        if (path === "odata/services" && method === "POST") {
+            const input = FakeBackend.odataInput(body);
+            if (this.odataServices.some((s) => s.name === input.name)) {
+                return this.json({ detail: `Service name '${input.name}' already exists` }, 409);
+            }
+            const created = this.makeODataService(input);
+            this.odataServices.push(created);
+            return this.json(FakeBackend.odataDict(created), 201);
+        }
+        const match = /^odata\/services\/([^/]+)(\/duplicate|\/test)?$/.exec(path);
+        if (!match) {
+            return undefined;
+        }
+        const name = decodeURIComponent(match[1]);
+        const action = match[2] ?? "";
+        const index = this.odataServices.findIndex((s) => s.name === name);
+        if (index === -1) {
+            return this.json({ detail: "Service not found" }, 404);
+        }
+        const stored = this.odataServices[index];
+        if (action === "/test" && method === "POST") {
+            return this.json(this.testResult);
+        }
+        if (action === "/duplicate" && method === "POST") {
+            const copyName = String(body?.name ?? "");
+            if (this.odataServices.some((s) => s.name === copyName)) {
+                return this.json({ detail: `Service name '${copyName}' already exists` }, 409);
+            }
+            const { id, created_at, updated_at, counts, has_write, used_by, ...source } = stored;
+            void [id, created_at, updated_at, counts, has_write, used_by];
+            const copy = this.makeODataService({
+                ...source,
+                name: copyName,
+                title: body?.title === undefined ? source.title : String(body.title),
+                destination: body?.destination === undefined ? source.destination : String(body.destination),
+                user_context: body?.user_context === undefined ? source.user_context : body.user_context === true,
+                definition: JSON.parse(JSON.stringify(source.definition)) as ODataDefinition
+            });
+            this.odataServices.push(copy);
+            return this.json(FakeBackend.odataDict(copy), 201);
+        }
+        if (action === "" && method === "GET") {
+            return this.json(FakeBackend.odataDict(stored));
+        }
+        if (action === "" && method === "PUT") {
+            const input = FakeBackend.odataInput(body);
+            if (input.name !== name) {
+                return this.json({ detail: "name cannot be changed; duplicate the service instead" }, 422);
+            }
+            this.odataServices[index] = { ...stored, ...input };
+            return this.json(FakeBackend.odataDict(this.odataServices[index]));
+        }
+        if (action === "" && method === "DELETE") {
+            if (stored.used_by.length) {
+                const agents = stored.used_by.map((u) => `'${u.agent}'`).join(", ");
+                return this.json({ detail: `Service '${name}' is used by agent(s) ${agents}` }, 409);
+            }
+            this.odataServices.splice(index, 1);
+            return this.noContent();
+        }
+        return undefined;
     }
 
     private json(body: unknown, status = 200): Promise<Response> {
@@ -477,6 +879,11 @@ export default class FakeBackend {
         }
         if (path === "import") {
             return this.json({ status: "ok" });
+        }
+        // --- odata ---
+        const odata = this.handleOData(path, method, body);
+        if (odata) {
+            return odata;
         }
         // --- where used ---
         // Derived from the agents and workflows above the way the server

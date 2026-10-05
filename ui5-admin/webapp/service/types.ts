@@ -136,6 +136,18 @@ export type OAuthClient =
            * `true`. See agents/destination_auth.py.
            */
           user_context?: boolean;
+          // --- odata ---
+          /**
+           * `builtin:odata` only. The catalogue services (their slugs, 1-50
+           * distinct) this agent may call. The entry carries no `destination`
+           * and no `user_context`: both belong to each catalogue service.
+           */
+          services?: string[];
+          /**
+           * `builtin:odata` only. Opens the write operations the catalogue
+           * enables for the attached services. Only sent as `true`.
+           */
+          allow_write?: boolean;
       };
 
 export interface McpServer {
@@ -338,6 +350,9 @@ export interface ImportPayload {
     /** Optional: an export made before workflows existed carries none, and
      * `replace` only removes workflows when the bundle has this section. */
     workflows?: WorkflowInput[];
+    /** Optional: an export made before the OData catalogue existed carries
+     * none. Imported before the agents, which refer to services by name. */
+    odata_services?: ODataServiceInput[];
     /** If true, delete agents/skills/workflows absent from the import. */
     replace: boolean;
 }
@@ -600,3 +615,220 @@ export const DEEP_DEFAULTS: Readonly<DeepConfig> = Object.freeze({
     subagent_max_depth: 1,
     subagent_instructions: ""
 });
+
+// --- odata ---
+// Mirrors of `agents/odata/models.py` (the definition a catalogue service
+// stores) and of the answers of `/admin/api/odata/...`.
+
+export type ODataVersion = "v2" | "v4";
+
+/** What an entity set can offer an agent. `create`, `update` and `delete`
+ * are the write operations an agent gets only with `allow_write`. */
+export type ODataEntityOp = "list" | "get" | "create" | "update" | "delete";
+
+export interface ODataKey {
+    name: string;
+    /** An EDM type name; the server's default is `Edm.String`. */
+    type: string;
+}
+
+/** What one coded value of a field means, e.g. `05` = released. */
+export interface ODataValueMeaning {
+    value: string;
+    meaning: string;
+}
+
+export interface ODataField {
+    name: string;
+    type: string;
+    label: string;
+    /** Returned to the agent and allowed in `$select`. */
+    selectable: boolean;
+    /** Allowed in `$filter` and `$orderby`. */
+    filterable: boolean;
+    /** Accepted in a create or update body. */
+    writable: boolean;
+    hint: string;
+    values: ODataValueMeaning[];
+    personal_data: boolean;
+}
+
+export interface ODataNavigation {
+    name: string;
+    /** The name of the entity set the navigation leads to. */
+    target: string;
+    collection: boolean;
+    description: string;
+}
+
+export interface ODataExampleQuery {
+    description: string;
+    filter: string;
+    select: string[];
+    orderby: string;
+    top: number | null;
+}
+
+export interface ODataEntitySet {
+    name: string;
+    title: string;
+    /** The path segment under the service path; blank means `name`. */
+    path: string;
+    entity_type: string;
+    description: string;
+    keys: ODataKey[];
+    operations: ODataEntityOp[];
+    fields: ODataField[];
+    navigations: ODataNavigation[];
+    examples: ODataExampleQuery[];
+}
+
+export interface ODataParam {
+    name: string;
+    type: string;
+    required: boolean;
+}
+
+/** A V2 function import, or a V4 action (POST) or function (GET). */
+export interface ODataOperation {
+    name: string;
+    /** V4 only: the namespace-qualified name. Blank on V2. */
+    qualified_name: string;
+    title: string;
+    kind: "function_import" | "action" | "function";
+    http_method: "GET" | "POST";
+    /** The name of the entity set the operation is bound to, if any. */
+    bound_to: string | null;
+    parameters: ODataParam[];
+    description: string;
+    enabled: boolean;
+    /** On, the operation is a write: an agent needs `allow_write` for it. */
+    changes_data: boolean;
+}
+
+export interface ODataDefinition {
+    entity_sets: ODataEntitySet[];
+    operations: ODataOperation[];
+}
+
+/** What POST/PUT /admin/api/odata/services accepts (`ODataServicePayload`). */
+export interface ODataServiceInput {
+    /** The slug agents and server entries use. Immutable once created. */
+    name: string;
+    title: string;
+    purpose: string;
+    not_for: string;
+    destination: string;
+    /** On, calls run as the signed-in user; off, as the destination's
+     * technical user. */
+    user_context: boolean;
+    odata_version: ODataVersion;
+    service_path: string;
+    enabled: boolean;
+    definition: ODataDefinition;
+    /** ISO timestamp of the last metadata import, or null. */
+    metadata_fetched_at: string | null;
+}
+
+/** One agent that lists the service in a `builtin:odata` server entry. */
+export interface ODataUsedBy {
+    agent_id: number;
+    agent: string;
+    enabled: boolean;
+    expose_api: boolean;
+    api_slug: string;
+    allow_write: boolean;
+}
+
+/** One row of GET /admin/api/odata/services: everything but the definition. */
+export interface ODataServiceSummary extends Omit<ODataServiceInput, "definition"> {
+    id: number;
+    created_at: string | null;
+    updated_at: string | null;
+    counts: { entity_sets: number; operations: number };
+    /** An entity set with a write operation, or an enabled operation that
+     * changes data. */
+    has_write: boolean;
+    used_by: ODataUsedBy[];
+}
+
+/** GET /admin/api/odata/services/{name}. */
+export interface ODataService extends ODataServiceSummary {
+    definition: ODataDefinition;
+}
+
+/** POST /admin/api/odata/metadata. Nothing is stored. */
+export interface ODataMetadataRequest {
+    destination: string;
+    service_path: string;
+    odata_version: ODataVersion;
+    user_context?: boolean;
+    /** The stored service to compare against; without it everything is new. */
+    service?: string;
+}
+
+export type ODataPreviewStatus = "new" | "in_service" | "changed";
+
+export interface ODataPreviewField {
+    name: string;
+    type: string;
+    label: string;
+    filterable: boolean;
+    creatable: boolean;
+    updatable: boolean;
+}
+
+export interface ODataPreviewEntitySet {
+    name: string;
+    entity_type: string;
+    label: string;
+    keys: ODataKey[];
+    fields: ODataPreviewField[];
+    navigations: { name: string; target: string; collection: boolean }[];
+    capabilities: { creatable: boolean; updatable: boolean; deletable: boolean };
+    status: ODataPreviewStatus;
+    new_fields: string[];
+    removed_fields: string[];
+}
+
+export interface ODataPreviewOperation {
+    name: string;
+    qualified_name: string;
+    kind: ODataOperation["kind"];
+    http_method: ODataOperation["http_method"];
+    bound_to: string | null;
+    parameters: ODataParam[];
+    label: string;
+    status: ODataPreviewStatus;
+}
+
+/** What the service's $metadata offers: names and labels only, no data. */
+export interface ODataMetadataPreview {
+    fetched_at: string;
+    entity_sets: ODataPreviewEntitySet[];
+    operations: ODataPreviewOperation[];
+    summary: { entity_sets: number; operations: number; in_service: number; changed: number };
+}
+
+/** POST /admin/api/odata/services/{name}/test. Never a data value. */
+export interface ODataTestResult {
+    ok: boolean;
+    status: number | null;
+    duration_ms: number;
+    target: string;
+    rows: number;
+    identity: "user" | "technical";
+    destination: string;
+    auth_type: string;
+    proxy_type: string;
+    message: string;
+}
+
+/** POST /admin/api/odata/services/{name}/duplicate. What is left out is
+ * taken from the source. */
+export interface ODataDuplicateRequest {
+    name: string;
+    title?: string;
+    destination?: string;
+    user_context?: boolean;
+}
