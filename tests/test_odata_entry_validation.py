@@ -606,6 +606,56 @@ async def test_saving_an_agent_with_an_unknown_service_is_422(client, service):
     assert await stored() == [ENTRY]
 
 
+@pytest.mark.parametrize(
+    "url", ["builtin:odata/", "BUILTIN:ODATA", "  builtin:odata  ", " Builtin:OData/ "]
+)
+async def test_no_spelling_of_the_url_escapes_the_existence_check(client, service, url):
+    """The check reads the prepared entries, the ones about to be stored
+    under ``builtin:odata``. Were it to read the raw list with a normaliser
+    of its own, a spelling only storage recognised would attach a service
+    the catalogue does not have."""
+    servers = [
+        {"url": "https://x.hana.ondemand.com/mcp", "auth_mode": "jwt"},
+        entry({"services": ["purchase-requisitions", "nope"], "allow_write": True}, url=url),
+    ]
+    # A caller that writes without the payload model ...
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError) as exc:
+            await upsert_agent(
+                s, name="direct", description="d", instructions="i", mcp_servers=servers
+            )
+        assert str(exc.value) == "unknown OData service 'nope'"
+    async with SessionLocal() as s:
+        assert await list_agents(s) == []
+    # ... and the update route, which prepares the servers itself.
+    r = await client.post(AGENTS, json=agent())
+    assert r.status_code == 201, r.text
+    r = await client.put(f"{AGENTS}/{r.json()['id']}", json=agent(servers=servers))
+    assert r.status_code == 422 and r.json()["detail"] == "unknown OData service 'nope'"
+    assert await stored() == [ENTRY]
+    r = await client.post(AGENTS, json=agent("other", servers=servers))
+    assert r.status_code == 422 and r.json()["detail"] == "unknown OData service 'nope'"
+
+
+async def test_the_update_route_checks_the_entries_it_stores(client, service, monkeypatch):
+    """One list: what the existence check is handed is what
+    ``prepare_servers`` returned for the row."""
+    seen: list[Any] = []
+    real = admin.check_odata_services
+
+    async def spy(session, servers):
+        seen.append(servers)
+        await real(session, servers)
+
+    monkeypatch.setattr(admin, "check_odata_services", spy)
+    r = await client.post(AGENTS, json=agent())
+    servers = [entry(url="BUILTIN:ODATA/"), {"url": "https://x.hana.ondemand.com/mcp"}]
+    r = await client.put(f"{AGENTS}/{r.json()['id']}", json=agent(servers=servers))
+    assert r.status_code == 200, r.text
+    assert seen == [await stored()]
+    assert seen[0][0] == ENTRY and seen[0][1]["url"] == "https://x.hana.ondemand.com/mcp"
+
+
 async def test_a_deleted_service_cannot_be_attached_again(client, service):
     assert (await client.delete(f"{SERVICES}/purchase-requisitions")).status_code == 204
     r = await client.post(AGENTS, json=agent())
@@ -694,14 +744,22 @@ async def test_export_round_trips_the_entry(client, service):
     r = await client.post("/admin/api/import", json=exported)
     assert r.status_code == 200, r.text
     assert await stored() == [ENTRY]
-    # ... and onto a landscape whose catalogue lacks the service: refused.
+    # ... and onto a landscape whose catalogue lacks the service: refused
+    # for a bundle that does not carry it (every export before the catalogue
+    # travelled along), restored from one that does.
     async with SessionLocal() as s:
         await s.execute(delete(AgentConfig))
         await s.execute(delete(ODataService))
         await s.commit()
-    r = await client.post("/admin/api/import", json=exported)
+    older = {k: v for k, v in exported.items() if k != "odata_services"}
+    r = await client.post("/admin/api/import", json=older)
     assert r.status_code == 422
     assert r.json()["detail"] == "Agent 'pr-agent': unknown OData service 'purchase-requisitions'"
+    async with SessionLocal() as s:
+        assert await list_agents(s) == []
+    r = await client.post("/admin/api/import", json=exported)
+    assert r.status_code == 200, r.text
+    assert await stored() == [ENTRY]
 
 
 # --- credential health --------------------------------------------------------
@@ -865,7 +923,14 @@ USER_TYPES = [
     "OAuth2UserTokenExchange",
     "OAuth2JWTBearer",
     "OAuth2SAMLBearerAssertion",
+    "SAMLAssertion",
 ]
+
+
+def test_the_health_cases_cover_every_user_propagating_type():
+    from agents.destination import USER_PROPAGATING_AUTH_TYPES
+
+    assert set(USER_TYPES) == set(USER_PROPAGATING_AUTH_TYPES)
 
 
 @pytest.mark.parametrize("auth_type", USER_TYPES + ["BasicAuthentication", ""])

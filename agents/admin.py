@@ -80,6 +80,8 @@ from agents.db import (
     delete_skill,
     delete_workflow,
     check_odata_services,
+    create_odata_service,
+    delete_odata_service,
     describe_referrers,
     get_active_model_name,
     get_agent,
@@ -100,15 +102,19 @@ from agents.db import (
     list_workflows,
     normalize_skills_json,
     odata_entries,
+    odata_service_referrers,
     prepare_servers,
+    prepared_server_list,
     rename_agent_references,
     rename_skill_references,
     set_active_model_name,
     set_orchestrator_instructions,
+    update_odata_service,
     upsert_agent,
     upsert_skill,
     upsert_workflow,
     validate_api_slug,
+    validate_odata_service,
 )
 from agents.registry import registry
 from agents.shared import available_models, default_model_name
@@ -998,7 +1004,15 @@ class ImportPayload(BaseModel):
     skills: list[SkillPayload] = Field(default_factory=list)
     agents: list[AgentPayload] = Field(default_factory=list)
     workflows: list[WorkflowPayload] = Field(default_factory=list)
-    # if true, delete agents/skills/workflows not in the import
+    # The OData catalogue, one `ODataService.to_export()` per service.
+    # Deliberately untyped: a declared `list[ODataServicePayload]` would be
+    # validated by FastAPI, whose 422 echoes each refused `input`, and a
+    # catalogue field (a path, a destination name) is where a URL with a
+    # credential in it gets pasted by mistake. `_import_odata_services`
+    # validates every entry and reports field names and rules only.
+    # None / absent / [] all mean "this bundle carries no catalogue".
+    odata_services: Any = None
+    # if true, delete agents/skills/workflows/OData services not in the import
     replace: bool = False
 
 
@@ -1132,8 +1146,12 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 payload.to_servers_list(), row
             )
             # `upsert_agent` does this for every other writer; this route
-            # writes the row itself. Same session as the commit below.
-            await check_odata_services(session, payload.to_servers_list())
+            # writes the row itself. Same session as the commit below, and
+            # on the prepared entries: the ones the row is given further
+            # down, not a second reading of the payload.
+            await check_odata_services(
+                session, prepared_server_list(primary, extras, primary_oauth_json)
+            )
             skills_json = await normalize_skills_json(session, payload.skills)
 
             slug = validate_api_slug(payload.api_slug)
@@ -1881,12 +1899,19 @@ async def api_export() -> dict[str, Any]:
         for w in await list_workflows(session):
             branches, steps = await get_workflow_parts(session, w.id)
             workflows.append(w.to_export(branches, steps))
+        # The catalogue travels with the agents that attach it. A service
+        # holds a destination NAME, never a credential, so nothing is
+        # redacted; `to_export` carries no id and no row timestamp, and
+        # `metadata_fetched_at` in UTC with a `Z`, which is also what an
+        # import stores, so export -> import -> export is byte-stable.
+        services = await list_odata_services(session)
         return {
             "version": 1,
             "orchestrator_instructions": orch,
             "skills": [s.to_export() for s in skills],
             "agents": [r.to_export() for r in rows],
             "workflows": workflows,
+            "odata_services": [s.to_export() for s in services],
         }
 
 
@@ -1921,6 +1946,106 @@ def _missing_secret_errors(agent: AgentPayload, existing: Any) -> list[str]:
     return errors
 
 
+# One bundle may carry this many catalogue services. Each may be a definition
+# of up to MAX_DEFINITION_BYTES that is validated in the request, so the
+# count is bounded like the size of a single one is.
+MAX_IMPORT_ODATA_SERVICES = 200
+# What decides whose identity a call carries and which system it reaches.
+_ODATA_SERVICE_IDENTITY_FIELDS = ("destination", "user_context")
+
+
+class _ODataImport:
+    """What `_import_odata_services` did, for the replace step and the answer."""
+
+    def __init__(self) -> None:
+        self.carried = False  # the bundle has a non-empty catalogue section
+        self.names: set[str] = set()
+        self.existing: dict[str, Any] = {}  # name -> row, as before the import
+        self.created = 0
+        self.updated = 0
+        # name -> the identity fields an update changed
+        self.identity: dict[str, list[str]] = {}
+
+
+async def _import_odata_services(
+    session: Any, section: Any, errors: list[str]
+) -> _ODataImport:
+    """Upsert a bundle's catalogue services by name, without committing.
+
+    Runs before the agents of the same bundle: `upsert_agent` refuses a
+    service name the catalogue lacks, and it reads this session, so a service
+    carried by the bundle counts. Each entry goes through
+    `validate_odata_service` as a whole -- an entry is stored as the bundle
+    has it or not at all -- and a refusal is one line that names the service
+    and the field, never a value: the name is repeated only when it has the
+    form of a service name, otherwise the entry is called by its position.
+
+    ``enabled`` must be present. The payload model defaults it to on, which
+    for an import would switch on a service the bundle never said to switch
+    on, or re-enable one an admin disabled on this landscape. Entity set
+    operations and operation switches default to off and need no such rule.
+
+    The catalogue rows are locked first (all of them: a replace may delete
+    any, and the catalogue is small), before anything else of this
+    transaction takes a lock: see `agents.db.list_odata_services`.
+    """
+    result = _ODataImport()
+    if section is None:
+        return result
+    if not isinstance(section, list):
+        errors.append("odata_services: expected a list of services")
+        return result
+    if len(section) > MAX_IMPORT_ODATA_SERVICES:
+        errors.append(
+            f"odata_services: more than {MAX_IMPORT_ODATA_SERVICES} services in one bundle"
+        )
+        return result
+    if not section:
+        return result
+    result.carried = True
+    result.existing = {r.name: r for r in await list_odata_services(session, lock=True)}
+    for position, entry in enumerate(section, start=1):
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if isinstance(name, str) and re.fullmatch(SERVICE_NAME_RE, name):
+            label = f"OData service '{name}'"
+        else:
+            label = f"OData service #{position}"
+        try:
+            data = validate_odata_service(entry)
+        except ValueError as e:
+            errors.append(f"{label}: {e}")
+            continue
+        if "enabled" not in entry:
+            errors.append(f"{label}: enabled: Field required")
+            continue
+        name = data["name"]
+        if name in result.names:
+            # The later entry would silently overwrite the earlier one.
+            errors.append(f"{label}: listed more than once")
+            continue
+        result.names.add(name)
+        row = result.existing.get(name)
+        if row is None:
+            try:
+                await create_odata_service(session, data, commit=False)
+            except ValueError as e:  # created by someone else since the read
+                errors.append(f"{label}: {e}")
+                continue
+            result.created += 1
+            continue
+        changed = [
+            field
+            for field in _ODATA_SERVICE_IDENTITY_FIELDS
+            if row.to_export()[field] != data[field]
+        ]
+        # By name, so the name cannot differ: a rename is impossible here.
+        await update_odata_service(session, row, data, commit=False)
+        result.updated += 1
+        if changed:
+            result.identity[name] = changed
+    return result
+
+
 @router.post("/api/import", dependencies=[Depends(require_admin)])
 async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     """Import a bundle as one transaction.
@@ -1930,10 +2055,15 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     exactly as it was -- no half-imported agents and no skipped ``replace``
     deletions. Errors are collected across the whole bundle rather than
     stopping at the first, so the operator fixes them in one round.
+
+    The registry is not rebuilt here (it never was: the admin UIs call
+    reload after an import), so an imported catalogue change takes effect at
+    the same reload as the agents of its bundle.
     """
     errors: list[str] = []
     warnings: list[str] = []
-    removed = removed_skills = removed_workflows = 0
+    removed = removed_skills = removed_workflows = removed_services = 0
+    identity_changes: list[dict[str, Any]] = []
     async with SessionLocal() as session:
         try:
             existing_agents = {r.name: r for r in await list_agents(session)}
@@ -1958,6 +2088,11 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                     commit=False,
                 )
                 imported_skill_names.add(skill.name)
+
+            # The catalogue before the agents, for the same reason.
+            odata = await _import_odata_services(
+                session, payload.odata_services, errors
+            )
 
             for agent in payload.agents:
                 secret_errors = _missing_secret_errors(agent, existing_agents.get(agent.name))
@@ -2062,6 +2197,47 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                             await session.delete(srow)
                             removed_skills += 1
 
+            if odata.carried and (payload.replace or odata.identity):
+                # Who attaches what once this import is in: the agents it
+                # wrote count, the ones it removes do not.
+                await session.flush()
+                used_by = {
+                    name: [r["agent"] for r in users if r["agent"] not in doomed]
+                    for name, users in (await odata_service_referrers(session)).items()
+                }
+                # Replace applies to the catalogue only when the bundle
+                # carries one, like skills. Unlike a skill, a service is not
+                # detached from its agents: one that lost its only service
+                # could not run, so a service still in use is an error.
+                if payload.replace:
+                    for name, srow in sorted(odata.existing.items()):
+                        if name in odata.names:
+                            continue
+                        if used_by.get(name):
+                            agents = ", ".join(f"'{a}'" for a in used_by[name])
+                            errors.append(
+                                f"OData service '{name}' cannot be removed by replace: "
+                                f"it is used by agent(s) {agents}"
+                            )
+                            continue
+                        await delete_odata_service(session, srow, commit=False)
+                        removed_services += 1
+                # Allowed, as an admin's own act, but never unseen: an agent
+                # whose service now runs as another identity or reaches
+                # another system. Field and agent names only.
+                for name in sorted(odata.identity):
+                    if not used_by.get(name):
+                        continue
+                    changed = odata.identity[name]
+                    identity_changes.append(
+                        {"service": name, "changed": changed, "agents": used_by[name]}
+                    )
+                    agents = ", ".join(f"'{a}'" for a in used_by[name])
+                    warnings.append(
+                        f"OData service '{name}': {', '.join(changed)} changed; "
+                        f"used by agent(s) {agents}"
+                    )
+
             if errors:
                 await session.rollback()
                 raise HTTPException(status_code=422, detail="\n".join(errors))
@@ -2077,11 +2253,19 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         "imported": len(payload.agents),
         "imported_skills": len(payload.skills),
         "imported_workflows": len(payload.workflows),
+        "imported_odata_services": odata.created + odata.updated,
+        "created_odata_services": odata.created,
+        "updated_odata_services": odata.updated,
         "removed": removed,
         "removed_skills": removed_skills,
         "removed_workflows": removed_workflows,
+        "removed_odata_services": removed_services,
+        # Catalogue services in use whose destination or identity
+        # (`user_context`) this import changed: [{service, changed, agents}].
+        "odata_identity_changes": identity_changes,
         # Model overrides this landscape cannot currently serve are imported
-        # rather than rejected, so the operator is told about them here.
+        # rather than rejected, so the operator is told about them here; so
+        # is every entry of `odata_identity_changes`, as a line of text.
         "warnings": warnings,
     }
 
@@ -2418,8 +2602,9 @@ async def _destination_health() -> list[dict[str, Any]]:
 
     A ``builtin:odata`` entry names no destination, so it is reported as one
     entry per attached service, with that service's destination and identity
-    from the catalogue (``service`` is the extra key). A name the catalogue
-    does not have is an ``error`` entry.
+    from the catalogue (``service`` and ``service_enabled`` are the extra
+    keys). A name the catalogue does not have is a ``missing`` entry with
+    ``service_enabled`` false; see `_odata_destination_health`.
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
@@ -2526,8 +2711,12 @@ async def _odata_destination_health(
     application no token (``PrincipalPropagation`` has no credential at all
     without a user), so for a service that runs as the signed-in user its
     properties are read instead, and it counts as resolvable when they name
-    such a type. The answer carries the service and destination names, the
-    identity and the auth type: no host, no header.
+    such a type. That makes ``resolvable`` weaker for these types: ANY failed
+    app-level resolve is forgiven once the properties name one, so a
+    transient destination-service failure on the resolve is not visible
+    here, and nothing says the destination works for a user. The answer
+    carries the service and destination names, the identity and the auth
+    type: no host, no header.
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,

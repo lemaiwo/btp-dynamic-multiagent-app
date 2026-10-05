@@ -1867,6 +1867,23 @@ def prepare_servers(
     return primary_clean, extras, primary_oauth_json
 
 
+def prepared_server_list(
+    primary: dict[str, Any], extras: list[dict[str, Any]], primary_oauth_json: str | None
+) -> list[dict[str, Any]]:
+    """`prepare_servers` output as one server list, primary first: the list
+    the row will hold (``AgentConfig.mcp_servers`` after the write).
+
+    For checks that must judge what is stored rather than what was sent
+    (`check_odata_services`): a second reading of the raw input would be a
+    second normaliser of URL spelling and block shape, free to drift from
+    the one that decides what is written.
+    """
+    first = dict(primary)
+    if primary_oauth_json:
+        first["oauth"] = json.loads(primary_oauth_json)
+    return [first, *extras]
+
+
 async def normalize_skills_json(
     session: AsyncSession, skills: list[str] | None
 ) -> str | None:
@@ -1949,8 +1966,11 @@ async def upsert_agent(
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     # Here rather than in the admin routes: scripts and seeds write agents
     # through this function too, and none of them may store a service name
-    # the catalogue does not have.
-    await check_odata_services(session, mcp_servers)
+    # the catalogue does not have. On the prepared list, i.e. on exactly the
+    # entries the row is about to hold.
+    await check_odata_services(
+        session, prepared_server_list(primary, extras, primary_oauth_json)
+    )
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
     # Order-preserving de-duplication: the same peer listed twice would
@@ -2276,8 +2296,22 @@ def _odata_columns(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def list_odata_services(session: AsyncSession) -> list[ODataService]:
-    result = await session.execute(select(ODataService).order_by(ODataService.name))
+async def list_odata_services(
+    session: AsyncSession, *, lock: bool = False
+) -> list[ODataService]:
+    """Every catalogue service, in name order.
+
+    ``lock`` takes an exclusive row lock on each (Postgres; SQLite has none
+    and serialises writers), held until the caller's transaction ends. For a
+    writer of many services at once (the bundle import): an agent save that
+    attaches one of them waits (`existing_odata_service_names`), exactly as
+    it does for the delete route. The name order is the lock order, so two
+    such writers cannot wait for each other.
+    """
+    query = select(ODataService).order_by(ODataService.name)
+    if lock:
+        query = query.with_for_update()
+    result = await session.execute(query)
     return list(result.scalars().all())
 
 
@@ -2322,7 +2356,10 @@ async def check_odata_services(session: AsyncSession, servers: list[dict[str, An
     order listed. Called by every write of an agent's servers
     (`upsert_agent`, and the admin update route beside its own
     `prepare_servers`), in the session that then writes the row and with the
-    found rows locked, so the answer holds until that write commits.
+    found rows locked, so the answer holds until that write commits. Both
+    hand over `prepared_server_list(...)`, the entries as they will be
+    stored, so this check and storage cannot disagree on what counts as a
+    ``builtin:odata`` entry.
 
     A dangling name is not harmless: the agent would be attached, with
     whatever ``allow_write`` its entry holds, to the next service somebody
@@ -2350,6 +2387,25 @@ async def check_odata_services(session: AsyncSession, servers: list[dict[str, An
         raise ValueError("unknown OData service " + ", ".join(f"'{n}'" for n in missing))
 
 
+async def _begin_before_savepoint(session: AsyncSession) -> None:
+    """Make sure a real transaction is open before a SAVEPOINT on SQLite.
+
+    The sqlite3 driver opens its transaction only at the first INSERT,
+    UPDATE or DELETE. A SAVEPOINT issued before that is the outermost one,
+    and releasing it COMMITS: the row of a caller with ``commit=False``
+    would be stored at once and survive that caller's rollback (a refused
+    import kept the services it had created first). An explicit BEGIN makes
+    the savepoint a nested one, as it always is on Postgres, where this does
+    nothing.
+    """
+    if session.get_bind().dialect.name != "sqlite":
+        return
+    connection = await session.connection()
+    raw = await connection.get_raw_connection()
+    if not raw.driver_connection.in_transaction:
+        await connection.exec_driver_sql("BEGIN")
+
+
 async def create_odata_service(
     session: AsyncSession, data: dict[str, Any], *, commit: bool = True
 ) -> ODataService:
@@ -2365,6 +2421,7 @@ async def create_odata_service(
     if await get_odata_service(session, name) is not None:
         raise ValueError(taken)
     row = ODataService(name=name, **_odata_columns(data))
+    await _begin_before_savepoint(session)
     try:
         async with session.begin_nested():
             session.add(row)
