@@ -24,7 +24,11 @@ to the identity, service, entity set and key it was read for.
 Every modifying call that passed all checks is recorded in two phases by
 the toolset's ``recorder`` (``WriteRecorder``, ``WriteAudit``): the intent
 before anything is built or sent -- no intent, no write -- and the result
-exactly once afterwards, whatever became of the call.
+exactly once afterwards, whatever became of the call. A toolset without a
+recorder that records (``agents.odata.audit.StoredWriteRecorder`` in the
+app) sends no write at all, whatever its entry allows
+(``audit_not_configured``). A write refused by a switch is not a record but
+one WARNING line on the ``agents.odata.audit`` logger.
 """
 
 from __future__ import annotations
@@ -106,6 +110,17 @@ _WRITE_VERSIONS = frozenset(
     if getattr(dialect, "supports_write", False) is True
 )
 _CALLS_AVAILABLE = False
+# A write attempt refused with one of these codes is logged (never stored):
+# an agent that keeps trying what it may not do should be visible.
+_LOGGED_WRITE_REFUSALS = frozenset(
+    {
+        "write_not_allowed",
+        "operation_disabled",
+        "not_available",
+        "invalid_etag",
+        "audit_not_configured",
+    }
+)
 _NO_USER_HINT = (
     "this service runs as the signed-in user and this run has none; "
     "use a service that runs as a technical user"
@@ -139,6 +154,7 @@ __all__ = [
     "AUDIT_RESULT_TIMEOUT_SECONDS",
     "NoUsableServiceError",
     "NoWriteRecorder",
+    "UnrecordedWritesForTests",
     "WRITE_OUTCOMES",
     "WriteAudit",
     "WriteRecorder",
@@ -449,7 +465,28 @@ class WriteRecorder(Protocol):
 
 
 class NoWriteRecorder:
-    """The default recorder: nothing is recorded."""
+    """No recorder: the default, and it means NO WRITES.
+
+    A toolset whose recorder is this one (or ``None``) refuses every
+    create, update and delete with ``audit_not_configured`` before anything
+    is sent, and its search offers none -- a change in SAP that nobody
+    recorded must not be possible by leaving an argument out.
+    """
+
+    async def intent(self, record: WriteAudit) -> Any:
+        raise RuntimeError("this toolset has no audit recorder")
+
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        return None
+
+
+class UnrecordedWritesForTests:
+    """TEST ONLY: lets writes through without recording any of them.
+
+    The explicit opt-in for a test that is about something else than the
+    audit. Never pass it outside a test: the app passes
+    ``agents.odata.audit.stored_recorder()``.
+    """
 
     async def intent(self, record: WriteAudit) -> Any:
         return None
@@ -486,12 +523,15 @@ class _PhasedSessions(CsrfSessionStore):
     thing is the write. Used only for a call that ends without an error
     that says it (a cancellation, an exception the client did not
     classify); every ``ODataError`` carries ``sent`` itself.
+
+    The phase only ever moves forward. The client comes back here to renew
+    the session after SAP refused a first send (403 ``Required``): a
+    modifying request has left by then, so that second ``get`` must not
+    take the phase back to ``token`` while it waits.
     """
 
     async def get(self, key: Any, fetch: Any) -> Any:
         holder = _write_phase.get()
-        if holder is not None:
-            holder["phase"] = "token"
         session = await super().get(key, fetch)
         if holder is not None:
             holder["phase"] = "write"
@@ -623,7 +663,14 @@ def odata_toolset(
     (``WriteRecorder``): the intent after all checks and before anything is
     built or sent -- if that fails, the write is not sent -- and the result
     exactly once afterwards. A call refused by a check is not recorded
-    (nothing was going to be sent). Default: ``NoWriteRecorder``.
+    (nothing was going to be sent). Without a recorder that records
+    (``None`` or ``NoWriteRecorder``, the default) the toolset fails closed:
+    it sends no write (``audit_not_configured``) and offers none, whatever
+    ``allow_write`` says. The app passes
+    ``agents.odata.audit.stored_recorder()``; a test that wants unrecorded
+    writes says so with ``UnrecordedWritesForTests``. A recorder with a
+    ``tasks`` set owns the result tasks still running (so it can drain
+    them); otherwise the toolset holds them.
     """
     if auth_mode != "destination":
         raise ValueError(
@@ -641,6 +688,15 @@ def odata_toolset(
     # the last gate before tools that change data in SAP. Storage normalises
     # the flag, but the gate must not depend on a caller two modules away.
     allow_write = oauth.get("allow_write") is True
+    audit: Any = recorder if recorder is not None else NoWriteRecorder()
+    # No record, no write: decided once, here, for search and execute alike.
+    recording = not isinstance(audit, NoWriteRecorder)
+    if allow_write and not recording:
+        logger.error(
+            "odata: agent '%s' may write (allow_write) but its toolset has no audit "
+            "recorder: every write is refused",
+            agent_name,
+        )
 
     toolset = FunctionToolset()
 
@@ -672,7 +728,7 @@ def odata_toolset(
             query,
             detail=detail,
             service=service,
-            allow_write=allow_write,
+            allow_write=allow_write and recording,
             allow_call=_CALLS_AVAILABLE,
             write_versions=_WRITE_VERSIONS,
         )
@@ -697,10 +753,12 @@ def odata_toolset(
     # toolset between every user of the agent.
     sessions = _PhasedSessions()
     handles = _EtagHandles()
-    audit = recorder if recorder is not None else NoWriteRecorder()
-    # The recorder's result tasks that are still running, held here so that
-    # one outliving its caller (a timeout, a second cancel) is not collected.
-    audit_tasks: set[asyncio.Task[None]] = set()
+    # The recorder's result tasks that are still running, held so that one
+    # outliving its caller (a timeout, a second cancel) is not collected.
+    # They belong to the recorder when it keeps a `tasks` set: it outlives
+    # this toolset and is what a retired build and the shutdown drain.
+    owned = getattr(audit, "tasks", None)
+    audit_tasks: set[asyncio.Task[None]] = owned if isinstance(owned, set) else set()
 
     def _rules(entry: _Service) -> tuple[ODataClient, ServiceDefinition, Any]:
         """The catalogue rules of a service, the definition and its dialect.
@@ -855,6 +913,7 @@ def odata_toolset(
         """
         return (
             allow_write
+            and recording
             and getattr(dialect, "supports_write", False) is True
             and bool({"update", "delete"} & set(entity_set.operations))
         )
@@ -956,9 +1015,21 @@ def odata_toolset(
         )
         try:
             token = await asyncio.wait_for(audit.intent(record), AUDIT_INTENT_TIMEOUT_SECONDS)
-        except Exception as exc:  # noqa: BLE001 - no record, no write (a cancellation passes)
+        except asyncio.CancelledError:
+            # The run was cancelled while the intent was being recorded. The
+            # recorder may have stored it all the same, and no result will
+            # follow: this line is what tells that row from a write that
+            # went out and lost its result.
+            audit_logger.warning(
+                "odata audit: intent interrupted, the write was not sent: %s",
+                _audit_text(record),
+            )
+            raise
+        except Exception as exc:  # noqa: BLE001 - no record, no write
+            # "Not confirmed", not "not recorded": a recorder that failed or
+            # timed out can have stored the intent before it did.
             audit_logger.error(
-                "odata audit: intent NOT recorded (%s at %s); the write was not sent: %s",
+                "odata audit: intent not confirmed (%s at %s); the write was not sent: %s",
                 type(exc).__name__,
                 _origin(exc),
                 _audit_text(record),
@@ -1218,6 +1289,14 @@ def odata_toolset(
                     "this agent may not change data in SAP",
                     hint="writes are not enabled for this agent",
                 )
+            if not recording:
+                # Both switches are on, but this toolset cannot record what
+                # it sends: fail closed (search_operations offers no write).
+                raise ODataError(
+                    "audit_not_configured",
+                    "nothing was changed; changes cannot be recorded here, so none is sent",
+                    hint="changes cannot be made right now; tell the user instead of retrying",
+                )
             if getattr(dialect, "supports_write", False) is not True:
                 # Both switches are on; it is this app that cannot do it yet
                 # (and search_operations does not offer it).
@@ -1295,7 +1374,11 @@ def odata_toolset(
         trying again, and never repeat a create blindly -- first list by the
         values you sent to see whether the entity exists now. The code
         'invalid_etag' means the 'etag' you passed is not (or no longer)
-        valid for that entity: 'get' it again.
+        valid for that entity: 'get' it again. The codes 'not_available'
+        (this cannot be done through this tool yet), 'audit_unavailable'
+        and 'audit_not_configured' (the change could not be recorded, so it
+        was not sent) all mean nothing was changed and repeating the call
+        will not help: tell the user.
 
         Args:
             service: The service name from search_operations.
@@ -1349,6 +1432,25 @@ def odata_toolset(
         try:
             return await _execute(service, target, operation, args, run_id)
         except ODataError as exc:
+            if exc.code in _LOGGED_WRITE_REFUSALS and (
+                operation in WRITE_OPS or exc.code == "write_not_allowed"
+            ):
+                # A refused write ATTEMPT: no audit row (nothing was going
+                # to be sent), but one line, so an agent that keeps trying
+                # is visible. Names only -- never a key or a body value.
+                audit_logger.warning(
+                    "odata audit: write attempt refused: agent=%r run_id=%r service=%r "
+                    "target=%r operation=%s code=%s",
+                    agent_name,
+                    run_id,
+                    label,
+                    # A catalogue name has this form; anything else is not repeated.
+                    target
+                    if isinstance(target, str) and re.fullmatch(EDM_NAME_RE, target)
+                    else "?",
+                    operation if operation in OPERATIONS else "?",
+                    exc.code,
+                )
             return _error(exc.code, exc.message, exc.hint)
         except DestinationUserRequired:
             return _error(
@@ -1377,4 +1479,5 @@ def odata_toolset(
     toolset.http_client = closer  # type: ignore[attr-defined]
     toolset.etag_handles = handles  # type: ignore[attr-defined]
     toolset.audit_tasks = audit_tasks  # type: ignore[attr-defined]
+    toolset.recorder = audit  # type: ignore[attr-defined]
     return toolset

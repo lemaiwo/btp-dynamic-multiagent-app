@@ -45,7 +45,7 @@ from agents.odata.search import (  # noqa: E402
     MAX_SUMMARY_MATCHES,
 )
 from agents.odata.search import search_catalogue as _search_as_shipped  # noqa: E402
-from agents.odata.tools import odata_toolset  # noqa: E402
+from agents.odata.tools import UnrecordedWritesForTests, odata_toolset  # noqa: E402
 
 # The ranking and shape tests below describe the catalogue search with
 # operations listed (`allow_call`), as the tool will run it once operations
@@ -750,9 +750,19 @@ async def test_string_false_does_not_open_writes():
         {"services": ["purchase-requisitions"], "allow_write": True},
         auth_mode="destination",
         services=SNAPSHOT,
+        recorder=UnrecordedWritesForTests(),
     )
     out = await ts.tools["search_operations"].function("requisition item")
     assert out["matches"][0]["operations"] == ["list", "get", "update"]
+    # allow_write alone is not enough: a toolset that cannot record a write
+    # offers none (and refuses it, tests/test_odata_write_guard.py).
+    ts = odata_toolset(
+        {"services": ["purchase-requisitions"], "allow_write": True},
+        auth_mode="destination",
+        services=SNAPSHOT,
+    )
+    out = await ts.tools["search_operations"].function("requisition item")
+    assert out["matches"][0]["operations"] == ["list", "get"]
 
 
 async def test_the_toolset_keeps_its_own_copy_of_the_snapshot():

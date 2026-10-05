@@ -205,12 +205,24 @@ def test_context_reaches_only_the_odata_factory(monkeypatch):
         "builtin:odata", {"services": ["a"]}, "destination", context=context
     )
     assert built == "TS"
+    from agents.odata.audit import StoredWriteRecorder, stored_recorder
+
+    # Always the storing recorder of this process, and not from the context:
+    # no caller builds the toolset through here with unrecorded writes.
+    assert isinstance(seen["recorder"], StoredWriteRecorder)
+    assert seen.pop("recorder") is stored_recorder()
     assert seen == {
         "server_key": "builtin:odata",
         "auth_mode": "destination",
         "services": {"a": {}},
         "agent_name": "x",
     }
+    seen.clear()
+    build_builtin_toolset(
+        "builtin:odata", {"services": ["a"]}, "destination",
+        context={**context, "recorder": None, "odata_recorder": None},
+    )
+    assert seen["recorder"] is stored_recorder()
 
     # Every other factory keeps the two keywords it always had: a factory
     # that does not take `services` must not be handed it.

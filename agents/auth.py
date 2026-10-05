@@ -143,7 +143,13 @@ def _principal_claim(payload: dict[str, Any]) -> str | None:
 
 
 # Claims that identify one issued token; compared one by one below.
-_TOKEN_IDENTITY_CLAIMS = ("jti", "iat", "exp", "iss", "user_uuid", "sub", "user_name", "origin")
+_TOKEN_IDENTITY_CLAIMS = (
+    "jti", "iat", "exp", "iss", "user_uuid", "sub", "user_name", "email", "origin",
+)
+# At least one of these must be on the token AND in the bound claims: two
+# sets of claims that carry none of them "agree" on every identifying claim
+# by both lacking it, which proves nothing about whose token it is.
+_TOKEN_ANCHOR_CLAIMS = ("jti", "user_uuid", "sub")
 
 
 def bound_token_principal() -> str | None:
@@ -159,7 +165,9 @@ def bound_token_principal() -> str | None:
     validation) merely to compare its identifying claims with the bound
     ones. ``None`` when no token or no claims are bound, when the token
     cannot be decoded, when any identifying claim differs (stale claims
-    next to another token), or when the claims name no principal. The
+    next to another token), when neither side carries a ``jti``,
+    ``user_uuid`` or ``sub`` that the other carries too (nothing ties the
+    claims to this token then), or when the claims name no principal. The
     unverified decode is never the source of the answer.
     """
     token = current_jwt.get()
@@ -173,6 +181,11 @@ def bound_token_principal() -> str | None:
     if not isinstance(own, dict):
         return None
     if any(own.get(name) != claims.get(name) for name in _TOKEN_IDENTITY_CLAIMS):
+        return None
+    if not any(
+        own.get(name) is not None and claims.get(name) is not None
+        for name in _TOKEN_ANCHOR_CLAIMS
+    ):
         return None
     return _principal_claim(claims)
 

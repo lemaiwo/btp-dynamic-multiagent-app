@@ -644,34 +644,106 @@ class ODataService(Base):
 
 
 class ODataAuditLog(Base):
-    """One line per write or operation call an agent made through
-    ``builtin:odata``: who, which service and target, and how it ended.
+    """One row per create, update or delete an agent sent through
+    ``builtin:odata``: who, which service and entity, and how it ended.
 
-    Holds names only. ``key_json`` is the key of the entity touched and
-    ``body_fields_json`` the *names* of the fields sent, never their values:
-    the row answers "who changed what" without becoming a second copy of
-    business data. No foreign key to ``odata_services`` -- the log outlives
-    the service it names. Only ``purge_odata_audit`` deletes rows, by age.
+    Written in two steps by ``agents.odata.audit.StoredWriteRecorder``: the
+    row is inserted with outcome ``intent`` before anything is sent, and
+    finalised exactly once afterwards (a conditional UPDATE on ``outcome =
+    'intent'``). Nothing else updates a row, and only ``purge_odata_audit``
+    deletes rows, by age. A row that stays ``intent`` is explained in the
+    docstring of ``agents.odata.audit``.
+
+    Two identities, on purpose: ``sent_as`` is whose credential SAP saw
+    (derived from the token actually sent, or ``technical:<destination>``),
+    ``run_principal`` is the principal of the run -- in a job the run-as
+    user, which can differ from the owner of the token the run carries.
+
+    ``key_json`` / ``created_key_json`` hold the key VALUES of the entity
+    touched (an audit must name it) and ``body_fields_json`` the *names* of
+    the fields sent, never their values. So the table can hold personal
+    data (key values, principals): it is read by admins only and purged by
+    age. Never stored: a body value, a token, a cookie, an ETag. No foreign
+    key to ``odata_services`` -- the log outlives the service it names.
     """
 
     __tablename__ = "odata_audit_log"
+    __table_args__ = (
+        UniqueConstraint("call_id", name="uq_odata_audit_log_call_id"),
+        # What an operator asks: one service, one sender, or "what is still
+        # open" (outcome = intent), each newest first.
+        Index("ix_odata_audit_log_service_created", "service", "created_at"),
+        Index("ix_odata_audit_log_sent_as_created", "sent_as", "created_at"),
+        Index("ix_odata_audit_log_outcome_created", "outcome", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # UTC. `created_at` is when the intent was recorded (before the request),
+    # `finished_at` when the result was; NULL while the row is an intent.
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), index=True
     )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    call_id: Mapped[str] = mapped_column(String(32), nullable=False)  # uuid4 hex
     agent: Mapped[str] = mapped_column(String(64), nullable=False)
     run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # The user principal, or "technical:<destination>" for a call that ran
-    # as the destination's technical user.
-    principal: Mapped[str] = mapped_column(String(255), nullable=False)
+    # "technical:<destination>", the principal of the token sent, or
+    # "token:<sha256>" when that token's owner could not be named.
+    sent_as: Mapped[str] = mapped_column(String(255), nullable=False)
+    run_principal: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    token_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)  # sha256 hex
     service: Mapped[str] = mapped_column(String(64), nullable=False)
     target: Mapped[str] = mapped_column(String(128), nullable=False)
-    operation: Mapped[str] = mapped_column(String(16), nullable=False)  # create|update|delete|call
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)  # create|update|delete
     key_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_key_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     body_fields_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # "token": no modifying request left the app; "write": one did.
+    phase: Mapped[str] = mapped_column(String(8), nullable=False, default="token")
+    # intent | ok | refused | sap_error | unknown | cancelled
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    outcome: Mapped[str] = mapped_column(String(16), nullable=False)  # intent|ok|error|refused
+
+    def to_dict(self) -> dict[str, Any]:
+        """The row for the admin audit route (key values included)."""
+
+        def stamp(value: datetime | None) -> str | None:
+            if value is None:
+                return None
+            # SQLite hands a timestamp back without its zone; it was UTC.
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat()
+
+        def loaded(text_value: str | None) -> Any:
+            if text_value is None:
+                return None
+            try:
+                return json.loads(text_value)
+            except ValueError:
+                return None
+
+        return {
+            "id": self.id,
+            "call_id": self.call_id,
+            "created_at": stamp(self.created_at),
+            "finished_at": stamp(self.finished_at),
+            "agent": self.agent,
+            "run_id": self.run_id,
+            "service": self.service,
+            "target": self.target,
+            "operation": self.operation,
+            "key": loaded(self.key_json),
+            "created_key": loaded(self.created_key_json),
+            "fields": loaded(self.body_fields_json) or [],
+            "phase": self.phase,
+            "outcome": self.outcome,
+            "status": self.http_status,
+            "sent_as": self.sent_as,
+            "run_principal": self.run_principal,
+            "token_digest": self.token_digest,
+        }
+
 
 class Workflow(Base):
     """A declared, ordered sequence of agents run as one background job.
@@ -2544,14 +2616,28 @@ async def odata_service_referrers(
     return {service: list(by_agent.values()) for service, by_agent in found.items()}
 
 
+# The longest retention the purge computes with (100 years): a larger
+# value would take the cutoff below year 1 and raise OverflowError.
+ODATA_AUDIT_MAX_RETENTION_DAYS = 36_500
+ODATA_AUDIT_OUTCOMES = ("intent", "ok", "refused", "sap_error", "unknown", "cancelled")
+
+
 async def purge_odata_audit(session: AsyncSession, days: int) -> int:
     """Delete audit rows older than ``days``; returns how many.
 
     ``days < 1`` deletes nothing: 0 is how retention is switched off, and a
-    misread setting must not empty the log.
+    misread setting must not empty the log. A value beyond
+    ``ODATA_AUDIT_MAX_RETENTION_DAYS`` is treated as that bound. Rows are
+    aged by ``created_at`` whatever their outcome: an ``intent`` row that
+    never got a result is purged like any other.
+
+    This function COMMITS the session it is given. Call it with a session
+    of its own (``app._purge_ide_sessions`` does), never with one that
+    carries a caller's open transaction.
     """
-    if days < 1:
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
         return 0
+    days = min(days, ODATA_AUDIT_MAX_RETENTION_DAYS)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     result = await session.execute(
         delete(ODataAuditLog)
@@ -2560,6 +2646,31 @@ async def purge_odata_audit(session: AsyncSession, days: int) -> int:
     )
     await session.commit()
     return int(result.rowcount or 0)
+
+
+async def list_odata_audit(
+    session: AsyncSession,
+    *,
+    service: str | None = None,
+    sent_as: str | None = None,
+    outcome: str | None = None,
+    since: datetime | None = None,
+    limit: int = 100,
+) -> list[ODataAuditLog]:
+    """Audit rows, newest first, at most ``limit``; every filter is an exact
+    match (``since``: recorded at or after). Read-only."""
+    query = select(ODataAuditLog)
+    if service is not None:
+        query = query.where(ODataAuditLog.service == service)
+    if sent_as is not None:
+        query = query.where(ODataAuditLog.sent_as == sent_as)
+    if outcome is not None:
+        query = query.where(ODataAuditLog.outcome == outcome)
+    if since is not None:
+        query = query.where(ODataAuditLog.created_at >= since)
+    query = query.order_by(ODataAuditLog.created_at.desc(), ODataAuditLog.id.desc()).limit(limit)
+    return list((await session.execute(query)).scalars().all())
+
 
 VALID_ON_UNKNOWN_BRANCH = ("fail", "skip")
 

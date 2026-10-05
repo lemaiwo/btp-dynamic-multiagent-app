@@ -55,6 +55,7 @@ from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.db import (  # noqa: E402
     SessionLocal,
     init_db,
+    purge_odata_audit,
     sweep_stale_runs,
     sweep_stale_workflow_runs,
 )
@@ -76,6 +77,8 @@ from agents.ide.store import (  # noqa: E402
 )
 from agents.job_runner import cancel_all_runs  # noqa: E402
 from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
+from agents.odata import audit as odata_audit  # noqa: E402
+from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
@@ -208,6 +211,14 @@ async def _purge_ide_sessions() -> int:
         True,
         ide_approvals.sweep_interrupted,
     )
+    # The OData write audit log has its own clock (0 = keep forever). Not
+    # counted in the return value, which is the number of IDE sessions.
+    # `purge_odata_audit` commits the session this pass opens for it.
+    await _pass(
+        "odata audit rows purged",
+        ODATA_AUDIT_RETENTION_DAYS >= 1,
+        lambda s: purge_odata_audit(s, ODATA_AUDIT_RETENTION_DAYS),
+    )
     return purged
 
 
@@ -255,6 +266,14 @@ async def lifespan(app: FastAPI):
             "purged, so the raw dump and trace text they store is kept until "
             "each session is deleted by hand",
             IDE_DIAGNOSE_RETENTION_DAYS,
+        )
+    if ODATA_AUDIT_RETENTION_DAYS < 1:
+        # Allowed, but said out loud: the audit rows name entities by key
+        # and users by principal, and nothing but this purge removes them.
+        logger.warning(
+            "ODATA_AUDIT_RETENTION_DAYS is %d: the OData write audit log is "
+            "never purged; its rows (entity keys, principals) are kept forever",
+            ODATA_AUDIT_RETENTION_DAYS,
         )
     try:
         purged = await _purge_ide_sessions()
@@ -304,6 +323,15 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "IDE approval call(s) still running at shutdown; the next start "
             "closes them as interrupted"
+        )
+    # A write whose run was cancelled above still has its result to store
+    # (its own shielded task). Bounded: `drain` gives up after its timeout
+    # and never raises; a row left `intent` is explained in agents.odata.audit.
+    left = await odata_audit.drain()
+    if left:
+        logger.warning(
+            "%d OData audit result(s) not stored at shutdown; their rows stay 'intent'",
+            left,
         )
     logger.info("Application shutdown complete")
 

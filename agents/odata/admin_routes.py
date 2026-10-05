@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -29,11 +30,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.auth import require_admin
 from agents.db import (
+    ODATA_AUDIT_OUTCOMES,
+    ODataAuditLog,
     ODataService,
     SessionLocal,
     create_odata_service,
     delete_odata_service,
     get_odata_service,
+    list_odata_audit,
     list_odata_services,
     odata_service_referrers,
     update_odata_service,
@@ -52,6 +56,10 @@ _MAX_REPORTED_ERRORS = 20
 # worker buffer and parse a body of any size.
 MAX_BODY_BYTES = MAX_DEFINITION_BYTES + 64 * 1024
 _TOO_LARGE = "Request body too large"
+# The audit route: how many rows one answer holds.
+AUDIT_DEFAULT_LIMIT = 100
+AUDIT_MAX_LIMIT = 500
+_AUDIT_PARAMS = ("service", "sent_as", "outcome", "since", "limit")
 
 
 class DuplicateBody(BaseModel):
@@ -292,3 +300,90 @@ async def api_duplicate_odata_service(name: str, request: Request) -> dict[str, 
         except ValueError as e:  # the name is taken
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from None
         return row.to_dict([])
+
+
+def _audit_filters(request: Request) -> dict[str, Any]:
+    """The query parameters of the audit route, checked one by one.
+
+    Read from the request and validated here, like the bodies above: a
+    refusal names the parameter and the rule, never the value.
+    """
+    params = request.query_params
+    if any(name not in _AUDIT_PARAMS for name in params.keys()):
+        raise _refuse("query: only " + ", ".join(_AUDIT_PARAMS) + " are known")
+    if any(len(params.getlist(name)) > 1 for name in _AUDIT_PARAMS):
+        raise _refuse("query: a parameter may be given once")
+    filters: dict[str, Any] = {"limit": AUDIT_DEFAULT_LIMIT}
+    service = params.get("service")
+    if service is not None:
+        if not re.fullmatch(SERVICE_NAME_RE, service):
+            raise _refuse("service: not a service name")
+        filters["service"] = service
+    sent_as = params.get("sent_as")
+    if sent_as is not None:
+        width = ODataAuditLog.__table__.c.sent_as.type.length
+        if not 1 <= len(sent_as) <= width or not sent_as.isprintable():
+            raise _refuse(f"sent_as: 1 to {width} printable characters")
+        filters["sent_as"] = sent_as
+    outcome = params.get("outcome")
+    if outcome is not None:
+        if outcome not in ODATA_AUDIT_OUTCOMES:
+            raise _refuse("outcome: one of " + ", ".join(ODATA_AUDIT_OUTCOMES))
+        filters["outcome"] = outcome
+    since = params.get("since")
+    if since is not None:
+        try:
+            if len(since) > 40 or not since.isascii():
+                raise ValueError
+            moment = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            raise _refuse(
+                "since: an ISO 8601 date or date-time, e.g. 2026-01-31T00:00:00Z"
+            ) from None
+        # Without an offset it is UTC, like the stored timestamps.
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        filters["since"] = moment.astimezone(timezone.utc)
+    limit = params.get("limit")
+    if limit is not None:
+        if not (limit.isascii() and limit.isdigit() and len(limit) <= 4) or not (
+            1 <= int(limit) <= AUDIT_MAX_LIMIT
+        ):
+            raise _refuse(f"limit: an integer from 1 to {AUDIT_MAX_LIMIT}")
+        filters["limit"] = int(limit)
+    return filters
+
+
+@router.get("/audit", dependencies=[Depends(require_admin)])
+async def api_list_odata_audit(request: Request) -> dict[str, Any]:
+    """The write audit log of ``builtin:odata``, newest first. Read-only:
+    there is no route that writes, changes or deletes an audit row.
+
+    Query parameters, all optional and each an exact match: ``service`` (a
+    service name), ``sent_as`` (whose credential SAP saw), ``outcome``
+    (``intent``, ``ok``, ``refused``, ``sap_error``, ``unknown``,
+    ``cancelled``), ``since`` (ISO 8601; rows recorded at or after it, UTC
+    when it has no offset) and ``limit`` (1 to ``AUDIT_MAX_LIMIT``, default
+    ``AUDIT_DEFAULT_LIMIT``). Any other parameter is a 422.
+
+    Answer: ``{"items": [row], "limit": n, "more": bool}``; ``more`` says
+    that older matching rows exist beyond ``limit`` (narrow the filters).
+    A row is ``ODataAuditLog.to_dict()``: ids and timestamps, agent, run id,
+    service, target, operation, ``key`` and ``created_key`` WITH their
+    values, the body field NAMES, phase, outcome, HTTP status, ``sent_as``,
+    ``run_principal`` and the token digest. How to read a row whose outcome
+    is still ``intent``: the docstring of ``agents.odata.audit``.
+
+    The table can hold personal data -- key values name an entity (which
+    can be a person's), principals name users -- so the route is for admins
+    only and the rows are purged by age (``ODATA_AUDIT_RETENTION_DAYS``).
+    """
+    filters = _audit_filters(request)
+    limit = filters.pop("limit")
+    async with SessionLocal() as session:
+        rows = await list_odata_audit(session, **filters, limit=limit + 1)
+        return {
+            "items": [row.to_dict() for row in rows[:limit]],
+            "limit": limit,
+            "more": len(rows) > limit,
+        }

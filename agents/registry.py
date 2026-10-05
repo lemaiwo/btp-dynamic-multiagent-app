@@ -1101,7 +1101,30 @@ class Registry:
                         await client.aclose()
                 except Exception:
                     logger.debug("Failed to close old MCP client", exc_info=True)
+            await _drain_audit_recorders(build)
         self._retired = still_busy
+
+
+async def _drain_audit_recorders(build: BuildResult) -> None:
+    """Let the audit results of a retired build's ``builtin:odata`` toolsets
+    finish being stored, for at most the recorder's own timeout.
+
+    The build is idle, so its writes are over; what can still run is the
+    task that stores a result whose caller timed out or was cancelled.
+    ``drain`` cancels nothing and does not raise; a failure here must not
+    fail a reload either.
+    """
+    seen: set[int] = set()
+    for server in build.mcp_clients:
+        recorder = getattr(server, "recorder", None)
+        drain = getattr(recorder, "drain", None)
+        if drain is None or id(recorder) in seen:
+            continue
+        seen.add(id(recorder))
+        try:
+            await drain()
+        except Exception:  # noqa: BLE001
+            logger.warning("Draining an OData audit recorder failed", exc_info=True)
 
 
 registry = Registry()

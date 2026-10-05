@@ -44,7 +44,9 @@ destination's properties (host, user, password) rather than a URL; see
 config block lists catalogue services (``services``, ``allow_write``), and the
 identity comes from each catalogue service, not from the entry. It is also the
 only factory that is handed more than its entry -- the catalogue snapshot the
-registry loaded -- through ``context``; see :mod:`agents.odata.tools`.
+registry loaded -- through ``context``; see :mod:`agents.odata.tools`. Its
+writes are recorded: the factory always gets the storing audit recorder
+(:mod:`agents.odata.audit`), without which the toolset refuses every write.
 """
 
 from __future__ import annotations
@@ -54,6 +56,7 @@ from typing import Any, Callable
 from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
 from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.audit import stored_recorder
 from agents.odata.tools import odata_toolset
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
 from agents.sapnotes_tools import BUILTIN_SAPNOTES_URL, sapnotes_toolset
@@ -101,6 +104,10 @@ def build_builtin_toolset(
     ``odata_services`` (the catalogue snapshot, by service name) and
     ``agent_name``. Only ``builtin:odata`` receives it; every other factory
     is called exactly as before, so none has to accept keywords it ignores.
+
+    ``builtin:odata`` is always built with the storing audit recorder of
+    this process. It is not read from ``context``: no caller can build the
+    toolset through here with writes that are not recorded.
     """
     key = str(url).strip().lower()
     factory = _FACTORIES.get(key)
@@ -116,5 +123,6 @@ def build_builtin_toolset(
             auth_mode=auth_mode,
             services=context.get("odata_services") or {},
             agent_name=context.get("agent_name") or "",
+            recorder=stored_recorder(),
         )
     return factory(oauth or {}, server_key=key, auth_mode=auth_mode)

@@ -53,7 +53,12 @@ from agents.auth import (  # noqa: E402
 from agents.odata import tools as tools_module  # noqa: E402
 from agents.odata import urls as urls_module  # noqa: E402
 from agents.odata.models import validate_odata_service  # noqa: E402
-from agents.odata.tools import WriteAudit, odata_toolset  # noqa: E402
+from agents.odata.tools import (  # noqa: E402
+    NoWriteRecorder,
+    UnrecordedWritesForTests,
+    WriteAudit,
+    odata_toolset,
+)
 from tests.odata_helpers import FakeResolver, service_payload, v2_error  # noqa: E402
 
 ALICE = "alice@example.com"
@@ -261,12 +266,12 @@ class World:
 
         kw.setdefault("recorder", self.recorder)
         kw.setdefault("resolver_factory", factory)
+        kw.setdefault("transport", httpx.MockTransport(self.sap.handler))
         self.toolset = odata_toolset(
             oauth if oauth is not None else {"services": ["pr", "pr-jobs"], "allow_write": True},
             auth_mode="destination",
             services=catalogue or snapshot(),
             agent_name="buyer",
-            transport=httpx.MockTransport(self.sap.handler),
             **kw,
         )
 
@@ -1068,9 +1073,213 @@ def test_bound_token_principal_needs_claims_that_are_the_tokens_own():
     assert bound(_token(**anonymous), anonymous) is None
 
 
-async def test_without_a_recorder_a_write_just_runs(alice):
-    w = World(recorder=None)
+@pytest.mark.parametrize("recorder", [None, NoWriteRecorder()])
+async def test_without_a_recorder_no_write_is_sent_and_none_is_offered(alice, caplog, recorder):
+    """Fail closed: allow_write and the catalogue say yes, nothing records."""
+    w = World(catalogue=snapshot(operations=ALL_OPS), recorder=recorder)
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        for call in (UPDATE, {"operation": "create", "body": {"Plant": "1"}},
+                     {"operation": "delete", "key": KEY}):
+            out = await w.run(**call)
+            assert out["error"]["code"] == "audit_not_configured", out
+            assert "nothing was changed" in out["error"]["message"]
+    assert w.sap.requests == [] and w.built == [] and w.resolved == []
+    assert w.toolset.http_clients == []
+    # ... search offers no write, and a read hands out no ETag handle.
+    full = await w.search(query="", detail="full")
+    kinds = {op for m in full["matches"] for op in m.get("operations", [])}
+    assert kinds == {"list", "get"}
+    read = await w.run(operation="get", key=KEY)
+    assert "etag" not in read and read["item"]["Plant"] == "1000"
+    # The refusal sits behind the two switches, which keep their own codes.
+    closed = World({"services": ["pr"], "allow_write": False}, recorder=recorder)
+    assert (await closed.run(**UPDATE))["error"]["code"] == "write_not_allowed"
+    off = World(catalogue=snapshot(update_enabled=False), recorder=recorder)
+    assert (await off.run(**UPDATE))["error"]["code"] == "operation_disabled"
+    # Said once when the toolset is built, as an error.
+    assert any(
+        r.levelno == logging.ERROR and "no audit recorder" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_the_no_op_recorder_cannot_be_used_to_send(alice):
+    """Belt and braces: even reached directly, its intent refuses."""
+    with pytest.raises(RuntimeError):
+        await NoWriteRecorder().intent(None)  # type: ignore[arg-type]
+
+
+async def test_unrecorded_writes_are_an_explicit_test_only_opt_in(alice):
+    w = World(recorder=UnrecordedWritesForTests())
     assert (await w.run(**UPDATE)) == {"ok": True, "status": 204}
+    assert "TEST ONLY" in (UnrecordedWritesForTests.__doc__ or "")
+
+
+async def test_a_run_cancelled_while_the_token_is_renewed_is_recorded_as_sent(alice):
+    """SAP refuses the first send (403 Required) and the client fetches a new
+    token: a modifying request has left, whatever happens during the refetch."""
+    sap = Sap()
+    refetching, never = asyncio.Event(), asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("X-CSRF-Token") == "Fetch" and sap.writes:
+            sap.requests.append(request)
+            refetching.set()
+            await never.wait()
+        if request.method != "GET":
+            sap.requests.append(request)
+            return httpx.Response(403, headers={"x-csrf-token": "Required"}, text="CSRF")
+        return await sap.handler(request)
+
+    w = World(transport=httpx.MockTransport(handler))
+    task = asyncio.create_task(w.run(**UPDATE))
+    await asyncio.wait_for(refetching.wait(), 2)
+    assert len(sap.writes) == 1 and len(sap.fetches) == 2
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [(a.outcome, a.phase) for a in w.audits] == [("cancelled", "write")]
+
+
+async def test_a_run_cancelled_during_the_first_token_fetch_sent_nothing(alice):
+    refetching, never = asyncio.Event(), asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        refetching.set()
+        await never.wait()
+        return httpx.Response(500)
+
+    w = World(transport=httpx.MockTransport(handler))
+    task = asyncio.create_task(w.run(**UPDATE))
+    await asyncio.wait_for(refetching.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [(a.outcome, a.phase) for a in w.audits] == [("cancelled", "token")]
+
+
+async def test_a_cancelled_intent_is_logged_with_its_call_id_and_sends_nothing(alice, caplog):
+    """The recorder may have committed the row before the cancel reached it:
+    the log line is what says that this intent was never acted on."""
+    started, never = asyncio.Event(), asyncio.Event()
+
+    class Stuck(Recorder):
+        async def intent(self, record: WriteAudit) -> Any:
+            self.intents.append(record)  # "committed"
+            started.set()
+            await never.wait()
+
+    w = World(recorder_type=Stuck)
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        task = asyncio.create_task(w.run(**UPDATE))
+        await asyncio.wait_for(started.wait(), 2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    (line,) = [r for r in caplog.records if r.name == "agents.odata.audit"]
+    text = line.getMessage()
+    assert "intent interrupted, the write was not sent" in text
+    assert f"call_id={w.recorder.intents[0].call_id}" in text
+    assert "10000001" not in caplog.text
+    assert w.sap.requests == [] and w.built == [] and w.recorder.results == []
+
+
+async def test_a_failed_intent_is_not_confirmed_rather_than_not_recorded(
+    alice, caplog, monkeypatch
+):
+    monkeypatch.setattr(tools_module, "AUDIT_INTENT_TIMEOUT_SECONDS", 0.05)
+
+    class Slow(Recorder):
+        async def intent(self, record: WriteAudit) -> Any:
+            self.intents.append(record)
+            await asyncio.Event().wait()
+
+    w = World(recorder_type=Slow)
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        out = await w.run(**UPDATE)
+    assert out["error"]["code"] == "audit_unavailable"
+    (line,) = [r for r in caplog.records if r.name == "agents.odata.audit"]
+    text = line.getMessage()
+    assert "intent not confirmed" in text and "the write was not sent" in text
+    assert "NOT recorded" not in text and f"call_id={w.recorder.intents[0].call_id}" in text
+    assert w.sap.requests == []
+
+
+async def test_refused_write_attempts_are_logged_without_values(alice, caplog):
+    def lines() -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == "agents.odata.audit" and r.levelno == logging.WARNING
+        ]
+
+    secret_key = {"PurchaseRequisition": "KEY-VALUE-1", "PurchaseRequisitionItem": "KEY-VALUE-2"}
+    attempt = {"operation": "update", "key": secret_key, "body": {"Plant": "BODY-VALUE"}}
+    cases = [
+        (World({"services": ["pr"], "allow_write": False}), attempt, "write_not_allowed"),
+        (World(catalogue=snapshot(update_enabled=False)), attempt, "operation_disabled"),
+        (World({"services": ["pr-v4"], "allow_write": True}, _v4_catalogue()),
+         {**attempt, "service": "pr-v4"}, "not_available"),
+        (World(), {**attempt, "etag": "W/\"raw-etag-value\""}, "invalid_etag"),
+        (World(recorder=None), attempt, "audit_not_configured"),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        for w, call, code in cases:
+            before = len(lines())
+            out = await w.run(**call)
+            assert out["error"]["code"] == code, out
+            (line,) = lines()[before:]
+            for part in ("write attempt refused", "agent='buyer'", "run_id='run-1'",
+                         f"service='{call.get('service', 'pr')}'", f"target='{ITEM}'",
+                         "operation=update", f"code={code}"):
+                assert part in line, (code, part, line)
+            assert w.audits == [] and w.recorder.intents == [] and w.sap.writes == []
+        for secret in ("KEY-VALUE", "BODY-VALUE", "raw-etag-value"):
+            assert secret not in caplog.text
+        # Not a write attempt, or not one of these refusals: no line.
+        before = len(lines())
+        w = World(catalogue=snapshot(operations=["get", "update"]))
+        assert (await w.run(operation="list"))["error"]["code"] == "operation_disabled"
+        assert (await w.run(operation="update", key=KEY, body={"Nope": 1}))["error"]["code"] == (
+            "unknown_field"
+        )
+        assert (await w.run(operation="update", key=KEY, body={"Plant": "1"}, target="x\ny"))[
+            "error"
+        ]["code"] == "unknown_target"
+        assert lines()[before:] == []
+        # A data-changing operation call by an agent that may not write is one.
+        closed = World({"services": ["pr"], "allow_write": False})
+        out = await closed.run(operation="call", target="Release")
+        assert out["error"]["code"] == "write_not_allowed"
+        assert "operation=call code=write_not_allowed" in lines()[-1]
+
+
+def test_bound_token_principal_compares_email_and_needs_an_anchor_claim():
+    def bound(jwt_value: str | None, bound_claims: dict | None) -> str | None:
+        a, b = current_jwt.set(jwt_value), current_claims.set(bound_claims)
+        try:
+            return bound_token_principal()
+        finally:
+            current_claims.reset(b)
+            current_jwt.reset(a)
+
+    claims = {"user_uuid": "uuid-of-alice", "email": ALICE, "jti": "a1", "iat": 1}
+    assert bound(_token(**claims), claims) == "uuid-of-alice"
+    # The same token id, another e-mail: not the same token's claims.
+    assert bound(_token(**claims), {**claims, "email": BOB}) is None
+    assert bound(_token(**{**claims, "email": BOB}), claims) is None
+    assert bound(_token(**claims), {k: v for k, v in claims.items() if k != "email"}) is None
+    # Nothing that ties claims to a token: both sides "agree" by lacking it.
+    weak = {"user_name": "alice", "email": ALICE, "origin": "ias", "iat": 1, "exp": 2, "iss": "x"}
+    assert bound(_token(**weak), weak) is None
+    # One anchor on both sides is enough, whichever it is.
+    for anchor in ("jti", "user_uuid", "sub"):
+        anchored = {**weak, anchor: "v1"}
+        assert bound(_token(**anchored), anchored) is not None, anchor
+        # ... on one side only it is a difference.
+        assert bound(_token(**anchored), weak) is None and bound(_token(**weak), anchored) is None
+    # A null anchor is no anchor.
+    nulled = {**weak, "jti": None}
+    assert bound(_token(**nulled), nulled) is None
 
 
 async def test_an_applied_write_is_never_reported_as_failed_afterwards(alice, monkeypatch, caplog):
