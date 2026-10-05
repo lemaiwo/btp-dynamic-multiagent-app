@@ -2316,3 +2316,14 @@ async def _destination_health() -> list[dict[str, Any]]:
                 )
             out.append(entry)
     return out
+
+
+# ---------------------------------------------------------------------------
+# OData catalogue (/admin/api/odata/...)
+#
+# A late import: the routes live in their own module, which needs nothing
+# from this one. Each of them carries `require_admin` itself.
+# ---------------------------------------------------------------------------
+from agents.odata.admin_routes import router as _odata_router  # noqa: E402
+
+router.include_router(_odata_router)
