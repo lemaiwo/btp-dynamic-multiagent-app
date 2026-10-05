@@ -62,7 +62,11 @@
                     valueStateText="{entity>/errors/description}"
                     liveChange=".onHeadEdit" />
                 <HBox wrap="Wrap" alignItems="Center">
-                    <Label id="entityKeysLabel" text="{i18n>odataKeys}" labelFor="entityKeys" class="sapUiTinyMarginEnd" />
+                    <!-- A text, not a label: the keys are no form field (a
+                         label's `for` must name one), and a FlexBox takes
+                         no ariaLabelledBy in UI5 1.120. It is read right
+                         before the keys, in reading order. -->
+                    <Text id="entityKeysLabel" text="{i18n>odataKeys}" class="sapUiTinyMarginEnd" />
                     <HBox id="entityKeys" wrap="Wrap" items="{entity>/keys}">
                         <ObjectStatus text="{entity>text}" inverted="true" class="odataFieldName sapUiTinyMarginEnd" />
                     </HBox>

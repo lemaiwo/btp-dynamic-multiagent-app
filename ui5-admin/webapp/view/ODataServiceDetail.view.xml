@@ -46,9 +46,24 @@
                     tooltip="{i18n>odataTagSavedTooltip}"
                     visible="{= ${svc>/exists} &amp;&amp; !${svc>/original/enabled} }" />
                 <ToolbarSpacer />
-                <!-- U6: "Import from $metadata" (odataImportMetadataButton)
-                     and "Test call" (odataTestCallButton) go here, before
-                     Duplicate. -->
+                <!-- Later: "Import from $metadata" (odataImportMetadataButton)
+                     goes here, before "Test call". -->
+                <!-- One read of one row through the STORED service: does its
+                     destination, identity and path work? -->
+                <Button
+                    id="odataTestCallButton"
+                    text="{i18n>odataTestCall}"
+                    icon="sap-icon://connected"
+                    tooltip="{i18n>odataTestCallTooltip}"
+                    enabled="{= ${svc>/exists} &amp;&amp; !${svc>/busy} &amp;&amp; !${svc>/asking} }"
+                    press=".onTestCall">
+                    <!-- The first to move into the overflow menu when the
+                         window is narrow: Duplicate and Delete keep their
+                         place. -->
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
                 <Button
                     id="odataDuplicateButton"
                     text="{i18n>odataDuplicate}"
@@ -145,9 +160,16 @@
                 showIcon="true"
                 class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
                 text="{svc>/saveError}" />
-            <!-- U6: the result of "Test call" (MessageStrip odataTestStrip)
-                 goes here. It is also what tells whether the destination
-                 resolves. -->
+            <!-- The result of "Test call": status, destination, duration,
+                 rows and identity, never a value that was read. What SAP or
+                 the server said about a failure is shown as plain text. -->
+            <MessageStrip
+                id="odataTestStrip"
+                visible="{= !!${svc>/test} }"
+                type="{= ${svc>/test/type} || 'Information' }"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{svc>/test/text}" />
             <Panel
                 id="odataGeneralPanel"
                 visible="{svc>/loaded}"
@@ -537,8 +559,190 @@
                     </items>
                 </Table>
             </Panel>
-            <!-- U5: the "Operations" panel goes here. -->
-            <!-- Later: the "Used by" panel goes here. -->
+            <!-- The operations: function imports (V2), actions and functions
+                 (V4). Each is off until it is enabled here, and counts as a
+                 write unless it is sent with GET and marked as only
+                 reading. Enabling a write is said next to Save and asked
+                 about by Save, like a ticked write of an entity set. The
+                 table shows `svc>/opRows`, one flat row per operation of
+                 `svc>/data/definition`. Names, titles, descriptions and
+                 parameter names come from a remote $metadata document and
+                 are rendered as text. -->
+            <Panel
+                id="odataOperationsPanel"
+                visible="{svc>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title
+                            id="odataOperationsTitle"
+                            text="{ path: 'svc>/opRows/length', formatter: '.formatOperationsTitle' }"
+                            level="H2" />
+                    </Toolbar>
+                </headerToolbar>
+                <Text id="odataOperationsHint" text="{i18n>odataOperationsHint}" class="odataMeta sapUiTinyMarginBottom" />
+                <core:InvisibleText id="odataOpNameChanges" text="{i18n>odataColChangesData}" />
+                <core:InvisibleText id="odataOpNameEnabled" text="{i18n>odataColEnabled}" />
+                <!-- Enabled operations of the stored service that no agent
+                     can call; each row says why. -->
+                <MessageStrip
+                    id="odataUncallableStrip"
+                    visible="{= !!${svc>/uncallableText} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{svc>/uncallableText}" />
+                <Table
+                    id="odataOperationsTable"
+                    items="{ path: 'svc>/opRows', key: 'index' }"
+                    growing="true"
+                    growingThreshold="20"
+                    popinLayout="GridSmall"
+                    noDataText="{i18n>odataNoOperations}"
+                    ariaLabelledBy="odataOperationsTitle">
+                    <columns>
+                        <Column width="14rem">
+                            <Label text="{i18n>odataColOperation}" />
+                        </Column>
+                        <Column minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColAgentDescription}" />
+                        </Column>
+                        <Column width="10rem" minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColBoundTo}" />
+                        </Column>
+                        <Column minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColParameters}" />
+                        </Column>
+                        <Column hAlign="Center" width="6rem" minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataColChangesData}" wrapping="true" />
+                        </Column>
+                        <Column
+                            hAlign="Center"
+                            width="5rem"
+                            minScreenWidth="Tablet"
+                            demandPopin="true"
+                            styleClass="odataWriteCol">
+                            <Label text="{i18n>odataColEnabled}" tooltip="{i18n>odataOperationEnabledTooltip}" />
+                        </Column>
+                        <Column hAlign="End" width="3rem">
+                            <core:InvisibleText text="{i18n>odataColActions}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <VBox>
+                                    <ObjectIdentifier title="{svc>title}" text="{svc>technical}" />
+                                    <core:InvisibleText id="odataOperationRowName" text="{svc>label}" />
+                                </VBox>
+                                <VBox>
+                                    <Text text="{svc>description}" visible="{= !!${svc>description} }" />
+                                    <!-- Enabled, and still no agent can call
+                                         it: why, in plain words. -->
+                                    <ObjectStatus
+                                        text="{ path: 'svc>uncallable', formatter: '.formatUncallable' }"
+                                        visible="{= !!${svc>uncallable} }"
+                                        state="Error"
+                                        icon="sap-icon://error"
+                                        class="odataRowMessage" />
+                                    <!-- Why the last click was not taken. -->
+                                    <ObjectStatus
+                                        text="{svc>note}"
+                                        visible="{= !!${svc>note} }"
+                                        state="Warning"
+                                        icon="sap-icon://alert"
+                                        class="odataRowMessage" />
+                                </VBox>
+                                <Text text="{ path: 'svc>boundTo', formatter: '.formatBoundTo' }" />
+                                <Text text="{svc>parameters}" class="odataFieldName" />
+                                <CheckBox
+                                    selected="{ path: 'svc>write', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    tooltip="{ parts: ['i18n>odataColChangesData', 'svc>title'], formatter: '.formatOperationOf' }"
+                                    ariaLabelledBy="odataOpNameChanges odataOperationRowName"
+                                    app:flag="changes_data"
+                                    select=".onToggleChangesData" />
+                                <CheckBox
+                                    selected="{ path: 'svc>enabled', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    valueState="{ parts: ['svc>enabled', 'svc>write'], formatter: '.formatEnabledWriteState' }"
+                                    tooltip="{ parts: ['svc>title', 'svc>write'], formatter: '.formatEnableOperation' }"
+                                    ariaLabelledBy="odataOpNameEnabled odataOperationRowName"
+                                    app:flag="enabled"
+                                    select=".onToggleOperationEnabled" />
+                                <Button
+                                    icon="sap-icon://decline"
+                                    type="Transparent"
+                                    enabled="{= !${svc>/busy} }"
+                                    tooltip="{ path: 'svc>title', formatter: '.formatRemoveOperation' }"
+                                    press=".onRemoveOperation" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+            <!-- Who gets what this page enables: the agents that list the
+                 STORED service in a server entry, whether their entry
+                 allows writes, and whether they can be started without a
+                 user (a run endpoint for the job scheduler). Read with the
+                 service; a save reads it again. -->
+            <Panel
+                id="odataUsedByPanel"
+                visible="{= ${svc>/loaded} &amp;&amp; ${svc>/exists} }"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title id="odataUsedByTitle" text="{i18n>odataUsedBy}" level="H2" />
+                    </Toolbar>
+                </headerToolbar>
+                <MessageStrip
+                    id="odataUsedByWarning"
+                    visible="{= !!${svc>/usedByWarning} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{svc>/usedByWarning}" />
+                <Table
+                    id="odataUsedByTable"
+                    items="{svc>/used_by}"
+                    noDataText="{i18n>odataNotUsed}"
+                    ariaLabelledBy="odataUsedByTitle">
+                    <columns>
+                        <Column>
+                            <Label text="{i18n>odataColAgent}" />
+                        </Column>
+                        <Column>
+                            <Label text="{i18n>odataColWritesAllowed}" wrapping="true" />
+                        </Column>
+                        <Column minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataColRunEndpoint}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <VBox>
+                                    <ObjectIdentifier title="{svc>agent}" />
+                                    <ObjectStatus
+                                        text="{i18n>odataAgentDisabled}"
+                                        visible="{= ${svc>enabled} === false }"
+                                        state="None"
+                                        inverted="true" />
+                                </VBox>
+                                <ObjectStatus
+                                    text="{ path: 'svc>allow_write', formatter: '.formatYesNo' }"
+                                    state="{ path: 'svc>allow_write', formatter: '.formatWritesAllowedState' }"
+                                    inverted="true" />
+                                <Text
+                                    text="{ parts: ['svc>expose_api', 'svc>api_slug'], formatter: '.formatRunEndpoint' }"
+                                    class="odataFieldName" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
         </content>
     </Page>
 </mvc:View>

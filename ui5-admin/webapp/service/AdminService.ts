@@ -313,9 +313,9 @@ export default class AdminService {
 
     /** One read of one row through the stored service; the answer says
      * whether it worked and as whom, never what was read. */
-    public testODataService(name: string): Promise<ODataTestResult> {
+    public testODataService(name: string, entitySet?: string): Promise<ODataTestResult> {
         return this.request<ODataTestResult>(`${AdminService.odataServicePath(name)}/test`, {
-            method: "POST", ...AdminService.json({})
+            method: "POST", ...AdminService.json(entitySet ? { entity_set: entitySet } : {})
         });
     }
 }

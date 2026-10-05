@@ -795,9 +795,22 @@ export interface ODataServiceSummary extends Omit<ODataServiceInput, "definition
     used_by: ODataUsedBy[];
 }
 
+/** Why no agent can call an enabled operation (`CALL_REFUSALS` in
+ *  agents/odata/client.py). Open-ended: a newer server may know more. */
+export interface ODataUncallableOperation {
+    name: string;
+    /** `calls_not_available`, `bound_set_missing`, `bound_set_without_key`,
+     *  `key_not_declared`, `bound_key_type`, `parameter_type`,
+     *  `invalid_definition`, ... */
+    reason: string;
+}
+
 /** GET /admin/api/odata/services/{name}. */
 export interface ODataService extends ODataServiceSummary {
     definition: ODataDefinition;
+    /** Read-only, about the STORED service: the enabled operations no agent
+     *  can ever call. Never part of a payload. Absent on an older server. */
+    uncallable_operations?: ODataUncallableOperation[];
 }
 
 /** POST /admin/api/odata/metadata. Nothing is stored. */
@@ -871,18 +884,42 @@ export interface ODataMetadataPreview {
     summary: { entity_sets: number; operations: number; in_service: number; changed: number };
 }
 
-/** POST /admin/api/odata/services/{name}/test. Never a data value. */
+/** Something a test call has to say besides its outcome. `code` is
+ *  stable (`service_disabled`, `technical_credential`,
+ *  `no_list_entity_set`, `paging_not_followed`,
+ *  `destination_queries_not_applied`); `message` is the server's text. */
+export interface ODataTestWarning {
+    code: string;
+    message: string;
+}
+
+/**
+ * POST /admin/api/odata/services/{name}/test (`run_test_call` in
+ * agents/odata/testcall.py). HTTP 200 also when the test FAILED: `ok` is
+ * then false and `code` says why. Never a data value.
+ */
 export interface ODataTestResult {
     ok: boolean;
+    /** null when `ok`; else `sap_error`, `unreachable`, `timeout`, ... */
+    code: string | null;
+    /** The HTTP status the OData service answered, or null without one. */
     status: number | null;
     duration_ms: number;
+    service: string;
+    enabled: boolean;
+    /** What was read: one row of `target`, or only the `$metadata`
+     *  document when no entity set has List enabled. */
+    read: "list" | "metadata";
     target: string;
     rows: number;
-    identity: "user" | "technical";
+    /** As whom the call ran; `unknown` when the destination was never resolved. */
+    identity: "user" | "technical" | "unknown";
+    per_user: boolean;
     destination: string;
     auth_type: string;
     proxy_type: string;
     message: string;
+    warnings: ODataTestWarning[];
 }
 
 /** POST /admin/api/odata/services/{name}/duplicate. What is left out is

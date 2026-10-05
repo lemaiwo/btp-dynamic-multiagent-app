@@ -116,6 +116,37 @@ export interface ODataNewFieldWrite {
     fields: string[];
 }
 
+/** What one row of the operations table shows: flat, so that the table
+ *  binds to plain values. Worked out from the definition (`operationRow`). */
+export interface ODataOperationRow {
+    /** The position of the operation in `definition.operations`. */
+    index: number;
+    name: string;
+    /** The business title, or the name when there is none. */
+    title: string;
+    /** "ReleaseItem · POST": what SAP calls it and how it is sent. */
+    technical: string;
+    description: string;
+    /** The title of the entity set it is bound to (its name when the
+     *  definition does not hold it), or "" for an unbound operation. */
+    boundTo: string;
+    /** The parameter names, comma-separated; an optional one is in brackets. */
+    parameters: string;
+    enabled: boolean;
+    /** Whether a call is a write (`operationIsWrite`): what the "Changes
+     *  data" box shows. A POST is one whatever its stored flag says. */
+    write: boolean;
+    /** Sent with POST: "Changes data" cannot be unticked. */
+    post: boolean;
+    /** Why no agent can call it although it is enabled, as an i18n key; ""
+     *  when it can be called, or is not enabled. */
+    uncallable: string;
+    /** Why the last click was not taken (already in the user's language). */
+    note: string;
+    /** "Release item (ReleaseItem)": the accessible name of the row. */
+    label: string;
+}
+
 /** Everything a save would newly let agents with `allow_write` do. */
 export interface ODataPending {
     entitySets: ODataNewWrite[];
@@ -344,6 +375,60 @@ function newWriteOperations(
     return writeOperations(current)
         .filter((o) => had.indexOf(o.name) === -1)
         .map((o) => ({ name: o.name, title: operationTitle(o) }));
+}
+
+/** The i18n key that says in plain words why an enabled operation cannot
+ *  be called (the reason codes of `CALL_REFUSALS` in agents/odata/client.py
+ *  and `INVALID_DEFINITION` in agents/odata/calls.py). */
+const UNCALLABLE_TEXT: Record<string, string> = {
+    calls_not_available: "odataUncallableKind",
+    bound_set_missing: "odataUncallableBoundMissing",
+    bound_set_without_key: "odataUncallableNoKey",
+    key_not_declared: "odataUncallableKeyNotDeclared",
+    bound_key_type: "odataUncallableKeyType",
+    parameter_type: "odataUncallableParameterType",
+    invalid_definition: "odataUncallableInvalid"
+};
+
+function uncallableKey(reason: string | undefined | null): string {
+    if (!reason) {
+        return "";
+    }
+    return Object.prototype.hasOwnProperty.call(UNCALLABLE_TEXT, reason) ? UNCALLABLE_TEXT[reason] : "odataUncallableOther";
+}
+
+/**
+ * The table row of the operation at `index` of `definition`. `uncallable`:
+ * operation name -> reason code, as the server said it about the STORED
+ * service; it is shown while the row is enabled (a reason for an operation
+ * that the admin has switched off again would describe nothing an agent
+ * meets).
+ */
+function operationRow(
+    operation: ODataOperation, index: number, definition: ODataDefinition | undefined | null,
+    uncallable: Record<string, string> = {}
+): ODataOperationRow {
+    const title = operationTitle(operation);
+    const bound = operation.bound_to === null || operation.bound_to === undefined ? "" : operation.bound_to;
+    const set = bound ? (definition?.entity_sets ?? []).filter((e) => e.name === bound)[0] : undefined;
+    const reason = Object.prototype.hasOwnProperty.call(uncallable, `=${operation.name}`)
+        ? uncallable[`=${operation.name}`] : "";
+    return {
+        index,
+        name: operation.name,
+        title,
+        technical: `${operation.name} \u00b7 ${operation.http_method}`,
+        description: (operation.description ?? "").trim(),
+        boundTo: set ? titleOf(set) : bound,
+        parameters: (operation.parameters ?? [])
+            .map((p) => (p.required === false ? `[${p.name}]` : p.name)).join(", "),
+        enabled: operation.enabled === true,
+        write: operationIsWrite(operation),
+        post: operation.http_method !== "GET",
+        uncallable: operation.enabled === true ? uncallableKey(reason) : "",
+        note: "",
+        label: title === operation.name ? title : `${title} (${operation.name})`
+    };
 }
 
 function titleOf(entitySet: ODataEntitySet): string {
@@ -816,6 +901,40 @@ export default {
     operationIsWrite,
 
     writeOperations,
+
+    operationRow,
+
+    /** One table row per operation, in the definition's order. */
+    operationRows(
+        definition: ODataDefinition | undefined | null, uncallable: Record<string, string> = {}
+    ): ODataOperationRow[] {
+        return (definition?.operations ?? []).map((operation, index) => (
+            operationRow(operation, index, definition, uncallable)
+        ));
+    },
+
+    /** `uncallable_operations` of a service answer as a lookup for
+     *  `operationRow`: operation name (behind "=", so that no name collides
+     *  with a property of every object) -> reason code. */
+    uncallableByName(
+        listed: readonly { name: string; reason: string }[] | undefined | null
+    ): Record<string, string> {
+        const byName: Record<string, string> = {};
+        (Array.isArray(listed) ? listed : []).forEach((entry) => {
+            if (entry && typeof entry.name === "string" && typeof entry.reason === "string") {
+                byName[`=${entry.name}`] = entry.reason;
+            }
+        });
+        return byName;
+    },
+
+    uncallableKey,
+
+    /** The agents of `usedBy` that have a run endpoint, by name: runs
+     *  started there have no signed-in user. */
+    jobAgents(usedBy: readonly ODataUsedBy[] | undefined | null): string[] {
+        return (usedBy ?? []).filter((used) => used.expose_api === true).map((used) => used.agent);
+    },
 
     /**
      * What `allow_write` opens, one entry per entity set with a write

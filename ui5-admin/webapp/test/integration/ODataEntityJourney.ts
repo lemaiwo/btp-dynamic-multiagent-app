@@ -12,6 +12,7 @@ import type SegmentedButton from "sap/m/SegmentedButton";
 import type Control from "sap/ui/core/Control";
 import type UI5Element from "sap/ui/core/Element";
 import type { ODataDefinition, ODataEntitySet, ODataField } from "com/agent/admin/service/types";
+import EntitySetDialog from "com/agent/admin/controller/odata/EntitySetDialog";
 import Common, { backend } from "./pages/Common";
 import { iPressInDialog } from "./pages/Dialogs";
 import { TABLE, VIEW as LIST_VIEW, messageOf } from "./pages/ODataList";
@@ -420,7 +421,7 @@ opaTest("Tick Read for the fields shown says how many, leaves personal data and 
     iOpen(When, ITEM);
     inDialog(Then, "all fields", always, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(
-            part<Button>(dialog, "entityReadAll").getText(), "Tick Read for 64 fields shown",
+            part<Button>(dialog, "entityReadAll").getText(), "Tick Read for 64 fields matching the filter",
             "89 fields, 24 readable, one marked as personal data"
         );
     });
@@ -431,14 +432,14 @@ opaTest("Tick Read for the fields shown says how many, leaves personal data and 
         Opa5.assert.deepEqual(fieldNames(dialog), ["CreatedByUser"]);
         Opa5.assert.strictEqual(header(dialog).showing, "Showing 1 of 89 fields");
         Opa5.assert.strictEqual(part<Button>(dialog, "entityReadAll").getEnabled(), false, "nothing to tick: never personal data");
-        Opa5.assert.strictEqual(part<Button>(dialog, "entityReadAll").getText(), "No field shown to tick Read for");
+        Opa5.assert.strictEqual(part<Button>(dialog, "entityReadAll").getText(), "No field matching the filter to tick Read for");
     });
     iDo(When, "all again", function (dialog: UI5Element) { pressSegment(part(dialog, "entityFieldFilter"), "all"); });
     iSearch(When, "Field08");
     inDialog(Then, "nine fields", function (dialog: UI5Element) {
         return fieldNames(dialog).length === 9;
     }, function (dialog: UI5Element) {
-        Opa5.assert.strictEqual(part<Button>(dialog, "entityReadAll").getText(), "Tick Read for 9 fields shown");
+        Opa5.assert.strictEqual(part<Button>(dialog, "entityReadAll").getText(), "Tick Read for 9 fields matching the filter");
     });
     iPressPart(When, "entityReadAll");
     inDialog(Then, "nine more readable", function (dialog: UI5Element) {
@@ -573,7 +574,7 @@ opaTest("after an entity set is removed and another renamed, a tick lands on the
     iPressPart(When, "entityRemoveButton");
     iSeeAQuestion(
         Then,
-        `The entity set "${ITEM}" (${ITEM_NAME}) cannot be removed: these operations are bound to it: Release item.`,
+        `The entity set "${ITEM}" (${ITEM_NAME}) cannot be removed: these operations are bound to it: Release item. Remove them in the Operations section of the page first.`,
         "the refused removal"
     );
     iPressInDialog(When, "Close");
@@ -932,7 +933,7 @@ opaTest("in Unticked a tick leaves the row, the footer and the bulk button where
         return header(dialog).showing === "Showing 65 of 89 fields";
     }, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(fieldItems(dialog).length, 50);
-        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 64 fields shown", "all but the personal-data field");
+        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 64 fields matching the filter", "all but the personal-data field");
     });
 
     // Write does not make a field readable: nothing the button counts changes.
@@ -942,7 +943,7 @@ opaTest("in Unticked a tick leaves the row, the footer and the bulk button where
         Opa5.assert.strictEqual(fieldRow(dialog, "Field030")?.write, true, "with its tick");
         Opa5.assert.strictEqual(fieldItems(dialog).length, 50, "as many rows as before");
         Opa5.assert.strictEqual(header(dialog).showing, "Showing 65 of 89 fields", "the footer counts what is listed");
-        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 64 fields shown", "and the button what it would tick");
+        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 64 fields matching the filter", "and the button what it would tick");
     });
 
     iTickField(When, "Field031", "read");
@@ -951,7 +952,7 @@ opaTest("in Unticked a tick leaves the row, the footer and the bulk button where
         Opa5.assert.ok(hasFocus(box(fieldItem(dialog, "Field031"), "read")), "with the focus on its checkbox");
         Opa5.assert.strictEqual(header(dialog).showing, "Showing 65 of 89 fields");
         Opa5.assert.strictEqual(header(dialog).tabs[0], "Fields (25 of 89)");
-        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 63 fields shown", "one field shown is readable now");
+        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 63 fields matching the filter", "one field shown is readable now");
     });
 
     // The button ticks what it counted: the fields listed, not what a filter run now would list.
@@ -987,7 +988,7 @@ opaTest("in Ticked an untick leaves the row listed, and the bulk button counts i
         return header(dialog).showing === "Showing 24 of 89 fields";
     }, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(fieldItems(dialog).length, 24);
-        Opa5.assert.strictEqual(readAll(dialog), "No field shown to tick Read for");
+        Opa5.assert.strictEqual(readAll(dialog), "No field matching the filter to tick Read for");
     });
     iTickField(When, "Field010", "read");
     inDialog(Then, "after the untick", always, function (dialog: UI5Element) {
@@ -996,7 +997,7 @@ opaTest("in Ticked an untick leaves the row listed, and the bulk button counts i
         Opa5.assert.strictEqual(fieldItems(dialog).length, 24, "as many rows as before");
         Opa5.assert.strictEqual(header(dialog).showing, "Showing 24 of 89 fields", "the footer counts what is listed");
         Opa5.assert.strictEqual(header(dialog).tabs[0], "Fields (23 of 89)");
-        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 1 field shown", "the button counts the field that is shown unread");
+        Opa5.assert.strictEqual(readAll(dialog), "Tick Read for 1 field matching the filter", "the button counts the field that is shown unread");
     });
     Then.iStopTheApp();
 });
@@ -1013,7 +1014,7 @@ opaTest("an entity set that an operation returns cannot be removed, and the dial
     iPressPart(When, "entityRemoveButton");
     iSeeAQuestion(
         Then,
-        `The entity set "${HEADER}" (A_PurchaseRequisitionHeader) cannot be removed: these operations return it: Header of an item.`,
+        `The entity set "${HEADER}" (A_PurchaseRequisitionHeader) cannot be removed: these operations return it: Header of an item. Remove them in the Operations section of the page first.`,
         "the server would refuse a definition in which an operation returns an entity set that is not there"
     );
     iPressInDialog(When, "Close");
@@ -1200,6 +1201,8 @@ opaTest("Apply writes back what the dialog edits and nothing else of the entity 
         const entitySet = model.getProperty("/data/definition/entity_sets/0");
         entitySet.operations = ["list", "get"];
         entitySet.path = "Items";
+        entitySet.keys = [entitySet.keys[0]];
+        entitySet.entity_type = "Changed.ItemType";
     });
     iTypeIn(When, "entityTitle", "Item renamed");
     iPressPart(When, "entityApplyButton");
@@ -1208,6 +1211,10 @@ opaTest("Apply writes back what the dialog edits and nothing else of the entity 
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(formSet(page, 0).path, "Items", "the path is the form's, not the dialog's copy");
         Opa5.assert.deepEqual(formSet(page, 0).operations, ["list", "get"], "and so are the operations");
+        Opa5.assert.deepEqual(
+            formSet(page, 0).keys.map((key) => key.name), ["PurchaseRequisition"], "the keys are not written back by Apply"
+        );
+        Opa5.assert.strictEqual(formSet(page, 0).entity_type, "Changed.ItemType", "and neither is the entity type");
         Opa5.assert.strictEqual(formSet(page, 0).fields.length, 89, "the fields are the dialog's");
     });
     Then.iStopTheApp();
@@ -1409,3 +1416,168 @@ opaTest("an entity set whose fields and examples lack optional keys is not repor
     });
     Then.iStopTheApp();
 });
+
+// --- re-review of the entity set dialog (with U6) ---------------------------------
+
+function iPressAdd(When: Common): void {
+    When.waitFor({ id: "odataAddEntitySetButton", viewName: VIEW, actions: new Press(), errorMessage: "No Add" });
+}
+
+opaTest("a second Add while the dialog of the first is on its way adds nothing", function (Given: Common, When: Common, Then: Common) {
+    iStart(Given, Then, JOBS);
+    When.waitFor({
+        id: "odataAddEntitySetButton", viewName: VIEW,
+        success: function (button: UI5Element) {
+            // Two presses before the dialog's fragment is there.
+            (button as Button).firePress();
+            (button as Button).firePress();
+        },
+        errorMessage: "No Add"
+    });
+    inDialog(Then, "the one dialog", always, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            formDefinition(dialog).entity_sets.length, 6, "one entity set was added for the one dialog, not two"
+        );
+    });
+    iPressPart(When, "entityCancelButton");
+    onPage(Then, "after Cancel", always, function (page: UI5Element) {
+        Opa5.assert.strictEqual(formDefinition(page).entity_sets.length, 5, "Cancel leaves no entity set behind");
+        Opa5.assert.strictEqual(isDirty(page), false, "and nothing to save");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Add and then leaving the page drops the added entity set and asks nothing", function (Given: Common, When: Common, Then: Common) {
+    let since = 0;
+    iStart(Given, Then, JOBS);
+    iPressAdd(When);
+    iDo(When, "the address changes, as the browser's Back does", function () {
+        since = Date.now();
+        HashChanger.getInstance().setHash("odata-services");
+    });
+    Then.waitFor({
+        autoWait: false,
+        // Time for a dialog to close and for a question to come up.
+        check: function () { return Date.now() - since > 1500; },
+        success: function () {
+            Opa5.assert.strictEqual(
+                HashChanger.getInstance().getHash(), "odata-services", "the page is left: it held nothing unsaved"
+            );
+            Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no dialog and no leave question");
+        },
+        errorMessage: "The address did not change"
+    });
+    When.waitFor({
+        id: TABLE, viewName: LIST_VIEW,
+        success: function () { HashChanger.getInstance().setHash(`odata-services/${JOBS}`); },
+        errorMessage: "The list was not shown"
+    });
+    onPage(Then, "the service again", function (page: UI5Element) {
+        return entityTitles(page).length > 0;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityTitles(page).length, 5, "without the entity set that was added");
+        Opa5.assert.strictEqual(stored(JOBS).definition.entity_sets.length, 5, "and nothing was stored");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("going from one service to another with the dialog open applies nothing", function (Given: Common, When: Common, Then: Common) {
+    iStart(Given, Then, JOBS);
+    iOpen(When, ITEM);
+    iTypeIn(When, "entityTitle", "Changed in the dialog");
+    iDo(When, "the address names another service", function () {
+        HashChanger.getInstance().setHash(`odata-services/${V4}`);
+    });
+    Then.waitFor({
+        id: "odataName", viewName: VIEW, autoWait: false,
+        check: function (input: UI5Element) {
+            return (input as Input).getValue() === V4 && document.querySelectorAll(".sapMDialogOpen").length === 0;
+        },
+        success: function (input: UI5Element) {
+            Opa5.assert.deepEqual(
+                entityTitles(input), ["Requisition", "Requisition item"], "the other service is shown, with its own entity sets"
+            );
+            Opa5.assert.strictEqual(isDirty(input), false, "nothing of the dialog was written into it");
+            Opa5.assert.strictEqual(stored(JOBS).definition.entity_sets[0].title, ITEM, "and nothing into the service that was left");
+            Opa5.assert.strictEqual(backend.requests.filter((r) => /^(PUT|POST)/.test(r)).length, 0, "nothing was sent");
+        },
+        errorMessage: "The other service was not shown without a dialog"
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("in Read and in Write an untick leaves the row listed, and reopening lists all fields again", function (Given: Common, When: Common, Then: Common) {
+    let name = "";
+    iStart(Given, Then, JOBS);
+    iOpen(When, ITEM);
+    iFilterFields(When, "read");
+    inDialog(Then, "the readable fields", function (dialog: UI5Element) {
+        return header(dialog).showing === "Showing 24 of 89 fields";
+    }, function (dialog: UI5Element) {
+        name = fieldNames(dialog)[3];
+        Opa5.assert.strictEqual(fieldRow(dialog, name).read, true, `${name} is readable`);
+    });
+    iDo(When, "untick Read", function (dialog: UI5Element) { new Press().executeOn(box(fieldItem(dialog, name), "read")); });
+    inDialog(Then, "the unticked row", function (dialog: UI5Element) {
+        return !!fieldItem(dialog, name) && !fieldRow(dialog, name).read;
+    }, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(header(dialog).showing, "Showing 24 of 89 fields", "the list holds still in Read");
+        Opa5.assert.strictEqual(fieldNames(dialog)[3], name, "the row is where it was");
+    });
+    iFilterFields(When, "write");
+    inDialog(Then, "the writable fields", function (dialog: UI5Element) {
+        return header(dialog).showing === "Showing 2 of 89 fields";
+    }, function () { Opa5.assert.ok(true, "two writable fields"); });
+    iTickField(When, "RequestedQuantity", "write");
+    inDialog(Then, "the unticked write", function (dialog: UI5Element) {
+        return !!fieldItem(dialog, "RequestedQuantity") && !fieldRow(dialog, "RequestedQuantity").write;
+    }, function (dialog: UI5Element) {
+        Opa5.assert.deepEqual(fieldNames(dialog), ["RequestedQuantity", "DeliveryDate"], "the list holds still in Write");
+        Opa5.assert.strictEqual(header(dialog).showing, "Showing 2 of 89 fields");
+    });
+
+    // Closed with a filter and a search set, and opened again.
+    iSearch(When, "date");
+    iPressPart(When, "entityCancelButton");
+    iSeeAQuestion(Then, DISCARD, "Cancel with input asks");
+    iPressInDialog(When, "Discard");
+    onPage(Then, "the page", always, function () { Opa5.assert.ok(true, "the dialog is closed"); });
+    iOpen(When, ITEM);
+    inDialog(Then, "the dialog again", always, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(header(dialog).showing, "Showing 89 of 89 fields", "all fields are listed");
+        Opa5.assert.strictEqual(part<SegmentedButton>(dialog, "entityFieldFilter").getSelectedKey(), "all", "the filter is All");
+        Opa5.assert.strictEqual(part<SearchField>(dialog, "entityFieldSearch").getValue(), "", "and the search is empty");
+        Opa5.assert.strictEqual(fieldRow(dialog, "RequestedQuantity").write, true, "the discarded untick is not there");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a dialog that cannot be shown is reported and the added entity set is dropped", function (Given: Common, When: Common, Then: Common) {
+    const proto = EntitySetDialog.prototype as unknown as { open: unknown };
+    const open = proto.open;
+    iStart(Given, Then, JOBS);
+    let shown: UI5Element;
+    When.waitFor({
+        id: PAGE, viewName: VIEW,
+        success: function (page: UI5Element) {
+            shown = page;
+            // As a fragment that fails to load: `open` rejects.
+            proto.open = function () { return Promise.reject(new Error("fragment not loaded")); };
+        }
+    });
+    iPressAdd(When);
+    Then.waitFor({
+        controlType: "sap.m.Dialog",
+        searchOpenDialogs: true,
+        success: function (dialogs: UI5Element[]) {
+            proto.open = open;
+            Opa5.assert.strictEqual(dialogs.length, 1, "the failure is reported in the central error dialog");
+            Opa5.assert.strictEqual(formDefinition(shown).entity_sets.length, 5, "the added entity set is gone again");
+            Opa5.assert.strictEqual(isDirty(shown), false, "and nothing is left to save");
+        },
+        errorMessage: "No error dialog"
+    });
+    Then.waitFor({ success: function () { proto.open = open; } });
+    Then.iStopTheApp();
+});
+

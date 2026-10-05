@@ -677,3 +677,85 @@ QUnit.test("serverRefusal keeps what a refusal says before its first field and i
         odataCatalog.serverErrors("x; title: Field required; and 3 more"), { title: "Field required" }, "serverErrors is its byLoc"
     );
 });
+
+// --- operations (U6) -----------------------------------------------------------
+
+QUnit.test("operationRow: what the operations table shows of an operation", function (assert) {
+    const definition = {
+        entity_sets: [{ ...odataCatalog.emptyEntitySet("A_Item"), title: "Item" }],
+        operations: [
+            {
+                name: "Release", qualified_name: "", title: "Release item", kind: "function_import" as const,
+                http_method: "POST" as const, bound_to: "A_Item",
+                parameters: [{ name: "Item", type: "Edm.String", required: true }, { name: "Note", type: "Edm.String", required: false }],
+                description: " Releases it. ", enabled: true, changes_data: false
+            },
+            {
+                name: "Probe", qualified_name: "", title: "", kind: "function_import" as const, http_method: "GET" as const,
+                bound_to: "A_Gone", parameters: [], description: "", enabled: false, changes_data: false
+            }
+        ]
+    };
+    const uncallable = odataCatalog.uncallableByName([
+        { name: "Release", reason: "key_not_declared" }, { name: "Probe", reason: "bound_set_missing" }
+    ]);
+    const rows = odataCatalog.operationRows(definition, uncallable);
+    assert.deepEqual(rows[0], {
+        index: 0, name: "Release", title: "Release item", technical: "Release · POST", description: "Releases it.",
+        boundTo: "Item", parameters: "Item, [Note]", enabled: true,
+        write: true, post: true, uncallable: "odataUncallableKeyNotDeclared", note: "", label: "Release item (Release)"
+    }, "a POST is a write whatever its flag says; the bound entity set by its title; an optional parameter in brackets");
+    assert.deepEqual(rows[1], {
+        index: 1, name: "Probe", title: "Probe", technical: "Probe · GET", description: "",
+        boundTo: "A_Gone", parameters: "", enabled: false,
+        write: false, post: false, uncallable: "", note: "", label: "Probe"
+    }, "a GET marked as only reading is a read; an entity set the definition lacks by its name; no reason while it is off");
+    assert.deepEqual(odataCatalog.operationRows(undefined), [], "no definition, no rows");
+});
+
+QUnit.test("uncallableKey: every reason of the server has its own words, an unknown one the fallback", function (assert) {
+    // `CALL_REFUSALS` in agents/odata/client.py that `uncallable_operations` can answer, and `invalid_definition`.
+    const keys = [
+        "calls_not_available", "bound_set_missing", "bound_set_without_key", "key_not_declared", "bound_key_type",
+        "parameter_type", "invalid_definition"
+    ].map((reason) => odataCatalog.uncallableKey(reason));
+    assert.deepEqual(keys, [
+        "odataUncallableKind", "odataUncallableBoundMissing", "odataUncallableNoKey", "odataUncallableKeyNotDeclared",
+        "odataUncallableKeyType", "odataUncallableParameterType", "odataUncallableInvalid"
+    ]);
+    assert.strictEqual(odataCatalog.uncallableKey("something_new"), "odataUncallableOther", "a reason this build does not know");
+    assert.strictEqual(odataCatalog.uncallableKey("constructor"), "odataUncallableOther", "a reason named like an object member");
+    assert.strictEqual(odataCatalog.uncallableKey(""), "", "no reason, no text");
+    assert.deepEqual(odataCatalog.uncallableByName(undefined), {}, "a server that sends no list");
+    assert.deepEqual(odataCatalog.uncallableByName("x" as never), {}, "or something that is no list");
+});
+
+QUnit.test("payloadOf: `returns` of an operation is kept, the read-only list is left out", function (assert) {
+    const service = {
+        ...odataCatalog.emptyService(),
+        definition: {
+            entity_sets: [odataCatalog.emptyEntitySet("A_Item")],
+            operations: [{
+                name: "Next", qualified_name: "", title: "", kind: "function_import" as const, http_method: "GET" as const,
+                bound_to: null, parameters: [], description: "", enabled: true, changes_data: false,
+                returns: { entity_set: "A_Item", collection: true }
+            }]
+        },
+        uncallable_operations: [{ name: "Next", reason: "parameter_type" }], used_by: [], id: 7
+    };
+    const payload = odataCatalog.payloadOf(service) as unknown as Record<string, unknown>;
+    assert.deepEqual(
+        (payload.definition as typeof service.definition).operations[0].returns, { entity_set: "A_Item", collection: true }
+    );
+    assert.strictEqual("uncallable_operations" in payload, false, "never sent back");
+    assert.strictEqual("used_by" in payload, false);
+});
+
+QUnit.test("jobAgents: the agents with a run endpoint", function (assert) {
+    const used = (agent: string, exposed: boolean) => ({
+        agent_id: 1, agent, enabled: true, expose_api: exposed, api_slug: exposed ? agent : "", allow_write: false
+    });
+    assert.deepEqual(odataCatalog.jobAgents([used("chat", false), used("nightly", true)]), ["nightly"]);
+    assert.deepEqual(odataCatalog.jobAgents(undefined), []);
+});
+

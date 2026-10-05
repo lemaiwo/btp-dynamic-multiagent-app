@@ -361,3 +361,93 @@ export function hasFocus(candidate: UI5Element): boolean {
     const dom = (candidate as Control).getDomRef();
     return !!dom && !!document.activeElement && dom.contains(document.activeElement);
 }
+
+// --- the operations table and "Used by" ----------------------------------------
+
+export const OPERATIONS_TABLE = "odataOperationsTable";
+
+/** What one row of the operations table shows. */
+export interface OperationRow {
+    title: string;
+    technical: string;
+    description: string;
+    boundTo: string;
+    parameters: string;
+    changesData: boolean;
+    enabled: boolean;
+    /** The value state of the Enabled box: "Warning" for an enabled write. */
+    enabledState: string;
+    /** Why no agent can call it, or "" when the row does not say so. */
+    uncallable: string;
+    /** Why the last click was not taken, or "". */
+    note: string;
+}
+
+export function operationItems(element: UI5Element): ColumnListItem[] {
+    return control<Table>(element, OPERATIONS_TABLE).getItems() as ColumnListItem[];
+}
+
+export function operationItem(element: UI5Element, title: string): ColumnListItem {
+    return operationItems(element).filter((item) => identifierOf(item).getTitle() === title)[0];
+}
+
+/** The "Changes data" or the "Enabled" box of a row. */
+export function operationBox(item: ColumnListItem, which: "changes" | "enabled"): CheckBox {
+    return item.getCells()[which === "changes" ? 4 : 5] as CheckBox;
+}
+
+export function operationRemove(item: ColumnListItem): Button {
+    return item.getCells()[6] as Button;
+}
+
+export function operationRow(element: UI5Element, title: string): OperationRow {
+    const item = operationItem(element, title);
+    const second = (item.getCells()[1] as VBox).getItems();
+    const description = second[0] as Text;
+    return {
+        title: identifierOf(item).getTitle(),
+        technical: identifierOf(item).getText(),
+        description: description.getVisible() ? description.getText(false) : "",
+        boundTo: (item.getCells()[2] as Text).getText(false),
+        parameters: (item.getCells()[3] as Text).getText(false),
+        changesData: operationBox(item, "changes").getSelected(),
+        enabled: operationBox(item, "enabled").getSelected(),
+        enabledState: operationBox(item, "enabled").getValueState(),
+        uncallable: shown(second[1] as ObjectStatus),
+        note: shown(second[2] as ObjectStatus)
+    };
+}
+
+/** The title of the operations section and what its table says when empty. */
+export function operationsHeader(element: UI5Element): { title: string; noData: string; titles: string[] } {
+    return {
+        title: control<Title>(element, "odataOperationsTitle").getText(),
+        noData: control<Table>(element, OPERATIONS_TABLE).getNoDataText(),
+        titles: operationItems(element).map((item) => identifierOf(item).getTitle())
+    };
+}
+
+/** The rows of "Used by": agent, the tag under it ("" when none), whether
+ *  it may write (with the state of that tag) and its run endpoint. */
+export function usedByRows(element: UI5Element): string[][] {
+    return (control<Table>(element, "odataUsedByTable").getItems() as ColumnListItem[]).map((item) => {
+        const first = (item.getCells()[0] as VBox).getItems();
+        const writes = item.getCells()[1] as ObjectStatus;
+        return [
+            (first[0] as ObjectIdentifier).getTitle(), shown(first[1] as ObjectStatus),
+            `${writes.getText()}/${writes.getState()}`, (item.getCells()[2] as Text).getText(false)
+        ];
+    });
+}
+
+/** The strip of the test call: whether it is shown, its type and text, and
+ *  whether what it shows holds an element (it must be text alone). */
+export function testStripOf(element: UI5Element): { visible: boolean; type: string; text: string; markup: boolean } {
+    const strip = control<MessageStrip>(element, "odataTestStrip");
+    const message = strip.getDomRef()?.querySelector(".sapMMsgStripMessage");
+    return {
+        visible: strip.getVisible(), type: strip.getVisible() ? strip.getType() : "",
+        text: strip.getVisible() ? strip.getText() : "",
+        markup: !!message && message.querySelector("b, script, img, a") !== null
+    };
+}

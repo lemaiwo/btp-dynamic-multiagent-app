@@ -469,14 +469,52 @@ export default class FakeBackend {
             ...service,
             counts: { entity_sets: definition.entity_sets.length, operations: definition.operations.length },
             has_write: definition.entity_sets.some((e) => e.operations.some((op) => writes.indexOf(op) !== -1))
-                || definition.operations.some((o) => o.enabled && o.changes_data)
+                || definition.operations.some((o) => o.enabled && o.changes_data),
+            uncallable_operations: FakeBackend.odataUncallable(service)
         };
+    }
+
+    /**
+     * `uncallable_operations` in agents/odata/calls.py, as far as the fake
+     * needs it: the ENABLED operations no agent can call, with the first
+     * reason of `CALL_REFUSALS` (agents/odata/client.py) that holds. The
+     * type rules (`bound_key_type`, `parameter_type`) are reduced to
+     * `Edm.Binary`, the one type the fixtures use for them.
+     */
+    private static odataUncallable(service: ODataService): { name: string; reason: string }[] {
+        const sets = service.definition.entity_sets;
+        const out: { name: string; reason: string }[] = [];
+        service.definition.operations.filter((o) => o.enabled === true).forEach((operation) => {
+            const kinds = service.odata_version === "v4" ? ["action", "function"] : ["function_import"];
+            const bound = operation.bound_to === null || operation.bound_to === undefined
+                ? undefined : sets.filter((e) => e.name === operation.bound_to)[0];
+            const parameters = operation.parameters ?? [];
+            let reason = "";
+            if (kinds.indexOf(operation.kind) === -1) {
+                reason = "calls_not_available";
+            } else if (operation.bound_to !== null && operation.bound_to !== undefined && !bound) {
+                reason = "bound_set_missing";
+            } else if (bound && bound.keys.length === 0) {
+                reason = "bound_set_without_key";
+            } else if (bound && service.odata_version === "v2"
+                && bound.keys.some((key) => !parameters.some((p) => p.name === key.name))) {
+                reason = "key_not_declared";
+            } else if (bound && bound.keys.some((key) => key.type === "Edm.Binary")) {
+                reason = "bound_key_type";
+            } else if (parameters.some((p) => p.required && p.type === "Edm.Binary")) {
+                reason = "parameter_type";
+            }
+            if (reason) {
+                out.push({ name: operation.name, reason });
+            }
+        });
+        return out;
     }
 
     /** `ODataService.to_summary()`: the same without the definition. */
     private static odataSummary(service: ODataService): ODataServiceSummary {
-        const { definition, ...summary } = FakeBackend.odataDict(service);
-        void definition;
+        const { definition, uncallable_operations: uncallable, ...summary } = FakeBackend.odataDict(service);
+        void [definition, uncallable];
         return summary;
     }
 
@@ -1090,9 +1128,10 @@ export default class FakeBackend {
             summary: { entity_sets: 5, operations: 1, in_service: 0, changed: 0 }
         };
         this.testResult = {
-            ok: true, status: 200, duration_ms: 412, target: "A_PurchaseRequisitionItem", rows: 1,
-            identity: "technical", destination: "S4_ODATA_TECH", auth_type: "BasicAuthentication",
-            proxy_type: "OnPremise", message: ""
+            ok: true, code: null, status: 200, duration_ms: 412, service: "purchase-requisitions-jobs",
+            enabled: true, read: "list", target: "A_PurchaseRequisitionItem", rows: 1,
+            identity: "technical", per_user: false, destination: "S4_ODATA_TECH",
+            auth_type: "BasicAuthentication", proxy_type: "OnPremise", message: "", warnings: []
         };
     }
 
@@ -1153,7 +1192,26 @@ export default class FakeBackend {
         const index = this.odataServices.findIndex((s) => s.name === name);
         const stored = this.odataServices[index];
         if (action === "/test" && method === "POST") {
-            return stored ? this.json(this.testResult) : notFound();
+            // `TestCallBody`: at most `entity_set`, which must be an entity
+            // set of the service with List on (422 with a stable code).
+            if (!stored) {
+                return notFound();
+            }
+            const extra = Object.keys(body ?? {}).filter((key) => key !== "entity_set")[0];
+            if (extra !== undefined) {
+                return this.refused([`${extra}: Extra inputs are not permitted`]);
+            }
+            const wanted = body?.entity_set;
+            if (wanted !== undefined && wanted !== null) {
+                const target = stored.definition.entity_sets.filter((e) => e.name === wanted)[0];
+                if (!target || target.operations.indexOf("list") === -1) {
+                    return this.json(
+                        { detail: target ? "list is not enabled for this entity set" : "not an entity set of this service" },
+                        422, { "X-OData-Error": target ? "operation_disabled" : "unknown_target" }
+                    );
+                }
+            }
+            return this.json(this.testResult);
         }
         if (action === "/duplicate" && method === "POST") {
             const problems = FakeBackend.validateODataDuplicate(body);
@@ -1320,9 +1378,9 @@ export default class FakeBackend {
         return answer();
     }
 
-    private json(body: unknown, status = 200): Promise<Response> {
+    private json(body: unknown, status = 200, headers: Record<string, string> = {}): Promise<Response> {
         return Promise.resolve(new Response(JSON.stringify(body), {
-            status, headers: { "Content-Type": "application/json" }
+            status, headers: { "Content-Type": "application/json", ...headers }
         }));
     }
 

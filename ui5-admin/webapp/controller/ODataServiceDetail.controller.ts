@@ -13,7 +13,7 @@ import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
 import odataCatalog, {
-    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataPending
+    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataOperationRow, type ODataPending
 } from "../model/odataCatalog";
 import odataDestinations, { type DestinationNotice, type DestinationsState } from "../model/odataDestinations";
 import { canonical } from "../model/runsPanel";
@@ -31,7 +31,8 @@ import type ListBinding from "sap/ui/model/ListBinding";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
 import type {
-    ODataDefinition, ODataEntityOp, ODataEntitySet, ODataService, ODataServiceInput, ODataServiceUpdate, ODataUsedBy
+    ODataDefinition, ODataEntityOp, ODataEntitySet, ODataOperation, ODataService, ODataServiceInput,
+    ODataServiceUpdate, ODataTestResult, ODataUsedBy
 } from "../service/types";
 
 const ROUTE = "odataServiceDetail";
@@ -87,10 +88,11 @@ interface SaveQuestion {
 }
 
 /**
- * One OData service of the catalogue: its header actions, the General
- * section and the entity sets with their operation switches. The definition
- * is loaded and sent back whole with every save; the operations section
- * comes with a later task.
+ * One OData service of the catalogue: its header actions (the test call
+ * among them), the General section, the entity sets with their operation
+ * switches, the operations (function imports, actions, functions) and the
+ * agents that use the service. The definition is loaded and sent back
+ * whole with every save.
  *
  * @namespace com.agent.admin.controller
  */
@@ -150,6 +152,14 @@ export default class ODataServiceDetail extends ODataController {
     private entityDialog?: EntitySetDialog;
     private entityOpen = false;
 
+    /** The entity set "Add" put into the form for the dialog that is open:
+     *  it leaves the form again unless that dialog is applied. */
+    private addedStub?: ODataEntitySet;
+
+    /** The open dialog was closed by the page (it is being left), not by
+     *  the admin: nothing on the page gets the focus for it. */
+    private entityDismissed = false;
+
     /** Watches the height of what the slot of the pending-writes strip holds. */
     private slotObserver?: ResizeObserver;
 
@@ -206,6 +216,9 @@ export default class ODataServiceDetail extends ODataController {
                 this.askAboutLeaving();
                 return;
             }
+            // Another service (or this one again) by the address: a dialog
+            // of the service that was shown does not stay open over it.
+            this.leaveEntityDialog();
             if (this.keepUnsaved()) {
                 return;
             }
@@ -299,7 +312,7 @@ export default class ODataServiceDetail extends ODataController {
     }
 
     public onExit(): void {
-        this.entityDialog?.dismiss();
+        this.leaveEntityDialog();
         this.slotObserver?.disconnect();
         window.removeEventListener("beforeunload", this.onBeforeUnload);
         document.removeEventListener("input", this.onDestinationInput, true);
@@ -319,7 +332,7 @@ export default class ODataServiceDetail extends ODataController {
      *  more -- unless it held unsaved changes, then it comes back and asks. */
     private onLeft(): void {
         // A dialog of this page is not left open over another page.
-        this.entityDialog?.dismiss();
+        this.leaveEntityDialog();
         if (this.keepUnsaved()) {
             return;
         }
@@ -332,6 +345,28 @@ export default class ODataServiceDetail extends ODataController {
         this.svc().setData(this.blankState(""));
         this.destinationsCount++;
         this.showDestinations("loading");
+    }
+
+    /**
+     * The page is being left (or shows another service) while the entity
+     * set dialog may be open: the dialog is closed as Cancel does, and an
+     * entity set that "Add" put into the form for it is taken out again
+     * right away -- before anything asks whether the form has unsaved
+     * changes. The dialog itself closes a moment later; by then the stub
+     * would have been taken for a change, and the admin asked about a page
+     * with nothing unsaved.
+     */
+    private leaveEntityDialog(): void {
+        if (!this.entityOpen) {
+            return;
+        }
+        this.entityDismissed = true;
+        const stub = this.addedStub;
+        this.addedStub = undefined;
+        if (stub) {
+            this.dropAdded(stub, true);
+        }
+        this.entityDialog?.dismiss();
     }
 
     /**
@@ -403,12 +438,22 @@ export default class ODataServiceDetail extends ODataController {
             // `asking`: a question about the save is open.
             rows: [], entitySearch: "", pendingWrites: "", asking: false, problemsOnly: "",
             pending: odataCatalog.noPending(),
+            // `opRows`: what the operations table shows, one flat row per
+            // operation of `data.definition` (`odataCatalog.operationRow`).
+            // `uncallable`: what the server said about the STORED service's
+            // enabled operations that no agent can call (name -> reason);
+            // `uncallableText`: the sentence above the table that counts
+            // the rows showing such a reason.
+            // `usedByWarning`: what the Used-by section warns about.
+            opRows: [], uncallable: {}, uncallableText: "", usedByWarning: "",
             // `updated_at`: the version of the service the form was loaded
             // from; a save is only made on top of that one.
             // `changedElsewhere` / `deletedElsewhere`: it is not the stored
             // version any more, or the service is gone.
             updated_at: null, changedElsewhere: false, deletedElsewhere: false,
-            // U6 fills this with the result of "Test call".
+            // The result of "Test call" as its strip shows it: `{type,
+            // text}`, or null. It is about the stored service, so it goes
+            // with every load and save.
             test: null,
             duplicate: {
                 name: "", destination: "", user_context: false, errors: {}, error: "", unsaved: false, writes: ""
@@ -434,8 +479,12 @@ export default class ODataServiceDetail extends ODataController {
             used_by: service.used_by ?? [],
             updated_at: service.updated_at ?? null,
             rows: odataCatalog.entitySetRows(service.definition),
+            // Read-only, and never part of what Save sends (`payloadOf`).
+            uncallable: odataCatalog.uncallableByName(service.uncallable_operations),
             entitySearch: search
         });
+        this.showOperations();
+        this.showUsedBy();
         this.filterEntitySets(search);
         this.typedDestination = undefined;
         this.checkDestination();
@@ -662,9 +711,13 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty("/exists", false);
         model.setProperty("/isNew", true);
         model.setProperty("/used_by", []);
+        model.setProperty("/uncallable", {});
+        model.setProperty("/test", null);
         model.setProperty("/updated_at", null);
         model.setProperty("/original", odataCatalog.emptyService());
         model.setProperty("/title", this.text("odataNewService"));
+        this.showOperations();
+        this.showUsedBy();
         this.showPendingWrites();
         this.checkDestination();
     }
@@ -776,6 +829,49 @@ export default class ODataServiceDetail extends ODataController {
         return this.text((search ?? "").trim() ? "odataNoEntityMatches" : "odataNoEntitySets");
     }
 
+    /** "Operations (3)". */
+    public formatOperationsTitle(count: number | undefined): string {
+        return this.text("odataOperations", [count ?? 0]);
+    }
+
+    /** The entity set an operation is bound to, or that it is bound to none. */
+    public formatBoundTo(boundTo: string | undefined): string {
+        return boundTo || this.text("odataUnbound");
+    }
+
+    /** Why no agent can call the operation, in words (`key`: an i18n key). */
+    public formatUncallable(key: string | undefined): string {
+        return key ? this.text(key) : "";
+    }
+
+    /** An enabled write stands out, like a ticked write of an entity set. */
+    public formatEnabledWriteState(enabled: boolean | undefined, write: boolean | undefined): ValueState {
+        return enabled && write ? ValueState.Warning : ValueState.None;
+    }
+
+    /** What the Enabled box of an operation switches, and that it is a write. */
+    public formatEnableOperation(title: string | undefined, write: boolean | undefined): string {
+        return this.text(write ? "odataEnableWriteOperation" : "odataEnableOperation", [title ?? ""]);
+    }
+
+    public formatRemoveOperation(title: string | undefined): string {
+        return this.text("odataRemoveOperation", [title ?? ""]);
+    }
+
+    public formatYesNo(value: boolean | undefined): string {
+        return this.text(value === true ? "odataYes" : "odataNo");
+    }
+
+    /** An agent that may write is the one a newly enabled write reaches. */
+    public formatWritesAllowedState(allowed: boolean | undefined): ValueState {
+        return allowed === true ? ValueState.Warning : ValueState.None;
+    }
+
+    /** The slug the job scheduler starts the agent by, or a dash. */
+    public formatRunEndpoint(exposed: boolean | undefined, slug: string | undefined): string {
+        return exposed === true && slug ? slug : this.text("odataNoRunEndpoint");
+    }
+
     /** "Add" until the definition is as large as the server takes it. */
     public formatCanAddEntitySet(busy: boolean | undefined, count: number | undefined): boolean {
         return !busy && (count ?? 0) < odataCatalog.MAX_ENTITY_SETS;
@@ -796,6 +892,8 @@ export default class ODataServiceDetail extends ODataController {
      *  what is pending is said to a screen reader too. */
     private showEntitySets(announce = false): void {
         this.svc().setProperty("/rows", odataCatalog.entitySetRows(this.definition()));
+        // An operation row names the entity set it is bound to by its title.
+        this.showOperations();
         this.showPendingWrites(announce);
     }
 
@@ -1055,7 +1153,11 @@ export default class ODataServiceDetail extends ODataController {
     public onAddEntitySet(): void {
         const model = this.svc();
         const entitySets = this.definition().entity_sets;
-        if (this.working || model.getProperty("/asking") === true
+        // Not while a dialog is open or on its way (its fragment is still
+        // being loaded after a first press): `openEntitySet` would not open
+        // a second one, and the entity set pushed here would stay behind
+        // without a dialog to cancel it in.
+        if (this.entityOpen || this.working || model.getProperty("/asking") === true
             || entitySets.length >= odataCatalog.MAX_ENTITY_SETS) {
             return;
         }
@@ -1116,6 +1218,8 @@ export default class ODataServiceDetail extends ODataController {
         }
         const stored = this.original().definition?.entity_sets ?? [];
         this.entityOpen = true;
+        this.entityDismissed = false;
+        this.addedStub = added ? entitySet : undefined;
         let result;
         try {
             result = await this.entityDialog.open(this.getView()!, entitySet, {
@@ -1130,11 +1234,20 @@ export default class ODataServiceDetail extends ODataController {
             throw error;
         } finally {
             this.entityOpen = false;
+            this.addedStub = undefined;
         }
+        const dismissed = this.entityDismissed;
+        this.entityDismissed = false;
         const entitySets = this.definition().entity_sets;
         const at = entitySets.indexOf(entitySet);
         if (!result) {
-            if (this.dropAdded(entitySet, added)) {
+            const dropped = this.dropAdded(entitySet, added);
+            if (dismissed) {
+                // The page closed the dialog because it is being left:
+                // the focus is not pulled back to it.
+                return;
+            }
+            if (dropped) {
                 this.focusEntityRow(-1);
             } else if (at !== -1) {
                 this.focusEntityRow(at);
@@ -1190,6 +1303,316 @@ export default class ODataServiceDetail extends ODataController {
         ((item ?? this.byId("odataAddEntitySetButton")) as Control | undefined)?.focus();
     }
 
+    // --- operations ---------------------------------------------------------
+
+    /**
+     * Works the rows of the operations table out again from the definition,
+     * and counts the rows that say why no agent can call them.
+     */
+    private showOperations(): void {
+        const model = this.svc();
+        const rows = model.getProperty("/loaded") === true
+            ? odataCatalog.operationRows(this.definition(), model.getProperty("/uncallable") as Record<string, string>)
+            : [];
+        model.setProperty("/opRows", rows);
+        this.countUncallable();
+    }
+
+    private countUncallable(): void {
+        const model = this.svc();
+        const count = (model.getProperty("/opRows") as ODataOperationRow[]).filter((row) => row.uncallable).length;
+        model.setProperty("/uncallableText", count === 0 ? ""
+            : count === 1 ? this.text("odataUncallableOne") : this.text("odataUncallableMany", [count]));
+    }
+
+    /**
+     * The operation a control of the operations table belongs to: its row
+     * and the operation at that position of the definition -- or only the
+     * row, when that is not (or no longer) the operation the row shows.
+     */
+    private operationAt(source: Control): { row?: ODataOperationRow; operation?: ODataOperation } {
+        const row = source.getBindingContext("svc")?.getObject() as ODataOperationRow | undefined;
+        const operation = row ? this.definition().operations[row.index] : undefined;
+        return { row, operation: operation && row && operation.name === row.name ? operation : undefined };
+    }
+
+    /** The row of `operation` anew: its note is about the click before. */
+    private showOperation(operation: ODataOperation, note = ""): void {
+        const model = this.svc();
+        const index = this.definition().operations.indexOf(operation);
+        if (index === -1) {
+            this.showOperations();
+            return;
+        }
+        model.setProperty(`/opRows/${index}`, {
+            ...odataCatalog.operationRow(
+                operation, index, this.definition(), model.getProperty("/uncallable") as Record<string, string>
+            ),
+            note
+        });
+        this.countUncallable();
+    }
+
+    /** Puts a box of the operations table back to what its row holds (the
+     *  boxes are bound one way, like those of the entity sets). */
+    private resetOperationBox(box: CheckBox): void {
+        const row = box.getBindingContext("svc")?.getObject() as ODataOperationRow | undefined;
+        box.setSelected(row ? (box.data("flag") === "enabled" ? row.enabled : row.write) === true : false);
+    }
+
+    /**
+     * A click on a box of the operations table that cannot be taken as it
+     * is: while a save is on its way or asked about, or on a row that is not
+     * the operation at its position. Returns the operation when the click
+     * can go on.
+     */
+    private clickedOperation(box: CheckBox): ODataOperation | undefined {
+        const model = this.svc();
+        const { row, operation } = this.operationAt(box);
+        if (!row || this.working || model.getProperty("/asking") === true) {
+            this.resetOperationBox(box);
+            return undefined;
+        }
+        if (!operation) {
+            this.showOperations();
+            this.resetOperationBox(box);
+            const text = this.text("odataOperationsRefreshed");
+            const index = (model.getProperty("/opRows") as ODataOperationRow[]).map((r) => r.name).indexOf(row.name);
+            if (index !== -1) {
+                model.setProperty(`/opRows/${index}/note`, text);
+            }
+            InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
+            return undefined;
+        }
+        return operation;
+    }
+
+    /**
+     * The Enabled box of an operation was clicked: switches the operation
+     * on or off in the form. Nothing is sent; Save does that.
+     *
+     * Enabling an operation that is a write (`odataCatalog.operationIsWrite`)
+     * is a pending write like a ticked Create, Update or Delete: the strip
+     * next to Save names it at once (`showPendingWrites`), and Save asks
+     * with the names of the agents that can then call it.
+     */
+    public onToggleOperationEnabled(event: Event): void {
+        const box = event.getSource() as CheckBox;
+        const enable = box.getSelected();
+        const operation = this.clickedOperation(box);
+        if (!operation) {
+            return;
+        }
+        operation.enabled = enable;
+        this.showOperation(operation);
+        this.svc().setProperty("/saveError", "");
+        this.showPendingWrites(true);
+    }
+
+    /**
+     * The "Changes data" box of an operation was clicked.
+     *
+     * Ticking it is always taken: the operation is then a write, and when
+     * it is enabled that is a pending write. Unticking it takes the
+     * operation out of the write permission and out of the audit, so it is
+     * asked about first, with Cancel as the default -- and it is refused on
+     * an operation that is sent with POST, which is run as a write whatever
+     * this flag says: the box would claim otherwise.
+     */
+    public onToggleChangesData(event: Event): void {
+        const box = event.getSource() as CheckBox;
+        const tick = box.getSelected();
+        const operation = this.clickedOperation(box);
+        if (!operation) {
+            return;
+        }
+        const model = this.svc();
+        if (tick) {
+            operation.changes_data = true;
+            this.showOperation(operation);
+            model.setProperty("/saveError", "");
+            this.showPendingWrites(true);
+            return;
+        }
+        // Nothing changes before the answer; the box shows what holds.
+        this.resetOperationBox(box);
+        if (operation.http_method !== "GET") {
+            const reason = this.text("odataChangesDataPost");
+            this.showOperation(operation, reason);
+            InvisibleMessage.getInstance().announce(reason, InvisibleMessageMode.Assertive);
+            return;
+        }
+        const untick = this.text("odataChangesDataOffAction");
+        const title = (operation.title ?? "").trim() || operation.name;
+        model.setProperty("/asking", true);
+        MessageBox.warning(this.text("odataChangesDataOffConfirm"), {
+            title: this.text("odataChangesDataOffTitle", [title]),
+            actions: [untick, MessageBox.Action.CANCEL],
+            emphasizedAction: MessageBox.Action.CANCEL,
+            initialFocus: MessageBox.Action.CANCEL,
+            onClose: (action: string | null) => {
+                model.setProperty("/asking", false);
+                // Only into the form the question was asked about.
+                if (action === untick && this.definition().operations.indexOf(operation) !== -1) {
+                    operation.changes_data = false;
+                    this.showOperation(operation);
+                    model.setProperty("/saveError", "");
+                    this.showPendingWrites(true);
+                }
+            }
+        });
+    }
+
+    /**
+     * Takes an operation out of the form, after asking. This is also the
+     * way to remove an entity set an operation is bound to or returns.
+     * Nothing is sent; Save does that.
+     */
+    public onRemoveOperation(event: Event): void {
+        const model = this.svc();
+        const { row, operation } = this.operationAt(event.getSource() as Control);
+        if (!row || this.working || model.getProperty("/asking") === true) {
+            return;
+        }
+        if (!operation) {
+            this.showOperations();
+            InvisibleMessage.getInstance().announce(this.text("odataOperationsRefreshed"), InvisibleMessageMode.Polite);
+            return;
+        }
+        const remove = this.text("odataRemove");
+        model.setProperty("/asking", true);
+        MessageBox.warning(this.text("odataRemoveOperationConfirm", [row.title, row.name]), {
+            title: this.text("odataRemoveOperationTitle"),
+            actions: [remove, MessageBox.Action.CANCEL],
+            emphasizedAction: remove,
+            initialFocus: MessageBox.Action.CANCEL,
+            onClose: (action: string | null) => {
+                model.setProperty("/asking", false);
+                const operations = this.definition().operations;
+                const at = operations.indexOf(operation);
+                if (action !== remove || at === -1) {
+                    return;
+                }
+                operations.splice(at, 1);
+                model.setProperty("/saveError", "");
+                this.showOperations();
+                this.showPendingWrites(true);
+                // The button that was pressed went with its row.
+                (this.byId("odataOperationsTable") as Control | undefined)?.focus();
+            }
+        });
+    }
+
+    // --- used by ------------------------------------------------------------
+
+    /**
+     * Warns when the service runs as the signed-in user (as the form has
+     * it) and an agent that uses it has a run endpoint: a run started there
+     * by the job scheduler has no user, and every call is refused.
+     */
+    private showUsedBy(): void {
+        const model = this.svc();
+        const agents = model.getProperty("/loaded") === true && this.data().user_context === true
+            ? odataCatalog.jobAgents(model.getProperty("/used_by") as ODataUsedBy[]) : [];
+        model.setProperty("/usedByWarning", agents.length === 0 ? ""
+            : agents.length === 1 ? this.text("odataUserServiceOnJobAgent", [agents[0]])
+                : this.text("odataUserServiceOnJobAgents", [agents.join(", ")]));
+    }
+
+    // --- test call ----------------------------------------------------------
+
+    /**
+     * Asks the server to read one row through the STORED service and shows
+     * how that went: status, destination, duration, rows and identity,
+     * never a value. With unsaved changes nothing is called: the result
+     * would be about another service than the one on the page.
+     */
+    public async onTestCall(): Promise<void> {
+        const model = this.svc();
+        const name = this.serviceName;
+        if (this.working || !name || model.getProperty("/exists") !== true || model.getProperty("/asking") === true) {
+            return;
+        }
+        if (this.isDirty()) {
+            this.showTest("Warning", this.text("odataTestUnsaved"));
+            return;
+        }
+        const count = this.loadCount;
+        this.setWorking(true);
+        let result: ODataTestResult;
+        try {
+            result = await this.withBusy(() => this.getAdminService().testODataService(name));
+        } catch (error) {
+            this.setWorking(false);
+            if (count === this.loadCount) {
+                this.showTestRefusal(error);
+            }
+            return;
+        }
+        this.setWorking(false);
+        if (count !== this.loadCount || name !== this.serviceName) {
+            // The page shows another service by now.
+            return;
+        }
+        const warnings = (Array.isArray(result.warnings) ? result.warnings : [])
+            .map((warning) => String(warning?.message || warning?.code || "")).filter(Boolean);
+        this.showTest(
+            result.ok !== true ? "Error" : warnings.length ? "Warning" : "Success",
+            [this.testText(result)].concat(warnings).join(" ")
+        );
+    }
+
+    /** The sentence about a test call that ran (or could be judged). */
+    private testText(result: ODataTestResult): string {
+        const as = this.text(result.identity === "user" ? "odataTestAsUser"
+            : result.identity === "technical" ? "odataTestAsTechnical" : "odataTestAsUnknown");
+        const destination = String(result.destination ?? "");
+        const status = typeof result.status === "number" ? String(result.status) : "";
+        const duration = String(result.duration_ms ?? 0);
+        if (result.ok === true) {
+            if (result.read === "metadata") {
+                return this.text("odataTestOkMetadata", [status, destination, duration, as]);
+            }
+            return result.rows === 1
+                ? this.text("odataTestOkOne", [status, destination, duration, String(result.target ?? ""), as])
+                : this.text("odataTestOk", [
+                    status, destination, duration, String(result.rows ?? 0), String(result.target ?? ""), as
+                ]);
+        }
+        // The server's words (SAP's code and text among them), as text.
+        const said = String(result.message || result.code || "");
+        if (status) {
+            return this.text("odataTestFailed", [status, destination, as, said]);
+        }
+        return destination
+            ? this.text("odataTestFailedNoStatus", [destination, said]) : this.text("odataTestFailedPlain", [said]);
+    }
+
+    /** The test was not made: the route refused it, or could not be reached. */
+    private showTestRefusal(error: unknown): void {
+        if (error instanceof AdminError && error.status === 404) {
+            this.svc().setProperty("/deletedElsewhere", true);
+            return;
+        }
+        const kind = ErrorHandler.classify(error);
+        if (kind === "session" || kind === "forbidden") {
+            ErrorHandler.handle(error);
+            return;
+        }
+        const reason = ErrorHandler.messageFor(error, "");
+        this.showTest("Error", error instanceof AdminError && error.status === 424 ? this.text("odataTestNoUser")
+            : error instanceof AdminError && error.status === 429 ? this.text("odataTestBusy")
+                : reason ? this.text("odataTestNotMade", [reason]) : this.text("odataTestNotMadePlain"));
+    }
+
+    /** Shows the strip of the test call, brings it into view (the button
+     *  stays in the toolbar while the page is scrolled) and announces it. */
+    private showTest(type: "Success" | "Warning" | "Error", text: string): void {
+        this.svc().setProperty("/test", { type, text });
+        (this.byId("odataServiceDetailPage") as Page | undefined)?.scrollTo(0);
+        InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
+    }
+
     // --- editing ------------------------------------------------------------
 
     /** Typing in a field takes its error away, and with it what the last
@@ -1204,6 +1627,7 @@ export default class ODataServiceDetail extends ODataController {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/user_context", key === "user");
         this.svc().setProperty("/saveError", "");
+        this.showUsedBy();
         this.checkDestination(true, undefined, true);
     }
 
@@ -1324,6 +1748,7 @@ export default class ODataServiceDetail extends ODataController {
         }
         model.setProperty("/changedElsewhere", false);
         model.setProperty("/used_by", fresh.used_by ?? []);
+        this.showUsedBy();
         return fresh;
     }
 
@@ -1815,6 +2240,7 @@ export default class ODataServiceDetail extends ODataController {
                         this.svc().setProperty("/errors", {});
                         this.svc().setProperty("/saveError", "");
                         this.showEntitySets();
+                        this.showUsedBy();
                     }
                     resolve(action === discard);
                 }

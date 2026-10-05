@@ -20,6 +20,8 @@ import {
     ENTITY_TABLE, PAGE, VIEW, accessibleName, actionsOf, announced, counterState, entityHeader, entityItem,
     entityItems, entityRow, entityTitles, formOf, hasFocus, inView, opBox, pageTitle, pressMore, pressSegment, rowTop,
     scrollerOf, stateOf, stripOf, tableHeaderScrolledAway, tagsOf, toasts, viewOf, withId,
+    OPERATIONS_TABLE, operationBox, operationItem, operationRemove, operationRow, operationsHeader, testStripOf,
+    usedByRows,
     type FormTexts, type Op
 } from "./pages/ODataDetail";
 
@@ -2840,3 +2842,505 @@ opaTest("Duplicate says so when the service has no write operations any more, an
 
     Then.iStopTheApp();
 });
+
+// --- operations, used by and the test call (U6) -----------------------------------
+
+const RELEASE_ROW = "Release item";
+const STRATEGY = "Release strategy";
+const CHANGES_OFF = "Only untick this when the operation is known not to change data. "
+    + "A call is then not audited and needs no write permission.";
+const POST_IS_WRITE = "An operation that is sent with POST always counts as changing data; this cannot be unticked.";
+const TEST = `POST odata/services/${JOBS}/test`;
+const TEST_OK = "Test call: 200 from S4_ODATA_TECH in 412 ms. Read 1 row of A_PurchaseRequisitionItem as the technical user.";
+
+/** The operation at `index` as the form holds it: what Save would send. */
+function formOperation(page: UI5Element, index: number): Record<string, unknown> {
+    const model = viewOf(page).getModel("svc") as unknown as { getProperty(path: string): Record<string, unknown> };
+    return model.getProperty(`/data/definition/operations/${index}`);
+}
+
+/**
+ * Presses "Test call" as a user does: in the toolbar, or -- in a window too
+ * narrow for all actions -- in the toolbar's overflow menu, opened first.
+ */
+function iPressTestCall(When: Common): void {
+    When.waitFor({
+        id: "odataDetailToolbar",
+        viewName: VIEW,
+        success: function (toolbar: UI5Element) {
+            const button = viewOf(toolbar).byId("odataTestCallButton") as Control;
+            if (button.getDomRef()) {
+                new Press().executeOn(button);
+                return;
+            }
+            new Press().executeOn(
+                (toolbar as unknown as { _getOverflowButton(): Control })._getOverflowButton()
+            );
+            When.waitFor({
+                controlType: "sap.m.Button",
+                searchOpenDialogs: true,
+                matchers: withId("odataTestCallButton"),
+                actions: new Press(),
+                errorMessage: "No Test call in the overflow menu"
+            });
+        },
+        errorMessage: "No toolbar"
+    });
+}
+
+/** Clicks the "Changes data" or the "Enabled" box of the operation titled `title`. */
+function iTickOperation(When: Common, title: string, which: "changes" | "enabled"): void {
+    When.waitFor({
+        id: OPERATIONS_TABLE,
+        viewName: VIEW,
+        check: function (table: UI5Element) { return !!operationItem(table, title); },
+        success: function (table: UI5Element) { new Press().executeOn(operationBox(operationItem(table, title), which)); },
+        errorMessage: `No row "${title}" in the operations table`
+    });
+}
+
+opaTest("the operations table shows method, binding, parameters and both switches", function (Given: Common, When: Common, Then: Common) {
+    iOpenPrepared(Given, When, JOBS, function () {
+        // What a remote $metadata document can hold: markup in a name's place.
+        stored(JOBS).definition.operations.push({
+            name: "Probe", qualified_name: "", title: "<b>Probe</b>", kind: "function_import", http_method: "GET",
+            bound_to: null, parameters: [{ name: "Depth", type: "Edm.Int32", required: false }],
+            description: "<img src=x onerror=alert(1)>", enabled: false, changes_data: false
+        });
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.deepEqual(operationsHeader(page), {
+            title: "Operations (2)", noData: "No operations. Import them from $metadata.",
+            titles: [RELEASE_ROW, "<b>Probe</b>"]
+        }, "the section counts and lists the operations");
+        Opa5.assert.deepEqual(operationRow(page, RELEASE_ROW), {
+            title: RELEASE_ROW, technical: "ReleaseItem · POST",
+            description: "Releases one requisition item with a release code.",
+            boundTo: "Requisition item",
+            parameters: "PurchaseRequisition, PurchaseRequisitionItem, ReleaseCode",
+            changesData: true, enabled: true, enabledState: "Warning", uncallable: "", note: ""
+        }, "method, the title of the bound entity set, the three parameters and both switches; an enabled write stands out");
+        Opa5.assert.deepEqual(operationRow(page, "<b>Probe</b>"), {
+            title: "<b>Probe</b>", technical: "Probe · GET", description: "<img src=x onerror=alert(1)>",
+            boundTo: "Unbound", parameters: "[Depth]",
+            changesData: false, enabled: false, enabledState: "None", uncallable: "", note: ""
+        }, "an unbound GET operation that only reads, off; an optional parameter in brackets");
+        const table = viewOf(page).byId(OPERATIONS_TABLE)!.getDomRef()!;
+        Opa5.assert.strictEqual(table.querySelectorAll("b, img").length, 0, "markup in a title or description is shown as text");
+        Opa5.assert.strictEqual(
+            accessibleName(operationBox(operationItem(page, RELEASE_ROW), "enabled")),
+            "Enabled Release item (ReleaseItem)", "the Enabled box is named with its operation"
+        );
+        Opa5.assert.strictEqual(
+            accessibleName(operationBox(operationItem(page, RELEASE_ROW), "changes")),
+            "Changes data Release item (ReleaseItem)", "and so is Changes data"
+        );
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "nothing is pending on a stored service");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("enabling an operation that changes data is said next to Save, asked about by Save, and only Save sends it", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    const RETURNS = { entity_set: "A_PurchaseRequisitionItem", collection: false };
+    let agent = "";
+    let before = "";
+
+    iOpenPrepared(Given, When, JOBS, function () {
+        const operation = stored(JOBS).definition.operations[0];
+        operation.enabled = false;
+        // What the page does not edit must come back from a save as it was.
+        operation.returns = RETURNS;
+        before = JSON.stringify(operation);
+        agent = stored(JOBS).used_by[0].agent;
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, RELEASE_ROW).enabled, false, "the operation is off");
+        Opa5.assert.strictEqual(operationRow(page, RELEASE_ROW).enabledState, "None");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "nothing pending");
+    });
+
+    iTickOperation(When, RELEASE_ROW, "enabled");
+    iSee(Then, "the pending operation", function (page: UI5Element) {
+        return operationRow(page, RELEASE_ROW).enabled;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataPendingWrites").text, pending(RELEASE), "the strip next to Save names the operation"
+        );
+        Opa5.assert.ok(announced().indexOf(RELEASE) !== -1, "and it is announced");
+        Opa5.assert.strictEqual(operationRow(page, RELEASE_ROW).enabledState, "Warning", "the box stands out");
+        Opa5.assert.strictEqual(formOperation(page, 0).enabled, true, "the form holds it");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "ticking asks nothing");
+        Opa5.assert.strictEqual(backend.requests.filter((r) => /^(PUT|POST)/.test(r)).length, 0, "and sends nothing");
+        Opa5.assert.strictEqual(stored(JOBS).definition.operations[0].enabled, false, "nothing is stored");
+    });
+
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            `The agent ${agent} uses this service.\n\n`
+            + `Saving enables these writes in SAP: ${RELEASE}.\n\n`
+            + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
+            "the Save question names the operation and the agent that can then call it"
+        );
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
+    }, "the write confirmation");
+    iPressInDialog(When, "Cancel");
+    iSeeNoDialog(Then, "cancelled", function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "Cancel sends nothing");
+        Opa5.assert.strictEqual(stored(JOBS).definition.operations[0].enabled, false, "nothing is stored");
+    });
+
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function () { Opa5.assert.ok(true, "the next Save asks again"); }, "the write confirmation, again");
+    iPressInDialog(When, "Save");
+    iSee(Then, "the saved operation", function (page: UI5Element) {
+        return backend.countRequests(PUT) === 1 && !stripOf(page, "odataPendingWrites").visible;
+    }, function (page: UI5Element) {
+        const body = backend.bodies[PUT] as Record<string, unknown>;
+        const sent = (body.definition as { operations: Record<string, unknown>[] }).operations;
+        Opa5.assert.deepEqual(
+            sent, [{ ...JSON.parse(before) as Record<string, unknown>, enabled: true }],
+            "the PUT carries the operation as it was stored, `returns` included, with only `enabled` changed"
+        );
+        Opa5.assert.strictEqual("uncallable_operations" in body, false, "the read-only list is not sent back");
+        Opa5.assert.deepEqual(stored(JOBS).definition.operations[0].returns, RETURNS, "and `returns` is still stored");
+        Opa5.assert.strictEqual(operationRow(page, RELEASE_ROW).enabled, true, "the saved service shows it enabled");
+        Opa5.assert.deepEqual(tagsOf(page), ["V2", "Technical user", "Write"], "with the Write tag");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("unticking Changes data asks with the audit warning; a POST operation stays a write", function (Given: Common, When: Common, Then: Common) {
+    const STRATEGY_WRITE = "the operation \"Release strategy\" (GetReleaseStrategy)";
+
+    iOpenPrepared(Given, When, UNUSED, function () {
+        // A GET function that still counts as a write, as an import leaves it.
+        stored(UNUSED).definition.operations[2].changes_data = true;
+    });
+    let shown: UI5Element;
+    iSeeTheService(Then, UNUSED, "the service is loaded", function (page: UI5Element) {
+        shown = page;
+        Opa5.assert.strictEqual(operationRow(page, STRATEGY).changesData, true, "Changes data is ticked");
+        Opa5.assert.strictEqual(operationRow(page, STRATEGY).technical, "GetReleaseStrategy · GET");
+    });
+
+    iTickOperation(When, STRATEGY, "changes");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), CHANGES_OFF, "the question carries the audit warning");
+        Opa5.assert.strictEqual(
+            (dialog as unknown as { getTitle(): string }).getTitle(), "Mark \"Release strategy\" as not changing data?"
+        );
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["It only reads", "Cancel"], "the answer or Cancel");
+        Opa5.assert.strictEqual(operationRow(shown, STRATEGY).changesData, true, "the box stays ticked until the answer");
+        Opa5.assert.strictEqual(formOperation(shown, 2).changes_data, true, "and so does the form");
+    }, "the question about Changes data");
+    iPressInDialog(When, "Cancel");
+    iSeeNoDialog(Then, "cancelled");
+    iSee(Then, "after Cancel", function () { return true; }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, STRATEGY).changesData, true, "Cancel leaves it ticked");
+        Opa5.assert.strictEqual(formOperation(page, 2).changes_data, true, "and the form as it was");
+    });
+
+    iTickOperation(When, STRATEGY, "changes");
+    iPressInDialog(When, "It only reads");
+    iSee(Then, "the unticked box", function (page: UI5Element) {
+        return !operationRow(page, STRATEGY).changesData;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(formOperation(page, 2).changes_data, false, "the form holds the answer");
+        Opa5.assert.strictEqual(backend.requests.filter((r) => /^(PUT|POST)/.test(r)).length, 0, "nothing is sent");
+    });
+
+    // Enabled as a read it is no write; marked as changing data again it is one.
+    iTickOperation(When, STRATEGY, "enabled");
+    iSee(Then, "the enabled read", function (page: UI5Element) {
+        return operationRow(page, STRATEGY).enabled;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "an enabled read is no pending write");
+        Opa5.assert.strictEqual(operationRow(page, STRATEGY).enabledState, "None", "and does not stand out");
+    });
+    iTickOperation(When, STRATEGY, "changes");
+    iSee(Then, "the write again", function (page: UI5Element) {
+        return operationRow(page, STRATEGY).changesData;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "ticking it asks nothing");
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataPendingWrites").text, pending(STRATEGY_WRITE), "the enabled operation is a pending write now"
+        );
+    });
+
+    // Sent with POST it is run as a write whatever the flag says.
+    iTickOperation(When, "Release", "changes");
+    iSee(Then, "the refused untick", function (page: UI5Element) {
+        return operationRow(page, "Release").note !== "";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, "Release").note, POST_IS_WRITE, "the row says why");
+        Opa5.assert.strictEqual(operationRow(page, "Release").changesData, true, "the box is ticked again");
+        Opa5.assert.strictEqual(formOperation(page, 0).changes_data, true, "the form is unchanged");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "and nothing is asked");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("an enabled operation that no agent can call says why on its row", function (Given: Common, When: Common, Then: Common) {
+    const WHY = "No agent can call this: a key field of the entity set it is bound to is not one of its parameters, "
+        + "so a call cannot name the entity.";
+
+    iOpenPrepared(Given, When, JOBS, function () {
+        // V2 sends the key as parameters: one key field is not declared.
+        stored(JOBS).definition.operations[0].parameters.splice(1, 1);
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, RELEASE_ROW).uncallable, WHY, "the reason, in plain words");
+        Opa5.assert.deepEqual(stripOf(page, "odataUncallableStrip"), {
+            visible: true, text: "1 enabled operation cannot be called by any agent. Its row says why."
+        }, "and the section counts such rows");
+    });
+    // Switched off, no agent meets it: nothing to explain.
+    iTickOperation(When, RELEASE_ROW, "enabled");
+    iSee(Then, "the operation off", function (page: UI5Element) {
+        return !operationRow(page, RELEASE_ROW).enabled;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, RELEASE_ROW).uncallable, "", "no reason on a disabled operation");
+        Opa5.assert.strictEqual(stripOf(page, "odataUncallableStrip").visible, false, "and no count");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("an operation is removed after a question, and Save sends the definition without it", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    const iPressRemove = function (): void {
+        When.waitFor({
+            id: OPERATIONS_TABLE, viewName: VIEW,
+            success: function (table: UI5Element) { new Press().executeOn(operationRemove(operationItem(table, RELEASE_ROW))); },
+            errorMessage: "No operations table"
+        });
+    };
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+    iPressRemove();
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            "Remove the operation \"Release item\" (ReleaseItem) from this service? Agents can no longer call it once the "
+            + "service is saved. An import from $metadata brings it back, switched off.",
+            "the question names the operation"
+        );
+    }, "the remove question");
+    iPressInDialog(When, "Cancel");
+    iSeeNoDialog(Then, "cancelled");
+    iSee(Then, "after Cancel", function () { return true; }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationsHeader(page).title, "Operations (1)", "Cancel keeps it");
+    });
+    iPressRemove();
+    iPressInDialog(When, "Remove");
+    iSee(Then, "the empty table", function (page: UI5Element) {
+        return operationsHeader(page).title === "Operations (0)";
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(operationsHeader(page).titles, [], "the row is gone");
+        Opa5.assert.strictEqual(stored(JOBS).definition.operations.length, 1, "nothing is stored before Save");
+    });
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function () { return backend.countRequests(PUT) === 1; }, function () {
+        Opa5.assert.deepEqual(
+            (backend.bodies[PUT]?.definition as { operations: unknown[] }).operations, [], "the PUT carries no operation"
+        );
+        Opa5.assert.strictEqual(
+            (backend.bodies[PUT]?.definition as { entity_sets: unknown[] }).entity_sets.length, 5, "and all entity sets"
+        );
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Used by lists the agent, whether it may write, and its run endpoint", function (Given: Common, When: Common, Then: Common) {
+    let agent = "";
+    iOpenPrepared(Given, When, JOBS, function () {
+        const first = stored(JOBS).used_by[0];
+        agent = first.agent;
+        first.expose_api = true;
+        first.api_slug = "pr-release-job";
+        stored(JOBS).used_by.push({ ...first, agent_id: 998, agent: "<i>reader</i>", allow_write: false, expose_api: false, api_slug: "", enabled: false });
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.deepEqual(usedByRows(page), [
+            [agent, "", "Yes/Warning", "pr-release-job"],
+            ["<i>reader</i>", "Agent disabled", "No/None", "–"]
+        ], "agent, whether its entry allows writes, and the slug of its run endpoint or a dash");
+        Opa5.assert.strictEqual(
+            viewOf(page).byId("odataUsedByTable")!.getDomRef()!.querySelectorAll("i").length, 0, "an agent name is text"
+        );
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataUsedByWarning").visible, false, "a technical-user service works from a run endpoint"
+        );
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a signed-in-user service attached to an agent with a run endpoint shows the warning strip", function (Given: Common, When: Common, Then: Common) {
+    let agent = "";
+    iOpenPrepared(Given, When, USER, function () {
+        const first = stored(USER).used_by[0];
+        agent = first.agent;
+        first.expose_api = true;
+        first.api_slug = "nightly-check";
+    });
+    iSeeTheService(Then, USER, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.deepEqual(stripOf(page, "odataUsedByWarning"), {
+            visible: true,
+            text: `The agent ${agent} has a run endpoint; scheduled runs have no user, so calls to this service are refused there.`
+        }, "the warning names the agent");
+        Opa5.assert.deepEqual(usedByRows(page), [[agent, "", "No/None", "nightly-check"]]);
+    });
+    // The warning follows what Runs as holds on the page.
+    iChoose(When, "odataRunsAs", "technical");
+    iSee(Then, "no warning for the technical user", function (page: UI5Element) {
+        return !stripOf(page, "odataUsedByWarning").visible;
+    }, function () { Opa5.assert.ok(true, "as the technical user the run endpoint works"); });
+    Then.iStopTheApp();
+});
+
+opaTest("a service that no agent uses says so, and a new service has no Used by section", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${UNUSED}`);
+    iSeeTheService(Then, UNUSED, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.deepEqual(usedByRows(page), [], "no row");
+        Opa5.assert.strictEqual(
+            (viewOf(page).byId("odataUsedByTable") as unknown as { getNoDataText(): string }).getNoDataText(),
+            "No agent uses this service."
+        );
+    });
+    When.waitFor({ success: function () { HashChanger.getInstance().setHash("odata-services/new"); } });
+    iSeeTheService(Then, "", "the new service", function (page: UI5Element) {
+        Opa5.assert.strictEqual((viewOf(page).byId("odataUsedByPanel") as Panel).getVisible(), false, "no Used by yet");
+        Opa5.assert.strictEqual(
+            (viewOf(page).byId("odataTestCallButton") as unknown as { getEnabled(): boolean }).getEnabled(), false,
+            "and nothing to test"
+        );
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Test call shows the success strip with status, destination, duration, rows and identity", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.strictEqual(testStripOf(page).visible, false, "no result before a test");
+    });
+    iPressTestCall(When);
+    iSee(Then, "the result", function (page: UI5Element) {
+        return testStripOf(page).visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(testStripOf(page), { visible: true, type: "Success", text: TEST_OK, markup: false });
+        Opa5.assert.strictEqual(backend.countRequests(TEST), 1, "one test call");
+        Opa5.assert.deepEqual(backend.bodies[TEST], {}, "with an empty body: the stored service decides what is read");
+        Opa5.assert.strictEqual(announced(), TEST_OK, "the result is announced");
+        Opa5.assert.ok(inView(page, "odataTestStrip"), "and in view");
+        Opa5.assert.strictEqual(backend.requests.filter((r) => /^PUT/.test(r)).length, 0, "nothing is saved by a test");
+    });
+
+    // What the server has to say besides the outcome is shown with it.
+    When.waitFor({
+        success: function () {
+            backend.testResult = {
+                ...backend.testResult, read: "metadata", target: "", rows: 0,
+                warnings: [{ code: "no_list_entity_set", message: "No entity set has List enabled: only $metadata was fetched." }]
+            };
+        }
+    });
+    iPressTestCall(When);
+    iSee(Then, "the result with a warning", function (page: UI5Element) {
+        return testStripOf(page).type === "Warning";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            testStripOf(page).text,
+            "Test call: 200 from S4_ODATA_TECH in 412 ms. Only the $metadata document was fetched as the technical user; "
+            + "no row was read. No entity set has List enabled: only $metadata was fetched.",
+            "a passed test with a warning is a warning, and says what was read"
+        );
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a failed test call shows the error strip with SAP's message", function (Given: Common, When: Common, Then: Common) {
+    const SAP = "HTTP 403 from the OData service: /IWFND/CM_BEC/026: No authorization <b>to read</b>";
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        backend.testResult = { ...backend.testResult, ok: false, code: "sap_error", status: 403, rows: 0, message: SAP };
+    });
+    iPressTestCall(When);
+    iSee(Then, "the failed test", function (page: UI5Element) {
+        return testStripOf(page).visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(testStripOf(page), {
+            visible: true, type: "Error", markup: false,
+            text: `Test call failed: 403 from S4_ODATA_TECH as the technical user. ${SAP}`
+        }, "status, destination, identity and what SAP said, as text");
+    });
+
+    // Nothing reached SAP: no status, no identity.
+    When.waitFor({
+        success: function () {
+            backend.testResult = {
+                ...backend.testResult, ok: false, code: "unreachable", status: null, identity: "unknown",
+                message: "The destination could not be reached."
+            };
+        }
+    });
+    iPressTestCall(When);
+    iSee(Then, "the test without an answer", function (page: UI5Element) {
+        return testStripOf(page).text.indexOf("without an answer") !== -1;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            testStripOf(page).text,
+            "Test call failed without an answer from S4_ODATA_TECH. The destination could not be reached."
+        );
+    });
+
+    // The route refuses the test: signed-in user required (424).
+    When.waitFor({
+        success: function () {
+            backend.failNext = { path: `odata/services/${JOBS}/test`, status: 424, body: { detail: "signed-in user required" } };
+        }
+    });
+    iPressTestCall(When);
+    iSee(Then, "the refused test", function (page: UI5Element) {
+        return testStripOf(page).text.indexOf("not made") !== -1;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(testStripOf(page), {
+            visible: true, type: "Error", markup: false,
+            text: "Test call not made: this service runs as the signed-in user, and no user sign-in reached the server "
+                + "with this request. Sign in again and retry."
+        });
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "said on the page, not in a dialog");
+        Opa5.assert.strictEqual(actionsOf(page).save, true, "the page is usable again");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Test call on unsaved changes asks to save first", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+    iEnter(When, "odataNotFor", "Contracts");
+    iPressTestCall(When);
+    iSee(Then, "the hint to save", function (page: UI5Element) {
+        return testStripOf(page).visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(testStripOf(page), {
+            visible: true, type: "Warning", markup: false,
+            text: "Save the service before testing it: a test call goes through the saved service, not through what is on this page."
+        });
+        Opa5.assert.strictEqual(backend.countRequests(TEST), 0, "no test call is made for a form that is not saved");
+    });
+    // Saved, the strip about the old state goes and the test runs.
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function (page: UI5Element) {
+        return stored(JOBS).not_for === "Contracts" && !testStripOf(page).visible;
+    }, function () { Opa5.assert.ok(true, "a save takes the strip away"); });
+    iPressTestCall(When);
+    iSee(Then, "the result", function (page: UI5Element) {
+        return testStripOf(page).type === "Success";
+    }, function () { Opa5.assert.strictEqual(backend.countRequests(TEST), 1, "now the test call is made"); });
+    Then.iStopTheApp();
+});
+
