@@ -10,12 +10,18 @@ question: can an OData service use this destination today.
 **What leaves this module is an allowlist.** A destination configuration is
 where the credential is: ``Password``, ``clientSecret``, a
 ``URL.headers.Authorization`` value, a certificate, and the ``URL`` itself
-(an internal host). ``_reduce`` reads exactly six properties of an entry
+(an internal host). ``_reduce`` reads exactly five properties of an entry
 (``Name``, ``Description``, ``Type``, ``ProxyType``, ``Authentication`` and
 nothing else) and builds a new object from them; the entry itself is never
 stored, returned, logged or put into an exception. Each of the strings is
-then cleaned on its own: one line, URLs masked, capped, and the three type
-fields only as a known value or a short identifier.
+then cleaned on its own: cut, one line, URLs masked, capped, and the three
+type fields only as a known value or a short identifier.
+
+``description`` is the admin's free text and is returned as such: one line,
+capped, with URLs masked -- and that is all. Nothing recognises a password
+or a key somebody typed into a description, so it is not a scrubbed field.
+It is in the answer because whoever may call this route may already name,
+and call through, any of these destinations.
 
 **Bounds.** One token request and one ``GET`` per level, no retry, no
 redirect followed, ``Accept-Encoding: identity`` (a compressed answer is not
@@ -25,10 +31,13 @@ the entries that arrived whole. Nothing is cached: an admin who just created
 a destination expects to see it, and the per-destination resolvers and their
 caches are not involved at all.
 
-**Errors.** Fixed texts and a stable code only (``ListError``); what the
-service said goes to the log at WARNING, scrubbed of the service token and
-the client secret, URLs masked. One level failing is a ``warnings`` entry
-next to the other level's list; see ``list_destinations`` for the contract.
+**Errors.** Fixed texts and a stable code only (``ListError``). The log
+line of a failure (WARNING) carries a reason code, the HTTP status and the
+class of the exception, never its text and never a body: an HTTP client's
+error texts quote bytes of the answer, which here are destination
+configurations or the service token. One level failing is a ``warnings``
+entry next to the other level's list; see ``list_destinations`` for the
+contract.
 
 Nothing here changes any state.
 """
@@ -52,7 +61,6 @@ from agents.destination import (
     DestinationServiceConfig,
     config_from_environment,
     fetch_service_token,
-    scrub,
 )
 from agents.odata.models import DESTINATION_NAME_RE
 
@@ -161,10 +169,17 @@ def _plain(text: object, limit: int) -> str:
     The rule of ``agents.odata.preview.plain``, kept here so that this module
     does not import the preview (and with it the metadata parser) for five
     lines.
+
+    The text is cut BEFORE it is cleaned. The URL mask backtracks over a long
+    run of scheme characters that never reaches ``://`` (quadratic), and it
+    runs in the event loop where no timeout can stop it, so it must never
+    see a property of megabytes. Four times the limit leaves room for what
+    cleaning removes; a URL that the cut falls into is still masked.
     """
     if not isinstance(text, str):
         return ""
-    line = " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
+    head = text[: limit * 4]
+    line = " ".join("".join(ch if ch.isprintable() else " " for ch in head).split())
     return _URL.sub("<url>", line)[:limit]
 
 
@@ -191,7 +206,7 @@ def _reduce(entry: object, level: str) -> tuple[str, dict[str, Any]] | None:
     """One listed entry as ``(stored name, what may be shown)``, or ``None``
     for an entry without a plain name.
 
-    THE place a destination configuration is read. Six properties are looked
+    THE place a destination configuration is read. Five properties are looked
     at; everything else in ``entry`` -- the URL, users, passwords, client
     secrets, token service settings, static headers and queries,
     certificates -- is never touched, and ``entry`` is not kept.
@@ -254,12 +269,18 @@ def _elements(text: str, cut: bool) -> Iterator[Any]:
         at += 1
     else:
         while True:
+            broken = False
             try:
                 element, at = decoder.raw_decode(text, at)
             except (ValueError, RecursionError):
+                broken = True
+            if broken:
                 if cut:
                     return
-                raise _LevelFailed("not_json") from None
+                # Raised outside the `except`: a JSONDecodeError holds the
+                # whole listing (`.doc`), and `from None` would only hide it,
+                # not let go of it (`__context__`).
+                raise _LevelFailed("not_json")
             yield element
             del element
             at = skip(at)
@@ -279,10 +300,14 @@ def _elements(text: str, cut: bool) -> Iterator[Any]:
 
 def _reduce_listing(raw: bytes, cut: bool, level: str) -> _Level:
     """The answer of one level, reduced. Raw configurations do not leave here."""
+    text: str | None = None
     try:
         text = raw.decode("utf-8-sig", errors="ignore" if cut else "strict")
     except UnicodeDecodeError:
-        raise _LevelFailed("not_json") from None
+        pass
+    if text is None:
+        # Outside the `except`: a UnicodeDecodeError holds the raw bytes.
+        raise _LevelFailed("not_json")
     result = _Level(level, truncated=cut)
     for element in _elements(text, cut):
         reduced = _reduce(element, level)
@@ -353,14 +378,19 @@ async def _list_level(
             raw, cut = await _read(http, f"{config.api_url}{path}", token)
             return _reduce_listing(raw, cut, level)
     except _LevelFailed as exc:
-        failed = exc
+        # A new object: the raised one carries a traceback whose frames hold
+        # the raw listing, and it is kept in the result.
+        failed = _LevelFailed(exc.reason, exc.status)
     except TimeoutError:
         failed = _LevelFailed("timeout" if budget.expired() else "unreachable")
     except httpx.TimeoutException:
         failed = _LevelFailed("timeout")
     except httpx.HTTPError as exc:
+        # The class only. h11 quotes bytes of the answer in its texts
+        # ("illegal chunk header: ...", "Illegal header value ..."), and the
+        # answer is the destination configurations.
         failed = _LevelFailed("unreachable")
-        detail = f"{type(exc).__name__}: {exc}"
+        detail = type(exc).__name__
     except Exception as exc:  # a defect; its text may quote a configuration
         failed = _LevelFailed("failed")
         detail = type(exc).__name__
@@ -369,9 +399,39 @@ async def _list_level(
         level,
         failed.reason,
         failed.status if failed.status is not None else "-",
-        _plain(scrub(detail, token, config.client_secret), _MAX_LOG_CHARS),
+        detail,
     )
     return _Level(level, failed=failed)
+
+
+# The two texts of ``agents.destination``'s token request that carry more
+# than a fixed sentence: the class of the httpx error followed by its text,
+# and the status followed by the body. Only the class and the status are for
+# the log.
+_TOKEN_UNREACHABLE_RE = re.compile(
+    r"could not reach the destination service token endpoint: ([A-Za-z_][A-Za-z0-9_]{0,63}):"
+)
+_TOKEN_STATUS_RE = re.compile(r"destination service token request returned ([0-9]{3}):")
+
+
+def _token_failure_code(text: str) -> str:
+    """What the log may say about a failed token request.
+
+    Recognised positively, anything else is ``failed``: the text of a
+    ``DestinationError`` can end in the token endpoint's body or in an httpx
+    error text that quotes the answer -- and that answer is the service token.
+    """
+    found = _TOKEN_UNREACHABLE_RE.match(text)
+    if found:
+        return f"unreachable {found.group(1)}"
+    found = _TOKEN_STATUS_RE.match(text)
+    if found:
+        return f"status {found.group(1)}"
+    if text.endswith("is not JSON"):
+        return "not_json"
+    if text.endswith("carried no access_token"):
+        return "no_access_token"
+    return "failed"
 
 
 def _level_text(level: str) -> str:
@@ -435,10 +495,10 @@ async def list_destinations() -> dict[str, Any]:
             async with asyncio.timeout_at(deadline) as scope:
                 token = await fetch_service_token(config, http)
         except DestinationError as exc:
-            token_failure = str(exc)
+            token_failure = _token_failure_code(str(exc)[:_MAX_LOG_CHARS])
         except TimeoutError:
             timed_out = scope.expired()
-            token_failure = "TimeoutError"
+            token_failure = "timeout"
         if token_failure is None:
             results = list(
                 await asyncio.gather(
@@ -457,10 +517,7 @@ async def list_destinations() -> dict[str, Any]:
             )
     if token_failure is not None:
         # Raised outside the except blocks: no chained, unscrubbed error.
-        logger.warning(
-            "odata destinations: no service token (%s)",
-            _plain(scrub(token_failure, config.client_secret), _MAX_LOG_CHARS),
-        )
+        logger.warning("odata destinations: no service token (%s)", token_failure)
         if timed_out:
             raise ListError(504, "timeout", TIMEOUT_TEXT)
         raise ListError(502, "token_failed", TOKEN_FAILED_TEXT)

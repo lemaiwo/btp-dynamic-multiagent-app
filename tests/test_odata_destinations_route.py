@@ -700,3 +700,254 @@ def test_the_module_keeps_no_cache_and_no_raw_configuration():
         if name.startswith("__"):
             continue
         assert not isinstance(value, (dict, list, set)), name
+
+
+# ------------------------------------------------------- review round 1 (DL1)
+
+
+def _child(code: str) -> str:
+    """Run ``code`` in a fresh interpreter and return its last output line.
+
+    A separate process with a timeout: a regular expression that goes
+    quadratic cannot be interrupted from inside, so a regression fails here
+    after 30 seconds instead of hanging the suite.
+    """
+    import subprocess
+
+    done = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, timeout=30
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    return done.stdout.strip().splitlines()[-1]
+
+
+@pytest.mark.parametrize("field", ["Name", "Description"])
+def test_a_huge_property_of_scheme_characters_is_reduced_fast(field):
+    """2 MB of characters a URL scheme may consist of, and no ``://``: the
+    URL mask must see a cut text, never the whole property."""
+    elapsed = _child(
+        "import time\n"
+        "from agents.odata import destinations as d\n"
+        "big = 'a' * (2 * 1024 * 1024)\n"
+        "entry = {'Name': 'ok', 'Description': 'fine', 'Type': 'HTTP'}\n"
+        f"entry[{field!r}] = big\n"
+        "started = time.perf_counter()\n"
+        "stored, item = d._reduce(entry, 'instance')\n"
+        "elapsed = time.perf_counter() - started\n"
+        "assert len(item['name']) <= d.MAX_NAME_CHARS\n"
+        "assert len(item['description']) <= d.MAX_DESCRIPTION_CHARS\n"
+        f"assert set(item[{field.lower()!r}]) == {{'a'}}\n"
+        "print(elapsed)\n"
+    )
+    assert float(elapsed) < 1.0
+
+
+def test_plain_cuts_before_it_cleans_and_still_masks():
+    text = "one\ntwo " + S_URL + "?q=1 " + "t" * 5000
+    out = destinations._plain(text, 40)
+    assert out == ("one two <url> " + "t" * 40)[:40]
+    # A URL that starts inside the part that is looked at is masked whole,
+    # also when the cut falls in the middle of it.
+    out = destinations._plain("x" * 30 + " " + S_URL * 50, 300)
+    assert out == "x" * 30 + " <url>"
+    assert destinations._plain(None, 10) == "" and destinations._plain(7, 10) == ""
+
+
+async def test_a_protocol_error_text_is_never_logged(client, service, caplog):
+    """h11 quotes bytes of the answer in its error texts: a listing's raw
+    configuration (or the token) would reach the WARNING line."""
+    caplog.set_level(logging.DEBUG)
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            f"illegal chunk header: {S_PASSWORD} marker-zz91", request=request
+        )
+
+    service.instance = broken
+    service.subaccount = [dest("sub")]
+    r = await client.get(URL)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [(w["level"], w["reason"]) for w in body["warnings"]] == [("instance", "unreachable")]
+    assert "RemoteProtocolError" in own(caplog)
+    assert "illegal chunk header" not in caplog.text and "marker-zz91" not in caplog.text
+    assert "marker-zz91" not in r.text
+    clean(r, caplog)
+
+    service.subaccount = broken
+    r = await client.get(URL)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "list_failed"
+    assert "marker-zz91" not in caplog.text and "marker-zz91" not in r.text
+    clean(r, caplog)
+
+
+async def test_a_protocol_error_on_the_token_request_is_never_logged(client, service, caplog):
+    """The same for the token answer, whose bytes are the service token."""
+    caplog.set_level(logging.DEBUG)
+
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            f"Illegal header value b'{SERVICE_TOKEN} marker-qq17'", request=request
+        )
+
+    service.token = broken
+    r = await client.get(URL)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "token_failed"
+    assert "RemoteProtocolError" in own(caplog)
+    assert "marker-qq17" not in caplog.text and "Illegal header" not in caplog.text
+    clean(r, caplog)
+
+
+async def test_a_token_error_body_is_not_logged(client, service, caplog):
+    caplog.set_level(logging.DEBUG)
+    service.token = httpx.Response(401, text="unauthorized marker-kk05 body")
+    r = await client.get(URL)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "token_failed"
+    assert "401" in own(caplog) and "marker-kk05" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "token_url",
+    ["https://auth.example.test:notaport/oauth/token", "https://auth.exa mple.test\x00/x"],
+)
+async def test_a_malformed_token_url_is_a_token_failure(
+    client, service, monkeypatch, caplog, token_url
+):
+    caplog.set_level(logging.DEBUG)
+    config = DestinationServiceConfig(
+        client_id="cid", client_secret=CLIENT_SECRET, token_url=token_url, api_url=API
+    )
+    monkeypatch.setattr(destinations, "_config", lambda: config)
+    r = await client.get(URL)
+    assert r.status_code == 502, r.text
+    assert r.headers["x-odata-error"] == "token_failed"
+    assert r.json() == {"detail": destinations.TOKEN_FAILED_TEXT}
+    assert r.headers["cache-control"] == "no-store"
+    assert service.requests == []
+    assert "InvalidURL" in own(caplog)
+    assert "example.test" not in own(caplog) and "notaport" not in caplog.text
+    clean(r, caplog)
+
+
+async def test_every_error_answer_is_no_store(client, service, monkeypatch):
+    service.instance = httpx.Response(500)
+    service.subaccount = httpx.Response(500)
+    r = await client.get(URL)
+    assert (r.status_code, r.headers["x-odata-error"]) == (502, "list_failed")
+    assert r.headers["cache-control"] == "no-store"
+
+    service.token = httpx.Response(500)
+    r = await client.get(URL)
+    assert (r.status_code, r.headers["x-odata-error"]) == (502, "token_failed")
+    assert r.headers["cache-control"] == "no-store"
+
+    async def slow(request: httpx.Request) -> dict[str, Any]:
+        await asyncio.sleep(30)
+        return {}
+
+    monkeypatch.setattr(destinations, "LIST_BUDGET_SECONDS", 0.2)
+    service.token = slow
+    r = await client.get(URL)
+    assert (r.status_code, r.headers["x-odata-error"]) == (504, "timeout")
+    assert r.headers["cache-control"] == "no-store"
+
+    monkeypatch.setattr(destinations, "_config", lambda: None)
+    r = await client.get(URL)
+    assert (r.status_code, r.headers["x-odata-error"]) == (503, "no_destination_service")
+    assert r.headers["cache-control"] == "no-store"
+
+
+async def test_a_refused_query_parameter_is_no_store(client, service):
+    r = await client.get(URL + "?level=instance")
+    assert r.status_code == 422
+    assert r.headers["cache-control"] == "no-store"
+
+
+async def test_an_upstream_401_on_one_level_and_on_both(client, service, caplog):
+    caplog.set_level(logging.DEBUG)
+    service.instance = [dest("inst")]
+    service.subaccount = httpx.Response(
+        401, text=f"unauthorized {SERVICE_TOKEN}", headers={"www-authenticate": "Bearer"}
+    )
+    r = await client.get(URL)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [i["name"] for i in body["items"]] == ["inst"]
+    assert [(w["level"], w["reason"], w["status"]) for w in body["warnings"]] == [
+        ("subaccount", "http_error", 401)
+    ]
+    assert service.count("/oauth/token") == 1 and service.count(SUBACCOUNT) == 1  # no retry
+    clean(r, caplog)
+
+    service.instance = httpx.Response(401, text=f"unauthorized {SERVICE_TOKEN}")
+    r = await client.get(URL)
+    assert (r.status_code, r.headers["x-odata-error"]) == (502, "list_failed")
+    assert r.json() == {"detail": destinations.LIST_FAILED_TEXT}
+    assert r.headers["cache-control"] == "no-store"
+    assert service.count("/oauth/token") == 2 and service.count(INSTANCE) == 2
+    clean(r, caplog)
+
+
+async def test_the_time_the_token_took_is_taken_off_the_levels(client, service, monkeypatch):
+    """One budget for the whole call: a level that would fit into a fresh
+    budget, but not into what the token request left, times out."""
+    monkeypatch.setattr(destinations, "LIST_BUDGET_SECONDS", 1.0)
+
+    async def slow_token(request: httpx.Request) -> dict[str, Any]:
+        await asyncio.sleep(0.6)
+        return {"access_token": SERVICE_TOKEN}
+
+    async def slow_level(request: httpx.Request) -> list[Any]:
+        await asyncio.sleep(0.7)
+        return [dest("late")]
+
+    service.token = slow_token
+    service.instance = slow_level
+    service.subaccount = slow_level
+    started = asyncio.get_running_loop().time()
+    r = await client.get(URL)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert (r.status_code, r.headers["x-odata-error"]) == (504, "timeout")
+    assert elapsed < 1.25, elapsed
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [b'[{"Name": "a"}, {"Name": ]', b'[{"Name": "a"} x]', b"\xff\xfe[]", b"{}"],
+)
+def test_a_listing_that_is_not_json_keeps_no_parser_error(raw):
+    """A ``JSONDecodeError`` carries the whole listing as ``.doc`` and a
+    ``UnicodeDecodeError`` the raw bytes as ``.object``: neither may hang off
+    the failure that is kept."""
+    with pytest.raises(destinations._LevelFailed) as caught:
+        destinations._reduce_listing(raw, False, "instance")
+    assert caught.value.reason == "not_json"
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+
+
+async def test_a_failed_level_keeps_no_traceback_of_the_listing():
+    """What ``_Level.failed`` holds is a fresh object: no traceback (whose
+    frames hold the raw listing) and no chained error."""
+    config = DestinationServiceConfig(
+        client_id="cid", client_secret=CLIENT_SECRET, token_url=TOKEN_URL, api_url=API
+    )
+    listing = json.dumps([dest("a")]).encode() + b" trailing"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=httpx.ByteStream(listing))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        result = await destinations._list_level(
+            http, config, SERVICE_TOKEN, "instance", INSTANCE, asyncio.get_running_loop().time() + 5
+        )
+    failed = result.failed
+    assert failed is not None and failed.reason == "not_json"
+    assert failed.__traceback__ is None
+    assert failed.__context__ is None and failed.__cause__ is None
+
+
+def test_the_docstrings_do_not_overstate_the_description():
+    doc = destinations.__doc__ or ""
+    assert "secrets masked" not in Path(destinations.__file__).read_text().lower()
+    assert "free text" in doc
+    assert "five properties" in doc and "six" not in doc.lower()

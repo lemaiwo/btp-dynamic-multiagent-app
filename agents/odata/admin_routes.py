@@ -702,7 +702,9 @@ async def api_list_odata_destinations(request: Request, response: Response) -> d
     never echoed).
     """
     if request.query_params.keys():
-        raise _refuse("query: this route takes no parameters")
+        refused = _refuse("query: this route takes no parameters")
+        refused.headers = {"Cache-Control": "no-store"}
+        raise refused
     response.headers["Cache-Control"] = "no-store"
     try:
         return await destinations.list_destinations()

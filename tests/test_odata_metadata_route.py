@@ -1566,3 +1566,41 @@ async def test_an_unexpected_failure_of_the_parse_is_a_coded_error_and_is_logged
             break
         await asyncio.sleep(0.01)
     assert preview._active == 0
+
+
+def test_plain_cuts_a_huge_text_before_the_url_mask():
+    """2 MB of characters a URL scheme may consist of, and no ``://``: the
+    mask is quadratic on such a run, so it must only ever see a cut text.
+    In a child process with a timeout, because a regular expression that
+    runs away cannot be interrupted from inside."""
+    import subprocess
+
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import time\n"
+            "from agents.odata import preview\n"
+            "big = 'a' * (2 * 1024 * 1024)\n"
+            "started = time.perf_counter()\n"
+            "out = preview.plain(big, 300)\n"
+            "elapsed = time.perf_counter() - started\n"
+            "assert out == 'a' * 300\n"
+            "print(elapsed)\n",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert float(done.stdout.strip().splitlines()[-1]) < 1.0
+
+
+def test_plain_still_cleans_masks_and_caps():
+    text = "one\ntwo https://host-77.example.test/x?q=1 " + "t" * 5000
+    assert preview.plain(text, 40) == ("one two <url> " + "t" * 40)[:40]
+    assert preview.plain("x" * 30 + " " + "https://host-77.example.test/p" * 50, 300) == (
+        "x" * 30 + " <url>"
+    )
+    assert preview.plain(None, 10) == "" and preview.plain(b"x", 10) == ""

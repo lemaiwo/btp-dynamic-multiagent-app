@@ -772,8 +772,22 @@ async def fetch_service_token(
     so there is one place that knows the grant; nothing is cached and no
     resolver's cache is touched. Raises :class:`DestinationError` whose text
     has the client secret scrubbed.
+
+    A ``token_url`` httpx cannot parse raises ``httpx.InvalidURL``, which is
+    not an ``httpx.HTTPError`` and so passes the request's own handling; here
+    it becomes the same "could not reach" error, with the class and without
+    the text (which quotes parts of the URL).
     """
-    return await DestinationResolver("", config)._service_token(http)
+    invalid: str | None = None
+    try:
+        return await DestinationResolver("", config)._service_token(http)
+    except httpx.InvalidURL as exc:
+        invalid = type(exc).__name__
+    # Raised outside the `except`: no chained error with the URL in it.
+    raise DestinationError(
+        f"could not reach the destination service token endpoint: {invalid}: "
+        "the token URL is not a valid URL"
+    )
 
 
 def scrub(text: str, *secrets: str | None) -> str:

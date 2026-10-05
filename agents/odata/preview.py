@@ -233,10 +233,18 @@ def _transport() -> httpx.AsyncBaseTransport | None:
 
 
 def plain(text: object, limit: int) -> str:
-    """One line of printable text, URLs masked, at most ``limit`` characters."""
+    """One line of printable text, URLs masked, at most ``limit`` characters.
+
+    The text is cut BEFORE it is cleaned: the URL mask backtracks over a long
+    run of scheme characters that never reaches ``://`` (quadratic) and runs
+    in the event loop, where no timeout can stop it. Four times the limit
+    leaves room for what cleaning removes; a URL the cut falls into is still
+    masked.
+    """
     if not isinstance(text, str):
         return ""
-    line = " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
+    head = text[: limit * 4]
+    line = " ".join("".join(ch if ch.isprintable() else " " for ch in head).split())
     return _URL.sub("<url>", line)[:limit]
 
 
