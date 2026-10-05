@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.19.0
+version: 2.20.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -125,11 +125,16 @@ modules:
       IDE_TRACE_ARM_TIMEOUT_S: "60"
       # A landscape turns the IDE seed on in its .mtaext.
       IDE_SEED: "false"
+      # --- OData services (builtin:odata) ---
+      # Days an odata_audit_log row is kept; 0 keeps them forever.
+      ODATA_AUDIT_RETENTION_DAYS: "365"
     requires:
       - name: aicore-service
       - name: uaa-service
       - name: agent-registry-db
       - name: agent-destination
+      # The connectivity proxy for ProxyType OnPremise destinations (Cloud Connector).
+      - name: agent-connectivity
       # Listed after uaa-service on purpose: the Job Scheduling Service reads
       # the app's XSUAA binding to mint the token it calls the action endpoint
       # with, so binding it first leaves it with nothing to grant against.
@@ -296,4 +301,10 @@ resources:
     type: org.cloudfoundry.managed-service
     parameters:
       service: destination
+      service-plan: lite
+
+  - name: agent-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
       service-plan: lite
