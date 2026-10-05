@@ -34,6 +34,7 @@ from agents.db import (
     ODataAuditLog,
     ODataService,
     SessionLocal,
+    begin_exclusive_write,
     create_odata_service,
     delete_odata_service,
     get_odata_service,
@@ -56,6 +57,17 @@ _MAX_REPORTED_ERRORS = 20
 # worker buffer and parse a body of any size.
 MAX_BODY_BYTES = MAX_DEFINITION_BYTES + 64 * 1024
 _TOO_LARGE = "Request body too large"
+# Optimistic concurrency of the update route: the `updated_at` the client
+# loaded. Not a stored field, so never part of the payload gate.
+EXPECTED_FIELD = "expected_updated_at"
+_EXPECTED_NO_STRING = f"{EXPECTED_FIELD}: Input should be a valid string"
+_EXPECTED_RULE = f"{EXPECTED_FIELD}: expected the updated_at this service was loaded with"
+# What `to_dict()` / `to_summary()` emit: `datetime.isoformat()`, with or
+# without a fraction, with an offset on Postgres and without one on SQLite
+# (both UTC). `Z` is accepted for a client that normalised it.
+_EXPECTED_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})?", re.ASCII
+)
 # The audit route: how many rows one answer holds.
 AUDIT_DEFAULT_LIMIT = 100
 AUDIT_MAX_LIMIT = 500
@@ -152,6 +164,56 @@ def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:
         raise _refuse("; ".join(lines)) from None
 
 
+def _stale_write(name: str) -> str:
+    """The 409 text. The name is safe to repeat: it matched the service-name
+    pattern before any lookup (`_service_name`)."""
+    return f"Service '{name}' was changed since it was loaded; reload it and save again"
+
+
+def _expected_updated_at(value: Any) -> datetime | None:
+    """A given ``expected_updated_at`` as an aware UTC instant, or a 422.
+
+    ``None`` (the field missing, or JSON ``null``) means the client asks for
+    no check. Otherwise only a string in the format the API emits
+    ``updated_at`` in; the refusal names the field and the rule, never the
+    value.
+
+    A value without an offset is UTC, as the stored timestamps are (SQLite
+    hands them back naive, and the API emits them that way).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise _refuse(_EXPECTED_NO_STRING)
+    if not _EXPECTED_RE.fullmatch(value):
+        raise _refuse(_EXPECTED_RULE)
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(timezone.utc)
+    except (ValueError, OverflowError):  # month 13, offset +99:00, year 1 minus an offset
+        raise _refuse(_EXPECTED_RULE) from None
+
+
+def _is_stale(row: ODataService, expected: datetime | None) -> bool:
+    """Whether ``row`` moved on since the client loaded it.
+
+    Instants are compared, not texts: the same moment is written with an
+    offset by Postgres and without one by SQLite, and a client may hand back
+    either. ``expected`` None means the client did not ask for the check.
+    Only meaningful on a row read under the lock that the write then keeps.
+    """
+    if expected is None:
+        return False
+    stored = row.updated_at
+    if stored is None:
+        return True
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    return stored.astimezone(timezone.utc) != expected
+
+
 def _locked_service_query(name: str) -> Select[tuple[ODataService]]:
     """The service row, with an exclusive row lock where the database has one.
 
@@ -211,12 +273,60 @@ async def api_get_odata_service(name: str) -> dict[str, Any]:
 
 @router.put("/services/{name}", dependencies=[Depends(require_admin)])
 async def api_update_odata_service(name: str, request: Request) -> dict[str, Any]:
+    """Replace a service: its definition and its identity (``destination``,
+    ``user_context``: as whom agents reach SAP).
+
+    The body is the service payload plus an optional top-level
+    ``expected_updated_at``: the ``updated_at`` string exactly as the list
+    or detail answer the client is editing carried it. **A UI must send
+    it.** When it is there, the service is replaced only if it still has
+    that ``updated_at`` (compared as instants, so the string a client got
+    back always matches an unchanged row); otherwise the answer is 409
+    (`_stale_write`) and nothing changes -- a save from an older tab cannot
+    replace what a newer one stored, nor put an identity change on top of a
+    state the admin never saw. Without the field, or with ``null``, the
+    route replaces unconditionally, as it always did (API clients,
+    scripts). A value that is no string, or no such timestamp, is a 422
+    naming the field.
+
+    Order of the answers: payload refusals (422), then the field's own 422,
+    unknown service (404), another name in the body (422), stale (409).
+
+    The answer is the stored service with its NEW ``updated_at`` (always
+    later than the previous one, also for a save that changed no field), to
+    be sent as ``expected_updated_at`` of the next save.
+
+    Lock, compare, write, in one transaction, like the delete route below:
+    the row is read ``FOR UPDATE`` and the comparison is made on that read.
+    Race-free on Postgres under READ COMMITTED: of two saves that loaded the
+    same ``updated_at``, the second waits at the locked read until the first
+    commits, and is then handed the committed row (a locking read re-reads a
+    row it waited for; the ``name`` it selects by never changes), so it
+    compares against the first save's ``updated_at`` and answers 409. A
+    conditional ``UPDATE ... WHERE updated_at = :expected`` would need the
+    client's text to equal the stored value exactly, which it does not on
+    SQLite (the column default writes whole seconds as text). SQLite has no
+    row locks; there `begin_exclusive_write` makes the transaction a writer
+    before the read, to the same effect.
+
+    No deadlock, for the reason given at the delete route: this transaction
+    waits for this one row before it holds anything.
+    """
     name = _service_name(name)
-    data = _validated(await _json_object(request))
+    body = await _json_object(request)
+    given = body.pop(EXPECTED_FIELD, None)
+    data = _validated(body)
+    expected = _expected_updated_at(given)
     async with SessionLocal() as session:
-        row = await get_odata_service(session, name)
+        await begin_exclusive_write(session)
+        row = await _lock_odata_service(session, name)
         if row is None:
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
+        if data["name"] != row.name:
+            # Before the stale answer: a rename is wrong whatever was loaded.
+            raise _refuse("name cannot be changed; duplicate the service instead")
+        if _is_stale(row, expected):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_stale_write(name))
         try:
             row = await update_odata_service(session, row, data)
         except ValueError as e:  # a different name in the body
@@ -257,6 +367,9 @@ async def api_delete_odata_service(name: str) -> None:
     holds anything. Once it has the lock, the agent read takes no row lock
     and the delete is of the row it already holds, so nothing a save holds
     can make it wait while a save waits for it.
+
+    No ``expected_updated_at`` here: the stale-write check is the update
+    route's alone.
     """
     name = _service_name(name)
     async with SessionLocal() as session:

@@ -2490,6 +2490,54 @@ async def _begin_before_savepoint(session: AsyncSession) -> None:
         await connection.exec_driver_sql("BEGIN")
 
 
+async def begin_exclusive_write(session: AsyncSession) -> None:
+    """Make this transaction a writer from its first statement, on SQLite.
+
+    For a route that reads a row, decides on what it read and then writes
+    it (the catalogue update: compare ``updated_at``, then replace). On
+    Postgres the read itself takes the row lock (``FOR UPDATE``) and this
+    does nothing. SQLite has no row locks and takes its write lock only at
+    the first INSERT, UPDATE or DELETE, so two such requests would both read
+    the old row and both write. ``BEGIN IMMEDIATE`` takes the write lock up
+    front: the second request waits here (the driver's busy timeout) and
+    then reads what the first one committed.
+
+    Call it before the first statement of the session; in a transaction
+    that is already open at the driver it does nothing.
+    """
+    if session.get_bind().dialect.name != "sqlite":
+        return
+    connection = await session.connection()
+    raw = await connection.get_raw_connection()
+    if not raw.driver_connection.in_transaction:
+        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def _odata_now() -> datetime:
+    """The clock `update_odata_service` stamps with; a function so a test
+    can stop it."""
+    return datetime.now(timezone.utc)
+
+
+def _next_odata_stamp(previous: datetime | None) -> datetime:
+    """The ``updated_at`` of an update: now, and always later than ``previous``.
+
+    ``updated_at`` is the version a client hands back as
+    ``expected_updated_at``, so two updates must never leave the same value.
+    The column default cannot promise that: SQLite's ``CURRENT_TIMESTAMP``
+    counts in seconds, and Postgres' ``now()`` is the start of the
+    transaction, which for a writer that waited for the row lock lies
+    *before* the value the winner stored. So the stamp is set here, from the
+    row read under the lock: the clock when it is ahead, otherwise the
+    stored value plus one microsecond (the resolution of both column types).
+    """
+    now = _odata_now()
+    stored = _odata_utc(previous)
+    if stored is None or now > stored:
+        return now
+    return stored + timedelta(microseconds=1)
+
+
 async def create_odata_service(
     session: AsyncSession,
     data: dict[str, Any],
@@ -2539,11 +2587,18 @@ async def update_odata_service(
 
     The name is refused rather than ignored: agents attach a service by
     name, so a silent rename would detach every one of them.
+
+    ``updated_at`` moves forward on every call, also when no field changed
+    (`_next_odata_stamp`): it is the version the admin API compares against
+    ``expected_updated_at``. That is only race-free when ``row`` was read
+    under a lock the caller still holds (the update route, the bundle
+    import); the function itself takes none.
     """
     if data["name"] != row.name:
         raise ValueError("name cannot be changed; duplicate the service instead")
     for column, value in (columns or odata_service_columns(data)).items():
         setattr(row, column, value)
+    row.updated_at = _next_odata_stamp(row.updated_at)
     if commit:
         await session.commit()
     else:
