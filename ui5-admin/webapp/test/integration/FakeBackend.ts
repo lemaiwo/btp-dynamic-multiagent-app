@@ -512,6 +512,14 @@ export default class FakeBackend {
         return length > max ? `String should have at most ${max} characters` : "";
     }
 
+    /** `_one_line` in agents/odata/models.py: no control character
+     * (category Cc) and no line or paragraph separator (Zl, Zp). */
+    private static odataOneLine(field: string, value: string): string {
+        const control = (ch: string) => ch.charCodeAt(0) < 0x20 || (ch.charCodeAt(0) >= 0x7f && ch.charCodeAt(0) <= 0x9f);
+        return value.split("").some((ch) => control(ch) || ch === "\u2028" || ch === "\u2029")
+            ? `Value error, ${field} must be one line of text without control characters` : "";
+    }
+
     /** One `<key>: <problem>` per string field that is missing (when
      * required), not a string, or refused by `check`. */
     private static odataText(
@@ -547,6 +555,15 @@ export default class FakeBackend {
         if (duplicate !== undefined) {
             return `duplicate field '${duplicate}' in ${who}`;
         }
+        const first = (list: string[]) => list.filter((name, i) => list.indexOf(name) !== i)[0];
+        const navigation = first((entitySet.navigations ?? []).map((n) => n.name));
+        if (navigation !== undefined) {
+            return `duplicate navigation '${navigation}' in ${who}`;
+        }
+        const key = first(keys.map((k) => k.name));
+        if (key !== undefined) {
+            return `duplicate key '${key}' in ${who}`;
+        }
         const strayKey = keys.filter((key) => names.indexOf(key.name) === -1)[0];
         if (strayKey) {
             return `key '${strayKey.name}' of ${who} is not one of its fields`;
@@ -575,27 +592,50 @@ export default class FakeBackend {
      */
     private static odataDefinitionProblems(definition: unknown): string[] {
         if (definition === undefined) {
-            return [];
+            // No default: a payload without the key is refused, so that an
+            // update can never replace the stored definition by an empty one.
+            return ["definition: Field required"];
         }
         if (definition === null || typeof definition !== "object" || Array.isArray(definition)) {
             return ["definition: Input should be a valid dictionary or instance of ServiceDefinition"];
         }
         const problems: string[] = [];
+        // StrictBool everywhere: "true", "false", 1 and 0 are refused.
+        const flags = (loc: string, source: unknown, keys: string[]) => {
+            const data = (source ?? {}) as Record<string, unknown>;
+            keys.forEach((key) => {
+                if (data[key] !== undefined && typeof data[key] !== "boolean") {
+                    problems.push(`${loc}.${key}: Input should be a valid boolean`);
+                }
+            });
+        };
         const entitySets = (definition as Partial<ODataDefinition>).entity_sets ?? [];
         entitySets.forEach((entitySet, i) => {
             const before = problems.length;
             (entitySet.fields ?? []).forEach((field, j) => {
-                if (field.filterable && !field.selectable) {
+                const loc = `definition.entity_sets.${i}.fields.${j}`;
+                const own = problems.length;
+                flags(loc, field, ["selectable", "filterable", "writable", "personal_data"]);
+                if (problems.length === own && field.filterable && !field.selectable) {
                     problems.push(
-                        `definition.entity_sets.${i}.fields.${j}: Value error, field '${field.name}' is `
+                        `${loc}: Value error, field '${field.name}' is `
                         + "filterable but not selectable; a filterable field must also be selectable"
                     );
                 }
+            });
+            (entitySet.navigations ?? []).forEach((navigation, k) => {
+                flags(`definition.entity_sets.${i}.navigations.${k}`, navigation, ["collection"]);
             });
             const problem = problems.length === before ? FakeBackend.odataEntitySetProblem(entitySet) : "";
             if (problem) {
                 problems.push(`definition.entity_sets.${i}: Value error, ${problem}`);
             }
+        });
+        ((definition as Partial<ODataDefinition>).operations ?? []).forEach((operation, m) => {
+            (operation.parameters ?? []).forEach((parameter, p) => {
+                flags(`definition.operations.${m}.parameters.${p}`, parameter, ["required"]);
+            });
+            flags(`definition.operations.${m}`, operation, ["enabled", "changes_data"]);
         });
         if (!problems.length) {
             const names = entitySets.map((e) => e.name);
@@ -626,10 +666,16 @@ export default class FakeBackend {
         FakeBackend.odataText(data, "name", true, (v) => (
             FakeBackend.ODATA_NAME_RE.test(v) ? "" : FakeBackend.ODATA_NAME_MSG
         ), problems);
-        FakeBackend.odataText(data, "title", true, (v) => FakeBackend.odataLength(v, 120), problems);
-        FakeBackend.odataText(data, "purpose", true, (v) => FakeBackend.odataLength(v, 200), problems);
+        // Stripped, measured, and only then held to one line: what
+        // surrounds a title or purpose is gone before `_one_line` runs.
+        FakeBackend.odataText(data, "title", true, (v) => (
+            FakeBackend.odataLength(v, 120) || FakeBackend.odataOneLine("title", v.trim())
+        ), problems);
+        FakeBackend.odataText(data, "purpose", true, (v) => (
+            FakeBackend.odataLength(v, 200) || FakeBackend.odataOneLine("purpose", v.trim())
+        ), problems);
         FakeBackend.odataText(data, "not_for", false, (v) => (
-            v.length > 200 ? "String should have at most 200 characters" : ""
+            v.length > 200 ? "String should have at most 200 characters" : FakeBackend.odataOneLine("not_for", v)
         ), problems);
         FakeBackend.odataText(data, "destination", true, (v) => (
             FakeBackend.ODATA_DESTINATION_RE.test(v) ? "" : FakeBackend.ODATA_DESTINATION_MSG
@@ -690,9 +736,10 @@ export default class FakeBackend {
             destination: String(input.destination), user_context: input.user_context === true,
             odata_version: input.odata_version === "v4" ? "v4" : "v2",
             service_path: String(input.service_path), enabled: input.enabled !== false,
-            // Like the model's default: a payload without a definition
-            // stores the EMPTY one. A PUT is a full replacement, so a form
-            // must always send the definition it holds.
+            // Always there: `validateODataPayload` refuses a payload
+            // without a definition. A PUT is a full replacement, so a form
+            // sends the definition it loaded even when only a General field
+            // changed.
             definition: {
                 entity_sets: input.definition?.entity_sets ?? [],
                 operations: input.definition?.operations ?? []

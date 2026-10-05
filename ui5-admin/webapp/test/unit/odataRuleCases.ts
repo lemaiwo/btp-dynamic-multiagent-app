@@ -9,8 +9,11 @@ import type { ODataServiceInput } from "com/agent/admin/service/types";
  */
 export interface RuleCase {
     rule: string;
-    field: "name" | "title" | "purpose" | "not_for" | "destination" | "service_path";
-    value: string;
+    field: "name" | "title" | "purpose" | "not_for" | "destination" | "service_path"
+        | "user_context" | "enabled" | "definition";
+    /** What the field is set to. `undefined` leaves the key out of the JSON
+     *  body, which is how a missing field reaches the server. */
+    value: unknown;
     clientKey: string;
     server: string;
 }
@@ -51,7 +54,7 @@ export const PATH_CASES: RuleCase[] = [
     path("a space inside", "/sap/ opu", WHITESPACE),
     path("a leading space (not trimmed)", " /sap/opu", WHITESPACE),
     path("a trailing space (not trimmed)", "/sap/opu ", WHITESPACE),
-    path("a no-break space", "/sap/ opu", WHITESPACE),
+    path("a no-break space", "/sap/\u00a0opu", WHITESPACE),
     path("a backslash", "/sap\\opu", "service_path must not contain a backslash"),
     path("a URL", "https://s4.internal:44300/sap", NOT_A_URL),
     path("a URL further down", "/sap/http://s4.internal", NOT_A_URL),
@@ -113,8 +116,62 @@ export const GENERAL_CASES: RuleCase[] = [
     }
 ];
 
-export const RULE_CASES: RuleCase[] = GENERAL_CASES.concat(PATH_CASES);
+function oneLine(field: "title" | "purpose" | "not_for", what: string, value: string, clientKey: string): RuleCase {
+    return {
+        rule: `${field}: ${what}`, field, value, clientKey,
+        server: `${field}: Value error, ${field} must be one line of text without control characters`
+    };
+}
+
+/**
+ * `_one_line` in agents/odata/models.py: title, purpose and not_for are one
+ * line each -- no control character (Unicode category Cc: tab, CR, LF, the
+ * C1 range) and no line or paragraph separator (Zl, Zp). Title and purpose
+ * are stripped first, so only a character INSIDE the text is refused there.
+ */
+export const ONE_LINE_CASES: RuleCase[] = [
+    oneLine("title", "a tab", "Purchase\trequisitions", "odataErrTitleOneLine"),
+    oneLine("title", "a C1 control character", "Purchase\u0085requisitions", "odataErrTitleOneLine"),
+    oneLine("purpose", "a line feed inside", "Read requisitions\nand their items", "odataErrPurposeOneLine"),
+    oneLine("purpose", "a carriage return inside", "Read requisitions\r\nand their items", "odataErrPurposeOneLine"),
+    oneLine("purpose", "a line separator", "Read requisitions\u2028and their items", "odataErrPurposeOneLine"),
+    oneLine("not_for", "a paragraph separator", "Purchase orders\u2029Contracts", "odataErrNotForOneLine"),
+    oneLine("not_for", "a trailing line feed (not stripped)", "Purchase orders\n", "odataErrNotForOneLine"),
+    oneLine("not_for", "a NUL", "Purchase\u0000orders", "odataErrNotForOneLine")
+];
+
+/** Texts the one-line rule accepts: a no-break space is no control
+ *  character, and what surrounds a title or purpose is stripped. */
+export const ONE_LINE_ACCEPTED: Partial<ODataServiceInput>[] = [
+    { title: "Purchase\u00a0requisitions" },
+    { purpose: "  Read requisitions \n" },
+    { title: "\tPurchase requisitions\r\n" }
+];
+
+function strictBoolean(field: "user_context" | "enabled", value: unknown): RuleCase {
+    return {
+        rule: `${field}: ${JSON.stringify(value)} is not a boolean`, field, value,
+        clientKey: "odataErrBoolean", server: `${field}: Input should be a valid boolean`
+    };
+}
+
+/** `StrictBool`: only a JSON boolean, never something that coerces to one. */
+export const BOOLEAN_CASES: RuleCase[] = [
+    strictBoolean("user_context", "true"), strictBoolean("user_context", "false"),
+    strictBoolean("user_context", 1), strictBoolean("user_context", 0),
+    strictBoolean("enabled", "true"), strictBoolean("enabled", "false"),
+    strictBoolean("enabled", 1), strictBoolean("enabled", 0)
+];
+
+/** `definition` has no default: left out, the payload is refused instead of
+ *  replacing the stored definition by an empty one. */
+export const DEFINITION_CASES: RuleCase[] = [{
+    rule: "definition: missing", field: "definition", value: undefined,
+    clientKey: "odataErrDefinitionRequired", server: "definition: Field required"
+}];
+
+export const RULE_CASES: RuleCase[] = GENERAL_CASES.concat(PATH_CASES, ONE_LINE_CASES, BOOLEAN_CASES, DEFINITION_CASES);
 
 export function withField(testCase: RuleCase): ODataServiceInput {
-    return { ...VALID_INPUT, [testCase.field]: testCase.value };
+    return { ...VALID_INPUT, [testCase.field]: testCase.value } as ODataServiceInput;
 }

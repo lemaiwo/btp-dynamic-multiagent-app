@@ -1,7 +1,7 @@
 import AdminService, { AdminError } from "com/agent/admin/service/AdminService";
 import type { ODataServiceInput } from "com/agent/admin/service/types";
 import FakeBackend from "com/agent/admin/test/integration/FakeBackend";
-import { RULE_CASES, VALID_INPUT, withField } from "./odataRuleCases";
+import { ONE_LINE_ACCEPTED, RULE_CASES, VALID_INPUT, withField } from "./odataRuleCases";
 
 QUnit.module("AdminService", {
     beforeEach: function (this: { originalFetch: typeof fetch }) {
@@ -671,20 +671,99 @@ QUnit.test("a stored service has its title and purpose stripped", async function
 QUnit.test("an update is a full replacement and moves updated_at", async function (assert) {
     const service = new AdminService();
     const stored = await service.getODataService("purchase-requisitions");
+
+    const updated = await service.updateODataService("purchase-requisitions", VALID_INPUT);
+    assert.notStrictEqual(updated.updated_at, stored.updated_at, "updated_at moved");
+    assert.strictEqual(updated.created_at, stored.created_at, "created_at did not");
+    assert.deepEqual(updated.definition, { entity_sets: [], operations: [] }, "the definition sent is the one stored");
+    assert.deepEqual(updated.counts, { entity_sets: 0, operations: 0 });
+    assert.strictEqual(updated.used_by.length, 1, "who uses it is not the payload's to say");
+});
+
+QUnit.test("a payload without a definition is refused and the stored one stays", async function (assert) {
+    const service = new AdminService();
+    const stored = await service.getODataService("purchase-requisitions");
     const { definition, ...withoutDefinition } = VALID_INPUT;
     void definition;
 
-    const updated = await service.updateODataService(
+    const put = await refusal(() => service.updateODataService(
         "purchase-requisitions", withoutDefinition as ODataServiceInput
-    );
-    assert.notStrictEqual(updated.updated_at, stored.updated_at, "updated_at moved");
-    assert.strictEqual(updated.created_at, stored.created_at, "created_at did not");
+    ));
+    assert.strictEqual(put.status, 422);
+    assert.strictEqual(put.detail, "definition: Field required");
     assert.deepEqual(
-        updated.definition, { entity_sets: [], operations: [] },
-        "like the server: a payload without a definition stores the empty one, it does not keep the old"
+        await service.getODataService("purchase-requisitions"), stored,
+        "the stored definition was not replaced by an empty one"
     );
-    assert.deepEqual(updated.counts, { entity_sets: 0, operations: 0 });
-    assert.strictEqual(updated.used_by.length, 1, "who uses it is not the payload's to say");
+    const post = await refusal(() => service.createODataService(
+        { ...withoutDefinition, name: "suppliers" } as ODataServiceInput
+    ));
+    assert.strictEqual(post.detail, "definition: Field required");
+});
+
+QUnit.test("the one-line rule accepts a no-break space and strips title and purpose first", async function (assert) {
+    const service = new AdminService();
+
+    for (let i = 0; i < ONE_LINE_ACCEPTED.length; i++) {
+        const created = await service.createODataService({ ...VALID_INPUT, ...ONE_LINE_ACCEPTED[i], name: `ok-${i}` });
+        assert.strictEqual(created.name, `ok-${i}`, JSON.stringify(ONE_LINE_ACCEPTED[i]));
+    }
+});
+
+QUnit.test("every boolean inside a definition is strict", async function (assert) {
+    const service = new AdminService();
+
+    const field = await refusal(() => service.createODataService(definitionWith({
+        fields: [{ ...HIDDEN, name: "Id", selectable: "true" }]
+    })));
+    assert.strictEqual(field.status, 422);
+    assert.strictEqual(
+        field.detail, "definition.entity_sets.0.fields.0.selectable: Input should be a valid boolean",
+        "a refused field keeps the entity set's own rules from being checked"
+    );
+
+    const input = definitionWith({
+        navigations: [{ name: "to_Item", target: "A_Item", collection: 1, description: "" }]
+    });
+    (input.definition.operations as unknown[]).push({
+        name: "Release", qualified_name: "", title: "", kind: "function_import", http_method: "POST",
+        bound_to: null, parameters: [{ name: "Code", type: "Edm.String", required: "true" }],
+        description: "", enabled: "false", changes_data: 0
+    });
+    const many = await refusal(() => service.createODataService(input));
+    assert.strictEqual(
+        many.detail,
+        "definition.entity_sets.0.navigations.0.collection: Input should be a valid boolean; "
+        + "definition.operations.0.parameters.0.required: Input should be a valid boolean; "
+        + "definition.operations.0.enabled: Input should be a valid boolean; "
+        + "definition.operations.0.changes_data: Input should be a valid boolean"
+    );
+});
+
+QUnit.test("key and navigation names are unique within an entity set", async function (assert) {
+    const service = new AdminService();
+    const key = { name: "Id", type: "Edm.String" };
+    const navigation = { name: "to_Item", target: "A_Item", collection: true, description: "" };
+
+    const keys = await refusal(() => service.createODataService(definitionWith({ keys: [key, key] })));
+    assert.strictEqual(keys.status, 422);
+    assert.strictEqual(
+        keys.detail, "definition.entity_sets.0: Value error, duplicate key 'Id' in entity set 'A_Item'"
+    );
+    const navigations = await refusal(() => service.createODataService(
+        definitionWith({ navigations: [navigation, { ...navigation, collection: false }] })
+    ));
+    assert.strictEqual(
+        navigations.detail,
+        "definition.entity_sets.0: Value error, duplicate navigation 'to_Item' in entity set 'A_Item'"
+    );
+    const both = await refusal(() => service.createODataService(
+        definitionWith({ keys: [key, key], navigations: [navigation, navigation] })
+    ));
+    assert.strictEqual(
+        both.detail, "definition.entity_sets.0: Value error, duplicate navigation 'to_Item' in entity set 'A_Item'",
+        "in the server's order: fields, navigations, keys"
+    );
 });
 
 QUnit.test("a name that cannot be a service name is the same 404 as an unknown one", async function (assert) {

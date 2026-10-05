@@ -2,7 +2,6 @@ import opaTest from "sap/ui/test/opaQunit";
 import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
-import PropertyStrictEquals from "sap/ui/test/matchers/PropertyStrictEquals";
 import HashChanger from "sap/ui/core/routing/HashChanger";
 import type Table from "sap/m/Table";
 import type MessageStrip from "sap/m/MessageStrip";
@@ -11,6 +10,7 @@ import type NavigationList from "sap/tnt/NavigationList";
 import type UI5Element from "sap/ui/core/Element";
 import type { ODataServiceInput } from "../../service/types";
 import Common, { backend } from "./pages/Common";
+import { iPressInDialog, iSeeADialog } from "./pages/Dialogs";
 import {
     TABLE, VIEW, buttonsOf, controllerOf, deleteButtonOf, itemOf, itemsOf, messageOf, namesIn, rowTexts,
     serviceOf, type RowTexts
@@ -48,30 +48,6 @@ function iPressDeleteOf(When: Common, name: string): void {
         matchers: function (table: UI5Element) { return deleteButtonOf(itemOf(table, name)); },
         actions: new Press(),
         errorMessage: `No delete button in the row of ${name}`
-    });
-}
-
-/** Presses the button `text` of the open dialog. */
-function iPressInDialog(When: Common, text: string): void {
-    When.waitFor({
-        controlType: "sap.m.Button",
-        searchOpenDialogs: true,
-        matchers: new PropertyStrictEquals({ name: "text", value: text }),
-        actions: new Press(),
-        errorMessage: `No button "${text}" in an open dialog`
-    });
-}
-
-/** Waits for the one open dialog and hands it to `assert`. */
-function iSeeADialog(Then: Common, assert: (dialog: UI5Element) => void, what: string): void {
-    Then.waitFor({
-        controlType: "sap.m.Dialog",
-        searchOpenDialogs: true,
-        success: function (dialogs: UI5Element[]) {
-            Opa5.assert.strictEqual(dialogs.length, 1, `one dialog is open: ${what}`);
-            assert(dialogs[0]);
-        },
-        errorMessage: `No dialog appeared: ${what}`
     });
 }
 
@@ -484,12 +460,20 @@ opaTest("Import configuration with a name that is taken shows the server's answe
         id: TABLE,
         viewName: VIEW,
         success: function (table: UI5Element) {
-            void controllerOf(table).importFile(fileOf(JSON.stringify({ ...EXPORTED, enabled: "yes" })));
+            // The rules inside a definition are the server's alone.
+            const entitySet = {
+                name: "A_Item", title: "", path: "", entity_type: "", description: "", keys: [],
+                operations: [], fields: [], navigations: [], examples: []
+            };
+            void controllerOf(table).importFile(fileOf(JSON.stringify({
+                ...EXPORTED, definition: { entity_sets: [entitySet, entitySet], operations: [] }
+            })));
         }
     });
     iSeeADialog(Then, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(
-            messageOf(dialog), "enabled: Input should be a valid boolean", "the server's refusal is shown as it came"
+            messageOf(dialog), "definition: Value error, duplicate entity set 'A_Item'",
+            "the server's refusal is shown as it came"
         );
     }, "the server's 422");
     iPressInDialog(When, "Close");

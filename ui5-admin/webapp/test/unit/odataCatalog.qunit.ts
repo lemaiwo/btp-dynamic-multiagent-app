@@ -2,7 +2,7 @@ import odataCatalog from "com/agent/admin/model/odataCatalog";
 import type {
     ODataDefinition, ODataEntitySet, ODataField, ODataServiceInput
 } from "com/agent/admin/service/types";
-import { PATH_CASES, RULE_CASES, VALID_PATHS, withField } from "./odataRuleCases";
+import { ONE_LINE_ACCEPTED, PATH_CASES, RULE_CASES, VALID_PATHS, withField } from "./odataRuleCases";
 
 QUnit.module("odataCatalog");
 
@@ -156,6 +156,70 @@ QUnit.test("validate names one key per refused field, for every rule of the shar
         assert.deepEqual(
             odataCatalog.validate(withField(testCase)), { [testCase.field]: testCase.clientKey }, testCase.rule
         );
+    });
+});
+
+QUnit.test("validate accepts a no-break space and whatever surrounds a title or purpose", function (assert) {
+    ONE_LINE_ACCEPTED.forEach((over) => {
+        assert.deepEqual(odataCatalog.validate(input(over)), {}, JSON.stringify(over));
+    });
+});
+
+QUnit.test("purposeLength counts what the server counts: the stripped text", function (assert) {
+    assert.strictEqual(odataCatalog.purposeLength("Nightly checks and release of requisitions"), 42);
+    assert.strictEqual(odataCatalog.purposeLength("  padded \n"), 6);
+    assert.strictEqual(odataCatalog.purposeLength(""), 0);
+    assert.strictEqual(odataCatalog.purposeLength(undefined), 0);
+});
+
+QUnit.test("payloadOf keeps the payload fields of a stored service and nothing else", function (assert) {
+    const stored = {
+        ...input({ definition: WRITING, metadata_fetched_at: "2026-10-05T07:30:00+00:00" }),
+        id: 7, created_at: "2026-10-01T00:00:00+00:00", updated_at: null,
+        counts: { entity_sets: 2, operations: 1 }, has_write: true, used_by: []
+    };
+
+    const payload = odataCatalog.payloadOf(stored);
+    assert.deepEqual(payload, input({ definition: WRITING, metadata_fetched_at: "2026-10-05T07:30:00+00:00" }));
+    assert.notStrictEqual(payload.definition, stored.definition, "the definition is a copy");
+    assert.notStrictEqual(
+        payload.definition.entity_sets[0], stored.definition.entity_sets[0], "all the way down"
+    );
+});
+
+QUnit.test("identityChange names what changes who the agents act as", function (assert) {
+    const stored = input({ user_context: true, destination: "S4_ODATA_USER" });
+
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ title: "Other", purpose: "Other", enabled: false })),
+        { runsAs: null, destination: null }, "other fields change nobody's identity"
+    );
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ user_context: false })),
+        { runsAs: "technical", destination: null }
+    );
+    assert.deepEqual(
+        odataCatalog.identityChange(input({ user_context: false }), input({ user_context: true })),
+        { runsAs: "user", destination: null }
+    );
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ destination: "S4_ODATA_TECH" })),
+        { runsAs: null, destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" } }
+    );
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ user_context: false, destination: "S4_ODATA_TECH" })),
+        { runsAs: "technical", destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" } }
+    );
+});
+
+QUnit.test("validateDuplicate checks the copy's name and destination like a service's", function (assert) {
+    assert.deepEqual(odataCatalog.validateDuplicate({ name: "copy", destination: "S4_ODATA_TECH" }), {});
+    assert.deepEqual(odataCatalog.validateDuplicate({ name: "copy" }), {}, "the destination may be left to the source");
+    assert.deepEqual(odataCatalog.validateDuplicate({ name: "", destination: "" }), {
+        name: "odataErrNameRequired", destination: "odataErrDestinationRequired"
+    });
+    assert.deepEqual(odataCatalog.validateDuplicate({ name: "Not A Slug", destination: "has space" }), {
+        name: "odataErrNameInvalid", destination: "odataErrDestinationInvalid"
     });
 });
 

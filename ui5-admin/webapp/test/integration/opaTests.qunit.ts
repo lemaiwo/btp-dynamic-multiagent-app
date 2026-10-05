@@ -15,6 +15,7 @@ Opa5.extendConfig({
 import "./AgentJourney";
 import "./SkillJourney";
 import "./ODataListJourney";
+import "./ODataDetailJourney";
 import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
 import "./ReloadJourney";

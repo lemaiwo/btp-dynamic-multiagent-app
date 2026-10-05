@@ -1,5 +1,5 @@
 import type {
-    ODataDefinition, ODataEntityOp, ODataEntitySet, ODataServiceInput
+    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataServiceInput
 } from "../service/types";
 
 /**
@@ -8,7 +8,8 @@ import type {
  *
  * No `sap.m` in here, so all of it is unit-testable. The server
  * (`agents/odata/models.py`) stays authoritative: whatever `validate` misses
- * is still refused there and surfaced through `AdminError.fieldErrors`.
+ * is still refused there, and `serverErrors` turns that refusal into one
+ * message per field.
  */
 
 /** Entity-set operations in the server's order (`ENTITY_OPS`). */
@@ -36,8 +37,25 @@ export interface ODataFieldCount {
     total: number;
 }
 
-/** The form fields `validate` can report on. */
-export type ODataErrorField = "name" | "title" | "purpose" | "not_for" | "destination" | "service_path";
+/** The payload fields `validate` can report on. The first six have a text
+ *  field in the form; the flags and the definition can only be wrong in a
+ *  payload that did not come from the form (an imported file). */
+export type ODataErrorField = "name" | "title" | "purpose" | "not_for" | "destination" | "service_path"
+    | "user_context" | "enabled" | "definition";
+
+/** What a save changes about whose identity reaches SAP, and through which
+ *  destination. `null` twice: nothing of the kind. */
+export interface ODataIdentityChange {
+    /** The identity the service switches TO, or null when it stays. */
+    runsAs: "user" | "technical" | null;
+    destination: { from: string; to: string } | null;
+}
+
+/** The payload fields, in the order of `ODataServicePayload`. */
+const PAYLOAD_FIELDS: readonly (keyof ODataServiceInput)[] = [
+    "name", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
+    "service_path", "enabled", "definition", "metadata_fetched_at"
+];
 
 /** Field -> i18n key of what is wrong with it. Empty means valid. */
 export type ODataErrors = Partial<Record<ODataErrorField, string>>;
@@ -51,6 +69,30 @@ function hasControlCharacter(value: string): boolean {
         }
     }
     return false;
+}
+
+/**
+ * Whether `value` is one line as the server means it (`_one_line` in
+ * agents/odata/models.py): no control character (Unicode category Cc, so no
+ * tab, CR or LF) and no line or paragraph separator (Zl, Zp). These texts
+ * are printed as one line each in an agent's instructions.
+ */
+function isOneLine(value: string): boolean {
+    return !hasControlCharacter(value) && value.indexOf("\u2028") === -1 && value.indexOf("\u2029") === -1;
+}
+
+function nameProblem(name: string): string {
+    if (!name) {
+        return "odataErrNameRequired";
+    }
+    return SERVICE_NAME_RE.test(name) ? "" : "odataErrNameInvalid";
+}
+
+function destinationProblem(destination: string): string {
+    if (!destination) {
+        return "odataErrDestinationRequired";
+    }
+    return DESTINATION_NAME_RE.test(destination) ? "" : "odataErrDestinationInvalid";
 }
 
 /**
@@ -155,41 +197,113 @@ export default {
      */
     validate(input: ODataServiceInput): ODataErrors {
         const errors: ODataErrors = {};
-        const name = input.name ?? "";
+        // Stripped first, as the server does for these two: what surrounds
+        // the text is dropped there, so only what is inside it counts.
         const title = (input.title ?? "").trim();
         const purpose = (input.purpose ?? "").trim();
-        const destination = input.destination ?? "";
+        const notFor = input.not_for ?? "";
         const path = input.service_path ?? "";
+        const set = (field: ODataErrorField, key: string): void => {
+            if (key) {
+                errors[field] = key;
+            }
+        };
 
-        if (!name) {
-            errors.name = "odataErrNameRequired";
-        } else if (!SERVICE_NAME_RE.test(name)) {
-            errors.name = "odataErrNameInvalid";
-        }
+        set("name", nameProblem(input.name ?? ""));
         if (!title) {
             errors.title = "odataErrTitleRequired";
         } else if (title.length > MAX_TITLE) {
             errors.title = "odataErrTitleTooLong";
+        } else if (!isOneLine(title)) {
+            errors.title = "odataErrTitleOneLine";
         }
         if (!purpose) {
             errors.purpose = "odataErrPurposeRequired";
         } else if (purpose.length > MAX_PURPOSE) {
             errors.purpose = "odataErrPurposeTooLong";
+        } else if (!isOneLine(purpose)) {
+            errors.purpose = "odataErrPurposeOneLine";
         }
-        if ((input.not_for ?? "").length > MAX_NOT_FOR) {
+        if (notFor.length > MAX_NOT_FOR) {
             errors.not_for = "odataErrNotForTooLong";
+        } else if (!isOneLine(notFor)) {
+            errors.not_for = "odataErrNotForOneLine";
         }
-        if (!destination) {
-            errors.destination = "odataErrDestinationRequired";
-        } else if (!DESTINATION_NAME_RE.test(destination)) {
-            errors.destination = "odataErrDestinationInvalid";
+        set("destination", destinationProblem(input.destination ?? ""));
+        // Strict, like the server's StrictBool: "true" or 1 is not a flag.
+        // This one decides whose identity reaches SAP.
+        if (typeof input.user_context !== "boolean") {
+            errors.user_context = "odataErrBoolean";
         }
         if (!path) {
             errors.service_path = "odataErrPathRequired";
         } else if (!isConfinedPath(path)) {
             errors.service_path = "odataErrPathInvalid";
         }
+        if (typeof input.enabled !== "boolean") {
+            errors.enabled = "odataErrBoolean";
+        }
+        // Required by the server: a payload without it is refused instead of
+        // replacing the stored definition by an empty one.
+        const definition: unknown = input.definition;
+        if (definition === null || typeof definition !== "object" || Array.isArray(definition)) {
+            errors.definition = "odataErrDefinitionRequired";
+        }
         return errors;
+    },
+
+    /** What the duplicate dialog can check before asking the server: the
+     *  copy's name, and its destination when one is given. */
+    validateDuplicate(body: ODataDuplicateRequest): ODataErrors {
+        const errors: ODataErrors = {};
+        const name = nameProblem(body.name ?? "");
+        if (name) {
+            errors.name = name;
+        }
+        if (body.destination !== undefined) {
+            const destination = destinationProblem(body.destination);
+            if (destination) {
+                errors.destination = destination;
+            }
+        }
+        return errors;
+    },
+
+    /** The length the server holds against the 200 of a purpose: that of
+     *  the stripped text. */
+    purposeLength(purpose: string | undefined | null): number {
+        return String(purpose ?? "").trim().length;
+    },
+
+    /**
+     * The payload fields of a service, as a deep copy and without anything
+     * else: a stored service carries `id`, `counts`, `used_by` and more,
+     * and the server refuses a payload with a key it does not know. The
+     * definition always goes along -- a save sends the whole service.
+     */
+    payloadOf(service: ODataServiceInput): ODataServiceInput {
+        const source = service as unknown as Record<string, unknown>;
+        const payload: Record<string, unknown> = {};
+        PAYLOAD_FIELDS.forEach((field) => {
+            payload[field] = source[field];
+        });
+        return JSON.parse(JSON.stringify(payload)) as ODataServiceInput;
+    },
+
+    /**
+     * What saving `current` over `stored` changes about who the agents
+     * using the service act as in SAP: the identity (signed-in or technical
+     * user) and the destination, which holds the technical user's
+     * credential and names the system.
+     */
+    identityChange(stored: ODataServiceInput, current: ODataServiceInput): ODataIdentityChange {
+        const before = stored.user_context === true;
+        const after = current.user_context === true;
+        return {
+            runsAs: before === after ? null : (after ? "user" : "technical"),
+            destination: stored.destination === current.destination
+                ? null : { from: stored.destination, to: current.destination }
+        };
     },
 
     /**

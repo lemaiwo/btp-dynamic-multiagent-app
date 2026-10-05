@@ -1,0 +1,252 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.ODataServiceDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1">
+    <Page
+        id="odataServiceDetailPage"
+        title="{svc>/title}"
+        showNavButton="true"
+        navButtonPress=".onBack">
+        <!-- Tags and actions sit in a toolbar of their own, not in the page
+             header: the header has no overflow handling, so three buttons
+             there cut the title on a narrow window. Here the secondary
+             actions move into the overflow menu and Save always stays. -->
+        <subHeader>
+            <OverflowToolbar id="odataDetailToolbar">
+                <!-- The tags describe the service as it is SAVED, which is
+                     what agents get; the form below may be ahead of it. -->
+                <ObjectStatus
+                    id="odataTagVersion"
+                    text="{ path: 'svc>/original/odata_version', formatter: '.formatVersion' }"
+                    inverted="true"
+                    visible="{svc>/exists}" />
+                <ObjectStatus
+                    id="odataTagRunsAs"
+                    text="{ path: 'svc>/original/user_context', formatter: '.formatRunsAs' }"
+                    state="{ path: 'svc>/original/user_context', formatter: '.formatRunsAsState' }"
+                    inverted="true"
+                    visible="{svc>/exists}" />
+                <ObjectStatus
+                    id="odataTagWrite"
+                    text="{i18n>odataTagWrite}"
+                    state="Warning"
+                    inverted="true"
+                    visible="{= ${svc>/exists} &amp;&amp; ${svc>/has_write} }" />
+                <ObjectStatus
+                    id="odataTagDisabled"
+                    text="{i18n>odataTagDisabled}"
+                    state="Error"
+                    inverted="true"
+                    visible="{= ${svc>/exists} &amp;&amp; !${svc>/original/enabled} }" />
+                <ToolbarSpacer />
+                <!-- U6: "Import from $metadata" (odataImportMetadataButton)
+                     and "Test call" (odataTestCallButton) go here, before
+                     Duplicate. -->
+                <Button
+                    id="odataDuplicateButton"
+                    text="{i18n>odataDuplicate}"
+                    icon="sap-icon://duplicate"
+                    enabled="{= ${svc>/exists} &amp;&amp; !${svc>/busy} }"
+                    press=".onDuplicate" />
+                <Button
+                    id="odataDeleteButton"
+                    text="{i18n>delete}"
+                    icon="sap-icon://delete"
+                    type="Transparent"
+                    enabled="{= ${svc>/exists} &amp;&amp; !${svc>/busy} }"
+                    press=".onDelete" />
+                <Button
+                    id="odataSaveButton"
+                    text="{i18n>save}"
+                    type="Emphasized"
+                    enabled="{= ${svc>/loaded} &amp;&amp; !${svc>/busy} }"
+                    press=".onSave">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" />
+                    </layoutData>
+                </Button>
+            </OverflowToolbar>
+        </subHeader>
+        <content>
+            <!-- A service that could not be read is said here, with a retry,
+                 and the form stays away: an empty form with a Save button
+                 could be saved over the real service. -->
+            <MessageStrip
+                id="odataDetailLoadFailed"
+                visible="{svc>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{svc>/loadError}">
+                <link>
+                    <Link id="odataDetailRetry" text="{i18n>odataRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
+            <!-- What a refused save says about anything that has no field of
+                 its own below. The server's words, as plain text. -->
+            <MessageStrip
+                id="odataSaveError"
+                visible="{= !!${svc>/saveError} }"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{svc>/saveError}" />
+            <!-- U6: the result of "Test call" (MessageStrip odataTestStrip)
+                 goes here. It is also what tells whether the destination
+                 resolves. -->
+            <Panel
+                id="odataGeneralPanel"
+                visible="{svc>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title text="{i18n>odataGeneral}" level="H2" />
+                        <ToolbarSpacer />
+                        <Label id="odataEnabledLabel" text="{i18n>odataEnabled}" labelFor="odataEnabledSwitch" />
+                        <Switch
+                            id="odataEnabledSwitch"
+                            state="{svc>/data/enabled}"
+                            ariaLabelledBy="odataEnabledLabel" />
+                    </Toolbar>
+                </headerToolbar>
+                <!-- Left: what the service is for (this is what an agent
+                     reads). Right: where it is and who calls it. -->
+                <f:SimpleForm
+                    id="odataGeneralForm"
+                    editable="true"
+                    layout="ResponsiveGridLayout"
+                    columnsM="1"
+                    columnsL="2"
+                    columnsXL="2"
+                    labelSpanS="12"
+                    labelSpanM="12"
+                    labelSpanL="12"
+                    labelSpanXL="12"
+                    singleContainerFullSize="false">
+                    <core:Title text="{i18n>odataGroupPurpose}" level="H3" />
+
+                    <Label text="{i18n>odataTitle}" required="true" labelFor="odataTitle" />
+                    <Input
+                        id="odataTitle"
+                        value="{svc>/data/title}"
+                        valueState="{ path: 'svc>/errors/title', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/title}"
+                        app:field="title"
+                        liveChange=".onEdit" />
+
+                    <Label text="{i18n>odataName}" required="true" labelFor="odataName" />
+                    <VBox>
+                        <Input
+                            id="odataName"
+                            value="{svc>/data/name}"
+                            editable="{svc>/isNew}"
+                            valueState="{ path: 'svc>/errors/name', formatter: '.formatErrorState' }"
+                            valueStateText="{svc>/errors/name}"
+                            ariaDescribedBy="odataNameHint"
+                            class="odataTechnical"
+                            app:field="name"
+                            liveChange=".onEdit" />
+                        <Text
+                            id="odataNameHint"
+                            text="{ path: 'svc>/isNew', formatter: '.formatNameHint' }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label text="{i18n>odataPurpose}" required="true" labelFor="odataPurpose" />
+                    <VBox>
+                        <!-- valueLiveUpdate: the counter follows each key. No
+                             maxLength: a pasted text that is too long is shown
+                             whole and refused, not silently cut. -->
+                        <TextArea
+                            id="odataPurpose"
+                            value="{svc>/data/purpose}"
+                            valueLiveUpdate="true"
+                            rows="3"
+                            width="100%"
+                            valueState="{ path: 'svc>/errors/purpose', formatter: '.formatErrorState' }"
+                            valueStateText="{svc>/errors/purpose}"
+                            ariaDescribedBy="odataPurposeCounter"
+                            app:field="purpose"
+                            liveChange=".onEdit" />
+                        <Text
+                            id="odataPurposeCounter"
+                            text="{ path: 'svc>/data/purpose', formatter: '.formatPurposeCounter' }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label text="{i18n>odataNotFor}" labelFor="odataNotFor" />
+                    <Input
+                        id="odataNotFor"
+                        value="{svc>/data/not_for}"
+                        valueState="{ path: 'svc>/errors/not_for', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/not_for}"
+                        app:field="not_for"
+                        liveChange=".onEdit" />
+
+                    <core:Title text="{i18n>odataGroupConnection}" level="H3" />
+
+                    <!-- A text field, not a list: the app cannot list the
+                         destinations of the subaccount. -->
+                    <Label text="{i18n>odataDestination}" required="true" labelFor="odataDestination" />
+                    <Input
+                        id="odataDestination"
+                        value="{svc>/data/destination}"
+                        valueState="{ path: 'svc>/errors/destination', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/destination}"
+                        class="odataTechnical"
+                        app:field="destination"
+                        liveChange=".onEdit" />
+
+                    <Label id="odataRunsAsLabel" text="{i18n>odataRunsAs}" labelFor="odataRunsAs" />
+                    <VBox>
+                        <SegmentedButton
+                            id="odataRunsAs"
+                            selectedKey="{ path: 'svc>/data/user_context', formatter: '.formatRunsAsKey' }"
+                            selectionChange=".onRunsAsChange"
+                            ariaLabelledBy="odataRunsAsLabel"
+                            ariaDescribedBy="odataRunsAsHint">
+                            <items>
+                                <SegmentedButtonItem id="odataRunsAsUser" key="user" text="{i18n>odataRunsAsUser}" />
+                                <SegmentedButtonItem id="odataRunsAsTechnical" key="technical" text="{i18n>odataRunsAsTechnical}" />
+                            </items>
+                        </SegmentedButton>
+                        <Text
+                            id="odataRunsAsHint"
+                            text="{ path: 'svc>/data/user_context', formatter: '.formatRunsAsHint' }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label id="odataVersionLabel" text="{i18n>odataVersion}" labelFor="odataVersion" />
+                    <SegmentedButton
+                        id="odataVersion"
+                        selectedKey="{svc>/data/odata_version}"
+                        selectionChange=".onVersionChange"
+                        ariaLabelledBy="odataVersionLabel">
+                        <items>
+                            <SegmentedButtonItem key="v2" text="{i18n>odataVersionV2}" />
+                            <SegmentedButtonItem key="v4" text="{i18n>odataVersionV4}" />
+                        </items>
+                    </SegmentedButton>
+
+                    <Label text="{i18n>odataServicePath}" required="true" labelFor="odataServicePath" />
+                    <Input
+                        id="odataServicePath"
+                        value="{svc>/data/service_path}"
+                        valueState="{ path: 'svc>/errors/service_path', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/service_path}"
+                        class="odataTechnical"
+                        app:field="service_path"
+                        liveChange=".onEdit" />
+                </f:SimpleForm>
+            </Panel>
+            <!-- U4: the "Entity sets" panel (table with a checkbox per
+                 operation, "Add", "Metadata read ...") goes here. -->
+            <!-- U5: the "Operations" panel goes here. -->
+            <!-- Later: the "Used by" panel goes here. -->
+        </content>
+    </Page>
+</mvc:View>

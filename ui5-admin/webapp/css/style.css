@@ -58,3 +58,18 @@
     font-size: 0.875rem;
     line-height: 1.4;
 }
+/* OData service detail (ODataServiceDetail.view.xml): technical values --
+   the name agents use, the destination, the service path -- read as code,
+   and the explanation under a field reads as a hint, not as a value. */
+.odataTechnical .sapMInputBaseInner {
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+.odataHint.sapMText,
+.sapUiForm .sapUiFormResGrid .odataHint.sapMText {
+    color: var(--sapContent_LabelColor);
+    font-size: 0.75rem;
+    /* A form gives its texts the line height of a field; a hint of two
+       lines would be spread over two field heights. */
+    line-height: 1.4;
+    margin-top: 0.25rem;
+}

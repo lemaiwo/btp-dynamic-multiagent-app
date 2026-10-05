@@ -3,8 +3,7 @@ import Filter from "sap/ui/model/Filter";
 import FilterOperator from "sap/ui/model/FilterOperator";
 import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
-import { ValueState } from "sap/ui/core/library";
-import BaseController from "./BaseController";
+import ODataController from "./odata/ODataController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import odataCatalog from "../model/odataCatalog";
@@ -14,7 +13,7 @@ import type SearchField from "sap/m/SearchField";
 import type Table from "sap/m/Table";
 import type Control from "sap/ui/core/Control";
 import type ListBinding from "sap/ui/model/ListBinding";
-import type { ODataServiceInput, ODataServiceSummary, ODataUsedBy, ODataVersion } from "../service/types";
+import type { ODataServiceInput, ODataServiceSummary, ODataUsedBy } from "../service/types";
 
 /** The fields of an exported service (`to_export()`), which are exactly what
  *  a create accepts. Anything else in a file (an id, counts, `used_by` of a
@@ -45,7 +44,7 @@ interface ConfigFile {
  *
  * @namespace com.agent.admin.controller
  */
-export default class ODataServices extends BaseController {
+export default class ODataServices extends ODataController {
 
     /** A delete is on its way: no second one until it has answered. */
     private deleting = false;
@@ -100,20 +99,6 @@ export default class ODataServices extends BaseController {
     }
 
     // --- formatters ---------------------------------------------------------
-
-    /** "V2" or "V4". */
-    public formatVersion(version: ODataVersion | undefined): string {
-        return this.text(version === "v4" ? "odataVersionV4" : "odataVersionV2");
-    }
-
-    public formatRunsAs(userContext: boolean | undefined): string {
-        return this.text(userContext ? "odataRunsAsUser" : "odataRunsAsTechnical");
-    }
-
-    /** The signed-in user stands out; the technical user is the neutral case. */
-    public formatRunsAsState(userContext: boolean | undefined): ValueState {
-        return userContext ? ValueState.Information : ValueState.None;
-    }
 
     /** "not used", "1 agent" or "n agents". */
     public formatUsedBy(usedBy: ODataUsedBy[] | undefined | null): string {
@@ -182,20 +167,8 @@ export default class ODataServices extends BaseController {
         }
         const service = (event.getSource() as Control)
             .getBindingContext("odata")?.getObject() as ODataServiceSummary;
-        const remove = this.text("delete");
-
-        // Titles can repeat (the same API under two identities), so the
-        // question also carries the technical name, which cannot.
-        MessageBox.warning(this.text("odataDeleteConfirm", [service.title, service.name]), {
-            title: remove,
-            actions: [remove, MessageBox.Action.CANCEL],
-            emphasizedAction: remove,
-            initialFocus: MessageBox.Action.CANCEL,
-            onClose: (action: string | null) => {
-                if (action === remove) {
-                    void this.deleteService(service);
-                }
-            }
+        this.askDelete(service, () => {
+            void this.deleteService(service);
         });
     }
 
@@ -214,30 +187,17 @@ export default class ODataServices extends BaseController {
         }
         this.deleting = true;
         this.setBusyFlag();
+        let outcome;
         try {
-            await this.withBusy(() => this.getAdminService().deleteODataService(service.name));
-        } catch (error) {
-            const kind = ErrorHandler.classify(error);
-            if (error instanceof AdminError && kind === "conflict") {
-                // The central policy shows a 409 as a passing toast ("a run
-                // is already in flight"). Here it is a refusal the admin has
-                // to act on, and the server's text names the agents to
-                // detach the service from, so it stays on screen as it came.
-                MessageBox.error(error.detail || this.text("odataDeleteFailed", [service.title]));
-            } else {
-                ErrorHandler.handle(error, this.text("odataDeleteFailed", [service.title]));
-            }
-            if (error instanceof AdminError && (kind === "conflict" || kind === "error")) {
+            outcome = await this.removeService(service);
+            if (outcome !== "unanswered") {
                 await this.load();
             }
-            return false;
         } finally {
             this.deleting = false;
             this.setBusyFlag();
         }
-        MessageToast.show(this.text("odataDeleted"));
-        await this.load();
-        return true;
+        return outcome === "deleted";
     }
 
     // --- import -------------------------------------------------------------
