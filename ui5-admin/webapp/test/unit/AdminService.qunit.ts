@@ -910,3 +910,66 @@ QUnit.test("duplicate refuses a body the server refuses", async function (assert
     );
     assert.strictEqual(copy.title, "Requisitions for jobs", "a given title is stripped and used as is");
 });
+
+// --- the destinations a service can name -------------------------------------
+
+QUnit.test("the destinations are read once from odata/destinations, as the server describes them", async function (this: { backend: FakeBackend }, assert) {
+    const list = await new AdminService().listODataDestinations();
+
+    assert.deepEqual(this.backend.requests, ["GET odata/destinations"]);
+    assert.deepEqual(list.items.map((item) => item.name), [
+        "S4 DEV invalid", "S4_DEV_BASIC", "S4_DEV_RFC", "S4_DEV_USER", "S4_ODATA_TECH", "S4_ODATA_USER"
+    ], "sorted by name, case-insensitively");
+    assert.deepEqual(
+        list.items.filter((item) => item.user_propagating).map((item) => item.name), ["S4_DEV_USER", "S4_ODATA_USER"]
+    );
+    assert.deepEqual(
+        list.items.filter((item) => !item.usable).map((item) => [item.name, item.reason]),
+        [["S4 DEV invalid", "invalid_name"], ["S4_DEV_RFC", "not_http"]]
+    );
+    assert.deepEqual(
+        list.items.filter((item) => item.proxy_type === "OnPremise").map((item) => [item.name, item.notes]),
+        [["S4_ODATA_TECH", ["on_premise"]], ["S4_ODATA_USER", ["on_premise"]]]
+    );
+    assert.deepEqual(
+        [list.truncated, list.skipped, list.warnings], [false, 0, []], "a complete list"
+    );
+    assert.deepEqual(Object.keys(list.items[0]).sort(), [
+        "authentication", "description", "level", "name", "notes", "proxy_type", "reason", "shadows_subaccount",
+        "type", "usable", "user_propagating"
+    ], "the eleven fields of the contract and nothing else");
+});
+
+QUnit.test("no list at all is a rejection with the status, never an empty list", async function (this: { backend: FakeBackend }, assert) {
+    this.backend.destinationsMode = "unavailable";
+
+    const error = await refusal(() => new AdminService().listODataDestinations());
+
+    assert.ok(error instanceof AdminError);
+    assert.strictEqual(error.status, 503);
+    assert.strictEqual(
+        error.detail,
+        "no destination service is bound to this application, so its destinations cannot be listed; "
+        + "type the destination name instead"
+    );
+});
+
+QUnit.test("a cut list and a list of one level say so", async function (this: { backend: FakeBackend }, assert) {
+    this.backend.destinationsMode = "truncated";
+    const cut = await new AdminService().listODataDestinations();
+    assert.strictEqual(cut.truncated, true);
+    assert.ok(cut.items.length > 0, "what was read is still listed");
+
+    this.backend.destinationsMode = "partial";
+    const partial = await new AdminService().listODataDestinations();
+    assert.strictEqual(partial.truncated, false);
+    assert.deepEqual(partial.warnings.map((w) => [w.code, w.level]), [["level_unavailable", "subaccount"]]);
+    assert.deepEqual(partial.items.map((item) => item.level), ["instance"], "the level that answered");
+});
+
+QUnit.test("the destinations route takes no query parameter", async function (assert) {
+    const response = await fetch("backend/odata/destinations?level=subaccount");
+
+    assert.strictEqual(response.status, 422);
+    assert.deepEqual(await response.json(), { detail: "query: this route takes no parameters" });
+});

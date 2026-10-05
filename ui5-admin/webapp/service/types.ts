@@ -890,3 +890,42 @@ export interface ODataDuplicateRequest {
     destination?: string;
     user_context?: boolean;
 }
+
+/** One destination of `GET odata/destinations`: a fixed description, never
+ *  its URL or credential. `type`, `proxy_type` and `authentication` are a
+ *  known identifier, `other`, or "" when the destination does not say. */
+export interface ODataDestination {
+    name: string;
+    description: string;
+    type: string;
+    proxy_type: string;
+    authentication: string;
+    level: "instance" | "subaccount";
+    /** The destination signs in as the user who makes the call. */
+    user_propagating: boolean;
+    /** Whether an OData service can name it; `reason` says why not
+     *  (`invalid_name`, `not_http`). The `name` of an invalid one is the
+     *  shown form, not necessarily the stored one. */
+    usable: boolean;
+    reason: string | null;
+    notes: string[];
+    shadows_subaccount: boolean;
+}
+
+/** A level (instance or subaccount) that could not be listed. */
+export interface ODataDestinationWarning {
+    code: string;
+    level?: string;
+    reason?: string;
+    status?: number | null;
+    message?: string;
+}
+
+export interface ODataDestinationList {
+    items: ODataDestination[];
+    /** More destinations exist than `items` holds. */
+    truncated: boolean;
+    skipped: number;
+    /** Not empty: the list is partial. */
+    warnings: ODataDestinationWarning[];
+}

@@ -1,7 +1,7 @@
 import type {
     Agent, CredentialStatus, JobRunDetail, ODataDefinition, ODataEntityOp, ODataEntitySet, ODataField,
-    ODataMetadataPreview, ODataPreviewEntitySet, ODataService, ODataServiceInput, ODataServiceSummary,
-    ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
+    ODataDestination, ODataDestinationList, ODataMetadataPreview, ODataPreviewEntitySet, ODataService,
+    ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 
@@ -42,6 +42,17 @@ export default class FakeBackend {
     public metadataPreview!: ODataMetadataPreview;
     /** What POST odata/services/{name}/test answers. */
     public testResult!: ODataTestResult;
+    /** The destinations GET odata/destinations lists, in any order. */
+    public odataDestinations: ODataDestination[] = [];
+    /**
+     * How GET odata/destinations answers: `ok` -- the whole list;
+     * `unavailable` -- no list at all (503 `no_destination_service`);
+     * `truncated` -- the first two, with `truncated: true`; `partial` -- the
+     * instance level only, with a `level_unavailable` warning for the
+     * subaccount; `held` -- no answer until `releaseDestinations()`.
+     */
+    public destinationsMode: "ok" | "unavailable" | "truncated" | "partial" | "held" = "ok";
+    private heldDestinations: (() => void)[] = [];
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
     /** Every intercepted call as "METHOD path" (query string dropped), in
@@ -244,6 +255,7 @@ export default class FakeBackend {
             steps: []
         }];
         this.seedOData();
+        this.seedDestinations();
         this.failNext = undefined;
     }
 
@@ -281,6 +293,18 @@ export default class FakeBackend {
             output: "Drafted.", error: null,
             started_at: "2026-08-25T08:00:05", finished_at: "2026-08-25T08:00:40"
         }];
+    }
+
+    /** Answers the GET odata/destinations calls that `held` kept waiting,
+     *  the way `mode` says (the list, or no list): all of them, or with
+     *  `newestOnly` the last one asked, leaving the earlier ones waiting. */
+    public releaseDestinations(mode: "ok" | "unavailable" = "ok", newestOnly = false): void {
+        const released = newestOnly ? this.heldDestinations.splice(-1) : this.heldDestinations.splice(0);
+        this.destinationsMode = mode;
+        released.forEach((release) => release());
+        if (this.heldDestinations.length > 0) {
+            this.destinationsMode = "held";
+        }
     }
 
     /** How many times "METHOD path" was requested so far. */
@@ -1199,6 +1223,84 @@ export default class FakeBackend {
         return undefined;
     }
 
+    /**
+     * What a destination service with two levels would list. Generic names
+     * only. The two destinations the seeded services use are among them, so
+     * that a stored service is the ordinary case: its destination is listed
+     * and matches its identity. No name here is the beginning of another: a
+     * combo box completes what is typed to the first item that starts with it.
+     */
+    private seedDestinations(): void {
+        const item = (name: string, over: Partial<ODataDestination>): ODataDestination => ({
+            name, description: "", type: "HTTP", proxy_type: "Internet", authentication: "BasicAuthentication",
+            level: "subaccount", user_propagating: false, usable: true, reason: null, notes: [],
+            shadows_subaccount: false, ...over
+        });
+        const onPremise = { proxy_type: "OnPremise", notes: ["on_premise"] };
+        this.destinationsMode = "ok";
+        this.heldDestinations = [];
+        this.odataDestinations = [
+            item("S4_ODATA_USER", {
+                ...onPremise, authentication: "PrincipalPropagation", user_propagating: true,
+                description: "Development system, as the signed-in user"
+            }),
+            item("S4_ODATA_TECH", { ...onPremise, description: "Development system, technical user for jobs" }),
+            item("S4_DEV_BASIC", { level: "instance", shadows_subaccount: true }),
+            item("S4_DEV_USER", { authentication: "OAuth2SAMLBearerAssertion", user_propagating: true }),
+            item("S4_DEV_RFC", { type: "RFC", authentication: "", usable: false, reason: "not_http" }),
+            item("S4 DEV invalid", { usable: false, reason: "invalid_name" })
+        ];
+    }
+
+    /** `list_destinations` in agents/odata/destinations.py: sorted by
+     *  name, case-insensitively. */
+    private destinationList(): ODataDestinationList {
+        const lower = (item: ODataDestination) => item.name.toLowerCase();
+        let items = this.odataDestinations.slice().sort((a, b) => (lower(a) < lower(b) ? -1 : lower(a) > lower(b) ? 1 : 0));
+        const list: ODataDestinationList = { items, truncated: false, skipped: 0, warnings: [] };
+        if (this.destinationsMode === "truncated") {
+            // Two that can be used, so that the cut list still offers something.
+            items = items.filter((entry) => entry.usable).slice(0, 2);
+            return { ...list, items, truncated: true };
+        }
+        if (this.destinationsMode === "partial") {
+            return {
+                ...list,
+                items: items.filter((entry) => entry.level === "instance"),
+                warnings: [{
+                    code: "level_unavailable", level: "subaccount", reason: "http_error", status: 500,
+                    message: "the destinations of the subaccount could not be listed"
+                }]
+            };
+        }
+        return list;
+    }
+
+    /** GET odata/destinations (`api_list_odata_destinations`). */
+    private answerDestinations(query: URLSearchParams): Promise<Response> {
+        if (Array.from(query.keys()).length > 0) {
+            return this.json({ detail: "query: this route takes no parameters" }, 422);
+        }
+        const answer = (): Promise<Response> => {
+            if (this.destinationsMode === "unavailable") {
+                return Promise.resolve(new Response(JSON.stringify({
+                    detail: "no destination service is bound to this application, so its destinations "
+                        + "cannot be listed; type the destination name instead"
+                }), {
+                    status: 503,
+                    headers: { "Content-Type": "application/json", "X-OData-Error": "no_destination_service" }
+                }));
+            }
+            return this.json(this.destinationList());
+        };
+        if (this.destinationsMode === "held") {
+            return new Promise<Response>((resolve) => {
+                this.heldDestinations.push(() => resolve(answer()));
+            });
+        }
+        return answer();
+    }
+
     private json(body: unknown, status = 200): Promise<Response> {
         return Promise.resolve(new Response(JSON.stringify(body), {
             status, headers: { "Content-Type": "application/json" }
@@ -1391,6 +1493,9 @@ export default class FakeBackend {
             return this.json({ status: "ok" });
         }
         // --- odata ---
+        if (path === "odata/destinations" && method === "GET") {
+            return this.answerDestinations(query);
+        }
         const odata = this.handleOData(path, method, body);
         if (odata) {
             return odata;

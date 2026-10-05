@@ -15,11 +15,13 @@ import formatter from "../model/formatter";
 import odataCatalog, {
     type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataPending
 } from "../model/odataCatalog";
+import odataDestinations, { type DestinationNotice, type DestinationsState } from "../model/odataDestinations";
 import { canonical } from "../model/runsPanel";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type Dialog from "sap/m/Dialog";
 import type CheckBox from "sap/m/CheckBox";
+import type ComboBox from "sap/m/ComboBox";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Page from "sap/m/Page";
 import type Table from "sap/m/Table";
@@ -104,6 +106,13 @@ export default class ODataServiceDetail extends ODataController {
 
     private duplicateDialog?: Dialog;
 
+    /** What the destination service lists, for the destination field. */
+    private destinations: DestinationsState = "loading";
+
+    /** Counts the reads of that list, so that the answer for an earlier
+     *  visit of the page is dropped. */
+    private destinationsCount = 0;
+
     /** The dialog of one entity set; it is open while `entityOpen`. */
     private entityDialog?: EntitySetDialog;
     private entityOpen = false;
@@ -137,6 +146,15 @@ export default class ODataServiceDetail extends ODataController {
 
     public onInit(): void {
         this.setModel(new JSONModel(this.blankState("")), "svc");
+        // `items`: what the destination field offers; `hint`: the line
+        // under it; `notice`: what there is to say about the name in it
+        // (a `DestinationNotice`). Apart from `svc`, which is replaced on
+        // every load and save.
+        this.setModel(new JSONModel({ items: [], hint: "", notice: "" }), "dest");
+        // A combo box has no liveChange: typing is heard on its input.
+        (this.byId("odataDestination") as ComboBox).addEventDelegate({
+            oninput: () => this.onDestinationTyping()
+        });
         this.getRouter().getRoute(ROUTE)?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const name = (event.getParameter("arguments") as { serviceName: string }).serviceName;
             if (this.restoring) {
@@ -266,6 +284,8 @@ export default class ODataServiceDetail extends ODataController {
         this.serviceName = undefined;
         this.shownHash = "";
         this.svc().setData(this.blankState(""));
+        this.destinationsCount++;
+        this.showDestinations("loading");
     }
 
     /**
@@ -371,6 +391,7 @@ export default class ODataServiceDetail extends ODataController {
             entitySearch: search
         });
         this.filterEntitySets(search);
+        this.checkDestination();
     }
 
     private data(): ODataServiceInput {
@@ -403,11 +424,14 @@ export default class ODataServiceDetail extends ODataController {
         const count = ++this.loadCount;
         const model = this.svc();
         this.releasePlace();
+        // Beside the service, not before it: the form does not wait for it.
+        void this.loadDestinations();
 
         if (name === NEW) {
             this.serviceName = undefined;
             model.setData({ ...this.blankState(this.text("odataNewService")), isNew: true, loaded: true });
             this.filterEntitySets("");
+            this.checkDestination();
             return;
         }
 
@@ -432,6 +456,101 @@ export default class ODataServiceDetail extends ODataController {
                 ErrorHandler.handle(error);
             }
         }
+    }
+
+    // --- destinations -------------------------------------------------------
+
+    /**
+     * Reads the destinations for the dropdown, once per visit of the page.
+     *
+     * Quiet whatever happens: without a list the field is a text field
+     * with a hint, and a lapsed session is the service load's to report.
+     * Only `dest` is written, never the service: a late or failed answer
+     * cannot change what is in the field.
+     */
+    private async loadDestinations(): Promise<void> {
+        const count = ++this.destinationsCount;
+        this.showDestinations("loading");
+        let state: DestinationsState;
+        try {
+            state = odataDestinations.read(await this.getAdminService().listODataDestinations());
+        } catch {
+            state = "unavailable";
+        }
+        if (count === this.destinationsCount) {
+            this.showDestinations(state, true);
+        }
+    }
+
+    /** `announce`: the list just arrived by itself, so what it changes on
+     *  the page is said. */
+    private showDestinations(state: DestinationsState, announce = false): void {
+        const text = (key: string, args?: (string | number)[]) => this.text(key, args);
+        const model = this.getModel("dest") as JSONModel;
+        this.destinations = state;
+        model.setProperty("/items", odataDestinations.choices(state, text));
+        model.setProperty("/hint", odataDestinations.hint(state, text));
+        if (announce && state === "unavailable") {
+            InvisibleMessage.getInstance().announce(odataDestinations.hint(state, text), InvisibleMessageMode.Polite);
+        }
+        this.checkDestination(announce);
+    }
+
+    /**
+     * Says what the list knows about the destination in the field, for the
+     * identity the service runs as.
+     *
+     * `announce`: the cause is not the field itself (Runs as changed, the
+     * list arrived), so a new warning is said; one that comes from typing
+     * in the field is read with the field, like its errors.
+     */
+    private checkDestination(announce = false, name = this.data().destination): void {
+        const model = this.getModel("dest") as JSONModel;
+        const notice: DestinationNotice = this.svc().getProperty("/loaded") === true
+            ? odataDestinations.notice(this.destinations, name, this.data().user_context === true)
+            : "";
+        if (notice === model.getProperty("/notice")) {
+            return;
+        }
+        model.setProperty("/notice", notice);
+        if (announce && notice && !this.svc().getProperty("/errors/destination")) {
+            InvisibleMessage.getInstance().announce(this.formatDestinationStateText("", notice), InvisibleMessageMode.Polite);
+        }
+    }
+
+    /** While a name is being typed nothing is said about it: neither the
+     *  last error nor what the list knew about the name before. */
+    private onDestinationTyping(): void {
+        this.svc().setProperty("/errors/destination", "");
+        this.svc().setProperty("/saveError", "");
+        (this.getModel("dest") as JSONModel).setProperty("/notice", "");
+    }
+
+    /** A name was picked or typed (the field was left, or Enter). */
+    public onDestinationChange(event: Event): void {
+        this.onEdit(event);
+        // From the field: the binding writes the model in the same event.
+        this.checkDestination(false, (event.getSource() as ComboBox).getValue());
+    }
+
+    /** An item got the selection, by a click or by the arrow keys (which
+     *  put its name in the field at once): the name is judged right away.
+     *  Typing that matches no item also ends here, without an item. */
+    public onDestinationSelect(event: Event): void {
+        const item = (event.getSource() as ComboBox).getSelectedItem();
+        if (item) {
+            this.checkDestination(false, item.getText());
+        }
+    }
+
+    /** An error of the field (a refused save) comes before what the list
+     *  says about the name. */
+    public formatDestinationState(error: string | undefined, notice: DestinationNotice | undefined): ValueState {
+        return error ? ValueState.Error : ValueState[odataDestinations.noticeState(notice ?? "")];
+    }
+
+    public formatDestinationStateText(error: string | undefined, notice: DestinationNotice | undefined): string {
+        return error || odataDestinations.noticeText(notice ?? "", (key, args) => this.text(key, args));
     }
 
     public onRetry(): void {
@@ -463,6 +582,7 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty("/original", odataCatalog.emptyService());
         model.setProperty("/title", this.text("odataNewService"));
         this.showPendingWrites();
+        this.checkDestination();
     }
 
     // --- formatters ---------------------------------------------------------
@@ -942,6 +1062,7 @@ export default class ODataServiceDetail extends ODataController {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/user_context", key === "user");
         this.svc().setProperty("/saveError", "");
+        this.checkDestination(true);
     }
 
     public onVersionChange(event: Event): void {

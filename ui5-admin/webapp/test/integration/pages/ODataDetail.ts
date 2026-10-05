@@ -1,5 +1,7 @@
 import Press from "sap/ui/test/actions/Press";
 import type Input from "sap/m/Input";
+import type ComboBox from "sap/m/ComboBox";
+import type ListItem from "sap/ui/core/ListItem";
 import type TextArea from "sap/m/TextArea";
 import type Text from "sap/m/Text";
 import type Page from "sap/m/Page";
@@ -69,7 +71,7 @@ export function formOf(element: UI5Element): FormTexts {
         purpose: control<TextArea>(element, "odataPurpose").getValue(),
         counter: control<ObjectStatus>(element, "odataPurposeCounter").getText(),
         notFor: control<Input>(element, "odataNotFor").getValue(),
-        destination: control<Input>(element, "odataDestination").getValue(),
+        destination: control<ComboBox>(element, DESTINATION).getValue(),
         runsAs: control<SegmentedButton>(element, "odataRunsAs").getSelectedKey(),
         runsAsHint: control<Text>(element, "odataRunsAsHint").getText(false),
         version: control<SegmentedButton>(element, "odataVersion").getSelectedKey(),
@@ -95,6 +97,38 @@ export function counterState(element: UI5Element): string {
 export function stripOf(element: UI5Element, id: string): { visible: boolean; text: string } {
     const strip = control<MessageStrip>(element, id);
     return { visible: strip.getVisible(), text: strip.getText() };
+}
+
+// --- the destination field ------------------------------------------------------
+
+/** The destination field: a combo box that also takes a typed name. */
+export const DESTINATION = "odataDestination";
+
+/** What the destination field shows. */
+export interface DestinationField {
+    value: string;
+    state: string;
+    stateText: string;
+    /** What the dropdown offers: [name, the line that describes it]. */
+    choices: string[][];
+    /** The line under the field, "" when there is none. */
+    hint: string;
+    /** Whether a screen reader is given the hint as the field's description. */
+    hintDescribes: boolean;
+}
+
+export function destinationOf(element: UI5Element): DestinationField {
+    const field = control<ComboBox>(element, DESTINATION);
+    const hint = control<Text>(element, "odataDestinationHint");
+    const described = (field.getFocusDomRef()?.getAttribute("aria-describedby") ?? "").split(" ");
+    return {
+        value: field.getValue(),
+        state: field.getValueState(),
+        stateText: field.getValueStateText(),
+        choices: field.getItems().map((item) => [item.getText(), (item as ListItem).getAdditionalText()]),
+        hint: hint.getVisible() ? hint.getText(false) : "",
+        hintDescribes: described.indexOf(hint.getId()) !== -1
+    };
 }
 
 /** The value state of a field and the text that explains it. */

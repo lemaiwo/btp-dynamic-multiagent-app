@@ -1,8 +1,8 @@
 import type {
     ImportResult,
     Agent, AgentInput, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
-    JobRun, JobRunDetail, ModelInfo, ODataDuplicateRequest, ODataMetadataPreview, ODataMetadataRequest,
-    ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
+    JobRun, JobRunDetail, ModelInfo, ODataDestinationList, ODataDuplicateRequest, ODataMetadataPreview,
+    ODataMetadataRequest, ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
     OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
@@ -294,6 +294,16 @@ export default class AdminService {
         return this.request<ODataService>(`${AdminService.odataServicePath(name)}/duplicate`, {
             method: "POST", ...AdminService.json(body)
         });
+    }
+
+    /**
+     * The destinations a service can name, read from the destination
+     * service on every call (the server caches nothing). Rejects when there
+     * is no list at all (503, 502, 504): the name can then only be typed.
+     * The route takes no parameter.
+     */
+    public listODataDestinations(): Promise<ODataDestinationList> {
+        return this.request<ODataDestinationList>("odata/destinations");
     }
 
     /** Reads a service's $metadata through its destination. Stores nothing. */
