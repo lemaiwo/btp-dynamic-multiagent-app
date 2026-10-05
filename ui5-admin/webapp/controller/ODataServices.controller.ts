@@ -3,6 +3,7 @@ import Filter from "sap/ui/model/Filter";
 import FilterOperator from "sap/ui/model/FilterOperator";
 import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
+import { ValueState } from "sap/ui/core/library";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
@@ -13,7 +14,7 @@ import type SearchField from "sap/m/SearchField";
 import type Table from "sap/m/Table";
 import type Control from "sap/ui/core/Control";
 import type ListBinding from "sap/ui/model/ListBinding";
-import type { ODataServiceInput, ODataServiceSummary, ODataUsedBy } from "../service/types";
+import type { ODataServiceInput, ODataServiceSummary, ODataUsedBy, ODataVersion } from "../service/types";
 
 /** The fields of an exported service (`to_export()`), which are exactly what
  *  a create accepts. Anything else in a file (an id, counts, `used_by` of a
@@ -23,6 +24,22 @@ const CONFIG_FIELDS: readonly (keyof ODataServiceInput)[] = [
     "service_path", "enabled", "definition", "metadata_fetched_at"
 ];
 
+/** The fields `odataCatalog.validate` reads as text. */
+const TEXT_FIELDS: readonly (keyof ODataServiceInput)[] = [
+    "name", "title", "purpose", "not_for", "destination", "service_path"
+];
+
+/** The largest file the import reads. A stored definition is at most
+ *  2,000,000 bytes (`MAX_DEFINITION_BYTES`), so nothing bigger can be a
+ *  service. The text `odataConfigTooLarge` states this limit. */
+const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
+
+/** What the import needs of a picked file. */
+interface ConfigFile {
+    size: number;
+    text(): Promise<string>;
+}
+
 /**
  * The list of OData services in the catalogue.
  *
@@ -30,23 +47,72 @@ const CONFIG_FIELDS: readonly (keyof ODataServiceInput)[] = [
  */
 export default class ODataServices extends BaseController {
 
+    /** A delete is on its way: no second one until it has answered. */
+    private deleting = false;
+
+    /** A picked file is being read or created. */
+    private importing = false;
+
+    /** The one file input behind "Import configuration". One element, so a
+     *  double click cannot leave two pickers behind. */
+    private fileInput?: HTMLInputElement;
+
     public onInit(): void {
         this.setModel(new JSONModel({ items: [] }), "odata");
+        // loadFailed / loadError: the last load did not work, and why.
+        // query: the search text, which decides the table's empty text.
+        // busy: a delete or an import is running.
+        this.setModel(new JSONModel({ loadFailed: false, loadError: "", query: "", busy: false }), "view");
         this.getRouter().getRoute("odataServices")?.attachPatternMatched(() => {
             void this.load();
         });
     }
 
+    /**
+     * Reads the list. A failure empties the table and is shown on the page
+     * with a retry, so it cannot be mistaken for an empty catalogue; a lapsed
+     * session or a missing scope additionally gets the central dialog.
+     */
     private load(): Promise<void> {
+        const view = this.getModel("view") as JSONModel;
         return this.withBusy(async () => {
-            const services = await this.run(
-                this.getAdminService().listODataServices(),
-                "Could not load the OData services."
-            );
-            if (services) {
+            try {
+                const services = await this.getAdminService().listODataServices();
                 (this.getModel("odata") as JSONModel).setProperty("/items", services);
+                view.setProperty("/loadFailed", false);
+                view.setProperty("/loadError", "");
+            } catch (error) {
+                (this.getModel("odata") as JSONModel).setProperty("/items", []);
+                const reason = ErrorHandler.messageFor(error, "");
+                view.setProperty("/loadError", reason
+                    ? this.text("odataLoadFailedReason", [reason]) : this.text("odataLoadFailed"));
+                view.setProperty("/loadFailed", true);
+                const kind = ErrorHandler.classify(error);
+                if (kind === "session" || kind === "forbidden") {
+                    ErrorHandler.handle(error);
+                }
             }
         });
+    }
+
+    public onRetry(): void {
+        void this.load();
+    }
+
+    // --- formatters ---------------------------------------------------------
+
+    /** "V2" or "V4". */
+    public formatVersion(version: ODataVersion | undefined): string {
+        return this.text(version === "v4" ? "odataVersionV4" : "odataVersionV2");
+    }
+
+    public formatRunsAs(userContext: boolean | undefined): string {
+        return this.text(userContext ? "odataRunsAsUser" : "odataRunsAsTechnical");
+    }
+
+    /** The signed-in user stands out; the technical user is the neutral case. */
+    public formatRunsAsState(userContext: boolean | undefined): ValueState {
+        return userContext ? ValueState.Information : ValueState.None;
     }
 
     /** "not used", "1 agent" or "n agents". */
@@ -63,6 +129,17 @@ export default class ODataServices extends BaseController {
         return (usedBy ?? []).map((used) => used.agent).join(", ");
     }
 
+    /** Why the table is empty: the load failed, the search matches nothing,
+     *  or there really is no service yet. */
+    public formatNoData(loadFailed: boolean | undefined, query: string | undefined): string {
+        if (loadFailed) {
+            return this.text("odataLoadFailedNoData");
+        }
+        return this.text(query ? "odataNoMatches" : "odataNoServices");
+    }
+
+    // --- search and navigation ----------------------------------------------
+
     /** Filters on what the first column shows: title, name and purpose.
      *  Bound to both `liveChange` and `search`, so the field's clear button
      *  and Enter behave like typing. */
@@ -78,6 +155,7 @@ export default class ODataServices extends BaseController {
                 and: false
             })]
             : [];
+        (this.getModel("view") as JSONModel).setProperty("/query", query);
         const table = this.byId("odataServicesTable") as Table;
         (table.getBinding("items") as ListBinding).filter(filters);
     }
@@ -92,88 +170,166 @@ export default class ODataServices extends BaseController {
         this.getRouter().navTo("odataServiceDetail", { serviceName: service.name });
     }
 
+    // --- delete -------------------------------------------------------------
+
+    private setBusyFlag(): void {
+        (this.getModel("view") as JSONModel).setProperty("/busy", this.deleting || this.importing);
+    }
+
     public onDelete(event: Event): void {
+        if (this.deleting) {
+            return;
+        }
         const service = (event.getSource() as Control)
             .getBindingContext("odata")?.getObject() as ODataServiceSummary;
+        const remove = this.text("delete");
 
-        MessageBox.confirm(this.text("odataDeleteConfirm", [service.title]), {
-            title: this.text("delete"),
-            emphasizedAction: MessageBox.Action.OK,
-            onClose: (action: string) => {
-                if (action === MessageBox.Action.OK) {
-                    void this.doDelete(service);
+        // Titles can repeat (the same API under two identities), so the
+        // question also carries the technical name, which cannot.
+        MessageBox.warning(this.text("odataDeleteConfirm", [service.title, service.name]), {
+            title: remove,
+            actions: [remove, MessageBox.Action.CANCEL],
+            emphasizedAction: remove,
+            initialFocus: MessageBox.Action.CANCEL,
+            onClose: (action: string | null) => {
+                if (action === remove) {
+                    void this.deleteService(service);
                 }
             }
         });
     }
 
-    private async doDelete(service: ODataServiceSummary): Promise<void> {
+    /**
+     * Deletes `service`; resolves whether it is gone. While one delete is
+     * running a second call does nothing and resolves `false`.
+     *
+     * Whatever answer the server gives means the row may no longer be true
+     * (someone else deleted the service, or attached it to an agent), so the
+     * list is read again after every refusal. Only a call that never got an
+     * answer leaves the list alone.
+     */
+    public async deleteService(service: ODataServiceSummary): Promise<boolean> {
+        if (this.deleting) {
+            return false;
+        }
+        this.deleting = true;
+        this.setBusyFlag();
         try {
-            await this.getAdminService().deleteODataService(service.name);
+            await this.withBusy(() => this.getAdminService().deleteODataService(service.name));
         } catch (error) {
-            // The central policy shows a 409 as a passing toast ("a run is
-            // already in flight"). Here it means the delete was refused, and
-            // the admin has to detach the service from the agents first, so
-            // it stays on screen and names them.
-            if (error instanceof AdminError && error.status === 409) {
-                const agents = this.formatUsedByNames(service.used_by);
-                MessageBox.error(agents ? this.text("odataDeleteInUse", [agents]) : error.detail);
-                // The row may be older than the refusal: show who uses it now.
-                void this.load();
+            const kind = ErrorHandler.classify(error);
+            if (error instanceof AdminError && kind === "conflict") {
+                // The central policy shows a 409 as a passing toast ("a run
+                // is already in flight"). Here it is a refusal the admin has
+                // to act on, and the server's text names the agents to
+                // detach the service from, so it stays on screen as it came.
+                MessageBox.error(error.detail || this.text("odataDeleteFailed", [service.title]));
             } else {
-                ErrorHandler.handle(error, `Could not delete the OData service "${service.title}".`);
+                ErrorHandler.handle(error, this.text("odataDeleteFailed", [service.title]));
             }
-            return;
+            if (error instanceof AdminError && (kind === "conflict" || kind === "error")) {
+                await this.load();
+            }
+            return false;
+        } finally {
+            this.deleting = false;
+            this.setBusyFlag();
         }
         MessageToast.show(this.text("odataDeleted"));
-        void this.load();
+        await this.load();
+        return true;
     }
+
+    // --- import -------------------------------------------------------------
 
     /** Lets the admin pick an exported service file and creates it. */
     public onImportConfiguration(): void {
-        const input = document.createElement("input");
-        input.type = "file";
-        input.accept = ".json,application/json";
-        input.addEventListener("change", () => {
-            const file = input.files?.[0];
-            if (file) {
-                void file.text().then((text) => this.importConfiguration(text));
+        if (this.importing) {
+            return;
+        }
+        if (!this.fileInput) {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.accept = ".json,application/json";
+            input.addEventListener("change", () => {
+                const file = input.files?.[0];
+                // Emptied so that picking the same file again fires `change`.
+                input.value = "";
+                if (file) {
+                    void this.importFile(file);
+                }
+            });
+            this.fileInput = input;
+        }
+        this.fileInput.click();
+    }
+
+    /**
+     * Reads a picked file and creates the service in it; resolves whether a
+     * service was created. A file that is too large is refused unread.
+     */
+    public async importFile(file: ConfigFile): Promise<boolean> {
+        if (this.importing) {
+            return false;
+        }
+        this.importing = true;
+        this.setBusyFlag();
+        try {
+            if (file.size > MAX_CONFIG_BYTES) {
+                MessageBox.error(this.text("odataConfigTooLarge"));
+                return false;
             }
-        });
-        input.click();
+            let text: string;
+            try {
+                text = await file.text();
+            } catch {
+                MessageBox.error(this.text("odataConfigUnreadable"));
+                return false;
+            }
+            return await this.importConfiguration(text);
+        } finally {
+            this.importing = false;
+            this.setBusyFlag();
+        }
     }
 
     /**
      * Creates a service from the text of an exported service file.
      *
-     * Resolves whether a service was created. A file that is not JSON, or
-     * whose general fields the server would refuse anyway, is reported
-     * without a call; the definition's own rules are the server's.
+     * A file that is not JSON, is not one object, or whose general fields
+     * the server would refuse anyway is reported without a call; the
+     * definition's own rules are the server's, and its answer is shown as
+     * it comes.
      */
-    public async importConfiguration(text: string): Promise<boolean> {
+    private async importConfiguration(text: string): Promise<boolean> {
         let parsed: unknown;
         try {
             parsed = JSON.parse(text);
-        } catch (error) {
-            MessageBox.error(this.text("odataConfigInvalid", [(error as Error).message]));
+        } catch {
+            MessageBox.error(this.text("odataConfigNotJson"));
+            return false;
+        }
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+            MessageBox.error(this.text("odataConfigNotObject"));
             return false;
         }
 
-        const input = ODataServices.toInput(parsed);
-        const invalid = Object.keys(odataCatalog.validate(input));
-        if (input.odata_version !== "v2" && input.odata_version !== "v4") {
-            invalid.push("odata_version");
-        }
+        const { input, invalid } = ODataServices.toInput(parsed as Record<string, unknown>);
         if (invalid.length) {
             MessageBox.error(this.text("odataConfigInvalid", [invalid.join(", ")]));
             return false;
         }
 
-        const created = await this.run(
-            this.getAdminService().createODataService(input),
-            "Could not create the OData service from the file."
-        );
-        if (!created) {
+        let created;
+        try {
+            created = await this.withBusy(() => this.getAdminService().createODataService(input));
+        } catch (error) {
+            if (error instanceof AdminError && ErrorHandler.classify(error) === "conflict") {
+                // A taken name: a refusal to act on, not a passing toast.
+                MessageBox.error(error.detail || this.text("odataConfigCreateFailed"));
+            } else {
+                ErrorHandler.handle(error, this.text("odataConfigCreateFailed"));
+            }
             return false;
         }
         MessageToast.show(this.text("odataConfigImported", [created.title]));
@@ -181,22 +337,32 @@ export default class ODataServices extends BaseController {
         return true;
     }
 
-    /** The payload fields of `parsed`, on top of an empty service. Anything
-     *  that is not an object yields the empty service, which fails validation
-     *  on every required field. */
-    private static toInput(parsed: unknown): ODataServiceInput {
+    /**
+     * The payload fields of a parsed file on top of an empty service, and
+     * the fields that cannot be right, in the order of the form.
+     */
+    private static toInput(source: Record<string, unknown>): { input: ODataServiceInput; invalid: string[] } {
         const input = odataCatalog.emptyService() as unknown as Record<string, unknown>;
-        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
-            const source = parsed as Record<string, unknown>;
-            // No default for the version: a file that does not say V2 or V4
-            // is refused rather than guessed at.
-            input.odata_version = undefined;
-            CONFIG_FIELDS.forEach((field) => {
-                if (source[field] !== undefined) {
-                    input[field] = source[field];
-                }
-            });
+        const wrongType: string[] = [];
+        CONFIG_FIELDS.forEach((field) => {
+            const value = source[field];
+            if (value === undefined) {
+                return;
+            }
+            if (TEXT_FIELDS.indexOf(field) !== -1 && typeof value !== "string") {
+                wrongType.push(field);
+                return;
+            }
+            input[field] = value;
+        });
+        // No default for the version: a file that does not say V2 or V4 is
+        // refused rather than guessed at.
+        if (source.odata_version !== "v2" && source.odata_version !== "v4") {
+            wrongType.push("odata_version");
         }
-        return input as unknown as ODataServiceInput;
+        const failed = Object.keys(odataCatalog.validate(input as unknown as ODataServiceInput));
+        const invalid = (CONFIG_FIELDS as readonly string[])
+            .filter((field) => wrongType.indexOf(field) !== -1 || failed.indexOf(field) !== -1);
+        return { input: input as unknown as ODataServiceInput, invalid };
     }
 }

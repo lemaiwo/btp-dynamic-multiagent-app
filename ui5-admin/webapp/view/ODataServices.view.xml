@@ -5,11 +5,6 @@
     <Page id="odataServicesPage" title="{i18n>navODataServices}">
         <headerContent>
             <Button
-                id="importODataConfigButton"
-                icon="sap-icon://upload"
-                text="{i18n>odataImportConfiguration}"
-                press=".onImportConfiguration" />
-            <Button
                 id="addODataServiceButton"
                 type="Emphasized"
                 icon="sap-icon://add"
@@ -17,24 +12,51 @@
                 press=".onCreate" />
         </headerContent>
         <content>
+            <!-- A failed load is said here, with a retry, so that the empty
+                 table below it cannot be read as an empty catalogue. -->
+            <MessageStrip
+                id="odataLoadFailed"
+                visible="{view>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{view>/loadError}">
+                <link>
+                    <Link id="odataRetry" text="{i18n>odataRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
             <Table
                 id="odataServicesTable"
                 items="{odata>/items}"
                 growing="true"
                 growingThreshold="50"
                 sticky="ColumnHeaders"
-                noDataText="{i18n>odataNoServices}">
-                <!-- In the table's toolbar, as on the Agents page: the page
-                     header has no overflow handling, so on a narrow window a
-                     search field there is clipped and pushes the title out. -->
+                popinLayout="GridSmall"
+                noDataText="{ parts: ['view>/loadFailed', 'view>/query'], formatter: '.formatNoData' }">
+                <!-- Search and import sit in the table's toolbar, as the
+                     search does on the Agents page: the page header has no
+                     overflow handling, so on a narrow window they are clipped
+                     there and push the title out. -->
                 <headerToolbar>
                     <OverflowToolbar>
                         <SearchField
                             id="odataSearch"
-                            width="18rem"
                             placeholder="{i18n>odataSearch}"
                             liveChange=".onSearch"
-                            search=".onSearch" />
+                            search=".onSearch">
+                            <!-- The search stays on a phone; only the import
+                                 button moves into the overflow menu. -->
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" maxWidth="18rem" />
+                            </layoutData>
+                        </SearchField>
+                        <ToolbarSpacer />
+                        <Button
+                            id="importODataConfigButton"
+                            icon="sap-icon://upload"
+                            text="{i18n>odataImportConfiguration}"
+                            enabled="{= !${view>/busy} }"
+                            press=".onImportConfiguration" />
                     </OverflowToolbar>
                 </headerToolbar>
                 <columns>
@@ -69,10 +91,10 @@
                                 </HBox>
                             </VBox>
                             <Text text="{odata>destination}" />
-                            <Text text="{= ${odata>odata_version} === 'v4' ? 'V4' : 'V2' }" />
+                            <Text text="{ path: 'odata>odata_version', formatter: '.formatVersion' }" />
                             <ObjectStatus
-                                text="{= ${odata>user_context} ? ${i18n>odataRunsAsUser} : ${i18n>odataRunsAsTechnical} }"
-                                state="{= ${odata>user_context} ? 'Information' : 'None' }" />
+                                text="{ path: 'odata>user_context', formatter: '.formatRunsAs' }"
+                                state="{ path: 'odata>user_context', formatter: '.formatRunsAsState' }" />
                             <Text text="{odata>counts/entity_sets}" />
                             <Text text="{odata>counts/operations}" />
                             <Text
@@ -82,6 +104,7 @@
                                 icon="sap-icon://delete"
                                 type="Transparent"
                                 tooltip="{i18n>delete}"
+                                enabled="{= !${view>/busy} }"
                                 press=".onDelete" />
                         </cells>
                     </ColumnListItem>
