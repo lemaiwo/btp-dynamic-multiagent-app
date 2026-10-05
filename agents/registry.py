@@ -33,6 +33,7 @@ from agents.db import (
 )
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.tools import NoUsableServiceError, attached_services
 from agents.shared import (
     create_mcp_server,
     default_model_name,
@@ -428,31 +429,17 @@ def _odata_line_text(value: object, limit: int) -> str:
     kept = []
     for ch in str(value or ""):
         category = unicodedata.category(ch)
-        if category == "Cf":  # zero-width, bidi controls: can hide a tag
+        # Cf: zero-width and bidi controls, which can hide a tag. Cs: a lone
+        # surrogate cannot be encoded, so one in a title would fail every
+        # model request of the agent. Co: private use, no agreed meaning.
+        if category in ("Cf", "Cs", "Co"):
             continue
         kept.append(" " if category in ("Cc", "Zl", "Zp") else ch)
-    text = " ".join("".join(kept).split())[:limit].strip()
-    return _ODATA_SERVICES_TAG.sub(lambda m: "<" + m.group(1) + "_" + m.group(2), text)
-
-
-def _odata_attached(oauth: object, snapshot: dict[str, dict]) -> list[dict]:
-    """The catalogue services a ``builtin:odata`` entry names that exist and
-    are enabled, in the entry's order.
-
-    The same selection the toolset makes (``agents.odata.tools``), so the
-    index lists exactly the services the tools answer for. Silent on
-    purpose: the toolset already logs a name that is missing or disabled,
-    and saying it twice per reload helps nobody.
-    """
-    names = oauth.get("services") if isinstance(oauth, dict) else None
-    if not isinstance(names, list):
-        return []
-    attached: list[dict] = []
-    for name in dict.fromkeys(n for n in names if isinstance(n, str)):
-        service = snapshot.get(name)
-        if isinstance(service, dict) and service.get("enabled", True) is not False:
-            attached.append({**service, "name": name})
-    return attached
+    text = " ".join("".join(kept).split())
+    # Neutralise first, cap last: the replacement is one character longer
+    # than the tag, and a cut cannot bring a tag back.
+    text = _ODATA_SERVICES_TAG.sub(lambda m: "<" + m.group(1) + "_" + m.group(2), text)
+    return text[:limit].strip()
 
 
 def _odata_instructions(
@@ -728,7 +715,7 @@ async def build_orchestrator() -> BuildResult:
                         oauth = spec.get("oauth")
                         odata_blocks.append(
                             _odata_instructions(
-                                _odata_attached(oauth, odata_by_name),
+                                attached_services(oauth, odata_by_name),
                                 # `is True`, as the toolset reads it.
                                 allow_write=isinstance(oauth, dict)
                                 and oauth.get("allow_write") is True,
@@ -745,6 +732,15 @@ async def build_orchestrator() -> BuildResult:
                 )
                 servers.append(server)
                 closable.append(server)
+            except NoUsableServiceError:
+                # An ordinary state after a service was deleted or disabled,
+                # and the toolset has named each one: one line, no traceback.
+                logger.warning(
+                    "Agent '%s': its %s entry names no usable OData service; "
+                    "the agent is built without the OData tools",
+                    row.name,
+                    BUILTIN_ODATA_URL,
+                )
             except Exception:
                 logger.exception(
                     "Failed to create MCP server %s for agent %s",

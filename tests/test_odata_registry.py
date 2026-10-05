@@ -62,7 +62,8 @@ from agents.db import (  # noqa: E402
 )
 from agents.deep import DeepState, WorkspaceScope, current_workspace  # noqa: E402
 from agents.ide.readonly import POLICIES, REFUSED_PREFIX, ReadOnlyGuard, policy_name  # noqa: E402
-from agents.registry import _odata_instructions  # noqa: E402
+from agents.odata import tools as odata_tools  # noqa: E402
+from agents.registry import _odata_instructions, _odata_line_text  # noqa: E402
 
 pytestmark = pytest.mark.usefixtures("real_agents_and_mcp")
 
@@ -315,6 +316,54 @@ def test_index_fields_are_capped():
     assert "N" * 200 in line and "N" * 201 not in line
 
 
+def test_a_field_never_exceeds_its_limit_after_the_tag_is_neutralised():
+    # Neutralising adds a character per tag: cap last, or the cap is not one.
+    text = _odata_line_text("<odata-services>" * 20, 120)
+    assert len(text) <= 120 and "<odata-services" not in text
+    edge = _odata_line_text("T" * 110 + "</odata-services>", 120)
+    assert len(edge) <= 120 and "</odata-services" not in edge
+
+
+def test_surrogates_and_private_use_characters_are_dropped():
+    assert _odata_line_text("a\ud800b\udfffc\ue000d\u200be", 120) == "abcde"
+
+
+def test_attached_services_is_the_silent_selection_of_the_toolset(caplog):
+    snapshot = {
+        "purchase-requisitions": SVC_USER,
+        "job-runs": SVC_JOBS,
+        "switched-off": {**SVC_JOBS, "name": "switched-off", "enabled": False},
+        "not-a-row": "x",
+    }
+    names = ["job-runs", 7, "gone", "switched-off", "not-a-row", "purchase-requisitions"]
+    names.append("job-runs")  # named twice, listed once
+    with caplog.at_level(logging.DEBUG):
+        got = odata_tools.attached_services({"services": names}, snapshot)
+    assert [s["name"] for s in got] == ["job-runs", "purchase-requisitions"]
+    assert caplog.records == []
+    for odd in (None, "x", {}, {"services": "job-runs"}, {"services": None}):
+        assert odata_tools.attached_services(odd, snapshot) == []
+    assert odata_tools.attached_services({"services": ["job-runs"]}, None) == []
+    # The toolset is built from exactly this selection, and still says why.
+    with caplog.at_level(logging.WARNING):
+        toolset_view = odata_tools._attached_services(
+            {"services": names}, snapshot, server_key="builtin:odata", agent_name="buyer"
+        )
+    assert [s["name"] for s in toolset_view] == [s["name"] for s in got]
+    assert toolset_view[0] is not snapshot["job-runs"]  # a private copy
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 3 and sum("'gone'" in m for m in said) == 1
+
+
+def test_no_usable_service_has_its_own_error_type():
+    assert issubclass(odata_tools.NoUsableServiceError, ValueError)
+    with pytest.raises(odata_tools.NoUsableServiceError, match="at least one enabled"):
+        odata_tools.odata_toolset({"services": ["gone"]}, auth_mode="destination", services={})
+    with pytest.raises(ValueError) as wrong_mode:
+        odata_tools.odata_toolset({"services": ["gone"]}, auth_mode="jwt", services={})
+    assert not isinstance(wrong_mode.value, odata_tools.NoUsableServiceError)
+
+
 def test_no_services_no_block():
     assert _odata_instructions([], allow_write=True) == ""
 
@@ -450,12 +499,83 @@ async def test_a_retired_build_closes_the_odata_clients_also_behind_a_prefix():
     built-in is a wrapper without that attribute, so the build must keep the
     toolset itself."""
     await add_service()
-    await add_agent("buyer", SAPNOTES, odata_server("purchase-requisitions"))
+    await add_agent("plain", odata_server("purchase-requisitions"))
+    await add_agent("prefixed", SAPNOTES, odata_server("purchase-requisitions"))
+    registry = registry_module.Registry()
+
+    old = await registry.reload()
+    closed: list[int] = []
+    odata = [c for c in old.mcp_clients if set(getattr(c, "tools", {})) == TOOLS]
+    assert len(odata) == 2  # one per agent, the prefixed one unwrapped
+
+    for index, toolset in enumerate(odata):
+        async def aclose(index=index):
+            closed.append(index)
+
+        toolset.http_client.aclose = aclose
+
+    assert closed == []
+    await registry.reload()  # retires `old`; nothing is running on it
+    assert sorted(closed) == [0, 1]
+    assert registry._retired == []
+
+
+async def test_no_usable_service_is_one_warning_without_a_traceback(caplog):
+    await add_agent("ghost", odata_server("gone-service"))
+    await add_agent("mixed", SAPNOTES, odata_server("gone-service"))
+
+    with caplog.at_level(logging.WARNING):
+        build = await registry_module.build_orchestrator()
+
+    assert "ghost" not in build.specialists and "mixed" in build.specialists
+    assert not [r for r in caplog.records if r.exc_info], "no traceback for a missing service"
+    for agent in ("ghost", "mixed"):
+        said = [
+            r for r in caplog.records
+            if r.name == registry_module.logger.name
+            and "OData" in r.getMessage() and f"'{agent}'" in r.getMessage()
+        ]
+        assert len(said) == 1, [r.getMessage() for r in caplog.records]
+        assert said[0].levelno == logging.WARNING
+        assert "MCP server" not in said[0].getMessage()
+        assert "gone-service" not in said[0].getMessage()  # the toolset named it already
+    assert not [r for r in caplog.records if "Failed to create MCP server" in r.getMessage()]
+
+
+async def test_another_failure_of_the_entry_keeps_its_traceback(caplog):
+    await add_service()
+    await add_agent("wrong-mode", SAPNOTES, odata_server("purchase-requisitions", auth_mode="jwt"))
+
+    with caplog.at_level(logging.WARNING):
+        build = await registry_module.build_orchestrator()
+
+    assert "wrong-mode" in build.specialists
+    assert [r for r in caplog.records if r.exc_info and "wrong-mode" in r.getMessage()]
+
+
+async def test_a_lone_surrogate_in_a_stored_title_does_not_break_the_build(monkeypatch):
+    """A lone surrogate cannot be encoded: left in the instructions it would
+    fail every model request of the agent, not just look odd."""
+    await add_service()
+    await add_agent("buyer", odata_server("purchase-requisitions"))
+    real = registry_module.list_odata_services
+
+    async def with_surrogate(session):
+        rows = await real(session)
+        for row in rows:
+            session.expunge(row)  # as read, then the text a driver may hand back
+            row.title = "Purchase\ud800 requi\udfffsitions\ue000"
+            row.purpose = "Read \udc80them"
+        return rows
+
+    monkeypatch.setattr(registry_module, "list_odata_services", with_surrogate)
 
     build = await registry_module.build_orchestrator()
+    tools, instructions = await seen_by_model(build.specialists["buyer"])
 
-    closers = [c for c in build.mcp_clients if hasattr(getattr(c, "http_client", None), "aclose")]
-    assert len(closers) == len(build.mcp_clients) == 2
+    assert TOOLS <= tools
+    instructions.encode("utf-8")  # raises on a lone surrogate
+    assert "- **purchase-requisitions**: Purchase requisitions. Read them" in instructions
 
 
 # --- ABAP Assistant sessions: default-deny ---------------------------------

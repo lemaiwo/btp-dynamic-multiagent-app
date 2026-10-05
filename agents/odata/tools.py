@@ -70,6 +70,8 @@ _SCRUB: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 __all__ = [
+    "NoUsableServiceError",
+    "attached_services",
     "DEFAULT_TOP",
     "MAX_EXPAND",
     "MAX_FILTER_CHARS",
@@ -81,6 +83,42 @@ __all__ = [
 ]
 
 
+class NoUsableServiceError(ValueError):
+    """A ``builtin:odata`` entry names no catalogue service that exists and
+    is enabled.
+
+    Its own type, so the registry can tell "an admin deleted or disabled the
+    service" (an ordinary state, already logged by name) from a broken entry;
+    a ``ValueError`` still, so a caller that knows nothing of it behaves as
+    before.
+    """
+
+
+def _entry_names(oauth: object) -> list[str]:
+    """The distinct service names of an entry's config block, in its order."""
+    names = oauth.get("services") if isinstance(oauth, dict) else None
+    if not isinstance(names, list):
+        return []
+    return list(dict.fromkeys(n for n in names if isinstance(n, str)))
+
+
+def attached_services(oauth: object, snapshot: dict[str, dict] | None) -> list[dict]:
+    """The catalogue services an entry names that exist and are enabled, in
+    the entry's order, each with its ``name``.
+
+    The one selection: the toolset is built from it and the registry lists
+    it in the agent's instructions, so the two cannot disagree. Silent, and
+    the services are the snapshot's own (not copies): for reading only.
+    """
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    kept: list[dict] = []
+    for name in _entry_names(oauth):
+        service = snapshot.get(name)
+        if isinstance(service, dict) and service.get("enabled", True) is not False:
+            kept.append({**service, "name": name})
+    return kept
+
+
 def _attached_services(
     oauth: dict[str, Any],
     snapshot: dict[str, dict],
@@ -88,36 +126,30 @@ def _attached_services(
     server_key: str,
     agent_name: str,
 ) -> list[dict]:
-    """The enabled catalogue services this entry names, in the entry's order."""
-    names = oauth.get("services")
-    if not isinstance(names, list):
-        names = []
-    kept: list[dict] = []
+    """The enabled catalogue services this entry names, in the entry's order.
+
+    `attached_services`, plus one warning per name that was left out and a
+    private copy of each service that was kept.
+    """
+    kept = attached_services(oauth, snapshot)
+    kept_names = {service["name"] for service in kept}
     who = f"agent '{agent_name}'" if agent_name else "an agent"
-    for name in dict.fromkeys(n for n in names if isinstance(n, str)):
-        service = snapshot.get(name)
-        if not isinstance(service, dict):
-            # A service deleted or renamed behind the agent: the agent keeps
-            # running on the rest instead of failing the whole registry build.
-            logger.warning(
-                "%s of %s names the OData service '%s', which is not in the catalogue",
-                server_key,
-                who,
-                name,
-            )
+    for name in _entry_names(oauth):
+        if name in kept_names:
             continue
-        if service.get("enabled", True) is False:
-            logger.warning(
-                "%s of %s names the OData service '%s', which is disabled",
-                server_key,
-                who,
-                name,
-            )
-            continue
-        # A private copy: the registry shares one snapshot between agents,
-        # and a toolset must keep answering from what it was built with.
-        kept.append(copy.deepcopy({**service, "name": name}))
-    return kept
+        # A service deleted, renamed or disabled behind the agent: the agent
+        # keeps running on the rest instead of failing the whole registry build.
+        known = isinstance(snapshot, dict) and isinstance(snapshot.get(name), dict)
+        logger.warning(
+            "%s of %s names the OData service '%s', which is %s",
+            server_key,
+            who,
+            name,
+            "disabled" if known else "not in the catalogue",
+        )
+    # A private copy: the registry shares one snapshot between agents,
+    # and a toolset must keep answering from what it was built with.
+    return [copy.deepcopy(service) for service in kept]
 
 
 class _NoCookies(CookiePolicy):
@@ -255,7 +287,7 @@ def odata_toolset(
         oauth, services or {}, server_key=server_key, agent_name=agent_name
     )
     if not attached:
-        raise ValueError(
+        raise NoUsableServiceError(
             f"{server_key} needs at least one enabled catalogue service in 'services'"
         )
     # `is True`, not bool(): the JSON string "false" is truthy, and this is
