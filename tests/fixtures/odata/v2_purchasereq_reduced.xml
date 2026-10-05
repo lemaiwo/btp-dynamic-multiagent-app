@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-reduced EDMX 1.0 of a purchase-requisition style OData V2 service.
+     Structurally faithful (namespaces, sap: annotations, association sets),
+     generic names only; not a copy of any system's $metadata. -->
+<edmx:Edmx Version="1.0"
+    xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx"
+    xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+    xmlns:sap="http://www.sap.com/Protocols/SAPData">
+  <edmx:DataServices m:DataServiceVersion="2.0">
+    <Schema Namespace="PURCHASEREQ_SRV" xml:lang="en" sap:schema-version="1"
+        xmlns="http://schemas.microsoft.com/ado/2008/09/edm">
+      <EntityType Name="A_PurchaseRequisitionHeaderType" sap:label="Purchase requisition" sap:content-version="1">
+        <Key>
+          <PropertyRef Name="PurchaseRequisition"/>
+        </Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String" Nullable="false" MaxLength="10" sap:label="Purchase requisition" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="PurchaseRequisitionType" Type="Edm.String" MaxLength="4" sap:label="Document type"/>
+        <Property Name="PurReqnDescription" Type="Edm.String" MaxLength="40" sap:label="Description"/>
+        <NavigationProperty Name="to_PurchaseReqnItem" Relationship="PURCHASEREQ_SRV.assoc_Header_Item" FromRole="FromRole_assoc_Header_Item" ToRole="ToRole_assoc_Header_Item"/>
+      </EntityType>
+      <EntityType Name="A_PurchaseRequisitionItemType" sap:label="Purchase requisition item" sap:content-version="1">
+        <Key>
+          <PropertyRef Name="PurchaseRequisition"/>
+          <PropertyRef Name="PurchaseRequisitionItem"/>
+        </Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String" Nullable="false" MaxLength="10" sap:label="Purchase requisition" sap:updatable="false"/>
+        <Property Name="PurchaseRequisitionItem" Type="Edm.String" Nullable="false" MaxLength="5" sap:label="Item" sap:updatable="false"/>
+        <Property Name="PurReqnReleaseStatus" Type="Edm.String" MaxLength="2" sap:label="Release status" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="Material" Type="Edm.String" MaxLength="40" sap:label="Material"/>
+        <Property Name="RequestedQuantity" Type="Edm.Decimal" Precision="13" Scale="3" sap:unit="BaseUnit" sap:label="Quantity"/>
+        <Property Name="BaseUnit" Type="Edm.String" MaxLength="3" sap:label="Unit" sap:semantics="unit-of-measure"/>
+        <Property Name="ItemNetAmount" Type="Edm.Decimal" Precision="16" Scale="3" sap:unit="PurReqnItemCurrency" sap:label="Net amount" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="PurReqnItemCurrency" Type="Edm.String" MaxLength="5" sap:label="Currency" sap:semantics="currency-code"/>
+        <Property Name="CreatedByUser" Type="Edm.String" MaxLength="12" sap:label="Created by" sap:creatable="false" sap:updatable="false" sap:filterable="false"/>
+        <Property Name="CreationDate" Type="Edm.DateTime" Precision="0" sap:display-format="Date" sap:label="Created on" sap:creatable="false" sap:updatable="false"/>
+        <NavigationProperty Name="to_PurchaseReqn" Relationship="PURCHASEREQ_SRV.assoc_Header_Item" FromRole="ToRole_assoc_Header_Item" ToRole="FromRole_assoc_Header_Item"/>
+      </EntityType>
+      <Association Name="assoc_Header_Item" sap:content-version="1">
+        <End Type="PURCHASEREQ_SRV.A_PurchaseRequisitionHeaderType" Multiplicity="1" Role="FromRole_assoc_Header_Item"/>
+        <End Type="PURCHASEREQ_SRV.A_PurchaseRequisitionItemType" Multiplicity="*" Role="ToRole_assoc_Header_Item"/>
+      </Association>
+      <EntityContainer Name="PURCHASEREQ_SRV_Entities" m:IsDefaultEntityContainer="true" sap:supported-formats="atom json xlsx">
+        <EntitySet Name="A_PurchaseRequisitionHeader" EntityType="PURCHASEREQ_SRV.A_PurchaseRequisitionHeaderType" sap:deletable="false" sap:content-version="1"/>
+        <EntitySet Name="A_PurchaseRequisitionItem" EntityType="PURCHASEREQ_SRV.A_PurchaseRequisitionItemType" sap:creatable="false" sap:updatable="true" sap:deletable="false" sap:content-version="1"/>
+        <AssociationSet Name="assoc_Header_Item_Set" Association="PURCHASEREQ_SRV.assoc_Header_Item" sap:creatable="false" sap:updatable="false" sap:deletable="false" sap:content-version="1">
+          <End EntitySet="A_PurchaseRequisitionHeader" Role="FromRole_assoc_Header_Item"/>
+          <End EntitySet="A_PurchaseRequisitionItem" Role="ToRole_assoc_Header_Item"/>
+        </AssociationSet>
+        <FunctionImport Name="ReleaseItem" ReturnType="PURCHASEREQ_SRV.A_PurchaseRequisitionItemType" EntitySet="A_PurchaseRequisitionItem" m:HttpMethod="POST" sap:action-for="PURCHASEREQ_SRV.A_PurchaseRequisitionItemType" sap:label="Release item">
+          <Parameter Name="PurchaseRequisition" Type="Edm.String" Mode="In" MaxLength="10" Nullable="false"/>
+          <Parameter Name="PurchaseRequisitionItem" Type="Edm.String" Mode="In" MaxLength="5" Nullable="false"/>
+          <Parameter Name="ReleaseCode" Type="Edm.String" Mode="In" MaxLength="2"/>
+        </FunctionImport>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>
