@@ -6,8 +6,7 @@
     <Dialog
         id="odataDuplicateDialog"
         title="{i18n>odataDuplicateTitle}"
-        contentWidth="32rem"
-        initialFocus="odataDuplicateName">
+        contentWidth="32rem">
         <content>
             <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop">
                 <Text id="odataDuplicateHint" text="{i18n>odataDuplicateHint}" />
@@ -18,6 +17,16 @@
                     showIcon="true"
                     class="sapUiSmallMarginTop"
                     text="{i18n>odataDuplicateUnsaved}" />
+                <!-- The copy is the stored service whole, its write
+                     operations included: they are listed, with who can run
+                     them. Not by colour alone: an icon and the words. -->
+                <MessageStrip
+                    id="odataDuplicateWrites"
+                    visible="{= !!${svc>/duplicate/writes} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"
+                    text="{ path: 'svc>/duplicate/writes', formatter: '.formatDuplicateWrites' }" />
                 <!-- What the server refuses about anything but the two
                      fields below, in its own words, as plain text. -->
                 <MessageStrip
@@ -74,7 +83,7 @@
         <beginButton>
             <Button
                 id="odataDuplicateConfirm"
-                text="{i18n>odataDuplicate}"
+                text="{ path: 'svc>/duplicate/writes', formatter: '.formatDuplicateAction' }"
                 type="Emphasized"
                 enabled="{= !${svc>/busy} }"
                 press=".onDuplicateConfirm" />

@@ -61,7 +61,7 @@ QUnit.test("counts, hasWrite and writeSummary", function (assert) {
     assert.deepEqual(odataCatalog.writeSummary(READ_ONLY), []);
 });
 
-QUnit.test("an operation counts as a write only when it is enabled and changes data", function (assert) {
+QUnit.test("an operation counts as a write only when it is enabled and is not a plain read", function (assert) {
     const operation = WRITING.operations[0];
     const withOperation = (over: Partial<typeof operation>): ODataDefinition => ({
         entity_sets: READ_ONLY.entity_sets, operations: [{ ...operation, ...over }]
@@ -69,7 +69,9 @@ QUnit.test("an operation counts as a write only when it is enabled and changes d
 
     assert.strictEqual(odataCatalog.hasWrite(withOperation({})), true);
     assert.strictEqual(odataCatalog.hasWrite(withOperation({ enabled: false })), false, "disabled");
-    assert.strictEqual(odataCatalog.hasWrite(withOperation({ changes_data: false })), false, "read-only call");
+    assert.strictEqual(
+        odataCatalog.hasWrite(withOperation({ changes_data: false, http_method: "GET" })), false, "read-only call"
+    );
     assert.deepEqual(odataCatalog.writeSummary(withOperation({ enabled: false })), []);
     assert.deepEqual(
         odataCatalog.writeSummary(withOperation({ title: "" })), ["ReleaseItem"],
@@ -551,4 +553,117 @@ QUnit.test("newWrites counts every write as new when the stored service is switc
 QUnit.test("entitySetRow labels a row by title and technical name", function (assert) {
     assert.strictEqual(odataCatalog.entitySetRow(entitySet("A_Item", { title: "Item" }), 0).label, "Item A_Item");
     assert.strictEqual(odataCatalog.entitySetRow(entitySet("A_Item"), 0).label, "A_Item", "not twice when there is no title");
+});
+
+// --- review round 2 ---------------------------------------------------------
+
+QUnit.test("an enabled operation is a write unless it is marked as reading AND sent with GET", function (assert) {
+    const operation = WRITING.operations[0];
+    const withOperation = (over: Partial<typeof operation>): ODataDefinition => ({
+        entity_sets: READ_ONLY.entity_sets, operations: [{ ...operation, ...over }]
+    });
+    const isWrite = (over: Partial<typeof operation>) => odataCatalog.operationIsWrite({ ...operation, ...over });
+
+    assert.strictEqual(isWrite({ changes_data: true, http_method: "POST" }), true);
+    assert.strictEqual(isWrite({ changes_data: true, http_method: "GET" }), true, "marked as changing data");
+    assert.strictEqual(isWrite({ changes_data: false, http_method: "POST" }), true, "a POST is a write whatever the flag says");
+    assert.strictEqual(isWrite({ changes_data: false, http_method: "GET" }), false, "the one read");
+    assert.strictEqual(
+        isWrite({ changes_data: undefined as unknown as boolean, http_method: "GET" }), true,
+        "a missing flag does not read as 'only reads'"
+    );
+
+    // The tag, the summary, the strip and the question all follow it.
+    assert.strictEqual(odataCatalog.hasWrite(withOperation({ changes_data: false, http_method: "POST" })), true);
+    assert.strictEqual(odataCatalog.hasWrite(withOperation({ changes_data: false, http_method: "GET" })), false);
+    assert.strictEqual(
+        odataCatalog.hasWrite(withOperation({ changes_data: false, http_method: "POST", enabled: false })), false, "disabled"
+    );
+    assert.deepEqual(
+        odataCatalog.writeSummary(withOperation({ changes_data: false, http_method: "POST" })), ["Release item"]
+    );
+    assert.deepEqual(
+        odataCatalog.writeOperations(withOperation({ changes_data: false, http_method: "POST" })).map((o) => o.name),
+        ["ReleaseItem"]
+    );
+    assert.deepEqual(odataCatalog.writeOperations(withOperation({ enabled: false })), []);
+    assert.deepEqual(odataCatalog.writeOperations(undefined), []);
+});
+
+QUnit.test("pendingWrites adds the enabled write operations a save newly opens", function (assert) {
+    const operation = WRITING.operations[0];
+    const off: ODataDefinition = { entity_sets: WRITING.entity_sets, operations: [{ ...operation, enabled: false }] };
+    const none: ODataDefinition = { entity_sets: WRITING.entity_sets, operations: [] };
+    const release = [{ name: "ReleaseItem", title: "Release item" }];
+
+    assert.deepEqual(odataCatalog.pendingWrites(WRITING, WRITING), { entitySets: [], operations: [] }, "stored and enabled: not new");
+    assert.deepEqual(odataCatalog.pendingWrites(off, WRITING).operations, release, "stored but not enabled");
+    assert.deepEqual(odataCatalog.pendingWrites(none, WRITING).operations, release, "not stored (matched by name)");
+    assert.deepEqual(odataCatalog.pendingWrites(undefined, WRITING).operations, release, "a new service");
+    assert.deepEqual(
+        odataCatalog.pendingWrites(WRITING, WRITING, true),
+        {
+            entitySets: [
+                { name: "A_PurchaseRequisitionItem", title: "Requisition item", operations: ["update"] },
+                { name: "A_PurchaseReqnItemText", title: "Item text", operations: ["create", "update"] }
+            ],
+            operations: release
+        },
+        "a service that is switched on opens everything it has"
+    );
+    assert.deepEqual(odataCatalog.pendingWrites(WRITING, off).operations, [], "an operation that is off is no write");
+    assert.deepEqual(
+        odataCatalog.pendingWrites(
+            { entity_sets: [], operations: [{ ...operation, changes_data: false, http_method: "GET" }] },
+            { entity_sets: [], operations: [{ ...operation, title: "", changes_data: false, http_method: "POST" }] }
+        ).operations,
+        [{ name: "ReleaseItem", title: "ReleaseItem" }],
+        "stored as a read, now a write: new, and named by its name without a title"
+    );
+});
+
+QUnit.test("pendingCount and pendingMinus say what one tick changed", function (assert) {
+    const before = odataCatalog.pendingWrites(READ_ONLY, WRITING);
+    const item = { name: "A_PurchaseRequisitionItem", title: "Requisition item" };
+    const after = {
+        entitySets: [{ ...item, operations: ["update", "delete"] as const }].map((w) => ({ ...w, operations: [...w.operations] })),
+        operations: [] as { name: string; title: string }[]
+    };
+    assert.strictEqual(odataCatalog.pendingCount(before), 4, "update + create, update + one operation");
+    assert.strictEqual(odataCatalog.pendingCount({ entitySets: [], operations: [] }), 0);
+    assert.deepEqual(
+        odataCatalog.pendingMinus(after, before), { entitySets: [{ ...item, operations: ["delete"] }], operations: [] },
+        "what is new in it"
+    );
+    assert.deepEqual(
+        odataCatalog.pendingMinus(before, after),
+        {
+            entitySets: [{ name: "A_PurchaseReqnItemText", title: "Item text", operations: ["create", "update"] }],
+            operations: [{ name: "ReleaseItem", title: "Release item" }]
+        },
+        "what is gone from it"
+    );
+    assert.deepEqual(odataCatalog.pendingMinus(before, before), { entitySets: [], operations: [] });
+});
+
+QUnit.test("serverRefusal keeps what a refusal says before its first field and its 'and n more' tail", function (assert) {
+    assert.deepEqual(
+        odataCatalog.serverRefusal("Not accepted; definition.entity_sets.0: Value error, something; title: Field required; and 12 more"),
+        {
+            lead: "Not accepted",
+            byLoc: { "definition.entity_sets.0": "something", title: "Field required" },
+            more: "and 12 more"
+        }
+    );
+    assert.deepEqual(
+        odataCatalog.serverRefusal("title: Field required"), { lead: "", byLoc: { title: "Field required" }, more: "" }
+    );
+    assert.deepEqual(
+        odataCatalog.serverRefusal("Service 'a' is used by agent(s) 'b'; 'c'"),
+        { lead: "Service 'a' is used by agent(s) 'b'; 'c'", byLoc: {}, more: "" }
+    );
+    assert.deepEqual(odataCatalog.serverRefusal(undefined), { lead: "", byLoc: {}, more: "" });
+    assert.deepEqual(
+        odataCatalog.serverErrors("x; title: Field required; and 3 more"), { title: "Field required" }, "serverErrors is its byLoc"
+    );
 });

@@ -9,6 +9,7 @@
         id="odataServiceDetailPage"
         title="{svc>/title}"
         showNavButton="true"
+        class="odataDetailPage"
         navButtonPress=".onBack">
         <!-- Tags and actions sit in a toolbar of their own, not in the page
              header: the header has no overflow handling, so three buttons
@@ -36,7 +37,7 @@
                     text="{i18n>odataTagWrite}"
                     state="Warning"
                     inverted="true"
-                    visible="{= ${svc>/exists} &amp;&amp; ${svc>/has_write} }" />
+                    visible="{ parts: ['svc>/exists', 'svc>/original/definition'], formatter: '.formatWriteTag' }" />
                 <ObjectStatus
                     id="odataTagDisabled"
                     text="{i18n>odataTagDisabled}"
@@ -75,16 +76,26 @@
         </subHeader>
         <content>
             <!-- Writes that are ticked but not saved: what they will let
-                 agents do, said before Save. Sticky under the toolbar that
-                 holds Save, so it is in view wherever the page is scrolled
-                 to; the controller also announces it to screen readers. -->
-            <MessageStrip
-                id="odataPendingWrites"
-                visible="{= !!${svc>/pendingWrites} }"
-                type="Warning"
-                showIcon="true"
-                class="odataStickyStrip sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
-                text="{svc>/pendingWrites}" />
+                 agents do, said before Save. Its slot is sticky under the
+                 toolbar that holds Save, so the strip is in view wherever
+                 the page is scrolled to, and it keeps room for the strip at
+                 all times, so the table does not move when the strip comes
+                 and goes (`holdPlace` in the controller covers a strip that
+                 needs more room). The inner box is what the controller
+                 watches for a change of height; it never changes the height
+                 of that one itself. The controller announces each change
+                 to screen readers. -->
+            <VBox id="odataPendingSlot" class="odataStickySlot">
+                <VBox id="odataPendingInner">
+                    <MessageStrip
+                        id="odataPendingWrites"
+                        visible="{= !!${svc>/pendingWrites} }"
+                        type="Warning"
+                        showIcon="true"
+                        class="odataPendingStrip sapUiSmallMarginBeginEnd sapUiTinyMarginTop"
+                        text="{svc>/pendingWrites}" />
+                </VBox>
+            </VBox>
             <!-- A service that could not be read is said here, with a retry,
                  and the form stays away: an empty form with a Save button
                  could be saved over the real service. -->
@@ -343,6 +354,20 @@
                 <core:InvisibleText id="odataOpNameUpdate" text="{i18n>odataOpUpdate}" />
                 <core:InvisibleText id="odataOpNameDelete" text="{i18n>odataOpDelete}" />
                 <core:InvisibleText id="odataOpWriteName" text="{i18n>odataWriteOperation}" />
+                <!-- After a refused save whose marked rows were not all on
+                     screen, the table shows the marked rows alone; this says
+                     so and is the way back. -->
+                <MessageStrip
+                    id="odataProblemsOnly"
+                    visible="{= !!${svc>/problemsOnly} }"
+                    type="Information"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{svc>/problemsOnly}">
+                    <link>
+                        <Link id="odataShowAll" text="{i18n>odataShowAll}" press=".onShowAllEntitySets" />
+                    </link>
+                </MessageStrip>
                 <!-- Growing: a service can hold 200 entity sets; twenty rows
                      at a time keep the page quick. The search filters all of
                      them, shown or not. -->

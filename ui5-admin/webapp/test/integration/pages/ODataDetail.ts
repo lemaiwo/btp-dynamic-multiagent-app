@@ -246,3 +246,34 @@ export function inView(element: UI5Element, id: string): boolean {
 export function announced(): string {
     return document.getElementById("__invisiblemessage-polite")?.textContent ?? "";
 }
+
+// --- scrolling ---------------------------------------------------------------
+
+/** The element of the page that scrolls. */
+export function scrollerOf(element: UI5Element): HTMLElement {
+    return control<Page>(element, PAGE).getDomRef("cont") as HTMLElement;
+}
+
+/** Where the row titled `title` is on screen (its top edge, in pixels). */
+export function rowTop(element: UI5Element, title: string): number {
+    return entityItem(element, title).getDomRef()!.getBoundingClientRect().top;
+}
+
+/** Whether the page is scrolled so far that the table's header row is
+ *  above the visible part of the page. */
+export function tableHeaderScrolledAway(element: UI5Element): boolean {
+    const header = control<Table>(element, ENTITY_TABLE).getDomRef()!.querySelector("thead") as HTMLElement;
+    return header.getBoundingClientRect().bottom < scrollerOf(element).getBoundingClientRect().top;
+}
+
+/** Presses the table's "More" button, as a user does. */
+export function pressMore(element: UI5Element): void {
+    const table = control<Table>(element, ENTITY_TABLE);
+    (table as unknown as { $(suffix: string): { trigger(event: string): void } }).$("trigger").trigger("tap");
+}
+
+/** Whether the keyboard focus is on (or in) the control. */
+export function hasFocus(candidate: UI5Element): boolean {
+    const dom = (candidate as Control).getDomRef();
+    return !!dom && !!document.activeElement && dom.contains(document.activeElement);
+}

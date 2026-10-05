@@ -103,11 +103,29 @@ html.sapUiTheme-sap_horizon .odataMeta.sapMText {
 }
 /* What the ticked, unsaved writes will allow stays under the toolbar with
    Save while the page scrolls: it must be in view whenever a write is
-   pending, wherever in a long table the tick was set. */
-.odataStickyStrip.sapMMsgStrip {
+   pending, wherever in a long table the tick was set. The strip sits in a
+   slot that is there at all times and keeps the room of a two-line strip,
+   so the table does not move under the pointer when the strip comes and
+   goes; an empty slot lets clicks through to what scrolls under it. */
+.odataStickySlot.sapMFlexBox {
     position: sticky;
-    top: 0.5rem;
+    top: 0;
     z-index: 2;
+    min-height: 3.625rem;
+    pointer-events: none;
+}
+.odataStickySlot .odataPendingStrip.sapMMsgStrip {
+    pointer-events: auto;
+    /* A last resort on a small screen with long names: the strip never
+       takes more than part of the window, and scrolls in itself. */
+    max-height: min(12rem, 45vh);
+    overflow-y: auto;
+}
+/* A strip that needs more than the slot's room moves what is below it; the
+   controller scrolls the page by as much (holdPlace). The browser's own
+   scroll anchoring would do the same a second time where it exists. */
+.odataDetailPage.sapMPage > section {
+    overflow-anchor: none;
 }
 /* A message on a row is a sentence and wraps under the description. */
 .odataRowMessage.sapMObjStatus {

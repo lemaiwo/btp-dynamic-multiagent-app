@@ -12,13 +12,16 @@ import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
 import odataCatalog, {
-    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataNewWrite
+    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataPending
 } from "../model/odataCatalog";
 import { canonical } from "../model/runsPanel";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type Dialog from "sap/m/Dialog";
 import type CheckBox from "sap/m/CheckBox";
+import type ColumnListItem from "sap/m/ColumnListItem";
+import type Page from "sap/m/Page";
+import type Table from "sap/m/Table";
 import type SearchField from "sap/m/SearchField";
 import type SegmentedButton from "sap/m/SegmentedButton";
 import type ListBinding from "sap/ui/model/ListBinding";
@@ -55,7 +58,13 @@ interface DuplicateState {
     error: string;
     /** The form has unsaved changes, which are not part of the copy. */
     unsaved: boolean;
+    /** The writes the copy gets, as the dialog lists them, or "". */
+    writes: string;
 }
+
+/** How many entity sets and operations the strip next to Save names; the
+ *  Save question lists them all. */
+const STRIP_CAP = 3;
 
 /** The i18n key of each entity-set operation's name. */
 const OP_TEXT: Record<ODataEntityOp, string> = {
@@ -93,6 +102,13 @@ export default class ODataServiceDetail extends ODataController {
     private justCreated?: string;
 
     private duplicateDialog?: Dialog;
+
+    /** Watches the height of what the slot of the pending-writes strip holds. */
+    private slotObserver?: ResizeObserver;
+
+    /** The slot's height just before something the admin did may change
+     *  it (`keepPlace`); undefined when nothing is to be held in place. */
+    private slotHeight?: number;
 
     /** The hash this page is shown under, to come back to when the user
      *  leaves by the browser (back button, edited address) with unsaved
@@ -144,7 +160,81 @@ export default class ODataServiceDetail extends ODataController {
         window.addEventListener("beforeunload", this.onBeforeUnload);
     }
 
+    /** The view is (again) in the page: the slot's element may be a new one. */
+    public onAfterRendering(): void {
+        this.slotObserver?.disconnect();
+        this.slotObserver = undefined;
+        // The box around the strip, not the slot: `holdPlace` may give the
+        // slot a height, and an observer must not resize what it observes.
+        const inner = this.byId("odataPendingInner")?.getDomRef();
+        if (inner && typeof ResizeObserver !== "undefined") {
+            this.slotObserver = new ResizeObserver(() => this.holdPlace());
+            this.slotObserver.observe(inner);
+        }
+    }
+
+    /**
+     * Call before a change the admin makes may change the strip about
+     * pending writes (a tick, the Enabled switch, a save): notes the height
+     * of its slot, so that `holdPlace` can keep the page where it is.
+     */
+    private keepPlace(): void {
+        const slot = this.byId("odataPendingSlot")?.getDomRef() as HTMLElement | null | undefined;
+        this.slotHeight = slot && slot.offsetParent !== null ? slot.offsetHeight : undefined;
+    }
+
+    /**
+     * The slot above the page content changed its height: the strip about
+     * pending writes appeared, grew, shrank or went. Everything below it
+     * would move by that much -- the row under the pointer included, so
+     * that a second click lands on its neighbour. The page is scrolled by
+     * the same amount instead, before the browser paints, so what is on
+     * screen stays where it is (the browser's own scroll anchoring is
+     * switched off for this page in style.css: not every browser has it).
+     * Only after `keepPlace`: a page that is being loaded is not held.
+     *
+     * The slot keeps room for a strip of two lines at all times
+     * (style.css), so the usual strip changes nothing at all. Two limits:
+     * at the very top of the page a strip that needs more room takes it and
+     * moves the content down by the difference -- scrolling there would put
+     * the top of the form, the Enabled switch included, under the strip;
+     * and where the page cannot scroll up as far as the slot shrank, the
+     * slot keeps the rest as empty room until the next load.
+     */
+    private holdPlace(): void {
+        const slot = this.byId("odataPendingSlot")?.getDomRef() as HTMLElement | null | undefined;
+        const scroller = (this.byId("odataServiceDetailPage") as Page | undefined)?.getDomRef("cont") as
+            HTMLElement | null | undefined;
+        if (!slot || !scroller || slot.offsetParent === null) {
+            // Not on screen (another page is shown): nothing moved.
+            return;
+        }
+        const height = slot.offsetHeight;
+        const before = this.slotHeight;
+        this.slotHeight = undefined;
+        // A row that gets the keyboard focus is scrolled to below the strip.
+        scroller.style.scrollPaddingTop = this.svc().getProperty("/pendingWrites") ? `${height}px` : "";
+        if (before === undefined || before === height || (height > before && scroller.scrollTop === 0)) {
+            return;
+        }
+        const wanted = scroller.scrollTop + height - before;
+        scroller.scrollTop = Math.max(wanted, 0);
+        if (wanted < 0) {
+            slot.style.minHeight = `${height - wanted}px`;
+        }
+    }
+
+    /** A service is put on the page anew: the slot is as style.css has it. */
+    private releasePlace(): void {
+        const slot = this.byId("odataPendingSlot")?.getDomRef() as HTMLElement | null | undefined;
+        if (slot) {
+            slot.style.minHeight = "";
+        }
+        this.slotHeight = undefined;
+    }
+
     public onExit(): void {
+        this.slotObserver?.disconnect();
         window.removeEventListener("beforeunload", this.onBeforeUnload);
         this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
         this.getRouter().detachBypassed(this.onLeft, this);
@@ -231,12 +321,17 @@ export default class ODataServiceDetail extends ODataController {
             isNew: false, loaded: false, exists: false, busy: false,
             loadFailed: false, loadError: "",
             data: odataCatalog.emptyService(), original: odataCatalog.emptyService(),
-            errors: {}, saveError: "", used_by: [], has_write: false,
+            errors: {}, saveError: "", used_by: [],
             // `rows`: what the entity sets table shows, one flat row per
             // entity set of `data.definition` (`odataCatalog.entitySetRow`).
-            // `pendingWrites`: what the ticked, unsaved writes will allow.
+            // `pendingWrites`: what the ticked, unsaved writes will allow,
+            // as the strip says it; `pending`: the same as data, to tell
+            // what one click changed.
+            // `problemsOnly`: the table shows the marked rows alone, and
+            // this is the sentence that says so.
             // `asking`: a question about the save is open.
-            rows: [], entitySearch: "", pendingWrites: "", asking: false,
+            rows: [], entitySearch: "", pendingWrites: "", asking: false, problemsOnly: "",
+            pending: { entitySets: [], operations: [] },
             // `updated_at`: the version of the service the form was loaded
             // from; a save is only made on top of that one.
             // `changedElsewhere` / `deletedElsewhere`: it is not the stored
@@ -244,7 +339,9 @@ export default class ODataServiceDetail extends ODataController {
             updated_at: null, changedElsewhere: false, deletedElsewhere: false,
             // U6 fills this with the result of "Test call".
             test: null,
-            duplicate: { name: "", destination: "", user_context: false, errors: {}, error: "", unsaved: false }
+            duplicate: {
+                name: "", destination: "", user_context: false, errors: {}, error: "", unsaved: false, writes: ""
+            }
         };
     }
 
@@ -255,12 +352,15 @@ export default class ODataServiceDetail extends ODataController {
      */
     private show(service: ODataService, keepSearch = false): void {
         const search = keepSearch ? this.svc().getProperty("/entitySearch") as string : "";
+        if (!keepSearch) {
+            this.releasePlace();
+        }
         this.serviceName = service.name;
         this.svc().setData({
             ...this.blankState(service.title),
             loaded: true, exists: true,
             data: odataCatalog.payloadOf(service), original: odataCatalog.payloadOf(service),
-            used_by: service.used_by ?? [], has_write: service.has_write === true,
+            used_by: service.used_by ?? [],
             updated_at: service.updated_at ?? null,
             rows: odataCatalog.entitySetRows(service.definition),
             entitySearch: search
@@ -297,6 +397,7 @@ export default class ODataServiceDetail extends ODataController {
     private async load(name: string): Promise<void> {
         const count = ++this.loadCount;
         const model = this.svc();
+        this.releasePlace();
 
         if (name === NEW) {
             this.serviceName = undefined;
@@ -374,6 +475,31 @@ export default class ODataServiceDetail extends ODataController {
     /** Over the limit, the counter says so before Save does. */
     public formatPurposeCounterState(purpose: string | undefined): ValueState {
         return odataCatalog.purposeLength(purpose) > odataCatalog.MAX_PURPOSE ? ValueState.Error : ValueState.None;
+    }
+
+    /**
+     * The Write tag: the stored service lets an agent with "Allow writes"
+     * change data. By the rule the Save question goes by
+     * (`odataCatalog.hasWrite`), not by the server's `has_write` flag, which
+     * leaves out an enabled POST operation marked as only reading.
+     */
+    public formatWriteTag(exists: boolean | undefined, definition: ODataDefinition | undefined): boolean {
+        return exists === true && odataCatalog.hasWrite(definition);
+    }
+
+    /** The copy button says when it copies write operations. */
+    public formatDuplicateAction(writes: string | undefined): string {
+        return this.text(writes ? "odataDuplicateWithWrites" : "odataDuplicate");
+    }
+
+    /** What the duplicate dialog says about the writes the copy gets. */
+    public formatDuplicateWrites(writes: string | undefined): string {
+        return writes ? this.text("odataDuplicateWrites", [writes]) : "";
+    }
+
+    /** "Showing only the 3 entity sets with a problem." */
+    private problemsOnlyText(count: number): string {
+        return count === 1 ? this.text("odataProblemRowsOne") : this.text("odataProblemRows", [count]);
     }
 
     public formatRunsAsKey(userContext: boolean | undefined): string {
@@ -462,19 +588,31 @@ export default class ODataServiceDetail extends ODataController {
         this.showPendingWrites();
     }
 
-    /** "Update on "Requisition item" (A_PurchaseRequisitionItem); ..." */
-    private writeList(writes: ODataNewWrite[]): string {
-        return writes.map((write) => this.text("odataWriteItem", [
+    /**
+     * "Update on "Requisition item" (A_PurchaseRequisitionItem); the
+     * operation "Release item" (ReleaseItem)": one entry per entity set and
+     * per operation. With `cap`, at most that many entries and the number
+     * of the others.
+     */
+    private writeList(pending: ODataPending, cap = Infinity): string {
+        const entries = pending.entitySets.map((write) => this.text("odataWriteItem", [
             write.operations.map((op) => this.text(OP_TEXT[op])).join(", "), write.title, write.name
-        ])).join("; ");
+        ])).concat(pending.operations.map((operation) => (
+            this.text("odataWriteOperationItem", [operation.title, operation.name])
+        )));
+        return entries.length <= cap
+            ? entries.join("; ")
+            : this.text("odataWriteMore", [entries.slice(0, cap).join("; "), entries.length - cap]);
     }
 
     /**
-     * The write operations saving the form over `stored` would newly open.
-     * Switching a stored, disabled service on opens all of its writes.
+     * The writes saving the form over `stored` would newly open: ticked
+     * entity-set operations, and enabled operations (function imports,
+     * actions) that are writes. Switching a stored, disabled service on
+     * opens all it has.
      */
-    private newWrites(stored: ODataServiceInput): ODataNewWrite[] {
-        return odataCatalog.newWrites(stored.definition, this.definition(), this.switchesOn(stored));
+    private newWrites(stored: ODataServiceInput): ODataPending {
+        return odataCatalog.pendingWrites(stored.definition, this.definition(), this.switchesOn(stored));
     }
 
     /** Whether saving the form switches the stored, disabled service on. */
@@ -492,12 +630,34 @@ export default class ODataServiceDetail extends ODataController {
      */
     private showPendingWrites(announce = false): void {
         const model = this.svc();
-        const writes = model.getProperty("/loaded") === true ? this.newWrites(this.original()) : [];
-        const text = writes.length ? this.text("odataPendingWrites", [this.writeList(writes)]) : "";
-        const changed = text !== model.getProperty("/pendingWrites");
-        model.setProperty("/pendingWrites", text);
-        if (announce && changed && text) {
-            InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
+        const before = model.getProperty("/pending") as ODataPending;
+        if (announce) {
+            this.keepPlace();
+        }
+        const pending = model.getProperty("/loaded") === true
+            ? this.newWrites(this.original()) : { entitySets: [], operations: [] };
+        const count = odataCatalog.pendingCount(pending);
+        model.setProperty("/pending", pending);
+        // The strip names a few and counts the rest: it stays over the page.
+        model.setProperty("/pendingWrites", count
+            ? this.text("odataPendingWrites", [this.writeList(pending, STRIP_CAP)]) : "");
+        if (!announce) {
+            return;
+        }
+        // What this click changed, and how many are pending now -- not the
+        // whole list again -- and also that none is pending any more.
+        const added = odataCatalog.pendingMinus(pending, before);
+        const removed = odataCatalog.pendingMinus(before, pending);
+        let said = "";
+        if (odataCatalog.pendingCount(added)) {
+            said = this.text("odataAnnounceAdded", [this.writeList(added, STRIP_CAP), count]);
+        } else if (odataCatalog.pendingCount(removed)) {
+            said = this.text(count ? "odataAnnounceRemoved" : "odataAnnounceNone", [
+                this.writeList(removed, STRIP_CAP), count
+            ]);
+        }
+        if (said) {
+            InvisibleMessage.getInstance().announce(said, InvisibleMessageMode.Polite);
         }
     }
 
@@ -540,6 +700,7 @@ export default class ODataServiceDetail extends ODataController {
             // table is worked out again and the box shows what is there.
             this.showEntitySets();
             this.resetBox(box, op);
+            this.sayListRefreshed(row.name);
             return;
         }
         const path = `/rows/${row.index}`;
@@ -559,20 +720,94 @@ export default class ODataServiceDetail extends ODataController {
         this.showPendingWrites(true);
     }
 
+    /**
+     * A click was not applied because the table was not showing the entity
+     * sets as they are. Said on the row that was clicked (when the entity
+     * set is still there) and to a screen reader.
+     */
+    private sayListRefreshed(name: string): void {
+        const text = this.text("odataListRefreshed");
+        const index = this.rows().map((row) => row.name).indexOf(name);
+        if (index !== -1) {
+            this.svc().setProperty(`/rows/${index}/note`, text);
+        }
+        InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
+    }
+
     /** Shows all entity sets again and empties the search field. */
     private clearEntitySearch(): void {
         this.svc().setProperty("/entitySearch", "");
         this.filterEntitySets("");
     }
 
+    /** The way back from the marked rows alone to all entity sets. */
+    public onShowAllEntitySets(): void {
+        this.clearEntitySearch();
+        // The link that was pressed goes away with its strip.
+        (this.byId("odataEntityTable") as Control | undefined)?.focus();
+    }
+
+    /** The positions (in the definition) of the rows the table renders now. */
+    private renderedRows(): number[] {
+        const table = this.byId("odataEntityTable") as Table | undefined;
+        return (table?.getItems() ?? []).map((item) => (
+            (item.getBindingContext("svc")?.getObject() as ODataEntityRow | undefined)?.index ?? -1
+        ));
+    }
+
+    /**
+     * Rows were marked (`marked`: their positions): makes sure they can be
+     * seen, and says so.
+     *
+     * When every marked row is among the rendered ones, the table and the
+     * search stay as they are. Otherwise -- the search hides one, or it is
+     * further down than the table has grown -- the table shows the marked
+     * rows alone, says that it does, and offers the way back. `focus`: the
+     * first marked row then gets the focus, which also scrolls it into
+     * view; not when a field of the form already has it. What is said above
+     * the form is announced, since the admin may be far from it.
+     */
+    private revealMarked(marked: number[], focus: boolean): void {
+        const model = this.svc();
+        const table = this.byId("odataEntityTable") as Table | undefined;
+        const toFirst = (): void => {
+            const first = (table?.getItems() ?? []).filter((item) => (
+                marked.indexOf((item.getBindingContext("svc")?.getObject() as ODataEntityRow).index) !== -1
+            ))[0] as ColumnListItem | undefined;
+            if (focus) {
+                first?.focus();
+            }
+        };
+        const rendered = this.renderedRows();
+        if (marked.some((index) => rendered.indexOf(index) === -1)) {
+            model.setProperty("/entitySearch", "");
+            model.setProperty("/problemsOnly", this.problemsOnlyText(marked.length));
+            table?.attachEventOnce("updateFinished", toFirst);
+            // The rows as marked now: a row that is repaired stays in the
+            // table until the admin leaves this view of it.
+            (table?.getBinding("items") as ListBinding | undefined)?.filter(new Filter({
+                path: "index", test: (index: number) => marked.indexOf(index) !== -1
+            }));
+        } else {
+            toFirst();
+        }
+        const said = [model.getProperty("/saveError") as string, model.getProperty("/problemsOnly") as string]
+            .filter(Boolean).join(" ");
+        if (said) {
+            InvisibleMessage.getInstance().announce(said, InvisibleMessageMode.Polite);
+        }
+    }
+
     /**
      * Shows the entity sets whose title, technical name or description
      * holds `query`. A filter on the binding: no row is worked out again,
-     * and only the rows on screen are rendered.
+     * and only the rows on screen are rendered. It also ends the view of
+     * the marked rows alone.
      */
     private filterEntitySets(query: string): void {
         const binding = this.byId("odataEntityTable")?.getBinding("items") as ListBinding | undefined;
         const text = query.trim();
+        this.svc().setProperty("/problemsOnly", "");
         binding?.filter(text ? new Filter({
             filters: ["title", "name", "description"].map((path) => new Filter(path, FilterOperator.Contains, text)),
             and: false
@@ -676,7 +911,7 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty("/saveError", "");
         // Both checks run, so that everything wrong is marked at once.
         const general = this.showProblems(odataCatalog.validate(this.data()));
-        const entitySets = this.showEntityProblems();
+        const entitySets = this.showEntityProblems(general);
         if (!general || !entitySets) {
             return;
         }
@@ -787,9 +1022,10 @@ export default class ODataServiceDetail extends ODataController {
      * Marks the entity sets the server would refuse (`definitionProblems`),
      * each on its row and in the user's language, and names them above the
      * form; returns whether there are none. Call after `showProblems`,
-     * which sets what is said above the form.
+     * which sets what is said above the form. `focus`: no field of the form
+     * has a problem, so the first marked row gets the focus.
      */
-    private showEntityProblems(): boolean {
+    private showEntityProblems(focus: boolean): boolean {
         const model = this.svc();
         const problems = odataCatalog.definitionProblems(this.definition());
         const byIndex: Record<number, string> = {};
@@ -799,11 +1035,11 @@ export default class ODataServiceDetail extends ODataController {
         this.showRowErrors(byIndex);
         if (problems.length) {
             // A marked row must be on screen, and named so that it is found.
-            this.clearEntitySearch();
             const rows = this.rows();
             const names = problems.map((problem) => odataCatalog.entityLabel(rows[problem.index])).join(", ");
             const above = model.getProperty("/saveError") as string;
             model.setProperty("/saveError", [above, this.text("odataEntityProblems", [names])].filter(Boolean).join(" "));
+            this.revealMarked(problems.map((problem) => problem.index), focus);
         }
         return problems.length === 0;
     }
@@ -866,7 +1102,8 @@ export default class ODataServiceDetail extends ODataController {
         const change = odataCatalog.identityChange(stored, this.data());
         const identity = usedBy.length > 0 && (!!change.runsAs || !!change.destination);
         const writes = this.newWrites(stored);
-        if (!identity && !writes.length) {
+        const anyWrite = odataCatalog.pendingCount(writes) > 0;
+        if (!identity && !anyWrite) {
             return undefined;
         }
         const names = usedBy.map((used) => used.agent);
@@ -883,7 +1120,7 @@ export default class ODataServiceDetail extends ODataController {
         if (identity && change.destination) {
             parts.push(this.text("odataIdentityDestination", [change.destination.from, change.destination.to]));
         }
-        if (writes.length) {
+        if (anyWrite) {
             if (this.switchesOn(stored)) {
                 parts.push(this.text("odataWriteSwitchedOn"));
             }
@@ -906,7 +1143,7 @@ export default class ODataServiceDetail extends ODataController {
             }
             parts.push(this.text("odataWriteAudited"));
         }
-        const title = identity && writes.length ? "odataSaveConfirmTitle"
+        const title = identity && anyWrite ? "odataSaveConfirmTitle"
             : identity ? "odataIdentityConfirmTitle" : "odataWriteConfirmTitle";
         return { title: this.text(title), text: parts.join("\n\n") };
     }
@@ -949,6 +1186,10 @@ export default class ODataServiceDetail extends ODataController {
             return;
         }
         this.setWorking(false);
+        if (!isNew) {
+            // The strip goes with the save; the rows stay where they are.
+            this.keepPlace();
+        }
         this.show(saved, !isNew);
         MessageToast.show(this.text("odataSaved"));
         if (isNew) {
@@ -977,20 +1218,21 @@ export default class ODataServiceDetail extends ODataController {
     private showRefusal(error: unknown, isNew: boolean, sentNames: string[] = []): void {
         const model = this.svc();
         if (error instanceof AdminError && error.status === 422) {
-            const byLoc = odataCatalog.serverErrors(error.detail);
+            const refusal = odataCatalog.serverRefusal(error.detail);
+            const byLoc = refusal.byLoc;
             // Only while the table still lists what was sent, row for row.
             const rows = this.rows();
             const placed = canonical(rows.map((row) => row.name)) === canonical(sentNames)
                 ? odataCatalog.rowErrors(byLoc, sentNames) : {};
             this.showRowErrors(placed);
             const marked = Object.keys(placed).length > 0;
-            if (marked) {
-                // A marked row must be on screen, whatever the search hid.
-                this.clearEntitySearch();
-            }
             // With a row marked, the text above the form names the entity
-            // set in place of its position in the definition.
-            const answer = marked ? odataCatalog.refusalLines(byLoc, rows).join("; ") : error.detail;
+            // set in place of its position in the definition -- and still
+            // says all the server said: what came before the first field,
+            // and its "and n more".
+            const answer = marked
+                ? [refusal.lead].concat(odataCatalog.refusalLines(byLoc, rows), [refusal.more]).filter(Boolean).join("; ")
+                : error.detail;
             const errors: Record<string, string> = {};
             let unplaced = Object.keys(byLoc).length === 0;
             Object.keys(byLoc).forEach((loc) => {
@@ -1005,6 +1247,11 @@ export default class ODataServiceDetail extends ODataController {
                 ? (answer ? this.text("odataSaveRefused", [answer]) : this.text("odataSaveFailed"))
                 : "");
             this.focusFirstError(errors);
+            if (marked) {
+                // A marked row must be seen, whatever the search hid and
+                // however far down it is.
+                this.revealMarked(Object.keys(placed).map(Number), Object.keys(errors).length === 0);
+            }
             return;
         }
         if (error instanceof AdminError && error.status === 409 && isNew && error.detail) {
@@ -1027,8 +1274,18 @@ export default class ODataServiceDetail extends ODataController {
 
     // --- duplicate ----------------------------------------------------------
 
-    /** Opens the dialog that asks what the copy differs in: its name, its
-     *  destination and its identity. */
+    /** Every write `definition` holds, as the duplicate dialog lists them:
+     *  the server copies the definition whole, writes included. */
+    private copiedWrites(definition: ODataDefinition): string {
+        return this.writeList(odataCatalog.pendingWrites(undefined, definition));
+    }
+
+    /**
+     * Opens the dialog that asks what the copy differs in: its name, its
+     * destination and its identity. It also lists the write operations the
+     * copy gets and says who can run them; with such a list the focus
+     * starts on Cancel and the copy button says that it copies them.
+     */
     public async onDuplicate(): Promise<void> {
         const model = this.svc();
         if (this.working || model.getProperty("/exists") !== true) {
@@ -1037,7 +1294,7 @@ export default class ODataServiceDetail extends ODataController {
         const stored = this.original();
         const state: DuplicateState = {
             name: "", destination: stored.destination, user_context: stored.user_context,
-            errors: {}, error: "", unsaved: this.isDirty()
+            errors: {}, error: "", unsaved: this.isDirty(), writes: this.copiedWrites(stored.definition)
         };
         model.setProperty("/duplicate", state);
 
@@ -1049,7 +1306,12 @@ export default class ODataServiceDetail extends ODataController {
             }) as Dialog;
             this.getView()!.addDependent(this.duplicateDialog);
         }
+        this.duplicateDialog.setInitialFocus(this.byId(state.writes ? "odataDuplicateCancel" : "odataDuplicateName") as Control);
         this.duplicateDialog.open();
+        if (state.writes) {
+            // The focus is on Cancel; what the copy carries is said as well.
+            InvisibleMessage.getInstance().announce(this.formatDuplicateWrites(state.writes), InvisibleMessageMode.Polite);
+        }
     }
 
     public onDuplicateEdit(event: Event): void {
@@ -1066,7 +1328,14 @@ export default class ODataServiceDetail extends ODataController {
         this.duplicateDialog?.close();
     }
 
-    /** Creates the copy and opens it. A refusal stays in the dialog. */
+    /**
+     * Creates the copy and opens it. A refusal stays in the dialog.
+     *
+     * The server copies the definition as it is stored at that moment, so
+     * the service is read again first: when its writes are not the ones the
+     * dialog lists, the list is brought up to date, the dialog says so and
+     * nothing is sent -- no write is copied without having been named here.
+     */
     public async onDuplicateConfirm(): Promise<void> {
         const model = this.svc();
         if (this.working || !this.serviceName) {
@@ -1088,9 +1357,20 @@ export default class ODataServiceDetail extends ODataController {
         this.setWorking(true);
         let copy: ODataService;
         try {
-            copy = await this.withBusy(() => this.getAdminService().duplicateODataService(
-                this.serviceName as string, body
-            ));
+            const name = this.serviceName;
+            const fresh = await this.withBusy(() => this.getAdminService().getODataService(name));
+            const writes = this.copiedWrites(fresh.definition);
+            if (writes !== state.writes) {
+                this.setWorking(false);
+                model.setProperty("/duplicate/writes", writes);
+                model.setProperty("/duplicate/error", this.text("odataDuplicateChanged"));
+                InvisibleMessage.getInstance().announce(
+                    [this.text("odataDuplicateChanged"), this.formatDuplicateWrites(writes)].filter(Boolean).join(" "),
+                    InvisibleMessageMode.Polite
+                );
+                return;
+            }
+            copy = await this.withBusy(() => this.getAdminService().duplicateODataService(name, body));
         } catch (error) {
             this.setWorking(false);
             this.showDuplicateRefusal(error);

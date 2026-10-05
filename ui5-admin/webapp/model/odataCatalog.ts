@@ -1,5 +1,6 @@
 import type {
-    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataServiceInput, ODataUsedBy
+    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataOperation, ODataServiceInput,
+    ODataUsedBy
 } from "../service/types";
 
 /**
@@ -85,6 +86,29 @@ export interface ODataNewWrite {
     name: string;
     title: string;
     operations: ODataEntityOp[];
+}
+
+/** An operation (function import, action) a save would newly open as a write. */
+export interface ODataNewOperation {
+    name: string;
+    /** The business title, or the name when there is none. */
+    title: string;
+}
+
+/** Everything a save would newly let agents with `allow_write` do. */
+export interface ODataPending {
+    entitySets: ODataNewWrite[];
+    operations: ODataNewOperation[];
+}
+
+/** A refused save, taken apart: see `serverRefusal`. */
+export interface ODataRefusal {
+    /** What the text says before its first `<loc>: `, or "". */
+    lead: string;
+    /** `loc` -> message. */
+    byLoc: Record<string, string>;
+    /** The server's "and n more" tail, or "". */
+    more: string;
 }
 
 /** What is wrong with the entity set at `index`: an i18n key and its arguments. */
@@ -205,6 +229,61 @@ const VALUE_ERROR_PREFIX = "Value error, ";
 function writeOpsOf(entitySet: ODataEntitySet): ODataEntityOp[] {
     const enabled = entitySet.operations ?? [];
     return WRITE_OPS.filter((op) => enabled.indexOf(op) !== -1);
+}
+
+/**
+ * Whether calling `operation` is a write. THE rule, the server's
+ * (`operation_changes_data` in agents/odata/search.py, `call_changes_data`
+ * in agents/odata/client.py): a read is only what is marked
+ * `changes_data: false` (exactly) AND is sent with GET. A missing flag does
+ * not read as "only reads", and a POST is a write whatever the flag says.
+ * The Write tag, the pending strip, the Save question and the duplicate
+ * dialog all go through here, so they cannot disagree.
+ */
+function operationIsWrite(operation: Pick<ODataOperation, "changes_data" | "http_method">): boolean {
+    return !(operation.changes_data === false && operation.http_method === "GET");
+}
+
+/** The operations of a definition an agent with `allow_write` can run as
+ *  writes: enabled, and a write by `operationIsWrite`. */
+function writeOperations(definition: ODataDefinition | undefined | null): ODataOperation[] {
+    return (definition?.operations ?? []).filter((o) => o.enabled === true && operationIsWrite(o));
+}
+
+function operationTitle(operation: ODataOperation): string {
+    return (operation.title ?? "").trim() || operation.name;
+}
+
+function newEntityWrites(
+    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null, switchedOn: boolean
+): ODataNewWrite[] {
+    const before: Record<string, ODataEntityOp[]> = {};
+    // A service that is switched on by this save had no write an agent
+    // could run: every write of it is newly enabled, ticked now or not.
+    (switchedOn ? [] : stored?.entity_sets ?? []).forEach((entitySet) => {
+        // Two of a name cannot be saved; if they are there, either's writes count as stored.
+        before[`=${entitySet.name}`] = (before[`=${entitySet.name}`] ?? []).concat(writeOpsOf(entitySet));
+    });
+    const added: ODataNewWrite[] = [];
+    (current?.entity_sets ?? []).forEach((entitySet) => {
+        const had = before[`=${entitySet.name}`] ?? [];
+        const operations = writeOpsOf(entitySet).filter((op) => had.indexOf(op) === -1);
+        if (operations.length) {
+            added.push({ name: entitySet.name, title: titleOf(entitySet), operations });
+        }
+    });
+    return added;
+}
+
+function newWriteOperations(
+    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null, switchedOn: boolean
+): ODataNewOperation[] {
+    // What agents could already run as a write: by name, and nothing when
+    // the stored service was switched off.
+    const had = switchedOn ? [] : writeOperations(stored).map((o) => o.name);
+    return writeOperations(current)
+        .filter((o) => had.indexOf(o.name) === -1)
+        .map((o) => ({ name: o.name, title: operationTitle(o) }));
 }
 
 function titleOf(entitySet: ODataEntitySet): string {
@@ -349,26 +428,30 @@ export default {
     /**
      * Whether the definition lets an agent with `allow_write` change data:
      * an entity set with create, update or delete, or an enabled operation
-     * that changes data. Same rule as `has_write` in the server's answer.
+     * that is a write (`operationIsWrite`). That is the rule the server RUNS
+     * calls by; the `has_write` flag in its answers is narrower (it leaves
+     * out an enabled POST marked `changes_data: false`), so the detail page
+     * shows its Write tag by this function and not by that flag.
      */
     hasWrite(definition: ODataDefinition | undefined | null): boolean {
         return (definition?.entity_sets ?? []).some((e) => writeOpsOf(e).length > 0)
-            || (definition?.operations ?? []).some((o) => o.enabled && o.changes_data);
+            || writeOperations(definition).length > 0;
     },
+
+    operationIsWrite,
+
+    writeOperations,
 
     /**
      * What `allow_write` opens, one entry per entity set with a write
      * operation -- "Item text (create, update)" -- followed by the enabled
-     * operations that change data, by title.
+     * operations that are writes, by title.
      */
     writeSummary(definition: ODataDefinition | undefined | null): string[] {
         const entitySets = (definition?.entity_sets ?? [])
             .filter((e) => writeOpsOf(e).length > 0)
             .map((e) => `${titleOf(e)} (${writeOpsOf(e).join(", ")})`);
-        const operations = (definition?.operations ?? [])
-            .filter((o) => o.enabled && o.changes_data)
-            .map((o) => (o.title ?? "").trim() || o.name);
-        return entitySets.concat(operations);
+        return entitySets.concat(writeOperations(definition).map(operationTitle));
     },
 
     /** How many of an entity set's fields an agent can read, of how many. */
@@ -404,22 +487,47 @@ export default {
         stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
         switchedOn = false
     ): ODataNewWrite[] {
-        const before: Record<string, ODataEntityOp[]> = {};
-        // A service that is switched on by this save had no write an agent
-        // could run: every write of it is newly enabled, ticked now or not.
-        (switchedOn ? [] : stored?.entity_sets ?? []).forEach((entitySet) => {
-            // Two of a name cannot be saved; if they are there, either's writes count as stored.
-            before[`=${entitySet.name}`] = (before[`=${entitySet.name}`] ?? []).concat(writeOpsOf(entitySet));
-        });
-        const added: ODataNewWrite[] = [];
-        (current?.entity_sets ?? []).forEach((entitySet) => {
-            const had = before[`=${entitySet.name}`] ?? [];
-            const operations = writeOpsOf(entitySet).filter((op) => had.indexOf(op) === -1);
+        return newEntityWrites(stored, current, switchedOn);
+    },
+
+    /**
+     * Everything saving `current` over `stored` newly lets agents with
+     * `allow_write` do: the entity-set writes of `newWrites`, and the
+     * enabled operations that are writes (`operationIsWrite`) and were not
+     * such in `stored` (matched by name: absent, not enabled, or a read
+     * there). `switchedOn`: the save also switches the stored, disabled
+     * service on, which opens every write it has.
+     */
+    pendingWrites(
+        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
+        switchedOn = false
+    ): ODataPending {
+        return {
+            entitySets: newEntityWrites(stored, current, switchedOn),
+            operations: newWriteOperations(stored, current, switchedOn)
+        };
+    },
+
+    /** How many write operations `pending` holds: each ticked operation of
+     *  each entity set, and each function import or action. */
+    pendingCount(pending: ODataPending): number {
+        return pending.entitySets.reduce((sum, write) => sum + write.operations.length, 0) + pending.operations.length;
+    },
+
+    /** What is in `pending` and not in `other`, in the order of `pending`. */
+    pendingMinus(pending: ODataPending, other: ODataPending): ODataPending {
+        const entitySets: ODataNewWrite[] = [];
+        pending.entitySets.forEach((write) => {
+            const had = other.entitySets
+                .filter((candidate) => candidate.name === write.name)
+                .reduce((all: ODataEntityOp[], candidate) => all.concat(candidate.operations), []);
+            const operations = write.operations.filter((op) => had.indexOf(op) === -1);
             if (operations.length) {
-                added.push({ name: entitySet.name, title: titleOf(entitySet), operations });
+                entitySets.push({ name: write.name, title: write.title, operations });
             }
         });
-        return added;
+        const names = other.operations.map((operation) => operation.name);
+        return { entitySets, operations: pending.operations.filter((operation) => names.indexOf(operation.name) === -1) };
     },
 
     /** The agents using a service, split by `allow_write`: only the first
@@ -658,20 +766,37 @@ export default {
      * still in use) gives an empty object: show `AdminError.detail` then.
      */
     serverErrors(detail: string | undefined | null): Record<string, string> {
-        const errors: Record<string, string> = {};
+        return this.serverRefusal(detail).byLoc;
+    },
+
+    /**
+     * The same refusal with what `serverErrors` leaves out: `lead`, the text
+     * before the first `<loc>: ` (all of it when no field is named), and
+     * `more`, the "and n more" the server ends a long list with. A page that
+     * rebuilds the text from `byLoc` appends both, so nothing the server
+     * said is lost.
+     */
+    serverRefusal(detail: string | undefined | null): ODataRefusal {
+        const byLoc: Record<string, string> = {};
+        const lead: string[] = [];
+        let more = "";
         let current = "";
         String(detail ?? "").split("; ").forEach((part) => {
             const match = SERVER_LOC_RE.exec(part);
             if (match) {
                 current = match[1];
                 const message = match[2];
-                errors[current] = message.indexOf(VALUE_ERROR_PREFIX) === 0
+                byLoc[current] = message.indexOf(VALUE_ERROR_PREFIX) === 0
                     ? message.substring(VALUE_ERROR_PREFIX.length) : message;
-            } else if (current && !/^and \d+ more$/.test(part)) {
-                errors[current] += `; ${part}`;
+            } else if (current && /^and \d+ more$/.test(part)) {
+                more = part;
+            } else if (current) {
+                byLoc[current] += `; ${part}`;
+            } else if (part) {
+                lead.push(part);
             }
         });
-        return errors;
+        return { lead: lead.join("; "), byLoc, more };
     },
 
     /**
