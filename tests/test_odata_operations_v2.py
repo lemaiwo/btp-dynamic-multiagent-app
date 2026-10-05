@@ -56,10 +56,12 @@ from agents.auth import current_jwt, current_principal  # noqa: E402
 from agents.db import ODataAuditLog, SessionLocal, init_db  # noqa: E402
 from agents.odata.audit import StoredWriteRecorder  # noqa: E402
 from agents.odata.client import (  # noqa: E402
+    CALL_NOT_AVAILABLE,
     CallPlan,
     ODataClient,
     ODataError,
     call_changes_data,
+    call_refusal,
 )
 from agents.odata.models import (  # noqa: E402
     OperationDef,
@@ -153,8 +155,27 @@ def _operations() -> list[dict[str, Any]]:
             {"name": "Plants", "type": "Collection(Edm.String)", "required": False},
             {"name": "Blob", "type": "Edm.Binary", "required": False},
         ]),
+        # Enabled, but never callable as the catalogue declares them (UNCALLABLE).
         _op("BoundWithoutKeyParams", bound_to=ITEM, parameters=[{"name": "Comment"}]),
+        _op("NeedsComplex", "GET", changes_data=False,
+            parameters=[{"name": "Address", "type": "API_PR.Address"}]),
+        _op("NeedsBinary", parameters=[{"name": "Blob", "type": "Edm.Binary"}]),
+        _op("KeyOfOddType", "GET", changes_data=False, bound_to=ITEM, parameters=[
+            {"name": "PurchaseRequisition"},
+            # Optional as a parameter, but a key field is always sent.
+            {"name": "PurchaseRequisitionItem", "type": "Collection(Edm.String)",
+             "required": False},
+        ]),
     ]
+
+
+# Enabled operations no agent can ever call, with the predicate's reason.
+UNCALLABLE = {
+    "BoundWithoutKeyParams": "key_not_declared",
+    "NeedsComplex": "parameter_type",
+    "NeedsBinary": "parameter_type",
+    "KeyOfOddType": "parameter_type",
+}
 
 
 def catalogue(
@@ -722,7 +743,8 @@ def test_a_call_plan_shows_names_only():
     )
     with pytest.raises(ODataError) as refused:
         v4.check_call(definition.operation("CountOpen"))
-    assert refused.value.code == "operation_disabled"
+    # The code and the text the tool answers for the same thing.
+    assert (refused.value.code, refused.value.message) == ("not_available", CALL_NOT_AVAILABLE)
 
 
 # -- bound operations --------------------------------------------------------------
@@ -740,7 +762,7 @@ async def test_bound_operation_checks_the_key_of_its_entity_set(alice):
     assert code(out) == "invalid_argument" and "'key' only" in out["error"]["message"]
     # Nothing is sent under a name the catalogue's parameter list does not declare.
     out = await w.call("BoundWithoutKeyParams", key=KEY, params={"Comment": "x"})
-    assert code(out) == "invalid_argument" and "declares no parameter" in out["error"]["message"]
+    assert code(out) == "not_available" and "declares no parameter" in out["error"]["message"]
     assert await w.untouched()
 
     w.sap.answer = {"d": entity()}
@@ -1087,7 +1109,7 @@ _SWITCH_CODES = {
     "unknown_service", "service_disabled", "unknown_target", "operation_disabled",
     "write_not_allowed", "not_available", "audit_not_configured",
 }
-CHANGING = {"ReleaseItem", "Recalculate", "PostMarkedReading", "Approve", "BoundWithoutKeyParams"}
+CHANGING = {"ReleaseItem", "Recalculate", "PostMarkedReading", "Approve"}
 READING = {"CountOpen", "ItemStatus", "HiddenItem", "Untyped", "Typed", "Odd"}
 
 
@@ -1120,12 +1142,39 @@ async def test_whatever_search_returns_execute_does_not_refuse_by_a_switch(
     assert operations == {"pr": expected, "pr-jobs": expected}
     for service, target, operation in offered:
         out = await w.run(service=service, target=target, operation=operation)
+        # `not_available` is in there: also the code of a catalogue reason.
         assert code(out) not in _SWITCH_CODES, (service, target, operation, out)
-    # ... and nothing else can be called: every other operation is refused by a switch.
+    # ... and nothing else can be called: every other operation is refused by a
+    # switch or for a reason that lies in the catalogue, never by its arguments.
     for service in ("pr", "pr-jobs"):
-        for target in (CHANGING | READING | {"Off", "OffReading"}) - expected:
+        for target in (CHANGING | READING | {"Off", "OffReading"} | set(UNCALLABLE)) - expected:
             out = await w.call(target, service=service)
             assert code(out) in _SWITCH_CODES, (service, target, out)
+        if expected == CHANGING | READING:
+            # Every switch is on: what is left is the catalogue's own reason,
+            # the same one the predicate gives, whatever arguments are passed.
+            for target in UNCALLABLE:
+                for args in ({}, {"key": KEY}, {"params": {"Comment": "x"}}):
+                    out = await w.call(target, service=service, **args)
+                    assert code(out) == "not_available", (target, args, out)
+                    assert "catalogue" in out["error"]["hint"]
+    # The predicate search and execute share says the same of every operation.
+    definition = ServiceDefinition.model_validate(catalogue()["pr"]["definition"])
+    keys = {e.name: [k.name for k in e.keys] for e in definition.entity_sets}
+    for operation in definition.operations:
+        reason = call_refusal(
+            operation, keys.get(operation.bound_to or ""), V2Dialect(), allow_write=True
+        )
+        if operation.name in UNCALLABLE:
+            assert reason == UNCALLABLE[operation.name], operation.name
+        elif operation.enabled:
+            assert reason is None, operation.name
+        else:
+            assert reason == "operation_disabled", operation.name
+        assert (operation.name in operations["pr"]) == (
+            operation.name in expected
+        ), operation.name
+    assert not await all_rows() or allow_write is True
     for target in ("Release", "CountOpen"):
         out = await w.call(target, service="pr-v4")
         expected_code = (
@@ -1157,6 +1206,10 @@ async def test_search_shows_parameters_and_what_a_call_changes(alice):
     }
     assert by_target["ItemStatus"]["bound_to"] == ITEM  # a set this agent can read
     assert by_target["HiddenItem"]["bound_to"] is None  # one it cannot see is not named
+    # The key a bound call takes is always said, by name only: also for a hidden set.
+    for target in ("ItemStatus", "HiddenItem", "Approve"):
+        assert by_target[target]["key"] == list(KEY), target
+    assert by_target["CountOpen"]["key"] == []
     assert by_target["CountOpen"]["changes_data"] is False
     assert by_target["Approve"]["changes_data"] is True
     assert "A_Hidden" not in json.dumps(by_target)
@@ -1394,3 +1447,94 @@ async def test_a_text_that_is_not_one_short_line_is_withheld(alice, value):
         out = await w.call("CountOpen")
         assert out == WITHHELD
         assert SECRET_USER not in json.dumps(out)
+
+
+# -- one "callable" rule for search, execute and the catalogue (task M1) -------------
+
+
+def _operation(**kw: Any) -> OperationDef:
+    return OperationDef.model_validate(_op("X", **kw))
+
+
+@pytest.mark.parametrize(
+    "operation, keys, dialect, allow_write, reason",
+    [
+        (_operation(), None, V2Dialect(), True, None),
+        (_operation(enabled=False), None, V2Dialect(), True, "operation_disabled"),
+        (_operation(), None, V4Dialect(), True, "calls_not_available"),
+        (_operation(), None, V2Dialect(), False, "write_not_allowed"),
+        (_operation(http_method="GET"), None, V2Dialect(), False, "write_not_allowed"),
+        (_operation(http_method="GET", changes_data=False), None, V2Dialect(), False, None),
+        # Bound: the set is there, and every key field is a parameter of a known type.
+        (_operation(bound_to=ITEM, parameters=KEY_PARAMS), None, V2Dialect(), True,
+         "bound_set_missing"),
+        (_operation(bound_to=ITEM, parameters=KEY_PARAMS), list(KEY), V2Dialect(), True, None),
+        (_operation(bound_to=ITEM, parameters=KEY_PARAMS[:1]), list(KEY), V2Dialect(), True,
+         "key_not_declared"),
+        (_operation(bound_to=ITEM, parameters=[
+            KEY_PARAMS[0], {**KEY_PARAMS[1], "type": "Edm.Binary", "required": False},
+        ]), list(KEY), V2Dialect(), True, "parameter_type"),
+        # A required parameter of a type the dialect does not write.
+        *[
+            (_operation(parameters=[{"name": "P", "type": edm}]), None, V2Dialect(), True,
+             "parameter_type")
+            for edm in ("NS.Address", "Collection(Edm.String)", "Edm.Binary", "Edm.Stream", "")
+            if edm
+        ],
+        # ... which does not matter while it is optional: it is left out.
+        (_operation(parameters=[{"name": "P", "type": "NS.Address", "required": False}]),
+         None, V2Dialect(), True, None),
+        *[
+            (_operation(parameters=[{"name": "P", "type": edm}]), None, V2Dialect(), True, None)
+            for edm, _, _ in TYPED.values()
+        ],
+    ],
+)
+def test_call_refusal_is_the_one_rule(operation, keys, dialect, allow_write, reason):
+    assert call_refusal(operation, keys, dialect, allow_write=allow_write) == reason
+
+
+async def test_a_wrong_key_of_a_hidden_set_does_not_name_the_set(alice):
+    w = World(READ_ONLY)
+    for key in (None, {"PurchaseRequisition": "10000001"}, {**KEY, "Extra": "1"}):
+        out = await w.call("HiddenItem", key=key)
+        assert code(out) == "invalid_key", out
+        assert out["error"]["message"] == (
+            "the key of this operation is exactly: PurchaseRequisition, PurchaseRequisitionItem"
+        )
+        assert "A_Hidden" not in json.dumps(out)
+    # The same words for a set the agent can see: one wording, nothing to tell apart.
+    out = await w.call("ItemStatus", key={})
+    assert "the key of this operation is exactly" in out["error"]["message"]
+    assert ITEM not in json.dumps(out)
+    found = await w.search(query="", detail="full", service="pr")
+    assert "A_Hidden" not in json.dumps(found)
+
+
+async def test_the_length_of_a_text_parameter_is_checked_after_conversion(alice):
+    dialect = V2Dialect()
+    assert dialect.call_literal("Edm.String", 10**999) == "'" + "1" + "0" * 999 + "'"
+    for value in (10**1000, 10**1200, 10**5000, -(10**5000)):
+        with pytest.raises(ODataError):
+            dialect.call_literal("Edm.String", value)
+        for edm in ("Edm.Int64", "Edm.Decimal", "Edm.Double"):
+            with pytest.raises(ODataError):
+                dialect.call_literal(edm, value)
+    w = World()
+    out = await w.call("ReleaseItem", params={**RELEASE, "Note": 10**1200})
+    assert code(out) == "invalid_argument" and await w.untouched()
+
+
+async def test_the_record_names_only_the_parameters_that_were_sent(alice):
+    w = World()
+    params = {**RELEASE, "Note": None}  # optional, passed as null: left out of the request
+    assert (await w.call("ReleaseItem", params=params))["ok"] is True
+    assert "Note" not in w.sap.calls[-1].url.params
+    (row,) = await all_rows()
+    assert json.loads(row.body_fields_json) == list(RELEASE)
+
+
+async def test_one_text_says_that_calls_of_a_version_are_not_available(alice):
+    w = World({"services": ["pr-v4"], "allow_write": True})
+    out = await w.call("CountOpen", service="pr-v4")
+    assert (code(out), out["error"]["message"]) == ("not_available", CALL_NOT_AVAILABLE)

@@ -68,7 +68,9 @@ from agents.destination import DestinationError
 from agents.destination_auth import DestinationUserRequired, destination_http_client
 
 from . import BUILTIN_ODATA_URL
+from .calls import DIALECTS
 from .client import (
+    CALL_NOT_AVAILABLE,
     RAW_ETAG_FIELD,
     ODataClient,
     ODataError,
@@ -88,8 +90,6 @@ from .models import (
 from .search import MAX_FULL_TARGETS, MAX_SUMMARY_MATCHES, search_catalogue
 from .session import CsrfSessionStore, NoCookieJar
 from .urls import MAX_FILTER_CHARS
-from .v2 import V2Dialect
-from .v4 import V4Dialect
 
 logger = logging.getLogger(__name__)
 # Where the record of a write goes when the recorder could not take it: the
@@ -119,7 +119,8 @@ RECORDS_WRITES_MARKER = "records_writes"
 OPERATIONS = (*ENTITY_OPS, "call")
 # One dialect object per protocol version this module can send. A version
 # that is not here is refused, never sent with another version's rules.
-_DIALECTS: dict[str, Any] = {"v2": V2Dialect(), "v4": V4Dialect()}
+# (`calls.DIALECTS`: the search tool and the admin API judge by the same.)
+_DIALECTS: dict[str, Any] = DIALECTS
 # What `execute_operation` can do beyond reading, said once so that
 # `search_operations` offers exactly that: the versions whose dialect can
 # write, and whether operations (function imports, actions, functions) can
@@ -753,7 +754,9 @@ def odata_toolset(
                 navigations, parameters and example queries for the best
                 few matches; ask for it before calling execute_operation.
                 A target of kind 'operation' is run with operation 'call';
-                its 'changes_data' says whether calling it changes SAP.
+                its 'changes_data' says whether calling it changes SAP and
+                its 'key' lists the names its 'key' argument takes (empty:
+                it takes none).
             service: Limit the search to one service name from an earlier
                 result.
         """
@@ -1485,10 +1488,7 @@ def odata_toolset(
             if getattr(dialect, "supports_call", False) is not True:
                 # Enabled, and this agent may: it is this app that cannot do
                 # it yet (and search_operations does not offer it).
-                raise ODataError(
-                    "not_available",
-                    "operations of a service of this OData version cannot be called yet",
-                )
+                raise ODataError("not_available", CALL_NOT_AVAILABLE)
             return await _call(entry, rules, dialect, called, args, run_id)
         entity_set = definition.entity_set(target) if isinstance(target, str) else None
         if entity_set is None:

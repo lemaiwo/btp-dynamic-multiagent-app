@@ -33,6 +33,7 @@ import re
 from collections.abc import Collection
 from typing import Any
 
+from .calls import key_names, stored_call_refusal
 from .models import ENTITY_OPS, WRITE_OPS, operation_is_write
 
 MAX_SUMMARY_MATCHES = 20
@@ -140,12 +141,6 @@ def operation_changes_data(operation: dict[str, Any]) -> bool:
     whatever the flag says.
     """
     return operation_is_write(operation.get("changes_data"), operation.get("http_method"))
-
-
-def _operation_visible(operation: dict[str, Any], allow_write: bool) -> bool:
-    if operation.get("enabled") is not True:
-        return False
-    return allow_write or not operation_changes_data(operation)
 
 
 def _field_out(field: dict[str, Any], allow_write: bool) -> dict[str, Any]:
@@ -261,15 +256,21 @@ def _entity_set_detail(
         "navigations": navigations,
         "parameters": [],
         "examples": _examples_out(entity_set, allow_write),
+        # The names the 'key' argument takes: the same list as `keys`.
+        "key": [_text(k.get("name")) for k in _dicts(entity_set.get("keys"))],
         "bound_to": None,
         "changes_data": None,
     }
 
 
 def _operation_detail(
-    operation: dict[str, Any], readable: dict[str, list[str]]
+    operation: dict[str, Any], readable: dict[str, list[str]], keys: dict[str, list[str]]
 ) -> dict[str, Any]:
     bound_to = operation.get("bound_to")
+    # The names of the key a bound call takes in 'key': always said (a key
+    # NAME is always visible, see `_entity_set_detail`), because without
+    # them the call cannot be made -- also when the set itself is not shown.
+    key = list(keys.get(bound_to, [])) if isinstance(bound_to, str) else []
     # Named only when this agent can see that entity set; otherwise the
     # operation would reveal an entity set the catalogue keeps from it.
     if not isinstance(bound_to, str) or not readable.get(bound_to):
@@ -287,6 +288,7 @@ def _operation_detail(
             for p in _dicts(operation.get("parameters"))
         ],
         "examples": [],
+        "key": key,
         "bound_to": bound_to,
         # What a call of it IS for this tool, not merely what is stored.
         "changes_data": operation_changes_data(operation),
@@ -302,7 +304,7 @@ class _Candidate:
     """
 
     __slots__ = (
-        "kind", "operations", "raw", "readable", "score", "service", "target", "write",
+        "keys", "kind", "operations", "raw", "readable", "score", "service", "target", "write",
     )
 
     def __init__(
@@ -316,6 +318,7 @@ class _Candidate:
         operations: list[str],
         readable: dict[str, list[str]],
         write: bool,
+        keys: dict[str, list[str]] | None = None,
     ) -> None:
         self.score = score
         self.service = service
@@ -324,6 +327,8 @@ class _Candidate:
         self.raw = raw
         self.operations = operations
         self.readable = readable
+        # Entity set name -> key field names, for an operation's `key`.
+        self.keys = keys or {}
         # Whether writes are visible for THIS service (the entry's switch
         # and the service's version), decided once in `_candidates`.
         self.write = write
@@ -347,7 +352,7 @@ class _Candidate:
             if self.kind == "entity_set":
                 out.update(_entity_set_detail(self.raw, self.readable, allow_write))
             else:
-                out.update(_operation_detail(self.raw, self.readable))
+                out.update(_operation_detail(self.raw, self.readable, self.keys))
             out.update(_service_out(self.service))
         return out
 
@@ -403,9 +408,17 @@ def _candidates(
 
     if not allow_call:
         return out
+    keys = key_names(definition)
+    version = service.get("odata_version")
     for operation in _dicts(definition.get("operations")):
         target = _text(operation.get("name"))
-        if not target or not _operation_visible(operation, call_write):
+        # Offered only when `execute_operation` can run it: the same rule
+        # (`client.call_refusal`) that its gate refuses by -- enabled, this
+        # version's operations can be called, the write switch, and nothing
+        # in the catalogue that makes every call fail.
+        if not target or operation.get("enabled") is not True:
+            continue
+        if stored_call_refusal(operation, keys, version, allow_write=call_write) is not None:
             continue
         own = _W_TARGET * _hits(tokens, operation.get("title"), target)
         own += _W_DESCRIPTION * _hits(tokens, operation.get("description"))
@@ -419,6 +432,7 @@ def _candidates(
                 operations=["call"],
                 readable=readable,
                 write=allow_write,
+                keys=keys,
             )
         )
     return out
@@ -443,11 +457,16 @@ def search_catalogue(
     ``allow_call`` says the caller can run operations (function imports,
     actions, functions); without it none is listed, whatever it changes.
     ``call_versions`` narrows it to the OData versions whose operations the
-    caller can run (``None``: any). An operation is listed only when it is
-    enabled and either only reads (``operation_changes_data``) or
-    ``allow_write`` is on -- the entry's switch as it is, since what a call
-    needs is the switch and the version in ``call_versions``, not entity
-    writes of that version.
+    caller can run (``None``: any). An operation is listed only when it
+    can be called (``client.call_refusal``, the rule ``execute_operation``
+    refuses by): it is enabled, the service's version is one whose
+    operations can be called, it either only reads
+    (``operation_changes_data``) or ``allow_write`` is on -- the entry's
+    switch as it is, since what a call needs is the switch and the version
+    in ``call_versions``, not entity writes of that version -- and nothing
+    in the catalogue makes every call of it fail (a bound operation whose
+    key fields are not all parameters, an always-sent parameter of a type
+    that is not written).
 
     ``services`` are ``ODataService.to_dict()`` dicts. Never raises: a
     refusal is ``{"error": {"code", "message", "hint"?}}``, because the

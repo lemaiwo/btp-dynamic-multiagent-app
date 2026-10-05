@@ -644,8 +644,19 @@ class ODataService(Base):
         return data
 
     def to_dict(self, used_by: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """``to_summary`` plus the definition and ``uncallable_operations``:
+        the ENABLED operations no agent can ever call, as ``[{name,
+        reason}]`` (``agents.odata.calls``). A warning for the admin UI, not
+        a refusal -- the save stands. Not in the summary: it validates every
+        operation, which the service list must not do per row."""
+        # Imported here: the dialects pull in the OData client.
+        from agents.odata.calls import uncallable_operations
+
         data = self.to_summary(used_by)
         data["definition"] = self.definition
+        data["uncallable_operations"] = uncallable_operations(
+            self.definition, self.odata_version
+        )
         return data
 
 

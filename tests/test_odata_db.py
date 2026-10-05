@@ -188,11 +188,13 @@ async def test_to_dict_shape_and_stored_types():
             "id", "name", "title", "purpose", "not_for", "destination", "user_context",
             "odata_version", "service_path", "enabled", "definition", "metadata_fetched_at",
             "created_at", "updated_at", "counts", "has_write", "used_by",
+            "uncallable_operations",
         }
+        assert d["uncallable_operations"] == []  # the one operation is not enabled
         assert d["user_context"] is True and d["enabled"] is True
         assert d["metadata_fetched_at"] is None and d["used_by"] == []
         assert isinstance(d["id"], int) and d["created_at"] and d["updated_at"]
-        assert set(row.to_summary()) == set(d) - {"definition"}
+        assert set(row.to_summary()) == set(d) - {"definition", "uncallable_operations"}
         used = [{"agent_id": 1, "agent": "a", "enabled": True, "expose_api": False,
                  "api_slug": None, "allow_write": False}]
         assert row.to_dict(used_by=used)["used_by"] == used
@@ -502,3 +504,42 @@ async def test_losing_the_name_race_is_a_value_error_and_keeps_the_transaction(m
     monkeypatch.undo()
     async with SessionLocal() as s:
         assert [r.name for r in await list_odata_services(s)] == ["kept", "raced"]
+
+
+async def test_to_dict_lists_enabled_operations_that_can_never_be_called():
+    """A warning, not a refusal: the save stands, and the answer says which
+    enabled operations no agent will ever be offered, and why."""
+    data = good(name="uncallable")
+    item = "A_PurchaseRequisitionItem"
+    data["definition"]["operations"] = [
+        # Bound, but the key fields are not all parameters.
+        {"name": "ReleaseItem", "kind": "function_import", "http_method": "POST",
+         "bound_to": item, "parameters": [{"name": "ReleaseCode"}], "enabled": True},
+        {"name": "NeedsComplex", "kind": "function_import", "http_method": "GET",
+         "parameters": [{"name": "Address", "type": "NS.Address"}], "enabled": True},
+        {"name": "Fine", "kind": "function_import", "http_method": "GET", "enabled": True,
+         "bound_to": item,
+         "parameters": [{"name": "PurchaseRequisition"}, {"name": "PurchaseRequisitionItem"},
+                        {"name": "Odd", "type": "NS.Address", "required": False}]},
+        # Not enabled: nothing to warn about.
+        {"name": "Off", "kind": "function_import", "http_method": "GET",
+         "parameters": [{"name": "Address", "type": "NS.Address"}]},
+    ]
+    v4 = good(name="uncallable-v4", odata_version="v4", service_path="/sap/opu/odata4/x")
+    v4["definition"]["operations"] = [
+        {"name": "Release", "qualified_name": "NS.Release", "kind": "action",
+         "http_method": "POST", "enabled": True},
+    ]
+    async with SessionLocal() as s:
+        row = await create_odata_service(s, validate_odata_service(data))  # saved all the same
+        assert row.to_dict()["uncallable_operations"] == [
+            {"name": "ReleaseItem", "reason": "key_not_declared"},
+            {"name": "NeedsComplex", "reason": "parameter_type"},
+        ]
+        assert "uncallable_operations" not in row.to_summary()
+        row = await create_odata_service(s, validate_odata_service(v4))
+        assert row.to_dict()["uncallable_operations"] == [
+            {"name": "Release", "reason": "calls_not_available"},
+        ]
+    broken = ODataService(name="x", odata_version="v2", definition_json="not json")
+    assert broken.to_dict()["uncallable_operations"] == []

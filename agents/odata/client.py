@@ -88,6 +88,7 @@ import copy
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote
@@ -161,6 +162,70 @@ def _outcome_hint(operation: str) -> str:
     if operation == "call":
         return _CALL_FIRST_HINT
     return _LIST_FIRST_HINT if operation == "create" else _READ_FIRST_HINT
+
+
+# The one text for "this app cannot call operations of this OData version".
+CALL_NOT_AVAILABLE = "operations of a service of this OData version cannot be called yet"
+# Why an operation cannot be called (`call_refusal`).
+CALL_REFUSALS = (
+    "operation_disabled",  # not enabled in the catalogue
+    "calls_not_available",  # the service's OData version: not this app, not yet
+    "write_not_allowed",  # it changes data and the agent may not
+    "bound_set_missing",  # bound to an entity set the catalogue does not hold
+    "key_not_declared",  # bound, and a key field is not one of its parameters
+    "parameter_type",  # a parameter that is always sent has a type not written
+)
+_CATALOGUE_HINT = "this is a catalogue setting; tell the user instead of retrying"
+
+
+def call_refusal(
+    operation: OperationDef,
+    bound_keys: Sequence[str] | None,
+    dialect: Any,
+    *,
+    allow_write: bool = True,
+) -> str | None:
+    """Why ``operation`` cannot be called, or ``None`` when it can. No I/O.
+
+    THE rule for "callable": ``ODataClient.check_call`` refuses by it, the
+    search tool offers only what passes it, and the admin API lists the
+    enabled operations that fail it. It is about the catalogue, the dialect
+    and the agent's write switch -- never about the arguments of one call.
+
+    ``bound_keys`` are the key field names of the entity set the operation
+    is bound to (``None`` when that set is not in the catalogue; ignored for
+    an operation that is not bound). ``dialect`` is the dialect of the
+    service's OData version (``None``: none). First match of
+    ``CALL_REFUSALS``, in that order.
+
+    A bound call sends the key of its entity as parameters of the same
+    names, so every key field must be a declared parameter. A parameter that
+    is always sent -- a ``required`` one, or a key field -- must have a type
+    the dialect writes (``sends_type``): a complex type, a collection,
+    ``Edm.Binary`` or an unknown name can never be given a value. An
+    optional parameter of such a type is merely never sent.
+    """
+    if operation.enabled is not True:
+        return "operation_disabled"
+    if getattr(dialect, "supports_call", False) is not True or operation.kind != "function_import":
+        return "calls_not_available"
+    if not allow_write and operation.is_write():
+        return "write_not_allowed"
+    always: set[str] = set()
+    if operation.bound_to is not None:
+        if bound_keys is None:
+            return "bound_set_missing"
+        declared = {p.name for p in operation.parameters}
+        if any(name not in declared for name in bound_keys):
+            return "key_not_declared"
+        always = set(bound_keys)
+    sends = getattr(dialect, "sends_type", None)
+    for parameter in operation.parameters:
+        if not (parameter.required or parameter.name in always):
+            continue
+        if not callable(sends) or sends(parameter.type) is not True:
+            return "parameter_type"
+    return None
 
 
 def call_changes_data(operation: OperationDef) -> bool:
@@ -285,9 +350,10 @@ class CallPlan:
 
     ``name`` is the operation's catalogue name; ``method``, ``path`` (the
     confined, relative request path) and ``query`` (for ``params=``) are the
-    request; ``fields`` the NAMES of the parameters the caller passed in
-    ``params``, in its order -- names only, which is all an audit record may
-    hold; ``key`` the validated key of the bound entity or ``None``;
+    request; ``fields`` the NAMES of the parameters of ``params`` that are
+    SENT, in the caller's order (an optional parameter passed as null is
+    left out of the request, and so of this) -- names only, which is all an
+    audit record may hold; ``key`` the validated key of the bound entity or ``None``;
     ``changes`` whether the call is a write (``call_changes_data``);
     ``bound`` the entity set it is bound to, if any (whose KEY the call
     takes); ``result_set`` the entity set returned entities are checked
@@ -853,20 +919,27 @@ class ODataClient:
         order is fixed. No refusal repeats a value, only names.
 
         1. ``operation`` is an operation of this service's definition
-           (``unknown_target``) and it is ``enabled``
-           (``operation_disabled``);
-        2. the service's OData version is one whose operations this client
-           can call (V2 function imports today) (``operation_disabled``);
+           (``unknown_target``);
+        2. it can be called at all (``call_refusal``, the rule the search
+           tool offers by): it is ``enabled`` (``operation_disabled``); the
+           service's OData version is one whose operations this client can
+           call, V2 function imports today (``not_available``, the code and
+           text the execute tool answers); and the catalogue declares it
+           callable -- a bound operation's entity set exists and every key
+           field is a declared parameter (SAP V2 takes the key of a bound
+           function import as parameters, and nothing is sent under a name
+           the catalogue does not declare), and every parameter that is
+           always sent has a type the dialect writes (``not_available``,
+           with a hint that it is a catalogue setting);
         3. ``params``: absent or an object of at most ``MAX_CALL_PARAMS``
            entries, every name a parameter the catalogue declares for the
            operation (``invalid_argument``);
         4. the key: an operation bound to an entity set needs exactly that
-           set's key, with valid values (``invalid_key``); SAP V2 takes the
-           key of a bound function import as parameters, so every key field
-           must be one of the declared parameters and must not be passed in
-           ``params`` as well (``invalid_argument``) -- nothing is sent
-           under a name the catalogue does not declare. An operation that
-           is not bound takes no key (``invalid_argument``);
+           set's key, with valid values (``invalid_key``; the refusal says
+           "this operation", never the set's name, which the agent may not
+           be able to see), and no key field in ``params`` as well
+           (``invalid_argument``). An operation that is not bound takes no
+           key (``invalid_argument``);
         5. every ``required`` parameter is there, and every value is one
            JSON scalar with the form of the parameter's EDM type; an
            object, a list and a type the dialect does not know are refused
@@ -882,18 +955,13 @@ class ODataClient:
         )
         if known is None or known != operation:
             raise ODataError("unknown_target", "the service has no such operation")
-        if operation.enabled is not True:
-            raise ODataError(
-                "operation_disabled", f"operation {operation.name!r} is not enabled"
-            )
-        if (
-            getattr(self._dialect, "supports_call", False) is not True
-            or operation.kind != "function_import"
-        ):
-            raise ODataError(
-                "operation_disabled",
-                "calling operations is not supported for the OData version of this service",
-            )
+        bound: EntitySetDef | None = None
+        if operation.bound_to is not None:
+            bound = self._definition.entity_set(operation.bound_to)
+        bound_keys = None if bound is None else [k.name for k in bound.keys]
+        reason = call_refusal(operation, bound_keys, self._dialect)
+        if reason is not None:
+            raise self._not_callable(operation, reason, bound_keys or [])
         if params is None:
             params = {}
         if not isinstance(params, dict) or len(params) > MAX_CALL_PARAMS:
@@ -909,26 +977,20 @@ class ODataClient:
                     f"operation {operation.name!r} has no parameter {_shown(name)}; "
                     f"its parameters are: {expected}",
                 )
-        bound: EntitySetDef | None = None
-        if operation.bound_to is not None:
-            bound = self._definition.entity_set(operation.bound_to)
-            if bound is None:
-                raise ODataError(
-                    "operation_disabled",
-                    f"the entity set operation {operation.name!r} is bound to is not "
-                    f"in the catalogue",
-                )
+        if bound is not None:
             # The rules of a key in a path, although this one travels in the
             # query: the same key names the same entity everywhere.
-            self._dialect.key_segment(bound, key)
+            try:
+                self._dialect.key_segment(bound, key)
+            except ODataError as exc:
+                # The agent may not be able to see the entity set (search
+                # then hides `bound_to`): the key is the operation's.
+                raise ODataError(
+                    exc.code,
+                    exc.message.replace(f"entity set {bound.name!r}", "this operation"),
+                    hint=exc.hint,
+                ) from None
             for definition in bound.keys:
-                if definition.name not in declared:
-                    raise ODataError(
-                        "invalid_argument",
-                        f"operation {operation.name!r} declares no parameter for key "
-                        f"field {definition.name!r}, so it cannot be called for one entity",
-                        hint="this is a catalogue setting; tell the user instead of retrying",
-                    )
                 if definition.name in params:
                     raise ODataError(
                         "invalid_argument",
@@ -962,7 +1024,8 @@ class ODataClient:
             method=method,
             path=path,
             query=query,
-            fields=tuple(params),
+            # What was sent: an optional parameter passed as null is not.
+            fields=tuple(name for name in params if name in query),
             key=dict(key) if bound is not None else None,
             changes=changes,
             bound=bound,
@@ -972,6 +1035,33 @@ class ODataClient:
             ),
             many=None if returns is None else returns.collection,
             etag=etag,
+        )
+
+    @staticmethod
+    def _not_callable(
+        operation: OperationDef, reason: str, bound_keys: Sequence[str]
+    ) -> ODataError:
+        """The refusal of a ``call_refusal`` reason. Names only."""
+        name = operation.name
+        if reason == "operation_disabled":
+            return ODataError("operation_disabled", f"operation {name!r} is not enabled")
+        if reason == "calls_not_available":
+            return ODataError("not_available", CALL_NOT_AVAILABLE)
+        if reason == "bound_set_missing":
+            why = "the entity set it is bound to is not in the catalogue"
+        elif reason == "key_not_declared":
+            declared = {p.name for p in operation.parameters}
+            missing = next((k for k in bound_keys if k not in declared), "")
+            why = (
+                f"it declares no parameter for key field {missing!r}, so it cannot be "
+                f"called for one entity"
+            )
+        else:
+            why = "one of its parameters has a type this tool does not send"
+        return ODataError(
+            "not_available",
+            f"operation {name!r} cannot be called as the catalogue declares it: {why}",
+            hint=_CATALOGUE_HINT,
         )
 
     # -- the call -----------------------------------------------------------

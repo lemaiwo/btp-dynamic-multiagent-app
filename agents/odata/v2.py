@@ -152,6 +152,20 @@ class V2Dialect:
         return common.key_segment(self.literal, entity_set, key)
 
     # -- function imports ---------------------------------------------------
+    def sends_type(self, edm_type: str) -> bool:
+        """Whether ``literal`` can write a value of ``edm_type`` at all.
+
+        The types of ``literal``, said once for ``client.call_refusal``: a
+        parameter of any other type (a complex type, a collection,
+        ``Edm.Binary``, an unknown name) can never be given a value.
+        """
+        return (
+            edm_type in ("Edm.String", "Edm.Boolean", "Edm.Decimal")
+            or edm_type in _INTEGER_TYPES
+            or edm_type in _FLOAT_TYPES
+            or edm_type in _PATTERN_TYPES
+        )
+
     def call_literal(self, edm_type: str, value: Any) -> str:
         """``value`` as the URI literal of a function import parameter.
 
@@ -159,9 +173,20 @@ class V2Dialect:
         a parameter value, an integer must fit its type, and a text has a
         length a query string can carry. A type ``literal`` does not know
         (a complex type, a collection, ``Edm.Binary``) is refused there.
+
+        The length is checked on the text that is sent: a number passed for
+        an ``Edm.String`` is turned into its digits first. (An integer too
+        large to have that few digits is refused by its size, before any
+        conversion: Python refuses to print a very long one.)
         """
         if value is None or isinstance(value, (dict, list, tuple, set)):
             raise _refuse(edm_type)
+        if isinstance(value, int) and not isinstance(value, bool):
+            # 1,000 decimal digits are fewer than 3,322 bits.
+            if value.bit_length() > 4 * MAX_PARAM_VALUE_CHARS:
+                raise _refuse(edm_type)
+            if edm_type == "Edm.String":
+                value = str(value)
         if isinstance(value, str) and len(value) > MAX_PARAM_VALUE_CHARS:
             raise _refuse(edm_type)
         text = self.literal(edm_type, value)

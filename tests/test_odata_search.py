@@ -174,7 +174,12 @@ PURCHASE_REQUISITIONS = _service(
                 "kind": "function_import",
                 "http_method": "POST",
                 "bound_to": ITEM,
-                "parameters": [{"name": "PurchaseRequisition"}, {"name": "ReleaseCode"}],
+                # Bound: the key fields of its entity set are parameters.
+                "parameters": [
+                    {"name": "PurchaseRequisition"},
+                    {"name": "PurchaseRequisitionItem"},
+                    {"name": "ReleaseCode"},
+                ],
                 "enabled": True,
                 "changes_data": True,
             },
@@ -454,8 +459,10 @@ def test_full_detail_of_an_operation_lists_its_parameters():
     assert op["bound_to"] == ITEM and op["changes_data"] is True
     assert op["parameters"] == [
         {"name": "PurchaseRequisition", "type": "Edm.String", "required": True},
+        {"name": "PurchaseRequisitionItem", "type": "Edm.String", "required": True},
         {"name": "ReleaseCode", "type": "Edm.String", "required": True},
     ]
+    assert op["key"] == ["PurchaseRequisition", "PurchaseRequisitionItem"]
 
 
 def test_an_example_never_names_a_hidden_field():
@@ -511,6 +518,8 @@ def _bound_service() -> dict[str, Any]:
             "kind": "function_import",
             "http_method": "GET",
             "bound_to": bound_to,
+            # A bound call sends the key of its entity as parameters.
+            "parameters": [{"name": "Id"}] if bound_to else [],
             "enabled": True,
             "changes_data": False,
         }
@@ -566,8 +575,8 @@ def test_bound_to_names_only_an_entity_set_the_agent_can_see():
 
 FULL_KEYS = {
     "service", "service_title", "target", "kind", "title", "description", "operations",
-    "keys", "fields", "navigations", "parameters", "examples", "bound_to", "changes_data",
-    "purpose", "not_for", "runs_as",
+    "keys", "key", "fields", "navigations", "parameters", "examples", "bound_to",
+    "changes_data", "purpose", "not_for", "runs_as",
 }  # fmt: skip
 
 
@@ -589,7 +598,7 @@ def test_every_full_match_has_the_same_shape():
             assert match["examples"] == [] and isinstance(match["changes_data"], bool)
     for match in search_catalogue(SERVICES, "", allow_write=True)["matches"]:
         assert set(match) == FULL_KEYS - {
-            "keys", "fields", "navigations", "parameters", "examples", "bound_to",
+            "keys", "key", "fields", "navigations", "parameters", "examples", "bound_to",
             "changes_data", "purpose", "not_for", "runs_as",
         }  # fmt: skip
 
