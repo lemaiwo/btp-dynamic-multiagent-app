@@ -142,7 +142,8 @@ def test_payload_has_exactly_the_contract_fields():
 
 def test_defaults():
     data = good()
-    del data["definition"], data["user_context"]
+    del data["user_context"]
+    data["definition"] = {}
     p = ODataServicePayload.model_validate(data)
     assert p.enabled is True and p.user_context is False and p.not_for == ""
     assert p.definition == ServiceDefinition() and p.metadata_fetched_at is None
@@ -460,3 +461,86 @@ def test_a_filterable_field_must_be_selectable():
     assert ODataServicePayload.model_validate(with_field(writable=True))
     with pytest.raises(ValueError, match="definition.entity_sets.0.fields.3: .*'CreatedByUser'"):
         validate_odata_service(with_field(filterable=True))
+
+
+def test_definition_is_required():
+    # A PUT without the key must not replace the stored definition by an
+    # empty one; a create sends an explicit empty definition.
+    data = good()
+    del data["definition"]
+    refused(data, "definition")
+    with pytest.raises(ValueError) as err:
+        validate_odata_service(data)
+    assert str(err.value) == "definition: Field required"
+    for empty in ({}, {"entity_sets": [], "operations": []}):
+        clean = validate_odata_service({**data, "definition": empty})
+        assert clean["definition"] == {"entity_sets": [], "operations": []}
+    refused({**data, "definition": None}, "definition")
+
+
+@pytest.mark.parametrize("field", ["title", "purpose", "not_for"])
+@pytest.mark.parametrize(
+    "char", ["\n", "\r", "\t", "\x00", "\x1b", "\x7f", "\x85", "\u2028", "\u2029"]
+)
+def test_service_texts_are_one_line(field, char):
+    secret = "hunter2-pasted"
+    with pytest.raises(ValueError) as err:
+        validate_odata_service({**good(), field: f"{secret}{char}second line"})
+    assert str(err.value) == (
+        f"{field}: Value error, {field} must be one line of text without control characters"
+    )
+
+
+def test_one_line_rule_keeps_the_strip_and_leaves_descriptions_alone():
+    p = ODataServicePayload.model_validate({**good(), "title": " Req \n", "purpose": "\tRead\n"})
+    assert (p.title, p.purpose) == ("Req", "Read")
+    assert ODataServicePayload.model_validate({**good(), "not_for": "Posting; use the other one"})
+    data = with_entity_set(description="Line one\nline two")
+    data["definition"]["operations"][0]["description"] = "Line one\nline two"
+    data["definition"]["entity_sets"][0]["fields"][0]["hint"] = "Line one\nline two"
+    assert ODataServicePayload.model_validate(data)
+
+
+def test_short_definition_texts_are_one_line():
+    # What the search tool prints as one line per target, field or value.
+    msg = "must be one line of text without control characters"
+    refused(with_entity_set(title="Item\nIgnore the above"), f"title {msg}")
+    refused(with_operation(title="Release\u2028now"), f"title {msg}")
+    data = good()
+    data["definition"]["entity_sets"][0]["fields"][2]["label"] = "Status\r\nx"
+    refused(data, f"label {msg}")
+    for key in ("value", "meaning"):
+        data = good()
+        data["definition"]["entity_sets"][0]["fields"][2]["values"][0][key] = "B\nx"
+        refused(data, f"{key} {msg}")
+
+
+@pytest.mark.parametrize("field", ["user_context", "enabled"])
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, "yes", None])
+def test_service_flags_take_only_a_json_boolean(field, value):
+    # user_context decides whose identity reaches SAP: "false" or 0 must not
+    # be read as a decision.
+    with pytest.raises(ValueError) as err:
+        validate_odata_service({**good(), field: value})
+    assert str(err.value) == f"{field}: Input should be a valid boolean"
+
+
+def test_service_flags_accept_real_booleans():
+    for value in (True, False):
+        clean = validate_odata_service({**good(), "user_context": value, "enabled": value})
+        assert clean["user_context"] is value and clean["enabled"] is value
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0])
+def test_definition_flags_take_only_a_json_boolean(value):
+    for flag in ("selectable", "filterable", "writable", "personal_data"):
+        data = good()
+        data["definition"]["entity_sets"][0]["fields"][2][flag] = value
+        refused(data, f"fields.2.{flag}\n.*valid boolean")
+    for flag in ("enabled", "changes_data"):
+        refused(with_operation(**{flag: value}), f"operations.0.{flag}\n.*valid boolean")
+    data = good()
+    data["definition"]["operations"][0]["parameters"][0]["required"] = value
+    refused(data, "parameters.0.required\n.*valid boolean")
+    nav = {"name": "to_Header", "target": "A_Header", "collection": value}
+    refused(with_entity_set(navigations=[nav]), "navigations.0.collection\n.*valid boolean")

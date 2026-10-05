@@ -19,6 +19,7 @@ all of them already matched ``EDM_NAME_RE``), never a free-text value:
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -26,8 +27,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StringConstraints,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -71,6 +74,20 @@ def _first_duplicate(names: list[str]) -> str | None:
     return None
 
 
+def _one_line(value: str, info: ValidationInfo) -> str:
+    """Refuse a control character or a line separator in a one-line text.
+
+    These texts are printed as one line each -- the service's ``purpose`` in
+    an agent's instructions, titles, labels and value meanings in the search
+    tool's answer -- so a line break in one of them would start a line of its
+    own there, which reads as something the catalogue did not say. The
+    message names the field, never the text.
+    """
+    if any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in value):
+        raise ValueError(f"{info.field_name} must be one line of text without control characters")
+    return value
+
+
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -86,6 +103,8 @@ class ValueMeaning(_Model):
     value: str = Field(min_length=1, max_length=64)
     meaning: str = Field(min_length=1, max_length=200)
 
+    _one_line = field_validator("value", "meaning")(_one_line)
+
 
 class FieldDef(_Model):
     """A property of an entity set.
@@ -97,12 +116,14 @@ class FieldDef(_Model):
     name: EdmName
     type: EdmType = "Edm.String"
     label: str = Field(default="", max_length=120)
-    selectable: bool = False
-    filterable: bool = False
-    writable: bool = False
+    selectable: StrictBool = False
+    filterable: StrictBool = False
+    writable: StrictBool = False
     hint: str = Field(default="", max_length=300)
     values: list[ValueMeaning] = Field(default_factory=list)
-    personal_data: bool = False
+    personal_data: StrictBool = False
+
+    _one_line = field_validator("label")(_one_line)
 
     @model_validator(mode="after")
     def _filterable_is_selectable(self) -> FieldDef:
@@ -121,7 +142,7 @@ class FieldDef(_Model):
 class NavigationDef(_Model):
     name: EdmName
     target: EdmName  # entity set name
-    collection: bool
+    collection: StrictBool
     description: str = Field(default="", max_length=300)
 
 
@@ -144,6 +165,8 @@ class EntitySetDef(_Model):
     fields: list[FieldDef] = Field(max_length=MAX_FIELDS)
     navigations: list[NavigationDef] = Field(default_factory=list)
     examples: list[ExampleQuery] = Field(default_factory=list)
+
+    _one_line = field_validator("title")(_one_line)
 
     @field_validator("path")
     @classmethod
@@ -202,7 +225,7 @@ class EntitySetDef(_Model):
 class ParamDef(_Model):
     name: EdmName
     type: EdmType = "Edm.String"
-    required: bool = True
+    required: StrictBool = True
 
 
 class OperationDef(_Model):
@@ -221,8 +244,10 @@ class OperationDef(_Model):
     bound_to: EdmName | None = None  # entity set name
     parameters: list[ParamDef] = Field(default_factory=list)
     description: str = Field(default="", max_length=600)
-    enabled: bool = False
-    changes_data: bool = True
+    enabled: StrictBool = False
+    changes_data: StrictBool = True
+
+    _one_line = field_validator("title")(_one_line)
 
     @field_validator("qualified_name")
     @classmethod
@@ -290,12 +315,17 @@ class ODataServicePayload(_Model):
     purpose: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
     not_for: str = Field(default="", max_length=200)
     destination: Annotated[str, StringConstraints(pattern=DESTINATION_NAME_RE)]
-    user_context: bool = False
+    user_context: StrictBool = False
     odata_version: Literal["v2", "v4"]
     service_path: str
-    enabled: bool = True
-    definition: ServiceDefinition = Field(default_factory=ServiceDefinition)
+    enabled: StrictBool = True
+    # Required on purpose: with a default, an update that leaves the key out
+    # would replace the stored definition by an empty one. A create sends {}.
+    definition: ServiceDefinition
     metadata_fetched_at: datetime | None = None
+
+    # Runs after the strip above, so surrounding whitespace is still dropped.
+    _one_line = field_validator("title", "purpose", "not_for")(_one_line)
 
     @field_validator("service_path")
     @classmethod
