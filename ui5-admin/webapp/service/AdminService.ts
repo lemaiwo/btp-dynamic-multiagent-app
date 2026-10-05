@@ -1,7 +1,8 @@
 import type {
+    ImportResult,
     Agent, AgentInput, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
     JobRun, JobRunDetail, ModelInfo, ODataDuplicateRequest, ODataMetadataPreview, ODataMetadataRequest,
-    ODataService, ODataServiceInput, ODataServiceSummary, ODataTestResult,
+    ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
     OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
@@ -197,8 +198,8 @@ export default class AdminService {
         return this.request<ImportPayload>("export");
     }
 
-    public importConfig(payload: ImportPayload): Promise<unknown> {
-        return this.request<unknown>("import", { method: "POST", ...AdminService.json(payload) });
+    public importConfig(payload: ImportPayload): Promise<ImportResult> {
+        return this.request<ImportResult>("import", { method: "POST", ...AdminService.json(payload) });
     }
 
     public whoami(): Promise<WhoAmI> {
@@ -274,8 +275,9 @@ export default class AdminService {
     }
 
     /** The name is immutable: `input.name` must be `name`, or the server
-     * answers 422. */
-    public updateODataService(name: string, input: ODataServiceInput): Promise<ODataService> {
+     * answers 422. With `expected_updated_at`, a service that was changed
+     * since that moment is not overwritten: 409. */
+    public updateODataService(name: string, input: ODataServiceUpdate): Promise<ODataService> {
         return this.request<ODataService>(AdminService.odataServicePath(name), {
             method: "PUT", ...AdminService.json(input)
         });

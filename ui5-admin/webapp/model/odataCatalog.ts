@@ -71,6 +71,19 @@ function hasControlCharacter(value: string): boolean {
     return false;
 }
 
+// What the server strips from both ends of a title and a purpose: Unicode
+// White_Space, as pydantic's `strip_whitespace` does. Not the same set as
+// JS `trim()`, which leaves U+0085 (so the text would be refused for a
+// control character the server drops) and takes U+FEFF (so a text of only
+// that would be "missing" here and accepted there).
+const SERVER_SPACE = "[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+const SERVER_STRIP_RE = new RegExp(`^${SERVER_SPACE}+|${SERVER_SPACE}+$`, "g");
+
+/** `value` as the server stores a stripped text field. */
+function serverStrip(value: string | undefined | null): string {
+    return String(value ?? "").replace(SERVER_STRIP_RE, "");
+}
+
 /**
  * Whether `value` is one line as the server means it (`_one_line` in
  * agents/odata/models.py): no control character (Unicode category Cc, so no
@@ -199,8 +212,8 @@ export default {
         const errors: ODataErrors = {};
         // Stripped first, as the server does for these two: what surrounds
         // the text is dropped there, so only what is inside it counts.
-        const title = (input.title ?? "").trim();
-        const purpose = (input.purpose ?? "").trim();
+        const title = serverStrip(input.title);
+        const purpose = serverStrip(input.purpose);
         const notFor = input.not_for ?? "";
         const path = input.service_path ?? "";
         const set = (field: ODataErrorField, key: string): void => {
@@ -231,8 +244,9 @@ export default {
         }
         set("destination", destinationProblem(input.destination ?? ""));
         // Strict, like the server's StrictBool: "true" or 1 is not a flag.
-        // This one decides whose identity reaches SAP.
-        if (typeof input.user_context !== "boolean") {
+        // This one decides whose identity reaches SAP. Left out, the server
+        // takes its default (technical user, enabled), so that is no error.
+        if (input.user_context !== undefined && typeof input.user_context !== "boolean") {
             errors.user_context = "odataErrBoolean";
         }
         if (!path) {
@@ -240,7 +254,7 @@ export default {
         } else if (!isConfinedPath(path)) {
             errors.service_path = "odataErrPathInvalid";
         }
-        if (typeof input.enabled !== "boolean") {
+        if (input.enabled !== undefined && typeof input.enabled !== "boolean") {
             errors.enabled = "odataErrBoolean";
         }
         // Required by the server: a payload without it is refused instead of
@@ -272,8 +286,15 @@ export default {
     /** The length the server holds against the 200 of a purpose: that of
      *  the stripped text. */
     purposeLength(purpose: string | undefined | null): number {
-        return String(purpose ?? "").trim().length;
+        return serverStrip(purpose).length;
     },
+
+    /** The most characters a purpose may have. */
+    MAX_PURPOSE,
+
+    /** A text as the server stores a title or a purpose: without the white
+     *  space around it (Unicode White_Space, which is not JS `trim()`). */
+    serverStrip,
 
     /**
      * The payload fields of a service, as a deep copy and without anything

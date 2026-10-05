@@ -64,6 +64,9 @@
 .odataTechnical .sapMInputBaseInner {
     font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
+.odataCounter .sapMObjStatusText {
+    font-size: 0.75rem;
+}
 .odataHint.sapMText,
 .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
     color: var(--sapContent_LabelColor);

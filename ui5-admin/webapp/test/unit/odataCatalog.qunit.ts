@@ -165,6 +165,26 @@ QUnit.test("validate accepts a no-break space and whatever surrounds a title or 
     });
 });
 
+QUnit.test("validate accepts a payload without the two flags: the server defaults them", function (assert) {
+    const { user_context, enabled, ...withoutFlags } = input();
+    void [user_context, enabled];
+
+    assert.deepEqual(odataCatalog.validate(withoutFlags as ODataServiceInput), {});
+    assert.deepEqual(
+        odataCatalog.validate({ ...withoutFlags, enabled: null } as unknown as ODataServiceInput),
+        { enabled: "odataErrBoolean" }, "present and not a boolean is still refused"
+    );
+});
+
+QUnit.test("serverStrip strips what the server strips, which is not what trim() strips", function (assert) {
+    assert.strictEqual(odataCatalog.serverStrip("  a b \t\r\n"), "a b");
+    assert.strictEqual(odataCatalog.serverStrip("\u0085a\u00a0\u2028\u3000"), "a", "NEL and the Unicode spaces go");
+    assert.strictEqual(odataCatalog.serverStrip("\ufeffa\ufeff"), "\ufeffa\ufeff", "U+FEFF stays");
+    assert.strictEqual(odataCatalog.serverStrip("a\u001f"), "a\u001f", "a separator control stays (and is refused)");
+    assert.strictEqual(odataCatalog.serverStrip(undefined), "");
+    assert.strictEqual(odataCatalog.purposeLength("\u0085abc\u0085"), 3);
+});
+
 QUnit.test("purposeLength counts what the server counts: the stripped text", function (assert) {
     assert.strictEqual(odataCatalog.purposeLength("Nightly checks and release of requisitions"), 42);
     assert.strictEqual(odataCatalog.purposeLength("  padded \n"), 6);

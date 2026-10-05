@@ -22,12 +22,14 @@
                     id="odataTagVersion"
                     text="{ path: 'svc>/original/odata_version', formatter: '.formatVersion' }"
                     inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
                     visible="{svc>/exists}" />
                 <ObjectStatus
                     id="odataTagRunsAs"
                     text="{ path: 'svc>/original/user_context', formatter: '.formatRunsAs' }"
                     state="{ path: 'svc>/original/user_context', formatter: '.formatRunsAsState' }"
                     inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
                     visible="{svc>/exists}" />
                 <ObjectStatus
                     id="odataTagWrite"
@@ -40,6 +42,7 @@
                     text="{i18n>odataTagDisabled}"
                     state="Error"
                     inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
                     visible="{= ${svc>/exists} &amp;&amp; !${svc>/original/enabled} }" />
                 <ToolbarSpacer />
                 <!-- U6: "Import from $metadata" (odataImportMetadataButton)
@@ -85,6 +88,32 @@
                     <Link id="odataDetailRetry" text="{i18n>odataRetry}" press=".onRetry" />
                 </link>
             </MessageStrip>
+            <!-- Saved elsewhere since the form loaded it: nothing is sent
+                 over it. The input stays until the admin reloads. -->
+            <MessageStrip
+                id="odataChangedElsewhere"
+                visible="{svc>/changedElsewhere}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{i18n>odataChangedElsewhere}">
+                <link>
+                    <Link id="odataReload" text="{i18n>odataReload}" press=".onReload" />
+                </link>
+            </MessageStrip>
+            <!-- Deleted elsewhere: the input stays and can be saved as a
+                 new service. -->
+            <MessageStrip
+                id="odataDeletedElsewhere"
+                visible="{svc>/deletedElsewhere}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{i18n>odataDeletedElsewhere}">
+                <link>
+                    <Link id="odataSaveAsNew" text="{i18n>odataSaveAsNew}" press=".onSaveAsNew" />
+                </link>
+            </MessageStrip>
             <!-- What a refused save says about anything that has no field of
                  its own below. The server's words, as plain text. -->
             <MessageStrip
@@ -110,6 +139,7 @@
                         <Switch
                             id="odataEnabledSwitch"
                             state="{svc>/data/enabled}"
+                            change=".onEnabledChange"
                             ariaLabelledBy="odataEnabledLabel" />
                     </Toolbar>
                 </headerToolbar>
@@ -172,10 +202,13 @@
                             ariaDescribedBy="odataPurposeCounter"
                             app:field="purpose"
                             liveChange=".onEdit" />
-                        <Text
+                        <!-- Turns red as soon as the text is too long, not
+                             only when Save refuses it. -->
+                        <ObjectStatus
                             id="odataPurposeCounter"
                             text="{ path: 'svc>/data/purpose', formatter: '.formatPurposeCounter' }"
-                            class="odataHint" />
+                            state="{ path: 'svc>/data/purpose', formatter: '.formatPurposeCounterState' }"
+                            class="odataCounter" />
                     </VBox>
 
                     <Label text="{i18n>odataNotFor}" labelFor="odataNotFor" />

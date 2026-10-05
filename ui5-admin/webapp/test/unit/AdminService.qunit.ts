@@ -701,6 +701,75 @@ QUnit.test("a payload without a definition is refused and the stored one stays",
     assert.strictEqual(post.detail, "definition: Field required");
 });
 
+QUnit.test("an update made from a stale version is refused with 409 and stores nothing", async function (assert) {
+    const service = new AdminService();
+    const loaded = await service.getODataService("purchase-requisitions");
+    const input = { ...VALID_INPUT, definition: loaded.definition };
+
+    // Someone else saves first.
+    const theirs = await service.updateODataService("purchase-requisitions", { ...input, title: "Theirs" });
+    assert.notStrictEqual(theirs.updated_at, loaded.updated_at, "their save moved updated_at");
+
+    const stale = await refusal(() => service.updateODataService(
+        "purchase-requisitions", { ...input, title: "Mine", expected_updated_at: loaded.updated_at }
+    ));
+    assert.strictEqual(stale.status, 409);
+    assert.strictEqual(
+        stale.detail, "Service 'purchase-requisitions' was changed since it was loaded; reload it and save again"
+    );
+    assert.strictEqual((await service.getODataService("purchase-requisitions")).title, "Theirs", "nothing was stored");
+
+    const fresh = await service.updateODataService(
+        "purchase-requisitions", { ...input, title: "Mine", expected_updated_at: theirs.updated_at }
+    );
+    assert.strictEqual(fresh.title, "Mine", "made from the current version, it is saved");
+    assert.notStrictEqual(fresh.updated_at, theirs.updated_at, "and updated_at moves again");
+    assert.strictEqual(
+        (await service.updateODataService("purchase-requisitions", { ...input, expected_updated_at: null })).title,
+        VALID_INPUT.title, "null, like a missing key, is not checked"
+    );
+});
+
+QUnit.test("expected_updated_at belongs to an update only, and is a string", async function (assert) {
+    const service = new AdminService();
+
+    const wrong = await refusal(() => service.updateODataService(
+        "purchase-requisitions", { ...VALID_INPUT, expected_updated_at: 7 as unknown as string }
+    ));
+    assert.strictEqual(wrong.status, 422);
+    assert.strictEqual(wrong.detail, "expected_updated_at: Input should be a valid string");
+    const create = await refusal(() => service.createODataService(
+        { ...VALID_INPUT, name: "suppliers", expected_updated_at: "x" } as ODataServiceInput
+    ));
+    assert.strictEqual(create.detail, "expected_updated_at: Extra inputs are not permitted");
+});
+
+QUnit.test("an unknown key is named only when it looks like a field name", async function (assert) {
+    const service = new AdminService();
+    const withKey = (key: string) => refusal(() => service.createODataService(
+        { ...VALID_INPUT, name: "suppliers", [key]: 1 } as ODataServiceInput
+    ));
+
+    assert.strictEqual((await withKey("used_by")).detail, "used_by: Extra inputs are not permitted");
+    assert.strictEqual((await withKey("a".repeat(64))).detail, `${"a".repeat(64)}: Extra inputs are not permitted`);
+    for (const key of ["https://alice:s3cret@s4.internal", "bad key", "a".repeat(65), "x\n", "9lives"]) {
+        assert.strictEqual(
+            (await withKey(key)).detail, "<unknown field>: Extra inputs are not permitted", JSON.stringify(key.substring(0, 20))
+        );
+    }
+});
+
+QUnit.test("a payload without the two flags is stored with the defaults", async function (assert) {
+    const { user_context, enabled, ...withoutFlags } = VALID_INPUT;
+    void [user_context, enabled];
+
+    const created = await new AdminService().createODataService(
+        { ...withoutFlags, name: "suppliers" } as ODataServiceInput
+    );
+    assert.strictEqual(created.user_context, false, "technical user");
+    assert.strictEqual(created.enabled, true, "enabled");
+});
+
 QUnit.test("the one-line rule accepts a no-break space and strips title and purpose first", async function (assert) {
     const service = new AdminService();
 

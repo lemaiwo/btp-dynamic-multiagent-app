@@ -16,7 +16,8 @@ import Common, { backend } from "./pages/Common";
 import { iPressInDialog, iSeeADialog } from "./pages/Dialogs";
 import { TABLE, VIEW as LIST_VIEW, buttonsOf, itemOf, messageOf } from "./pages/ODataList";
 import {
-    PAGE, VIEW, actionsOf, formOf, pageTitle, pressSegment, stateOf, tagsOf, toasts, viewOf, withId,
+    PAGE, VIEW, actionsOf, counterState, formOf, pageTitle, pressSegment, stateOf, stripOf, tagsOf, toasts, viewOf,
+    withId,
     type FormTexts
 } from "./pages/ODataDetail";
 
@@ -264,6 +265,7 @@ opaTest("purpose is required, counted and one line; a refused form sends nothing
         return formOf(page).counter === "29 / 200";
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(formOf(page).counter, "29 / 200", "the counter counts what was typed");
+        Opa5.assert.strictEqual(counterState(page), "None", "within the limit it is not marked");
         Opa5.assert.strictEqual(stateOf(page, "odataPurpose").state, "None", "editing the field clears its error");
     });
 
@@ -273,6 +275,7 @@ opaTest("purpose is required, counted and one line; a refused form sends nothing
         return stateOf(page, "odataPurpose").state === "Error";
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(formOf(page).counter, "201 / 200", "the counter shows the excess");
+        Opa5.assert.strictEqual(counterState(page), "Error", "and is marked as an error");
         Opa5.assert.strictEqual(
             stateOf(page, "odataPurpose").text, "Use at most 200 characters.", "201 characters are refused"
         );
@@ -453,7 +456,7 @@ opaTest("a 422 from the server lands on the matching field, the rest is shown as
     Given.iStartTheApp(`odata-services/${JOBS}`);
     iSeeTheService(Then, JOBS, "the service is loaded", function () {
         // Set once the page has loaded, so that it is the save that fails.
-        backend.failNext = { path: `odata/services/${JOBS}`, status: 422, body: { detail: DETAIL } };
+        backend.failNext = { path: `odata/services/${JOBS}`, method: "PUT", status: 422, body: { detail: DETAIL } };
     });
 
     iEnter(When, "odataTitle", "Edited");
@@ -482,6 +485,17 @@ opaTest("a 422 from the server lands on the matching field, the rest is shown as
         );
         Opa5.assert.strictEqual(formOf(page).title, "Edited", "the form keeps the edit");
         Opa5.assert.strictEqual(stored(JOBS).title, "Purchase requisitions (jobs)", "nothing was stored");
+    });
+
+    // Editing takes away what the refused save said above the form.
+    iEnter(When, "odataNotFor", "Contracts");
+    iSee(Then, "the strip gone", function (page: UI5Element) {
+        return !stripOf(page, "odataSaveError").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataSaveError").visible, false, "an edit clears the strip");
+        Opa5.assert.strictEqual(
+            stateOf(page, "odataServicePath").state, "Error", "a field keeps its own error until it is edited"
+        );
     });
 
     // The next save goes through and clears the refusal.
@@ -835,6 +849,342 @@ opaTest("leaving with unsaved changes asks before discarding them", function (Gi
     });
     iPressTheNavItem(When, "skills");
     iSeeTheHash(Then, "skills", "a clean form lets the side navigation through without a question");
+
+    Then.iStopTheApp();
+});
+
+const CHANGED_ELSEWHERE = "This service was changed elsewhere. Reload to see the current version; "
+    + "your changes are kept until you reload.";
+const DELETED_ELSEWHERE = "This service was deleted elsewhere. Your input is kept: you can save it as a new "
+    + "service, or go back to the list.";
+const TO_TECHNICAL = "Runs as changes from \"Signed-in user\" to \"Technical user\". The service then works in chat, "
+    + "jobs and workflows, and every user of the agent sees what that SAP user may see.";
+
+function usedBy(agent: string) {
+    return { agent_id: 77, agent, enabled: true, expose_api: false, api_slug: "", allow_write: false };
+}
+
+opaTest("a service that was changed elsewhere is not saved over; the form keeps its input until Reload", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        // Another tab saves the service: its definition and purpose change.
+        const service = stored(JOBS);
+        service.purpose = "Saved in another tab";
+        service.definition.entity_sets.pop();
+        service.updated_at = "2026-10-05T10:15:00+00:00";
+    });
+
+    iEnter(When, "odataTitle", "My edit");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the changed-elsewhere strip", function (page: UI5Element) {
+        return stripOf(page, "odataChangedElsewhere").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataChangedElsewhere").text, CHANGED_ELSEWHERE, "the page says so");
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "no PUT was sent");
+        Opa5.assert.strictEqual(stored(JOBS).purpose, "Saved in another tab", "the other save stands");
+        Opa5.assert.strictEqual(stored(JOBS).definition.entity_sets.length, 4, "with its definition");
+        Opa5.assert.strictEqual(formOf(page).title, "My edit", "the form keeps the input");
+        Opa5.assert.strictEqual(
+            formOf(page).purpose, "Nightly checks and release of requisitions", "and still shows what it loaded"
+        );
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no dialog on top");
+    });
+
+    // Saving again changes nothing: still refused, still nothing sent.
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the second attempt", function () {
+        return backend.countRequests(`GET odata/services/${JOBS}`) === 3;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "a second Save sends nothing either");
+        Opa5.assert.strictEqual(stripOf(page, "odataChangedElsewhere").visible, true, "the strip stays");
+    });
+
+    iPress(When, "odataReload");
+    iSee(Then, "the current version", function (page: UI5Element) {
+        return formOf(page).purpose === "Saved in another tab";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(formOf(page).title, "Purchase requisitions (jobs)", "Reload drops the input");
+        Opa5.assert.strictEqual(stripOf(page, "odataChangedElsewhere").visible, false, "and the strip");
+    });
+
+    // From the current version the save goes through, with the definition
+    // the other tab saved.
+    iEnter(When, "odataTitle", "My edit");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function (page: UI5Element) {
+        return pageTitle(page) === "My edit";
+    }, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "one PUT");
+        Opa5.assert.strictEqual(
+            backend.bodies[PUT]?.expected_updated_at, "2026-10-05T10:15:00+00:00",
+            "the PUT says which version it was made from"
+        );
+        Opa5.assert.strictEqual(stored(JOBS).definition.entity_sets.length, 4, "the other tab's definition survived");
+        Opa5.assert.strictEqual(stored(JOBS).purpose, "Saved in another tab", "and its purpose");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("an agent attached after the page loaded is named before its identity changes", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${UNUSED}`;
+
+    Given.iStartTheApp(`odata-services/${UNUSED}`);
+    iSeeTheService(Then, UNUSED, "the service is loaded, used by nobody", function () {
+        // Attaching a service changes the agent, not the service: its
+        // updated_at stays, only `used_by` tells.
+        stored(UNUSED).used_by.push(usedBy("late-agent"));
+    });
+
+    iChoose(When, "odataRunsAs", "technical");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog), `The agent late-agent uses this service.\n\n${TO_TECHNICAL}`,
+            "the question names the agent that was attached after the page loaded"
+        );
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing was sent before the answer");
+    }, "the identity confirmation");
+    iPressInDialog(When, "Save");
+    iSee(Then, "the saved identity", function (page: UI5Element) {
+        return tagsOf(page).indexOf("Technical user") !== -1;
+    }, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "one PUT after Save");
+        Opa5.assert.strictEqual(
+            backend.bodies[PUT]?.expected_updated_at, "2026-10-05T08:00:00+00:00",
+            "the PUT carries the updated_at the form was loaded with"
+        );
+        Opa5.assert.strictEqual(stored(UNUSED).user_context, false, "saved");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a destination-only change on a service of several agents names them all", function (Given: Common, When: Common, Then: Common) {
+    const NAME = "business-partners";
+    let agents: string[] = [];
+
+    Given.iStartTheApp(`odata-services/${NAME}`);
+    iSeeTheService(Then, NAME, "the service is loaded", function () {
+        agents = stored(NAME).used_by.map((used) => used.agent);
+    });
+
+    iEnter(When, "odataDestination", "S4_ODATA_TECH");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(agents.length, 2, "two agents use it");
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            `These agents use this service: ${agents.join(", ")}.\n\n`
+            + "The destination changes from S4_ODATA_USER to S4_ODATA_TECH. It decides which SAP system is "
+            + "called and with which credentials.",
+            "all agents are named, and only the destination is said to change"
+        );
+    }, "the identity confirmation");
+    iPressInDialog(When, "Cancel");
+    iSeeNoDialog(Then, "cancelled", function () {
+        Opa5.assert.strictEqual(backend.countRequests(`PUT odata/services/${NAME}`), 0, "Cancel sends nothing");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("after a refused save the next save asks about the identity again", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${USER}`;
+
+    Given.iStartTheApp(`odata-services/${USER}`);
+    iSeeTheService(Then, USER, "the service is loaded", function () {
+        backend.failNext = {
+            path: `odata/services/${USER}`, method: "PUT", status: 422,
+            body: { detail: "definition: Value error, the definition is larger than 2000000 bytes" }
+        };
+    });
+
+    iChoose(When, "odataRunsAs", "technical");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "asked first");
+    }, "the first confirmation");
+    iPressInDialog(When, "Save");
+    iSee(Then, "the refusal", function (page: UI5Element) {
+        return stripOf(page, "odataSaveError").visible;
+    }, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "the save was sent and refused");
+        Opa5.assert.strictEqual(stored(USER).user_context, true, "nothing changed");
+    });
+
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.ok(messageOf(dialog).indexOf(TO_TECHNICAL) !== -1, "the question is asked again");
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "and nothing more was sent before the answer");
+    }, "the second confirmation");
+    iPressInDialog(When, "Save");
+    iSee(Then, "the saved identity", function (page: UI5Element) {
+        return tagsOf(page).indexOf("Technical user") !== -1;
+    }, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 2, "the second save went through");
+        Opa5.assert.strictEqual(stored(USER).user_context, false, "and is stored");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a service that was deleted elsewhere keeps the input and can be saved as a new one", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${UNUSED}`);
+    iSeeTheService(Then, UNUSED, "the service is loaded", function () {
+        backend.odataServices = backend.odataServices.filter((service) => service.name !== UNUSED);
+    });
+
+    iEnter(When, "odataTitle", "Kept input");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the deleted-elsewhere strip", function (page: UI5Element) {
+        return stripOf(page, "odataDeletedElsewhere").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataDeletedElsewhere").text, DELETED_ELSEWHERE, "the page says so");
+        Opa5.assert.strictEqual(backend.countRequests(`PUT odata/services/${UNUSED}`), 0, "no PUT was sent");
+        Opa5.assert.strictEqual(formOf(page).title, "Kept input", "the form keeps the input");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no error dialog on top");
+    });
+
+    iPress(When, "odataSaveAsNew");
+    iSee(Then, "the form of a new service", function (page: UI5Element) {
+        return formOf(page).nameEditable;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(pageTitle(page), "New service", "the page is a new service now");
+        Opa5.assert.strictEqual(formOf(page).name, UNUSED, "with the same name, which can be changed");
+        Opa5.assert.deepEqual(tagsOf(page), [], "and no tags of a stored service");
+        Opa5.assert.deepEqual(actionsOf(page), { save: true, duplicate: false, remove: false }, "only Save is offered");
+        Opa5.assert.strictEqual(stripOf(page, "odataDeletedElsewhere").visible, false, "the strip is gone");
+    });
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the service created again", function (page: UI5Element) {
+        return pageTitle(page) === "Kept input";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(backend.countRequests("POST odata/services"), 1, "one POST");
+        Opa5.assert.strictEqual(stored(UNUSED).title, "Kept input", "the service exists again with the input");
+        Opa5.assert.strictEqual(stored(UNUSED).definition.entity_sets.length, 2, "and the definition the page held");
+        Opa5.assert.strictEqual(formOf(page).nameEditable, false, "the name is display-only again");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a 404 or a 409 answered to the save itself is said the same way, with the server's text", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    const STALE = `Service '${JOBS}' was changed since it was loaded; reload it and save again`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        // Changed in the moment between the check and the save.
+        backend.failNext = { path: `odata/services/${JOBS}`, method: "PUT", status: 409, body: { detail: STALE } };
+    });
+
+    iEnter(When, "odataTitle", "Raced");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the 409", function (page: UI5Element) {
+        return stripOf(page, "odataChangedElsewhere").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "the PUT was sent and refused");
+        Opa5.assert.strictEqual(stripOf(page, "odataChangedElsewhere").text, CHANGED_ELSEWHERE, "changed elsewhere");
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataSaveError").text, `The service was not saved. The server answered: ${STALE}`,
+            "with the server's own text"
+        );
+        Opa5.assert.strictEqual(formOf(page).title, "Raced", "the form keeps the input");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no dialog on top");
+        backend.failNext = {
+            path: `odata/services/${JOBS}`, method: "PUT", status: 404, body: { detail: "Service not found" }
+        };
+    });
+
+    iPress(When, "odataReload");
+    iSeeTheService(Then, JOBS, "reloaded");
+    iEnter(When, "odataTitle", "Raced again");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the 404", function (page: UI5Element) {
+        return stripOf(page, "odataDeletedElsewhere").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataDeletedElsewhere").text, DELETED_ELSEWHERE, "deleted elsewhere");
+        Opa5.assert.strictEqual(formOf(page).title, "Raced again", "the form keeps the input");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the browser's back button or an edited address asks too, and brings the form back", function (Given: Common, When: Common, Then: Common) {
+    const HERE = `odata-services/${JOBS}`;
+    const go = function (target: string): void {
+        When.waitFor({
+            id: PAGE,
+            viewName: VIEW,
+            success: function () { HashChanger.getInstance().setHash(target); }
+        });
+    };
+
+    Given.iStartTheApp(HERE);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+    iEnter(When, "odataTitle", "Half an edit");
+
+    // Another page of the app.
+    go("skills");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), DISCARD_QUESTION, "leaving by the address asks");
+    }, "the discard question");
+    iPressInDialog(When, "Cancel");
+    iSeeTheHash(Then, HERE, "Cancel is back on the service");
+    iSeeTheService(Then, JOBS, "which is shown again", function (page: UI5Element) {
+        Opa5.assert.strictEqual(formOf(page).title, "Half an edit", "with the edit");
+        Opa5.assert.strictEqual(backend.countRequests(`GET odata/services/${JOBS}`), 1, "and was not read again");
+    });
+
+    // Another service: the same route, another name.
+    go(`odata-services/${USER}`);
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), DISCARD_QUESTION, "another service asks as well");
+    }, "the discard question for another service");
+    iPressInDialog(When, "Cancel");
+    iSeeTheService(Then, JOBS, "still this service", function (page: UI5Element) {
+        Opa5.assert.strictEqual(formOf(page).title, "Half an edit", "with the edit");
+    });
+
+    // An address that is no page at all.
+    go("no/such/page");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), DISCARD_QUESTION, "an unknown address asks as well");
+    }, "the discard question for an unknown address");
+    iPressInDialog(When, "Discard");
+    iSeeTheHash(Then, "no/such/page", "Discard goes where the address said", function () {
+        Opa5.assert.strictEqual(backend.countRequests(`PUT odata/services/${JOBS}`), 0, "nothing was saved");
+    });
+
+    // Behind the not-found page no form is left to ask about.
+    iPressTheNavItem(When, "skills");
+    iSeeTheHash(Then, "skills", "the side navigation goes on without a question", function () {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no dialog");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a clean form left for an unknown address leaves no form and no guard behind", function (Given: Common, When: Common, Then: Common) {
+    let view: ReturnType<typeof viewOf> | undefined;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        view = viewOf(page);
+        HashChanger.getInstance().setHash("no/such/page");
+    });
+    iSeeTheHash(Then, "no/such/page", "the not-found page, without a question", function () {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no dialog");
+        // No route matched, so only the router's "bypassed" tells the page.
+        const model = view?.getModel("svc") as unknown as { getProperty(path: string): unknown };
+        Opa5.assert.strictEqual(model.getProperty("/loaded"), false, "the page behind it holds no form any more");
+        Opa5.assert.strictEqual(model.getProperty("/data/name"), "", "and no service");
+    });
+    iPressTheNavItem(When, "skills");
+    iSeeTheHash(Then, "skills", "and the side navigation goes on without a question");
 
     Then.iStopTheApp();
 });

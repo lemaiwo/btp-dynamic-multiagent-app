@@ -5,6 +5,7 @@ import type Text from "sap/m/Text";
 import type Page from "sap/m/Page";
 import type Button from "sap/m/Button";
 import type Switch from "sap/m/Switch";
+import type MessageStrip from "sap/m/MessageStrip";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type SegmentedButton from "sap/m/SegmentedButton";
 import type View from "sap/ui/core/mvc/View";
@@ -60,7 +61,7 @@ export function formOf(element: UI5Element): FormTexts {
         name: control<Input>(element, "odataName").getValue(),
         nameEditable: control<Input>(element, "odataName").getEditable(),
         purpose: control<TextArea>(element, "odataPurpose").getValue(),
-        counter: control<Text>(element, "odataPurposeCounter").getText(false),
+        counter: control<ObjectStatus>(element, "odataPurposeCounter").getText(),
         notFor: control<Input>(element, "odataNotFor").getValue(),
         destination: control<Input>(element, "odataDestination").getValue(),
         runsAs: control<SegmentedButton>(element, "odataRunsAs").getSelectedKey(),
@@ -77,6 +78,17 @@ export function tagsOf(element: UI5Element): string[] {
         .map((id) => control<ObjectStatus>(element, id))
         .filter((tag) => tag.getVisible())
         .map((tag) => tag.getText());
+}
+
+/** The state of the purpose counter: "Error" once the text is too long. */
+export function counterState(element: UI5Element): string {
+    return control<ObjectStatus>(element, "odataPurposeCounter").getState();
+}
+
+/** Whether a message strip of the page is shown, and what it says. */
+export function stripOf(element: UI5Element, id: string): { visible: boolean; text: string } {
+    const strip = control<MessageStrip>(element, id);
+    return { visible: strip.getVisible(), text: strip.getText() };
 }
 
 /** The value state of a field and the text that explains it. */

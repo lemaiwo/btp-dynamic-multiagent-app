@@ -6,7 +6,13 @@ import type {
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
-export interface FailNext { path: string; status: number; body: unknown }
+export interface FailNext {
+    path: string;
+    status: number;
+    body: unknown;
+    /** Only a call with this method fails; without it, the next call to `path`. */
+    method?: string;
+}
 
 /**
  * An in-memory stand-in for /admin/api, installed over `window.fetch`.
@@ -39,6 +45,8 @@ export default class FakeBackend {
      * order, so a journey can assert that something was -- or was no
      * longer -- requested. */
     public requests: string[] = [];
+    /** The JSON body of the last call per "<METHOD> <path>". */
+    public bodies: Record<string, Record<string, unknown> | undefined> = {};
     /** The paths of the POST .../run calls, in order. */
     public runNowCalls: string[] = [];
 
@@ -80,6 +88,7 @@ export default class FakeBackend {
         // already assumes btp-agent is id 100.
         this.nextId = 100;
         this.requests = [];
+        this.bodies = {};
         this.runNowCalls = [];
         this.agents = [this.makeAgent("btp-agent"), this.makeAgent("gmail-agent")];
         // btp-agent is exposed as a job API, so its Run now button is live
@@ -503,9 +512,29 @@ export default class FakeBackend {
         return "";
     }
 
+    /** pydantic's `strip_whitespace`: Unicode White_Space off both ends.
+     * Not JS `trim()`, which leaves U+0085 and takes U+FEFF. */
+    private static odataStrip(value: string): string {
+        const space = "[\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
+        return value.replace(new RegExp(`^${space}+|${space}+$`, "g"), "");
+    }
+
+    /** What the catalogue answers (409) to an update whose
+     * `expected_updated_at` is not the stored `updated_at`. */
+    public static odataChangedElsewhere(name: string): string {
+        return `Service '${name}' was changed since it was loaded; reload it and save again`;
+    }
+
+    /** A new `updated_at`, never the one a service already has. */
+    private odataStamp = Date.parse("2026-10-05T09:00:00Z");
+    private nextODataStamp(): string {
+        this.odataStamp += 1000;
+        return new Date(this.odataStamp).toISOString().replace(".000Z", "+00:00");
+    }
+
     /** A stripped string of 1..max characters, in pydantic's words. */
     private static odataLength(value: string, max: number): string {
-        const length = value.trim().length;
+        const length = FakeBackend.odataStrip(value).length;
         if (length < 1) {
             return "String should have at least 1 character";
         }
@@ -541,7 +570,10 @@ export default class FakeBackend {
 
     private static odataExtras(data: Record<string, unknown>, known: string[], problems: string[]): void {
         Object.keys(data).filter((key) => known.indexOf(key) === -1).forEach((key) => {
-            problems.push(`${key.substring(0, 64)}: Extra inputs are not permitted`);
+            // `_loc` in agents/odata/models.py: a key is the client's own
+            // text, so it is repeated only when it looks like a field name.
+            const shown = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(key) ? key : "<unknown field>";
+            problems.push(`${shown}: Extra inputs are not permitted`);
         });
     }
 
@@ -669,10 +701,10 @@ export default class FakeBackend {
         // Stripped, measured, and only then held to one line: what
         // surrounds a title or purpose is gone before `_one_line` runs.
         FakeBackend.odataText(data, "title", true, (v) => (
-            FakeBackend.odataLength(v, 120) || FakeBackend.odataOneLine("title", v.trim())
+            FakeBackend.odataLength(v, 120) || FakeBackend.odataOneLine("title", FakeBackend.odataStrip(v))
         ), problems);
         FakeBackend.odataText(data, "purpose", true, (v) => (
-            FakeBackend.odataLength(v, 200) || FakeBackend.odataOneLine("purpose", v.trim())
+            FakeBackend.odataLength(v, 200) || FakeBackend.odataOneLine("purpose", FakeBackend.odataStrip(v))
         ), problems);
         FakeBackend.odataText(data, "not_for", false, (v) => (
             v.length > 200 ? "String should have at most 200 characters" : FakeBackend.odataOneLine("not_for", v)
@@ -731,8 +763,8 @@ export default class FakeBackend {
     private static odataInput(body: Record<string, unknown> | undefined): ODataServiceInput {
         const input = (body ?? {}) as Partial<ODataServiceInput>;
         return {
-            name: String(input.name), title: String(input.title).trim(),
-            purpose: String(input.purpose).trim(), not_for: input.not_for ?? "",
+            name: String(input.name), title: FakeBackend.odataStrip(String(input.title)),
+            purpose: FakeBackend.odataStrip(String(input.purpose)), not_for: input.not_for ?? "",
             destination: String(input.destination), user_context: input.user_context === true,
             odata_version: input.odata_version === "v4" ? "v4" : "v2",
             service_path: String(input.service_path), enabled: input.enabled !== false,
@@ -1033,22 +1065,34 @@ export default class FakeBackend {
             return this.json(FakeBackend.odataDict(copy), 201);
         }
         if (action === "" && method === "PUT") {
-            const problems = FakeBackend.validateODataPayload(body);
+            // An update may say which version it was made from; that key is
+            // not part of the payload.
+            const { expected_updated_at: expected, ...payload } = body ?? {};
+            const problems = FakeBackend.validateODataPayload(payload);
+            if (expected !== undefined && expected !== null && typeof expected !== "string") {
+                problems.push("expected_updated_at: Input should be a valid string");
+            }
             if (problems.length) {
                 return this.refused(problems);
             }
             if (!stored) {
                 return notFound();
             }
-            const input = FakeBackend.odataInput(body);
+            const input = FakeBackend.odataInput(payload);
             if (input.name !== name) {
                 return this.refused(["name cannot be changed; duplicate the service instead"]);
+            }
+            // Stale-write protection: the service was saved by someone else
+            // since this client read it. Exact comparison of the ISO text
+            // the GET answered; left out or null means "do not check".
+            if (typeof expected === "string" && expected !== stored.updated_at) {
+                return this.json({ detail: FakeBackend.odataChangedElsewhere(name) }, 409);
             }
             // A full replacement of the payload fields. `used_by` stays as
             // stored: the fake keeps it on the row for now; the task that
             // attaches services to agents derives it from the agents' server
             // entries, as `odata_service_referrers` does.
-            this.odataServices[index] = { ...stored, ...input, updated_at: new Date().toISOString() };
+            this.odataServices[index] = { ...stored, ...input, updated_at: this.nextODataStamp() };
             return this.json(FakeBackend.odataDict(this.odataServices[index]));
         }
         if (!stored) {
@@ -1086,8 +1130,10 @@ export default class FakeBackend {
         const method = init?.method ?? "GET";
         const body = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : undefined;
         this.requests.push(`${method} ${path}`);
+        this.bodies[`${method} ${path}`] = body;
 
-        if (this.failNext && this.failNext.path === path) {
+        if (this.failNext && this.failNext.path === path
+            && (!this.failNext.method || this.failNext.method === method)) {
             const failure = this.failNext;
             this.failNext = undefined;
             return this.json(failure.body, failure.status);

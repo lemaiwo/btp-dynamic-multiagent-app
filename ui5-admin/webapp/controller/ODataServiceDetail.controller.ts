@@ -1,5 +1,6 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
 import Fragment from "sap/ui/core/Fragment";
+import HashChanger from "sap/ui/core/routing/HashChanger";
 import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import { ValueState } from "sap/ui/core/library";
@@ -14,7 +15,7 @@ import type Dialog from "sap/m/Dialog";
 import type SegmentedButton from "sap/m/SegmentedButton";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
-import type { ODataService, ODataServiceInput, ODataUsedBy } from "../service/types";
+import type { ODataService, ODataServiceInput, ODataServiceUpdate, ODataUsedBy } from "../service/types";
 
 const ROUTE = "odataServiceDetail";
 
@@ -70,6 +71,18 @@ export default class ODataServiceDetail extends ODataController {
 
     private duplicateDialog?: Dialog;
 
+    /** The hash this page is shown under, to come back to when the user
+     *  leaves by the browser (back button, edited address) with unsaved
+     *  changes: the router cannot refuse a hash, only undo it. */
+    private shownHash = "";
+
+    /** The hash was just put back to `shownHash`: the route that matches
+     *  next is this page again and must not load anything. */
+    private restoring = false;
+
+    /** Where the user was going when the hash was put back. */
+    private wantedHash = "";
+
     private readonly onBeforeUnload = (event: BeforeUnloadEvent): void => {
         if (this.isDirty()) {
             // The browser's own "leave site?" question; its text is not ours.
@@ -82,6 +95,17 @@ export default class ODataServiceDetail extends ODataController {
         this.setModel(new JSONModel(this.blankState("")), "svc");
         this.getRouter().getRoute(ROUTE)?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const name = (event.getParameter("arguments") as { serviceName: string }).serviceName;
+            if (this.restoring) {
+                // Back on the page the user tried to leave; it is as it was.
+                this.restoring = false;
+                this.getOwnerComponentTyped().setLeaveGuard(() => this.confirmLeave());
+                this.askAboutLeaving();
+                return;
+            }
+            if (this.keepUnsaved()) {
+                return;
+            }
+            this.shownHash = HashChanger.getInstance().getHash();
             this.getOwnerComponentTyped().setLeaveGuard(() => this.confirmLeave());
             if (name === this.justCreated) {
                 this.justCreated = undefined;
@@ -91,25 +115,77 @@ export default class ODataServiceDetail extends ODataController {
             void this.load(name);
         });
         this.getRouter().attachRouteMatched(this.onAnyRouteMatched, this);
+        // A hash that matches no route fires no routeMatched: without this
+        // the form and its guard would live on behind the not-found page.
+        this.getRouter().attachBypassed(this.onLeft, this);
         window.addEventListener("beforeunload", this.onBeforeUnload);
     }
 
     public onExit(): void {
         window.removeEventListener("beforeunload", this.onBeforeUnload);
         this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
+        this.getRouter().detachBypassed(this.onLeft, this);
         this.getOwnerComponentTyped().setLeaveGuard(undefined);
     }
 
-    /** Another page is shown: this one no longer has a say about leaving,
-     *  and whatever it held is not a form any more. */
     private onAnyRouteMatched(event: Router$RouteMatchedEvent): void {
-        if (event.getParameter("name") === ROUTE) {
+        if (event.getParameter("name") !== ROUTE) {
+            this.onLeft();
+        }
+    }
+
+    /** Another page is shown (or the not-found page): this one no longer
+     *  has a say about leaving, and whatever it held is not a form any
+     *  more -- unless it held unsaved changes, then it comes back and asks. */
+    private onLeft(): void {
+        if (this.keepUnsaved()) {
             return;
         }
+        this.restoring = false;
+        this.justCreated = undefined;
         this.getOwnerComponentTyped().setLeaveGuard(undefined);
         this.loadCount++;
         this.serviceName = undefined;
+        this.shownHash = "";
         this.svc().setData(this.blankState(""));
+    }
+
+    /**
+     * The address changed under a form with unsaved changes (the browser's
+     * back button, an edited hash); the page's own ways out have asked
+     * before they navigate and never get here with changes.
+     *
+     * The router cannot refuse a hash, so the old one is put back, which
+     * shows this page again with its input, and the question is asked from
+     * there. "Discard" then goes where the user wanted to go. Returns
+     * whether it took over.
+     */
+    private keepUnsaved(): boolean {
+        const hashChanger = HashChanger.getInstance();
+        const wanted = hashChanger.getHash();
+        if (!this.shownHash || wanted === this.shownHash || !this.isDirty()) {
+            return false;
+        }
+        this.restoring = true;
+        this.wantedHash = wanted;
+        hashChanger.replaceHash(this.shownHash);
+        return true;
+    }
+
+    /**
+     * Asks the question once this page is shown again. Not earlier, and not
+     * in the same tick: the router closes every open dialog when it
+     * navigates, and it is still navigating back here.
+     */
+    private askAboutLeaving(): void {
+        const wanted = this.wantedHash;
+        setTimeout(() => {
+            void this.confirmLeave().then((leave) => {
+                if (leave) {
+                    HashChanger.getInstance().setHash(wanted);
+                }
+            });
+        }, 0);
     }
 
     // --- state --------------------------------------------------------------
@@ -133,6 +209,11 @@ export default class ODataServiceDetail extends ODataController {
             loadFailed: false, loadError: "",
             data: odataCatalog.emptyService(), original: odataCatalog.emptyService(),
             errors: {}, saveError: "", used_by: [], has_write: false,
+            // `updated_at`: the version of the service the form was loaded
+            // from; a save is only made on top of that one.
+            // `changedElsewhere` / `deletedElsewhere`: it is not the stored
+            // version any more, or the service is gone.
+            updated_at: null, changedElsewhere: false, deletedElsewhere: false,
             // U6 fills this with the result of "Test call".
             test: null,
             duplicate: { name: "", destination: "", user_context: false, errors: {}, error: "", unsaved: false }
@@ -146,7 +227,8 @@ export default class ODataServiceDetail extends ODataController {
             ...this.blankState(service.title),
             loaded: true, exists: true,
             data: odataCatalog.payloadOf(service), original: odataCatalog.payloadOf(service),
-            used_by: service.used_by ?? [], has_write: service.has_write === true
+            used_by: service.used_by ?? [], has_write: service.has_write === true,
+            updated_at: service.updated_at ?? null
         });
     }
 
@@ -215,6 +297,30 @@ export default class ODataServiceDetail extends ODataController {
         }
     }
 
+    /** Reads the service again after it was changed elsewhere. The strip
+     *  that offers this says that the input on the page is lost by it. */
+    public onReload(): void {
+        if (this.serviceName && !this.working) {
+            void this.load(this.serviceName);
+        }
+    }
+
+    /**
+     * The service was deleted elsewhere: turns the page into the form of a
+     * new service that holds the same input, so that Save creates it again
+     * (the name can be changed, too).
+     */
+    public onSaveAsNew(): void {
+        const model = this.svc();
+        model.setProperty("/deletedElsewhere", false);
+        model.setProperty("/exists", false);
+        model.setProperty("/isNew", true);
+        model.setProperty("/used_by", []);
+        model.setProperty("/updated_at", null);
+        model.setProperty("/original", odataCatalog.emptyService());
+        model.setProperty("/title", this.text("odataNewService"));
+    }
+
     // --- formatters ---------------------------------------------------------
 
     /** A field with a message is in error. */
@@ -225,6 +331,11 @@ export default class ODataServiceDetail extends ODataController {
     /** "44 / 200", counting what the server counts. */
     public formatPurposeCounter(purpose: string | undefined): string {
         return this.text("odataPurposeCounter", [odataCatalog.purposeLength(purpose)]);
+    }
+
+    /** Over the limit, the counter says so before Save does. */
+    public formatPurposeCounterState(purpose: string | undefined): ValueState {
+        return odataCatalog.purposeLength(purpose) > odataCatalog.MAX_PURPOSE ? ValueState.Error : ValueState.None;
     }
 
     public formatRunsAsKey(userContext: boolean | undefined): string {
@@ -243,30 +354,43 @@ export default class ODataServiceDetail extends ODataController {
 
     // --- editing ------------------------------------------------------------
 
-    /** Typing in a field takes its error away; the next save checks again. */
+    /** Typing in a field takes its error away, and with it what the last
+     *  refused save said above the form; the next save checks again. */
     public onEdit(event: Event): void {
         const field = (event.getSource() as Control).data("field") as string;
         this.svc().setProperty(`/errors/${field}`, "");
+        this.svc().setProperty("/saveError", "");
     }
 
     public onRunsAsChange(event: Event): void {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/user_context", key === "user");
+        this.svc().setProperty("/saveError", "");
     }
 
     public onVersionChange(event: Event): void {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/odata_version", key === "v4" ? "v4" : "v2");
+        this.svc().setProperty("/saveError", "");
+    }
+
+    public onEnabledChange(): void {
+        this.svc().setProperty("/saveError", "");
     }
 
     // --- save ---------------------------------------------------------------
 
     /**
-     * Checks the form and saves it. On a service that agents use, a change
-     * of identity or destination is confirmed first: it changes who those
-     * agents act as in SAP.
+     * Checks the form and saves it.
+     *
+     * An existing service is read again first. If it was saved elsewhere
+     * since the form loaded it, nothing is sent: a PUT replaces the whole
+     * service, definition included, and would undo that. And the agents
+     * that use it are taken from that fresh answer: a change of identity or
+     * destination changes who THEY act as in SAP, so it is confirmed with
+     * their names, including an agent that was attached a minute ago.
      */
-    public onSave(): void {
+    public async onSave(): Promise<void> {
         const model = this.svc();
         if (this.working || model.getProperty("/loaded") !== true) {
             return;
@@ -275,9 +399,16 @@ export default class ODataServiceDetail extends ODataController {
         if (!this.showProblems(odataCatalog.validate(this.data()))) {
             return;
         }
+        if (model.getProperty("/isNew") === true) {
+            void this.save();
+            return;
+        }
 
-        const usedBy = model.getProperty("/used_by") as ODataUsedBy[];
-        const question = model.getProperty("/isNew") || !usedBy.length ? "" : this.identityQuestion(usedBy);
+        const usedBy = await this.freshUsedBy();
+        if (!usedBy) {
+            return;
+        }
+        const question = usedBy.length ? this.identityQuestion(usedBy) : "";
         if (!question) {
             void this.save();
             return;
@@ -294,6 +425,36 @@ export default class ODataServiceDetail extends ODataController {
                 }
             }
         });
+    }
+
+    /**
+     * Reads the stored service and answers who uses it now -- or nothing,
+     * when the save must not go on: the service is gone, was changed
+     * elsewhere, or could not be read. Each of those is said on the page.
+     */
+    private async freshUsedBy(): Promise<ODataUsedBy[] | undefined> {
+        const model = this.svc();
+        const name = this.serviceName as string;
+        this.setWorking(true);
+        let fresh: ODataService;
+        try {
+            fresh = await this.withBusy(() => this.getAdminService().getODataService(name));
+        } catch (error) {
+            this.showRefusal(error, false);
+            return undefined;
+        } finally {
+            this.setWorking(false);
+        }
+        if (name !== this.serviceName) {
+            return undefined;
+        }
+        if ((fresh.updated_at ?? null) !== model.getProperty("/updated_at")) {
+            model.setProperty("/changedElsewhere", true);
+            return undefined;
+        }
+        model.setProperty("/changedElsewhere", false);
+        model.setProperty("/used_by", fresh.used_by ?? []);
+        return fresh.used_by ?? [];
     }
 
     /**
@@ -358,7 +519,14 @@ export default class ODataServiceDetail extends ODataController {
             return;
         }
         const isNew = this.svc().getProperty("/isNew") === true;
-        const payload = odataCatalog.payloadOf(this.data());
+        const payload: ODataServiceUpdate = odataCatalog.payloadOf(this.data());
+        const loadedAt = this.svc().getProperty("/updated_at") as string | null;
+        if (!isNew && loadedAt) {
+            // The server refuses (409) when the service is no longer the
+            // version this form was loaded from; the check before the
+            // question cannot rule out a save in the moment between.
+            payload.expected_updated_at = loadedAt;
+        }
         this.setWorking(true);
         let saved: ODataService;
         try {
@@ -388,6 +556,10 @@ export default class ODataServiceDetail extends ODataController {
      * field here (the definition, a flag) or the refusal names none at all,
      * the whole text is shown above the form. The texts are the server's,
      * in English, and are shown as text. A 409 on create is about the name.
+     *
+     * On an existing service, a 404 means it was deleted elsewhere and a
+     * 409 that it was changed elsewhere: both get a strip of their own that
+     * says what can be done, and the input stays.
      */
     private showRefusal(error: unknown, isNew: boolean): void {
         const model = this.svc();
@@ -412,6 +584,16 @@ export default class ODataServiceDetail extends ODataController {
         if (error instanceof AdminError && error.status === 409 && isNew && error.detail) {
             model.setProperty("/errors", { name: error.detail });
             this.focusFirstError({ name: error.detail });
+            return;
+        }
+        if (error instanceof AdminError && error.status === 404 && !isNew) {
+            model.setProperty("/deletedElsewhere", true);
+            return;
+        }
+        if (error instanceof AdminError && error.status === 409 && !isNew) {
+            model.setProperty("/changedElsewhere", true);
+            model.setProperty("/saveError", error.detail
+                ? this.text("odataSaveRefused", [error.detail]) : this.text("odataSaveFailed"));
             return;
         }
         ErrorHandler.handle(error, this.text("odataSaveFailed"));

@@ -357,6 +357,35 @@ export interface ImportPayload {
     replace: boolean;
 }
 
+/** A catalogue service in use whose destination or identity an import
+ * changed, and the agents that now act differently in SAP. */
+export interface ODataIdentityChangeReport {
+    service: string;
+    changed: ("destination" | "user_context")[];
+    agents: string[];
+}
+
+/** POST /admin/api/import. The OData keys are optional: a backend from
+ * before the catalogue does not send them. */
+export interface ImportResult {
+    status: string;
+    imported?: number;
+    imported_skills?: number;
+    imported_workflows?: number;
+    /** Created plus updated. */
+    imported_odata_services?: number;
+    created_odata_services?: number;
+    updated_odata_services?: number;
+    removed?: number;
+    removed_skills?: number;
+    removed_workflows?: number;
+    removed_odata_services?: number;
+    removed_odata_service_names?: string[];
+    odata_identity_changes?: ODataIdentityChangeReport[];
+    /** One line of text each, among them every identity change. */
+    warnings?: string[];
+}
+
 /** POST /admin/api/reload. `agents` is the total; `enabled` the subset the
  * orchestrator can delegate to. Reload rebuilds all of them, not just the
  * orchestrator. */
@@ -728,6 +757,17 @@ export interface ODataServiceInput {
     definition: ODataDefinition;
     /** ISO timestamp of the last metadata import, or null. */
     metadata_fetched_at: string | null;
+}
+
+/**
+ * What PUT /admin/api/odata/services/{name} accepts: the payload plus the
+ * `updated_at` the service had when the form loaded it. The server compares
+ * it with the stored value and answers 409 when they differ, so a save
+ * from a stale page cannot overwrite what someone else saved meanwhile.
+ * Left out or null: not checked.
+ */
+export interface ODataServiceUpdate extends ODataServiceInput {
+    expected_updated_at?: string | null;
 }
 
 /** One agent that lists the service in a `builtin:odata` server entry. */

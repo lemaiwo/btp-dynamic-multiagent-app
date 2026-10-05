@@ -137,7 +137,10 @@ export const ONE_LINE_CASES: RuleCase[] = [
     oneLine("purpose", "a line separator", "Read requisitions\u2028and their items", "odataErrPurposeOneLine"),
     oneLine("not_for", "a paragraph separator", "Purchase orders\u2029Contracts", "odataErrNotForOneLine"),
     oneLine("not_for", "a trailing line feed (not stripped)", "Purchase orders\n", "odataErrNotForOneLine"),
-    oneLine("not_for", "a NUL", "Purchase\u0000orders", "odataErrNotForOneLine")
+    oneLine("not_for", "a NUL", "Purchase\u0000orders", "odataErrNotForOneLine"),
+    // U+001C..U+001F are no white space to the server: not stripped, refused.
+    oneLine("title", "a trailing unit separator (not stripped)", "Purchase requisitions\u001f", "odataErrTitleOneLine"),
+    oneLine("purpose", "a leading file separator (not stripped)", "\u001cRead requisitions", "odataErrPurposeOneLine")
 ];
 
 /** Texts the one-line rule accepts: a no-break space is no control
@@ -145,7 +148,12 @@ export const ONE_LINE_CASES: RuleCase[] = [
 export const ONE_LINE_ACCEPTED: Partial<ODataServiceInput>[] = [
     { title: "Purchase\u00a0requisitions" },
     { purpose: "  Read requisitions \n" },
-    { title: "\tPurchase requisitions\r\n" }
+    { title: "\tPurchase requisitions\r\n" },
+    // The server strips Unicode White_Space, which is not JS trim(): U+0085
+    // (NEL) goes, and U+FEFF stays and counts as text.
+    { title: "Purchase requisitions\u0085" },
+    { purpose: "\u2028Read requisitions\u3000" },
+    { title: "\ufeff" }
 ];
 
 function strictBoolean(field: "user_context" | "enabled", value: unknown): RuleCase {
