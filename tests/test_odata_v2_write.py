@@ -25,6 +25,12 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
+
+# The application's logging configuration, which the platform-log test below
+# looks at. Imported here, before the environment is cleared: `app` loads the
+# local `.env`, and what that sets must not survive into the tests.
+import app  # noqa: E402, F401
+
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 for _v in (
@@ -595,7 +601,10 @@ async def test_a_2xx_that_is_not_the_answer_of_a_write_is_not_reported_as_succes
     }[operation]
     error = await refused(call())
     assert error.code == "write_outcome_unknown" and error.status == answer.status_code
-    assert "read the entity first" in error.hint and "Logon" not in error.message
+    # A create has no key to read back, so its hint is its own.
+    expected = "list by the values you sent" if operation == "create" else "read the entity first"
+    assert expected in error.hint and "Logon" not in error.message
+    assert ("read the entity first" in error.hint) is (operation != "create")
     assert len(sap.writes) == 1
 
 
@@ -611,13 +620,117 @@ async def test_what_counts_as_a_successful_write():
     ):
         error = await refused(client(Sap(answer)).create(ES, {"Plant": "1000"}))
         assert error.code == "write_outcome_unknown"
-    # update / delete: 204, or 200 with nothing or JSON.
+    # update / delete: 204, or 200 with nothing or with the entity.
     for answer in (httpx.Response(204), httpx.Response(200), httpx.Response(200, json={"d": {}})):
         c = client(Sap(answer))
         assert (await c.update(ES, KEY, {"Plant": "1"}))["ok"] is True
         assert await c.delete(ES, KEY) == {"ok": True, "status": answer.status_code}
     error = await refused(client(Sap(httpx.Response(201))).delete(ES, KEY))
     assert error.code == "write_outcome_unknown"
+
+
+ERROR_IN_A_200 = {"error": {"code": "ZX/001", "message": {"value": "Not changed"}}}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        ERROR_IN_A_200,
+        {"d": CREATED["d"], "error": {"code": "ZX/001"}},  # an entity AND an error
+        {"error": None},
+        {"ok": True},
+        {"results": []},
+        ["d"],
+        "done",
+        0,
+        b"null",
+    ],
+)
+@pytest.mark.parametrize("operation", ["update", "delete"])
+async def test_a_200_with_a_body_that_is_no_entity_is_not_a_completed_change(operation, body):
+    """JSON alone proves nothing: a proxy can wrap SAP's error in a 200."""
+    as_content = {"content": body} if isinstance(body, bytes) else {"json": body}
+    sap = Sap(httpx.Response(200, **as_content))
+    c = client(sap)
+    call = c.update(ES, KEY, {"Plant": "1"}) if operation == "update" else c.delete(ES, KEY)
+    error = await refused(call)
+    assert error.code == "write_outcome_unknown" and error.status == 200
+    assert "read the entity first" in error.hint
+    assert "ZX/001" not in error.message and len(sap.writes) == 1
+    # The same for a 204 that carries one.
+    error = await refused(client(Sap(httpx.Response(204, **as_content))).delete(ES, KEY))
+    assert error.code == "write_outcome_unknown"
+
+
+async def test_an_error_body_is_not_a_created_entity():
+    for answer in (
+        httpx.Response(201, json=ERROR_IN_A_200),
+        httpx.Response(200, json={"d": CREATED["d"], "error": {"code": "ZX/001"}}),
+    ):
+        error = await refused(client(Sap(answer)).create(ES, {"Plant": "1000"}))
+        assert error.code == "write_outcome_unknown"
+        assert "list by the values you sent" in error.hint
+
+
+async def test_an_unknown_create_says_to_list_first_wherever_it_comes_from():
+    def lost(request):
+        raise httpx.ReadTimeout("timed out")
+
+    for answer in (lost, httpx.Response(504, text="x"), httpx.Response(200, text="OK")):
+        error = await refused(client(Sap(answer)).create(ES, {"Plant": "1000"}))
+        assert error.code == "write_outcome_unknown"
+        assert "list by the values you sent before trying again" in error.hint
+        assert "read the entity first" not in error.hint
+        error = await refused(client(Sap(answer)).update(ES, KEY, {"Plant": "1000"}))
+        assert error.code == "write_outcome_unknown" and "read the entity first" in error.hint
+
+
+SIGN_IN_COOKIE = "MYSAPSSO2=SIGN-IN-PAGE-COOKIE; path=/"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(
+            200,
+            headers=[("content-type", "text/html"), ("Set-Cookie", SIGN_IN_COOKIE)],
+            text="<html><form>Logon</form></html>",
+        ),
+        httpx.Response(200, headers={"Set-Cookie": SIGN_IN_COOKIE}, json=ERROR_IN_A_200),
+        httpx.Response(202, headers={"Set-Cookie": SIGN_IN_COOKIE}),
+    ],
+)
+async def test_cookies_of_an_unconfirmed_answer_never_reach_the_stored_session(answer):
+    sap = Sap(answer, httpx.Response(204))
+    store = CsrfSessionStore()
+    c = client(sap, store=store)
+    error = await refused(c.update(ES, KEY, {"Plant": "1"}))
+    assert error.code == "write_outcome_unknown"
+    # The session that did not get the write through is gone, and nothing of
+    # the answer was merged into it: the next write starts from a new token.
+    assert len(store) == 0
+    assert (await c.update(ES, KEY, {"Plant": "1"}))["ok"] is True
+    assert len(sap.fetches) == 2 and len(sap.writes) == 2
+    for request in sap.requests:
+        assert "SIGN-IN-PAGE-COOKIE" not in request.headers.get("Cookie", "")
+        assert "MYSAPSSO2" not in request.headers.get("Cookie", "")
+    assert f"T-{TECH}-2" == sap.writes[1].headers["X-CSRF-Token"]
+
+
+async def test_cookies_of_a_refused_change_are_not_merged_either():
+    """A 4xx keeps the session as it was sent: only a confirmed write moves it on."""
+    refusal = httpx.Response(
+        400,
+        headers={"Set-Cookie": "MYSAPSSO2=FROM-A-400; path=/"},
+        json={"error": {"code": "ZX/001", "message": {"value": "Invalid value"}}},
+    )
+    sap = Sap(refusal, httpx.Response(204))
+    store = CsrfSessionStore()
+    c = client(sap, store=store)
+    assert (await refused(c.update(ES, KEY, {"Plant": "1"}))).code == "sap_error"
+    assert (await c.update(ES, KEY, {"Plant": "1"}))["ok"] is True
+    assert len(sap.fetches) == 1  # the session itself is kept
+    assert "FROM-A-400" not in sap.writes[1].headers["Cookie"]
 
 
 async def test_a_gateway_timeout_on_a_write_leaves_the_outcome_open():
@@ -835,7 +948,7 @@ async def test_a_destination_error_and_a_cancellation_pass_through():
 
     class Slow(Sap):
         async def handler(self, request):
-            if request.method != "GET":
+            if request.method != "GET" and not started.is_set():
                 started.set()
                 await asyncio.sleep(30)
             return await super().handler(request)
@@ -847,9 +960,13 @@ async def test_a_destination_error_and_a_cancellation_pass_through():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    # Nothing is left half-open: the same client serves the next call.
-    assert (await client(Sap()).delete(ES, KEY))["ok"] is True
+    # Nothing is left half-open: the cancelled client itself serves the next
+    # call, on the session it already had.
     assert c._http.is_closed is False
+    assert await c.delete(ES, KEY) == {"ok": True, "status": 204}
+    # One token for both; the double records a request when it answers it,
+    # which the cancelled one never got to.
+    assert len(sap.fetches) == 1 and len(sap.writes) == 1
 
 
 async def test_the_platform_log_carries_no_host_key_or_filter_value(caplog):
@@ -860,8 +977,6 @@ async def test_the_platform_log_carries_no_host_key_or_filter_value(caplog):
     every user. ``app.py`` turns that down; this drives a read and a write
     through the real client and looks at everything that was logged.
     """
-    import app  # noqa: F401 - the application's logging configuration
-
     caplog.set_level(logging.INFO)  # the root logger, as in the platform log
     sap = Sap()
     c = client(sap)
@@ -894,6 +1009,14 @@ async def test_the_platform_log_carries_no_host_key_or_filter_value(caplog):
     for secret in ("s4.internal", "10000001", "00010", "FILTER-VAL", "BODY-VAL", SERVICE_PATH):
         assert secret not in caplog.text, secret
     assert not [r for r in caplog.records if r.name.startswith(("httpx", "httpcore"))]
+
+
+def test_the_application_turns_the_http_library_loggers_down():
+    """What the test above relies on, stated on its own: `app` (imported at
+    the top of this module) raises the loggers that would write request URLs."""
+    assert "app" in sys.modules
+    for name in ("httpx", "httpcore"):
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, name
 
 
 async def test_token_and_cookie_are_never_in_an_error_message_or_log(caplog):

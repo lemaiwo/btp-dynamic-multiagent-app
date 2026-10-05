@@ -768,7 +768,7 @@ async def test_an_oversized_answer_is_refused(monkeypatch):
 
 async def test_filter_travels_only_as_a_parameter_value(monkeypatch):
     monkeypatch.setattr(
-        client_module, "check_filter", lambda expr, fields: None
+        client_module, "check_filter", lambda expr, fields, **_: None
     )  # check_filter bypassed
     sap = Sap(page([ROW]))
     hostile = "x eq 1&$top=9999&$select=CreatedByUser#frag /../OTHER?y=1"

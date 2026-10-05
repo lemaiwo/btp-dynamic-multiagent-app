@@ -21,9 +21,13 @@ the SAP error text of a proper OData error envelope: an HTML error page, a
 sign-in page or an httpx exception text (which can carry a URL) becomes a
 fixed message.
 
-The dialect (``v2.V2Dialect``, later ``v4.V4Dialect``) holds everything
-that differs between protocol versions: literals, the key predicate, the
-query option names and the payload shapes.
+The dialect (``v2.V2Dialect``, ``v4.V4Dialect``) holds everything that
+differs between protocol versions: literals, the key predicate, the query
+option names, where an expanded entity's fields are named, and the payload
+shapes. Which one a client gets is the caller's decision from the
+catalogue's ``odata_version``; this module never looks at an answer to find
+out, and the checks, their order and the row filter are the same code for
+both.
 
 Writes (``create``, ``update``, ``delete``) follow the same pattern with
 their own gate, ``check_write``, and three rules of their own:
@@ -38,13 +42,18 @@ their own gate, ``check_write``, and three rules of their own:
   repeats it exactly once after a 403 that SAP marks ``X-CSRF-Token:
   Required``. Below it, ``DestinationAuth`` re-sends a request once after a
   401 (its cached credential aged out), a POST included. The two multiply:
-  one write is at most four sends and two token requests, each repeat
-  following a refusal (``tests/test_odata_v2_write.py`` pins the bound).
+  one write is at most four sends of the change and two token fetches
+  (calls of ``_fetch_session``, each of which ``DestinationAuth`` can
+  itself re-send once after a 401), every repeat following a refusal
+  (``tests/test_odata_v2_write.py`` pins the bound).
 * A failure while the request is under way is never retried: whether SAP
   applied the change is unknown, and the caller is told so with the code
   ``write_outcome_unknown``. The same code answers a 2xx that is not the
-  answer of a write (a sign-in page arriving as ``200 text/html``) and a
-  bare 502/504 from a gateway: success is recognised positively.
+  answer of a write (a sign-in page arriving as ``200 text/html``, a JSON
+  body that is an error) and a bare 502/504 from a gateway: success is
+  recognised positively. Cookies of an answer are taken into the stored
+  session only after that verdict, and an answer that fails it ends the
+  session: what a sign-in page sets is never sent with a later write.
 * No token, cookie, body value or host appears in an error, a log line or a
   ``repr`` of this module.
 """
@@ -97,6 +106,18 @@ _ORDERBY = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)(?: +(asc|desc))?$")
 _READ_FIRST_HINT = (
     "do not send the change again blindly; read the entity first to see whether it was applied"
 )
+# A create has no key to read back: the entity may exist under a key SAP chose.
+_LIST_FIRST_HINT = (
+    "do not send the create again blindly; list by the values you sent before trying "
+    "again, to see whether the entity was created"
+)
+
+
+def _outcome_hint(operation: str) -> str:
+    """How to find out whether a write of unknown outcome was applied."""
+    return _LIST_FIRST_HINT if operation == "create" else _READ_FIRST_HINT
+
+
 # Raised before a connection exists: nothing left this app.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 _STATUS_HINTS = {
@@ -216,14 +237,20 @@ _DROP = object()
 
 
 def _value(value: Any) -> Any:
-    """A field value without the protocol's bookkeeping keys."""
+    """A field value without the protocol's bookkeeping keys.
+
+    V2 keeps them in ``__metadata`` / ``__deferred``; V4 in annotations,
+    whose key is ``@name`` or ``Property@name`` (``@odata.type``,
+    ``City@odata.type``, ``Items@odata.nextLink``). A property name can hold
+    no ``@``, so every key with one is dropped.
+    """
     if isinstance(value, dict):
         if "__deferred" in value:
             return _DROP
         cleaned = {
             k: _value(v)
             for k, v in value.items()
-            if isinstance(k, str) and not k.startswith(("__", "@"))
+            if isinstance(k, str) and not k.startswith("__") and "@" not in k
         }
         return {k: v for k, v in cleaned.items() if v is not _DROP}
     if isinstance(value, list):
@@ -360,14 +387,17 @@ class ODataClient:
 
     def _projection(
         self, target: EntitySetDef, select: Any, expand: Any
-    ) -> tuple[list[str], list[tuple[NavigationDef, EntitySetDef]], list[str]]:
-        """``(fields to return, expanded navigations, the $select to send)``.
+    ) -> tuple[list[str], list[tuple[NavigationDef, EntitySetDef]], list[str], list[str]]:
+        """``(fields to return, expanded navigations, $select, $expand)``.
 
         A read never asks for "everything": without a ``select`` it asks for
         the selectable fields, so a field the admin did not release is not
         even transported. An expanded navigation contributes its target's
-        selectable fields (V2 returns an expanded entity only when ``$select``
-        names it).
+        selectable fields, and nothing else of the target. How the two
+        options carry that is the dialect's (``projection``): V2 names the
+        fields as ``Nav/Field`` in ``$select``, V4 as ``Nav($select=..)`` in
+        ``$expand``. An ``expand`` entry is only ever a navigation name; the
+        nested options are written here, never taken from the caller.
         """
         if select is not None and not isinstance(select, list):
             raise ODataError("invalid_argument", "select must be a list of field names")
@@ -391,7 +421,7 @@ class ODataClient:
                 "operation_disabled", f"entity set {target.name!r} has no readable field"
             )
         expands: list[tuple[NavigationDef, EntitySetDef]] = []
-        sent = list(names)
+        nested: list[tuple[str, list[str]]] = []
         for name in expand or []:
             nav, nav_target = self._navigation_target(target, name, None)
             if any(nav.name == seen.name for seen, _ in expands):
@@ -406,8 +436,9 @@ class ODataClient:
                     f"so navigation {nav.name!r} cannot be expanded",
                 )
             expands.append((nav, nav_target))
-            sent.extend(f"{nav.name}/{field}" for field in readable)
-        return names, expands, sent
+            nested.append((nav.name, readable))
+        sent, expanded = self._dialect.projection(names, nested)
+        return names, expands, sent, expanded
 
     @staticmethod
     def _orderby(target: EntitySetDef, orderby: Any) -> list[str]:
@@ -477,10 +508,13 @@ class ODataClient:
            own target is in the catalogue with the matching read enabled and
            at least one selectable field (``operation_disabled``);
         7. ``orderby``: ``Field [asc|desc]`` (``invalid_argument``) on known
-           (``unknown_field``), selectable (``field_not_selectable``) fields;
-        8. ``filter``: a string, checked by ``urls.check_filter``
-           (``invalid_argument``, ``unknown_field``, ``field_not_filterable``);
-           it is stripped, and a blank one is no filter;
+           (``unknown_field``), selectable (``field_not_selectable``) fields
+           of a type the dialect can sort by (``invalid_argument``; V4: a
+           recognised primitive type, so no complex or collection field);
+        8. ``filter``: a string, checked by ``urls.check_filter`` in the
+           grammar of the service's version (``invalid_argument``,
+           ``unknown_field``, ``field_not_filterable``); it is stripped, and
+           a blank one is no filter;
         9. ``top`` (1..``MAX_PAGE_SIZE``) and ``skip`` (>= 0, ``None`` = 0)
            (``invalid_argument``).
 
@@ -490,8 +524,7 @@ class ODataClient:
         if operation not in ("list", "get"):
             raise ODataError("invalid_argument", "a read is either 'list' or 'get'")
         path, target = self._resolve(entity_set, key, navigation, operation)
-        names, expands, sent = self._projection(target, select, expand)
-        expand_names = [nav.name for nav, _ in expands]
+        names, expands, sent, expand_names = self._projection(target, select, expand)
         if operation == "get":
             if orderby or (filter is not None and filter != "") or top is not None or skip:
                 raise ODataError(
@@ -508,12 +541,21 @@ class ODataClient:
             )
             return ReadPlan(operation, path, target, names, expands, query)
         ordered = self._orderby(target, orderby)
+        for entry in ordered:
+            sorted_by = target.field(entry.partition(" ")[0])
+            if sorted_by is None or not self._dialect.comparable(sorted_by.type):
+                raise ODataError(
+                    "invalid_argument",
+                    f"field {entry.partition(' ')[0]!r} has a type that cannot be used to sort",
+                )
         if filter is not None and not isinstance(filter, str):
             raise ODataError("invalid_argument", "filter must be a string")
         filter = (filter or "").strip() or None
         if filter:
             try:
-                check_filter(filter, {f.name: f for f in target.fields})
+                check_filter(
+                    filter, {f.name: f for f in target.fields}, version=self._dialect.version
+                )
             except FilterError as exc:
                 raise ODataError(exc.code, exc.message) from None
         skip = 0 if skip is None else skip
@@ -554,7 +596,8 @@ class ODataClient:
 
         1. ``operation`` is ``"create"``, ``"update"`` or ``"delete"``
            (``invalid_argument``);
-        2. the operation is enabled on ``entity_set``
+        2. the operation is enabled on ``entity_set``, and the service's
+           OData version is one this client can write (V2 today)
            (``operation_disabled``);
         3. the key: exactly the key fields with valid values for an update
            and a delete (``invalid_key``); none for a create
@@ -586,6 +629,13 @@ class ODataClient:
             raise ODataError(
                 "operation_disabled",
                 f"{operation!r} is not enabled for entity set {entity_set.name!r}",
+            )
+        if getattr(self._dialect, "supports_write", False) is not True:
+            # Before the key and the body are looked at, and long before a
+            # CSRF token is asked for: nothing of this call is sent.
+            raise ODataError(
+                "operation_disabled",
+                "writing to an OData V4 service is not supported yet; only reads are",
             )
         segment = entity_set.path or entity_set.name
         if operation == "create":
@@ -669,7 +719,7 @@ class ODataClient:
         return WritePlan(operation, path, entity_set, tuple(names), encoded, etag)
 
     # -- the call -----------------------------------------------------------
-    def _sap_error(self, status: int, content_type: str, body: bytes) -> ODataError:
+    def _sap_error(self, status: int, content_type: str, body: bytes | None) -> ODataError:
         """The error of a non-2xx answer: SAP's own code and text, or the status."""
         snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
         code, text = self._dialect.parse_error(snapshot)
@@ -849,7 +899,7 @@ class ODataClient:
         path, target, names, expands = plan.path, plan.target, plan.names, plan.expands
         params = self._dialect.read_params(plan.query)
         payload, headers = await self._fetch(path, params)
-        if payload is None or (isinstance(payload, dict) and payload.get("d", ...) is None):
+        if payload is None or self._dialect.is_null_entity(payload):
             # A single-valued navigation that leads nowhere.
             return {"item": None, "truncated": False}
         row, etag = self._dialect.parse_entity(payload)
@@ -935,7 +985,13 @@ class ODataClient:
         return CsrfSession.fresh(token, cookies)
 
     async def _modify(
-        self, method: str, url: str, headers: dict[str, str], content: bytes | None
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        content: bytes | None,
+        *,
+        operation: str = "",
     ) -> tuple[int, httpx.Headers, bytes | None]:
         """Send one modifying request. ``(status, headers, body)``.
 
@@ -989,20 +1045,37 @@ class ODataClient:
                     "write_outcome_unknown",
                     "the connection failed while the change was being sent: it is not "
                     "known whether SAP applied it. The request was not repeated",
-                    hint=_READ_FIRST_HINT,
+                    hint=_outcome_hint(operation),
                 ) from None
             body = None
         return status, answer, None if body is None else bytes(body)
+
+    def _is_entity(self, decoded: Any) -> bool:
+        """Whether a decoded write answer is an entity as the dialect reads one.
+
+        A JSON object with a top-level ``error`` key is an error, whatever
+        else it holds and whatever status it came with.
+        """
+        if not isinstance(decoded, dict) or "error" in decoded:
+            return False
+        try:
+            self._dialect.parse_entity(decoded)
+        except ODataError:
+            return False
+        return True
 
     def _confirmed(self, plan: WritePlan, status: int, body: bytes | None) -> Any:
         """The decoded answer of a write that SAP confirmed, else an error.
 
         Success is recognised, not assumed. A status below 300 alone says
-        little: a sign-in page or a SAML form arrives as ``200 text/html``.
+        little: a sign-in page or a SAML form arrives as ``200 text/html``,
+        and a proxy can wrap an error in a 200.
 
         * create: 201, or 200 with the created entity. A body, when there is
           one, must be JSON the dialect reads as an entity;
-        * update, delete: 204, or 200; a body, when there is one, must be JSON.
+        * update, delete: 204 without a body, or 200 with no body or with
+          the entity. Any other body -- text, markup, JSON that is not an
+          entity, JSON with a top-level ``error`` -- is not a confirmation.
 
         Everything else below 300 was answered by something, but not
         recognisably by the write: ``write_outcome_unknown``.
@@ -1019,23 +1092,23 @@ class ODataClient:
             readable = body is not None  # b"": nothing to read, nothing wrong
         if plan.operation == "create":
             if decoded is not None:
-                try:
-                    self._dialect.parse_entity(decoded)
-                    ok = status in (200, 201)
-                except ODataError:
-                    ok = False
+                ok = status in (200, 201) and self._is_entity(decoded)
             else:
                 # Created, and the echo is absent (or could not be read).
                 ok = status == 201 and (readable or body is None)
+        elif body:
+            ok = status == 200 and self._is_entity(decoded)
         else:
-            ok = status in (200, 204) and (readable or (body is None and status == 204))
+            # No body. One that could not be read (`None`) counts only with
+            # the status that never has one.
+            ok = status == 204 or (status == 200 and body is not None)
         if not ok:
             raise ODataError(
                 "write_outcome_unknown",
                 f"the answer (HTTP {status}) is not the answer of a completed "
                 f"{plan.operation}: it is not known whether SAP applied the change",
                 status=status,
-                hint=_READ_FIRST_HINT
+                hint=_outcome_hint(plan.operation)
                 + "; a sign-in page instead of an answer usually means the "
                 "destination's credential was not accepted",
             )
@@ -1077,7 +1150,9 @@ class ODataClient:
             if cookie:
                 # Explicitly, from this identity's own entry, for this request only.
                 sent["Cookie"] = cookie
-            status, answer, body = await self._modify(method, plan.path, sent, content)
+            status, answer, body = await self._modify(
+                method, plan.path, sent, content, operation=plan.operation
+            )
             stale = status == 403 and answer.get("x-csrf-token", "").strip().lower() == "required"
             if not stale:
                 break
@@ -1089,12 +1164,6 @@ class ODataClient:
             # SAP refused the request before processing it, so sending it
             # again changes nothing twice. Once.
             session = await self._renew(sessions, key, session)
-        rotated = cookies_from_response(httpx.Response(status, headers=answer))
-        if any(session.cookies.get(name) != value for name, value in rotated.items()):
-            # SAP moved the session on: the next write of this identity sends
-            # the new cookies. Done only while the store still holds the
-            # session this request was sent with.
-            sessions.update(key, session, {**session.cookies, **rotated})
         logger.info(
             "odata: %s on entity set %s answered HTTP %s",
             plan.operation,
@@ -1123,10 +1192,27 @@ class ODataClient:
                     f"a gateway answered HTTP {status} for the change: it is not known "
                     f"whether SAP applied it. The request was not repeated",
                     status=status,
-                    hint=_READ_FIRST_HINT,
+                    hint=_outcome_hint(plan.operation),
                 )
             raise error
-        return status, answer, self._confirmed(plan, status, body)
+        try:
+            decoded = self._confirmed(plan, status, body)
+        except ODataError:
+            # Something answered in SAP's place (a sign-in page, usually).
+            # Its cookies are not this identity's session, and the session
+            # the request went out with did not get the write through: it is
+            # ended here (unless a newer one replaced it already), so the
+            # next write starts from a fresh token.
+            sessions.drop(key, session)
+            raise
+        # Only now, with the write confirmed, is the answer known to be
+        # SAP's own: when it moved the session on, the next write of this
+        # identity sends the new cookies. Done only while the store still
+        # holds the session this request was sent with.
+        rotated = cookies_from_response(httpx.Response(status, headers=answer))
+        if any(session.cookies.get(name) != value for name, value in rotated.items()):
+            sessions.update(key, session, {**session.cookies, **rotated})
+        return status, answer, decoded
 
     async def create(self, entity_set: EntitySetDef, body: dict) -> dict:
         """Create one entity. ``{"item", "status"}`` plus the raw ETag if any.

@@ -197,10 +197,56 @@ _FILTER_TOKEN = re.compile(
     """,
     re.VERBOSE,
 )
+
+# -- OData V4 ---------------------------------------------------------------------
+# The primitive types a V4 filter or sort order may compare. A field of any
+# other type -- a complex type, a collection, a stream, a type this code does
+# not know -- is no target: the type string comes verbatim from `$metadata`
+# and is recognised positively, never guessed.
+V4_COMPARABLE_TYPES = frozenset(
+    "Edm.String Edm.Boolean Edm.Byte Edm.SByte Edm.Int16 Edm.Int32 Edm.Int64 Edm.Decimal "
+    "Edm.Double Edm.Single Edm.Guid Edm.Date Edm.DateTimeOffset Edm.TimeOfDay Edm.Duration".split()
+)
+_V4_FILTER_WORDS = _FILTER_WORDS
+# No `substringof` (V2 only), no `cast` / `isof` (they take a type name), no
+# `any` / `all` (lambda operators) and no geo functions.
+_V4_FILTER_FUNCTIONS = frozenset(
+    "contains startswith endswith tolower toupper trim length indexof concat substring "
+    "year month day hour minute second fractionalseconds date time totaloffsetminutes now "
+    "round floor ceiling".split()
+)
+# What may not follow a bare literal: it would make it another token.
+_V4_END = r"(?![A-Za-z0-9_.:'-])"
+# V4 literals carry no type prefix and no type suffix: a GUID, a date and a
+# timestamp are bare, a number is only a number. The two forms that do have a
+# name before the quote are the duration and the enumeration member. Tried in
+# this order, so a GUID or a date is never read as a number followed by text.
+_V4_FILTER_TOKEN = re.compile(
+    rf"""
+      (?P<space>[ ]+)
+    | (?P<string>'(?:[^']|'')*')
+    | (?P<duration>duration'-?P[0-9DTHMS.]{{1,40}}')
+    | (?P<enum>[A-Za-z_][A-Za-z0-9_]{{0,63}}(?:\.[A-Za-z_][A-Za-z0-9_]{{0,63}}){{1,8}}
+        '[A-Za-z_][A-Za-z0-9_,]{{0,200}}')
+    | (?P<guid>[0-9A-Fa-f]{{8}}(?:-[0-9A-Fa-f]{{4}}){{3}}-[0-9A-Fa-f]{{12}}{_V4_END})
+    | (?P<stamp>[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}
+        (?:T[0-9]{{2}}:[0-9]{{2}}(?::[0-9]{{2}}(?:\.[0-9]{{1,12}})?)?(?:Z|[+-][0-9]{{2}}:[0-9]{{2}}))?
+        {_V4_END})
+    | (?P<clock>[0-9]{{2}}:[0-9]{{2}}(?::[0-9]{{2}}(?:\.[0-9]{{1,12}})?)?{_V4_END})
+    | (?P<number>-?[0-9]{{1,40}}(?:\.[0-9]{{1,40}})?(?:[eE][+-]?[0-9]{{1,4}})?{_V4_END})
+    | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
+    | (?P<punct>[(),])
+    """,
+    re.VERBOSE,
+)
 _SHOWN_NAME = 64
+_GRAMMARS = {
+    "v2": (_FILTER_TOKEN, _FILTER_WORDS, _FILTER_FUNCTIONS),
+    "v4": (_V4_FILTER_TOKEN, _V4_FILTER_WORDS, _V4_FILTER_FUNCTIONS),
+}
 
 
-def check_filter(expr: str, fields: Mapping[str, FieldDef]) -> None:
+def check_filter(expr: str, fields: Mapping[str, FieldDef], *, version: str = "v2") -> None:
     """Refuse a ``$filter`` that reads anything but filterable fields.
 
     A filter is an oracle: ``CreatedByUser eq 'X'`` answers a question about
@@ -215,7 +261,24 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef]) -> None:
     than passed on for SAP to judge. The expression still travels only as
     the *value* of the ``$filter`` parameter (the client sends it through
     ``params=``); this check is about fields, not about URL injection.
+
+    ``version`` is the service's declared OData version and picks the
+    grammar; the two are not mixed. ``"v4"`` reads the V4 literals (a bare
+    GUID, date, timestamp and time of day, ``duration'P..'``, an enumeration
+    member ``Namespace.Type'Member'``, numbers without a suffix) and the V4
+    functions (``contains`` instead of ``substringof``), and refuses the V2
+    forms (``guid'..'``, ``datetime'..'``, ``10.5M``). The lambda operators
+    ``any`` / ``all`` and the path segments ``$it``, ``$root`` and ``$count``
+    stay refused in both: a path leads to fields of another entity set, and
+    nothing here could check those. In V4 a field must also have a type that
+    can be compared (``V4_COMPARABLE_TYPES``): a complex or collection-valued
+    field is no filter target, and a field of an enumeration type only where
+    the expression holds a member literal of exactly that type.
     """
+    grammar = _GRAMMARS.get(version) if isinstance(version, str) else None
+    if grammar is None:
+        raise FilterError("invalid_argument", "filters are not supported for this OData version")
+    tokens, words, functions = grammar
     if not isinstance(expr, str):
         raise FilterError("invalid_argument", "filter must be a string")
     if len(expr) > MAX_FILTER_CHARS:
@@ -226,10 +289,11 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef]) -> None:
         raise FilterError("invalid_argument", "filter must not contain control characters")
     # Tokenise the whole expression first, so that an expression the
     # tokeniser cannot read is refused as such whatever names it mentions.
-    identifiers: list[tuple[str, bool]] = []  # (name, is a call)
+    identifiers: list[tuple[str, bool, bool]] = []  # (name, is a call, is a literal prefix)
+    enum_types: set[str] = set()
     position = 0
     while position < len(expr):
-        token = _FILTER_TOKEN.match(expr, position)
+        token = tokens.match(expr, position)
         if token is None:
             raise FilterError(
                 "invalid_argument",
@@ -239,9 +303,19 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef]) -> None:
             )
         position = token.end()
         if token.lastgroup == "ident":
-            called = expr[position:].lstrip(" ").startswith("(")
-            identifiers.append((token.group("ident"), called))
-    for name, called in identifiers:
+            rest = expr[position:]
+            identifiers.append(
+                (token.group("ident"), rest.lstrip(" ").startswith("("), rest.startswith("'"))
+            )
+        elif token.lastgroup == "enum":
+            type_name = token.group("enum").partition("'")[0]
+            if type_name.startswith("Edm."):
+                raise FilterError(
+                    "invalid_argument",
+                    "an OData V4 value is written without a type name in front of it",
+                )
+            enum_types.add(type_name)
+    for name, called, prefixes in identifiers:
         shown = name if len(name) <= _SHOWN_NAME else name[:_SHOWN_NAME] + "..."
         # A field wins over an operator word or a function of the same name:
         # an entity set may have a field called `in`, `has` or `null`, and
@@ -252,11 +326,25 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef]) -> None:
                 raise FilterError(
                     "field_not_filterable", f"field {shown!r} cannot be used in a filter"
                 )
+            if version == "v4":
+                edm_type = getattr(field, "type", "Edm.String")
+                if edm_type not in V4_COMPARABLE_TYPES and edm_type not in enum_types:
+                    raise FilterError(
+                        "field_not_filterable",
+                        f"field {shown!r} has a type that cannot be compared in a filter",
+                    )
             continue
-        if name in _FILTER_WORDS:
+        if name in words:
             continue
+        if version == "v4" and prefixes:
+            # `guid'..'`, `datetime'..'`, `binary'..'`: the V2 way of writing a value.
+            raise FilterError(
+                "invalid_argument",
+                "an OData V4 value is written without a type name in front of it "
+                "(a GUID, a date and a timestamp are bare; a text is in single quotes)",
+            )
         if called:
-            if name not in _FILTER_FUNCTIONS:
+            if name not in functions:
                 raise FilterError(
                     "invalid_argument", f"function {shown!r} is not supported in a filter"
                 )

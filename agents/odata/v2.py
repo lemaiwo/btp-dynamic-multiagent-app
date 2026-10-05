@@ -95,6 +95,7 @@ class V2Dialect:
     """OData V2 as SAP Gateway speaks it."""
 
     version = "v2"
+    supports_write = True
 
     # -- literals -----------------------------------------------------------
     def literal(self, edm_type: str, value: Any) -> str:
@@ -332,6 +333,29 @@ class V2Dialect:
         return out
 
     # -- query options ------------------------------------------------------
+    def comparable(self, edm_type: str) -> bool:
+        """Whether a field of ``edm_type`` may be a sort target: in V2, any.
+
+        The V4 dialect narrows this to the types it recognises; V2 keeps the
+        rule it always had (the field must be selectable).
+        """
+        return True
+
+    def projection(
+        self, names: list[str], expands: list[tuple[str, list[str]]]
+    ) -> tuple[list[str], list[str]]:
+        """``($select entries, $expand entries)`` of a read.
+
+        ``expands`` pairs each navigation with the fields of its target that
+        may be read. V2 returns an expanded entity only when ``$select``
+        names it, so those fields travel as ``Nav/Field`` paths in
+        ``$select`` and ``$expand`` holds the bare navigation names.
+        """
+        select = list(names)
+        for nav, fields in expands:
+            select.extend(f"{nav}/{field}" for field in fields)
+        return select, [nav for nav, _ in expands]
+
     def read_params(self, query: ReadQuery) -> dict[str, str]:
         """The query options of a read, as parameters (never as URL text)."""
         params = {"$format": "json"}
@@ -377,6 +401,10 @@ class V2Dialect:
         metadata = d.get("__metadata")
         etag = metadata.get("etag") if isinstance(metadata, dict) else None
         return d, etag if isinstance(etag, str) and etag else None
+
+    def is_null_entity(self, payload: Any) -> bool:
+        """Whether ``payload`` says "no entity": ``{"d": null}``."""
+        return isinstance(payload, dict) and payload.get("d", ...) is None
 
     def parse_error(self, response: httpx.Response) -> tuple[str, str]:
         """``(code, text)`` of an OData error envelope, or ``("", "")``.
