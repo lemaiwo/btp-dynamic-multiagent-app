@@ -33,10 +33,12 @@ import re
 from collections.abc import Collection
 from typing import Any
 
-from .calls import key_names, stored_call_refusal
+from .calls import key_is_addressable, key_names, key_types, stored_call_refusal
 from .models import ENTITY_OPS, WRITE_OPS, operation_is_write
 
 MAX_SUMMARY_MATCHES = 20
+# The entity operations that name one entity by its key in the URL.
+_BY_KEY_OPS = ("get", "update", "delete")
 MAX_FULL_TARGETS = 5
 
 # A query is model text: bound the work it can cause, whatever its length.
@@ -375,7 +377,25 @@ def _candidates(
     if not isinstance(definition, dict):
         return []
     service_score = _W_SERVICE * _hits(tokens, service.get("title"), service.get("purpose"))
-    entity_sets = _dicts(definition.get("entity_sets"))
+    version = service.get("odata_version")
+    # An entity set whose key cannot be written into a URL is seen without
+    # its by-key operations from here on -- by everything below: the
+    # operations listed, the fields shown as writable, the navigations that
+    # start at or lead to one entity of it. `execute_operation` would refuse
+    # each of them on every key (`invalid_key`).
+    entity_sets = [
+        e
+        if key_is_addressable(e, version)
+        else {
+            **e,
+            "operations": [
+                op
+                for op in (e.get("operations") if isinstance(e.get("operations"), list) else [])
+                if op not in _BY_KEY_OPS
+            ],
+        }
+        for e in _dicts(definition.get("entity_sets"))
+    ]
     readable = {
         _text(e.get("name")): visible_operations(e, allow_write) for e in entity_sets
     }
@@ -409,7 +429,7 @@ def _candidates(
     if not allow_call:
         return out
     keys = key_names(definition)
-    version = service.get("odata_version")
+    types = key_types(definition)
     for operation in _dicts(definition.get("operations")):
         target = _text(operation.get("name"))
         # Offered only when `execute_operation` can run it: the same rule
@@ -418,7 +438,10 @@ def _candidates(
         # in the catalogue that makes every call fail.
         if not target or operation.get("enabled") is not True:
             continue
-        if stored_call_refusal(operation, keys, version, allow_write=call_write) is not None:
+        if (
+            stored_call_refusal(operation, keys, version, allow_write=call_write, types=types)
+            is not None
+        ):
             continue
         own = _W_TARGET * _hits(tokens, operation.get("title"), target)
         own += _W_DESCRIPTION * _hits(tokens, operation.get("description"))

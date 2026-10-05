@@ -68,7 +68,7 @@ from . import common
 from .client import ODataError, ReadQuery
 from .common import refuse as _refuse
 from .models import EDM_NAME_RE, EntitySetDef, OperationDef
-from .urls import V4_COMPARABLE_TYPES, join_path
+from .urls import MAX_SEGMENT, V4_COMPARABLE_TYPES, join_path
 
 # What one parameter value of a function may weigh: it travels in the path.
 MAX_PARAM_VALUE_CHARS = common.MAX_KEY_VALUE_CHARS
@@ -109,9 +109,13 @@ _VALUE_HINTS = {
     "Edm.TimeOfDay": "write it as 12:30:00",
     "Edm.Duration": "write it as an ISO 8601 duration, for example P1DT2H",
     "Edm.Guid": "write it as 8-4-4-4-12 hexadecimal digits",
-    "Edm.Decimal": "write it as a number with at most 15 significant digits; "
-    "more cannot be sent exactly and is not rounded",
+    "Edm.Decimal": 'pass it as text, for example "12.50", with at most 15 significant '
+    "digits and not smaller than 0.0001; a value that cannot be sent exactly in "
+    "plain digits is not rounded",
 }
+# The most significant digits of a decimal passed as a NUMBER that are
+# trusted: the JSON parser that read it has already rounded a longer one.
+_MAX_FLOAT_DIGITS = 15
 
 
 def _type_shown(edm_type: str) -> str:
@@ -274,9 +278,9 @@ class V4Dialect:
         ``Edm.Int64`` and ``Edm.Decimal`` are sent as JSON numbers, which is
         the V4 default (strings need ``IEEE754Compatible=true``, which this
         client does not ask for). An integer is exact at any size. A decimal
-        with a fraction goes through a float, so it is sent only when the
-        float reads back as exactly the digits that were given; otherwise it
-        is refused -- a silently rounded amount is worse than a refusal.
+        with a fraction goes through a float (``_decimal_number``) and is
+        refused when that cannot be exact -- a silently rounded amount is
+        worse than a refusal.
         """
         if isinstance(value, (dict, list, tuple, set)) or edm_type not in V4_COMPARABLE_TYPES:
             raise _refuse(edm_type)
@@ -312,22 +316,7 @@ class V4Dialect:
                 raise _refuse(edm_type)
             return number
         if edm_type == "Edm.Decimal":
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float):
-                if not math.isfinite(value):
-                    raise _refuse(edm_type)
-                return value
-            if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
-                raise _refuse(edm_type)
-            if "." not in value:
-                return int(value)
-            number = float(value)
-            if not math.isfinite(number) or decimal.Decimal(repr(number)) != decimal.Decimal(
-                value
-            ):
-                raise _refuse(edm_type)
-            return number
+            return self._decimal_number(value)
         if edm_type in _FLOAT_TYPES:
             if isinstance(value, str) and not _DECIMAL.fullmatch(value):
                 raise _refuse(edm_type)
@@ -345,6 +334,42 @@ class V4Dialect:
             raise _refuse(edm_type)
         self.literal(edm_type, value)
         return value
+
+    @staticmethod
+    def _decimal_number(value: Any) -> int | float:
+        """An ``Edm.Decimal`` as the JSON number that is sent, or a refusal.
+
+        An OData decimal is plain digits: no exponent. ``json.dumps`` prints
+        a float with ``repr``, which switches to exponent form below 0.0001
+        and from 1e16 on, so a float is sent only when its ``repr`` is plain
+        digits. On top of that:
+
+        * given as text, the float must read back as exactly the digits
+          given (``12.50`` and ``12.5`` are the same number);
+        * given as a number, it has at most ``_MAX_FLOAT_DIGITS``
+          significant digits: whoever parsed the JSON has already rounded a
+          longer one, and what was meant cannot be told any more.
+
+        An integer (a number, or text without a point) is exact at any size.
+        """
+        edm_type = "Edm.Decimal"
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, float):
+            text = repr(value) if math.isfinite(value) else ""
+            digits = text.lstrip("-").replace(".", "").lstrip("0")
+            if not _DECIMAL.fullmatch(text) or len(digits) > _MAX_FLOAT_DIGITS:
+                raise _refuse(edm_type)
+            return value
+        if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
+            raise _refuse(edm_type)
+        if "." not in value:
+            return int(value)
+        number = float(value)
+        sent = repr(number)
+        if not _DECIMAL.fullmatch(sent) or decimal.Decimal(sent) != decimal.Decimal(value):
+            raise _refuse(edm_type)
+        return number
 
     def encode_body(self, entity_set: EntitySetDef, body: dict) -> dict:
         """``body`` as the JSON object of a V4 create or update request.
@@ -528,6 +553,12 @@ class V4Dialect:
                     f"a parameter of operation {name!r} has a name a URL cannot carry",
                 )
             address += "(" + ",".join(f"{p}={text}" for p, text in sent.items()) + ")"
+            if len(address) > MAX_SEGMENT:
+                raise ODataError(
+                    "invalid_argument",
+                    f"the parameters of operation {name!r} are together too long for one call",
+                    hint="pass shorter values, or leave out optional parameters",
+                )
         segments.append(address)
         try:
             path = join_path(service_path, *segments)
@@ -555,7 +586,10 @@ class V4Dialect:
         A ``value`` that is the only property is the wrapper, unless the
         context says the answer is one entity (``.../$entity``): an entity
         type may have a single property of that name, and it must not pass
-        as a scalar. Whether an entity or a collection may be shown is not
+        as a scalar. A scalar under ``value`` is a ``value`` only when the
+        context names a primitive type (``$metadata#Edm.<Type>``): without a
+        context, or with one that names a complex or entity type, it is
+        ``other`` and never shown. Whether an entity or a collection may be shown is not
         decided here. An answer that is not a JSON object, or has a
         top-level ``error``, is not the answer of a call (``sap_error``).
         """
@@ -573,7 +607,12 @@ class V4Dialect:
             if value is None:
                 return "none", None
             if isinstance(value, (str, int, float)):  # bool is an int
-                return "value", value
+                _, found, fragment = (
+                    context.rpartition(_METADATA) if isinstance(context, str) else ("", "", "")
+                )
+                if found and fragment.startswith("Edm."):
+                    return "value", value
+                return "other", None
             if isinstance(value, list):
                 return "collection", value
             return "other", None

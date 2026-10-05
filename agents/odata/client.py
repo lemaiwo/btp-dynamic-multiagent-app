@@ -185,6 +185,7 @@ CALL_REFUSALS = (
     "bound_set_missing",  # bound to an entity set the catalogue does not hold
     "bound_set_without_key",  # ... or to one that has no key: no entity to name
     "key_not_declared",  # bound, and a key field is not one of its parameters
+    "bound_key_type",  # bound to a set whose key has a type no literal is written for
     "parameter_type",  # a parameter that is always sent has a type not written
 )
 _CATALOGUE_HINT = "this is a catalogue setting; tell the user instead of retrying"
@@ -196,6 +197,7 @@ def call_refusal(
     dialect: Any,
     *,
     allow_write: bool = True,
+    bound_key_types: Sequence[str] | None = None,
 ) -> str | None:
     """Why ``operation`` cannot be called, or ``None`` when it can. No I/O.
 
@@ -223,6 +225,14 @@ def call_refusal(
     puts it in the path as the key predicate of the bound entity; nothing
     has to be declared for it.
 
+    Wherever the key travels, it is checked as the key of its entity
+    (``common.key_segment``, with the types of the entity set's key
+    fields): ``bound_key_types`` are those types, and a key field of a type
+    the dialect writes no literal for -- ``Edm.Binary``, an enumeration, an
+    unknown name -- makes every call fail on its key (``bound_key_type``).
+    ``None`` means the caller does not know them; the client and the search
+    tool always do.
+
     A parameter that is always sent -- a ``required`` one, or a key field
     that travels as a parameter -- must have a type the dialect writes
     (``sends_type``): a complex type, a collection, ``Edm.Binary`` or an
@@ -241,6 +251,7 @@ def call_refusal(
     if not allow_write and operation.is_write():
         return "write_not_allowed"
     always: set[str] = set()
+    sends = getattr(dialect, "sends_type", None)
     if operation.bound_to is not None:
         if bound_keys is None:
             return "bound_set_missing"
@@ -251,7 +262,10 @@ def call_refusal(
             if any(name not in declared for name in bound_keys):
                 return "key_not_declared"
             always = set(bound_keys)
-    sends = getattr(dialect, "sends_type", None)
+        if bound_key_types is not None and not (
+            callable(sends) and all(sends(edm) is True for edm in bound_key_types)
+        ):
+            return "bound_key_type"
     for parameter in operation.parameters:
         if not (parameter.required or parameter.name in always):
             continue
@@ -997,7 +1011,12 @@ class ODataClient:
         if operation.bound_to is not None:
             bound = self._definition.entity_set(operation.bound_to)
         bound_keys = None if bound is None else [k.name for k in bound.keys]
-        reason = call_refusal(operation, bound_keys, self._dialect)
+        reason = call_refusal(
+            operation,
+            bound_keys,
+            self._dialect,
+            bound_key_types=None if bound is None else [k.type for k in bound.keys],
+        )
         if reason is not None:
             raise self._not_callable(operation, reason, bound_keys or [])
         if params is None:
@@ -1109,6 +1128,11 @@ class ODataClient:
             why = "the entity set it is bound to is not in the catalogue"
         elif reason == "bound_set_without_key":
             why = "the entity set it is bound to has no key, so it cannot be called for one entity"
+        elif reason == "bound_key_type":
+            why = (
+                "a key field of the entity set it is bound to has a type this tool "
+                "does not send, so it cannot be called for one entity"
+            )
         elif reason == "key_not_declared":
             declared = {p.name for p in operation.parameters}
             missing = next((k for k in bound_keys if k not in declared), "")
@@ -1530,6 +1554,10 @@ class ODataClient:
 
         Everything else below 300 was answered by something, but not
         recognisably by the write: ``write_outcome_unknown``.
+
+        Open pilot check (V4): a V4 body is not required to carry
+        ``@odata.context`` to count; whether to require it waits for real
+        answers, because a wrong tightening reports applied writes as unknown.
         """
         decoded: Any = None
         ok = False
@@ -1764,10 +1792,16 @@ class ODataClient:
         plan = self.check_write(entity_set, "update", key=key, body=body, etag=etag)
         method, extra = self._dialect.update_request(plan.path, plan.body)
         status, headers, payload = await self._write(plan, method, dict(extra))
+        # From here on SAP has applied the change: nothing below may raise.
         result: dict[str, Any] = {"ok": True, "status": status}
         inner: str | None = None
         if payload is not None:
-            _, inner = self._dialect.parse_entity(payload)  # accepted by _confirmed
+            try:
+                _, inner = self._dialect.parse_entity(payload)
+            except ODataError:
+                # `_confirmed` read it as an entity; should a second look
+                # fail, the update stands and merely carries no ETag.
+                inner = None
         new_etag = _etag_of(headers.get("etag"), inner)
         if new_etag:
             result[RAW_ETAG_FIELD] = new_etag

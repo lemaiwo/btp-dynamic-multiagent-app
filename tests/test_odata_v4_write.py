@@ -144,6 +144,20 @@ def _entity_set(name: str, operations: list[str], entity_type: str = ITEM_TYPE) 
     }
 
 
+def _odd_key_set() -> dict[str, Any]:
+    """Every operation ticked, and a key no V4 (or V2) literal exists for."""
+    return {
+        "name": "A_OddKey",
+        "entity_type": "SRV.OddType",
+        "keys": [{"name": "Token", "type": "Edm.Binary"}],
+        "operations": ALL_OPS,
+        "fields": [
+            {"name": "Token", "type": "Edm.Binary", "selectable": True},
+            {"name": "Plant", "selectable": True, "writable": True},
+        ],
+    }
+
+
 def _operations(enabled: bool = True) -> list[dict[str, Any]]:
     operations = [
         _action("Release", parameters=[
@@ -175,13 +189,22 @@ def _operations(enabled: bool = True) -> list[dict[str, Any]]:
         # Enabled, but never callable as the catalogue declares them.
         _action("NeedsComplex", parameters=[{"name": "Address", "type": "SRV.Address"}]),
         _function("BoundToKeyless", changes_data=False, bound_to="A_Keyless"),
+        # Bound to a set whose key has a type no literal can be written for.
+        _function("OddKeyStatus", changes_data=False, bound_to="A_OddKey"),
+        _function("Wide", changes_data=False, parameters=[
+            {"name": f"P{i}", "required": False} for i in range(6)
+        ]),
     ]
     if not enabled:
         operations = [{**op, "enabled": False} for op in operations]
     return operations
 
 
-UNCALLABLE = {"NeedsComplex": "parameter_type", "BoundToKeyless": "bound_set_without_key"}
+UNCALLABLE = {
+    "NeedsComplex": "parameter_type",
+    "BoundToKeyless": "bound_set_without_key",
+    "OddKeyStatus": "bound_key_type",
+}
 
 
 def catalogue(item_ops: list[str] | None = None, enabled: bool = True) -> dict[str, dict]:
@@ -192,6 +215,7 @@ def catalogue(item_ops: list[str] | None = None, enabled: bool = True) -> dict[s
             _entity_set("A_Hidden", []),  # in the catalogue, readable by nobody
             _entity_set("A_Other", ["list", "get"], entity_type="SRV.OtherType"),
             {**_entity_set("A_Keyless", ["list"]), "keys": []},
+            _odd_key_set(),
         ],
         "operations": _operations(enabled),
     }
@@ -852,7 +876,7 @@ async def test_whatever_search_offers_execute_does_not_refuse_by_a_switch(alice,
         out = await w.run(target=target, operation=operation)
         assert code(out) not in switch_codes, (target, operation, out)
     called = {target for target, operation in offered if operation == "call"}
-    reading = {"CountOpen", "ItemStatus", "OpenItems", "Typed"}
+    reading = {"CountOpen", "ItemStatus", "OpenItems", "Typed", "Wide"}
     changing = {"Release", "Approve", "MarkedReading", "Copy", "Recalculate"}
     # `HiddenItem` reads, bound to a set nobody may read: callable, and offered.
     assert called - {"HiddenItem"} == (reading | changing if allow_write else reading)
@@ -1094,8 +1118,7 @@ def test_parse_call_recognises_the_v4_shapes_positively():
     assert parse(None, "X") == ("none", None)
     assert parse({"@odata.null": True}, "X") == ("none", None)
     assert parse({"@odata.context": "c", "value": None}, "X") == ("none", None)
-    assert parse({"@odata.context": "c", "value": 3}, "X") == ("value", 3)
-    assert parse({"value": "a"}, "X") == ("value", "a")
+    assert parse({"@odata.context": "$metadata#Edm.Int32", "value": 3}, "X") == ("value", 3)
     assert parse({"@odata.context": "c", "value": [1]}, "X") == ("collection", [1])
     row = {"@odata.context": CONTEXT, "Plant": "1"}
     assert parse(row, "X") == ("entity", row)
@@ -1109,3 +1132,175 @@ def test_parse_call_recognises_the_v4_shapes_positively():
         with pytest.raises(ODataError) as refused:
             parse(payload, "X")
         assert refused.value.code == "sap_error"
+
+
+# -- review round 1 -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect", [V4Dialect(), V2Dialect()])
+def test_a_bound_operation_needs_a_key_the_dialect_can_write(dialect):
+    kind = _action("X") if dialect.version == "v4" else {
+        "name": "X", "kind": "function_import", "http_method": "POST", "enabled": True,
+    }
+    operation = OperationDef.model_validate(
+        {**kind, "bound_to": ITEM, "parameters": [{"name": "A"}, {"name": "B"}]}
+    )
+    for types, reason in (
+        (["Edm.String", "Edm.Int32"], None),
+        (["Edm.String", "Edm.Binary"], "bound_key_type"),
+        (["SRV.Status", "Edm.String"], "bound_key_type"),
+        (["Collection(Edm.String)"], "bound_key_type"),
+        ([""], "bound_key_type"),
+        (None, None),  # not said: the caller has no types (never the client or search)
+    ):
+        assert call_refusal(operation, ["A", "B"], dialect, bound_key_types=types) == reason
+    # Not bound: no key, nothing to look at.
+    free = OperationDef.model_validate(kind)
+    assert call_refusal(free, None, dialect, bound_key_types=["Edm.Binary"]) is None
+
+
+async def test_by_key_operations_are_not_offered_on_a_set_whose_key_cannot_be_written(alice):
+    w = World()
+    found = await w.search(query="A_OddKey", detail="full", service="pr4")
+    match = next(m for m in found["matches"] if m["target"] == "A_OddKey")
+    # get, update and delete need the key in the URL; list and create do not.
+    assert match["operations"] == ["list", "create"]
+    assert "OddKeyStatus" not in {m["target"] for m in (await w.search(query=""))["matches"]}
+    # ... because execute could never run them, whatever key is passed.
+    for key in ({"Token": "AAEC"}, {"Token": 1}, {"Token": "X'0102'"}):
+        for operation in ("get", "delete"):
+            out = await w.run(target="A_OddKey", operation=operation, key=key)
+            assert code(out) == "invalid_key", (operation, key, out)
+    out = await w.call("OddKeyStatus", key={"Token": "AAEC"})
+    assert code(out) == "not_available" and "catalogue setting" in out["error"]["hint"]
+    assert "A_OddKey" not in json.dumps(out)
+    assert await w.untouched()
+    # The same catalogue on a V2 service: the same answer.
+    from agents.odata.search import search_catalogue
+
+    v2 = {**catalogue()["pr4"], "odata_version": "v2"}
+    v2["definition"] = {**v2["definition"], "operations": []}
+    hit = next(
+        m for m in search_catalogue([v2], "A_OddKey", detail="full", allow_write=True)["matches"]
+        if m["target"] == "A_OddKey"
+    )
+    assert hit["operations"] == ["list", "create"]
+
+
+@pytest.mark.parametrize("value, sent", [
+    (12.5, 12.5), (0.1, 0.1), (-3.25, -3.25), (12.0, 12.0), (0.0001, 0.0001),
+    (123456789012.345, 123456789012.345),
+    ("12.50", 12.5), ("0.0001", 0.0001), ("0.1234567890123456", 0.1234567890123456),
+    (10**20, 10**20), ("100000000000000000000", 10**20),
+])
+def test_a_decimal_that_json_prints_in_plain_form_is_sent(value, sent):
+    out = V4Dialect()._json_value("Edm.Decimal", value)
+    assert out == sent and type(out) is type(sent)
+    text = json.dumps(out)
+    assert "e" not in text.lower() and text.lstrip("-").replace(".", "").isdigit()
+
+
+@pytest.mark.parametrize("value", [
+    0.00001, 1e-7, 1e16, 1.5e300, 5e-324,           # JSON would print an exponent
+    0.12345678901234568, 1234567890123456.7,         # 16+ digits: already rounded by a parser
+    "0.00001", "0.000001234", "-0.00001",            # the text path prints an exponent too
+    "0.12345678901234567890123", "12345678901234567.25",
+])
+def test_a_decimal_that_cannot_be_sent_as_plain_digits_is_refused(value):
+    item = _definition().entity_set(ITEM)
+    with pytest.raises(ODataError) as refused:
+        V4Dialect().encode_body(item, {"Amount": value})
+    assert refused.value.code == "invalid_argument"
+    assert "pass it as text" in refused.value.hint and "not rounded" in refused.value.hint
+    release = _definition().operation("Release")
+    with pytest.raises(ODataError) as refused:
+        V4Dialect().call_request(V4_PATH, release, None, {"ReleaseCode": "1", "Quantity": value})
+    assert refused.value.code == "invalid_argument" and "pass it as text" in refused.value.hint
+
+
+def test_a_lone_value_is_a_scalar_only_when_the_context_names_a_primitive_type():
+    parse = V4Dialect().parse_call
+    for context in ("$metadata#Edm.Int32", "https://s4.internal:44300/x/$metadata#Edm.String",
+                    "../$metadata#Edm.Boolean"):
+        assert parse({"@odata.context": context, "value": 3}, "X") == ("value", 3)
+    for payload in (
+        {"value": 3},                                               # says nothing about itself
+        {"@odata.context": "c", "value": 3},
+        {"@odata.context": "$metadata#SRV.Address", "value": "x"},  # a complex type
+        {"@odata.context": f"$metadata#{ITEM}", "value": "x"},
+        {"@odata.context": "$metadata#SRV.Edm.String", "value": "x"},
+        {"@odata.context": "Edm.String", "value": "x"},
+        {"@odata.context": 5, "value": "x"},
+    ):
+        assert parse(payload, "X") == ("other", None), payload
+    # No value and a list are what they are, whatever the context.
+    assert parse({"value": None}, "X") == ("none", None)
+    assert parse({"value": [1]}, "X") == ("collection", [1])
+
+
+async def test_a_scalar_without_a_primitive_context_is_withheld(alice):
+    w = World(READ_ONLY)
+    for answer in ({"value": SECRET_USER}, {"@odata.context": "$metadata#SRV.Address",
+                                            "value": SECRET_USER}):
+        w.sap.answer = answer
+        out = await w.call("CountOpen", params={"Plant": "1000"})
+        assert out == WITHHELD, answer
+    w.sap.answer = {"@odata.context": "$metadata#Edm.String", "value": "released"}
+    out = await w.call("CountOpen", params={"Plant": "1000"})
+    assert (out["returned"], out["result"]) == ("value", "released")
+
+
+ODD = "a,b)=(c'd"
+
+
+async def test_separators_inside_a_text_stay_inside_its_literal(alice):
+    from urllib.parse import unquote
+
+    w = World(READ_ONLY)
+    w.sap.answer = {"@odata.context": "$metadata#Edm.Int32", "value": 1}
+    assert (await w.call("CountOpen", params={"Plant": ODD, "Limit": 5}))["ok"] is True
+    call = w.sap.calls[-1]
+    assert call.url.path == f"{V4_PATH}/CountOpen(Plant='a,b)=(c''d',Limit=5)"
+    key = {**KEY, "PurchaseRequisition": ODD}
+    assert (await w.call("ItemStatus", key=key, params={"AsOf": "2026-10-05"}))["ok"] is True
+    bound = w.sap.calls[-1]
+    assert bound.url.path == (
+        f"{V4_PATH}/{ITEM}(PurchaseRequisition='a,b)=(c''d',PurchaseRequisitionItem='00010')"
+        "/SRV.ItemStatus(AsOf=2026-10-05)"
+    )
+    assert (await w.run(operation="get", key=key)).get("item")
+    for request, extra in ((call, 1), (bound, 2), (w.sap.requests[-1], 1)):
+        # One percent-decode of what went over the wire adds no segment.
+        raw = request.url.raw_path.decode("ascii").split("?")[0]
+        assert unquote(raw).count("/") == V4_PATH.count("/") + extra == raw.count("/")
+    assert call.url.query == b"" and bound.url.query == b""
+
+
+async def test_parameters_too_long_for_one_path_segment_are_refused_with_a_hint(alice):
+    w = World(READ_ONLY)
+    w.sap.answer = {"@odata.context": "$metadata#Edm.Int32", "value": 1}
+    assert (await w.call("Wide", params={f"P{i}": "x" * 150 for i in range(6)}))["ok"] is True
+    out = await w.call("Wide", params={f"P{i}": "x" * 255 for i in range(6)})
+    assert code(out) == "invalid_argument"
+    assert "too long" in out["error"]["message"] and "shorter" in out["error"]["hint"]
+    assert len(w.sap.calls) == 1
+
+
+async def test_an_applied_update_is_never_an_error_because_its_answer_reads_badly(
+    alice, monkeypatch
+):
+    w = World()
+    w.sap.answer = entity(etag=NEW_ETAG)
+    real, calls = V4Dialect.parse_entity, []
+
+    def flaky(self, payload):
+        calls.append(1)
+        if len(calls) > 1:  # the confirmation read it; the second look fails
+            raise ODataError("sap_error", "the OData service answered in an unexpected shape")
+        return real(self, payload)
+
+    monkeypatch.setattr(V4Dialect, "parse_entity", flaky)
+    out = await w.run(**UPDATE)
+    assert out == {"ok": True, "status": 200}
+    (row,) = await all_rows()
+    assert (row.outcome, row.phase, row.http_status) == ("ok", "write", 200)
