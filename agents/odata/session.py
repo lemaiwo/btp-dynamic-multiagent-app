@@ -11,18 +11,28 @@ path attaches the cookies to each request as an explicit ``Cookie`` header.
 What keeps two users apart:
 
 * The key is minted by :meth:`CsrfSessionStore.key` from the request context
-  (``agents.auth.current_jwt`` / ``current_principal``), the same way
-  ``DestinationAuth._user`` finds the user. It is never taken from an
-  argument a model could set.
-* A user's key part is prefixed (``user:`` or, when no principal could be
-  derived, ``token:`` plus a digest of the JWT), so no principal can ever
-  spell the technical entry's marker and two users without a principal do
-  not meet in one slot.
-* :meth:`CsrfSessionStore.get` serves a user's entry only while that same
-  user is bound. A key that was carried into another request is refused
+  (``agents.auth.current_jwt`` / ``current_principal``). It is never taken
+  from an argument a model could set.
+* The key follows the credential that is *sent*, not only the name that is
+  bound. SAP issues a session to whoever the forwarded JWT belongs to, and
+  the bound principal can name somebody else: a job run started with "Run
+  now" keeps the trigger's JWT while ``agents.auth.run_as`` rebinds the
+  principal to the agent's run-as user. So a user's key part is
+  ``user:<principal>:<sha256 of the JWT>`` (``token:<sha256 of the JWT>``
+  when no principal is bound): an entry is served only to a request that
+  carries the same token under the same principal, for at most the TTL. A
+  refreshed or different JWT is a new entry and one more token fetch; the
+  old entry ages out.
+* The prefixes mean no principal can spell the technical entry's marker or
+  another kind of key, whatever characters it contains (the digest is always
+  the last 64 hex characters).
+* :meth:`CsrfSessionStore.get` and :meth:`CsrfSessionStore.update` act on a
+  user's entry only while that same principal and token are bound. A key
+  that was carried into another request is refused
   (:class:`SessionIdentityError`), not served.
 * A caller gets a private copy; nothing it does to the copy reaches the
-  next caller.
+  next caller. A cookie SAP rotates goes back through ``update``.
+* The store validates no token: it reads what the JWT middleware bound.
 
 A user-context service without a signed-in user is refused with
 ``DestinationUserRequired`` -- there is no fall-back to the technical entry.
@@ -35,7 +45,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import hmac
 import logging
 import re
 import time
@@ -43,6 +52,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from http.cookiejar import CookieJar, CookiePolicy
 from typing import Any
 
@@ -135,17 +145,42 @@ def cookies_from_response(response: httpx.Response) -> dict[str, str]:
     """Name and value of every cookie a response sets; attributes are dropped.
 
     Read from the ``Set-Cookie`` headers, not from a jar: the client's jar
-    stores nothing. A cookie with an empty value (a deletion) or with a
-    name or value that could not be sent back safely is left out.
+    stores nothing. Left out: a deletion (an empty value, ``Max-Age`` of
+    zero or less, or an ``Expires`` in the past) and a cookie whose name or
+    value could not be sent back safely.
     """
     cookies: dict[str, str] = {}
     for header in response.headers.get_list("set-cookie"):
-        pair = header.split(";", 1)[0]
+        pair, _, attributes = header.partition(";")
         name, separator, value = pair.partition("=")
         name, value = name.strip(), value.strip()
-        if separator and _cookie_ok(name, value):
+        if separator and _cookie_ok(name, value) and not _is_deletion(attributes):
             cookies[name] = value
     return cookies
+
+
+def _is_deletion(attributes: str) -> bool:
+    """Whether the attributes of a ``Set-Cookie`` say "forget this cookie".
+
+    ``Max-Age`` decides when it is there (RFC 6265, 5.3); else ``Expires``.
+    An attribute that cannot be read decides nothing: the cookie is kept, and
+    a wrong one costs a 403 and a refetch.
+    """
+    max_age: int | None = None
+    expires: float | None = None
+    for attribute in attributes.split(";"):
+        name, _, value = attribute.partition("=")
+        name, value = name.strip().lower(), value.strip()
+        try:
+            if name == "max-age":
+                max_age = int(value)
+            elif name == "expires":
+                expires = parsedate_to_datetime(value).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            continue
+    if max_age is not None:
+        return max_age <= 0
+    return expires is not None and expires <= time.time()
 
 
 class _RejectAll(CookiePolicy):
@@ -226,18 +261,25 @@ class CsrfSessionStore:
     # -- identity -----------------------------------------------------------
     @staticmethod
     def _user_part(destination: str) -> str:
-        """The key part of the signed-in user, from the request context."""
-        from agents.auth import current_jwt, current_principal, principal_from_token
+        """The key part of the signed-in user, from the request context.
+
+        The JWT digest is always part of it, because the JWT is what the
+        destination turns into the SAP user; the principal alone can be a
+        run-as name bound over somebody else's token. Nothing is validated
+        here (``principal_from_token`` may fetch a JWK set, blocking): the
+        middleware bound the principal already, and without one the digest
+        alone tells users apart.
+        """
+        from agents.auth import current_jwt, current_principal
 
         token = current_jwt.get()
         if not token:
             raise DestinationUserRequired(BUILTIN_ODATA_URL, destination)
-        principal = current_principal.get() or principal_from_token(token)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        principal = current_principal.get()
         if principal:
-            return _USER_PREFIX + principal
-        # Same idea as ConnectivityTokens.user_key: without a principal the
-        # token itself tells users apart, as a digest.
-        return _TOKEN_PREFIX + hashlib.sha256(token.encode("utf-8")).hexdigest()
+            return f"{_USER_PREFIX}{principal}:{digest}"
+        return _TOKEN_PREFIX + digest
 
     def key(self, destination: str, user_context: bool) -> SessionKey:
         """``(destination, user)`` for the current request.
@@ -266,8 +308,7 @@ class CsrfSessionStore:
         destination, owner = key
         if owner == TECHNICAL:
             return
-        current = self._user_part(destination)
-        if not hmac.compare_digest(current.encode("utf-8"), owner.encode("utf-8")):
+        if self._user_part(destination) != owner:
             raise SessionIdentityError(destination)
 
     # -- entries ------------------------------------------------------------
@@ -339,14 +380,47 @@ class CsrfSessionStore:
             )
             return self._copy(kept)
 
-    def drop(self, key: SessionKey) -> None:
-        """Forget the session of ``key`` (SAP answered 403); nobody else's."""
-        if self._entries.pop(key, None) is not None:
-            logger.debug(
-                "OData CSRF session dropped for destination %s (%s)",
-                key[0],
-                "technical" if key[1] == TECHNICAL else "user",
-            )
+    def drop(self, key: SessionKey, stale: CsrfSession | None = None) -> None:
+        """Forget the session of ``key`` (SAP answered 403); nobody else's.
+
+        With ``stale`` -- the copy the refused request was sent with -- the
+        entry goes only while it still holds that token. Overlapping calls
+        of one user that were all refused with the same old session then
+        cost one refetch, not one each: the first drops, the others find a
+        newer entry and leave it. A fetch in flight is not affected either
+        way; what it returns is newer than anything a drop can mean.
+        """
+        hit = self._entries.get(key)
+        if hit is None:
+            return
+        if stale is not None and hit.token != stale.token:
+            return
+        del self._entries[key]
+        logger.debug(
+            "OData CSRF session dropped for destination %s (%s)",
+            key[0],
+            "technical" if key[1] == TECHNICAL else "user",
+        )
+
+    def update(self, key: SessionKey, seen: CsrfSession, cookies: dict[str, str]) -> bool:
+        """Replace the cookies of ``key``'s session; ``True`` when it was done.
+
+        For a cookie SAP rotates on an answer. ``seen`` is the copy the
+        request was sent with: the swap happens only while the store still
+        holds that token, so a slow answer never overwrites a session that
+        was fetched since. ``cookies`` is the complete new set (typically
+        ``{**seen.cookies, **cookies_from_response(response)}``); pairs that
+        could not be sent back safely are left out. The lifetime is not
+        extended. Same caller rule as :meth:`get`.
+        """
+        self._check_caller(key)
+        hit = self._live(key)
+        if hit is None or not isinstance(seen, CsrfSession) or hit.token != seen.token:
+            return False
+        hit.cookies = {
+            name: value for name, value in dict(cookies).items() if _cookie_ok(name, value)
+        }
+        return True
 
 
 __all__ = [

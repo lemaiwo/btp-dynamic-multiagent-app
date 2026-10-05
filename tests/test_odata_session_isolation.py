@@ -14,6 +14,8 @@ No network, no database.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import logging
 import os
 import sys
@@ -67,7 +69,11 @@ class Sap:
     cookie belongs to somebody else.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, parallel_sessions: bool = False) -> None:
+        # parallel_sessions: an earlier session of a caller stays valid next to
+        # a newer one (real SAP allows several); off, only the latest counts.
+        self.parallel_sessions = parallel_sessions
+        self.history: dict[str, set[tuple[str, str]]] = {}
         self.issued: dict[str, tuple[str, str]] = {}   # caller -> (token, cookie value)
         self.fetches: dict[str, int] = {}
         self.writes: list[tuple[str, str, str]] = []   # (caller, token, cookie header)
@@ -87,6 +93,7 @@ class Sap:
             self.fetches[caller] = self.fetches.get(caller, 0) + 1
             token, cookie = f"T-{caller}-{n}", f"S-{caller}-{n}"
             self.issued[caller] = (token, cookie)
+            self.history.setdefault(caller, set()).add((token, cookie))
             return httpx.Response(
                 200,
                 headers=[
@@ -102,6 +109,11 @@ class Sap:
         self.writes.append((caller, token, cookie))
         expected = self.issued.get(caller)
         if expected and token == expected[0] and f"{COOKIE_NAME}={expected[1]}" in cookie:
+            return httpx.Response(201, json={"d": {}})
+        if self.parallel_sessions and any(
+            token == t and f"{COOKIE_NAME}={c};" in f"{cookie};"
+            for t, c in self.history.get(caller, ())
+        ):
             return httpx.Response(201, json={"d": {}})
         if any(
             other != caller and (token == t or c in cookie)
@@ -600,3 +612,339 @@ async def test_no_token_or_cookie_value_in_repr_logs_or_errors(caplog):
     # still usable
     assert held.token == secret_token and held.cookies[COOKIE_NAME] == secret_cookie
     assert "CsrfSession" in repr(held) and "CsrfSessionStore" in repr(store)
+
+
+# -- fix round 1: the key follows the credential that is sent ----------------
+
+def jwt_digest(jwt: str) -> str:
+    return hashlib.sha256(jwt.encode("utf-8")).hexdigest()
+
+
+async def test_the_key_is_the_principal_and_a_digest_of_the_bound_token():
+    store = CsrfSessionStore()
+    with as_user(ALICE, jwt="token-a"):
+        assert store.key(USER_DEST, True) == (USER_DEST, f"user:{ALICE}:{jwt_digest('token-a')}")
+    with as_user(None, jwt="token-a"):
+        assert store.key(USER_DEST, True) == (USER_DEST, f"token:{jwt_digest('token-a')}")
+    # a refreshed token of the same user is a new entry
+    with as_user(ALICE, jwt="token-a2"):
+        assert store.key(USER_DEST, True) == (USER_DEST, f"user:{ALICE}:{jwt_digest('token-a2')}")
+
+
+async def test_a_run_as_principal_with_the_triggers_token_never_meets_either_user():
+    """A "Run now" job keeps the trigger's JWT while ``run_as`` rebinds the
+    principal. SAP then issues the session of the JWT's owner; it must not be
+    filed where the run-as user -- or anybody but that exact pair -- finds it."""
+    sap, store = Sap(), CsrfSessionStore()
+    async with client(sap) as http:
+        # admin alice triggers; the run is bound to bob, the token stays alice's
+        with as_user(BOB, jwt=f"jwt-of-{ALICE}"):
+            run_key = store.key(USER_DEST, True)
+            run_session = await store.get(run_key, fetcher(http, ALICE))   # SAP sees alice
+        assert run_session.token == f"T-{ALICE}-1"
+
+        # bob's own request: his token, his principal
+        with as_user(BOB):
+            bob_key = store.key(USER_DEST, True)
+            assert bob_key != run_key
+            bob = await store.get(bob_key, fetcher(http, BOB))
+            with pytest.raises(SessionIdentityError):
+                await store.get(run_key, fetcher(http, BOB))
+        assert bob.token == f"T-{BOB}-1"
+        assert bob.cookies[COOKIE_NAME] == f"S-{BOB}-1"
+
+        # alice's own request: same token as the run, but another principal
+        with as_user(ALICE):
+            alice_key = store.key(USER_DEST, True)
+            assert alice_key not in (run_key, bob_key)
+            alice = await store.get(alice_key, fetcher(http, ALICE))
+            with pytest.raises(SessionIdentityError):
+                await store.get(run_key, fetcher(http, ALICE))
+        assert alice.token == f"T-{ALICE}-2"       # fetched anew, not the run's entry
+
+        # the same pair again is served the run's entry
+        with as_user(BOB, jwt=f"jwt-of-{ALICE}"):
+            assert store.key(USER_DEST, True) == run_key
+            assert (await store.get(run_key, fetcher(http, ALICE))).token == run_session.token
+    assert sap.fetches == {ALICE: 2, BOB: 1}
+    assert len(store) == 3
+
+
+async def test_a_refreshed_token_is_not_served_the_old_tokens_entry():
+    store = CsrfSessionStore()
+    n = 0
+
+    async def fetch() -> CsrfSession:
+        nonlocal n
+        n += 1
+        return CsrfSession.fresh(f"T-{n}", {})
+
+    with as_user(ALICE, jwt="first"):
+        old_key = store.key(USER_DEST, True)
+        assert (await store.get(old_key, fetch)).token == "T-1"
+    with as_user(ALICE, jwt="second"):
+        assert (await store.get(store.key(USER_DEST, True), fetch)).token == "T-2"
+        with pytest.raises(SessionIdentityError):
+            await store.get(old_key, fetch)
+
+
+async def test_no_token_validation_happens_in_the_store(monkeypatch):
+    """Keys come from what the middleware already bound; nothing here validates
+    a JWT (a blocking JWKS fetch on the event loop) to find a principal."""
+    def boom(*a: object, **k: object) -> None:
+        raise AssertionError("the store must not validate tokens")
+
+    monkeypatch.setattr(auth, "principal_from_token", boom)
+    monkeypatch.setattr(auth, "get_validator", boom)
+    store = CsrfSessionStore()
+
+    async def fetch() -> CsrfSession:
+        return CsrfSession.fresh("T", {})
+
+    with as_user(None, jwt="some-token"):
+        key = store.key(USER_DEST, True)
+        await store.get(key, fetch)
+    with as_user(ALICE):
+        await store.get(store.key(USER_DEST, True), fetch)
+
+
+@pytest.mark.parametrize(
+    "principal",
+    [TECHNICAL, "token:" + "a" * 64, "user:" + ALICE, f"{ALICE}:" + "b" * 64, "token:"],
+)
+async def test_odd_principals_never_reach_another_entry(principal):
+    store = CsrfSessionStore()
+
+    def fetch_of(token: str):
+        async def fetch() -> CsrfSession:
+            return CsrfSession.fresh(token, {})
+        return fetch
+
+    jwt = "x"
+    technical = store.key(USER_DEST, False)
+    await store.get(technical, fetch_of("tech"))
+    with as_user(None, jwt=jwt):
+        anonymous = store.key(USER_DEST, True)
+        await store.get(anonymous, fetch_of("anon"))
+    with as_user(ALICE, jwt=jwt):
+        alice = store.key(USER_DEST, True)
+        await store.get(alice, fetch_of("alice"))
+    with as_user(principal, jwt=jwt):
+        odd = store.key(USER_DEST, True)
+        assert odd not in (technical, anonymous, alice)
+        assert (await store.get(odd, fetch_of("odd"))).token == "odd"
+        for foreign in (anonymous, alice):
+            with pytest.raises(SessionIdentityError):
+                await store.get(foreign, fetch_of("never"))
+    assert len(store) == 4
+
+
+# -- fix round 1: concurrency ------------------------------------------------
+
+async def test_a_slow_fetch_of_one_user_does_not_block_another():
+    store = CsrfSessionStore()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def slow() -> CsrfSession:
+        started.set()
+        await release.wait()
+        return CsrfSession.fresh("T-alice", {})
+
+    async def quick() -> CsrfSession:
+        return CsrfSession.fresh("T-bob", {})
+
+    async def alice_run() -> CsrfSession:
+        with as_user(ALICE):
+            return await store.get(store.key(USER_DEST, True), slow)
+
+    task = asyncio.create_task(alice_run())
+    await started.wait()
+    with as_user(BOB):
+        bob = await asyncio.wait_for(store.get(store.key(USER_DEST, True), quick), 1)
+    technical = await asyncio.wait_for(store.get(store.key(USER_DEST, False), quick), 1)
+    assert bob.token == technical.token == "T-bob"
+    assert not task.done()
+    release.set()
+    assert (await task).token == "T-alice"
+
+
+async def test_drop_while_a_fetch_is_in_flight_keeps_the_fresh_session():
+    """The drop meant the old session; the one being fetched is newer."""
+    store = CsrfSessionStore()
+    started, release = asyncio.Event(), asyncio.Event()
+    fetches = 0
+
+    async def slow() -> CsrfSession:
+        nonlocal fetches
+        fetches += 1
+        started.set()
+        await release.wait()
+        return CsrfSession.fresh(f"T-{fetches}", {})
+
+    with as_user(ALICE):
+        key = store.key(USER_DEST, True)
+        task = asyncio.create_task(store.get(key, slow))
+        await started.wait()
+        store.drop(key)
+        release.set()
+        assert (await task).token == "T-1"
+        assert (await store.get(key, slow)).token == "T-1"
+    assert fetches == 1
+
+
+async def test_a_cancelled_fetch_releases_the_key_and_stores_nothing():
+    store = CsrfSessionStore()
+    started = asyncio.Event()
+
+    async def hangs() -> CsrfSession:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def works() -> CsrfSession:
+        return CsrfSession.fresh("T-ok", {})
+
+    with as_user(ALICE):
+        key = store.key(USER_DEST, True)
+        first = asyncio.create_task(store.get(key, hangs))
+        await started.wait()
+        waiter = asyncio.create_task(store.get(key, works))   # queued behind the fetch
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert (await asyncio.wait_for(waiter, 1)).token == "T-ok"
+        assert len(store) == 1
+
+
+async def test_eviction_during_overlapping_runs_never_crosses(monkeypatch):
+    """A cache too small for the users in flight costs fetches, never a crossing."""
+    monkeypatch.setattr(session_mod, "SESSION_CACHE_MAX", 1)
+    sap, store = Sap(parallel_sessions=True), CsrfSessionStore()
+    carol = "carol@example.com"
+
+    async with client(sap) as http:
+        rounds = [
+            write_as(store, http, user, pause=1 + (i + j) % 3)
+            for i in range(10)
+            for j, user in enumerate((ALICE, BOB, carol))
+        ]
+        statuses = await asyncio.gather(*rounds)
+
+    assert statuses == [201] * 30
+    assert sap.crossed == []
+    for caller, token, cookie in sap.writes:
+        assert token.startswith(f"T-{caller}-")
+        assert cookie.startswith(f"{COOKIE_NAME}=S-{caller}-")
+    assert len(store) <= 1
+    assert sum(sap.fetches.values()) > 3      # eviction did happen
+
+
+async def test_a_key_is_served_in_a_child_task_and_refused_without_a_token():
+    store = CsrfSessionStore()
+
+    async def fetch() -> CsrfSession:
+        return CsrfSession.fresh("T-alice", {})
+
+    with as_user(ALICE):
+        key = store.key(USER_DEST, True)
+        child = asyncio.create_task(store.get(key, fetch))            # copies the context
+        bare = asyncio.create_task(store.get(key, fetch), context=contextvars.Context())
+        assert (await child).token == "T-alice"
+        with pytest.raises(DestinationUserRequired):
+            await bare
+    assert len(store) == 1
+
+
+# -- fix round 1: drop(stale) and update --------------------------------------
+
+async def test_drop_with_a_stale_copy_spares_a_newer_session():
+    store = CsrfSessionStore()
+    n = 0
+
+    async def fetch() -> CsrfSession:
+        nonlocal n
+        n += 1
+        return CsrfSession.fresh(f"T-{n}", {})
+
+    with as_user(ALICE):
+        key = store.key(USER_DEST, True)
+        stale = await store.get(key, fetch)
+        # five overlapping calls saw the same stale copy and were all refused by SAP
+        store.drop(key, stale)
+        fresh = await store.get(key, fetch)
+        for _ in range(4):
+            store.drop(key, stale)                     # the fresh entry stays
+        assert (await store.get(key, fetch)).token == fresh.token == "T-2"
+        assert n == 2
+        store.drop(key, fresh)
+        assert len(store) == 0
+        store.drop(key, fresh)                         # nothing there: harmless
+        await store.get(key, fetch)
+        store.drop(key)                                # the plain form still drops
+        assert len(store) == 0
+
+
+async def test_update_swaps_cookies_of_the_session_the_caller_saw(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(session_mod, "_now", lambda: now[0])
+    store = CsrfSessionStore()
+    n = 0
+
+    async def fetch() -> CsrfSession:
+        nonlocal n
+        n += 1
+        return CsrfSession.fresh(f"T-{n}", {COOKIE_NAME: f"S-{n}"})
+
+    with as_user(ALICE):
+        key = store.key(USER_DEST, True)
+        seen = await store.get(key, fetch)
+        now[0] += 100
+        rotated = {COOKIE_NAME: "S-rotated", "bad name": "x", "nl": "a\r\nb"}
+        assert store.update(key, seen, rotated) is True
+        rotated[COOKIE_NAME] = "changed-after-the-call"
+        after = await store.get(key, fetch)
+        assert after.token == "T-1"
+        assert after.cookies == {COOKIE_NAME: "S-rotated"}       # unsafe pairs are not kept
+        assert after.expires_at == seen.expires_at               # no new lifetime
+
+        # a copy of an older session changes nothing
+        store.drop(key)
+        newer = await store.get(key, fetch)
+        assert store.update(key, seen, {COOKIE_NAME: "S-old-writer"}) is False
+        assert (await store.get(key, fetch)).cookies == newer.cookies
+        # nothing stored, or expired: nothing to update
+        store.drop(key)
+        assert store.update(key, newer, {COOKIE_NAME: "x"}) is False
+        assert len(store) == 0
+        current = await store.get(key, fetch)
+        now[0] += SESSION_TTL_SECONDS
+        assert store.update(key, current, {COOKIE_NAME: "x"}) is False
+
+    # only the owner may update
+    with as_user(ALICE):
+        mine = await store.get(key, fetch)
+    with as_user(BOB):
+        with pytest.raises(SessionIdentityError):
+            store.update(key, mine, {COOKIE_NAME: "S-bob"})
+    with pytest.raises(DestinationUserRequired):
+        store.update(key, mine, {COOKIE_NAME: "S-nobody"})
+    with as_user(ALICE):
+        assert (await store.get(key, fetch)).cookies == mine.cookies
+
+
+def test_a_deletion_cookie_with_a_value_is_not_stored():
+    response = httpx.Response(
+        200,
+        headers=[
+            ("Set-Cookie", "keep=1; Max-Age=3600; Path=/"),
+            ("Set-Cookie", "later=1; Expires=Fri, 01 Jan 2100 00:00:00 GMT"),
+            ("Set-Cookie", "odd=1; Expires=not-a-date; Max-Age=soon"),
+            ("Set-Cookie", "zero=deleted; Max-Age=0"),
+            ("Set-Cookie", "negative=deleted; max-age=-1; Path=/"),
+            ("Set-Cookie", "past=deleted; expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/"),
+            # Max-Age wins over Expires (RFC 6265)
+            ("Set-Cookie", "both=deleted; Expires=Fri, 01 Jan 2100 00:00:00 GMT; Max-Age=0"),
+        ],
+    )
+    assert cookies_from_response(response) == {"keep": "1", "later": "1", "odd": "1"}
