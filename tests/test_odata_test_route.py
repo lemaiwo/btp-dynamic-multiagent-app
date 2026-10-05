@@ -91,6 +91,7 @@ ROW = {
 V2_ROWS = {"d": {"results": [ROW]}}
 V4_ROWS = {
     "@odata.context": "$metadata#X",
+    "@odata.count": 4711,
     "value": [{k: v for k, v in ROW.items() if k[0] != "_"}],
 }
 ANSWER_KEYS = {
@@ -252,10 +253,13 @@ async def test_v2_one_list_read_of_one_row_and_nothing_of_it_in_answer_or_log(
     (sent,) = remote.requests
     assert sent.method == "GET"
     assert sent.url.host == SAP_HOST and sent.url.path == f"{SERVICE_PATH}/{HEADER}"
+    # `$inlinecount` too: the tools always ask for the count, and a service
+    # that refuses the option must not test green.
     assert dict(sent.url.params) == {
         "$format": "json",
         "$select": "PurchaseRequisition,PurReqnDescription",
         "$top": "1",
+        "$inlinecount": "allpages",
     }
     assert sent.headers["accept"] == "application/json"
     assert sent.headers["authorization"] == "Bearer dest-token"
@@ -294,7 +298,9 @@ async def test_v4_one_list_read(client, remote, caplog):
     assert dict(sent.url.params) == {
         "$select": "PurchaseRequisition,PurReqnDescription",
         "$top": "1",
+        "$count": "true",
     }
+    assert "4711" not in r.text  # the count is dropped with the rows
     no_data(r.text, caplog.text)
 
 
@@ -421,6 +427,10 @@ async def test_a_user_context_service_is_read_as_the_admin_who_calls(client, rem
     assert sent_token == token and principal
     (sent,) = remote.requests
     assert sent.headers["authorization"] == f"Bearer user-token-of-{principal}"
+    # The admin's own JWT goes to the destination service only: no header of
+    # the request to the target carries it, nor its URL.
+    assert all(token not in value for value in sent.headers.values())
+    assert token not in str(sent.url)
     (line,) = lines(caplog)
     assert f"by={principal}" in line and "user_context=True" in line and "per_user=True" in line
     assert token not in caplog.text and token not in r.text
@@ -469,7 +479,25 @@ async def test_user_context_on_a_technical_destination_is_said(client, remote, c
     assert body["auth_type"] == "BasicAuthentication" and body["proxy_type"] == "Internet"
     codes = [w["code"] for w in body["warnings"]]
     assert codes == ["technical_credential", "destination_queries_not_applied"]
+    assert body["warnings"][0]["message"] == testcall._WARNINGS["technical_credential"]
+    assert "the test ran" in body["warnings"][0]["message"]
+    assert "the test ran" in body["warnings"][1]["message"]
     assert "dGVjaDp4" not in caplog.text
+
+
+async def test_warnings_do_not_claim_a_run_when_nothing_was_sent(client, remote):
+    await seed(client, user_context=True)
+    # An http:// destination is refused after it was resolved, before sending.
+    remote.resolver = Technical(url="http://s4.internal:8000", name="S4_ODATA_TECH")
+    body = (await client.post(URL, json={}, headers=bearer("alice"))).json()
+    assert body["code"] == "destination_error" and remote.requests == []
+    assert body["identity"] == "technical" and body["auth_type"] == "BasicAuthentication"
+    codes = [w["code"] for w in body["warnings"]]
+    assert codes == ["technical_credential", "destination_queries_not_applied"]
+    for warning in body["warnings"]:
+        assert "ran" not in warning["message"], warning
+        assert "requests through this destination" in warning["message"]
+    assert "sap-client" in body["warnings"][1]["message"]
 
 
 async def test_destination_query_properties_are_not_applied_and_said(client, remote):
@@ -505,7 +533,7 @@ async def test_an_on_premise_destination_sends_nothing(client, remote, url, oper
     body = r.json()
     assert r.status_code == 200, r.text
     assert body["ok"] is False and body["code"] == "on_premise_unavailable"
-    assert body["message"] == preview._ON_PREMISE_TEXT
+    assert body["message"] == preview.ON_PREMISE_TEXT
     assert body["status"] is None and body["rows"] == 0
     assert body["proxy_type"] == "OnPremise"
     assert remote.requests == []
@@ -626,6 +654,61 @@ async def test_the_test_has_a_total_timeout(client, remote, monkeypatch):
     assert body["ok"] is False and body["code"] == "timeout" and body["status"] is None
 
 
+class Stalls(httpx.AsyncByteStream):
+    """A body that begins and then never goes on."""
+
+    async def __aiter__(self):
+        yield b'{"d": {"results": ['
+        await asyncio.sleep(5)
+
+
+class Breaks(httpx.AsyncByteStream):
+    """A body whose connection is lost after its beginning."""
+
+    async def __aiter__(self):
+        yield b'{"d": {"results": ['
+        raise httpx.ReadError(f"connection to {SAP_HOST} lost")
+
+
+LIST_AND_GET = {HEADER: ["list", "get"], ITEM: ["list", "get"]}
+GET_ONLY = {HEADER: ["get"], ITEM: ["get"]}
+
+
+@pytest.mark.parametrize("operations", [LIST_AND_GET, GET_ONLY])
+async def test_a_timeout_after_the_headers_arrived_keeps_the_status(
+    client, remote, monkeypatch, operations
+):
+    monkeypatch.setattr(preview, "PREVIEW_BUDGET_SECONDS", 0.05)
+    await seed(client, definition=definition(**operations))
+
+    async def stalls(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/xml"}, stream=Stalls())
+
+    monkeypatch.setattr(testcall, "_transport", lambda: httpx.MockTransport(stalls))
+    started = time.monotonic()
+    body = (await client.post(URL, json={})).json()
+    assert time.monotonic() - started < 3
+    assert body["ok"] is False and body["code"] == "timeout" and body["status"] == 200
+
+
+@pytest.mark.parametrize("operations", [LIST_AND_GET, GET_ONLY])
+async def test_a_connection_lost_mid_body_is_unreachable_with_the_status(
+    client, remote, monkeypatch, caplog, operations
+):
+    caplog.set_level(logging.DEBUG)
+    await seed(client, definition=definition(**operations))
+
+    async def breaks(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/xml"}, stream=Breaks())
+
+    monkeypatch.setattr(testcall, "_transport", lambda: httpx.MockTransport(breaks))
+    r = await client.post(URL, json={})
+    body = r.json()
+    assert body["ok"] is False and body["code"] == "unreachable" and body["status"] == 200
+    assert body["message"] == preview.UNREACHABLE_TEXT
+    assert SAP_HOST not in r.text and SAP_HOST not in caplog.text
+
+
 async def test_an_unreachable_service_names_no_host(client, remote, monkeypatch, caplog):
     caplog.set_level(logging.DEBUG)
     await seed(client)
@@ -656,10 +739,27 @@ async def test_a_destination_that_cannot_be_resolved(client, remote, caplog):
     body = r.json()
     assert r.status_code == 200
     assert body["ok"] is False and body["code"] == "destination_error"
-    assert body["message"] == preview._DESTINATION_TEXT
+    assert body["message"] == preview.DESTINATION_TEXT
     assert body["auth_type"] == "" and body["per_user"] is False
+    # Nothing was resolved: as whom it would have run is not known.
+    assert body["identity"] == "unknown" and body["warnings"] == []
     assert SECRET not in r.text and SECRET not in caplog.text
     assert remote.requests == []
+
+
+async def test_identity_is_unknown_when_a_user_context_destination_was_not_resolved(
+    client, remote
+):
+    await seed(client, user_context=True)
+
+    class Broken(FakeResolver):
+        async def resolve(self, **_kwargs: Any) -> Destination:
+            raise DestinationError("no such destination")
+
+    remote.resolver = Broken()
+    body = (await client.post(URL, json={}, headers=bearer("alice"))).json()
+    assert body["code"] == "destination_error"
+    assert body["identity"] == "unknown" and body["per_user"] is False
 
 
 async def test_no_destination_binding_is_a_destination_error(client):
@@ -700,6 +800,7 @@ async def test_a_stored_definition_that_is_not_valid_sends_nothing(client, remot
         await s.commit()
     body = (await client.post(URL, json={})).json()
     assert body["ok"] is False and body["code"] == "invalid_definition"
+    assert body["identity"] == "unknown"
     assert remote.requests == [] and remote.asked_for == []
 
 
@@ -740,15 +841,38 @@ async def test_test_calls_and_previews_share_the_two_slots(client, remote, monke
     assert arrived == 2 and preview._active == 2
     third = await client.post(URL, json={})
     assert third.status_code == 429 and third.headers["x-odata-error"] == "busy"
-    assert third.json() == {"detail": preview._BUSY_TEXT}
+    assert third.json() == {"detail": preview.BUSY_TEXT}
+    assert preview.BUSY_TEXT == "other previews or test calls are running; try again in a moment"
     fourth = await client.post("/admin/api/odata/metadata", json=metadata)
-    assert fourth.status_code == 429
+    assert fourth.status_code == 429 and fourth.json() == {"detail": preview.BUSY_TEXT}
     assert arrived == 2
     gate.set()
     assert (await first).json()["ok"] is True
     await second
     assert preview._active == 0
     assert (await client.post(URL, json={})).json()["ok"] is True
+
+
+@pytest.mark.parametrize("operations", [LIST_AND_GET, GET_ONLY])
+async def test_a_cancelled_request_gives_its_slot_back(remote, monkeypatch, operations):
+    """A client that disconnects cancels the handler while SAP is asked."""
+    gate = asyncio.Event()
+    arrived = asyncio.Event()
+
+    async def held(_request: httpx.Request) -> httpx.Response:
+        arrived.set()
+        await gate.wait()
+        return httpx.Response(200, json=V2_ROWS)
+
+    monkeypatch.setattr(testcall, "_transport", lambda: httpx.MockTransport(held))
+    service = service_payload(destination="S4_ODATA_TECH", definition=definition(**operations))
+    call = asyncio.ensure_future(testcall.run_test_call(service))
+    await asyncio.wait_for(arrived.wait(), 2)
+    assert preview._active == 1
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert preview._active == 0
 
 
 async def test_a_failed_or_refused_test_gives_its_slot_back(client, remote):

@@ -9,8 +9,10 @@ service may be tested.
 * **What is sent.** Everything comes from the stored service; the caller can
   at most name one of its entity sets. The read is the agent's own ``list``
   (``ODataClient.list``: the same gate ``check_read``, the same dialect, the
-  same headers) with ``top`` 1 and every selectable field in ``$select``, so
-  a green test means the request shape of the tools works. A service without
+  same headers) with ``top`` 1, every selectable field in ``$select`` and
+  the count option the tools always send (``$inlinecount`` / ``$count``), so
+  a green test means the request shape of the tools works; the count is
+  dropped with the rows. A service without
   an entity set that has ``list`` enabled cannot be read without a key: only
   the beginning of its ``$metadata`` is fetched, a reachability and sign-on
   check, and the answer says that no data was read.
@@ -58,7 +60,7 @@ from pydantic import ValidationError
 
 from agents.destination import USER_PROPAGATING_AUTH_TYPES, Destination, DestinationError
 from agents.destination_auth import PLACEHOLDER_BASE, DestinationUserRequired, resolver_for
-from agents.odata import common, preview
+from agents.odata import preview
 from agents.odata.client import ODataClient, ODataError, ReadQuery
 from agents.odata.models import EntitySetDef, ServiceDefinition
 from agents.odata.session import NoCookieJar
@@ -99,10 +101,6 @@ _REDIRECT_TEXT = (
     "followed; a redirect to a sign-in page usually means the destination's "
     "credential was not accepted"
 )
-_NOT_XML_TEXT = (
-    "the OData service did not answer its $metadata with an XML document; a "
-    "sign-in page instead usually means the destination's credential was not accepted"
-)
 _TIMEOUT_TEXT = "the test did not finish within {seconds:g} seconds"
 _FAILED_TEXT = "the test failed unexpectedly; the application log has the reason"
 _WARNINGS = {
@@ -113,6 +111,12 @@ _WARNINGS = {
         "the service is set to act as the signed-in user, but the destination's "
         "authentication type does not propagate a user: the test ran with the "
         "destination's own credential, and so will agents"
+    ),
+    # The same finding when the test sent nothing: no "the test ran".
+    "technical_credential/unsent": (
+        "the service is set to act as the signed-in user, but the destination's "
+        "authentication type does not propagate a user: requests through this "
+        "destination use the destination's own credential"
     ),
     "no_list_entity_set": (
         "no entity set has 'list' enabled, so no data read was possible (a 'get' "
@@ -126,6 +130,11 @@ _WARNINGS = {
 _QUERIES_WARNING = (
     "the destination has URL.queries properties ({names}) that are not applied "
     "to requests yet: the test ran without them, e.g. in the default SAP client"
+)
+_QUERIES_WARNING_UNSENT = (
+    "the destination has URL.queries properties ({names}) that are not applied "
+    "to requests yet: requests through this destination go without them, e.g. "
+    "to the default SAP client"
 )
 
 
@@ -153,7 +162,7 @@ class _Outcome:
 
 
 def _failed(code: str, message: str, status: int | None = None) -> _Outcome:
-    return _Outcome(False, code, preview._plain(message, MAX_MESSAGE_CHARS), status)
+    return _Outcome(False, code, preview.plain(message, MAX_MESSAGE_CHARS), status)
 
 
 # --------------------------------------------------------------------- seams
@@ -208,12 +217,13 @@ def _refused_read(exc: ODataError, wire: _Wire) -> _Outcome:
     if wire.blocked and status is not None and 200 <= status < 300:
         # The one answer was a proper, empty page; its paging link was not followed.
         return _Outcome(True, None, _NO_ROW_TEXT, status, 0, ["paging_not_followed"])
-    if not wire.sent:
-        # Refused by the catalogue gate (or the URL could not be built).
-        code = "unreachable" if exc.code == "destination_error" else exc.code
-        return _failed(code, exc.message)
-    if status is None:
-        return _failed("unreachable", preview._UNREACHABLE_TEXT)
+    if exc.code == "destination_error":
+        # The client's code for every transport failure: no connection, or
+        # one that broke while the body arrived (the status is then known).
+        return _failed("unreachable", preview.UNREACHABLE_TEXT, status)
+    if not wire.sent or status is None:
+        # Refused by the catalogue gate: nothing was sent.
+        return _failed(exc.code, exc.message)
     if 300 <= status < 400:
         return _failed("redirect", _REDIRECT_TEXT.format(status=status), status)
     if status >= 400:
@@ -239,46 +249,29 @@ async def _list(
         result = await client.list(
             entity_set,
             # An empty select is "all selectable fields"; they are always sent.
-            ReadQuery(select=[], filter=None, expand=[], orderby=[], top=1, skip=0, count=False),
+            # The count is asked for because the tools always ask for it: a
+            # service that refuses the option must fail here, not for an agent.
+            ReadQuery(select=[], filter=None, expand=[], orderby=[], top=1, skip=0, count=True),
         )
     except ODataError as exc:
         return _refused_read(exc, wire)
-    # Counted and dropped: no row leaves this function.
+    # Counted and dropped: no row and no count leaves this function.
     rows = 1 if result.get("items") else 0
     del result
     return _Outcome(True, None, _ROW_TEXT if rows else _NO_ROW_TEXT, wire.status, rows)
 
 
-async def _probe(http: httpx.AsyncClient, path: str) -> _Outcome:
-    """The beginning of the service's ``$metadata``: does it answer, as XML?"""
-    async with http.stream(
-        "GET",
-        path,
-        # Both are pinned again by `preview._MetadataAuth`.
-        headers={"Accept": "application/xml", "Accept-Encoding": "identity"},
-        follow_redirects=False,
-    ) as response:
-        status = response.status_code
-        content_type = response.headers.get("content-type", "")
-        if 300 <= status < 400:
-            return _failed("redirect", _REDIRECT_TEXT.format(status=status), status)
-        failed = not 200 <= status < 300
-        plain = preview._identity_encoded(response)
-        if not failed and (not plain or "html" in content_type.lower()):
-            return _failed("unexpected_answer", _NOT_XML_TEXT, status)
-        limit = common.MAX_ERROR_BODY if failed else PROBE_BYTES
-        head = bytearray()
-        if plain:
-            async for chunk in response.aiter_raw():
-                head += chunk
-                if len(head) >= limit:
-                    break  # the rest of the document is never read
-    if failed:
-        refusal = preview._sap_error(status, content_type, bytes(head[:limit]))
-        return _failed("sap_error", refusal.detail, status)
-    if not preview._looks_like_xml(bytes(head[:PROBE_BYTES])):
-        return _failed("unexpected_answer", _NOT_XML_TEXT, status)
-    return _Outcome(True, None, _METADATA_TEXT, status)
+async def _probe(http: httpx.AsyncClient, path: str, wire: _Wire) -> _Outcome:
+    """The beginning of the service's ``$metadata``: does it answer, as XML?
+    The preview's own fetch (``preview.read_document``), stopped after
+    ``PROBE_BYTES``; nothing is parsed."""
+    try:
+        await preview.read_document(http, path, head=PROBE_BYTES)
+    except preview.PreviewError as exc:
+        # The preview's fixed texts, or SAP's own short code and message.
+        code = "unexpected_answer" if exc.code == "not_xml" else exc.code
+        return _failed(code, exc.detail, wire.status)
+    return _Outcome(True, None, _METADATA_TEXT, wire.status)
 
 
 # ------------------------------------------------------------------ the test
@@ -299,8 +292,14 @@ def _choose(definition: ServiceDefinition, named: str | None) -> EntitySetDef | 
 
 
 def _warnings(
-    service: dict[str, Any], resolved: Destination | None, outcome: _Outcome, read: str
+    service: dict[str, Any],
+    resolved: Destination | None,
+    outcome: _Outcome,
+    read: str,
+    sent: bool,
 ) -> list[dict[str, str]]:
+    """``sent``: whether a request left. A warning about the destination says
+    "the test ran ..." only then; the finding itself holds either way."""
     codes: list[str] = []
     if service.get("enabled") is not True:
         codes.append("service_disabled")
@@ -313,7 +312,15 @@ def _warnings(
     if read == "metadata":
         codes.append("no_list_entity_set")
     codes.extend(outcome.warnings)
-    warnings = [{"code": code, "message": _WARNINGS[code]} for code in codes]
+    warnings = [
+        {
+            "code": code,
+            "message": _WARNINGS.get(f"{code}/unsent", _WARNINGS[code])
+            if not sent
+            else _WARNINGS[code],
+        }
+        for code in codes
+    ]
     # `DestinationAuth` does not add `URL.queries.*` (sap-client, ...) yet.
     names = [n for n in (resolved.queries if resolved else {}) if _QUERY_NAME.fullmatch(str(n))]
     if resolved is not None and resolved.queries:
@@ -321,7 +328,9 @@ def _warnings(
         warnings.append(
             {
                 "code": "destination_queries_not_applied",
-                "message": _QUERIES_WARNING.format(names=shown),
+                "message": (_QUERIES_WARNING if sent else _QUERIES_WARNING_UNSENT).format(
+                    names=shown
+                ),
             }
         )
     return warnings
@@ -341,8 +350,11 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
     check), ``target`` the entity set (or ``$metadata``), ``rows`` 0 or 1,
     ``code`` ``None`` when ``ok``. ``auth_type``, ``proxy_type`` and
     ``per_user`` say how the destination WAS resolved (empty / false when
-    it was not); ``identity`` is ``user`` only when the service acts as the
-    signed-in user and the destination's type propagates one.
+    it was not); ``identity`` is ``unknown`` when the destination was never
+    resolved, ``user`` when it was, the service acts as the signed-in user
+    and the destination's type propagates one, and ``technical`` otherwise.
+    ``status`` is the HTTP status whenever headers arrived, also when the
+    body then stalled or broke.
     ``duration_ms`` is the time of the call to SAP, destination lookup
     included.
     """
@@ -356,6 +368,7 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
     auth: preview.OneShotAuth | None = None
     read, target = "list", ""
     duration_ms = 0
+    wire = _Wire()
 
     def log(word: str, code: str | None, status: int | None, rows: int) -> None:
         resolved = auth.resolved if auth else None
@@ -393,9 +406,12 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             "read": read,
             "target": target,
             "rows": outcome.rows,
+            # What happened, not what was asked: nothing resolved is unknown.
             "identity": (
-                "user"
-                if user_context and (resolved is None or auth_type in USER_PROPAGATING_AUTH_TYPES)
+                "unknown"
+                if resolved is None
+                else "user"
+                if user_context and auth_type in USER_PROPAGATING_AUTH_TYPES
                 else "technical"
             ),
             "per_user": bool(resolved and resolved.per_user),
@@ -403,7 +419,7 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             "auth_type": auth_type,
             "proxy_type": resolved.proxy_type if resolved else "",
             "message": outcome.message,
-            "warnings": _warnings(service, resolved, outcome, read),
+            "warnings": _warnings(service, resolved, outcome, read, bool(wire.sent)),
         }
 
     def refuse(refusal: preview.PreviewError) -> preview.PreviewError:
@@ -432,7 +448,6 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
         preview.take_slot()
     except preview.PreviewError as exc:
         raise refuse(exc) from None
-    wire = _Wire()
     started = time.monotonic()
     clock: asyncio.Timeout | None = None
     try:
@@ -441,7 +456,7 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             # on behalf of nobody, and never a fall-back to its own credential.
             raise refuse(preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT))
         try:
-            auth_class = preview.OneShotAuth if chosen is not None else preview._MetadataAuth
+            auth_class = preview.OneShotAuth if chosen is not None else preview.MetadataAuth
             auth = auth_class(
                 _resolver(destination),
                 user_context=user_context,
@@ -453,15 +468,17 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
                     if chosen is not None:
                         outcome = await _list(http, service, definition, chosen, wire)
                     else:
-                        outcome = await _probe(http, join_path(service_path, METADATA_TARGET))
+                        outcome = await _probe(
+                            http, join_path(service_path, METADATA_TARGET), wire
+                        )
         except preview.PreviewError:
             raise
         except DestinationUserRequired:
             raise refuse(
                 preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
             ) from None
-        except preview._OnPremise:
-            outcome = _failed("on_premise_unavailable", preview._ON_PREMISE_TEXT)
+        except preview.OnPremise:
+            outcome = _failed("on_premise_unavailable", preview.ON_PREMISE_TEXT)
         except (DestinationError, ValueError) as exc:
             # ValueError: `resolver_for` on an empty name. The text can quote the
             # destination service's answer, so it goes to the log only, URLs masked.
@@ -469,18 +486,18 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
                 "odata test call: destination '%s' could not be used (%s): %s",
                 destination,
                 type(exc).__name__,
-                preview._plain(str(exc), 300),
+                preview.plain(str(exc), 300),
             )
-            outcome = _failed("destination_error", preview._DESTINATION_TEXT)
+            outcome = _failed("destination_error", preview.DESTINATION_TEXT)
         except TimeoutError:
             if clock is not None and clock.expired():
-                outcome = _failed("timeout", _TIMEOUT_TEXT.format(seconds=budget))
+                outcome = _failed("timeout", _TIMEOUT_TEXT.format(seconds=budget), wire.status)
             else:
-                outcome = _failed("unreachable", preview._UNREACHABLE_TEXT)
+                outcome = _failed("unreachable", preview.UNREACHABLE_TEXT, wire.status)
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
             # The exception text can carry the URL; only its type is logged.
             logger.warning("odata test call: request failed (%s)", type(exc).__name__)
-            outcome = _failed("unreachable", preview._UNREACHABLE_TEXT)
+            outcome = _failed("unreachable", preview.UNREACHABLE_TEXT, wire.status)
         except Exception as exc:
             # A defect. Its text may quote an answer or a URL: the type is
             # logged, a fixed text answered.

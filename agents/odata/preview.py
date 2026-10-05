@@ -105,23 +105,22 @@ MAX_PREVIEW_KEYS = 64
 MAX_PREVIEW_NAVIGATIONS = 200
 MAX_PREVIEW_PARAMETERS = 100  # client.MAX_CALL_PARAMS
 
-_ON_PREMISE_TEXT = "on-premise destinations are not available yet in this version"
+ON_PREMISE_TEXT = "on-premise destinations are not available yet in this version"
 _USER_REQUIRED_TEXT = (
     "This fetch runs in SAP as the signed-in user, but no user token "
     "reached the backend. Sign in again and retry."
 )
-_DESTINATION_TEXT = (
+DESTINATION_TEXT = (
     "the destination could not be resolved or used; check its name, its "
     "authentication type and this app's destination service binding "
     "(the application log has the reason)"
 )
-_UNREACHABLE_TEXT = "the OData service could not be reached"
+UNREACHABLE_TEXT = "the OData service could not be reached"
 _FAILED_TEXT = (
     "the $metadata preview failed unexpectedly; the application log has the reason"
 )
-_BUSY_TEXT = (
-    "other $metadata previews are running; wait for them to finish and try again"
-)
+# The slots are shared with the catalogue test call (`take_slot`).
+BUSY_TEXT = "other previews or test calls are running; try again in a moment"
 _TECHNICAL_WARNING = (
     "the preview was asked for as the signed-in user, but the destination's "
     "authentication type does not propagate a user: it was fetched with the "
@@ -156,7 +155,7 @@ class PreviewError(Exception):
         self.detail = detail
 
 
-class _OnPremise(DestinationError):
+class OnPremise(DestinationError):
     """The destination is reached through the Cloud Connector."""
 
 
@@ -164,7 +163,7 @@ class OneShotAuth(DestinationAuth):
     """``DestinationAuth`` for one admin-triggered request: no on-premise
     target, and it remembers the destination the request was shaped for.
 
-    Shared by the preview (``_MetadataAuth``) and the catalogue test call
+    Shared by the preview (``MetadataAuth``) and the catalogue test call
     (``agents.odata.testcall``), so that both refuse the same destinations.
     Built with ``retry_on_401=False``: the resolver is new for this call, so
     a second attempt could only repeat a refused logon -- against a system
@@ -184,11 +183,11 @@ class OneShotAuth(DestinationAuth):
             # Connector. The connectivity task (plan section 1.7, task C2:
             # `DestinationAuth(connectivity=...)` + `OnPremiseRouter`) adds
             # that route; this refusal goes when the fetch can take it.
-            raise _OnPremise(_ON_PREMISE_TEXT)
+            raise OnPremise(ON_PREMISE_TEXT)
         super().send_through(request, destination)
 
 
-class _MetadataAuth(OneShotAuth):
+class MetadataAuth(OneShotAuth):
     """``OneShotAuth`` for the ``$metadata`` fetch: the two headers the fetch
     relies on cannot be changed by the destination."""
 
@@ -229,7 +228,7 @@ def _transport() -> httpx.AsyncBaseTransport | None:
 # ----------------------------------------------------------------- the fetch
 
 
-def _plain(text: object, limit: int) -> str:
+def plain(text: object, limit: int) -> str:
     """One line of printable text, URLs masked, at most ``limit`` characters."""
     if not isinstance(text, str):
         return ""
@@ -242,11 +241,11 @@ def _message_of(message: Any) -> Any:
     return message.get("value") if isinstance(message, dict) else message
 
 
-def _sap_error(status: int, content_type: str, body: bytes) -> PreviewError:
+def sap_error(status: int, content_type: str, body: bytes) -> PreviewError:
     """A non-2xx answer as SAP's own short code and message, or the status."""
     snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
     code, text = common.read_error(snapshot, _message_of)
-    code, text = _plain(code, 80), _plain(text, MAX_MESSAGE_CHARS)
+    code, text = plain(code, 80), plain(text, MAX_MESSAGE_CHARS)
     said = f"{code}: {text}" if code and text else text
     detail = f"HTTP {status} from the OData service"
     if said:
@@ -256,7 +255,7 @@ def _sap_error(status: int, content_type: str, body: bytes) -> PreviewError:
     return PreviewError(502, "sap_error", detail[:MAX_MESSAGE_CHARS])
 
 
-def _looks_like_xml(body: bytes) -> bool:  # the first bytes are enough
+def looks_like_xml(body: bytes) -> bool:  # the first bytes are enough
     """Whether ``body`` can be an XML document at all, and is no HTML page.
 
     The parser decides what the document is; this only keeps a page -- which
@@ -268,16 +267,27 @@ def _looks_like_xml(body: bytes) -> bool:  # the first bytes are enough
     return head.startswith(b"<") and not head.startswith(_HTML_STARTS)
 
 
-def _identity_encoded(response: httpx.Response) -> bool:
+def identity_encoded(response: httpx.Response) -> bool:
     encoding = response.headers.get("content-encoding", "").strip().lower()
     return encoding in ("", "identity")
 
 
-async def _read(client: httpx.AsyncClient, path: str) -> bytearray:
+async def read_document(
+    client: httpx.AsyncClient, path: str, *, head: int | None = None
+) -> bytearray:
+    """One ``GET`` of the XML document at ``path``; :class:`PreviewError`
+    for a redirect, a non-2xx answer, a page or a compressed answer.
+
+    The whole document, at most ``MAX_FETCH_BYTES`` (``too_large`` beyond).
+    With ``head``, only the beginning: the read stops with the chunk that
+    reaches ``head`` bytes and the rest is never fetched -- for a caller
+    that asks whether the service answers, not what (the catalogue test
+    call). An ``httpx`` error passes through to the caller.
+    """
     async with client.stream(
         "GET",
         path,
-        # Both are pinned again by `_MetadataAuth`, after the destination's
+        # Both are pinned again by `MetadataAuth`, after the destination's
         # static headers.
         headers={"Accept": "application/xml", "Accept-Encoding": "identity"},
         follow_redirects=False,
@@ -294,14 +304,14 @@ async def _read(client: httpx.AsyncClient, path: str) -> bytearray:
                 "destination's credential was not accepted",
             )
         failed = not 200 <= status < 300
-        plain = _identity_encoded(response)
+        plain = identity_encoded(response)
         if not failed:
             # `identity` was asked for. A compressed answer all the same is
             # not read: inflating it is exactly what the cap must not allow.
             if not plain or "html" in content_type.lower():
                 raise PreviewError(502, "not_xml", _NOT_XML_TEXT)
             declared = response.headers.get("content-length", "")
-            if declared.isdigit() and int(declared) > MAX_FETCH_BYTES:
+            if head is None and declared.isdigit() and int(declared) > MAX_FETCH_BYTES:
                 raise PreviewError(
                     502,
                     "too_large",
@@ -313,6 +323,8 @@ async def _read(client: httpx.AsyncClient, path: str) -> bytearray:
             # Raw: the bytes of the wire, never a decoded form of them.
             async for chunk in response.aiter_raw():
                 body += chunk
+                if head is not None and not failed and len(body) >= head:
+                    break  # the beginning was asked for; the rest is not read
                 if len(body) > limit:
                     if failed:
                         break  # an error text needs no more than its beginning
@@ -320,8 +332,8 @@ async def _read(client: httpx.AsyncClient, path: str) -> bytearray:
                         502, "too_large", f"the $metadata document is larger than {limit} bytes"
                     )
     if failed:
-        raise _sap_error(status, content_type, bytes(body[:limit]))
-    if not _looks_like_xml(bytes(body[:1024])):
+        raise sap_error(status, content_type, bytes(body[:limit]))
+    if not looks_like_xml(bytes(body[:1024])):
         raise PreviewError(502, "not_xml", _NOT_XML_TEXT)
     return body
 
@@ -347,7 +359,7 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         # behalf of nobody, and never a fall-back to its own credential.
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
     try:
-        auth = _MetadataAuth(
+        auth = MetadataAuth(
             _resolver(destination),
             user_context=user_context is True,
             server_key=SERVER_KEY,
@@ -362,7 +374,7 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
             follow_redirects=False,
         )
         async with client:
-            document = await _read(client, path)
+            document = await read_document(client, path)
         resolved = auth.resolved
         return Fetched(
             document=document,
@@ -374,8 +386,8 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         raise
     except DestinationUserRequired:
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT) from None
-    except _OnPremise:
-        raise PreviewError(502, "on_premise_unavailable", _ON_PREMISE_TEXT) from None
+    except OnPremise:
+        raise PreviewError(502, "on_premise_unavailable", ON_PREMISE_TEXT) from None
     except (DestinationError, ValueError) as exc:
         # ValueError: `resolver_for` on an empty name. The text can quote the
         # destination service's answer, so it goes to the log only, URLs masked.
@@ -383,15 +395,15 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
             "odata metadata: destination '%s' could not be used (%s): %s",
             destination,
             type(exc).__name__,
-            _plain(str(exc), 300),
+            plain(str(exc), 300),
         )
-        raise PreviewError(502, "destination_error", _DESTINATION_TEXT) from None
+        raise PreviewError(502, "destination_error", DESTINATION_TEXT) from None
     except httpx.TimeoutException:
         raise _timed_out() from None
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         # The exception text can carry the URL; only its type is logged.
         logger.warning("odata metadata: request failed (%s)", type(exc).__name__)
-        raise PreviewError(502, "unreachable", _UNREACHABLE_TEXT) from None
+        raise PreviewError(502, "unreachable", UNREACHABLE_TEXT) from None
 
 
 def _timed_out() -> PreviewError:
@@ -719,7 +731,7 @@ def take_slot() -> None:
     the check and the increment. Give it back with :func:`free_slot`."""
     global _active
     if _active >= MAX_CONCURRENT_PREVIEWS:
-        raise PreviewError(429, "busy", _BUSY_TEXT)
+        raise PreviewError(429, "busy", BUSY_TEXT)
     _active += 1
 
 
@@ -777,7 +789,7 @@ async def run_preview(
 
     try:
         if _active >= MAX_CONCURRENT_PREVIEWS:
-            raise PreviewError(429, "busy", _BUSY_TEXT)
+            raise PreviewError(429, "busy", BUSY_TEXT)
         _active += 1
         try:
             async with asyncio.timeout(PREVIEW_BUDGET_SECONDS):

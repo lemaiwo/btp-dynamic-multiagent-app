@@ -704,7 +704,7 @@ async def test_a_destination_that_cannot_be_resolved(client, remote, caplog):
     remote.resolver = Broken()
     r = await client.post(URL, json=REQUEST)
     assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
-    assert r.json() == {"detail": preview._DESTINATION_TEXT}
+    assert r.json() == {"detail": preview.DESTINATION_TEXT}
     assert SECRET not in r.text and SECRET not in caplog.text
     assert remote.requests == []
 
@@ -1404,7 +1404,7 @@ async def test_at_most_two_previews_run_at_a_time(client, remote, monkeypatch):
     assert arrived == 2 and preview._active == 2
     third = await client.post(URL, json=REQUEST)
     assert third.status_code == 429 and third.headers["x-odata-error"] == "busy"
-    assert third.json() == {"detail": preview._BUSY_TEXT}
+    assert third.json() == {"detail": preview.BUSY_TEXT}
     assert arrived == 2  # the third fetched nothing
     gate.set()
     assert (await first).status_code == 200 and (await second).status_code == 200
