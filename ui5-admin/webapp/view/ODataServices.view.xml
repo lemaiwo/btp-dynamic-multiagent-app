@@ -1,0 +1,92 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.ODataServices"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="odataServicesPage" title="{i18n>navODataServices}">
+        <headerContent>
+            <Button
+                id="importODataConfigButton"
+                icon="sap-icon://upload"
+                text="{i18n>odataImportConfiguration}"
+                press=".onImportConfiguration" />
+            <Button
+                id="addODataServiceButton"
+                type="Emphasized"
+                icon="sap-icon://add"
+                text="{i18n>odataNewService}"
+                press=".onCreate" />
+        </headerContent>
+        <content>
+            <Table
+                id="odataServicesTable"
+                items="{odata>/items}"
+                growing="true"
+                growingThreshold="50"
+                sticky="ColumnHeaders"
+                noDataText="{i18n>odataNoServices}">
+                <!-- In the table's toolbar, as on the Agents page: the page
+                     header has no overflow handling, so on a narrow window a
+                     search field there is clipped and pushes the title out. -->
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <SearchField
+                            id="odataSearch"
+                            width="18rem"
+                            placeholder="{i18n>odataSearch}"
+                            liveChange=".onSearch"
+                            search=".onSearch" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <Column><Text text="{i18n>odataColService}" /></Column>
+                    <Column width="11rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>odataColDestination}" /></Column>
+                    <Column width="5rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>odataColVersion}" /></Column>
+                    <Column width="9rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>odataColRunsAs}" /></Column>
+                    <Column width="6rem" minScreenWidth="Desktop" demandPopin="true" hAlign="End"><Text text="{i18n>odataColEntitySets}" /></Column>
+                    <Column width="6rem" minScreenWidth="Desktop" demandPopin="true" hAlign="End"><Text text="{i18n>odataColOperations}" /></Column>
+                    <Column width="7rem" minScreenWidth="Desktop" demandPopin="true"><Text text="{i18n>odataColUsedBy}" /></Column>
+                    <Column width="4rem" hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <VBox>
+                                <ObjectIdentifier title="{odata>title}" text="{odata>name}" />
+                                <Text text="{odata>purpose}" maxLines="2" />
+                                <HBox>
+                                    <ObjectStatus
+                                        text="{i18n>odataTagWrite}"
+                                        state="Warning"
+                                        inverted="true"
+                                        visible="{odata>has_write}"
+                                        class="sapUiTinyMarginEnd sapUiTinyMarginTop" />
+                                    <ObjectStatus
+                                        text="{i18n>odataTagDisabled}"
+                                        state="Error"
+                                        inverted="true"
+                                        visible="{= !${odata>enabled} }"
+                                        class="sapUiTinyMarginTop" />
+                                </HBox>
+                            </VBox>
+                            <Text text="{odata>destination}" />
+                            <Text text="{= ${odata>odata_version} === 'v4' ? 'V4' : 'V2' }" />
+                            <ObjectStatus
+                                text="{= ${odata>user_context} ? ${i18n>odataRunsAsUser} : ${i18n>odataRunsAsTechnical} }"
+                                state="{= ${odata>user_context} ? 'Information' : 'None' }" />
+                            <Text text="{odata>counts/entity_sets}" />
+                            <Text text="{odata>counts/operations}" />
+                            <Text
+                                text="{ path: 'odata>used_by', formatter: '.formatUsedBy' }"
+                                tooltip="{ path: 'odata>used_by', formatter: '.formatUsedByNames' }" />
+                            <Button
+                                icon="sap-icon://delete"
+                                type="Transparent"
+                                tooltip="{i18n>delete}"
+                                press=".onDelete" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
+    </Page>
+</mvc:View>

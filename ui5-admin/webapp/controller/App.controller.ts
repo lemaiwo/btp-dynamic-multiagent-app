@@ -14,6 +14,8 @@ const NAV_KEY_BY_ROUTE: Record<string, string> = {
     agentDetail: "agents",
     skills: "skills",
     skillDetail: "skills",
+    odataServices: "odataServices",
+    odataServiceDetail: "odataServices",
     runs: "runs",
     runDetail: "runs",
     workflows: "workflows",
