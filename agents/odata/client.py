@@ -76,9 +76,10 @@ also a ``GET`` is sent as a read (``call_changes_data``). Every other call,
 a ``GET`` included, goes out exactly like an entity write: the caller's own
 CSRF session, one repeat after a 403 ``Required``, never a repeat after a
 failure, success recognised positively. What comes back is shown only when
-it can be tied to a catalogue entity set, so that the field allowlist
-applies; otherwise the answer is a confirmation and nothing else
-(``ODataClient.call``).
+it can be tied to a catalogue entity set -- the one the operation's
+``returns`` names, else the one it is ``bound_to`` -- so that the field
+allowlist applies; otherwise the answer is a confirmation and nothing else
+(``ODataClient.call``, ``_returned``).
 """
 
 from __future__ import annotations
@@ -149,6 +150,10 @@ _CALL_FIRST_HINT = (
 )
 # How many parameters one call may carry (a catalogue never declares more).
 MAX_CALL_PARAMS = 100
+# The longest text a read-type call may return as its one scalar. Function
+# imports that return a serialised document (JSON, XML) in an `Edm.String`
+# exist; such a text would carry fields past the catalogue's allowlist.
+MAX_CALL_VALUE_CHARS = 1000
 
 
 def _outcome_hint(operation: str) -> str:
@@ -159,15 +164,10 @@ def _outcome_hint(operation: str) -> str:
 
 
 def call_changes_data(operation: OperationDef) -> bool:
-    """Whether calling ``operation`` is a write. THE rule, said once.
-
-    A read is only what the catalogue marks ``changes_data: false`` AND
-    sends with ``GET``. Everything else is a write: ``changes_data`` true
-    (the default an import gets), and every ``POST`` whatever
-    ``changes_data`` says -- the catalogue can store ``POST`` with
-    ``changes_data: false``, and that combination is not run as a read.
-    """
-    return not (operation.changes_data is False and operation.http_method == "GET")
+    """Whether calling ``operation`` is a write: the model's own rule
+    (``OperationDef.is_write`` / ``models.operation_is_write``), which is
+    also what ``has_write`` and the search tool go by."""
+    return operation.is_write()
 
 
 # Raised before a connection exists: nothing left this app.
@@ -289,10 +289,15 @@ class CallPlan:
     ``params``, in its order -- names only, which is all an audit record may
     hold; ``key`` the validated key of the bound entity or ``None``;
     ``changes`` whether the call is a write (``call_changes_data``);
-    ``bound`` the entity set it is bound to, if any; ``etag`` the validated
-    ``If-Match`` value or ``None``. ``operation`` and ``body`` make it the
-    plan of a modifying request for ``_write``. The ``repr`` shows names
-    only: the query carries the parameter and key values.
+    ``bound`` the entity set it is bound to, if any (whose KEY the call
+    takes); ``result_set`` the entity set returned entities are checked
+    against and cut to -- the one the catalogue's ``returns`` names, else
+    ``bound`` -- and ``many`` what ``returns`` declares (``True`` a
+    collection, ``False`` one entity, ``None`` when the catalogue does not
+    say); ``etag`` the validated ``If-Match`` value or ``None``.
+    ``operation`` and ``body`` make it the plan of a modifying request for
+    ``_write``. The ``repr`` shows names only: the query carries the
+    parameter and key values.
     """
 
     name: str
@@ -303,6 +308,8 @@ class CallPlan:
     key: dict[str, Any] | None = field(default=None, repr=False)
     changes: bool = True
     bound: EntitySetDef | None = field(default=None, repr=False)
+    result_set: EntitySetDef | None = field(default=None, repr=False)
+    many: bool | None = field(default=None, repr=False)
     etag: str | None = field(default=None, repr=False)
     operation: str = "call"
     body: None = None
@@ -946,6 +953,7 @@ class ODataClient:
                     hint="read the entity with 'get' and use the etag of that answer; "
                     "'*' is never accepted",
                 )
+        returns = operation.returns
         method, path, query, _ = self._dialect.call_request(
             self._service_path, operation, key if bound is not None else None, params
         )
@@ -958,6 +966,11 @@ class ODataClient:
             key=dict(key) if bound is not None else None,
             changes=changes,
             bound=bound,
+            # `returns` wins for the RESULT, `bound_to` stays the KEY.
+            result_set=(
+                bound if returns is None else self._definition.entity_set(returns.entity_set)
+            ),
+            many=None if returns is None else returns.collection,
             etag=etag,
         )
 
@@ -1605,41 +1618,60 @@ class ODataClient:
     def _returned(self, plan: CallPlan, shape: str, value: Any) -> tuple[str, Any]:
         """``(returned, result)``: what of a call's answer may be shown.
 
-        The catalogue's field allowlist is per entity set, and an operation
-        declares no return type there. So entity data is shown only when it
-        can be tied to a catalogue entity set positively: the operation is
-        bound to it, that set can be read (``get`` or ``list`` enabled), and
-        EVERY returned entity says in ``__metadata.type`` that it is of that
-        set's entity type. It is then cut to the set's selectable fields
-        exactly like a read. Anything else that looks like data -- an entity
-        of another or of no stated type, a complex type, a list of values --
-        is ``withheld``: the caller learns that the call worked, not what it
+        The catalogue's field allowlist is per entity set, so entity data is
+        shown only when it can be tied to a catalogue entity set positively
+        (``plan.result_set``): the set the operation's ``returns`` names,
+        or, when the catalogue does not say what it returns, the set it is
+        bound to. That set must have the read enabled that matches what
+        came back -- ``get`` for one entity, ``list`` for a collection;
+        with ``returns`` the answer must also have the declared shape,
+        without it either read will do -- and EVERY returned entity must
+        say in ``__metadata.type`` that it is of that set's entity type. It
+        is then cut to the set's selectable fields exactly like a read
+        (``_row``: no ``__metadata``, no ETag). Anything else that looks
+        like data -- an entity of another or of no stated type, a set
+        nobody may read, a complex type, a list of values -- is
+        ``withheld``: the caller learns that the call worked, not what it
         returned.
 
         A single JSON scalar is passed on for a call that only reads (it is
-        the whole point of such a function); never for one that changes
-        data, whose answer is the confirmation.
+        the whole point of such a function): a number or a boolean as it
+        is, a text only when it is one printable line of at most
+        ``MAX_CALL_VALUE_CHARS`` characters once the white space around it
+        is dropped -- a longer or multi-line text is a document, not a
+        value. Never for a call that changes data, whose answer is the
+        confirmation.
         """
         if shape == "none":
             return "nothing", None
         if shape == "value":
-            return ("value", value) if not plan.changes else ("withheld", None)
-        target = plan.bound
-        if (
-            shape not in ("entity", "collection")
-            or target is None
-            or not target.entity_type
-            or not {"get", "list"} & set(target.operations)
-        ):
+            if plan.changes:
+                return "withheld", None
+            if isinstance(value, str):
+                value = value.strip()
+                if len(value) > MAX_CALL_VALUE_CHARS or not value.isprintable():
+                    return "withheld", None
+            return "value", value
+        target = plan.result_set
+        if shape not in ("entity", "collection") or target is None or not target.entity_type:
             return "withheld", None
-        rows = [value] if shape == "entity" else value
+        many = shape == "collection"
+        if plan.many is None:
+            reads = {"get", "list"}
+        elif plan.many is not many:
+            return "withheld", None  # one was declared and many came, or the reverse
+        else:
+            reads = {"list"} if many else {"get"}
+        names = target.selectable_names()
+        if not reads & set(target.operations) or not names:
+            return "withheld", None
+        rows = value if many else [value]
         for row in rows:
             metadata = row.get("__metadata") if isinstance(row, dict) else None
             if not isinstance(metadata, dict) or metadata.get("type") != target.entity_type:
                 return "withheld", None
-        names = target.selectable_names()
         cut = [self._row(row, target, names, []) for row in rows]
-        return ("entity", cut[0]) if shape == "entity" else ("entities", cut)
+        return ("entities", cut) if many else ("entity", cut[0])
 
     async def call(
         self,
@@ -1652,8 +1684,8 @@ class ODataClient:
         """Call one function import. ``{"ok", "status", "returned", "result"}``.
 
         ``returned`` says what ``result`` is: ``entity`` / ``entities`` (cut
-        to the selectable fields of the entity set the operation is bound
-        to), ``value`` (one scalar, read-type calls only), ``nothing`` (SAP
+        to the selectable fields of the entity set the operation returns,
+        or is bound to), ``value`` (one scalar, read-type calls only), ``nothing`` (SAP
         sent no content) or ``withheld`` (SAP sent something that could not
         be tied to a catalogue entity set, so it is not passed on);
         ``result`` is ``None`` for the last two. See ``_returned``.

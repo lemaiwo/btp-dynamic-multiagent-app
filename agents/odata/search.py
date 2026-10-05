@@ -33,7 +33,7 @@ import re
 from collections.abc import Collection
 from typing import Any
 
-from .models import ENTITY_OPS, WRITE_OPS
+from .models import ENTITY_OPS, WRITE_OPS, operation_is_write
 
 MAX_SUMMARY_MATCHES = 20
 MAX_FULL_TARGETS = 5
@@ -134,12 +134,12 @@ def _visible_fields(entity_set: dict[str, Any], allow_write: bool) -> list[dict[
 def operation_changes_data(operation: dict[str, Any]) -> bool:
     """Whether calling this operation is a write.
 
-    The rule of ``client.call_changes_data``, on the stored dict: a read is
-    only what is marked ``changes_data: false`` (exactly) AND is sent with
-    ``GET``. A missing key must not read as "only reads", and a ``POST`` is
-    a write whatever the flag says.
+    ``models.operation_is_write`` on the stored dict: a read is only what is
+    marked ``changes_data: false`` (exactly) AND is sent with ``GET``. A
+    missing key must not read as "only reads", and a ``POST`` is a write
+    whatever the flag says.
     """
-    return not (operation.get("changes_data") is False and operation.get("http_method") == "GET")
+    return operation_is_write(operation.get("changes_data"), operation.get("http_method"))
 
 
 def _operation_visible(operation: dict[str, Any], allow_write: bool) -> bool:

@@ -157,13 +157,17 @@ def _operations() -> list[dict[str, Any]]:
     ]
 
 
-def catalogue(operations: list[dict[str, Any]] | None = None) -> dict[str, dict]:
+def catalogue(
+    operations: list[dict[str, Any]] | None = None,
+    entity_sets: list[dict[str, Any]] | None = None,
+) -> dict[str, dict]:
     """``pr`` (as the signed-in user), ``pr-jobs`` (technical) and ``pr-v4``."""
     definition = {
         "entity_sets": [
             _entity_set(ITEM, ["list", "get"]),
             _entity_set("A_Hidden", []),  # in the catalogue, readable by nobody
             _entity_set("A_Untyped", ["get"], entity_type=""),
+            *(entity_sets or []),
         ],
         "operations": _operations() if operations is None else operations,
     }
@@ -885,9 +889,10 @@ async def test_a_long_value_is_cut_and_says_so(alice):
     from agents.odata.tools import MAX_RESULT_CHARS
 
     w = World(READ_ONLY)
+    # A text that long is no scalar answer (a serialised document): not shown at all.
     w.sap.answer = {"d": {"CountOpen": "x" * (MAX_RESULT_CHARS * 2)}}
     out = await w.call("CountOpen")
-    assert out["truncated"] is True and len(json.dumps(out)) <= MAX_RESULT_CHARS
+    assert (out["returned"], out["result"], out["truncated"]) == ("withheld", None, False)
     w.sap.answer = {"d": {"results": [entity() for _ in range(2000)]}}
     out = await w.call("ItemStatus", key=KEY)
     assert out["truncated"] is True and 0 < len(out["result"]) < 2000
@@ -1227,3 +1232,165 @@ def test_the_catalogue_of_this_suite_is_not_shared_between_tests():
     first, second = catalogue(), catalogue()
     first["pr"]["definition"]["operations"].clear()
     assert second["pr"]["definition"]["operations"] and copy.deepcopy(second) == second
+
+
+# -- the declared return entity set (task M1) ----------------------------------------
+
+SUPPLIER = "A_Supplier"
+SUPPLIER_TYPE = "API_PURCHASEREQ_PROCESS_SRV.A_SupplierType"
+
+
+def returning() -> dict[str, dict]:
+    """Operations that say what they return, over sets with different reads."""
+
+    def returns(name: str, many: bool) -> dict[str, Any]:
+        return {"returns": {"entity_set": name, "collection": many}}
+
+    reading = {"changes_data": False}
+    return catalogue(
+        [
+            _op("OpenItems", "GET", **reading, **returns(ITEM, True)),
+            _op("OneItem", "GET", **reading, **returns(ITEM, False)),
+            _op("PostItem", "POST", **returns(ITEM, False)),
+            _op("ManyFromGetOnly", "GET", **reading, **returns("A_GetOnly", True)),
+            _op("OneFromGetOnly", "GET", **reading, **returns("A_GetOnly", False)),
+            _op("OneFromListOnly", "GET", **reading, **returns("A_ListOnly", False)),
+            _op("ManyFromListOnly", "GET", **reading, **returns("A_ListOnly", True)),
+            _op("FromHidden", "GET", **reading, **returns("A_Hidden", False)),
+            _op("FromUntyped", "GET", **reading, **returns("A_Untyped", False)),
+            # Bound to an item (the KEY), returns a supplier (the RESULT).
+            _op("SupplierOfItem", "GET", **reading, bound_to=ITEM, parameters=KEY_PARAMS,
+                **returns(SUPPLIER, False)),
+            _op("CountOpen", "GET", **reading),
+        ],
+        [
+            _entity_set("A_GetOnly", ["get"]),
+            _entity_set("A_ListOnly", ["list"]),
+            {**_entity_set(SUPPLIER, ["list", "get"], entity_type=SUPPLIER_TYPE),
+             "fields": [
+                 {"name": "PurchaseRequisition", "selectable": True},
+                 {"name": "PurchaseRequisitionItem", "selectable": True},
+                 {"name": "Plant"},  # not released for a supplier
+                 {"name": "PurReqnReleaseStatus"},
+             ]},
+        ],
+    )
+
+
+CUT = {**KEY, "PurReqnReleaseStatus": "05", "Plant": "1000"}
+WITHHELD = {"ok": True, "status": 200, "returned": "withheld", "result": None, "truncated": False}
+
+
+async def test_an_unbound_call_returns_entities_of_its_declared_set_cut_like_a_read(alice):
+    w = World(READ_ONLY, services=returning())
+    rows = [entity(), entity({**KEY, "PurchaseRequisitionItem": "00020"})]
+    for answer in ({"d": {"results": rows}}, {"d": {"OpenItems": {"results": rows}}}):
+        w.sap.answer = answer
+        out = await w.call("OpenItems")
+        assert out["returned"] == "entities" and out["result"][0] == CUT, out
+        assert len(out["result"]) == 2
+        text = json.dumps(out)
+        assert SECRET_USER not in text and "__metadata" not in text and "etag" not in text
+    for answer in ({"d": entity()}, {"d": {"OneItem": entity()}}):
+        w.sap.answer = answer
+        out = await w.call("OneItem")
+        assert (out["returned"], out["result"]) == ("entity", CUT), out
+        assert SECRET_USER not in json.dumps(out) and "s4.internal" not in json.dumps(out)
+
+
+async def test_a_changing_call_shows_the_entity_of_its_declared_set(alice):
+    w = World(services=returning())
+    w.sap.answer = {"d": entity()}
+    out = await w.call("PostItem")
+    assert (out["ok"], out["returned"], out["result"]) == (True, "entity", CUT), out
+    w.sap.answer = {"d": {"PostItem": "DOC-4711"}}  # still never a scalar
+    assert await w.call("PostItem") == WITHHELD
+
+
+@pytest.mark.parametrize(
+    "target, answer",
+    [
+        # Every entity must say it is of the declared set's type.
+        ("OneItem", {"d": entity(type_name=SUPPLIER_TYPE)}),
+        ("OneItem", {"d": entity(type_name=None)}),
+        ("OpenItems", {"d": {"results": [entity(), entity(type_name=SUPPLIER_TYPE)]}}),
+        # One was declared and many came, or the other way round.
+        ("OneItem", {"d": {"results": [entity()]}}),
+        ("OpenItems", {"d": entity()}),
+        # The read that fits the shape is not enabled on the declared set.
+        ("ManyFromGetOnly", {"d": {"results": [entity()]}}),
+        ("OneFromListOnly", {"d": entity()}),
+        ("FromHidden", {"d": entity()}),
+        ("FromUntyped", {"d": entity(type_name="")}),
+        # Not an entity at all.
+        ("OneItem", {"d": {"Street": SECRET_USER}}),
+        ("OpenItems", {"d": {"results": [SECRET_USER]}}),
+    ],
+)
+async def test_a_result_that_does_not_fit_the_declared_set_is_withheld(alice, target, answer):
+    w = World(READ_ONLY, services=returning())
+    w.sap.answer = answer
+    assert await w.call(target) == WITHHELD
+
+
+async def test_the_read_that_fits_the_shape_is_enough(alice):
+    w = World(READ_ONLY, services=returning())
+    w.sap.answer = {"d": entity()}
+    assert (await w.call("OneFromGetOnly"))["returned"] == "entity"
+    w.sap.answer = {"d": {"results": [entity()]}}
+    assert (await w.call("ManyFromListOnly"))["returned"] == "entities"
+
+
+async def test_returns_decides_the_result_and_bound_to_the_key(alice):
+    w = World(READ_ONLY, services=returning())
+    w.sap.answer = {"d": entity(type_name=SUPPLIER_TYPE)}
+    out = await w.call("SupplierOfItem", key=KEY)
+    # The key is the item's; the result is cut to the SUPPLIER's selectable fields.
+    assert (out["returned"], out["result"]) == ("entity", KEY), out
+    assert w.sap.calls[-1].url.params["PurchaseRequisitionItem"] == "'00010'"
+    # An entity of the bound set's type is not what was declared.
+    w.sap.answer = {"d": entity()}
+    assert await w.call("SupplierOfItem", key=KEY) == WITHHELD
+    out = await w.call("SupplierOfItem")
+    assert code(out) == "invalid_key"
+
+
+@pytest.mark.parametrize(
+    "value, shown",
+    [
+        (7, 7), (1.5, 1.5), (True, True), (False, False), ("", ""), ("05", "05"),
+        ("x" * 1000, "x" * 1000),
+        ('{"a": 1}', '{"a": 1}'),  # one short line is a value, whatever it spells
+        ("  padded \n", "padded"),
+    ],
+)
+async def test_a_scalar_of_a_reading_call_is_a_number_a_boolean_or_one_short_line(
+    alice, value, shown
+):
+    w = World(READ_ONLY, services=returning())
+    w.sap.answer = {"d": {"CountOpen": value}}
+    out = await w.call("CountOpen")
+    assert (out["returned"], out["result"]) == ("value", shown), out
+    assert type(out["result"]) is type(shown)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "x" * 1001,
+        "line one\nline two",
+        '{\n  "CreatedByUser": "' + SECRET_USER + '"\n}',  # serialised JSON
+        "<Item>\r\n<User>" + SECRET_USER + "</User></Item>",
+        "tab\tseparated",
+        "zero\u200bwidth",
+        "bidi\u202eoverride",
+        "line\u2028separator",
+    ],
+)
+async def test_a_text_that_is_not_one_short_line_is_withheld(alice, value):
+    w = World(READ_ONLY, services=returning())
+    for answer in ({"d": {"CountOpen": value}}, {"d": value}):
+        w.sap.answer = answer
+        out = await w.call("CountOpen")
+        assert out == WITHHELD
+        assert SECRET_USER not in json.dumps(out)

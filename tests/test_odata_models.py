@@ -369,11 +369,18 @@ def test_helpers():
     # The one operation changes data but is not enabled, so nothing writes yet.
     assert p.has_write() is False
     assert ODataServicePayload.model_validate(with_operation(enabled=True)).has_write() is True
+    # "Only reads" counts only for a GET: a POST runs as a write whatever it says.
+    assert (
+        ODataServicePayload.model_validate(
+            with_operation(enabled=True, changes_data=False, http_method="GET")
+        ).has_write()
+        is False
+    )
     assert (
         ODataServicePayload.model_validate(
             with_operation(enabled=True, changes_data=False)
         ).has_write()
-        is False
+        is True
     )
     writable = with_entity_set(operations=["list", "update"])
     writable["definition"]["entity_sets"][0]["fields"][2]["writable"] = True
@@ -570,3 +577,72 @@ def test_definition_flags_take_only_a_json_boolean(value):
     refused(data, "parameters.0.required\n.*valid boolean")
     nav = {"name": "to_Header", "target": "A_Header", "collection": value}
     refused(with_entity_set(navigations=[nav]), "navigations.0.collection\n.*valid boolean")
+
+
+# -- what an operation returns (task M1) ---------------------------------------------
+
+
+def test_returns_is_optional_and_names_an_entity_set_of_the_definition():
+    plain = ODataServicePayload.model_validate(GOOD)
+    assert plain.definition.operations[0].returns is None
+    assert validate_odata_service(good())["definition"]["operations"][0]["returns"] is None
+    p = ODataServicePayload.model_validate(
+        with_operation(returns={"entity_set": "A_PurchaseRequisitionItem", "collection": True})
+    )
+    returns = p.definition.operations[0].returns
+    assert (returns.entity_set, returns.collection) == ("A_PurchaseRequisitionItem", True)
+    assert ODataServicePayload.model_validate(p.model_dump(mode="json")) == p
+    # `collection` defaults to one entity.
+    single = with_operation(returns={"entity_set": "A_PurchaseRequisitionItem"})
+    one = ODataServicePayload.model_validate(single).definition.operations[0].returns
+    assert one.collection is False
+
+
+def test_returns_of_a_missing_entity_set_is_refused_naming_operation_and_set():
+    refused(
+        with_operation(returns={"entity_set": "A_Missing"}),
+        "returns entity set 'A_Missing' of operation 'ReleaseItem'",
+    )
+    with pytest.raises(ValueError, match="A_Missing.*ReleaseItem"):
+        validate_odata_service(with_operation(returns={"entity_set": "A_Missing"}))
+
+
+@pytest.mark.parametrize(
+    "returns",
+    [
+        {"entity_set": "A_PurchaseRequisitionItem\n"},
+        {"entity_set": "bad name"},
+        {"entity_set": ""},
+        {"entity_set": "A_PurchaseRequisitionItem", "collection": "true"},
+        {"entity_set": "A_PurchaseRequisitionItem", "type": "Edm.String"},  # nothing else
+        {"collection": True},
+        "A_PurchaseRequisitionItem",
+    ],
+)
+def test_returns_holds_an_edm_name_a_real_boolean_and_nothing_else(returns):
+    refused(with_operation(returns=returns), "returns")
+
+
+@pytest.mark.parametrize(
+    "method, flag, write",
+    [
+        ("GET", False, False),
+        ("GET", True, True),
+        ("GET", None, True),  # the flag is missing: the model's default
+        ("POST", False, True),
+        ("POST", True, True),
+        ("POST", None, True),
+    ],
+)
+def test_is_write_is_the_one_rule_and_has_write_counts_by_it(method, flag, write):
+    patch: dict[str, Any] = {"http_method": method, "enabled": True, "bound_to": None}
+    if flag is not None:
+        patch["changes_data"] = flag
+    p = ODataServicePayload.model_validate(with_operation(**patch))
+    assert p.definition.operations[0].is_write() is write
+    assert p.has_write() is write and p.definition.has_write() is write
+    # On a stored dict a missing flag arrives as None.
+    assert odata_models.operation_is_write(flag, method) is write
+    # Not enabled: whatever it is, nothing writes.
+    off = ODataServicePayload.model_validate(with_operation(**{**patch, "enabled": False}))
+    assert off.has_write() is False

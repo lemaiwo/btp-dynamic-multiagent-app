@@ -559,6 +559,26 @@ def _changes_data(operation: ParsedOperation) -> tuple[bool, bool]:
     return True, True
 
 
+def _returns(operation: ParsedOperation) -> dict[str, Any] | None:
+    """What the document says the operation returns, for ``suggested``.
+
+    ``entity_set`` is the name of an entity set of this preview or ``None``
+    (the parser resolves it or leaves it out, it never guesses),
+    ``collection`` whether many come back, ``type`` the EDM name of a
+    primitive return type or ``""``. ``None`` when the document declares no
+    return type. The catalogue's ``OperationDef.returns`` holds
+    ``{entity_set, collection}`` only, and only the admin puts it there.
+    """
+    returns = operation.returns
+    if returns is None:
+        return None
+    return {
+        "entity_set": returns.entity_set,
+        "collection": returns.collection,
+        "type": returns.type,
+    }
+
+
 def _operation(parsed: ParsedOperation, stored: set[str] | None) -> dict[str, Any]:
     changes_data, known = _changes_data(parsed)
     parameters = parsed.parameters[:MAX_PREVIEW_PARAMETERS]
@@ -575,7 +595,7 @@ def _operation(parsed: ParsedOperation, stored: set[str] | None) -> dict[str, An
         "label": parsed.label,
         "status": "in_service" if stored is not None and parsed.name in stored else "new",
         # Nested like `declared`: not a value to take over unseen.
-        "suggested": {"changes_data": changes_data, "known": known},
+        "suggested": {"changes_data": changes_data, "known": known, "returns": _returns(parsed)},
         "truncated": len(parameters) < len(parsed.parameters),
     }
 

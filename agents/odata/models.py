@@ -229,6 +229,35 @@ class ParamDef(_Model):
     required: StrictBool = True
 
 
+def operation_is_write(changes_data: Any, http_method: Any) -> bool:
+    """Whether calling an operation is a write. THE rule, said once.
+
+    A read is only what the catalogue marks ``changes_data: false`` (exactly
+    that; a missing flag is not "only reads") AND sends with ``GET``.
+    Everything else is a write: the default an import gets, and every
+    ``POST`` whatever its flag says -- the catalogue can store ``POST`` with
+    ``changes_data: false``, and that combination is not run as a read.
+
+    Takes the two stored values, so that the model (``OperationDef.is_write``),
+    the code that reads a stored dict without validating it (the service
+    list in ``agents.db``, the search tool) and the client decide alike.
+    """
+    return not (changes_data is False and http_method == "GET")
+
+
+class ReturnDef(_Model):
+    """What an operation returns, as far as the catalogue can use it.
+
+    Only the NAME of a catalogue entity set and whether one entity or many
+    come back: the field allowlist is per entity set, so this is what lets
+    a call's result be cut like a read of that set. A primitive or complex
+    return type is not stored; absent means unknown.
+    """
+
+    entity_set: EdmName
+    collection: StrictBool = False
+
+
 class OperationDef(_Model):
     """A function import (V2), or an action or function (V4).
 
@@ -247,8 +276,14 @@ class OperationDef(_Model):
     description: str = Field(default="", max_length=600)
     enabled: StrictBool = False
     changes_data: StrictBool = True
+    # None = not known: a result is then tied to `bound_to`, or withheld.
+    returns: ReturnDef | None = None
 
     _one_line = field_validator("title")(_one_line)
+
+    def is_write(self) -> bool:
+        """Whether a call of this operation is a write (``operation_is_write``)."""
+        return operation_is_write(self.changes_data, self.http_method)
 
     @field_validator("qualified_name")
     @classmethod
@@ -287,6 +322,11 @@ class ServiceDefinition(_Model):
                     f"bound_to {op.bound_to!r} of operation {op.name!r} "
                     "is not an entity set of this service"
                 )
+            if op.returns is not None and op.returns.entity_set not in names:
+                raise ValueError(
+                    f"returns entity set {op.returns.entity_set!r} of operation "
+                    f"{op.name!r} is not an entity set of this service"
+                )
         # Read through the module so the cap is one constant (and patchable).
         limit = MAX_DEFINITION_BYTES
         if len(self.model_dump_json().encode("utf-8")) > limit:
@@ -300,9 +340,14 @@ class ServiceDefinition(_Model):
         return next((o for o in self.operations if o.name == name), None)
 
     def has_write(self) -> bool:
-        """Whether anything in here can change data in SAP."""
+        """Whether anything in here can change data in SAP.
+
+        An entity set with create, update or delete, or an ENABLED operation
+        that is run as a write (``OperationDef.is_write``: also a ``POST``
+        stored as ``changes_data: false``).
+        """
         return any(e.has_write() for e in self.entity_sets) or any(
-            o.enabled and o.changes_data for o in self.operations
+            o.enabled and o.is_write() for o in self.operations
         )
 
 

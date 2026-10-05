@@ -251,6 +251,26 @@ class ParsedEntitySet:
 
 
 @dataclass(frozen=True)
+class ParsedReturn:
+    """What the document says an operation returns.
+
+    ``entity_set`` is the NAME of an entity set of the result, given only
+    when the document ties the return value to exactly one: the set the
+    import names, when it is part of the result and of the declared type, or
+    the only set of the result with that type (and then only when every
+    entity set of the document was read). ``None`` means "not known": an
+    operation whose return set cannot be resolved is still an operation.
+    ``collection`` is whether ``Collection(...)`` is declared. ``type`` is
+    the EDM name of a PRIMITIVE return type (``Edm.Int32``), ``""`` for
+    anything else.
+    """
+
+    entity_set: str | None
+    collection: bool
+    type: str
+
+
+@dataclass(frozen=True)
 class ParsedOperation:
     name: str
     qualified_name: str
@@ -259,6 +279,9 @@ class ParsedOperation:
     bound_to: str | None
     parameters: tuple[ParamDef, ...]
     label: str
+    # None when the document declares no (readable) return type. Not part of
+    # what makes two parsed operations the same operation.
+    returns: ParsedReturn | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -818,6 +841,50 @@ def _sets_by_type(drafts: dict[str, _SetDraft]) -> dict[str, list[str]]:
     return sets_by_type
 
 
+_COLLECTION = "Collection("
+
+
+@dataclass(frozen=True)
+class _ReturnSets:
+    """What a return type is resolved against: the kept entity sets, by name
+    and by type. ``complete`` is false when entity sets of the document were
+    left unread (the cap), so "the only set of this type" is not known."""
+
+    drafts: dict[str, _SetDraft]
+    by_type: dict[str, list[str]]
+    complete: bool
+
+
+def _parsed_return(
+    type_ref: str | None, named: str | None, schemas: _Schemas, sets: _ReturnSets
+) -> ParsedReturn | None:
+    """A ``ReturnType`` and the entity set the document names for it.
+
+    ``named`` is ``None`` when the document names no set, ``""`` when it
+    names one that is not an entity set of the result, else that set's name.
+    A named set counts only when it has exactly the declared entity type;
+    without one, the only kept set of the type is taken -- never one of
+    several, and never when sets were left unread. Dictionary lookups on one
+    attribute value: nothing here grows with the document.
+    """
+    type_ref = (type_ref or "").strip()
+    collection = type_ref.startswith(_COLLECTION)
+    if collection != type_ref.endswith(")"):
+        return None  # half a `Collection(...)`: one or many would be a guess
+    inner = type_ref[len(_COLLECTION) : -1].strip() if collection else type_ref
+    if not inner or len(inner) > _MAX_TYPE_CHARS:
+        return None
+    if inner.startswith("Edm."):
+        return ParsedReturn(None, collection, inner) if _NAME_RE.fullmatch(inner) else None
+    entity_type = schemas.canonical_type(inner)
+    if named is None:
+        candidates = sets.by_type.get(entity_type, [])
+        named = candidates[0] if sets.complete and len(candidates) == 1 else ""
+    elif named and sets.drafts[named].entity_type != entity_type:
+        named = ""
+    return ParsedReturn(named or None, collection, "")
+
+
 # ------------------------------------------------------------------------- V2
 
 
@@ -974,7 +1041,11 @@ def _v2_navigations(
 
 
 def _v2_operation(
-    element: ET.Element, schemas: _Schemas, sets_by_type: dict[str, list[str]]
+    element: ET.Element,
+    schemas: _Schemas,
+    sets_by_type: dict[str, list[str]],
+    container: ET.Element,
+    sets: _ReturnSets,
 ) -> ParsedOperation | str:
     """The function import, or the reason code it is skipped for."""
     work = schemas.work
@@ -1013,6 +1084,11 @@ def _v2_operation(
     # the set of its RETURN value and decides nothing here.
     # `sets_by_type` holds kept sets only: a skipped set is never a binding.
     candidates = sets_by_type.get(schemas.canonical_type(element.get("action-for")), [])
+    # The set of the RETURN value: a set of this import's own container.
+    named = element.get("EntitySet")
+    if named is not None:
+        found = sets.drafts.get(named.strip())
+        named = found.name if found is not None and found.container is container else ""
     return ParsedOperation(
         name=name,
         qualified_name="",  # a V2 function import is addressed by its plain name
@@ -1021,6 +1097,7 @@ def _v2_operation(
         bound_to=candidates[0] if element.get("action-for") and len(candidates) == 1 else None,
         parameters=tuple(parameters.values()),
         label=_label(element, work),
+        returns=_parsed_return(element.get("ReturnType"), named, schemas, sets),
     )
 
 
@@ -1066,6 +1143,7 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
     # are resolved afterwards, against these only.
     drafts, sets_declared = _entity_set_drafts(schemas, skipped, _v2_fields_of(work))
     sets_by_type = _sets_by_type(drafts)
+    return_sets = _ReturnSets(drafts, sets_by_type, complete=not work.truncated)
     targets = _v2_navigation_targets(schemas, drafts)
     own_navigations = _v2_own_navigations(schemas)
 
@@ -1098,7 +1176,7 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
                 work.truncated = True
                 break
             position += 1
-            operation = _v2_operation(element, schemas, sets_by_type)
+            operation = _v2_operation(element, schemas, sets_by_type, container, return_sets)
             if isinstance(operation, str):
                 skipped.append(SkippedElement("operation", "", position, operation))
             elif operation.name in operations:
@@ -1548,6 +1626,7 @@ def _v4_operation(
     sets_by_type: dict[str, list[str]],
     imports: dict[tuple[str, str], list[tuple[ET.Element, ET.Element]]],
     import_labels: dict[int, str],
+    sets: _ReturnSets,
 ) -> list[ParsedOperation | str]:
     """What one ``Action`` / ``Function`` gives: operations, or reason codes.
 
@@ -1575,6 +1654,8 @@ def _v4_operation(
         return ["invalid_parameter"]
     http_method = "POST" if kind == "action" else "GET"
     label = annotations.label(element, annotations.target(qualified))
+    returned = work.first(element, "ReturnType")
+    return_type = None if returned is None else returned.get("Type")
 
     if bound:
         binding = work.first(element, "Parameter")
@@ -1585,6 +1666,12 @@ def _v4_operation(
         candidates = sets_by_type.get(schemas.canonical_type(type_ref), [])
         if len(candidates) != 1:
             return ["unsupported_binding"]
+        # `EntitySetPath` that is the binding parameter itself: the set the
+        # operation is called on comes back. A longer path (through a
+        # navigation) is not followed; without one the type decides.
+        path = (element.get("EntitySetPath") or "").strip()
+        own = binding is not None and path and path == (binding.get("Name") or "").strip()
+        named = candidates[0] if own else "" if path else None
         return [
             ParsedOperation(
                 name=name,
@@ -1594,6 +1681,7 @@ def _v4_operation(
                 bound_to=candidates[0],
                 parameters=parameters,
                 label=label,
+                returns=_parsed_return(return_type, named, schemas, sets),
             )
         ]
 
@@ -1609,6 +1697,19 @@ def _v4_operation(
             own_label = import_labels[id(imported)] = annotations.label(
                 imported, annotations.target(schemas.name_of(container), import_name)
             )
+        # The import's `EntitySet`: a set of its own container, or
+        # `Container/EntitySet` in the container named (as a binding target).
+        named = imported.get("EntitySet")
+        if named is not None:
+            head, slash, rest = named.strip().partition("/")
+            found = sets.drafts.get(rest if slash else head)
+            if found is None:
+                named = ""
+            elif slash:
+                place = schemas.canonical(head)
+                named = found.name if place and schemas.name_of(found.container) == place else ""
+            else:
+                named = found.name if found.container is container else ""
         outcomes.append(
             ParsedOperation(
                 name=import_name,
@@ -1618,6 +1719,7 @@ def _v4_operation(
                 bound_to=None,
                 parameters=parameters,
                 label=own_label or label,
+                returns=_parsed_return(return_type, named, schemas, sets),
             )
         )
     return outcomes or ["not_imported"]
@@ -1634,6 +1736,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
         schemas, skipped, _v4_fields_of(schemas, annotations)
     )
     sets_by_type = _sets_by_type(drafts)
+    return_sets = _ReturnSets(drafts, sets_by_type, complete=not work.truncated)
     own_navigations = _v4_own_navigations(work)
     # id(EntityType) -> its label: the fallback of every set of the type.
     type_labels: dict[int, str] = {}
@@ -1709,7 +1812,15 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
                 break
             position += 1
             for outcome in _v4_operation(
-                element, kind, namespace, schemas, annotations, sets_by_type, imports, import_labels
+                element,
+                kind,
+                namespace,
+                schemas,
+                annotations,
+                sets_by_type,
+                imports,
+                import_labels,
+                return_sets,
             ):
                 if isinstance(outcome, str):
                     skipped.append(SkippedElement("operation", "", position, outcome))

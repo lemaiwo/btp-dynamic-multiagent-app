@@ -44,6 +44,7 @@ from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import SERVICE_NAME_RE as _ODATA_SERVICE_NAME_RE
 from agents.odata.models import WRITE_OPS as _ODATA_WRITE_OPS
 from agents.odata.models import ServiceDefinition as _ODataServiceDefinition
+from agents.odata.models import operation_is_write as _odata_operation_is_write
 from agents.odata.models import validate_odata_service  # noqa: F401  (re-export)
 
 # Supported MCP auth modes
@@ -603,8 +604,9 @@ class ODataService(Base):
         has_write = any(
             op in _ODATA_WRITE_OPS for e in sets for op in e.get("operations") or []
         ) or any(
-            # `changes_data` defaults to True in OperationDef.
-            bool(o.get("enabled")) and o.get("changes_data", True) is not False
+            # The models' own rule: a missing flag and every POST are writes.
+            bool(o.get("enabled"))
+            and _odata_operation_is_write(o.get("changes_data"), o.get("http_method"))
             for o in ops
         )
         return {"entity_sets": len(sets), "operations": len(ops)}, has_write

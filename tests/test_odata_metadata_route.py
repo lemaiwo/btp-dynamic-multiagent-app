@@ -352,19 +352,25 @@ async def test_changes_data_is_suggested_per_kind(client, remote):
     remote.answer(xml(V4))
     r = await client.post(URL, json=request(odata_version="v4"))
     release, count = r.json()["operations"]
-    assert release["suggested"] == {"changes_data": True, "known": True}
-    assert count["suggested"] == {"changes_data": False, "known": True}
+    assert release["suggested"] == {
+        "changes_data": True,
+        "known": True,
+        # The fixture's action returns the entity it is called on.
+        "returns": {"entity_set": "PurchaseRequisition", "collection": False, "type": ""},
+    }
+    assert count["suggested"]["changes_data"] is False and count["suggested"]["known"] is True
     # V2: a POST function import changes data ...
     remote.answer(xml(V2))
     (post,) = (await client.post(URL, json=REQUEST)).json()["operations"]
-    assert post["suggested"] == {"changes_data": True, "known": True}
+    item = {"entity_set": "A_PurchaseRequisitionItem", "collection": False, "type": ""}
+    assert post["suggested"] == {"changes_data": True, "known": True, "returns": item}
     # ... and of a GET one nothing is known: it is treated as changing.
     as_get = V2.replace(b'm:HttpMethod="POST"', b'm:HttpMethod="GET"')
     assert as_get != V2
     remote.answer(xml(as_get))
     (get,) = (await client.post(URL, json=REQUEST)).json()["operations"]
     assert get["http_method"] == "GET"
-    assert get["suggested"] == {"changes_data": True, "known": False}
+    assert get["suggested"] == {"changes_data": True, "known": False, "returns": item}
 
 
 async def test_nothing_in_the_preview_is_enabled(client, remote):

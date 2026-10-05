@@ -302,9 +302,20 @@ async def test_has_write_true_for_an_enabled_changing_operation_or_a_write_op():
     by_entity = good(name="by-entity")
     by_entity["definition"]["entity_sets"][0]["operations"] = ["list", "get", "update"]
     read_only_op = good(name="read-only-op")
-    read_only_op["definition"]["operations"][0].update(enabled=True, changes_data=False)
+    read_only_op["definition"]["operations"][0].update(
+        enabled=True, changes_data=False, http_method="GET"
+    )
+    # Stored as "only reads", but a POST: it runs as a write, so it counts as one.
+    post_reading = good(name="post-reading")
+    post_reading["definition"]["operations"][0].update(enabled=True, changes_data=False)
+    # A stored row without the flag (older data): the model's default, a write.
+    get_unsaid = good(name="get-unsaid")
+    get_unsaid["definition"]["operations"][0].update(enabled=True, http_method="GET")
     async with SessionLocal() as s:
-        cases = ((by_op, True), (by_entity, True), (read_only_op, False), (good(), False))
+        cases = (
+            (by_op, True), (by_entity, True), (read_only_op, False), (good(), False),
+            (post_reading, True), (get_unsaid, True),
+        )
         for data, expected in cases:
             row = await create_odata_service(s, validate_odata_service(data))
             assert row.to_dict()["has_write"] is expected, data["name"]
