@@ -1680,7 +1680,12 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         # is checked as text, under jsdom, and against the live API.
         check("odata is a known destination built-in",
               "'builtin:odata':" in html and "['services', 'allow_write']" in html)
-        check("odata services select exists", 'class="dest-services"' in html)
+        check("odata services picker exists", 'class="dest-services"' in html)
+        # A list box replaces the whole selection on one plain click or arrow
+        # key; for a control that grants access that is a silent detach.
+        check("the picker is a checkbox list, not a list box",
+              "<select multiple" not in html and "dest-service-check" in html)
+        check("the write switch is described as a standing grant", "standing grant" in html)
         check("odata write switch exists", 'class="dest-allow_write"' in html)
         check("the destination name can be hidden", "dest-field-destination" in html)
         check("write switch uses the approved wording",
@@ -1696,13 +1701,15 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                   m is not None and "loadODataCatalogue()" in m.group(1))
         # Catalogue text (titles, purposes) is admin-written: the picker is
         # built from DOM nodes, never from an HTML string.
-        for fn in ("renderODataServiceOptions", "syncODataNotes", "syncODataRows"):
+        for fn in ("renderODataServiceChecks", "syncODataNotes", "syncODataRows"):
             m = re.search(rf"function {fn}\(.*?\n\}}", js, re.DOTALL)
             check(f"{fn}() builds no HTML from catalogue text",
                   m is not None and "innerHTML" not in m.group(0) and "textContent" in m.group(0))
 
         # A stored entry, as GET /agents/{id} answers it, for the round trip
         # below: load it into the row, collect it, PUT it back unchanged.
+        # Not in name order: the catalogue lists by name, so a round trip
+        # that kept this order did not take it from the catalogue.
         odata_names = ["purchase-requisitions", "business-partners"]
         for svc_name, as_user in zip(odata_names, (True, False)):
             r = await client.post("/admin/api/odata/services", json={
@@ -1715,7 +1722,7 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             })
             check(f"fixture OData service {svc_name} created", r.status_code == 201, r.text[:300])
         odata_entry = {"url": "builtin:odata", "auth_mode": "destination",
-                       "oauth": {"services": list(reversed(odata_names)), "allow_write": True}}
+                       "oauth": {"services": list(odata_names), "allow_write": True}}
         odata_agent = {
             "name": "uiodata", "description": "UI test agent with OData services.",
             "instructions": "You are a UI test agent.", "enabled": True,
@@ -1731,7 +1738,7 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             stored_odata = r.json()["mcp_servers"]
             check("the stored entry holds the services in the saved order and the write switch",
                   len(stored_odata) == 1
-                  and stored_odata[0]["oauth"].get("services") == list(reversed(odata_names))
+                  and stored_odata[0]["oauth"].get("services") == odata_names
                   and stored_odata[0]["oauth"].get("allow_write") is True,
                   str(stored_odata))
 
@@ -1747,6 +1754,20 @@ const dom = new JSDOM(`<!doctype html><html><body>
   <input id="agent-api-slug" value="">
   <input type="checkbox" id="agent-expose-api">
   <p id="agent-endpoint-hint"></p>
+  <div id="agent-modal"></div>
+  <input id="agent-id" value="7"><input id="agent-name" value="uiodata">
+  <input id="agent-description" value="d"><textarea id="agent-instructions">i</textarea>
+  <select id="agent-model-name"><option value="" selected></option></select>
+  <input type="checkbox" id="agent-enabled" checked>
+  <input type="checkbox" id="agent-expose-chat" checked>
+  <input id="agent-run-as" value=""><input id="agent-run-prompt" value="">
+  <input id="agent-run-timeout" value="1800">
+  <div id="agent-skills"></div><div id="agent-peers"></div>
+  <input type="checkbox" id="agent-deep-enabled"><input type="checkbox" id="agent-deep-planning">
+  <input type="checkbox" id="agent-deep-scratchpad">
+  <input type="checkbox" id="agent-deep-subagents">
+  <input id="agent-deep-max-subagents" value="5"><input id="agent-deep-max-depth" value="1">
+  <textarea id="agent-deep-instructions"></textarea>
 </body></html>`, { url: 'https://admin.example/admin' });
 global.window = dom.window;
 global.document = dom.window.document;
@@ -1919,58 +1940,103 @@ assert.strictEqual(row.querySelector('.dest-user_context').checked, false, 'stor
 assert.deepStrictEqual(out.oauth, { destination: 'D' });
 
 // --- builtin:odata ---------------------------------------------------------
-const optionsOf = r => [...r.querySelector('.dest-services').options];
-const picked = r => optionsOf(r).filter(o => o.selected).map(o => o.value);
-const optionOf = (r, name) => optionsOf(r).find(o => o.value === name);
+// The picker is a checkbox list. Events are dispatched, so the listeners the
+// page installs are what is exercised (the auth-mode select and the API
+// switch use inline handlers, which jsdom does not run: those are called).
+const fire = (el, type) => el.dispatchEvent(new window.Event(type, { bubbles: true }));
+const boxesOf = r => [...r.querySelectorAll('.dest-services .dest-service-check')];
+const picked = r => boxesOf(r).filter(b => b.checked).map(b => b.value);
+const boxOf = (r, name) => boxesOf(r).find(b => b.value === name);
+const textOf = (r, name) => boxOf(r, name).closest('label').textContent;
+const tick = (r, name, on) => { const b = boxOf(r, name); b.checked = on; fire(b, 'change'); };
+const typeUrl = (r, url) => {
+    const u = r.querySelector('.mcp-url');
+    u.value = url;
+    fire(u, 'input');
+};
+const setMode = (r, mode) => {
+    r.querySelector('.mcp-auth-mode').value = mode;
+    toggleOauthFields(r.querySelector('.mcp-auth-mode'));
+    updateEndpointHint();
+};
 const shown = (r, cls) => r.querySelector(cls).style.display;
 const noteOf = r => r.querySelector('.dest-services-note').textContent;
 const warningOf = r => r.querySelector('.dest-odata-warning').textContent;
+const writeNoteOf = r => r.querySelector('.dest-allow_write-note').textContent;
+const hintOf = r => r.querySelector('.dest-hint').textContent;
 const expose = document.getElementById('agent-expose-api');
+const setExpose = on => { expose.checked = on; updateEndpointHint(); };
+const odata = (services, extra) => ({ url: 'builtin:odata', auth_mode: 'destination',
+    oauth: Object.assign({ services }, extra || {}) });
 
 // 10. The entry is {services, allow_write}: no destination, no identity.
-({ row, out } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-    oauth: { services: ['purchase-requisitions'], allow_write: true } },
+({ row, out } = addAndCollect(odata(['purchase-requisitions'], { allow_write: true }),
     { odataServices: CATALOGUE }));
 assert.deepStrictEqual(out, { url: 'builtin:odata', auth_mode: 'destination',
     oauth: { services: ['purchase-requisitions'], allow_write: true } });
 assert.strictEqual(shown(row, '.dest-field-destination'), 'none', 'no destination name for odata');
 assert.strictEqual(shown(row, '.dest-field-user_context'), 'none', 'no identity switch for odata');
-assert.strictEqual(row.querySelector('.dest-field-services').style.display, '');
-assert.strictEqual(row.querySelector('.dest-field-allow_write').style.display, '');
+assert.strictEqual(shown(row, '.dest-field-services'), '');
+assert.strictEqual(shown(row, '.dest-field-allow_write'), '');
 assert.strictEqual(row.querySelector('.dest-allow_write').checked, true);
-assert.ok(row.querySelector('.dest-hint').textContent.includes(
-    'Destination and identity come from each catalogue service'));
-assert.ok(row.querySelector('.dest-hint').textContent.includes('UI5 admin'));
-assert.strictEqual(optionOf(row, 'purchase-requisitions').textContent,
-    'Purchase requisitions (purchase-requisitions) — V2 — runs as signed-in user');
-assert.strictEqual(optionOf(row, 'business-partners').textContent,
+assert.ok(hintOf(row).includes('Destination and identity come from each catalogue service'));
+assert.ok(hintOf(row).includes('UI5 admin'));
+assert.strictEqual(textOf(row, 'purchase-requisitions'), 'Purchase requisitions '
+    + '(purchase-requisitions) — V2 — runs as signed-in user — has write operations');
+assert.strictEqual(textOf(row, 'business-partners'),
     'Business partners (business-partners) — V2 — runs as technical user');
-assert.ok(optionOf(row, 'purchase-requisitions-v4').textContent.endsWith('— disabled'),
+assert.ok(textOf(row, 'purchase-requisitions-v4').endsWith('— disabled'),
     'a disabled service is offered and marked');
-assert.strictEqual(row.querySelector('.dest-field-services input'), null,
+assert.strictEqual(row.querySelector('.dest-field-services select'), null, 'no list box');
+assert.strictEqual(row.querySelector('.dest-field-services input:not([type=checkbox])'), null,
     'no free-text field for service names');
+assert.ok(boxesOf(row).every(b => b.type === 'checkbox' && !b.disabled));
+
+// 10a. Accessibility: the note and the warning are outside every <label>
+//      (a click on that text must not move focus into the list or tick a
+//      box), the group and the switch are described by them, and the switch's
+//      label holds the two words only.
+for (const cls of ['.dest-services-note', '.dest-odata-warning', '.dest-allow_write-note']) {
+    assert.strictEqual(row.querySelector(cls).closest('label'), null, cls + ' is not in a label');
+}
+const group = row.querySelector('.dest-field-services [role=group]');
+const describedBy = el => (el.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean)
+    .map(id => document.getElementById(id));
+assert.deepStrictEqual(describedBy(group),
+    [row.querySelector('.dest-services-note'), row.querySelector('.dest-odata-warning')]);
+assert.strictEqual(row.querySelector('.dest-odata-warning').getAttribute('role'), 'status');
+const writeBox = row.querySelector('.dest-allow_write');
+assert.strictEqual(writeBox.closest('label').textContent.trim(), 'Allow writes');
+assert.deepStrictEqual(describedBy(writeBox), [row.querySelector('.dest-allow_write-note')]);
 
 // 11. allow_write is only ever sent as true; the stored order is kept, and a
 //     disabled service may stay attached.
-({ row, out } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-    oauth: { services: ['purchase-requisitions-v4', 'business-partners'] } },
+({ row, out } = addAndCollect(odata(['purchase-requisitions-v4', 'business-partners']),
     { odataServices: CATALOGUE }));
 assert.deepStrictEqual(out.oauth, { services: ['purchase-requisitions-v4', 'business-partners'] });
 assert.ok(noteOf(row).includes('purchase-requisitions-v4') && noteOf(row).includes('isabled'),
     'the note says which attached service is disabled');
 for (const notTrue of ['true', 1, false, null]) {
-    ({ row, out } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-        oauth: { services: ['business-partners'], allow_write: notTrue } }));
+    ({ row, out } = addAndCollect(odata(['business-partners'], { allow_write: notTrue })));
     assert.strictEqual(row.querySelector('.dest-allow_write').checked, false,
         'only the boolean true ticks the switch');
     assert.deepStrictEqual(out.oauth, { services: ['business-partners'] });
 }
 row.querySelector('.dest-allow_write').checked = true;
+fire(row.querySelector('.dest-allow_write'), 'change');
 assert.strictEqual(collectMcpServers()[0].oauth.allow_write, true, 'a JSON boolean, not a string');
-optionOf(row, 'purchase-requisitions').selected = true;
-assert.deepStrictEqual(collectMcpServers()[0].oauth,
-    { services: ['business-partners', 'purchase-requisitions'], allow_write: true },
-    'a newly picked service follows the stored ones');
+
+// 11a. Order of the posted list: stored names first, in the stored order;
+//      then the newly ticked ones in catalogue order, whatever the click order.
+({ row } = addAndCollect(odata(['purchase-requisitions-v4', 'gone-service'])));
+tick(row, 'purchase-requisitions', true);
+tick(row, 'business-partners', true);
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { services:
+    ['purchase-requisitions-v4', 'gone-service', 'business-partners', 'purchase-requisitions'] });
+// One click changes one service, never the rest of the selection.
+tick(row, 'business-partners', false);
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { services:
+    ['purchase-requisitions-v4', 'gone-service', 'purchase-requisitions'] });
 
 // 12. Nothing of another built-in is posted: not what a stored block holds,
 //     not what the row's other fields still hold after the url changed.
@@ -1983,117 +2049,169 @@ assert.deepStrictEqual(out.oauth, { services: ['business-partners'] },
 ({ row } = addAndCollect({ url: 'builtin:outlook', auth_mode: 'destination',
     oauth: { destination: 'GRAPH', user_context: true, lookback: '2d', recipients: 'a@x',
              allow_send: true, theme: { band: '#102030' } } }));
-row.querySelector('.mcp-url').value = 'Builtin:OData/';
-syncDestinationFields(row);
-optionOf(row, 'business-partners').selected = true;
+typeUrl(row, 'Builtin:OData/');
+assert.strictEqual(shown(row, '.dest-field-services'), '', 'typing the url shows the picker');
+tick(row, 'business-partners', true);
 assert.deepStrictEqual(collectMcpServers()[0].oauth, { services: ['business-partners'] });
 
-// 13. No other server type posts services or allow_write.
-({ out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+// 13. No other server type posts services or allow_write, and the write
+//     switch is only ever loaded for, and kept on, a builtin:odata row.
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
     oauth: { destination: 'JIRA', project: 'ABC', services: ['business-partners'],
              allow_write: true } }));
 assert.deepStrictEqual(out.oauth, { destination: 'JIRA', project: 'ABC' });
+assert.strictEqual(row.querySelector('.dest-allow_write').checked, false,
+    'a stored allow_write of another type does not tick the switch');
+typeUrl(row, 'builtin:odata');
+assert.strictEqual(row.querySelector('.dest-allow_write').checked, false,
+    'so making the row an odata row grants no writes');
 ({ row, out } = addAndCollect({ url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
     oauth: { destination: 'D', services: ['business-partners'], allow_write: true } }));
 assert.deepStrictEqual(out.oauth, { destination: 'D' });
-assert.strictEqual(row.querySelector('.dest-field-services').style.display, 'none');
-assert.strictEqual(row.querySelector('.dest-field-allow_write').style.display, 'none');
+assert.strictEqual(shown(row, '.dest-field-services'), 'none');
+assert.strictEqual(shown(row, '.dest-field-allow_write'), 'none');
 assert.strictEqual(shown(row, '.dest-field-destination'), '',
     'every other type names a destination');
-row.querySelector('.mcp-url').value = 'builtin:odata';
-syncDestinationFields(row);
-row.querySelector('.mcp-url').value = 'builtin:jira';
-syncDestinationFields(row);
-row.querySelector('.dest-allow_write').checked = true;
-assert.deepStrictEqual(collectMcpServers()[0].oauth, { destination: 'D' });
+({ row } = addAndCollect(odata(['business-partners'], { allow_write: true })));
+typeUrl(row, 'builtin:jira');
+assert.strictEqual(row.querySelector('.dest-allow_write').checked, false,
+    'editing the url away from builtin:odata clears the switch');
+assert.ok(!('allow_write' in collectMcpServers()[0].oauth));
+typeUrl(row, 'builtin:odata');
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { services: ['business-partners'] },
+    'coming back starts without writes');
 
-// 14. A stored name the catalogue no longer has stays selected, is marked,
-//     and is still posted: the server refuses it, the note says to remove it.
-({ row, out } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-    oauth: { services: ['gone-service', 'business-partners'] } }));
+// 13a. A brand-new row: the url typed afterwards, writes off, none posted.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+setMode(row, 'destination');
+typeUrl(row, 'builtin:odata');
+assert.strictEqual(row.querySelector('.dest-allow_write').checked, false,
+    'writes are off by default');
+assert.deepStrictEqual(picked(row), [], 'nothing is attached by default');
+assert.throws(() => collectMcpServers(), /Select at least one OData service/);
+tick(row, 'purchase-requisitions', true);
+assert.deepStrictEqual(collectMcpServers(), [{ url: 'builtin:odata', auth_mode: 'destination',
+    oauth: { services: ['purchase-requisitions'] } }]);
+
+// 14. A stored name the catalogue no longer has is a ticked box, marked, and
+//     still posted: the server refuses it, the note says to remove it.
+({ row, out } = addAndCollect(odata(['gone-service', 'business-partners'])));
 assert.deepStrictEqual(picked(row).sort(), ['business-partners', 'gone-service']);
-assert.strictEqual(optionOf(row, 'gone-service').textContent, 'gone-service (not in catalogue)');
+assert.strictEqual(textOf(row, 'gone-service'), 'gone-service (not in catalogue)');
 assert.deepStrictEqual(out.oauth, { services: ['gone-service', 'business-partners'] });
-assert.ok(/gone-service/.test(noteOf(row)) && /[Rr]emove|[Dd]eselect/.test(noteOf(row)),
+assert.ok(/gone-service/.test(noteOf(row)) && /[Rr]emove|[Uu]ntick/.test(noteOf(row)),
     noteOf(row));
-optionOf(row, 'gone-service').selected = false;
-odataSelectionChanged(row);
+tick(row, 'gone-service', false);
 assert.ok(!/gone-service/.test(noteOf(row)), 'the note follows the selection');
 assert.deepStrictEqual(collectMcpServers()[0].oauth, { services: ['business-partners'] });
 
 // 15. No service selected: refused here, never posted as an empty list.
-optionOf(row, 'business-partners').selected = false;
+tick(row, 'business-partners', false);
 assert.throws(() => collectMcpServers(), /Select at least one OData service/);
 // ... and builtin:odata on another auth mode is refused, not posted.
-optionOf(row, 'business-partners').selected = true;
-row.querySelector('.mcp-auth-mode').value = 'oauth2';
-toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+tick(row, 'business-partners', true);
+setMode(row, 'oauth2');
 assert.throws(() => collectMcpServers(), /builtin:odata.*BTP destination/);
 
-// 16. One builtin:odata entry per agent: a second row offers no services,
-//     says why, and blocks the save until one of the two is gone.
-({ row } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-    oauth: { services: ['business-partners'] } }));
-addMcpServerRow({ url: 'builtin:odata', auth_mode: 'destination',
-    oauth: { services: ['purchase-requisitions'] } });
+// 16. One builtin:odata entry per agent: the other row offers no services,
+//     says so without telling which one to remove, and the save is blocked.
+({ row } = addAndCollect(odata(['business-partners'])));
+addMcpServerRow(odata(['purchase-requisitions']));
 let rows = [...document.querySelectorAll('.mcp-server-row')];
-assert.strictEqual(rows[0].querySelector('.dest-field-services').style.display, '');
-assert.strictEqual(rows[1].querySelector('.dest-field-services').style.display, 'none');
-assert.strictEqual(rows[1].querySelector('.dest-field-allow_write').style.display, 'none');
-assert.ok(/already has a builtin:odata entry/.test(rows[1].querySelector('.dest-hint').textContent),
-    rows[1].querySelector('.dest-hint').textContent);
-assert.throws(() => collectMcpServers(), /one builtin:odata entry/);
+assert.strictEqual(shown(rows[0], '.dest-field-services'), '');
+assert.strictEqual(shown(rows[1], '.dest-field-services'), 'none');
+assert.strictEqual(shown(rows[1], '.dest-field-allow_write'), 'none');
+assert.ok(/[Tt]wo builtin:odata rows/.test(hintOf(rows[1])) && /keep one/i.test(hintOf(rows[1])),
+    hintOf(rows[1]));
+assert.ok(!/remove this row/i.test(hintOf(rows[1])), 'the hint does not pick the row to remove');
+assert.throws(() => collectMcpServers(), /[Tt]wo builtin:odata rows/);
 rows[0].remove();
 updateEndpointHint();
 assert.strictEqual(shown(rows[1], '.dest-field-services'), '', 'the remaining row is the entry');
 assert.deepStrictEqual(collectMcpServers().map(s => s.oauth),
     [{ services: ['purchase-requisitions'] }]);
-// typing the url into a second new row is caught the same way
+
+// 16a. The entry is the row that holds the stored services, not the first
+//      row in the list: an earlier row whose url is edited to builtin:odata
+//      must not turn the stored entry into "the duplicate".
+document.getElementById('agent-mcp-servers').innerHTML = '';
+renderMcpServers([{ url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
+                    oauth: { destination: 'D' } },
+                  odata(['purchase-requisitions'], { allow_write: true })]);
+rows = [...document.querySelectorAll('.mcp-server-row')];
+typeUrl(rows[0], 'builtin:odata');
+assert.strictEqual(shown(rows[1], '.dest-field-services'), '', 'the stored entry stays the entry');
+assert.strictEqual(shown(rows[0], '.dest-field-services'), 'none');
+assert.ok(/[Tt]wo builtin:odata rows/.test(hintOf(rows[0])), hintOf(rows[0]));
+assert.throws(() => collectMcpServers(), /[Tt]wo builtin:odata rows/);
+typeUrl(rows[0], 'https://arc1.example.com/mcp');
+assert.deepStrictEqual(collectMcpServers()[1].oauth,
+    { services: ['purchase-requisitions'], allow_write: true }, 'nothing of the entry was lost');
+// A first row with the url on another auth mode is not the entry either.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+renderMcpServers([{ url: 'builtin:odata', auth_mode: 'jwt' }]);
 addMcpServerRow();
 rows = [...document.querySelectorAll('.mcp-server-row')];
-rows[1].querySelector('.mcp-url').value = 'builtin:odata';
-rows[1].querySelector('.mcp-auth-mode').value = 'destination';
-toggleOauthFields(rows[1].querySelector('.mcp-auth-mode'));
-assert.strictEqual(rows[1].querySelector('.dest-field-services').style.display, 'none');
-assert.throws(() => collectMcpServers(), /one builtin:odata entry/);
+setMode(rows[1], 'destination');
+typeUrl(rows[1], 'builtin:odata');
+assert.strictEqual(shown(rows[1], '.dest-field-services'), '',
+    'the destination-mode row is the entry, not the earlier row on another mode');
+tick(rows[1], 'business-partners', true);
+assert.throws(() => collectMcpServers(), /[Tt]wo builtin:odata rows/, 'still two rows: no save');
 
 // 17. Exposed for job runs + a service that runs as the signed-in user: warn.
-({ row } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-    oauth: { services: ['business-partners', 'purchase-requisitions'] } }));
+({ row } = addAndCollect(odata(['business-partners', 'purchase-requisitions'])));
 assert.strictEqual(warningOf(row), '', 'no warning while the agent is not exposed for runs');
-expose.checked = true;
-updateEndpointHint();
+setExpose(true);
+assert.ok(warningOf(row).startsWith('Warning:'), 'not told apart from the note by colour alone');
 assert.ok(warningOf(row).includes('Purchase requisitions') && /signed-in user/.test(warningOf(row))
     && /refused/.test(warningOf(row)), warningOf(row));
 assert.ok(!warningOf(row).includes('Business partners'), 'a technical-user service is not named');
-optionOf(row, 'purchase-requisitions').selected = false;
-odataSelectionChanged(row);
+tick(row, 'purchase-requisitions', false);
 assert.strictEqual(warningOf(row), '', 'technical-user services only: nothing to warn about');
-expose.checked = false;
-updateEndpointHint();
+setExpose(false);
+
+// 17a. The write switch says what it opens: the selected services that have
+//      write operations enabled, or that none has one yet; and that it is a
+//      standing grant.
+({ row } = addAndCollect(odata(['business-partners'])));
+assert.ok(/standing grant/.test(writeNoteOf(row)) && /later/.test(writeNoteOf(row)),
+    writeNoteOf(row));
+assert.ok(/None of the selected services has a write operation enabled/.test(writeNoteOf(row)),
+    writeNoteOf(row));
+tick(row, 'purchase-requisitions', true);
+assert.ok(writeNoteOf(row).includes('"Purchase requisitions"')
+    && !writeNoteOf(row).includes('"Business partners"')
+    && !/None of the selected/.test(writeNoteOf(row)), writeNoteOf(row));
 
 // 18. Catalogue text is rendered as text.
-({ row, out } = addAndCollect(
-    { url: 'builtin:odata', auth_mode: 'destination', oauth: { services: ['evil'] } },
-    { odataServices: [{ name: 'evil', title: '<img src=x onerror=alert(1)>', purpose: '<b>p</b>',
-                        destination: 'D', user_context: true, odata_version: 'v2',
-                        enabled: false }] }));
-expose.checked = true;
-updateEndpointHint();
+const EVIL = '<img src=x onerror=alert(1)>';
+({ row, out } = addAndCollect(odata(['evil']),
+    { odataServices: [{ name: 'evil', title: EVIL, purpose: '<b>p</b>', destination: 'D',
+                        user_context: true, odata_version: 'v2', enabled: false,
+                        has_write: true }] }));
+setExpose(true);
 assert.strictEqual(row.querySelector('img'), null, 'a title never becomes markup');
-assert.ok(optionOf(row, 'evil').textContent.startsWith('<img src=x onerror=alert(1)> (evil)'));
-assert.ok(warningOf(row).includes('<img src=x onerror=alert(1)>'));
-expose.checked = false;
-updateEndpointHint();
-// ... and a catalogue answer that is not a list of named services offers nothing.
-row = addRow({ url: 'builtin:odata', auth_mode: 'destination', oauth: {} },
-    { odataServices: [{ title: 'no name' }, null, 'x', { name: 7 }] });
-assert.strictEqual(row.querySelector('.dest-services').options.length, 0);
+assert.strictEqual(row.querySelector('.dest-field-services b'), null);
+assert.ok(textOf(row, 'evil').startsWith(EVIL + ' (evil)'));
+assert.ok(warningOf(row).includes(EVIL) && writeNoteOf(row).includes(EVIL));
+setExpose(false);
+// ... a catalogue answer that is not a list of named services offers nothing,
+row = addRow(odata([]), { odataServices: [{ title: 'no name' }, null, 'x', { name: 7 }] });
+assert.strictEqual(boxesOf(row).length, 0);
+// ... and a field the answer lacks is not guessed: no empty version, and an
+// unknown identity is not shown as the technical user.
+row = addRow(odata([]),
+    { odataServices: [{ name: 'bare' }, { name: 'tech', user_context: false }] });
+assert.strictEqual(textOf(row, 'bare'), 'bare — identity unknown');
+assert.strictEqual(textOf(row, 'tech'), 'tech — runs as technical user');
 
 // 19. An empty catalogue: nothing to pick, a pointer to the UI5 admin, and
 //     still no free-text field.
-row = addRow({ url: 'builtin:odata', auth_mode: 'destination', oauth: {} }, { odataServices: [] });
-assert.strictEqual(row.querySelector('.dest-services').style.display, 'none');
+row = addRow(odata([]), { odataServices: [] });
+assert.strictEqual(shown(row, '.dest-services'), 'none');
 assert.ok(/empty/.test(noteOf(row)) && /UI5 admin/.test(noteOf(row)), noteOf(row));
 assert.strictEqual(row.querySelector('.dest-field-services input'), null);
 assert.strictEqual(row.querySelector('.dest-field-services textarea'), null);
@@ -2108,30 +2226,33 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
 
 (async () => {
     // 21. The catalogue is fetched when the editor opens; rows already drawn
-    //     are filled in and keep what they had selected.
+    //     are filled in and keep what they had selected. Until it is in, the
+    //     boxes cannot be changed, and a save posts the stored entry as it is.
     let calls = [];
     let answer = () => ({ ok: true, status: 200, json: async () => CATALOGUE });
     global.fetch = async (url, opts) => {
-        calls.push([url, (opts && opts.method) || 'GET']);
-        return answer();
+        calls.push([url, (opts && opts.method) || 'GET', opts && opts.body]);
+        return answer(url, opts);
     };
     setODataCatalogue(null);
-    ({ row, out } = addAndCollect({ url: 'builtin:odata', auth_mode: 'destination',
-        oauth: { services: ['purchase-requisitions', 'gone-service'], allow_write: true } }));
+    ({ row, out } = addAndCollect(odata(['purchase-requisitions', 'gone-service'],
+        { allow_write: true })));
     const asStored = { services: ['purchase-requisitions', 'gone-service'], allow_write: true };
     assert.deepStrictEqual(out.oauth, asStored,
         'a save before the catalogue is in changes nothing');
-    assert.strictEqual(optionOf(row, 'gone-service').textContent, 'gone-service',
+    assert.strictEqual(textOf(row, 'gone-service'), 'gone-service',
         'nothing is called missing before the catalogue is known');
+    assert.ok(boxesOf(row).length === 2 && boxesOf(row).every(b => b.disabled && b.checked),
+        'not editable while loading');
     await loadODataCatalogue();
-    assert.deepStrictEqual(calls, [['/admin/api/odata/services', 'GET']]);
-    assert.strictEqual(row.querySelector('.dest-services').options.length, 4);
-    assert.strictEqual(optionOf(row, 'gone-service').textContent,
-        'gone-service (not in catalogue)');
+    assert.deepStrictEqual(calls.map(c => c.slice(0, 2)), [['/admin/api/odata/services', 'GET']]);
+    assert.strictEqual(boxesOf(row).length, 4);
+    assert.ok(boxesOf(row).every(b => !b.disabled), 'editable once the catalogue is known');
+    assert.strictEqual(textOf(row, 'gone-service'), 'gone-service (not in catalogue)');
     assert.deepStrictEqual(collectMcpServers()[0].oauth, asStored);
 
     // 22. The call fails: say so, point to the UI5 admin, keep the stored
-    //     entry as it is, offer no free text.
+    //     entry as it is, lock the boxes, offer no free text.
     const failures = [
         () => ({ ok: false, status: 403, json: async () => ({ detail: 'Forbidden' }) }),
         () => { throw new Error('network'); },
@@ -2143,12 +2264,14 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         assert.ok(/could not be loaded/.test(noteOf(row)) && /UI5 admin/.test(noteOf(row)),
             noteOf(row));
         assert.deepStrictEqual(picked(row), ['purchase-requisitions', 'gone-service']);
-        assert.strictEqual(optionOf(row, 'gone-service').textContent, 'gone-service');
-        assert.strictEqual(row.querySelector('.dest-field-services input'), null);
+        assert.ok(boxesOf(row).every(b => b.disabled), 'not editable without a catalogue');
+        assert.strictEqual(textOf(row, 'gone-service'), 'gone-service');
+        assert.strictEqual(
+            row.querySelector('.dest-field-services input:not([type=checkbox])'), null);
         assert.deepStrictEqual(collectMcpServers()[0].oauth, asStored);
     }
-    row = addRow({ url: 'builtin:odata', auth_mode: 'destination', oauth: {} });
-    assert.strictEqual(row.querySelector('.dest-services').style.display, 'none');
+    row = addRow(odata([]));
+    assert.strictEqual(shown(row, '.dest-services'), 'none');
     assert.ok(/could not be loaded/.test(noteOf(row)));
 
     // 23. A slow answer of an earlier open never overwrites a later one.
@@ -2163,12 +2286,41 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
     await loadODataCatalogue();
     releaseSlow();
     await slow;
-    assert.strictEqual(optionsOf(row).length, 3, 'the later answer stands');
+    assert.strictEqual(boxesOf(row).length, 3, 'the later answer stands');
 
-    // 24. The entry as the live API stored it: load, collect, same entry.
+    // 24. saveAgent() with an odata row: the request body carries the entry
+    //     and nothing else in its block, and a refusal is shown as text.
+    ({ row } = addAndCollect(odata(['purchase-requisitions'], { allow_write: true })));
+    tick(row, 'business-partners', true);
+    calls = [];
+    const refusal = "unknown OData service '<b>x</b>'";
+    answer = () => ({ ok: false, status: 422, statusText: 'Unprocessable Entity',
+                      json: async () => ({ detail: refusal }) });
+    await saveAgent();
+    assert.deepStrictEqual(calls.map(c => c.slice(0, 2)), [['/admin/api/agents/7', 'PUT']]);
+    const sent = JSON.parse(calls[0][2]);
+    assert.deepStrictEqual(sent.mcp_servers, [{ url: 'builtin:odata', auth_mode: 'destination',
+        oauth: { services: ['purchase-requisitions', 'business-partners'], allow_write: true } }]);
+    assert.strictEqual(sent.mcp_servers[0].oauth.allow_write, true);
+    const toastEl = document.getElementById('toast');
+    assert.strictEqual(toastEl.textContent, 'Save failed: ' + refusal);
+    assert.strictEqual(toastEl.querySelector('b'), null, 'server text is not markup');
+    // ... and a row the form refuses is never sent at all.
+    tick(row, 'purchase-requisitions', false);
+    tick(row, 'business-partners', false);
+    calls = [];
+    await saveAgent();
+    assert.deepStrictEqual(calls, [], 'no request for an entry without services');
+    assert.strictEqual(toastEl.textContent, 'Select at least one OData service');
+
+    // 25. The entry as the live API stored it: load, collect, same entry. The
+    //     catalogue here lists by name, the stored entry does not.
     if (STORED_ODATA) {
         document.getElementById('agent-mcp-servers').innerHTML = '';
         renderMcpServers(STORED_ODATA);
+        assert.notDeepStrictEqual(STORED_ODATA[0].oauth.services,
+            CATALOGUE.map(s => s.name).filter(n => STORED_ODATA[0].oauth.services.includes(n)),
+            'the fixture order differs from the catalogue order');
         const again = collectMcpServers();
         assert.deepStrictEqual(Object.keys(again[0].oauth).sort(), ['allow_write', 'services']);
         console.log('ROUNDTRIP:' + JSON.stringify(again));
@@ -2226,6 +2378,10 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                 os.unlink(dest_harness_path)
             if odata_agent_id is not None:
                 await client.delete(f"/admin/api/agents/{odata_agent_id}")
+        for svc_name in odata_names:
+            r = await client.delete(f"/admin/api/odata/services/{svc_name}")
+            check(f"fixture OData service {svc_name} removed", r.status_code == 204,
+                  f"{r.status_code} {r.text[:200]}")
 
         # ------------------------------------------------------------------
         # saveAgent() must actually SEND all six exposure fields, not just
