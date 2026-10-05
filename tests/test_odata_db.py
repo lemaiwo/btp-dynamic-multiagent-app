@@ -379,10 +379,9 @@ async def test_referrers_merge_two_entries_of_one_agent():
         assert got == [("buyer", True)]
 
 
-@pytest.mark.xfail(strict=True, raises=ValueError, reason="R2")
 async def test_referrers_lists_enabled_and_disabled_agents_with_allow_write():
-    """Through ``upsert_agent``: red until R2 teaches the storage cleaner the
-    ``builtin:odata`` block (today it demands a destination name)."""
+    """Through ``upsert_agent``, i.e. the storage cleaner's own shape of the
+    ``builtin:odata`` block (it names no destination)."""
     async with SessionLocal() as s:
         for name, enabled in (("buyer", True), ("reader", False)):
             await upsert_agent(

@@ -109,8 +109,8 @@ def good(**patch: Any) -> dict[str, Any]:
 
 
 def _agent_row(name: str, *, enabled: int, allow_write: bool = False) -> AgentConfig:
-    """An agent attaching the service, written without the save-time cleaner
-    (the API cannot store a ``builtin:odata`` entry before R2)."""
+    """An agent attaching the service, written as a row: these tests are
+    about the catalogue routes, not the agent save gate."""
     block: dict[str, Any] = {"services": ["purchase-requisitions"]}
     if allow_write:
         block["allow_write"] = True
@@ -479,7 +479,7 @@ async def test_used_by_names_the_agents_in_list_and_detail(client, created):
 
 async def test_delete_in_use_is_409_naming_enabled_and_disabled_agents(client, created):
     """Rows written directly; the same path through the agent API is the
-    xfail below."""
+    test below."""
     async with SessionLocal() as s:
         s.add(_agent_row("buyer", enabled=1))
         s.add(_agent_row("reader", enabled=0))
@@ -498,9 +498,8 @@ async def test_delete_in_use_is_409_naming_enabled_and_disabled_agents(client, c
     assert (await client.delete(ONE)).status_code == 204
 
 
-@pytest.mark.xfail(strict=True, reason="R2")
 async def test_delete_in_use_is_409_naming_the_agents(client, created):
-    """Through the agent API: red until R2 lets an agent store the entry."""
+    """Through the agent API, which stores the entry."""
     r = await client.post(
         "/admin/api/agents",
         json={

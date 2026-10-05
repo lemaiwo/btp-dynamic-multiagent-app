@@ -35,13 +35,24 @@ from urllib.parse import SplitResult, urlsplit
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    StrictBool,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
+from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.models import SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.slack_tools import BUILTIN_SLACK_URL
@@ -56,7 +67,10 @@ from agents.db import (
     AUTH_MODE_SESSION,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
+    MAX_ODATA_ENTRY_SERVICES,
     OAUTH_CONFIG_MODES,
+    ODATA_ENTRY_KEYS,
+    ODATA_SINGLE_ENTRY_MESSAGE,
     VALID_AUTH_MODES,
     SessionLocal,
     agent_referrers,
@@ -66,6 +80,7 @@ from agents.db import (
     delete_skill,
     delete_workflow,
     describe_referrers,
+    existing_odata_service_names,
     get_active_model_name,
     get_agent,
     get_agent_by_slug,
@@ -78,11 +93,13 @@ from agents.db import (
     get_workflow_run,
     list_agents,
     list_item_runs,
+    list_odata_services,
     list_skills,
     list_step_runs,
     list_workflow_runs,
     list_workflows,
     normalize_skills_json,
+    odata_entries,
     prepare_servers,
     rename_agent_references,
     rename_skill_references,
@@ -274,6 +291,12 @@ class OAuthClientPayload(BaseModel):
     # builtin:smtp and builtin:outlook only. The look of originated mail:
     # colours, font, logo, org name, footer. See agents/mail_render.MailTheme.
     theme: dict[str, Any] | None = None
+    # builtin:odata only, and all its entry holds: the catalogue services the
+    # agent may use and whether it may change data through them. Strict,
+    # because pydantic would read the string "true" or the number 1 as True
+    # and so open writes. See `_validate_odata_entry`.
+    services: list[str] = Field(default_factory=list)
+    allow_write: StrictBool = False
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -382,6 +405,10 @@ class OAuthClientPayload(BaseModel):
             config["allow_comment"] = True
         if self.user_context:
             config["user_context"] = True
+        if self.services:
+            config["services"] = list(self.services)
+        if self.allow_write:
+            config["allow_write"] = True
         return config
 
 
@@ -473,8 +500,42 @@ class McpServerPayload(BaseModel):
             if cfg.get(key):
                 _split_endpoint_url(str(cfg[key]), field=f"oauth.{key}")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_odata_entry(cls, data: Any) -> Any:
+        """The ``builtin:odata`` block as the client sent it.
+
+        Checked before the block becomes an `OAuthClientPayload`, which
+        ignores keys it does not know and fills every other field with a
+        default: afterwards a stray key, or ``user_context: false``, can no
+        longer be told from an entry that was sent correctly.
+        """
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_ODATA_URL:
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            if isinstance(oauth, dict):
+                _validate_odata_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
+        if _server_key(self.url) == BUILTIN_ODATA_URL:
+            # Its own rules, and none of the generic destination ones below:
+            # this entry names no destination (see `_validate_odata_entry`).
+            if self.auth_mode != AUTH_MODE_DESTINATION:
+                raise ValueError(
+                    f"{BUILTIN_ODATA_URL} requires auth_mode=destination: every "
+                    "catalogue service is reached through the BTP destination it "
+                    "names, and the entry holds no credential of its own"
+                )
+            _validate_odata_entry(self.oauth.to_config() if self.oauth else {})
+            return self
+        if self.oauth is not None and (self.oauth.services or self.oauth.allow_write):
+            raise ValueError(
+                f"oauth.services and oauth.allow_write belong to a {BUILTIN_ODATA_URL} "
+                "entry only; no other server reads them"
+            )
         if self.oauth is not None and self.oauth.theme:
             _validate_mail_theme(self.url, self.oauth.theme)
         # Before the per-mode rules, because the oauth2 branch below returns
@@ -815,6 +876,10 @@ class AgentPayload(BaseModel):
             raise ValueError("at least one mcp_servers entry is required")
         # Reject duplicates within a single agent
         urls = [s.url for s in self.mcp_servers]
+        # Before the duplicate rule, so two OData entries get the message
+        # that says what to do instead.
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_ODATA_URL) > 1:
+            raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
         if len(set(urls)) != len(urls):
             raise ValueError("mcp_servers contains duplicate urls")
         return self
@@ -1002,6 +1067,7 @@ async def api_list_agents() -> list[dict[str, Any]]:
 )
 async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
     async with SessionLocal() as session:
+        await _check_odata_services(session, payload.to_servers_list())
         try:
             row = await upsert_agent(
                 session,
@@ -1053,6 +1119,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 raise HTTPException(
                     status_code=409, detail=f"Agent name '{payload.name}' already exists"
                 )
+        await _check_odata_services(session, payload.to_servers_list())
         try:
             primary, extras, primary_oauth_json = prepare_servers(
                 payload.to_servers_list(), row
@@ -1887,6 +1954,13 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 if secret_errors:
                     errors.extend(secret_errors)
                     continue
+                # Against the catalogue as this transaction sees it. A bundle
+                # does not carry catalogue services yet; once it does they are
+                # written before the agents and found here.
+                unknown = await _unknown_odata_services(session, agent.to_servers_list())
+                if unknown:
+                    errors.append(f"Agent '{agent.name}': {unknown}")
+                    continue
                 try:
                     # run_as_principal is deliberately not carried by exports
                     # (it is a landscape-specific service identity), and is
@@ -2063,6 +2137,10 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             except Exception as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry, e)
                 continue
+            unknown = await _unknown_odata_services(session, payload.to_servers_list())
+            if unknown:
+                logger.warning("Skipping seed agent %r: %s", payload.name, unknown)
+                continue
             try:
                 await upsert_agent(
                     session,
@@ -2201,6 +2279,132 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
         )
 
 
+def _server_key(url: Any) -> str:
+    """A server URL the way storage compares it: trimmed, no trailing slash,
+    lower case (``agents.db.odata_entries`` and ``_clean_destination``)."""
+    return str(url or "").strip().rstrip("/").lower()
+
+
+# Every key an `OAuthClientPayload` knows, by its wire name. A closed set, so
+# a refusal may name one of these; a key outside it is the client's own text
+# and is not repeated.
+_OAUTH_FIELD_NAMES = frozenset(
+    field.alias or name for name, field in OAuthClientPayload.model_fields.items()
+) | frozenset(OAuthClientPayload.model_fields)
+# Added to every block by the API's own answers and exports (`_redact_servers`
+# in agents/db.py); accepted back when false, never stored.
+_ODATA_ECHOED_KEY = "has_client_secret"
+_ODATA_IDENTITY_KEYS = frozenset({"destination", "user_context"})
+_ODATA_CREDENTIAL_KEYS = frozenset({
+    "client_id", "client_secret", "uaa_url", "authorize_url", "token_url", "scope", "dcr",
+})
+
+
+def _validate_odata_entry(cfg: dict[str, Any]) -> None:
+    """The block of a ``builtin:odata`` entry: ``{services, allow_write?}``.
+
+    This is the gate for which agent may use which OData service and whether
+    it may write, so it allows by exact key and refuses the rest -- including
+    a key sent with its default value: ``user_context: false`` reads as a
+    choice of identity, and there is none to make here. The destination and
+    the identity (signed-in user or technical user) belong to the catalogue
+    service, so that no agent can run a service as someone else by editing
+    its own entry.
+
+    Messages name the field, never the value: a service name is repeated
+    only when it has the form of one, a key only when it is a known field.
+    Storage (`agents.db._clean_odata_entry`) keeps the same two keys.
+    """
+    keys = {str(k) for k in cfg}
+    if cfg.get(_ODATA_ECHOED_KEY) is False:
+        keys.discard(_ODATA_ECHOED_KEY)
+    stray = keys - set(ODATA_ENTRY_KEYS)
+    identity = sorted(stray & _ODATA_IDENTITY_KEYS)
+    if identity:
+        raise ValueError(
+            f"{BUILTIN_ODATA_URL} takes no oauth.{', oauth.'.join(identity)}: the "
+            "destination and identity belong to the catalogue service; duplicate "
+            "the service to run it as another identity"
+        )
+    credential = sorted(stray & _ODATA_CREDENTIAL_KEYS)
+    if credential:
+        raise ValueError(
+            f"{BUILTIN_ODATA_URL} stores no credential of its own; remove "
+            f"oauth.{', oauth.'.join(credential)} (the credential lives in the "
+            "destination of each catalogue service)"
+        )
+    if stray:
+        known = sorted(stray & _OAUTH_FIELD_NAMES)
+        named = f"oauth.{', oauth.'.join(known)}" if known else "the unknown keys"
+        raise ValueError(
+            f"a {BUILTIN_ODATA_URL} entry holds only oauth.services and "
+            f"oauth.allow_write; remove {named}"
+        )
+    if "allow_write" in cfg and not isinstance(cfg["allow_write"], bool):
+        raise ValueError(
+            "oauth.allow_write must be the JSON boolean true or false; a string "
+            "or a number does not open writes"
+        )
+    services = cfg.get("services")
+    if services is None or services == []:
+        raise ValueError(
+            f"{BUILTIN_ODATA_URL} requires oauth.services: the names of the "
+            "catalogue services this agent may use (at least one)"
+        )
+    if not isinstance(services, list):
+        raise ValueError("oauth.services must be a list of catalogue service names")
+    if len(services) > MAX_ODATA_ENTRY_SERVICES:
+        raise ValueError(
+            f"oauth.services lists more than {MAX_ODATA_ENTRY_SERVICES} services"
+        )
+    seen: set[str] = set()
+    for name in services:
+        if not isinstance(name, str) or not re.fullmatch(SERVICE_NAME_RE, name):
+            raise ValueError(
+                "oauth.services: invalid service name (lower-case letters, digits "
+                "and '-', at most 64 characters)"
+            )
+        if name in seen:
+            raise ValueError(f"oauth.services: duplicate service '{name}'")
+        seen.add(name)
+
+
+async def _unknown_odata_services(session: Any, servers: list[dict[str, Any]]) -> str | None:
+    """``unknown OData service 'x'`` for the services a server list attaches
+    that are not in the catalogue, or None.
+
+    Run in the session that then writes the agent, with the found rows
+    locked, so the answer holds until that write commits (see
+    `agents.db.existing_odata_service_names`). A disabled service exists: an
+    admin may prepare an agent before switching its service on, and the run
+    time leaves a disabled service out. A missing one is refused, because the
+    agent would be saved in a state that silently does less than configured.
+    """
+    names: list[str] = []
+    for block in odata_entries(servers):
+        services = block.get("services")
+        for name in services if isinstance(services, list) else []:
+            if not isinstance(name, str) or not re.fullmatch(SERVICE_NAME_RE, name):
+                # Not reachable past the payload model; never echoed anyway.
+                return "invalid service name"
+            if name not in names:
+                names.append(name)
+    if not names:
+        return None
+    found = await existing_odata_service_names(session, names, lock=True)
+    missing = [n for n in names if n not in found]
+    if not missing:
+        return None
+    return "unknown OData service " + ", ".join(f"'{n}'" for n in missing)
+
+
+async def _check_odata_services(session: Any, servers: list[dict[str, Any]]) -> None:
+    """422 when ``servers`` attaches a service the catalogue does not have."""
+    unknown = await _unknown_odata_services(session, servers)
+    if unknown:
+        raise HTTPException(status_code=422, detail=unknown)
+
+
 # Built-ins that originate mail through agents/mail_render and so read a
 # `theme`. Mirrors `_MAIL_THEME_URLS` in agents/db.py.
 _MAIL_THEME_URLS = frozenset({BUILTIN_SMTP_URL, BUILTIN_OUTLOOK_URL})
@@ -2248,6 +2452,11 @@ async def _destination_health() -> list[dict[str, Any]]:
     signed-in user whose ``Authentication`` is an app-level type gets a
     warning, because that mismatch otherwise surfaces only as every user
     reading the same mailbox.
+
+    A ``builtin:odata`` entry names no destination, so it is reported as one
+    entry per attached service, with that service's destination and identity
+    from the catalogue (``service`` is the extra key). A name the catalogue
+    does not have is an ``error`` entry.
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
@@ -2259,6 +2468,10 @@ async def _destination_health() -> list[dict[str, Any]]:
 
     async with SessionLocal() as session:
         rows = await list_agents(session)
+        catalogue: dict[str, Any] = {}
+        if any(r.enabled and odata_entries(r.mcp_servers) for r in rows):
+            # One read for every entry of every agent.
+            catalogue = {s.name: s for s in await list_odata_services(session)}
     config = config_from_environment(os.environ)
     resolvers: dict[str, DestinationResolver] = {}
     out: list[dict[str, Any]] = []
@@ -2269,6 +2482,13 @@ async def _destination_health() -> list[dict[str, Any]]:
             if str(srv.get("auth_mode") or "") != AUTH_MODE_DESTINATION:
                 continue
             oauth = srv.get("oauth") if isinstance(srv.get("oauth"), dict) else {}
+            if _server_key(srv.get("url")) == BUILTIN_ODATA_URL:
+                out.extend(
+                    await _odata_destination_health(
+                        row.name, oauth, catalogue, config, resolvers
+                    )
+                )
+                continue
             name = str(oauth.get("destination") or "").strip()
             user_context = oauth.get("user_context") is True
             entry: dict[str, Any] = {
@@ -2315,6 +2535,97 @@ async def _destination_health() -> list[dict[str, Any]]:
                     f"OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
                 )
             out.append(entry)
+    return out
+
+
+async def _odata_destination_health(
+    agent: str,
+    oauth: dict[str, Any],
+    catalogue: dict[str, Any],
+    config: Any,
+    resolvers: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """The `_destination_health` entries of one ``builtin:odata`` entry: one
+    per service it lists, disabled services included.
+
+    Resolved as the application, like every other entry -- never with a
+    user's token. A ``PrincipalPropagation`` destination cannot be resolved
+    that way at all (it has no credential without a user), so for a service
+    that runs as the signed-in user its properties are read instead, and it
+    counts as resolvable when they say so. The answer carries the service and
+    destination names, the identity and the auth type: no host, no header.
+    """
+    from agents.destination import (
+        MISSING_BINDING_MESSAGE,
+        USER_PROPAGATING_AUTH_TYPES,
+        DestinationError,
+        DestinationResolver,
+    )
+
+    services = oauth.get("services")
+    out: list[dict[str, Any]] = []
+    for name in services if isinstance(services, list) else []:
+        entry: dict[str, Any] = {
+            "agent": agent,
+            "server_key": BUILTIN_ODATA_URL,
+            "service": "",
+            "destination": "",
+            "user_context": False,
+            "state": "error",
+            "auth_type": "",
+            "error": None,
+        }
+        out.append(entry)
+        if not isinstance(name, str) or not re.fullmatch(SERVICE_NAME_RE, name):
+            # A row written around the save gate; the value is not repeated.
+            entry["error"] = "invalid service name"
+            continue
+        entry["service"] = name
+        service = catalogue.get(name)
+        if service is None:
+            entry["error"] = "unknown OData service"
+            continue
+        destination = str(service.destination or "").strip()
+        user_context = bool(service.user_context)
+        entry["destination"] = destination
+        entry["user_context"] = user_context
+        if not destination:
+            entry["error"] = "no destination name configured"
+            continue
+        if config is None:
+            entry["state"] = "unbound"
+            entry["error"] = MISSING_BINDING_MESSAGE
+            continue
+        resolver = resolvers.get(destination)
+        if resolver is None:
+            resolver = DestinationResolver(destination, config, require_credential=False)
+            resolvers[destination] = resolver
+        try:
+            try:
+                entry["auth_type"] = (await resolver.resolve()).auth_type
+            except DestinationError:
+                if not user_context:
+                    raise
+                try:
+                    fallback = (await resolver.resolve_properties()).auth_type
+                except Exception:  # noqa: BLE001 - the first error is the answer
+                    fallback = ""
+                if fallback != "PrincipalPropagation":
+                    raise
+                entry["auth_type"] = fallback
+            entry["state"] = "resolvable"
+        except DestinationError as e:
+            entry["error"] = str(e)[:400]
+        except Exception as e:  # noqa: BLE001 - a health check must not 500
+            entry["error"] = f"{type(e).__name__}: {e}"[:400]
+        auth_type = str(entry["auth_type"] or "")
+        if user_context and auth_type and auth_type not in USER_PROPAGATING_AUTH_TYPES:
+            entry["warning"] = (
+                f"the service runs as the signed-in user, but the destination's "
+                f"Authentication is {auth_type}, an app-level type; every user "
+                f"would share one credential. Use PrincipalPropagation (on-premise), "
+                f"OAuth2UserTokenExchange, OAuth2JWTBearer or OAuth2SAMLBearerAssertion"
+            )
     return out
 
 

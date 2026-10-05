@@ -41,6 +41,7 @@ from agents.odata import BUILTIN_ODATA_URL
 
 # The catalogue's save-time gate lives with its models; re-exported because
 # every other `validate_*` of a stored definition is found in this module.
+from agents.odata.models import SERVICE_NAME_RE as _ODATA_SERVICE_NAME_RE
 from agents.odata.models import WRITE_OPS as _ODATA_WRITE_OPS
 from agents.odata.models import ServiceDefinition as _ODataServiceDefinition
 from agents.odata.models import validate_odata_service  # noqa: F401  (re-export)
@@ -1675,6 +1676,9 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     src = oauth if isinstance(oauth, dict) else {}
     cleaned: dict[str, Any] = {}
     builtin = str(url or "").strip().rstrip("/").lower()
+    if builtin == BUILTIN_ODATA_URL:
+        # The one destination-mode block without a destination name.
+        return _clean_odata_entry(src)
     if builtin in _DEST_KEYS_BY_URL:
         # The built-ins that gained destination mode later keep their own
         # pinned keys plus the user-context switch; see `# --- destinations ---`.
@@ -1829,6 +1833,7 @@ def prepare_servers(
                 prev_oauth_by_url[s["url"]] = s["oauth"]
 
     normalized: list[dict[str, Any]] = []
+    odata_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
         mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
@@ -1836,6 +1841,17 @@ def prepare_servers(
             raise ValueError("MCP server url is required")
         if mode not in VALID_AUTH_MODES:
             raise ValueError(f"invalid auth_mode {mode!r}")
+        if url.rstrip("/").lower() == BUILTIN_ODATA_URL:
+            # Stored under exactly this spelling. `odata_entries` (who uses a
+            # service) forgives case and a trailing slash, the registry's
+            # built-in lookup does not: any other spelling would be an entry
+            # that blocks the delete of a service it can never call.
+            url = BUILTIN_ODATA_URL
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_ODATA_MODE_MESSAGE)
+            if odata_seen:
+                raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
+            odata_seen = True
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
@@ -2264,6 +2280,28 @@ async def list_odata_services(session: AsyncSession) -> list[ODataService]:
 async def get_odata_service(session: AsyncSession, name: str) -> ODataService | None:
     result = await session.execute(select(ODataService).where(ODataService.name == name))
     return result.scalar_one_or_none()
+
+
+async def existing_odata_service_names(
+    session: AsyncSession, names: list[str], *, lock: bool = False
+) -> set[str]:
+    """Which of ``names`` are catalogue services right now (enabled or not).
+
+    ``lock`` takes a shared row lock on the services found, held until the
+    caller's transaction ends: an agent write that attaches them cannot
+    commit a name whose delete has already been issued (the select waits for
+    that delete and then no longer finds the row). A delete issued later
+    waits for the agent write; whether it then still goes through is decided
+    by the delete's own referrer check. Postgres only; SQLite has no row
+    locks, ignores the clause and serialises writers anyway.
+    """
+    wanted = sorted(set(names))
+    if not wanted:
+        return set()
+    query = select(ODataService.name).where(ODataService.name.in_(wanted))
+    if lock:
+        query = query.with_for_update(read=True)
+    return set((await session.execute(query)).scalars().all())
 
 
 async def create_odata_service(
@@ -3311,6 +3349,23 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:sapnotedetail": _SAPNOTEDETAIL_DEST_KEYS,
     "builtin:smtp": _SMTP_DEST_KEYS,
 }
+# builtin:odata is not in the map above on purpose: its entry stores no
+# destination. Which destination a call goes through, and whether as the
+# signed-in user, belongs to each catalogue service (`ODataService`), so an
+# agent cannot pick another identity for a service by editing its own entry.
+# The entry names the services the agent may use and whether it may write.
+# Public because `agents.admin` refuses every other key at the payload
+# boundary (the reason `BUILTIN_PUBLIC_KEYS` is public).
+ODATA_ENTRY_KEYS = ("services", "allow_write")
+MAX_ODATA_ENTRY_SERVICES = 50
+ODATA_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:odata entry; list every service "
+    "in that entry's oauth.services"
+)
+_ODATA_MODE_MESSAGE = (
+    "builtin:odata requires auth_mode=destination: every catalogue service "
+    "is reached through the BTP destination it names"
+)
 # Built-ins whose destination may act as the signed-in user. NVD has no user
 # to act as and the me.sap.com cookie is one shared session, so the switch is
 # dropped for those rather than stored as a promise nothing keeps.
@@ -3341,4 +3396,42 @@ def _clean_builtin_destination(src: dict[str, Any], builtin: str) -> dict[str, A
         cleaned["user_context"] = True
     if builtin in _DEST_ALLOW_SEND_URLS:
         cleaned["allow_send"] = src.get("allow_send") is True
+    return cleaned
+
+
+def _clean_odata_entry(src: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:odata`` entry for storage.
+
+    Exactly ``{"services": [...]}`` plus ``"allow_write": True``; every other
+    key is dropped, ``destination`` and ``user_context`` included. The last
+    gate before the row, whoever the caller is, so it denies by default:
+
+    - ``services`` must be a list of service names (the catalogue's slug
+      form). Anything else is refused rather than skipped: an entry whose
+      list was silently shortened would be an agent with less than its admin
+      configured, and a non-string value has no meaning here. Duplicates are
+      dropped, first occurrence wins.
+    - ``allow_write`` is kept only for the JSON boolean ``true``. The string
+      "true" or the number 1 must not open writes; stored without the key,
+      the entry is read-only.
+
+    Whether the names exist in the catalogue is the save route's question
+    (it needs the session). The message never repeats a refused value.
+    """
+    raw = src.get("services")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("builtin:odata requires at least one service")
+    services: list[str] = []
+    for name in raw:
+        if not isinstance(name, str) or not re.fullmatch(_ODATA_SERVICE_NAME_RE, name):
+            raise ValueError("builtin:odata services: invalid service name")
+        if name not in services:
+            services.append(name)
+    if len(services) > MAX_ODATA_ENTRY_SERVICES:
+        raise ValueError(
+            f"builtin:odata allows at most {MAX_ODATA_ENTRY_SERVICES} services per entry"
+        )
+    cleaned: dict[str, Any] = {"services": services}
+    if src.get("allow_write") is True:
+        cleaned["allow_write"] = True
     return cleaned
