@@ -946,8 +946,9 @@ async def test_a_snapshot_entry_with_an_unusable_identity_or_version_is_refused(
 # -- writes and calls: later tasks -------------------------------------------
 
 
-@pytest.mark.parametrize("allow_write", [False, True, "true"])
-async def test_write_operations_are_refused_until_w3(alice, allow_write):
+@pytest.mark.parametrize("allow_write", [False, None, "true", 1])
+async def test_write_operations_are_refused_without_allow_write(alice, allow_write):
+    """The entry's own switch; with it on, see tests/test_odata_write_guard.py."""
     w = World(oauth={"services": ["purchase-requisitions"], "allow_write": allow_write})
     for args in (
         {"target": "A_Note", "operation": "create", "body": {"Note": "x"}},
