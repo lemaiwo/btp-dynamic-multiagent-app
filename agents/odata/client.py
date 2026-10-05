@@ -24,6 +24,22 @@ fixed message.
 The dialect (``v2.V2Dialect``, later ``v4.V4Dialect``) holds everything
 that differs between protocol versions: literals, the key predicate, the
 query option names and the payload shapes.
+
+Writes (``create``, ``update``, ``delete``) follow the same pattern with
+their own gate, ``check_write``, and three rules of their own:
+
+* The CSRF token and the SAP session cookies of a write come from the
+  ``CsrfSessionStore`` entry of the identity *this request* runs as
+  (destination + signed-in user, or the destination's technical entry) and
+  are set as explicit headers on that one request. The shared HTTP client
+  keeps no cookie; a read sends neither.
+* A modifying request is sent once. The only repeat is after a 403 that
+  SAP marks ``X-CSRF-Token: Required`` -- the request was refused before it
+  was processed -- and then exactly once. A transport failure is never
+  retried: whether SAP applied the change is unknown, and the caller is told
+  so with the code ``write_outcome_unknown``.
+* No token, cookie, body value or host appears in an error, a log line or a
+  ``repr`` of this module.
 """
 
 from __future__ import annotations
@@ -32,7 +48,7 @@ import copy
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import unquote
 
@@ -40,6 +56,7 @@ import httpx
 from pydantic import ValidationError
 
 from .models import EDM_NAME_RE, EntitySetDef, NavigationDef, ServiceDefinition
+from .session import CsrfSession, NoCookieJar, cookies_from_response
 from .urls import FilterError, check_filter, confine_next_link, confine_service_path, join_path
 
 logger = logging.getLogger(__name__)
@@ -53,6 +70,20 @@ MAX_RESPONSE_BYTES = 8_000_000
 MAX_PAGE_SIZE = 1000
 MAX_MESSAGE_CHARS = 500
 _MAX_ETAG_CHARS = 512
+# What one write may weigh once it is encoded.
+MAX_REQUEST_BYTES = 1_000_000
+WRITE_OPERATIONS = ("create", "update", "delete")
+# The result key under which a get, a create and an update hand the RAW ETag
+# of the entity to the tool layer. It is never part of ``item``. The tool
+# layer keeps it to itself and gives the model an opaque handle instead; it
+# must not pass this value on.
+RAW_ETAG_FIELD = "etag"
+
+# One entity tag (RFC 9110), strong or weak. A list of tags and the wildcard
+# `*` do not have this form, so `If-Match: *` ("overwrite whatever is there")
+# can never be sent.
+_ETAG = re.compile(r'(?:W/)?"[\x21\x23-\x7E]{0,500}"')
+_CSRF_TOKEN = re.compile(r"[\x21-\x7E]{1,512}")
 
 _ORDERBY = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)(?: +(asc|desc))?$")
 _STATUS_HINTS = {
@@ -119,6 +150,33 @@ class ReadPlan:
     query: ReadQuery
 
 
+@dataclass(frozen=True)
+class WritePlan:
+    """A write that passed every catalogue check (``ODataClient.check_write``).
+
+    ``path`` is the confined, relative request path; ``body`` the encoded
+    request body (``None`` for a delete); ``fields`` the names of the fields
+    the body sets, in the caller's order -- names only, which is all an
+    audit record may hold; ``etag`` the validated ``If-Match`` value or
+    ``None``. Body and ETag are left out of the ``repr``.
+    """
+
+    operation: str
+    path: str
+    entity_set: EntitySetDef
+    fields: tuple[str, ...]
+    body: dict[str, Any] | None = field(default=None, repr=False)
+    etag: str | None = field(default=None, repr=False)
+
+
+def _etag_of(*candidates: object) -> str | None:
+    """The first candidate that is one well-formed entity tag."""
+    for candidate in candidates:
+        if isinstance(candidate, str) and _ETAG.fullmatch(candidate):
+            return candidate
+    return None
+
+
 def _shown(name: object) -> str:
     """A name for a refusal: repeated only when it has the form of a name."""
     if isinstance(name, str) and re.fullmatch(EDM_NAME_RE, name) and len(name) <= 64:
@@ -154,7 +212,7 @@ def _value(value: Any) -> Any:
 
 
 class ODataClient:
-    """Reads of one catalogue service through its destination."""
+    """Reads and writes of one catalogue service through its destination."""
 
     def __init__(
         self,
@@ -168,7 +226,17 @@ class ODataClient:
         self._dialect = dialect
         # The CSRF token store of the write path; a read neither needs nor touches it.
         self._sessions = sessions
+        if sessions is not None and http is not None:
+            # A client that writes handles SAP session cookies, and the HTTP
+            # client is shared by every user of the agent: whatever jar it
+            # came with, from here on it stores and sends nothing by itself.
+            if not isinstance(http.cookies.jar, NoCookieJar):
+                http.cookies = NoCookieJar()  # type: ignore[assignment]
         service = service if isinstance(service, dict) else {}
+        # Whose SAP session a write uses: the catalogue service's own
+        # settings, never an argument of a call.
+        self._destination = service.get("destination")
+        self._user_context = service.get("user_context")
         try:
             self._service_path = confine_service_path(service.get("service_path"))  # type: ignore[arg-type]
         except ValueError:
@@ -447,7 +515,153 @@ class ODataClient:
         )
         return ReadPlan(operation, path, target, names, expands, query)
 
+    def check_write(
+        self,
+        entity_set: EntitySetDef,
+        operation: str,
+        *,
+        key: Any = None,
+        body: Any = None,
+        etag: Any = None,
+    ) -> WritePlan:
+        """Every catalogue check of a write, without sending anything.
+
+        ``create``, ``update`` and ``delete`` run exactly this before they
+        ask for a CSRF token or send, and a caller that wants the refusal
+        first (the execute tool) calls it directly. The first failing check
+        raises ``ODataError``; the order is fixed. No refusal repeats a
+        value, only names.
+
+        1. ``operation`` is ``"create"``, ``"update"`` or ``"delete"``
+           (``invalid_argument``);
+        2. the operation is enabled on ``entity_set``
+           (``operation_disabled``);
+        3. the key: exactly the key fields with valid values for an update
+           and a delete (``invalid_key``); none for a create
+           (``invalid_argument``);
+        4. the body: an object with at least one field for a create and an
+           update; none for a delete (``invalid_argument``);
+        5. every body field, in the caller's order: its name is a field of
+           the entity set (``unknown_field``) that is marked ``writable``
+           (``field_not_writable``); the refusal names the field;
+        6. every body value is ``null`` or a JSON scalar that has the form
+           of the field's EDM type (``invalid_argument``, naming the field
+           and the type). An object or a list is refused: a deep insert is
+           not supported;
+        7. update only: a key field in the body must carry the key's own
+           value (``invalid_argument``) -- a key cannot be changed. Such a
+           field is then left out of the request, and a body that holds
+           nothing else is refused (``invalid_argument``);
+        8. the encoded body is at most ``MAX_REQUEST_BYTES``
+           (``invalid_argument``);
+        9. ``etag``: not used with a create; else absent or one entity tag
+           as a get returned it. ``*`` and a list of tags are refused
+           (``invalid_argument``): this client never sends ``If-Match: *``.
+        """
+        if operation not in WRITE_OPERATIONS:
+            raise ODataError(
+                "invalid_argument", "a write is one of 'create', 'update' or 'delete'"
+            )
+        if operation not in entity_set.operations:
+            raise ODataError(
+                "operation_disabled",
+                f"{operation!r} is not enabled for entity set {entity_set.name!r}",
+            )
+        segment = entity_set.path or entity_set.name
+        if operation == "create":
+            if key is not None:
+                raise ODataError(
+                    "invalid_argument",
+                    "a create takes no key; key fields the service expects go in the body",
+                )
+        else:
+            segment += self._dialect.key_segment(entity_set, key)
+        try:
+            path = join_path(self._service_path, segment)
+        except ValueError:
+            raise ODataError(
+                "invalid_argument", "the request path could not be built from these arguments"
+            ) from None
+        encoded: dict[str, Any] | None = None
+        names: list[str] = []
+        if operation == "delete":
+            if body is not None:
+                raise ODataError("invalid_argument", "a delete takes no body")
+        else:
+            if not isinstance(body, dict) or not body:
+                raise ODataError(
+                    "invalid_argument",
+                    f"{operation!r} needs a body: an object of field names and values",
+                )
+            for name in body:
+                definition = entity_set.field(name) if isinstance(name, str) else None
+                if definition is None:
+                    raise ODataError(
+                        "unknown_field",
+                        f"entity set {entity_set.name!r} has no field {_shown(name)}",
+                    )
+                if not definition.writable:
+                    raise ODataError(
+                        "field_not_writable", f"field {definition.name!r} cannot be written"
+                    )
+                names.append(definition.name)
+            encoded = self._dialect.encode_body(entity_set, body)
+            if operation == "update":
+                for definition in entity_set.keys:
+                    if definition.name not in encoded:
+                        continue
+                    try:
+                        same = self._dialect.literal(
+                            definition.type, body[definition.name]
+                        ) == self._dialect.literal(definition.type, key[definition.name])
+                    except ODataError:
+                        same = False
+                    if not same:
+                        raise ODataError(
+                            "invalid_argument",
+                            f"key field {definition.name!r} cannot be changed: leave it "
+                            f"out of the body or give it the value of the key",
+                        )
+                    del encoded[definition.name]
+                    names.remove(definition.name)
+                if not encoded:
+                    raise ODataError(
+                        "invalid_argument", "the body holds nothing to update besides the key"
+                    )
+            try:
+                size = len(json.dumps(encoded).encode("utf-8"))
+            except (TypeError, ValueError):
+                raise ODataError("invalid_argument", "the body cannot be sent as JSON") from None
+            if size > MAX_REQUEST_BYTES:
+                raise ODataError(
+                    "invalid_argument", f"the body is larger than {MAX_REQUEST_BYTES} bytes"
+                )
+        if etag is not None:
+            if operation == "create":
+                raise ODataError("invalid_argument", "an etag is not used with a create")
+            if not isinstance(etag, str) or not _ETAG.fullmatch(etag):
+                raise ODataError(
+                    "invalid_argument",
+                    "the etag is not one entity tag as a read of the entity returned it",
+                    hint="read the entity with 'get' and use the etag of that answer; "
+                    "'*' is never accepted",
+                )
+        return WritePlan(operation, path, entity_set, tuple(names), encoded, etag)
+
     # -- the call -----------------------------------------------------------
+    def _sap_error(self, status: int, content_type: str, body: bytes) -> ODataError:
+        """The error of a non-2xx answer: SAP's own code and text, or the status."""
+        snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
+        code, text = self._dialect.parse_error(snapshot)
+        code, text = _plain(code, 80), _plain(text)
+        message = f"{code}: {text}" if code and text else text
+        return ODataError(
+            "sap_error",
+            message[:MAX_MESSAGE_CHARS] if message else f"HTTP {status} from the OData service",
+            status=status,
+            hint=_STATUS_HINTS.get(status),
+        )
+
     async def _fetch(self, url: str, params: dict[str, str] | None) -> tuple[Any, httpx.Headers]:
         """GET ``url`` (relative) and return the decoded JSON and the headers.
 
@@ -482,20 +696,7 @@ class ODataClient:
                 "destination_error", "the OData service could not be reached"
             ) from None
         if status >= 300:
-            snapshot = httpx.Response(
-                status,
-                headers={"content-type": headers.get("content-type", "")},
-                content=bytes(body),
-            )
-            code, text = self._dialect.parse_error(snapshot)
-            code, text = _plain(code, 80), _plain(text)
-            message = f"{code}: {text}" if code and text else text
-            raise ODataError(
-                "sap_error",
-                message[:MAX_MESSAGE_CHARS] if message else f"HTTP {status} from the OData service",
-                status=status,
-                hint=_STATUS_HINTS.get(status),
-            )
+            raise self._sap_error(status, headers.get("content-type", ""), bytes(body))
         if status == 204 or not body:
             return None, headers
         try:
@@ -638,6 +839,244 @@ class ODataClient:
             result["etag"] = etag
         result["truncated"] = False
         return result
+
+    # -- writes -------------------------------------------------------------
+    def _session_key(self) -> tuple[Any, Any]:
+        """The store and the session key of the identity this request runs as.
+
+        Fails closed when the pieces do not line up: the key must describe
+        the same identity the HTTP client's auth will send the request as,
+        or a user's cookie could travel with another credential.
+        """
+        if self._sessions is None or self._http is None:
+            raise ODataError("destination_error", "this service is not set up for writing")
+        if (
+            not isinstance(self._destination, str)
+            or not self._destination
+            or not isinstance(self._user_context, bool)
+        ):
+            raise ODataError(
+                "destination_error", "the service names no destination to write through"
+            )
+        auth = self._http.auth
+        if (
+            getattr(auth, "user_context", None) is not self._user_context
+            or getattr(auth, "destination_name", None) != self._destination
+        ):
+            raise ODataError(
+                "destination_error",
+                "the connection of this service does not match its destination settings",
+            )
+        # Raises DestinationUserRequired for a user-context service without a
+        # signed-in user; there is no fall-back to the technical entry.
+        return self._sessions, self._sessions.key(self._destination, self._user_context)
+
+    async def _fetch_session(self) -> CsrfSession:
+        """Ask SAP for a CSRF token: a GET on the service root, as the caller.
+
+        Runs in the caller's own context (``CsrfSessionStore.get``), so the
+        destination resolves the caller's credential and the token and the
+        cookies that come back are that identity's. The body is not read.
+        """
+        body = bytearray()
+        try:
+            async with self._http.stream(
+                "GET",
+                join_path(self._service_path) + "/",
+                headers={"Accept": "application/json", "X-CSRF-Token": "Fetch"},
+                follow_redirects=False,
+            ) as response:
+                status = response.status_code
+                content_type = response.headers.get("content-type", "")
+                token = response.headers.get("x-csrf-token", "")
+                cookies = cookies_from_response(response)
+                if status >= 300:
+                    async for chunk in response.aiter_bytes():
+                        body += chunk
+                        if len(body) > MAX_RESPONSE_BYTES:
+                            break
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # Nothing was changed: this was the token request, not the write.
+            logger.warning("odata: CSRF token request failed (%s)", type(exc).__name__)
+            raise ODataError(
+                "destination_error",
+                "the OData service could not be reached; nothing was changed",
+            ) from None
+        if status >= 300:
+            raise self._sap_error(status, content_type, bytes(body))
+        if not _CSRF_TOKEN.fullmatch(token) or token.lower() in ("required", "fetch"):
+            raise ODataError(
+                "sap_error",
+                "the OData service did not hand out a CSRF token; nothing was changed",
+                status=status,
+            )
+        return CsrfSession.fresh(token, cookies)
+
+    async def _modify(
+        self, method: str, url: str, headers: dict[str, str], content: bytes | None
+    ) -> tuple[int, httpx.Headers, bytes]:
+        """Send one modifying request, once. ``(status, headers, body)``.
+
+        Never retried here. A failure before SAP's status line arrived leaves
+        the outcome open and is reported as ``write_outcome_unknown``; once
+        the status is known it stands, and a body that could not be read (or
+        is too large) is simply not there.
+        """
+        body = bytearray()
+        status: int | None = None
+        answer = httpx.Headers()
+        try:
+            async with self._http.stream(
+                method, url, headers=headers, content=content, follow_redirects=False
+            ) as response:
+                status = response.status_code
+                answer = response.headers
+                async for chunk in response.aiter_bytes():
+                    body += chunk
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        body.clear()
+                        break
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            # The exception text can carry the URL; only its type is logged.
+            logger.warning(
+                "odata: modifying request failed (%s), status %s",
+                type(exc).__name__,
+                status if status is not None else "unknown",
+            )
+            if status is None:
+                raise ODataError(
+                    "write_outcome_unknown",
+                    "the connection failed while the change was being sent: it is not "
+                    "known whether SAP applied it. The request was not repeated",
+                    hint="do not send the change again blindly; read the entity first "
+                    "to see whether it was applied",
+                ) from None
+            body.clear()
+        return status, answer, bytes(body)
+
+    async def _renew(self, sessions: Any, key: Any, used: CsrfSession) -> CsrfSession:
+        """A session to retry with after SAP refused ``used`` as stale.
+
+        When another call of the same identity already replaced it, that
+        newer session is taken as it is; only when the store still holds the
+        refused one is it dropped and fetched again.
+        """
+        current = await sessions.get(key, self._fetch_session)
+        if current.token == used.token and current.cookies == used.cookies:
+            sessions.drop(key)
+            current = await sessions.get(key, self._fetch_session)
+        return current
+
+    async def _write(
+        self, plan: WritePlan, method: str, extra: dict[str, str]
+    ) -> tuple[int, httpx.Headers, bytes]:
+        """Send ``plan`` with the caller's CSRF session; the answer of a success."""
+        sessions, key = self._session_key()
+        headers = {"Accept": "application/json", **extra}
+        content: bytes | None = None
+        if plan.body is not None:
+            content = json.dumps(plan.body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if plan.etag is not None:
+            headers["If-Match"] = plan.etag
+        session = await sessions.get(key, self._fetch_session)
+        attempt = 0
+        while True:
+            attempt += 1
+            sent = dict(headers)
+            sent["X-CSRF-Token"] = session.token
+            cookie = session.cookie_header()
+            if cookie:
+                # Explicitly, from this identity's own entry, for this request only.
+                sent["Cookie"] = cookie
+            status, answer, body = await self._modify(method, plan.path, sent, content)
+            stale = status == 403 and answer.get("x-csrf-token", "").strip().lower() == "required"
+            if not stale:
+                break
+            if attempt == 2:
+                # Refused twice: the error below is the answer. The entry is
+                # of no use to the next call either.
+                sessions.drop(key)
+                break
+            # SAP refused the request before processing it, so sending it
+            # again changes nothing twice. Once.
+            session = await self._renew(sessions, key, session)
+        rotated = cookies_from_response(httpx.Response(status, headers=answer))
+        if any(session.cookies.get(name) != value for name, value in rotated.items()):
+            # SAP moved the session on. The store has no update, so the entry
+            # goes and the next write fetches a token with the new session.
+            sessions.drop(key)
+        logger.info(
+            "odata: %s on entity set %s answered HTTP %s",
+            plan.operation,
+            plan.entity_set.name,
+            status,
+        )
+        if status >= 300:
+            error = self._sap_error(status, answer.get("content-type", ""), body)
+            if status == 428:
+                raise ODataError(
+                    "etag_required",
+                    "SAP changes this entity only with the etag of its current version",
+                    status=status,
+                    hint="read the entity with 'get' first, then repeat the call with "
+                    "the etag of that answer",
+                )
+            if status == 412:
+                error.hint = "read the entity again and retry with its etag"
+            elif stale:
+                error.hint = "SAP did not accept the CSRF token; nothing was changed"
+            raise error
+        return status, answer, body
+
+    async def create(self, entity_set: EntitySetDef, body: dict) -> dict:
+        """Create one entity. ``{"item", "status"}`` plus the raw ETag if any.
+
+        ``item`` is what SAP answered, cut to the selectable fields of the
+        entity set exactly like a read: a value the admin did not release
+        does not come back just because the caller wrote the entity.
+        """
+        plan = self.check_write(entity_set, "create", body=body)
+        status, headers, raw = await self._write(plan, "POST", {})
+        item: dict[str, Any] = {}
+        etag: str | None = None
+        if raw:
+            try:
+                row, inner = self._dialect.parse_entity(json.loads(raw))
+            except (ValueError, ODataError):
+                row, inner = {}, None  # created; only the echo is unreadable
+            item = self._row(row, entity_set, entity_set.selectable_names(), [])
+            etag = _etag_of(inner)
+        result: dict[str, Any] = {"item": item, "status": status}
+        etag = etag or _etag_of(headers.get("etag"))
+        if etag:
+            result[RAW_ETAG_FIELD] = etag
+        return result
+
+    async def update(
+        self, entity_set: EntitySetDef, key: dict, body: dict, *, etag: str | None = None
+    ) -> dict:
+        """Change the given fields of one entity; the others stay as they are.
+
+        ``etag`` is the value a read of the entity returned; it is sent as
+        ``If-Match`` so a change made by somebody else in between is not
+        overwritten. Returns ``{"ok", "status"}`` plus the entity's new raw
+        ETag when SAP sends one.
+        """
+        plan = self.check_write(entity_set, "update", key=key, body=body, etag=etag)
+        method, extra = self._dialect.update_request(plan.path, plan.body)
+        status, headers, _ = await self._write(plan, method, dict(extra))
+        result: dict[str, Any] = {"ok": True, "status": status}
+        new_etag = _etag_of(headers.get("etag"))
+        if new_etag:
+            result[RAW_ETAG_FIELD] = new_etag
+        return result
+
+    async def delete(self, entity_set: EntitySetDef, key: dict, *, etag: str | None = None) -> dict:
+        """Delete one entity by key. ``{"ok", "status"}``; no body comes back."""
+        plan = self.check_write(entity_set, "delete", key=key, etag=etag)
+        status, _, _ = await self._write(plan, "DELETE", {})
+        return {"ok": True, "status": status}
 
 
 # -- the size cap ---------------------------------------------------------------

@@ -16,6 +16,7 @@ No refusal repeats a value.
 
 from __future__ import annotations
 
+import calendar
 import html
 import math
 import re
@@ -54,6 +55,22 @@ _PATTERN_TYPES = {
     "Edm.Guid": ("guid", _GUID),
 }
 _KEY_BREAKERS = ("/", "\\", "%", "?", "#")
+
+# -- request bodies -------------------------------------------------------------
+_INTEGER_RANGES = {
+    "Edm.Byte": (0, 255),
+    "Edm.SByte": (-128, 127),
+    "Edm.Int16": (-(2**15), 2**15 - 1),
+    "Edm.Int32": (-(2**31), 2**31 - 1),
+    "Edm.Int64": (-(2**63), 2**63 - 1),
+}
+# The V2 JSON date as a read returns it, which a model hands back unchanged.
+_JSON_DATE = re.compile(r"/Date\(-?[0-9]{1,15}\)/")
+_JSON_DATE_OFFSET = re.compile(r"/Date\(-?[0-9]{1,15}(?:[+-][0-9]{4})?\)/")
+_ISO = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,7}))?)?"
+    r"(Z|[+-][0-9]{2}:[0-9]{2})?"
+)
 
 _XML_CODE = re.compile(r"<code[^<>]*>([^<]{0,200})</code>")
 _XML_MESSAGE = re.compile(r"<message[^<>]*>([^<]{0,2000})</message>")
@@ -160,6 +177,155 @@ class V2Dialect:
         if len(parts) == 1:
             return f"({parts[0]})"
         return "(" + ",".join(f"{name}={part}" for name, part in zip(names, parts)) + ")"
+
+    # -- request bodies -----------------------------------------------------
+    def update_request(self, path: str, body: dict | None) -> tuple[str, dict[str, str]]:
+        """``(HTTP method, extra headers)`` of a partial update.
+
+        V2 on SAP Gateway: ``POST`` tunnelling ``MERGE``, which changes the
+        fields in the body and leaves the others alone (``PUT`` would reset
+        them). It lives in the dialect so that V4 can answer ``PATCH``.
+        """
+        return "POST", {"X-HTTP-Method": "MERGE"}
+
+    @staticmethod
+    def _json_date(match: re.Match[str], with_offset: bool) -> str:
+        """``/Date(ms)/`` (or ``/Date(ms+mmmm)/``) of an ISO timestamp."""
+        year, month, day, hour, minute = (int(match.group(i)) for i in range(1, 6))
+        second = int(match.group(6) or 0)
+        if not (1 <= month <= 12 and 1 <= day <= 31 and hour < 24 and minute < 60 and second < 60):
+            raise ValueError("not a timestamp")
+        # timegm refuses nothing; a day the month does not have is caught here.
+        if day > calendar.monthrange(year, month)[1] or year < 1:
+            raise ValueError("not a date")
+        millis = calendar.timegm((year, month, day, hour, minute, second)) * 1000
+        millis += int((match.group(7) or "0").ljust(3, "0")[:3])
+        if not with_offset:
+            return f"/Date({millis})/"
+        zone = match.group(8)
+        minutes = 0
+        if zone != "Z":
+            hours, mins = int(zone[1:3]), int(zone[4:6])
+            if hours > 14 or mins > 59:
+                raise ValueError("not an offset")
+            minutes = (hours * 60 + mins) * (-1 if zone[0] == "-" else 1)
+        # The ticks are the UTC instant; the offset says where it was meant.
+        millis -= minutes * 60_000
+        return f"/Date({millis}{'-' if minutes < 0 else '+'}{abs(minutes):04d})/"
+
+    def _json_value(self, edm_type: str, value: Any) -> Any:
+        """``value`` in the form V2 JSON carries ``edm_type`` in a request.
+
+        By positive recognition, like ``literal``: an unknown type or a value
+        without the form of its type is refused. ``None`` (clear the field)
+        passes for every known type.
+        """
+        if isinstance(value, (dict, list, tuple, set)):
+            raise _refuse(edm_type)
+        if edm_type == "Edm.String":
+            if value is None:
+                return None
+            if isinstance(value, int) and not isinstance(value, bool):
+                return str(value)
+            if not isinstance(value, str) or not all(
+                ch.isprintable() or ch in "\n\r\t" for ch in value
+            ):
+                raise _refuse(edm_type)
+            return value
+        if edm_type == "Edm.Boolean":
+            if value is None:
+                return None
+            if value is True or value == "true":
+                return True
+            if value is False or value == "false":
+                return False
+            raise _refuse(edm_type)
+        if isinstance(value, bool):
+            raise _refuse(edm_type)
+        known = (
+            edm_type in _INTEGER_RANGES
+            or edm_type in _FLOAT_TYPES
+            or edm_type in _PATTERN_TYPES
+            or edm_type == "Edm.Decimal"
+        )
+        if not known:
+            raise _refuse(edm_type)
+        if value is None:
+            return None
+        if edm_type in _INTEGER_RANGES:
+            text = str(value) if isinstance(value, int) else value
+            if not isinstance(text, str) or not _INTEGER.fullmatch(text):
+                raise _refuse(edm_type)
+            low, high = _INTEGER_RANGES[edm_type]
+            number = int(text)
+            if not low <= number <= high:
+                raise _refuse(edm_type)
+            # V2 JSON: Int64 travels as a string, the smaller integers as numbers.
+            return str(number) if edm_type == "Edm.Int64" else number
+        if edm_type == "Edm.Decimal" or edm_type in _FLOAT_TYPES:
+            text = value
+            if isinstance(value, int):
+                text = str(value)
+            elif isinstance(value, float) and math.isfinite(value):
+                text = repr(value)
+            if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
+                raise _refuse(edm_type)
+            return text  # V2 JSON carries Decimal, Double and Single as strings
+        if not isinstance(value, str):
+            raise _refuse(edm_type)
+        if edm_type in ("Edm.DateTime", "Edm.DateTimeOffset"):
+            with_offset = edm_type == "Edm.DateTimeOffset"
+            if (_JSON_DATE_OFFSET if with_offset else _JSON_DATE).fullmatch(value):
+                return value
+            match = _ISO.fullmatch(value)
+            if match is None or bool(match.group(8)) is not with_offset:
+                raise _refuse(edm_type)
+            try:
+                return self._json_date(match, with_offset)
+            except (ValueError, OverflowError):
+                raise _refuse(edm_type) from None
+        _, pattern = _PATTERN_TYPES[edm_type]  # Edm.Time, Edm.Guid
+        if not value or not pattern.fullmatch(value):
+            raise _refuse(edm_type)
+        return value
+
+    def encode_body(self, entity_set: EntitySetDef, body: dict) -> dict:
+        """``body`` as the JSON object of a V2 create or update request.
+
+        Every name must be a field of the entity set and every value a
+        scalar (or ``None``) with the form of that field's EDM type; an
+        object or a list -- a deep insert -- is refused. Whether a field may
+        be written is the client's check (``ODataClient.check_write``), which
+        runs first. A refusal names the field and the type, never the value.
+        """
+        if not isinstance(body, dict):
+            raise ODataError("invalid_argument", "the body must be an object of field values")
+        out: dict[str, Any] = {}
+        for name, value in body.items():
+            definition = entity_set.field(name) if isinstance(name, str) else None
+            if definition is None:
+                raise ODataError(
+                    "unknown_field", f"entity set {entity_set.name!r} has no such field"
+                )
+            if isinstance(value, (dict, list, tuple, set)):
+                raise ODataError(
+                    "invalid_argument",
+                    f"the value of field {definition.name!r} must be a single value; "
+                    f"nested entities and lists cannot be written",
+                )
+            try:
+                out[definition.name] = self._json_value(definition.type, value)
+            except ODataError:
+                shown = (
+                    definition.type
+                    if re.fullmatch(r"[A-Za-z0-9_.]{1,64}", definition.type)
+                    else "its type"
+                )
+                raise ODataError(
+                    "invalid_argument",
+                    f"the value of field {definition.name!r} is not a valid {shown} value",
+                ) from None
+        return out
 
     # -- query options ------------------------------------------------------
     def read_params(self, query: ReadQuery) -> dict[str, str]:
