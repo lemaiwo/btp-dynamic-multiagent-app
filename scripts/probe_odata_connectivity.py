@@ -36,6 +36,24 @@ tries the user mode(s). The passcode prompt needs a terminal: when the script
 itself arrives on stdin there is no way to ask, so run it from a file in an
 interactive session (``cf ssh <app> -t``).
 
+The spike record needs two runs: one without ``--user`` against the
+technical-user destination (settles ``TECH_USER``) and one with ``--user``
+against the principal-propagation destination (settles ``PP_MODE``). Each run
+prints ``not-tested`` for what it did not try; that is expected, not a failure.
+In the final block the first word after each key is one fixed value; anything
+that needs explaining follows in ``NOTE:`` lines.
+
+A user run never sends a credential stored in the destination: SAP would get
+the technical user next to the user token, could answer 2xx as the technical
+user, and the run would look like working principal propagation. On a
+destination whose ``Authentication`` is not ``PrincipalPropagation`` the user
+attempts are still made (without the destination's headers), a ``WARNING`` is
+printed and ``PP_MODE`` stays ``not-tested``.
+
+``LOCATION_ID_NEEDED`` says that the destination carries a
+``CloudConnectorLocationId`` (which is then sent), not that a call without it
+was tried and failed.
+
 Exit code: 0 when at least one attempted path answered 2xx, 1 when none did,
 2 when the probe could not get as far as an attempt.
 """
@@ -49,6 +67,7 @@ import json
 import os
 import sys
 import urllib.parse
+import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
@@ -58,6 +77,7 @@ except ImportError:  # pragma: no cover - the script may run outside the venv
     sys.exit("httpx is required: run this with the app's Python")
 
 USER_MODES = ("exchange", "header")
+PRINCIPAL_PROPAGATION = "PrincipalPropagation"
 JWT_BEARER = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 _QUERY_PREFIX = "URL.queries."
 _HEADER_PREFIX = "URL.headers."
@@ -108,7 +128,8 @@ class ResolvedDestination:
     proxy_type: str
     location_id: str
     queries: dict[str, str] = field(repr=False)
-    headers: dict[str, str] = field(repr=False)
+    static_headers: dict[str, str] = field(repr=False)  # URL.headers.* properties
+    token_headers: dict[str, str] = field(repr=False)  # from authTokens
     auth_tokens: bool = False
     auth_token_error: bool = False
 
@@ -229,6 +250,24 @@ def proxy_headers(
     return headers
 
 
+def destination_headers(dest: ResolvedDestination, mode: str) -> dict[str, str]:
+    """The destination's own headers an attempt may carry.
+
+    The technical path sends all of them: that is the credential under test.
+    A user path sends only what ``authTokens`` returned for a
+    ``PrincipalPropagation`` destination, and nothing at all for any other
+    ``Authentication``: a stored credential next to the user token would let
+    SAP answer as the technical user and pass for principal propagation.
+    ``URL.headers.*`` are left out of a user path for the same reason (a
+    static ``Authorization`` is a stored credential).
+    """
+    if mode == "technical":
+        return {**dest.static_headers, **dest.token_headers}
+    if dest.authentication == PRINCIPAL_PROPAGATION:
+        return dict(dest.token_headers)
+    return {}
+
+
 def build_request_url(base_url: str, path: str, queries: Mapping[str, str]) -> str:
     """``<destination URL><path>?$format=json`` plus the destination's queries.
 
@@ -251,29 +290,49 @@ def report_block(
     auth_tokens: bool,
     sap_client: bool = False,
     scheme: str = "http",
+    pp_destination: bool = True,
 ) -> str:
     """The spike record block. A path that was not attempted says so.
 
     ``statuses`` maps each attempted mode to its HTTP status (``None`` when no
-    answer came back).
+    answer came back). ``pp_destination`` is false when the user modes ran
+    against a destination that is not ``PrincipalPropagation``: no result is
+    claimed for them then. The six lines each hold one fixed value; the
+    explanations follow as ``NOTE:`` lines so the block stays parseable.
     """
+    notes: list[str] = []
+    ok = any(_is_2xx(s) for s in statuses.values())
+
     user = {m: statuses[m] for m in USER_MODES if m in statuses}
     if not user:
         pp_mode = "not-tested"
+    elif not pp_destination:
+        pp_mode = "not-tested"
+        notes.append(
+            "PP_MODE: the destination is not PrincipalPropagation, so the user attempts "
+            "say nothing about principal propagation"
+        )
     elif _is_2xx(user.get("exchange")):
         pp_mode = "exchange"  # the mechanism SAP recommends wins when both work
     elif _is_2xx(user.get("header")):
         pp_mode = "header"
-    else:
+    elif len(user) == len(USER_MODES):
         pp_mode = "none-works"
+    else:
+        pp_mode = "not-tested"
+        notes.append(f"PP_MODE: only {next(iter(user))} was tried and it failed")
 
     answered = [s for s in statuses.values() if s is not None and s != 407 and s < 500]
     if scheme != "http" or not statuses:
         forward = "not-tested"
-    elif any(_is_2xx(s) for s in statuses.values()):
+    elif ok:
         forward = "ok"
     elif answered:
-        forward = f"ok (no 2xx: the proxy took the request, the target answered {answered[0]})"
+        forward = "ok"
+        notes.append(
+            "ONPREM_HTTP_FORWARD: no 2xx; the proxy took the request and the target "
+            f"answered {answered[0]}"
+        )
     else:
         forward = "failed"
 
@@ -283,11 +342,17 @@ def report_block(
         tech = "ok" if _is_2xx(statuses["technical"]) else "failed"
 
     if not sap_client:
-        client = "needs URL.queries.sap-client on the destination (none set: SAP default client)"
-    elif any(_is_2xx(s) for s in statuses.values()):
+        client = "needs URL.queries.sap-client"
+        notes.append("SAP_CLIENT: the destination sets none, so SAP used its default client")
+    elif ok:
         client = "URL.queries.sap-client honoured"
+        notes.append(
+            "SAP_CLIENT: the property was sent and a 2xx came back; the probe cannot see "
+            "which client SAP used"
+        )
     else:
-        client = "needs a 2xx answer to tell (URL.queries.sap-client was sent)"
+        client = "needs retest"
+        notes.append("SAP_CLIENT: URL.queries.sap-client was sent, but no attempt answered 2xx")
 
     return "\n".join(
         [
@@ -297,6 +362,7 @@ def report_block(
             f"LOCATION_ID_NEEDED: {f'yes ({location_id})' if location_id else 'no'}",
             f"FIND_DESTINATION_PP: authTokens {'present' if auth_tokens else 'absent'}",
             f"SAP_CLIENT: {client}",
+            *(f"NOTE: {note}" for note in notes),
         ]
     )
 
@@ -399,34 +465,38 @@ async def _find_destination(
     if not isinstance(cfg, dict):
         raise ProbeError("find destination: no destinationConfiguration in the answer")
 
-    out_headers: dict[str, str] = {}
+    static_headers: dict[str, str] = {}
+    token_headers: dict[str, str] = {}
     queries: dict[str, str] = {}
     for key, value in cfg.items():
         if key.startswith(_QUERY_PREFIX) and key[len(_QUERY_PREFIX) :]:
             queries[key[len(_QUERY_PREFIX) :]] = str(value)
         elif key.startswith(_HEADER_PREFIX) and key[len(_HEADER_PREFIX) :]:
             if key[len(_HEADER_PREFIX) :].lower() not in _RESERVED:
-                out_headers[key[len(_HEADER_PREFIX) :]] = str(value)
+                static_headers[key[len(_HEADER_PREFIX) :]] = str(value)
 
     tokens = payload.get("authTokens") or []
     token_error = False
-    if tokens and isinstance(tokens[0], dict):
-        first = tokens[0]
+    if tokens:
+        first = tokens[0] if isinstance(tokens, list) else None
+        header = first.get("http_header") or {} if isinstance(first, dict) else None
+        if not isinstance(header, dict):
+            raise ProbeError("find destination: authTokens has an unexpected shape")
         token_error = bool(first.get("error"))
-        header = first.get("http_header") or {}
         if not token_error:
             if header.get("key") and header.get("value"):
                 if str(header["key"]).lower() not in _RESERVED:
-                    out_headers[str(header["key"])] = str(header["value"])
+                    token_headers[str(header["key"])] = str(header["value"])
             elif first.get("type") and first.get("value"):
-                out_headers["Authorization"] = f"{first['type']} {first['value']}"
+                token_headers["Authorization"] = f"{first['type']} {first['value']}"
     return ResolvedDestination(
         url=str(cfg.get("URL") or ""),
         authentication=str(cfg.get("Authentication") or ""),
         proxy_type=str(cfg.get("ProxyType") or ""),
         location_id=str(cfg.get("CloudConnectorLocationId") or ""),
         queries=queries,
-        headers=out_headers,
+        static_headers=static_headers,
+        token_headers=token_headers,
         auth_tokens=bool(tokens),
         auth_token_error=token_error,
     )
@@ -447,22 +517,36 @@ def _describe_destination(dest: ResolvedDestination, scheme: str) -> None:
     print(f"DESTINATION URL.queries: {', '.join(sorted(dest.queries)) or '-'}")
 
 
-def _read_passcode() -> str:
-    """Ask on the terminal. Refuses when there is none.
-
-    Without a terminal ``getpass`` falls back to stdin, which is the script
-    itself when the probe was piped into ``python -``.
-    """
+def _has_terminal() -> bool:
     try:
         with open("/dev/tty"):
-            pass
+            return True
     except OSError:
-        if not sys.stdin.isatty():
+        return sys.stdin.isatty()
+
+
+def _read_passcode() -> str:
+    """Ask on the terminal. Refuses when the code could not be read unseen.
+
+    Without a terminal ``getpass`` falls back to stdin, which is the script
+    itself when the probe was piped into ``python -``. When it cannot turn
+    echo off it warns (``GetPassWarning``) and reads an echoed line; the
+    warning is made an error here, which is raised before anything is read.
+    """
+    if not _has_terminal():
+        raise ProbeError(
+            "--user needs a terminal for the passcode: run the probe from a file "
+            "in an interactive session (cf ssh <app> -t)"
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass("One-time passcode: ")
+        except getpass.GetPassWarning:
             raise ProbeError(
-                "--user needs a terminal for the passcode: run the probe from a file "
-                "in an interactive session (cf ssh <app> -t)"
+                "the terminal cannot hide the passcode (echo cannot be turned off): "
+                "nothing was read; use an interactive session (cf ssh <app> -t)"
             ) from None
-    return getpass.getpass("One-time passcode: ")
 
 
 async def run(
@@ -477,6 +561,11 @@ async def run(
         return await _run(args, environ, transport, read_passcode)
     except ProbeError as exc:
         print(f"ERROR: {exc}")
+        return 2
+    except Exception as exc:  # noqa: BLE001 - the text may hold a URL or a token
+        # No traceback and no message: an httpx.InvalidURL or a parser error
+        # quotes its input, which here is landscape data.
+        print(f"ERROR: unexpected {type(exc).__name__}")
         return 2
 
 
@@ -531,6 +620,17 @@ async def _run(
                 "forward proxy; use http://<virtual host>:<port> in the destination"
             )
 
+        pp_destination = dest.authentication == PRINCIPAL_PROPAGATION
+        from_destination = destination_headers(dest, modes[0])
+        taken = any(name.lower() == "authorization" for name in from_destination)
+        print(f"DESTINATION Authorization header taken from destination: {_yes(taken)}")
+        if args.user and not pp_destination:
+            print(
+                "WARNING: --user against a destination whose Authentication is not "
+                "PrincipalPropagation. Its headers and credential are not sent, and the "
+                "attempts below are not reported as a principal-propagation result."
+            )
+
         url = build_request_url(dest.url, args.path, dest.queries)
         proxy_url = f"http://{cfg.connectivity.proxy_host}:{cfg.connectivity.proxy_port}"
         statuses: dict[str, int | None] = {}
@@ -562,7 +662,7 @@ async def _run(
                         )
                 headers = {
                     "Accept": "application/json",
-                    **dest.headers,
+                    **destination_headers(dest, mode),
                     **proxy_headers(
                         mode,
                         app_token=app_token,
@@ -576,7 +676,7 @@ async def _run(
                 )
             except ProbeError as exc:
                 error = str(exc).replace(": ", "=").replace(" ", "_")
-            except httpx.HTTPError as exc:
+            except Exception as exc:  # noqa: BLE001 - class only, see run()
                 error = type(exc).__name__
             statuses[mode] = result.status if result else None
             line = (
@@ -594,6 +694,7 @@ async def _run(
             auth_tokens=dest.auth_tokens,
             sap_client="sap-client" in dest.queries,
             scheme=scheme,
+            pp_destination=pp_destination,
         )
     )
     return 0 if any(_is_2xx(s) for s in statuses.values()) else 1

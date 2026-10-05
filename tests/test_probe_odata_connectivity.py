@@ -215,7 +215,16 @@ BASIC = base64.b64encode(b"TECH:s3cr3t-sap-password").decode()
 PASSCODE = "one-time-passcode-123"
 
 
-def btp_services(calls: list[httpx.Request], *, proxy_type="OnPremise", auth_tokens=True):
+def btp_services(
+    calls: list[httpx.Request],
+    *,
+    proxy_type="OnPremise",
+    auth_tokens=True,
+    authentication=None,
+    tokens=None,
+    url="http://s4.internal:44300",
+    extra=None,
+):
     """XSUAA (app + connectivity), and the destination service, as one transport."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -242,15 +251,19 @@ def btp_services(calls: list[httpx.Request], *, proxy_type="OnPremise", auth_tok
         assert request.headers["authorization"] == f"Bearer {DEST_TOKEN}"
         cfg = {
             "Name": "S4_ODATA_TECH",
-            "URL": "http://s4.internal:44300",
+            "URL": url,
             "ProxyType": proxy_type,
-            "Authentication": "BasicAuthentication" if auth_tokens else "PrincipalPropagation",
+            "Authentication": authentication
+            or ("BasicAuthentication" if auth_tokens else "PrincipalPropagation"),
             "CloudConnectorLocationId": "LOC",
             "URL.queries.sap-client": "100",
             "Password": "s3cr3t-sap-password",
+            **(extra or {}),
         }
         body: dict = {"destinationConfiguration": cfg}
-        if auth_tokens:
+        if tokens is not None:
+            body["authTokens"] = tokens
+        elif auth_tokens:
             body["authTokens"] = [
                 {
                     "type": "Basic",
@@ -370,3 +383,168 @@ async def test_an_internet_destination_is_refused_before_any_proxy_call(capsys):
     assert "ProxyType: Internet" in out
     for secret in SECRETS:
         assert secret not in out
+
+
+# ---- fix round 1 ------------------------------------------------------------
+
+STATIC = "Bearer s3cr3t-static-header"
+
+
+async def test_technical_run_says_the_authorization_came_from_the_destination(capsys):
+    recorded, calls = Recorded(), []
+    server, port = await start_forward_proxy(recorded)
+    async with server:
+        await probe.run(
+            args_for(), environ_for(port), transport=btp_services(calls), read_passcode=no_passcode
+        )
+    out = capsys.readouterr().out
+    assert "DESTINATION Authorization header taken from destination: yes" in out
+    assert "WARNING" not in out
+
+
+async def test_user_run_never_sends_a_stored_credential_and_claims_no_pp_result(capsys):
+    """--user against a destination with a stored credential.
+
+    SAP would get the technical credential next to the user token and could
+    answer 2xx as the technical user; that must not be reported as a working
+    principal-propagation mode.
+    """
+    recorded, calls = Recorded(), []
+    server, port = await start_forward_proxy(recorded)  # answers 200 to everything
+    async with server:
+        code = await probe.run(
+            args_for("--user"),
+            environ_for(port),
+            transport=btp_services(calls, extra={"URL.headers.Authorization": STATIC}),
+            read_passcode=lambda: PASSCODE,
+        )
+    out = capsys.readouterr().out
+    assert len(recorded.header_sets) == 2
+    for headers in recorded.header_sets:
+        assert "authorization" not in headers
+    assert "DESTINATION Authorization header taken from destination: no" in out
+    assert "WARNING" in out and "PrincipalPropagation" in out
+    assert "PP_MODE: not-tested" in out
+    assert "PP_MODE: exchange" not in out and "PP_MODE: header" not in out
+    assert "RESULT mode=exchange status=200" in out  # the attempt itself is still shown
+    assert code == 0
+    for secret in SECRETS:
+        assert secret not in out
+
+
+async def test_user_run_on_a_pp_destination_sends_only_what_authtokens_gave(capsys):
+    recorded, calls = Recorded(), []
+    server, port = await start_forward_proxy(recorded)
+    tokens = [{"type": "x", "value": "y", "http_header": {"key": "X-Dest", "value": "from-token"}}]
+    async with server:
+        await probe.run(
+            args_for("--user", "--mode", "exchange"),
+            environ_for(port),
+            transport=btp_services(
+                calls,
+                authentication="PrincipalPropagation",
+                tokens=tokens,
+                extra={"URL.headers.X-Static": "static", "URL.headers.Authorization": STATIC},
+            ),
+            read_passcode=lambda: PASSCODE,
+        )
+    out = capsys.readouterr().out
+    assert recorded.headers["x-dest"] == "from-token"
+    assert "x-static" not in recorded.headers and "authorization" not in recorded.headers
+    assert "DESTINATION Authorization header taken from destination: no" in out
+    assert "WARNING" not in out
+    assert "PP_MODE: exchange" in out
+
+
+def test_none_works_needs_both_user_modes_attempted():
+    text = probe.report_block({"exchange": 407}, location_id="", auth_tokens=False)
+    assert "PP_MODE: not-tested\n" in text
+    assert "NOTE: PP_MODE: only exchange was tried and it failed" in text
+    assert "none-works" not in text
+    assert "PP_MODE: exchange\n" in probe.report_block(
+        {"exchange": 200}, location_id="", auth_tokens=False
+    )
+
+
+def test_block_lines_hold_enumeration_values_and_notes_follow():
+    text = probe.report_block({"technical": 404}, location_id="", auth_tokens=False)
+    lines = text.splitlines()
+    assert lines[:6] == [
+        "PP_MODE: not-tested",
+        "ONPREM_HTTP_FORWARD: ok",
+        "TECH_USER: failed",
+        "LOCATION_ID_NEEDED: no",
+        "FIND_DESTINATION_PP: authTokens absent",
+        "SAP_CLIENT: needs URL.queries.sap-client",
+    ]
+    assert all(line.startswith("NOTE: ") for line in lines[6:]) and len(lines) > 6
+    assert any("404" in line for line in lines[6:])
+    text = probe.report_block(
+        {"technical": 407}, location_id="", auth_tokens=False, sap_client=True
+    )
+    assert "SAP_CLIENT: needs retest\n" in text
+    assert probe.report_block(
+        {"exchange": 200}, location_id="", auth_tokens=False, pp_destination=False
+    ).startswith("PP_MODE: not-tested\n")
+
+
+async def test_an_unexpected_authtokens_shape_is_one_error_line(capsys):
+    recorded, calls = Recorded(), []
+    server, port = await start_forward_proxy(recorded)
+    async with server:
+        code = await probe.run(
+            args_for(),
+            environ_for(port),
+            transport=btp_services(calls, tokens=[{"http_header": "s3cr3t-odd-shape"}]),
+            read_passcode=no_passcode,
+        )
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "ERROR:" in out and "Traceback" not in out
+    assert recorded.request_lines == []
+    for secret in SECRETS:
+        assert secret not in out
+
+
+async def test_a_malformed_destination_url_is_named_by_class_only(capsys):
+    recorded, calls = Recorded(), []
+    server, port = await start_forward_proxy(recorded)
+    async with server:
+        code = await probe.run(
+            args_for(),
+            environ_for(port),
+            transport=btp_services(calls, url="http://[s3cr3t-host"),
+            read_passcode=no_passcode,
+        )
+    out = capsys.readouterr().out
+    assert code == 2
+    assert "ERROR: unexpected ValueError" in out
+    assert "s3cr3t" not in out
+
+
+async def test_an_invalid_url_at_the_request_is_named_by_class_only(capsys, monkeypatch):
+    async def boom(*args, **kwargs):
+        raise httpx.InvalidURL("Invalid port in http://s3cr3t-host:99999999/")
+
+    monkeypatch.setattr(probe, "send_through_proxy", boom)
+    code = await probe.run(
+        args_for(), environ_for(1), transport=btp_services([]), read_passcode=no_passcode
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "RESULT mode=technical status=- sap_user_header=- length=0 error=InvalidURL" in out
+    assert "s3cr3t" not in out
+
+
+def test_a_passcode_that_would_be_echoed_is_refused(monkeypatch):
+    import getpass
+    import warnings
+
+    def echoing(prompt=""):
+        warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning)
+        raise AssertionError("the passcode must not be read once echo cannot be turned off")
+
+    monkeypatch.setattr(probe.getpass, "getpass", echoing)
+    monkeypatch.setattr(probe, "_has_terminal", lambda: True)
+    with pytest.raises(probe.ProbeError, match="echo"):
+        probe._read_passcode()
