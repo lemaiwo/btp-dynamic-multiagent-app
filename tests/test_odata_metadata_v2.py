@@ -9,6 +9,7 @@ that is not plain EDMX -- a DTD, an entity, an oversized body, a login page.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -39,9 +40,10 @@ from agents.odata.metadata import (  # noqa: E402
     MAX_METADATA_BYTES,
     MetadataError,
     ParsedMetadata,
+    SkippedElement,
     parse_metadata,
 )
-from agents.odata.models import KeyDef, ParamDef  # noqa: E402
+from agents.odata.models import KeyDef, OperationDef, ParamDef  # noqa: E402
 
 XML = (ROOT / "tests/fixtures/odata/v2_purchasereq_reduced.xml").read_bytes()
 
@@ -79,6 +81,7 @@ def _sets(md: ParsedMetadata) -> dict:
 def test_entity_sets_keys_labels_and_capabilities():
     md = parse_metadata(XML, "v2")
     assert md.version == "v2"
+    assert md.skipped == ()
     assert [e.name for e in md.entity_sets] == [
         "A_PurchaseRequisitionHeader",
         "A_PurchaseRequisitionItem",
@@ -227,14 +230,17 @@ def test_several_schemas_alias_and_base_type():
         '<Schema Namespace="Container" xmlns="http://schemas.microsoft.com/ado/2008/09/edm">'
         '<EntityContainer Name="C"><EntitySet Name="Orders" EntityType="M.Order"/>'
         '<EntitySet Name="Lines" EntityType="Model.Line"/>'
-        '<EntitySet Name="Orphans" EntityType="Model.Missing"/></EntityContainer>'
+        '<EntitySet Name="Orphans" EntityType="Model.Missing"/>'
+        '<AssociationSet Name="OL" Association="M.Order_Line">'
+        '<End EntitySet="Orders" Role="O"/><End EntitySet="Lines" Role="L"/>'
+        "</AssociationSet></EntityContainer>"
         "</Schema></edmx:DataServices></edmx:Edmx>"
     ).encode()
     sets = _sets(parse_metadata(xml, "v2"))
     orders = sets["Orders"]
     assert [k.name for k in orders.keys] == ["Id"]  # inherited from the base type
     assert [f.name for f in orders.fields] == ["Id", "Note"]
-    # No AssociationSet: the one entity set of the target type is the target.
+    # The association set is found through the schema's alias as well.
     assert [(n.name, n.target, n.collection) for n in orders.navigations] == [
         ("Lines", "Lines", True)
     ]
@@ -242,58 +248,255 @@ def test_several_schemas_alias_and_base_type():
     assert sets["Orphans"].fields == () and sets["Orphans"].keys == ()
 
 
-def test_navigation_without_a_target_entity_set_has_an_empty_target():
+_NAV_TYPES = (
+    '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+    '<Property Name="Id" Type="Edm.Guid" Nullable="false"/>'
+    '<NavigationProperty Name="to_Note" Relationship="NS.A" FromRole="O" ToRole="N"/>'
+    '<NavigationProperty Name="to_Gone" Relationship="NS.Nope" FromRole="O" ToRole="N"/>'
+    '<NavigationProperty Name="to_NoEnd" Relationship="NS.A" FromRole="O" ToRole="X"/>'
+    "</EntityType>"
+    '<EntityType Name="NoteType"><Key><PropertyRef Name="Id"/></Key>'
+    '<Property Name="Id" Type="Edm.Guid" Nullable="false"/></EntityType>'
+    '<Association Name="A"><End Type="NS.OrderType" Multiplicity="1" Role="O"/>'
+    '<End Type="NS.NoteType" Multiplicity="0..1" Role="N"/></Association>'
+)
+
+
+def test_an_unresolved_navigation_is_skipped_never_emitted_with_an_empty_target():
+    """No association set covering this entity set means no known target.
+
+    The one entity set of the target *type* is not taken as a stand-in: the
+    association set is what says which set the other end is.
+    """
     md = parse_metadata(
         _doc(
-            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
-            '<Property Name="Id" Type="Edm.Guid" Nullable="false"/>'
-            '<NavigationProperty Name="to_Note" Relationship="NS.A" FromRole="O" ToRole="N"/>'
-            "</EntityType>"
-            '<EntityType Name="NoteType"><Key><PropertyRef Name="Id"/></Key>'
-            '<Property Name="Id" Type="Edm.Guid" Nullable="false"/></EntityType>'
-            '<Association Name="A"><End Type="NS.OrderType" Multiplicity="1" Role="O"/>'
-            '<End Type="NS.NoteType" Multiplicity="0..1" Role="N"/></Association>'
-            '<EntityContainer Name="C"><EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+            _NAV_TYPES + '<EntityContainer Name="C">'
+            '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+            '<EntitySet Name="Notes" EntityType="NS.NoteType"/>'
             "</EntityContainer>"
         ),
         "v2",
     )
-    (nav,) = md.entity_sets[0].navigations
-    assert (nav.name, nav.target, nav.collection) == ("to_Note", "", False)
+    assert _sets(md)["Orders"].navigations == ()
+    assert md.skipped == (
+        SkippedElement("navigation", "Orders", 1, "unresolved_target"),  # no association set
+        SkippedElement("navigation", "Orders", 2, "unresolved_target"),  # no such association
+        SkippedElement("navigation", "Orders", 3, "unresolved_target"),  # no such ToRole end
+    )
 
 
-def test_action_for_an_ambiguous_or_unknown_type_is_unbound():
+def test_the_association_set_decides_between_entity_sets_of_one_type():
     md = parse_metadata(
         _doc(
-            _ORDER + '<EntityContainer Name="C">'
+            _NAV_TYPES + '<EntityContainer Name="C">'
             '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
             '<EntitySet Name="ArchivedOrders" EntityType="NS.OrderType"/>'
+            '<EntitySet Name="Notes" EntityType="NS.NoteType"/>'
+            '<EntitySet Name="ArchivedNotes" EntityType="NS.NoteType"/>'
+            '<AssociationSet Name="S1" Association="NS.A">'
+            '<End EntitySet="Orders" Role="O"/><End EntitySet="Notes" Role="N"/></AssociationSet>'
+            '<AssociationSet Name="S2" Association="NS.A">'
+            '<End EntitySet="ArchivedOrders" Role="O"/><End EntitySet="ArchivedNotes" Role="N"/>'
+            "</AssociationSet></EntityContainer>"
+        ),
+        "v2",
+    )
+    sets = _sets(md)
+    assert [(n.name, n.target, n.collection) for n in sets["Orders"].navigations] == [
+        ("to_Note", "Notes", False)
+    ]
+    assert [(n.name, n.target) for n in sets["ArchivedOrders"].navigations] == [
+        ("to_Note", "ArchivedNotes")
+    ]
+    assert all(n.target for e in md.entity_sets for n in e.navigations)
+
+
+def test_action_for_binds_only_when_one_entity_set_has_the_type():
+    md = parse_metadata(
+        _doc(
+            _ORDER + '<EntityType Name="LineType"><Key><PropertyRef Name="Pos"/></Key>'
+            '<Property Name="Pos" Type="Edm.Int32" Nullable="false"/></EntityType>'
+            '<EntityContainer Name="C">'
+            '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+            '<EntitySet Name="ArchivedOrders" EntityType="NS.OrderType"/>'
+            '<EntitySet Name="Lines" EntityType="NS.LineType"/>'
             '<FunctionImport Name="Close" m:HttpMethod="POST" sap:action-for="NS.OrderType"/>'
             '<FunctionImport Name="Pinned" m:HttpMethod="POST" EntitySet="ArchivedOrders" '
             'sap:action-for="NS.OrderType"/>'
             '<FunctionImport Name="Lost" m:HttpMethod="POST" sap:action-for="NS.Nope"/>'
+            '<FunctionImport Name="Split" m:HttpMethod="POST" EntitySet="Orders" '
+            'sap:action-for="NS.LineType"/>'
+            '<FunctionImport Name="Free" m:HttpMethod="POST" EntitySet="Orders"/>'
             "</EntityContainer>"
         ),
         "v2",
     )
     assert {o.name: o.bound_to for o in md.operations} == {
         "Close": None,  # two entity sets share the type: not guessed
-        "Pinned": "ArchivedOrders",  # ... unless the import names one of them
+        "Pinned": None,  # EntitySet is the import's RETURN set, it settles nothing
         "Lost": None,
+        "Split": "Lines",  # the one set of the action-for type, not the return set
+        "Free": None,
     }
+    assert md.skipped == ()
 
 
-def test_a_name_that_is_not_an_edm_identifier_is_refused_without_echoing_it():
-    bad = _doc(
-        '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
-        '<Property Name="Id" Type="Edm.Guid"/>'
-        '<Property Name="x/../y?token=abc" Type="Edm.String"/></EntityType>'
-        '<EntityContainer Name="C"><EntitySet Name="Orders" EntityType="NS.OrderType"/>'
-        "</EntityContainer>"
+# ------------------------------------------------- skipped, not failed (and why)
+
+_SECRET = "x/../y?token=abc"
+
+
+def _container(body: str) -> str:
+    return f'<EntityContainer Name="C">{body}</EntityContainer>'
+
+
+def test_a_property_or_navigation_with_a_bad_name_is_skipped_and_recorded():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid"/>'
+            f'<Property Name="{_SECRET}" Type="Edm.String"/>'
+            '<Property Name="Note" Type="Edm.String"/>'
+            '<Property Name="Note&#10;" Type="Edm.String"/>'  # fullmatch: no trailing newline
+            f'<Property Name="Blob" Type="{"T" * 201}"/>'
+            f'<NavigationProperty Name="{_SECRET}" Relationship="NS.A" FromRole="O" ToRole="N"/>'
+            "</EntityType>" + _container('<EntitySet Name="Orders" EntityType="NS.OrderType"/>')
+        ),
+        "v2",
     )
-    with pytest.raises(MetadataError) as exc:
-        parse_metadata(bad, "v2")
-    assert "token" not in str(exc.value) and "Orders" in str(exc.value)
+    (orders,) = md.entity_sets
+    assert [f.name for f in orders.fields] == ["Id", "Note"]
+    assert md.skipped == (
+        SkippedElement("property", "Orders", 2, "invalid_name"),
+        SkippedElement("property", "Orders", 4, "invalid_name"),
+        SkippedElement("property", "Orders", 5, "invalid_type"),
+        SkippedElement("navigation", "Orders", 1, "invalid_name"),
+    )
+    # Never the offending name, nor any other text of the document.
+    assert "token" not in repr(md) and "TTTT" not in repr(md.skipped)
+
+
+def test_an_entity_set_that_cannot_be_represented_is_skipped_as_a_whole():
+    md = parse_metadata(
+        _doc(
+            _ORDER
+            # the key property's name is not an identifier
+            + '<EntityType Name="BadKeyType"><Key><PropertyRef Name="a b"/></Key>'
+            '<Property Name="a b" Type="Edm.String"/><Property Name="Ok"/></EntityType>'
+            # the key names a property that does not exist
+            '<EntityType Name="GhostKeyType"><Key><PropertyRef Name="Id"/>'
+            '<PropertyRef Name="Ghost"/></Key><Property Name="Id" Type="Edm.Guid"/></EntityType>'
+            + _container(
+                f'<EntitySet Name="{_SECRET}" EntityType="NS.OrderType"/>'
+                '<EntitySet Name="BadKeys" EntityType="NS.BadKeyType"/>'
+                '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+                '<EntitySet Name="GhostKeys" EntityType="NS.GhostKeyType"/>'
+                f'<EntitySet Name="LongType" EntityType="NS.{"T" * 200}"/>'
+                '<EntitySet Name="Orders" EntityType="NS.GhostKeyType"/>'
+                '<FunctionImport Name="Fix" m:HttpMethod="POST" sap:action-for="NS.BadKeyType"/>'
+            )
+        ),
+        "v2",
+    )
+    assert [e.name for e in md.entity_sets] == ["Orders"]
+    assert md.entity_sets[0].entity_type == "NS.OrderType"
+    assert md.skipped == (
+        SkippedElement("entity_set", "", 1, "invalid_name"),
+        # One entry for the set; its own bad property is not listed separately.
+        SkippedElement("entity_set", "BadKeys", 2, "unrepresentable_key"),
+        SkippedElement("entity_set", "GhostKeys", 4, "unrepresentable_key"),
+        SkippedElement("entity_set", "LongType", 5, "invalid_type"),
+        SkippedElement("entity_set", "Orders", 6, "duplicate_name"),
+    )
+    # A skipped set is nothing an operation can be bound to.
+    assert md.operations[0].bound_to is None
+    assert "token" not in repr(md)
+
+
+def test_a_navigation_to_a_skipped_entity_set_is_skipped_too():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid"/>'
+            '<NavigationProperty Name="to_Bad" Relationship="NS.A" FromRole="O" ToRole="B"/>'
+            "</EntityType>"
+            '<EntityType Name="BadType"><Key><PropertyRef Name="Ghost"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid"/></EntityType>'
+            '<Association Name="A"><End Type="NS.OrderType" Multiplicity="1" Role="O"/>'
+            '<End Type="NS.BadType" Multiplicity="*" Role="B"/></Association>'
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+                '<EntitySet Name="Bads" EntityType="NS.BadType"/>'
+                '<AssociationSet Name="S" Association="NS.A">'
+                '<End EntitySet="Orders" Role="O"/><End EntitySet="Bads" Role="B"/>'
+                "</AssociationSet>"
+            )
+        ),
+        "v2",
+    )
+    assert [e.name for e in md.entity_sets] == ["Orders"]
+    assert md.entity_sets[0].navigations == ()
+    assert md.skipped == (
+        SkippedElement("entity_set", "Bads", 2, "unrepresentable_key"),
+        SkippedElement("navigation", "Orders", 1, "unresolved_target"),
+    )
+
+
+@pytest.mark.parametrize("method", ["PUT", "DELETE", "MERGE", "patch", "GET POST", "&lt;x&gt;"])
+def test_a_function_import_with_another_http_method_is_skipped(method):
+    """Everything the parser emits fits ``OperationDef`` (GET or POST only)."""
+    md = parse_metadata(
+        _doc(
+            _ORDER
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+                '<FunctionImport Name="Read"/>'
+                f'<FunctionImport Name="Odd" m:HttpMethod="{method}"/>'
+                '<FunctionImport Name="Write" m:HttpMethod=" post "/>'
+            )
+        ),
+        "v2",
+    )
+    assert [(o.name, o.http_method) for o in md.operations] == [("Read", "GET"), ("Write", "POST")]
+    assert md.skipped == (SkippedElement("operation", "", 2, "unsupported_http_method"),)
+    for op in md.operations:  # the proof: the definition model takes it as it is
+        OperationDef(
+            name=op.name,
+            kind=op.kind,
+            http_method=op.http_method,
+            bound_to=op.bound_to,
+            parameters=list(op.parameters),
+            title=op.label,
+        )
+
+
+def test_a_function_import_with_a_bad_name_or_parameter_is_skipped():
+    md = parse_metadata(
+        _doc(
+            _ORDER
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+                f'<FunctionImport Name="{_SECRET}" m:HttpMethod="POST"/>'
+                '<FunctionImport Name="BadParamName" m:HttpMethod="POST">'
+                f'<Parameter Name="{_SECRET}" Type="Edm.String" Mode="In"/></FunctionImport>'
+                '<FunctionImport Name="BadParamType" m:HttpMethod="POST">'
+                f'<Parameter Name="P" Type="{"T" * 201}" Mode="In"/></FunctionImport>'
+                '<FunctionImport Name="Fine" m:HttpMethod="POST">'
+                # an Out parameter is not sent, so its name does not matter
+                f'<Parameter Name="{_SECRET}" Type="Edm.String" Mode="Out"/></FunctionImport>'
+                '<FunctionImport Name="Fine" m:HttpMethod="GET"/>'
+            )
+        ),
+        "v2",
+    )
+    assert [(o.name, o.http_method, o.parameters) for o in md.operations] == [("Fine", "POST", ())]
+    assert md.skipped == (
+        SkippedElement("operation", "", 1, "invalid_name"),
+        SkippedElement("operation", "", 2, "invalid_parameter"),
+        SkippedElement("operation", "", 3, "invalid_parameter"),
+        SkippedElement("operation", "", 5, "duplicate_name"),
+    )
+    assert "token" not in repr(md)
 
 
 def test_labels_are_one_line_and_bounded():
@@ -309,6 +512,21 @@ def test_labels_are_one_line_and_bounded():
     )
     label = md.entity_sets[0].fields[0].label
     assert label.startswith("A label x") and len(label) == 120 and "\n" not in label
+
+
+def test_labels_lose_format_and_control_characters():
+    """A bidi override in a label would reorder the admin's view of the line."""
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType" sap:label="Or&#x202E;der&#x200B;s&#xFEFF;">'
+            '<Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" sap:label="&#x2066;I&#x2069;d&#x200F;&#9;x"/>'
+            "</EntityType>" + _container('<EntitySet Name="Orders" EntityType="NS.OrderType"/>')
+        ),
+        "v2",
+    )
+    assert md.entity_sets[0].label == "Orders"
+    assert md.entity_sets[0].fields[0].label == "Id x"
 
 
 # -------------------------------------------------------------------- refusals
@@ -329,10 +547,13 @@ def test_doctype_and_entities_are_refused():
 
 @pytest.mark.parametrize("codec", ["utf-16", "utf-16-le", "utf-16-be", "cp037", "cp500"])
 def test_a_dtd_in_an_encoding_a_byte_scan_cannot_read_is_refused(codec):
-    """The byte scan for ``<!DOCTYPE`` is not the only line of defence.
+    """Whatever the encoding, a document with a DTD does not come back parsed.
 
-    expat decodes UTF-16 and (through Python's codecs) single-byte encodings
-    such as EBCDIC, in which the ASCII scan sees nothing.
+    Which layer refuses differs: UTF-16 with a BOM is decoded by expat and
+    stopped by the DTD handlers; UTF-16 without a BOM and EBCDIC (cp037,
+    cp500) are not decodable by expat at all (it cannot read the XML
+    declaration), so they end as a parse error. The handler layer on its own
+    is proven by ``test_the_dtd_handlers_refuse_without_the_byte_scan``.
     """
     declared = "utf-16" if codec.startswith("utf-16") else codec
     text = (
@@ -340,9 +561,38 @@ def test_a_dtd_in_an_encoding_a_byte_scan_cannot_read_is_refused(codec):
         '<!DOCTYPE x [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;">]><x>&b;</x>'
     )
     payload = text.encode(codec)
-    assert b"<!DOCTYPE" not in payload or codec == "utf-16"  # utf-16: BOM + wide chars
+    assert b"<!DOCTYPE" not in payload  # the ASCII scan sees nothing
     with pytest.raises(MetadataError):
         parse_metadata(payload, "v2")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'<?xml version="1.0"?><!DOCTYPE x><x/>',
+        b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x>',
+        b'<?xml version="1.0"?><!DOCTYPE x SYSTEM "http://s4.internal:44300/x.dtd"><x/>',
+        b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]><x>&e;</x>',
+        '<?xml version="1.0" encoding="utf-16"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x>'.encode(
+            "utf-16"
+        ),
+        b'<?xml version="1.0" encoding="iso-8859-1"?><!DOCTYPE x [<!ENTITY a "b">]><x>&a;</x>',
+    ],
+)
+def test_the_dtd_handlers_refuse_without_the_byte_scan(monkeypatch, payload):
+    """The expat handlers are a layer of their own, not a copy of the scan."""
+    monkeypatch.setattr(odata_metadata, "_DTD_RE", re.compile(rb"(?!x)x"))  # never matches
+    calls: list[int] = []
+    real = odata_metadata._refuse_dtd
+
+    def spy(*args):
+        calls.append(1)
+        return real(*args)
+
+    monkeypatch.setattr(odata_metadata, "_refuse_dtd", spy)
+    with pytest.raises(MetadataError, match="DTD"):
+        parse_metadata(payload, "v2")
+    assert calls == [1]  # refused at the first declaration expat reported
 
 
 def test_no_dtd_handler_is_reached_for_plain_edmx(monkeypatch):

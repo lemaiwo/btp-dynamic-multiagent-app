@@ -10,14 +10,16 @@ flags are what SAP *says*, the catalogue's flags are what the admin allows.
 
 The document comes from a remote system, so it is untrusted input:
 
-* A DTD is never accepted. Input containing ``<!DOCTYPE`` or ``<!ENTITY`` is
-  refused before parsing, and the parser itself refuses a doctype or entity
-  declaration when expat reports one. The second check is the one that
-  holds for an encoding a byte scan cannot read (UTF-16, or a single-byte
-  codec such as EBCDIC that expat decodes through Python's codecs). Without
-  a DTD there is no entity to expand (no "billion laughs") and no external
-  entity to resolve; an external entity handler is installed anyway and
-  refuses.
+* A DTD is never accepted, by two independent layers. Input containing
+  ``<!DOCTYPE`` or ``<!ENTITY`` is refused before parsing (an ASCII byte
+  scan), and the parser itself refuses a doctype or entity declaration when
+  expat reports one. The handlers are the layer that holds for input the
+  scan cannot read but expat can decode: UTF-16 with a byte order mark.
+  Input expat cannot decode at all (EBCDIC, UTF-16 without a BOM) is not
+  stopped by either layer -- it simply does not parse and is refused as
+  "not an EDMX document". Without a DTD there is no entity to expand (no
+  "billion laughs") and no external entity to resolve; an external entity
+  handler is installed anyway and refuses.
 * Size and nesting depth are capped.
 * An error never quotes the document: what came back instead of EDMX is
   often a login page, and a refusal is echoed to the admin UI and logged.
@@ -25,17 +27,28 @@ The document comes from a remote system, so it is untrusted input:
 Elements and attributes are matched by local name, so every EDMX 1.0 / EDM
 schema namespace revision and the ``sap:`` / ``m:`` annotation namespaces
 parse the same way.
+
+Everything in the result fits the definition models (``agents.odata.models``):
+names match ``EDM_NAME_RE``, an operation's method is GET or POST, a
+navigation always has a target entity set. What the document declares but
+cannot be represented that way is left out and listed in
+``ParsedMetadata.skipped`` (kind, owning entity set, position, a reason code
+from ``SKIP_REASONS`` -- never its name or other text of the document); one
+odd element does not make the whole service unreadable.
+
+``parse_metadata`` is synchronous CPU work (up to ``MAX_METADATA_BYTES`` of
+XML): a route or tool must call it through ``asyncio.to_thread`` and not on
+the event loop.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Literal
 from xml.parsers import expat
-
-from pydantic import ValidationError
 
 from .models import EDM_NAME_RE, KeyDef, ParamDef
 
@@ -52,6 +65,22 @@ _MAX_TYPE_CHARS = 200  # models.EdmType
 _DTD_RE = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
 _NAME_RE = re.compile(EDM_NAME_RE)
 _NOT_EDMX = "not an EDMX document"
+_HTTP_METHODS = ("GET", "POST")  # models.OperationDef.http_method
+
+# Why an element is in `ParsedMetadata.skipped`. `position` counts, 1-based
+# and in document order: EntitySet elements over all containers
+# ("entity_set"), FunctionImport elements over all containers ("operation"),
+# and the Property / NavigationProperty elements of the entity set's type,
+# base types first ("property" / "navigation").
+SKIP_REASONS = (
+    "invalid_name",  # the Name is not an EDM_NAME_RE identifier
+    "invalid_type",  # a type name longer than the models accept
+    "duplicate_name",  # entity_set / operation: an earlier one has the name
+    "unrepresentable_key",  # entity_set: a key part is no (parsed) property of it
+    "unresolved_target",  # navigation: no association set gives its target entity set
+    "unsupported_http_method",  # operation: m:HttpMethod is not GET or POST
+    "invalid_parameter",  # operation: an In parameter with a bad name or type
+)
 
 
 class MetadataError(ValueError):
@@ -72,7 +101,7 @@ class ParsedField:
 @dataclass(frozen=True)
 class ParsedNavigation:
     name: str
-    target: str  # entity SET name ("" when the target type has none)
+    target: str  # entity SET name, always one of ParsedMetadata.entity_sets
     collection: bool
 
 
@@ -94,10 +123,27 @@ class ParsedOperation:
     name: str
     qualified_name: str
     kind: str
-    http_method: str
+    http_method: str  # "GET" | "POST"
     bound_to: str | None
     parameters: tuple[ParamDef, ...]
     label: str
+
+
+@dataclass(frozen=True)
+class SkippedElement:
+    """Something the document declares that the parser left out, and why.
+
+    Deliberately without the element's own name or any other text of the
+    document: an element is skipped because its name or type is not
+    something the definition models accept, so that text is exactly what
+    must not travel on into a preview or a log. ``position`` is how the
+    admin finds it in the ``$metadata``.
+    """
+
+    kind: str  # "entity_set" | "property" | "navigation" | "operation"
+    entity_set: str  # the owning (or, for kind "entity_set", the own) set; "" when none or invalid
+    position: int  # 1-based, see SKIP_REASONS for what is counted
+    reason: str  # one of SKIP_REASONS
 
 
 @dataclass(frozen=True)
@@ -105,6 +151,7 @@ class ParsedMetadata:
     version: str
     entity_sets: tuple[ParsedEntitySet, ...]
     operations: tuple[ParsedOperation, ...]
+    skipped: tuple[SkippedElement, ...] = ()
 
 
 # --------------------------------------------------------------- safe parsing
@@ -174,26 +221,46 @@ def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
 
 
 def _flag(element: ET.Element, name: str) -> bool:
-    """A SAP capability annotation; absent means ``true`` (the V2 default)."""
+    """A SAP capability annotation; absent means ``true`` (the V2 default).
+
+    This is what SAP *declares*, not a permission: the catalogue enables
+    nothing from it.
+    """
     value = element.get(name)
     return True if value is None else value.strip().lower() != "false"
 
 
 def _label(element: ET.Element | None) -> str:
+    """A one-line label without invisible characters.
+
+    Format characters (category Cf: bidi overrides and isolates, zero-width
+    characters, BOM) are dropped: in an admin table they can reorder or hide
+    what the line says. Other control characters become a space.
+    """
     if element is None:
         return ""
-    return " ".join((element.get("label") or "").split())[:MAX_LABEL_CHARS]
+    text = "".join(
+        " " if unicodedata.category(ch) == "Cc" else ch
+        for ch in element.get("label") or ""
+        if unicodedata.category(ch) != "Cf"
+    )
+    return " ".join(text.split())[:MAX_LABEL_CHARS]
 
 
-def _valid_name(value: str | None) -> bool:
-    return bool(value) and _NAME_RE.match(value or "") is not None
+def _name(element: ET.Element) -> str | None:
+    """The element's ``Name`` when the definition models accept it, else ``None``.
+
+    ``fullmatch``: with ``match`` the pattern's ``$`` also accepts a trailing
+    newline.
+    """
+    value = element.get("Name")
+    return value if value and _NAME_RE.fullmatch(value) else None
 
 
-def _type_name(element: ET.Element, who: str) -> str:
+def _type_name(element: ET.Element) -> str | None:
+    """The ``Type`` (default ``Edm.String``), or ``None`` when it is too long."""
     value = (element.get("Type") or "").strip() or "Edm.String"
-    if len(value) > _MAX_TYPE_CHARS:
-        raise MetadataError(f"{who} has a type name longer than {_MAX_TYPE_CHARS} characters")
-    return value
+    return value if len(value) <= _MAX_TYPE_CHARS else None
 
 
 class _Schemas:
@@ -246,19 +313,38 @@ class _Schemas:
 # ------------------------------------------------------------------------- V2
 
 
-def _v2_fields(chain: list[ET.Element], who: str) -> tuple[ParsedField, ...]:
+@dataclass
+class _SetDraft:
+    """An entity set that survived the first pass (name, type, fields, key)."""
+
+    name: str
+    element: ET.Element
+    type_element: ET.Element | None
+    entity_type: str
+    chain: list[ET.Element]
+    fields: tuple[ParsedField, ...]
+    keys: tuple[KeyDef, ...]
+
+
+def _v2_fields(
+    chain: list[ET.Element], set_name: str
+) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
     fields: dict[str, ParsedField] = {}
+    skipped: list[SkippedElement] = []
+    position = 0
     for entity_type in chain:
         for prop in entity_type.findall("Property"):
-            name = prop.get("Name")
-            if not _valid_name(name):
-                raise MetadataError(f"{who} has a property whose name is not a valid identifier")
-            assert name is not None
+            position += 1
+            name, type_name = _name(prop), _type_name(prop)
+            if name is None or type_name is None:
+                reason = "invalid_name" if name is None else "invalid_type"
+                skipped.append(SkippedElement("property", set_name, position, reason))
+                continue
             fields.setdefault(
                 name,
                 ParsedField(
                     name=name,
-                    type=_type_name(prop, f"property {name!r} of {who}"),
+                    type=type_name,
                     label=_label(prop),
                     filterable=_flag(prop, "filterable"),
                     creatable=_flag(prop, "creatable"),
@@ -266,172 +352,235 @@ def _v2_fields(chain: list[ET.Element], who: str) -> tuple[ParsedField, ...]:
                     nullable=(prop.get("Nullable") or "").strip().lower() != "false",
                 ),
             )
-    return tuple(fields.values())
+    return tuple(fields.values()), skipped
 
 
-def _v2_keys(
-    chain: list[ET.Element], fields: tuple[ParsedField, ...], who: str
-) -> tuple[KeyDef, ...]:
+def _v2_keys(chain: list[ET.Element], fields: tuple[ParsedField, ...]) -> tuple[KeyDef, ...] | None:
+    """The key, ``()`` for a type that declares none, ``None`` when it cannot be represented.
+
+    A key part must be one of the parsed fields: a part that names no
+    property, or a property that was skipped, would leave an entity set
+    whose rows cannot be addressed -- and guessing a type for it would send
+    wrongly quoted keys to SAP.
+    """
     types = {f.name: f.type for f in fields}
     for entity_type in chain:  # the key is declared once, on the root of the hierarchy
         key = entity_type.find("Key")
         if key is None:
             continue
         names = list(dict.fromkeys(ref.get("Name") or "" for ref in key.findall("PropertyRef")))
-        try:
-            return tuple(KeyDef(name=n, type=types.get(n, "Edm.String")) for n in names)
-        except ValidationError:
-            raise MetadataError(f"{who} has a key whose name is not a valid identifier") from None
+        if any(name not in types for name in names):
+            return None
+        return tuple(KeyDef(name=name, type=types[name]) for name in names)
     return ()
 
 
 def _v2_navigations(
-    chain: list[ET.Element],
-    set_name: str,
+    draft: _SetDraft,
     schemas: _Schemas,
-    association_sets: list[tuple[str, dict[str, str]]],
-    sets_by_type: dict[str, list[str]],
-    who: str,
-) -> tuple[ParsedNavigation, ...]:
+    targets: dict[tuple[str, str, str], str],
+) -> tuple[tuple[ParsedNavigation, ...], list[SkippedElement]]:
     navigations: dict[str, ParsedNavigation] = {}
-    for entity_type in chain:
+    skipped: list[SkippedElement] = []
+    position = 0
+    for entity_type in draft.chain:
         for nav in entity_type.findall("NavigationProperty"):
-            name = nav.get("Name")
-            if not _valid_name(name):
-                raise MetadataError(f"{who} has a navigation whose name is not a valid identifier")
-            assert name is not None
+            position += 1
+            name = _name(nav)
+            if name is None:
+                skipped.append(SkippedElement("navigation", draft.name, position, "invalid_name"))
+                continue
             association = schemas.associations.get((nav.get("Relationship") or "").strip())
             to_role, from_role = nav.get("ToRole") or "", nav.get("FromRole") or ""
-            target, collection = "", False
-            if association is not None:
-                canonical, element = association
-                end = next((e for e in element.findall("End") if e.get("Role") == to_role), None)
-                if end is not None:
-                    collection = (end.get("Multiplicity") or "").strip() == "*"
-                    # The association set says which entity SET the other end
-                    # is; several sets can share one entity type.
-                    for assoc_name, roles in association_sets:
-                        if assoc_name == canonical and roles.get(from_role) == set_name:
-                            target = roles.get(to_role, "")
-                            break
-                    if not target:
-                        candidates = sets_by_type.get(schemas.canonical_type(end.get("Type")), [])
-                        target = candidates[0] if len(candidates) == 1 else ""
-            navigations.setdefault(
-                name, ParsedNavigation(name=name, target=target, collection=collection)
+            end = (
+                next((e for e in association[1].findall("End") if e.get("Role") == to_role), None)
+                if association is not None
+                else None
             )
-    return tuple(navigations.values())
+            # Only an association set says which entity SET the other end is
+            # (several sets can share one entity type); without one for this
+            # set the navigation has no known target and is not offered.
+            target = (
+                targets.get((association[0], from_role, draft.name))
+                if association is not None and end is not None
+                else None
+            )
+            if end is None or not target:
+                skipped.append(
+                    SkippedElement("navigation", draft.name, position, "unresolved_target")
+                )
+                continue
+            navigations.setdefault(
+                name,
+                ParsedNavigation(
+                    name=name,
+                    target=target,
+                    collection=(end.get("Multiplicity") or "").strip() == "*",
+                ),
+            )
+    return tuple(navigations.values()), skipped
 
 
 def _v2_operation(
-    element: ET.Element,
-    schemas: _Schemas,
-    set_names: set[str],
-    sets_by_type: dict[str, list[str]],
-) -> ParsedOperation:
-    name = element.get("Name")
-    if not _valid_name(name):
-        raise MetadataError("a function import name is not a valid identifier")
-    assert name is not None
-    who = f"function import {name!r}"
+    element: ET.Element, schemas: _Schemas, sets_by_type: dict[str, list[str]]
+) -> ParsedOperation | str:
+    """The function import, or the reason code it is skipped for."""
+    name = _name(element)
+    if name is None:
+        return "invalid_name"
+    http_method = (element.get("HttpMethod") or "").strip().upper() or "GET"
+    if http_method not in _HTTP_METHODS:
+        # PUT / DELETE / MERGE exist in V2, but the tools call an operation
+        # with GET or POST only, and `OperationDef` stores nothing else.
+        return "unsupported_http_method"
     parameters: dict[str, ParamDef] = {}
     for param in element.findall("Parameter"):
         # Out parameters are part of the answer, not of the call.
         if (param.get("Mode") or "In").strip().lower() == "out":
             continue
-        try:
-            parsed = ParamDef(
-                name=param.get("Name") or "",
-                type=_type_name(param, f"a parameter of {who}"),
+        param_name, type_name = _name(param), _type_name(param)
+        if param_name is None or type_name is None:
+            # Not callable as declared: a call without one of its parameters
+            # would be a different call.
+            return "invalid_parameter"
+        parameters.setdefault(
+            param_name,
+            ParamDef(
+                name=param_name,
+                type=type_name,
                 # A parameter is optional only when the service says it may
                 # be null; SAP Gateway writes Nullable="false" on mandatory ones.
                 required=(param.get("Nullable") or "").strip().lower() == "false",
-            )
-        except ValidationError:
-            raise MetadataError(
-                f"{who} has a parameter whose name is not a valid identifier"
-            ) from None
-        parameters.setdefault(parsed.name, parsed)
+            ),
+        )
 
-    bound_to: str | None = None
-    action_for = element.get("action-for")
-    if action_for:
-        candidates = sets_by_type.get(schemas.canonical_type(action_for), [])
-        own_set = (element.get("EntitySet") or "").strip()
-        if len(candidates) == 1:
-            bound_to = candidates[0]
-        elif own_set in candidates and own_set in set_names:
-            bound_to = own_set  # several sets share the type: only an explicit one counts
+    # sap:action-for names an entity TYPE. It is a binding only when exactly
+    # one entity set has that type; the import's own EntitySet attribute is
+    # the set of its RETURN value and decides nothing here.
+    candidates = sets_by_type.get(schemas.canonical_type(element.get("action-for")), [])
     return ParsedOperation(
         name=name,
         qualified_name="",  # a V2 function import is addressed by its plain name
         kind="function_import",
-        http_method=(element.get("HttpMethod") or "GET").strip().upper() or "GET",
-        bound_to=bound_to,
+        http_method=http_method,
+        bound_to=candidates[0] if element.get("action-for") and len(candidates) == 1 else None,
         parameters=tuple(parameters.values()),
         label=_label(element),
     )
 
 
-def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
-    set_elements: dict[str, ET.Element] = {}
+def _v2_entity_set_drafts(schemas: _Schemas, skipped: list[SkippedElement]) -> dict[str, _SetDraft]:
+    drafts: dict[str, _SetDraft] = {}
+    position = 0
     for container in schemas.containers:
         for element in container.findall("EntitySet"):
-            name = element.get("Name")
-            if not _valid_name(name):
-                raise MetadataError("an entity set name is not a valid identifier")
-            assert name is not None
-            set_elements.setdefault(name, element)
+            position += 1
+            name = _name(element)
+            if name is None:
+                skipped.append(SkippedElement("entity_set", "", position, "invalid_name"))
+                continue
+            if name in drafts:
+                skipped.append(SkippedElement("entity_set", name, position, "duplicate_name"))
+                continue
+            resolved = schemas.entity_type(element.get("EntityType"))
+            entity_type = schemas.canonical_type(element.get("EntityType"))
+            if len(entity_type) > _MAX_TYPE_CHARS:
+                skipped.append(SkippedElement("entity_set", name, position, "invalid_type"))
+                continue
+            # A set whose type is not in the document is still listed (empty),
+            # so the admin sees it exists instead of wondering where it went.
+            chain = schemas.chain(resolved[1]) if resolved else []
+            fields, skipped_fields = _v2_fields(chain, name)
+            keys = _v2_keys(chain, fields)
+            if keys is None:
+                # One entry for the whole set; its properties are not listed.
+                skipped.append(SkippedElement("entity_set", name, position, "unrepresentable_key"))
+                continue
+            skipped.extend(skipped_fields)
+            drafts[name] = _SetDraft(
+                name=name,
+                element=element,
+                type_element=resolved[1] if resolved else None,
+                entity_type=entity_type,
+                chain=chain,
+                fields=fields,
+                keys=keys,
+            )
+    return drafts
 
-    sets_by_type: dict[str, list[str]] = {}
-    for name, element in set_elements.items():
-        sets_by_type.setdefault(schemas.canonical_type(element.get("EntityType")), []).append(name)
 
-    association_sets: list[tuple[str, dict[str, str]]] = []
+def _v2_navigation_targets(
+    schemas: _Schemas, drafts: dict[str, _SetDraft]
+) -> dict[tuple[str, str, str], str]:
+    """``(association, from role, from entity set) -> to entity set``, built once.
+
+    The from *set* is part of the key because one association can have
+    several association sets, one per pair of entity sets. Only entity sets
+    that are part of the result appear, on either side.
+    """
+    targets: dict[tuple[str, str, str], str] = {}
     for container in schemas.containers:
         for element in container.findall("AssociationSet"):
             association = schemas.associations.get((element.get("Association") or "").strip())
             if association is None:
                 continue
-            roles = {
-                end.get("Role") or "": end.get("EntitySet") or ""
+            ends = [
+                (end.get("Role") or "", end.get("EntitySet") or "")
                 for end in element.findall("End")
-                if (end.get("EntitySet") or "") in set_elements
-            }
-            association_sets.append((association[0], roles))
+            ]
+            for from_role, from_set in ends:
+                for to_role, to_set in ends:
+                    if from_role != to_role and from_set in drafts and to_set in drafts:
+                        targets.setdefault((association[0], from_role, from_set), to_set)
+    return targets
+
+
+def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
+    skipped: list[SkippedElement] = []
+    # Pass 1: which entity sets exist in the result. Navigations and bindings
+    # are resolved afterwards, against these only.
+    drafts = _v2_entity_set_drafts(schemas, skipped)
+    sets_by_type: dict[str, list[str]] = {}
+    for draft in drafts.values():
+        sets_by_type.setdefault(draft.entity_type, []).append(draft.name)
+    targets = _v2_navigation_targets(schemas, drafts)
 
     entity_sets: list[ParsedEntitySet] = []
-    for name, element in set_elements.items():
-        who = f"entity set {name!r}"
-        resolved = schemas.entity_type(element.get("EntityType"))
-        # A set whose type is not in the document is still listed (empty), so
-        # the admin sees it exists instead of wondering where it went.
-        chain = schemas.chain(resolved[1]) if resolved else []
-        fields = _v2_fields(chain, who)
+    for draft in drafts.values():
+        navigations, skipped_navigations = _v2_navigations(draft, schemas, targets)
+        skipped.extend(skipped_navigations)
         entity_sets.append(
             ParsedEntitySet(
-                name=name,
-                entity_type=schemas.canonical_type(element.get("EntityType")),
-                label=_label(element) or _label(resolved[1] if resolved else None),
-                keys=_v2_keys(chain, fields, who),
-                fields=fields,
-                navigations=_v2_navigations(
-                    chain, name, schemas, association_sets, sets_by_type, who
-                ),
-                creatable=_flag(element, "creatable"),
-                updatable=_flag(element, "updatable"),
-                deletable=_flag(element, "deletable"),
+                name=draft.name,
+                entity_type=draft.entity_type,
+                label=_label(draft.element) or _label(draft.type_element),
+                keys=draft.keys,
+                fields=draft.fields,
+                navigations=navigations,
+                creatable=_flag(draft.element, "creatable"),
+                updatable=_flag(draft.element, "updatable"),
+                deletable=_flag(draft.element, "deletable"),
             )
         )
 
     operations: dict[str, ParsedOperation] = {}
+    position = 0
     for container in schemas.containers:
         for element in container.findall("FunctionImport"):
-            operation = _v2_operation(element, schemas, set(set_elements), sets_by_type)
-            operations.setdefault(operation.name, operation)
+            position += 1
+            operation = _v2_operation(element, schemas, sets_by_type)
+            if isinstance(operation, str):
+                skipped.append(SkippedElement("operation", "", position, operation))
+            elif operation.name in operations:
+                skipped.append(SkippedElement("operation", "", position, "duplicate_name"))
+            else:
+                operations[operation.name] = operation
 
     return ParsedMetadata(
-        version="v2", entity_sets=tuple(entity_sets), operations=tuple(operations.values())
+        version="v2",
+        entity_sets=tuple(entity_sets),
+        operations=tuple(operations.values()),
+        skipped=tuple(skipped),
     )
 
 
