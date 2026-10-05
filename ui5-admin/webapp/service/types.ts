@@ -802,11 +802,29 @@ export interface ODataPreviewOperation {
     status: ODataPreviewStatus;
 }
 
+/**
+ * Something the $metadata declares that the parser left out
+ * (`SkippedElement` in agents/odata/metadata.py). Never the element's own
+ * text: `entity_set` is the owning set (for kind `entity_set` its own name,
+ * blank when that name was the problem) and `position` is its 1-based place
+ * in the document, which is how an admin finds it.
+ */
+export interface ODataSkippedElement {
+    kind: "entity_set" | "property" | "navigation" | "operation";
+    entity_set: string;
+    position: number;
+    /** A reason code, e.g. `invalid_name`, `invalid_type`, `duplicate_name`,
+     * `unrepresentable_key`, `unresolved_target`. Open-ended on purpose. */
+    reason: string;
+}
+
 /** What the service's $metadata offers: names and labels only, no data. */
 export interface ODataMetadataPreview {
     fetched_at: string;
     entity_sets: ODataPreviewEntitySet[];
     operations: ODataPreviewOperation[];
+    /** What the parser left out; empty when it took everything. */
+    skipped: ODataSkippedElement[];
     summary: { entity_sets: number; operations: number; in_service: number; changed: number };
 }
 

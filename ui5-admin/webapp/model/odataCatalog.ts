@@ -42,10 +42,11 @@ export type ODataErrorField = "name" | "title" | "purpose" | "not_for" | "destin
 /** Field -> i18n key of what is wrong with it. Empty means valid. */
 export type ODataErrors = Partial<Record<ODataErrorField, string>>;
 
+/** C0 and C1 control characters and DEL, as the server counts them. */
 function hasControlCharacter(value: string): boolean {
     for (let i = 0; i < value.length; i++) {
         const code = value.charCodeAt(i);
-        if (code < 0x20 || code === 0x7f) {
+        if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
             return true;
         }
     }
@@ -53,22 +54,33 @@ function hasControlCharacter(value: string): boolean {
 }
 
 /**
- * Whether `path` is a service path the server accepts: it starts with one
- * `/`, has no `..`, `//`, `?`, `#`, backslash or control character, does not
- * end in `/` and is at most 512 characters. Starting with `/` and having no
- * `//` is what rules out a scheme or a host: those always come from the
- * destination, never from here.
+ * Whether `path` is a service path the server accepts. Mirrors
+ * `confine_service_path` in agents/odata/urls.py rule for rule: at most 512
+ * characters; no control character, whitespace (anywhere: the value is not
+ * trimmed, the server does not trim it either), backslash, `://`, `?`, `#`
+ * or `%`; a leading `/` and no trailing one; no empty segment (`//`), no
+ * `..` anywhere and no `.` segment. The host always comes from the
+ * destination, never from here, and `sap-client` belongs there as well.
  */
 function isConfinedPath(path: string): boolean {
-    return path.length > 1
+    return path.length > 0
         && path.length <= MAX_SERVICE_PATH
+        && !hasControlCharacter(path)
+        && !/\s/.test(path)
+        && path.indexOf("\\") === -1
+        && path.indexOf("://") === -1
         && path.charAt(0) === "/"
+        && !/[?#%]/.test(path)
         && path.charAt(path.length - 1) !== "/"
-        && path.indexOf("..") === -1
         && path.indexOf("//") === -1
-        && !/[?#\\]/.test(path)
-        && !hasControlCharacter(path);
+        && path.indexOf("..") === -1
+        && path.split("/").indexOf(".") === -1;
 }
+
+// "<loc>: " at the start of one part of a refusal: a dotted path of field
+// names and list positions, e.g. "definition.entity_sets.0.fields.1: ".
+const SERVER_LOC_RE = /^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*): (.*)$/;
+const VALUE_ERROR_PREFIX = "Value error, ";
 
 function writeOpsOf(entitySet: ODataEntitySet): ODataEntityOp[] {
     const enabled = entitySet.operations ?? [];
@@ -177,6 +189,35 @@ export default {
         } else if (!isConfinedPath(path)) {
             errors.service_path = "odataErrPathInvalid";
         }
+        return errors;
+    },
+
+    /**
+     * The fields a refused save names, from the 422 of the catalogue routes.
+     *
+     * Those routes answer `{"detail": "<loc>: <msg>; <loc>: <msg>"}`: one
+     * string, not FastAPI's `detail[]` (which would echo the refused input),
+     * so `AdminError.fieldErrors` is empty for them and this is what gives a
+     * form its per-field messages. Keys are the server's `loc` (`title`,
+     * `service_path`, `definition.entity_sets.0.fields.1`); a message may
+     * itself contain "; ", so a part starts a new field only when it begins
+     * with a `loc`. A refusal that names no field (a taken name, a service
+     * still in use) gives an empty object: show `AdminError.detail` then.
+     */
+    serverErrors(detail: string | undefined | null): Record<string, string> {
+        const errors: Record<string, string> = {};
+        let current = "";
+        String(detail ?? "").split("; ").forEach((part) => {
+            const match = SERVER_LOC_RE.exec(part);
+            if (match) {
+                current = match[1];
+                const message = match[2];
+                errors[current] = message.indexOf(VALUE_ERROR_PREFIX) === 0
+                    ? message.substring(VALUE_ERROR_PREFIX.length) : message;
+            } else if (current && !/^and \d+ more$/.test(part)) {
+                errors[current] += `; ${part}`;
+            }
+        });
         return errors;
     },
 

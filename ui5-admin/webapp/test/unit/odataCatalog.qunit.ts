@@ -2,6 +2,7 @@ import odataCatalog from "com/agent/admin/model/odataCatalog";
 import type {
     ODataDefinition, ODataEntitySet, ODataField, ODataServiceInput
 } from "com/agent/admin/service/types";
+import { PATH_CASES, RULE_CASES, VALID_PATHS, withField } from "./odataRuleCases";
 
 QUnit.module("odataCatalog");
 
@@ -139,21 +140,60 @@ QUnit.test("validate accepts only the slug the server accepts as a name", functi
     });
 });
 
-QUnit.test("validate confines the service path", function (assert) {
-    ["/sap/opu/odata/sap/API_SRV", "/sap/opu/odata4/sap/api/srvd_a2x/sap/pr/0001", "/a", "/" + "a".repeat(511)]
-        .forEach((path) => {
-            assert.deepEqual(odataCatalog.validate(input({ service_path: path })), {}, path);
-        });
-    [
-        "sap/opu", "/sap/../etc", "/sap//opu", "/sap/opu?x=1", "/sap/opu#x", "/sap\\opu", "/sap/opu/",
-        "https://s4.internal:44300/sap", "//s4.internal/sap", "/sap/\topu", "/sap/op\u007fu",
-        "/" + "a".repeat(512), "/"
-    ].forEach((path) => {
+QUnit.test("validate confines the service path like the server does", function (assert) {
+    VALID_PATHS.forEach((path) => {
+        assert.deepEqual(odataCatalog.validate(input({ service_path: path })), {}, path.substring(0, 60));
+    });
+    PATH_CASES.forEach((testCase) => {
         assert.deepEqual(
-            odataCatalog.validate(input({ service_path: path })), { service_path: "odataErrPathInvalid" },
-            JSON.stringify(path)
+            odataCatalog.validate(withField(testCase)), { service_path: testCase.clientKey }, testCase.rule
         );
     });
+});
+
+QUnit.test("validate names one key per refused field, for every rule of the shared table", function (assert) {
+    RULE_CASES.forEach((testCase) => {
+        assert.deepEqual(
+            odataCatalog.validate(withField(testCase)), { [testCase.field]: testCase.clientKey }, testCase.rule
+        );
+    });
+});
+
+QUnit.test("serverErrors turns a refusal's detail into one message per field", function (assert) {
+    assert.deepEqual(
+        odataCatalog.serverErrors(
+            "title: String should have at least 1 character; purpose: String should have at most 200 characters"
+        ),
+        {
+            title: "String should have at least 1 character",
+            purpose: "String should have at most 200 characters"
+        }
+    );
+    assert.deepEqual(
+        odataCatalog.serverErrors("service_path: Value error, service_path must start with '/'"),
+        { service_path: "service_path must start with '/'" },
+        "pydantic's 'Value error, ' prefix is dropped"
+    );
+    assert.deepEqual(
+        odataCatalog.serverErrors(
+            "definition.entity_sets.0.fields.1: Value error, field 'B' is filterable but not selectable; "
+            + "a filterable field must also be selectable; name: Field required; and 3 more"
+        ),
+        {
+            "definition.entity_sets.0.fields.1":
+                "field 'B' is filterable but not selectable; a filterable field must also be selectable",
+            name: "Field required"
+        },
+        "a '; ' inside a message does not start a new field, and the 'and n more' tail is no field"
+    );
+});
+
+QUnit.test("serverErrors is empty for a refusal that names no field", function (assert) {
+    assert.deepEqual(odataCatalog.serverErrors("Service name 'suppliers' already exists"), {});
+    assert.deepEqual(odataCatalog.serverErrors("name cannot be changed; duplicate the service instead"), {});
+    assert.deepEqual(odataCatalog.serverErrors("Service 'a' is used by agent(s) 'b', 'c'"), {});
+    assert.deepEqual(odataCatalog.serverErrors(""), {});
+    assert.deepEqual(odataCatalog.serverErrors(undefined), {});
 });
 
 QUnit.test("toggleOperation adds and removes an entity operation without duplicates", function (assert) {

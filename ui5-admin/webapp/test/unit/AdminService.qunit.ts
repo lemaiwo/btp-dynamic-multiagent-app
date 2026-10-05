@@ -1,6 +1,7 @@
 import AdminService, { AdminError } from "com/agent/admin/service/AdminService";
 import type { ODataServiceInput } from "com/agent/admin/service/types";
 import FakeBackend from "com/agent/admin/test/integration/FakeBackend";
+import { RULE_CASES, VALID_INPUT, withField } from "./odataRuleCases";
 
 QUnit.module("AdminService", {
     beforeEach: function (this: { originalFetch: typeof fetch }) {
@@ -445,7 +446,7 @@ QUnit.test("duplicate copies the definition under a new name; a taken name is a 
         name: "pr-copy", destination: "S4_ODATA_TECH", user_context: false
     });
     assert.strictEqual(copy.name, "pr-copy");
-    assert.strictEqual(copy.title, source.title, "the title is kept unless one is given");
+    assert.strictEqual(copy.title, "Purchase requisitions (copy)", "the title says it is a copy unless one is given");
     assert.strictEqual(copy.destination, "S4_ODATA_TECH");
     assert.strictEqual(copy.user_context, false);
     assert.deepEqual(copy.definition, source.definition, "same definition");
@@ -459,22 +460,276 @@ QUnit.test("duplicate copies the definition under a new name; a taken name is a 
     }
 });
 
-QUnit.test("metadata and test answer with the fake's preview and result", async function (assert) {
+QUnit.test("metadata compares the offer with the service the request names", async function (assert) {
     const service = new AdminService();
+    const where = { destination: "S4_ODATA_TECH", service_path: "/sap/opu/odata/sap/SRV", odata_version: "v2" as const };
 
-    const preview = await service.readODataMetadata({
-        destination: "S4_ODATA_TECH", service_path: "/sap/opu/odata/sap/SRV", odata_version: "v2",
-        service: "purchase-requisitions-jobs"
-    });
-    assert.strictEqual(preview.summary.entity_sets, preview.entity_sets.length);
-    assert.strictEqual(preview.summary.operations, preview.operations.length);
+    const fresh = await service.readODataMetadata(where);
     assert.deepEqual(
-        preview.entity_sets.filter((e) => e.status === "changed").map((e) => e.new_fields),
-        [["PurReqnOrigin", "LastChangeDateTime"]]
+        fresh.entity_sets.map((e) => e.status), ["new", "new", "new", "new", "new"],
+        "without a service everything is new"
     );
+    assert.deepEqual(fresh.operations.map((o) => o.status), ["new"]);
+    assert.deepEqual(fresh.summary, { entity_sets: 5, operations: 1, in_service: 0, changed: 0 });
+    assert.deepEqual(fresh.entity_sets[0].new_fields, [], "nothing to compare with, so no new fields");
 
-    const result = await service.testODataService("purchase-requisitions-jobs");
+    const compared = await service.readODataMetadata({ ...where, service: "purchase-requisitions-jobs" });
+    assert.deepEqual(
+        compared.entity_sets.map((e) => e.status),
+        ["changed", "in_service", "in_service", "in_service", "in_service"]
+    );
+    assert.deepEqual(compared.entity_sets[0].new_fields, ["PurReqnOrigin", "LastChangeDateTime"]);
+    assert.deepEqual(compared.entity_sets[0].removed_fields, []);
+    assert.deepEqual(compared.operations.map((o) => o.status), ["in_service"]);
+    assert.deepEqual(compared.summary, { entity_sets: 5, operations: 1, in_service: 4, changed: 1 });
+
+    const other = await service.readODataMetadata({ ...where, service: "business-partners" });
+    assert.deepEqual(other.summary, { entity_sets: 5, operations: 1, in_service: 0, changed: 0 });
+
+    assert.deepEqual(compared.skipped, [
+        { kind: "property", entity_set: "A_PurReqnAcctAssgmt", position: 38, reason: "invalid_type" }
+    ], "what the parser left out is listed by kind, set, position and reason");
+});
+
+QUnit.test("the test call answers with the fake's result", async function (assert) {
+    const result = await new AdminService().testODataService("purchase-requisitions-jobs");
+
     assert.strictEqual(result.ok, true);
     assert.strictEqual(result.identity, "technical");
     assert.strictEqual(result.destination, "S4_ODATA_TECH");
+});
+
+// --- what the real routes refuse ---
+// agents/odata/admin_routes.py answers a refused body with 422 and a STRING
+// detail, "<loc>: <msg>; <loc>: <msg>", which never repeats the input.
+async function refusal(call: () => Promise<unknown>): Promise<AdminError> {
+    try {
+        await call();
+    } catch (e) {
+        return e as AdminError;
+    }
+    throw new Error("the call was not refused");
+}
+
+QUnit.test("create answers 422 with the server's text for every rule of the shared table", async function (assert) {
+    const service = new AdminService();
+
+    for (const testCase of RULE_CASES) {
+        const error = await refusal(() => service.createODataService(withField(testCase)));
+        assert.strictEqual(error.status, 422, `${testCase.rule}: 422`);
+        assert.strictEqual(error.detail, testCase.server, `${testCase.rule}: detail`);
+    }
+    assert.strictEqual((await service.listODataServices()).length, 4, "nothing was stored");
+});
+
+QUnit.test("update is held to the same rules as create", async function (assert) {
+    const service = new AdminService();
+    const stored = await service.getODataService("purchase-requisitions");
+
+    for (const testCase of RULE_CASES.filter((c) => c.field !== "name")) {
+        const error = await refusal(() => service.updateODataService("purchase-requisitions", withField(testCase)));
+        assert.strictEqual(error.status, 422, `${testCase.rule}: 422`);
+        assert.strictEqual(error.detail, testCase.server, `${testCase.rule}: detail`);
+    }
+    assert.deepEqual(await service.getODataService("purchase-requisitions"), stored, "the service is unchanged");
+});
+
+QUnit.test("a refusal is a string that lists every problem and never the input", async function (assert) {
+    const error = await refusal(() => new AdminService().createODataService({
+        ...VALID_INPUT, title: " ", purpose: "x".repeat(201),
+        service_path: "https://alice:s3cret@s4.internal:44300/sap"
+    }));
+
+    assert.strictEqual(
+        error.detail,
+        "title: String should have at least 1 character; "
+        + "purpose: String should have at most 200 characters; "
+        + "service_path: Value error, service_path is a path, not a URL; the host comes from the destination"
+    );
+    assert.strictEqual(error.detail.indexOf("s3cret"), -1, "the refused value is not repeated");
+    assert.deepEqual(error.fieldErrors, {}, "a string detail carries no field errors of its own");
+});
+
+function definitionWith(over: Record<string, unknown>): ODataServiceInput {
+    const entitySet = {
+        name: "A_Item", title: "", path: "", entity_type: "", description: "",
+        keys: [{ name: "Id", type: "Edm.String" }], operations: ["list", "get"],
+        fields: [{
+            name: "Id", type: "Edm.String", label: "", selectable: true, filterable: true, writable: false,
+            hint: "", values: [], personal_data: false
+        }],
+        navigations: [], examples: [], ...over
+    };
+    return { ...VALID_INPUT, definition: { entity_sets: [entitySet], operations: [] } } as ODataServiceInput;
+}
+
+const HIDDEN = {
+    name: "Secret", type: "Edm.String", label: "", selectable: false, filterable: false, writable: false,
+    hint: "", values: [], personal_data: false
+};
+
+QUnit.test("a filterable field must also be selectable", async function (assert) {
+    const input = definitionWith({});
+    input.definition.entity_sets[0].fields.push({ ...HIDDEN, filterable: true });
+
+    const error = await refusal(() => new AdminService().createODataService(input));
+    assert.strictEqual(error.status, 422);
+    assert.strictEqual(
+        error.detail,
+        "definition.entity_sets.0.fields.1: Value error, field 'Secret' is filterable but not selectable; "
+        + "a filterable field must also be selectable"
+    );
+});
+
+QUnit.test("an entity set with list or get needs a selectable field", async function (assert) {
+    const service = new AdminService();
+
+    const list = await refusal(() => service.createODataService(
+        definitionWith({ fields: [{ ...HIDDEN, name: "Id" }], operations: ["list"] })
+    ));
+    assert.strictEqual(list.status, 422);
+    assert.strictEqual(
+        list.detail, "definition.entity_sets.0: Value error, entity set 'A_Item' has 'list' but no selectable field"
+    );
+    const get = await refusal(() => service.createODataService(
+        definitionWith({ fields: [{ ...HIDDEN, name: "Id" }], operations: ["get"] })
+    ));
+    assert.strictEqual(
+        get.detail, "definition.entity_sets.0: Value error, entity set 'A_Item' has 'get' but no selectable field"
+    );
+    const none = await service.createODataService({
+        ...definitionWith({ fields: [{ ...HIDDEN, name: "Id" }], operations: [] }), name: "not-described-yet"
+    });
+    assert.strictEqual(none.name, "not-described-yet", "without an operation the set needs no readable field");
+});
+
+QUnit.test("a key must be a field, and get, update and delete need a key", async function (assert) {
+    const service = new AdminService();
+
+    const unknown = await refusal(() => service.createODataService(
+        definitionWith({ keys: [{ name: "Nope", type: "Edm.String" }] })
+    ));
+    assert.strictEqual(unknown.status, 422);
+    assert.strictEqual(
+        unknown.detail,
+        "definition.entity_sets.0: Value error, key 'Nope' of entity set 'A_Item' is not one of its fields"
+    );
+    const keyless = await refusal(() => service.createODataService(definitionWith({ keys: [] })));
+    assert.strictEqual(
+        keyless.detail, "definition.entity_sets.0: Value error, entity set 'A_Item' has 'get' but no key"
+    );
+});
+
+QUnit.test("create and update need a writable field", async function (assert) {
+    const error = await refusal(() => new AdminService().createODataService(
+        definitionWith({ operations: ["list", "update"] })
+    ));
+    assert.strictEqual(
+        error.detail,
+        "definition.entity_sets.0: Value error, entity set 'A_Item' has 'update' but no writable field"
+    );
+});
+
+QUnit.test("entity set names are unique", async function (assert) {
+    const input = definitionWith({});
+    input.definition.entity_sets.push(input.definition.entity_sets[0]);
+
+    const error = await refusal(() => new AdminService().createODataService(input));
+    assert.strictEqual(error.status, 422);
+    assert.strictEqual(error.detail, "definition: Value error, duplicate entity set 'A_Item'");
+});
+
+QUnit.test("an unknown or a missing top-level key is refused", async function (assert) {
+    const service = new AdminService();
+
+    const extra = await refusal(() => service.createODataService(
+        { ...VALID_INPUT, id: 7, used_by: [] } as unknown as ODataServiceInput
+    ));
+    assert.strictEqual(extra.status, 422);
+    assert.strictEqual(
+        extra.detail, "id: Extra inputs are not permitted; used_by: Extra inputs are not permitted",
+        "a stored service sent back whole is refused, not silently trimmed"
+    );
+    const { odata_version, destination, ...partial } = VALID_INPUT;
+    void [odata_version, destination];
+    const missing = await refusal(() => service.createODataService(partial as ODataServiceInput));
+    assert.strictEqual(missing.detail, "destination: Field required; odata_version: Field required");
+    const version = await refusal(() => service.createODataService(
+        { ...VALID_INPUT, odata_version: "v3" } as unknown as ODataServiceInput
+    ));
+    assert.strictEqual(version.detail, "odata_version: Input should be 'v2' or 'v4'");
+});
+
+QUnit.test("a stored service has its title and purpose stripped", async function (assert) {
+    const created = await new AdminService().createODataService(
+        { ...VALID_INPUT, name: "suppliers", title: "  Suppliers ", purpose: " Look up suppliers\n" }
+    );
+    assert.strictEqual(created.title, "Suppliers");
+    assert.strictEqual(created.purpose, "Look up suppliers");
+});
+
+QUnit.test("an update is a full replacement and moves updated_at", async function (assert) {
+    const service = new AdminService();
+    const stored = await service.getODataService("purchase-requisitions");
+    const { definition, ...withoutDefinition } = VALID_INPUT;
+    void definition;
+
+    const updated = await service.updateODataService(
+        "purchase-requisitions", withoutDefinition as ODataServiceInput
+    );
+    assert.notStrictEqual(updated.updated_at, stored.updated_at, "updated_at moved");
+    assert.strictEqual(updated.created_at, stored.created_at, "created_at did not");
+    assert.deepEqual(
+        updated.definition, { entity_sets: [], operations: [] },
+        "like the server: a payload without a definition stores the empty one, it does not keep the old"
+    );
+    assert.deepEqual(updated.counts, { entity_sets: 0, operations: 0 });
+    assert.strictEqual(updated.used_by.length, 1, "who uses it is not the payload's to say");
+});
+
+QUnit.test("a name that cannot be a service name is the same 404 as an unknown one", async function (assert) {
+    const service = new AdminService();
+    const calls: (() => Promise<unknown>)[] = [
+        () => service.getODataService("Not A Slug"),
+        () => service.updateODataService("Not A Slug", { ...VALID_INPUT, title: " " }),
+        () => service.deleteODataService("Not A Slug"),
+        () => service.duplicateODataService("Not A Slug", { name: "Also Bad" }),
+        () => service.testODataService("Not A Slug")
+    ];
+
+    for (const call of calls) {
+        const error = await refusal(call);
+        assert.strictEqual(error.status, 404, "404 before the body is looked at");
+        assert.strictEqual(error.detail, "Service not found");
+    }
+});
+
+QUnit.test("duplicate refuses a body the server refuses", async function (assert) {
+    const service = new AdminService();
+    const duplicate = (body: Record<string, unknown>) => refusal(
+        () => service.duplicateODataService("purchase-requisitions", body as never)
+    );
+
+    assert.strictEqual(
+        (await duplicate({ name: "Not A Slug" })).detail,
+        "name: String should match pattern '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'"
+    );
+    assert.strictEqual((await duplicate({})).detail, "name: Field required");
+    assert.strictEqual((await duplicate({ name: "copy", title: "  " })).detail,
+        "title: String should have at least 1 character");
+    assert.strictEqual((await duplicate({ name: "copy", destination: "a b" })).detail,
+        "destination: String should match pattern '^[A-Za-z0-9_.-]{1,200}$'");
+    assert.strictEqual((await duplicate({ name: "copy", user_context: "true" })).detail,
+        "user_context: Input should be a valid boolean");
+    assert.strictEqual((await duplicate({ name: "copy", definition: {} })).detail,
+        "definition: Extra inputs are not permitted");
+    for (const body of [{ name: "Not A Slug" }, {}]) {
+        assert.strictEqual((await duplicate(body)).status, 422);
+    }
+    assert.strictEqual((await service.listODataServices()).length, 4, "no copy was stored");
+
+    const copy = await service.duplicateODataService(
+        "purchase-requisitions", { name: "copy", title: " Requisitions for jobs " }
+    );
+    assert.strictEqual(copy.title, "Requisitions for jobs", "a given title is stripped and used as is");
 });

@@ -444,21 +444,291 @@ export default class FakeBackend {
         return summary;
     }
 
-    /** Stored like the server stores a payload: only its fields, defaults
-     * filled in, so an unknown or read-only key never reaches a row. */
+    private static readonly ODATA_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+    private static readonly ODATA_DESTINATION_RE = /^[A-Za-z0-9_.-]{1,200}$/;
+    private static readonly ODATA_NAME_MSG = "String should match pattern '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'";
+    private static readonly ODATA_DESTINATION_MSG = "String should match pattern '^[A-Za-z0-9_.-]{1,200}$'";
+    private static readonly ODATA_PAYLOAD_KEYS = [
+        "name", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
+        "service_path", "enabled", "definition", "metadata_fetched_at"
+    ];
+    private static readonly ODATA_DUPLICATE_KEYS = ["name", "title", "destination", "user_context"];
+
+    /** `create_odata_service` in agents/db.py: the one text for a taken name,
+     * on create and on duplicate. */
+    private static odataNameTaken(name: string): string {
+        return `Service name '${name}' already exists`;
+    }
+
+    /** `confine_service_path` in agents/odata/urls.py, in its order and with
+     * its messages (none of which repeats the value). "" means accepted. */
+    private static odataPathProblem(value: string): string {
+        const control = (ch: string) => ch.charCodeAt(0) < 0x20 || (ch.charCodeAt(0) >= 0x7f && ch.charCodeAt(0) <= 0x9f);
+        if (!value) {
+            return "service_path is required";
+        }
+        if (value.length > 512) {
+            return "service_path must be at most 512 characters";
+        }
+        if (value.split("").some(control)) {
+            return "service_path must not contain control characters";
+        }
+        if (/\s/.test(value)) {
+            return "service_path must not contain whitespace";
+        }
+        if (value.indexOf("\\") !== -1) {
+            return "service_path must not contain a backslash";
+        }
+        if (value.indexOf("://") !== -1) {
+            return "service_path is a path, not a URL; the host comes from the destination";
+        }
+        if (value.charAt(0) !== "/") {
+            return "service_path must start with '/'";
+        }
+        if (/[?#]/.test(value)) {
+            return "service_path must not contain '?' or '#'; query parameters belong in the destination";
+        }
+        if (value.indexOf("%") !== -1) {
+            return "service_path must not contain '%'";
+        }
+        if (value.charAt(value.length - 1) === "/") {
+            return "service_path must not end with '/'";
+        }
+        if (value.indexOf("//") !== -1) {
+            return "service_path must not contain '//'";
+        }
+        if (value.indexOf("..") !== -1 || value.split("/").indexOf(".") !== -1) {
+            return "service_path must not contain '.' or '..' segments";
+        }
+        return "";
+    }
+
+    /** A stripped string of 1..max characters, in pydantic's words. */
+    private static odataLength(value: string, max: number): string {
+        const length = value.trim().length;
+        if (length < 1) {
+            return "String should have at least 1 character";
+        }
+        return length > max ? `String should have at most ${max} characters` : "";
+    }
+
+    /** One `<key>: <problem>` per string field that is missing (when
+     * required), not a string, or refused by `check`. */
+    private static odataText(
+        data: Record<string, unknown>, key: string, required: boolean,
+        check: (value: string) => string, problems: string[]
+    ): void {
+        const value = data[key];
+        if (value === undefined) {
+            if (required) {
+                problems.push(`${key}: Field required`);
+            }
+            return;
+        }
+        const problem = typeof value === "string" ? check(value) : "Input should be a valid string";
+        if (problem) {
+            problems.push(`${key}: ${problem}`);
+        }
+    }
+
+    private static odataExtras(data: Record<string, unknown>, known: string[], problems: string[]): void {
+        Object.keys(data).filter((key) => known.indexOf(key) === -1).forEach((key) => {
+            problems.push(`${key.substring(0, 64)}: Extra inputs are not permitted`);
+        });
+    }
+
+    /** The first rule of `EntitySetDef._consistent` the entity set breaks. */
+    private static odataEntitySetProblem(entitySet: ODataEntitySet): string {
+        const who = `entity set '${entitySet.name}'`;
+        const fields = entitySet.fields ?? [];
+        const keys = entitySet.keys ?? [];
+        const names = fields.map((f) => f.name);
+        const duplicate = names.filter((name, i) => names.indexOf(name) !== i)[0];
+        if (duplicate !== undefined) {
+            return `duplicate field '${duplicate}' in ${who}`;
+        }
+        const strayKey = keys.filter((key) => names.indexOf(key.name) === -1)[0];
+        if (strayKey) {
+            return `key '${strayKey.name}' of ${who} is not one of its fields`;
+        }
+        for (const op of entitySet.operations ?? []) {
+            if ((op === "get" || op === "update" || op === "delete") && !keys.length) {
+                return `${who} has '${op}' but no key`;
+            }
+            if ((op === "list" || op === "get") && !fields.some((f) => f.selectable)) {
+                return `${who} has '${op}' but no selectable field`;
+            }
+            if ((op === "create" || op === "update") && !fields.some((f) => f.writable)) {
+                return `${who} has '${op}' but no writable field`;
+            }
+        }
+        return "";
+    }
+
+    /**
+     * The cross-field rules of a definition (agents/odata/models.py), with
+     * the server's `loc` and text. Like pydantic, an entity set is checked as
+     * a whole only when its fields passed, and the definition as a whole only
+     * when everything in it passed. Not mirrored: the per-value rules inside
+     * a definition (EDM names, text lengths, the size cap) and the operation
+     * rules -- the import and entity-set dialogs build those values.
+     */
+    private static odataDefinitionProblems(definition: unknown): string[] {
+        if (definition === undefined) {
+            return [];
+        }
+        if (definition === null || typeof definition !== "object" || Array.isArray(definition)) {
+            return ["definition: Input should be a valid dictionary or instance of ServiceDefinition"];
+        }
+        const problems: string[] = [];
+        const entitySets = (definition as Partial<ODataDefinition>).entity_sets ?? [];
+        entitySets.forEach((entitySet, i) => {
+            const before = problems.length;
+            (entitySet.fields ?? []).forEach((field, j) => {
+                if (field.filterable && !field.selectable) {
+                    problems.push(
+                        `definition.entity_sets.${i}.fields.${j}: Value error, field '${field.name}' is `
+                        + "filterable but not selectable; a filterable field must also be selectable"
+                    );
+                }
+            });
+            const problem = problems.length === before ? FakeBackend.odataEntitySetProblem(entitySet) : "";
+            if (problem) {
+                problems.push(`definition.entity_sets.${i}: Value error, ${problem}`);
+            }
+        });
+        if (!problems.length) {
+            const names = entitySets.map((e) => e.name);
+            const duplicate = names.filter((name, i) => names.indexOf(name) !== i)[0];
+            if (duplicate !== undefined) {
+                problems.push(`definition: Value error, duplicate entity set '${duplicate}'`);
+            }
+        }
+        return problems;
+    }
+
+    /**
+     * What `validate_odata_service` refuses, as the list of `<loc>: <msg>`
+     * the real route joins with "; " into the 422's string detail. Empty
+     * means the payload is accepted. Never contains a refused value.
+     *
+     * Without this the fake would store whatever a form sends, and a journey
+     * could pass against input the real backend refuses.
+     */
+    private static validateODataPayload(body: Record<string, unknown> | undefined): string[] {
+        const data = body ?? {};
+        const problems: string[] = [];
+        const flag = (key: string) => {
+            if (data[key] !== undefined && typeof data[key] !== "boolean") {
+                problems.push(`${key}: Input should be a valid boolean`);
+            }
+        };
+        FakeBackend.odataText(data, "name", true, (v) => (
+            FakeBackend.ODATA_NAME_RE.test(v) ? "" : FakeBackend.ODATA_NAME_MSG
+        ), problems);
+        FakeBackend.odataText(data, "title", true, (v) => FakeBackend.odataLength(v, 120), problems);
+        FakeBackend.odataText(data, "purpose", true, (v) => FakeBackend.odataLength(v, 200), problems);
+        FakeBackend.odataText(data, "not_for", false, (v) => (
+            v.length > 200 ? "String should have at most 200 characters" : ""
+        ), problems);
+        FakeBackend.odataText(data, "destination", true, (v) => (
+            FakeBackend.ODATA_DESTINATION_RE.test(v) ? "" : FakeBackend.ODATA_DESTINATION_MSG
+        ), problems);
+        flag("user_context");
+        if (data.odata_version === undefined) {
+            problems.push("odata_version: Field required");
+        } else if (data.odata_version !== "v2" && data.odata_version !== "v4") {
+            problems.push("odata_version: Input should be 'v2' or 'v4'");
+        }
+        FakeBackend.odataText(data, "service_path", true, (v) => {
+            const problem = FakeBackend.odataPathProblem(v);
+            return problem ? `Value error, ${problem}` : "";
+        }, problems);
+        flag("enabled");
+        FakeBackend.odataDefinitionProblems(data.definition).forEach((problem) => problems.push(problem));
+        FakeBackend.odataExtras(data, FakeBackend.ODATA_PAYLOAD_KEYS, problems);
+        return problems;
+    }
+
+    /** What `DuplicateBody` (agents/odata/admin_routes.py) refuses: the new
+     * name by the same rule as a service's, and nothing but the four keys. */
+    private static validateODataDuplicate(body: Record<string, unknown> | undefined): string[] {
+        const data = body ?? {};
+        const problems: string[] = [];
+        FakeBackend.odataText(data, "name", true, (v) => (
+            FakeBackend.ODATA_NAME_RE.test(v) ? "" : FakeBackend.ODATA_NAME_MSG
+        ), problems);
+        if (data.title !== null) {
+            FakeBackend.odataText(data, "title", false, (v) => FakeBackend.odataLength(v, 120), problems);
+        }
+        if (data.destination !== null) {
+            FakeBackend.odataText(data, "destination", false, (v) => (
+                FakeBackend.ODATA_DESTINATION_RE.test(v) ? "" : FakeBackend.ODATA_DESTINATION_MSG
+            ), problems);
+        }
+        if (data.user_context !== undefined && data.user_context !== null && typeof data.user_context !== "boolean") {
+            problems.push("user_context: Input should be a valid boolean");
+        }
+        FakeBackend.odataExtras(data, FakeBackend.ODATA_DUPLICATE_KEYS, problems);
+        return problems;
+    }
+
+    /** The 422 of the catalogue routes: ONE string, "<loc>: <msg>; ...",
+     * not FastAPI's `detail[]` -- that array would echo each refused input. */
+    private refused(problems: string[]): Promise<Response> {
+        return this.json({ detail: problems.join("; ") }, 422);
+    }
+
+    /** A validated payload as the server stores it: title and purpose
+     * stripped, what is optional filled in with the model's defaults. Call
+     * only after `validateODataPayload` accepted the body. */
     private static odataInput(body: Record<string, unknown> | undefined): ODataServiceInput {
         const input = (body ?? {}) as Partial<ODataServiceInput>;
         return {
-            name: String(input.name ?? ""), title: String(input.title ?? ""),
-            purpose: String(input.purpose ?? ""), not_for: String(input.not_for ?? ""),
-            destination: String(input.destination ?? ""), user_context: input.user_context === true,
+            name: String(input.name), title: String(input.title).trim(),
+            purpose: String(input.purpose).trim(), not_for: input.not_for ?? "",
+            destination: String(input.destination), user_context: input.user_context === true,
             odata_version: input.odata_version === "v4" ? "v4" : "v2",
-            service_path: String(input.service_path ?? ""), enabled: input.enabled !== false,
+            service_path: String(input.service_path), enabled: input.enabled !== false,
+            // Like the model's default: a payload without a definition
+            // stores the EMPTY one. A PUT is a full replacement, so a form
+            // must always send the definition it holds.
             definition: {
                 entity_sets: input.definition?.entity_sets ?? [],
                 operations: input.definition?.operations ?? []
             },
             metadata_fetched_at: input.metadata_fetched_at ?? null
+        };
+    }
+
+    /** The offer in `metadataPreview` compared with a stored definition
+     * (`undefined`: nothing to compare with, so everything is new). */
+    private odataPreview(stored: ODataDefinition | undefined): ODataMetadataPreview {
+        const entitySets = this.metadataPreview.entity_sets.map((offered) => {
+            const known = stored?.entity_sets.filter((e) => e.name === offered.name)[0];
+            if (!known) {
+                return { ...offered, status: "new" as const, new_fields: [], removed_fields: [] };
+            }
+            const have = known.fields.map((f) => f.name);
+            const offer = offered.fields.map((f) => f.name);
+            const added = offer.filter((name) => have.indexOf(name) === -1);
+            const removed = have.filter((name) => offer.indexOf(name) === -1);
+            return {
+                ...offered, new_fields: added, removed_fields: removed,
+                status: added.length || removed.length ? "changed" as const : "in_service" as const
+            };
+        });
+        const operations = this.metadataPreview.operations.map((offered) => ({
+            ...offered,
+            status: stored?.operations.some((o) => o.name === offered.name) ? "in_service" as const : "new" as const
+        }));
+        return {
+            ...this.metadataPreview, entity_sets: entitySets, operations,
+            summary: {
+                entity_sets: entitySets.length, operations: operations.length,
+                in_service: entitySets.filter((e) => e.status === "in_service").length,
+                changed: entitySets.filter((e) => e.status === "changed").length
+            }
         };
     }
 
@@ -575,9 +845,11 @@ export default class FakeBackend {
             })
         ];
 
-        // What $metadata of the requisition service offers, compared with the
-        // jobs service: four entity sets in it (one with two new fields), one
-        // new, and the function import it already has.
+        // What $metadata of the requisition service offers: the five entity
+        // sets and the function import of the jobs service, with two fields
+        // on the item that no stored service has yet. `status`, `new_fields`,
+        // `removed_fields` and `summary` are placeholders here: every answer
+        // computes them against the service the request names (odataPreview).
         const jobs = this.odataServices[1].definition;
         const labels: Record<string, string> = {
             A_PurchaseRequisitionItem: "Purchase requisition item",
@@ -593,11 +865,8 @@ export default class FakeBackend {
             })),
             navigations: e.navigations.map((n) => ({ name: n.name, target: n.target, collection: n.collection })),
             capabilities: { creatable: false, updatable: e.name !== "A_PurReqAddDelivery", deletable: false },
-            status: e.name === "A_PurReqAddDelivery" ? "new" : "in_service",
-            new_fields: [], removed_fields: []
+            status: "new", new_fields: [], removed_fields: []
         }));
-        previewSets[0].status = "changed";
-        previewSets[0].new_fields = ["PurReqnOrigin", "LastChangeDateTime"];
         previewSets[0].fields = previewSets[0].fields.concat([
             { name: "PurReqnOrigin", type: "Edm.String", label: "Origin of requisition",
               filterable: true, creatable: false, updatable: false },
@@ -609,9 +878,13 @@ export default class FakeBackend {
             entity_sets: previewSets,
             operations: jobs.operations.map((o) => ({
                 name: o.name, qualified_name: o.qualified_name, kind: o.kind, http_method: o.http_method,
-                bound_to: o.bound_to, parameters: o.parameters, label: "", status: "in_service"
+                bound_to: o.bound_to, parameters: o.parameters, label: "", status: "new"
             })),
-            summary: { entity_sets: 5, operations: 1, in_service: 4, changed: 1 }
+            // One element the parser left out (`ParsedMetadata.skipped`), so
+            // the import dialog has an "n elements skipped" to show. Set it
+            // to [] in a journey for the ordinary case.
+            skipped: [{ kind: "property", entity_set: "A_PurReqnAcctAssgmt", position: 38, reason: "invalid_type" }],
+            summary: { entity_sets: 5, operations: 1, in_service: 0, changed: 0 }
         };
         this.testResult = {
             ok: true, status: 200, duration_ms: 412, target: "A_PurchaseRequisitionItem", rows: 1,
@@ -620,21 +893,43 @@ export default class FakeBackend {
         };
     }
 
-    /** The eight routes of /admin/api/odata. Undefined: not an OData call. */
+    /**
+     * The eight routes of /admin/api/odata, answering what
+     * agents/odata/admin_routes.py answers, in its order of checks.
+     * Undefined: not an OData call.
+     *
+     * Not mirrored: 413 for an oversized body, and 424 "signed-in user
+     * required" from `metadata` and `test` (no JWT bound with `user_context`
+     * on) -- the fake has no session, so a journey reaches a 424 only
+     * through `failNext`.
+     */
     private handleOData(
         path: string, method: string, body: Record<string, unknown> | undefined
     ): Promise<Response> | undefined {
         if (path === "odata/metadata" && method === "POST") {
-            return this.json(this.metadataPreview);
+            // Compared with the stored service the request names; without
+            // `service` everything is new. (The real route does not exist
+            // yet: a 404 for an unknown `service` is this fake's assumption.)
+            if (body?.service === undefined || body.service === null) {
+                return this.json(this.odataPreview(undefined));
+            }
+            const compared = this.odataServices.filter((s) => s.name === body.service)[0];
+            return compared
+                ? this.json(this.odataPreview(compared.definition))
+                : this.json({ detail: "Service not found" }, 404);
         }
         if (path === "odata/services" && method === "GET") {
             const sorted = this.odataServices.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
             return this.json(sorted.map((s) => FakeBackend.odataSummary(s)));
         }
         if (path === "odata/services" && method === "POST") {
+            const problems = FakeBackend.validateODataPayload(body);
+            if (problems.length) {
+                return this.refused(problems);
+            }
             const input = FakeBackend.odataInput(body);
             if (this.odataServices.some((s) => s.name === input.name)) {
-                return this.json({ detail: `Service name '${input.name}' already exists` }, 409);
+                return this.json({ detail: FakeBackend.odataNameTaken(input.name) }, 409);
             }
             const created = this.makeODataService(input);
             this.odataServices.push(created);
@@ -646,42 +941,74 @@ export default class FakeBackend {
         }
         const name = decodeURIComponent(match[1]);
         const action = match[2] ?? "";
-        const index = this.odataServices.findIndex((s) => s.name === name);
-        if (index === -1) {
-            return this.json({ detail: "Service not found" }, 404);
+        const notFound = () => this.json({ detail: "Service not found" }, 404);
+        // A name that cannot be a service name is the same 404 as an unknown
+        // one, before the body is looked at (`_service_name`).
+        if (!FakeBackend.ODATA_NAME_RE.test(name)) {
+            return notFound();
         }
+        const index = this.odataServices.findIndex((s) => s.name === name);
         const stored = this.odataServices[index];
         if (action === "/test" && method === "POST") {
-            return this.json(this.testResult);
+            return stored ? this.json(this.testResult) : notFound();
         }
         if (action === "/duplicate" && method === "POST") {
-            const copyName = String(body?.name ?? "");
-            if (this.odataServices.some((s) => s.name === copyName)) {
-                return this.json({ detail: `Service name '${copyName}' already exists` }, 409);
+            const problems = FakeBackend.validateODataDuplicate(body);
+            if (problems.length) {
+                return this.refused(problems);
             }
+            if (!stored) {
+                return notFound();
+            }
+            const copyName = String(body?.name);
             const { id, created_at, updated_at, counts, has_write, used_by, ...source } = stored;
             void [id, created_at, updated_at, counts, has_write, used_by];
-            const copy = this.makeODataService({
+            const given = (key: string) => body?.[key] !== undefined && body[key] !== null;
+            const copyBody: Record<string, unknown> = {
                 ...source,
                 name: copyName,
-                title: body?.title === undefined ? source.title : String(body.title),
-                destination: body?.destination === undefined ? source.destination : String(body.destination),
-                user_context: body?.user_context === undefined ? source.user_context : body.user_context === true,
+                // `_copy_title`: "<title> (copy)", cut to fit the 120 limit.
+                title: given("title") ? body?.title : `${source.title.substring(0, 113).trim()} (copy)`,
+                destination: given("destination") ? body?.destination : source.destination,
+                user_context: given("user_context") ? body?.user_context : source.user_context,
                 definition: JSON.parse(JSON.stringify(source.definition)) as ODataDefinition
-            });
+            };
+            // The copy goes through the same gate as a new service.
+            const copyProblems = FakeBackend.validateODataPayload(copyBody);
+            if (copyProblems.length) {
+                return this.refused(copyProblems);
+            }
+            if (this.odataServices.some((s) => s.name === copyName)) {
+                return this.json({ detail: FakeBackend.odataNameTaken(copyName) }, 409);
+            }
+            const copy = this.makeODataService(FakeBackend.odataInput(copyBody));
             this.odataServices.push(copy);
             return this.json(FakeBackend.odataDict(copy), 201);
         }
-        if (action === "" && method === "GET") {
-            return this.json(FakeBackend.odataDict(stored));
-        }
         if (action === "" && method === "PUT") {
+            const problems = FakeBackend.validateODataPayload(body);
+            if (problems.length) {
+                return this.refused(problems);
+            }
+            if (!stored) {
+                return notFound();
+            }
             const input = FakeBackend.odataInput(body);
             if (input.name !== name) {
-                return this.json({ detail: "name cannot be changed; duplicate the service instead" }, 422);
+                return this.refused(["name cannot be changed; duplicate the service instead"]);
             }
-            this.odataServices[index] = { ...stored, ...input };
+            // A full replacement of the payload fields. `used_by` stays as
+            // stored: the fake keeps it on the row for now; the task that
+            // attaches services to agents derives it from the agents' server
+            // entries, as `odata_service_referrers` does.
+            this.odataServices[index] = { ...stored, ...input, updated_at: new Date().toISOString() };
             return this.json(FakeBackend.odataDict(this.odataServices[index]));
+        }
+        if (!stored) {
+            return notFound();
+        }
+        if (action === "" && method === "GET") {
+            return this.json(FakeBackend.odataDict(stored));
         }
         if (action === "" && method === "DELETE") {
             if (stored.used_by.length) {
