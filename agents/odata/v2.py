@@ -39,6 +39,9 @@ _CLOCK = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,
 _DATETIME = re.compile(_CLOCK)
 _DATETIMEOFFSET = re.compile(_CLOCK + r"(?:Z|[+-][0-9]{2}:[0-9]{2})")
 _TIME = re.compile(r"PT(?:[0-9]{1,2}H)?(?:[0-9]{1,2}M)?(?:[0-9]{1,2}(?:\.[0-9]{1,7})?S)?")
+# The most significant digits of a decimal passed as a NUMBER that are
+# trusted in a literal (the same rule as `v4._plain_float`).
+_MAX_FLOAT_DIGITS = 15
 _INTEGER_TYPES = {
     "Edm.Byte": "",
     "Edm.SByte": "",
@@ -122,8 +125,15 @@ class V2Dialect:
             return text + _INTEGER_TYPES[edm_type]
         if edm_type == "Edm.Decimal":
             text = str(value) if isinstance(value, int) else value
-            if isinstance(value, float) and math.isfinite(value):
-                text = repr(value)
+            if isinstance(value, float):
+                # A number with more digits was rounded by whoever parsed the
+                # JSON: in a key it could name another entity than the one
+                # meant. As text, every digit goes out as given. (The `.0`
+                # that `repr` appends to a whole number is not a digit.)
+                text = repr(value) if math.isfinite(value) else ""
+                digits = text.lstrip("-").removesuffix(".0").replace(".", "").lstrip("0")
+                if len(digits) > _MAX_FLOAT_DIGITS:
+                    raise _refuse(edm_type)
             if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
                 raise _refuse(edm_type)
             return text + "M"

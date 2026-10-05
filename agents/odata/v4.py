@@ -110,12 +110,33 @@ _VALUE_HINTS = {
     "Edm.Duration": "write it as an ISO 8601 duration, for example P1DT2H",
     "Edm.Guid": "write it as 8-4-4-4-12 hexadecimal digits",
     "Edm.Decimal": 'pass it as text, for example "12.50", with at most 15 significant '
-    "digits and not smaller than 0.0001; a value that cannot be sent exactly in "
-    "plain digits is not rounded",
+    "digits; no value between -0.0001 and 0.0001 other than 0 can be sent; a value "
+    "that cannot be sent exactly in plain digits is not rounded",
+}
+# In a URL (a function parameter) a decimal given as text goes out as its
+# own digits, so only a NUMBER has a limit there.
+_LITERAL_HINTS = {
+    **_VALUE_HINTS,
+    "Edm.Decimal": 'pass it as text, for example "12.50": a number with more than 15 '
+    "significant digits may already be rounded and is not sent",
 }
 # The most significant digits of a decimal passed as a NUMBER that are
 # trusted: the JSON parser that read it has already rounded a longer one.
 _MAX_FLOAT_DIGITS = 15
+
+
+def _plain_float(value: float) -> str | None:
+    """``repr(value)`` when a decimal may be sent as that text, else ``None``.
+
+    Plain digits only (``repr`` switches to an exponent below 0.0001 and
+    from 1e16 on), and at most ``_MAX_FLOAT_DIGITS`` significant digits; the
+    ``.0`` that ``repr`` appends to a whole number is not one.
+    """
+    text = repr(value) if math.isfinite(value) else ""
+    if not _DECIMAL.fullmatch(text):
+        return None
+    digits = text.lstrip("-").removesuffix(".0").replace(".", "").lstrip("0")
+    return text if len(digits) <= _MAX_FLOAT_DIGITS else None
 
 
 def _type_shown(edm_type: str) -> str:
@@ -205,8 +226,10 @@ class V4Dialect:
             return text
         if edm_type == "Edm.Decimal":
             text = str(value) if isinstance(value, int) else value
-            if isinstance(value, float) and math.isfinite(value):
-                text = repr(value)
+            if isinstance(value, float):
+                # A long number was rounded by whoever parsed the JSON: in a
+                # key it could name another entity than the one meant.
+                text = _plain_float(value)
             if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
                 raise _refuse(edm_type)
             return text
@@ -356,9 +379,7 @@ class V4Dialect:
         if isinstance(value, int) and not isinstance(value, bool):
             return value
         if isinstance(value, float):
-            text = repr(value) if math.isfinite(value) else ""
-            digits = text.lstrip("-").replace(".", "").lstrip("0")
-            if not _DECIMAL.fullmatch(text) or len(digits) > _MAX_FLOAT_DIGITS:
+            if _plain_float(value) is None:
                 raise _refuse(edm_type)
             return value
         if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
@@ -541,7 +562,9 @@ class V4Dialect:
                     f"the value of parameter {parameter!r} is not a single valid "
                     f"{_type_shown(definition.type)} value (objects, lists and types this "
                     f"tool does not know are not sent)",
-                    hint=_VALUE_HINTS.get(definition.type),
+                    hint=(_VALUE_HINTS if method == "POST" else _LITERAL_HINTS).get(
+                        definition.type
+                    ),
                 ) from None
         body: dict[str, Any] | None = None
         if method == "POST":

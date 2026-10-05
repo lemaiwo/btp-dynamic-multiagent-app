@@ -39,8 +39,7 @@ def key_names(definition: Any) -> dict[str, list[str]]:
     for entity_set in _dicts(definition.get("entity_sets")):
         name = entity_set.get("name")
         if isinstance(name, str):
-            keys = _dicts(entity_set.get("keys"))
-            out.setdefault(name, [k["name"] for k in keys if isinstance(k.get("name"), str)])
+            out.setdefault(name, [k["name"] for k in _keys(entity_set)])
     return out
 
 
@@ -56,8 +55,17 @@ def key_types(definition: Any) -> dict[str, list[str]]:
     for entity_set in _dicts(definition.get("entity_sets")):
         name = entity_set.get("name")
         if isinstance(name, str):
-            out.setdefault(name, [_key_type(k) for k in _dicts(entity_set.get("keys"))])
+            out.setdefault(name, [_key_type(k) for k in _keys(entity_set)])
     return out
+
+
+def _keys(entity_set: dict[str, Any]) -> list[dict[str, Any]]:
+    """The key entries of a stored entity set that count: those with a name.
+
+    One filter for ``key_names``, ``key_types`` and ``key_is_addressable``,
+    so that the three always speak of the same keys in the same order.
+    """
+    return [k for k in _dicts(entity_set.get("keys")) if isinstance(k.get("name"), str)]
 
 
 def _key_type(key: dict[str, Any]) -> str:
@@ -73,12 +81,16 @@ def key_is_addressable(entity_set: Any, version: Any) -> bool:
     version's dialect writes no literal for makes each of them fail on
     every key, so the search tool does not offer them. The rule for a bound
     operation is the same one (``call_refusal``: ``bound_key_type``).
+
+    A set without a key has no entity to name (``bound_set_without_key``
+    for an operation): not addressable either, whatever is ticked on it.
     """
     dialect = DIALECTS.get(version) if isinstance(version, str) else None
     sends = getattr(dialect, "sends_type", None)
     if not callable(sends) or not isinstance(entity_set, dict):
         return False
-    return all(sends(_key_type(k)) is True for k in _dicts(entity_set.get("keys")))
+    keys = _keys(entity_set)
+    return bool(keys) and all(sends(_key_type(k)) is True for k in keys)
 
 
 def stored_call_refusal(

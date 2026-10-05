@@ -883,6 +883,12 @@ async def test_whatever_search_offers_execute_does_not_refuse_by_a_switch(alice,
     assert not called & (set(UNCALLABLE) | {"Off"})
     kinds = {operation for _, operation in offered}
     assert ({"create", "update", "delete"} <= kinds) is allow_write
+    # A set without a key is offered nothing that names one entity.
+    by_target: dict[str, set[str]] = {}
+    for target, operation in offered:
+        by_target.setdefault(target, set()).add(operation)
+    assert by_target["A_Keyless"] == {"list"}
+    assert by_target["A_OddKey"] == ({"list", "create"} if allow_write else {"list"})
     # What is enabled and never offered is exactly what the admin API lists.
     assert {(u["name"], u["reason"]) for u in uncallable_operations(
         catalogue()["pr4"]["definition"], "v4"
@@ -930,6 +936,21 @@ def _operation(**kw: Any) -> OperationDef:
 ])
 def test_call_refusal_is_the_one_rule_for_v4_too(operation, keys, dialect, allow_write, reason):
     assert call_refusal(operation, keys, dialect, allow_write=allow_write) == reason
+
+
+@pytest.mark.parametrize("types, reason", [
+    (["Edm.String", "Edm.String"], None),
+    # Bound to a set whose key has a type no literal is written for.
+    (["Edm.String", "Edm.Binary"], "bound_key_type"),
+    (["SRV.Status", "Edm.String"], "bound_key_type"),
+])
+def test_call_refusal_is_the_one_rule_for_v4_too_with_the_key_types(types, reason):
+    operation = _operation(bound_to=ITEM)
+    assert call_refusal(operation, list(KEY), V4Dialect(), bound_key_types=types) == reason
+    # First match: a switch that is off is said before the catalogue's reason.
+    assert call_refusal(
+        operation, list(KEY), V4Dialect(), allow_write=False, bound_key_types=types
+    ) == "write_not_allowed"
 
 
 # -- the audit ----------------------------------------------------------------------
@@ -1304,3 +1325,113 @@ async def test_an_applied_update_is_never_an_error_because_its_answer_reads_badl
     assert out == {"ok": True, "status": 200}
     (row,) = await all_rows()
     assert (row.outcome, row.phase, row.http_status) == ("ok", "write", 200)
+
+
+# -- review follow-up -----------------------------------------------------------------
+
+# 17 significant digits: what a JSON parser makes of a longer number.
+ROUNDED = 1234567890123456.7
+AMOUNT_KEY_SET = "A_ByAmount"
+
+
+def _by_amount_catalogue() -> dict[str, dict]:
+    services = catalogue()
+    for service in services.values():
+        service["definition"]["entity_sets"].append({
+            "name": AMOUNT_KEY_SET,
+            "entity_type": "SRV.ByAmountType",
+            "keys": [{"name": "Amount", "type": "Edm.Decimal"}],
+            "operations": ALL_OPS,
+            "fields": [
+                {"name": "Amount", "type": "Edm.Decimal", "selectable": True},
+                {"name": "Plant", "selectable": True, "writable": True},
+            ],
+        })
+        service["definition"]["operations"].append(_function(
+            "ByAmount", changes_data=False, parameters=[{"name": "Amount", "type": "Edm.Decimal"}],
+        ))
+    return services
+
+
+@pytest.mark.parametrize("value", [ROUNDED, 0.12345678901234568, 1e16, 0.00001])
+async def test_a_decimal_number_that_may_be_rounded_never_names_an_entity(alice, value):
+    w = World(services=_by_amount_catalogue())
+    for call in (
+        {"operation": "get"},
+        {"operation": "update", "body": {"Plant": "1"}},
+        {"operation": "delete"},
+    ):
+        out = await w.run(target=AMOUNT_KEY_SET, key={"Amount": value}, **call)
+        assert code(out) == "invalid_key" and "'Amount'" in out["error"]["message"], out
+    out = await w.call("ByAmount", params={"Amount": value})
+    assert code(out) == "invalid_argument" and "pass it as text" in out["error"]["hint"]
+    assert "0.0001" not in out["error"]["hint"]  # that limit is the body's, not the path's
+    assert await w.untouched()
+
+
+async def test_the_same_decimal_as_text_and_a_short_number_are_sent(alice):
+    w = World(services=_by_amount_catalogue())
+    w.sap.answer = {"@odata.context": "$metadata#Edm.Int32", "value": 1}
+    text = "1234567890123456.7"
+    for value, literal in ((text, text), ("0.00001", "0.00001"), (12.5, "12.5"),
+                           (123456789012345.0, "123456789012345.0"), (7, "7")):
+        assert (await w.call("ByAmount", params={"Amount": value}))["ok"] is True, value
+        assert w.sap.calls[-1].url.path == f"{V4_PATH}/ByAmount(Amount={literal})"
+    w.sap.answer = None
+    assert (await w.run(target=AMOUNT_KEY_SET, operation="delete", key={"Amount": text})) == {
+        "ok": True, "status": 204,
+    }
+    assert w.sap.calls[-1].url.path == f"{V4_PATH}/{AMOUNT_KEY_SET}({text})"
+
+
+@pytest.mark.parametrize("dialect, suffix", [(V4Dialect(), ""), (V2Dialect(), "M")])
+def test_the_float_rule_of_a_decimal_literal_is_the_same_in_both_versions(dialect, suffix):
+    for value in (ROUNDED, 0.12345678901234568, 1e16, 1e-5, float("nan")):
+        with pytest.raises(ODataError):
+            dialect.literal("Edm.Decimal", value)
+    # A trailing `.0` is not a digit: this one has 15.
+    assert dialect.literal("Edm.Decimal", 123456789012345.0) == "123456789012345.0" + suffix
+    assert dialect.literal("Edm.Decimal", 12.5) == "12.5" + suffix
+    assert dialect.literal("Edm.Decimal", "1234567890123456.7") == "1234567890123456.7" + suffix
+    assert V4Dialect()._json_value("Edm.Decimal", 123456789012345.0) == 123456789012345.0
+    with pytest.raises(ODataError):
+        V4Dialect()._json_value("Edm.Decimal", 1234567890123456.0)  # 16 digits
+
+
+def test_the_decimal_hint_names_the_small_value_limit_only_where_it_applies():
+    item = _definition().entity_set(ITEM)
+    with pytest.raises(ODataError) as refused:
+        V4Dialect().encode_body(item, {"Amount": "-0.00001"})
+    assert "between -0.0001 and 0.0001 other than 0" in refused.value.hint
+    assert "not smaller than" not in refused.value.hint
+    # Zero and a negative amount are sent.
+    assert V4Dialect().encode_body(item, {"Amount": "0.00"}) == {"Amount": 0.0}
+    assert V4Dialect().encode_body(item, {"Amount": "-12.50"}) == {"Amount": -12.5}
+
+
+def test_key_names_and_key_types_filter_the_same_keys_and_no_key_is_not_addressable():
+    from agents.odata.calls import key_is_addressable, key_names, key_types
+    from agents.odata.search import search_catalogue
+
+    odd = {"name": "A_Odd", "keys": [
+        {"name": "A"}, {"type": "Edm.Int32"}, {"name": 5, "type": "Edm.Guid"},
+        {"name": "B", "type": "Edm.Int32"}, "junk", {"name": "C", "type": 7},
+    ]}
+    definition = {"entity_sets": [odd]}
+    assert key_names(definition) == {"A_Odd": ["A", "B", "C"]}
+    assert key_types(definition) == {"A_Odd": ["Edm.String", "Edm.Int32", ""]}
+    assert key_is_addressable({"keys": [{"name": "A"}]}, "v4") is True
+    for keyless in ({"keys": []}, {}, {"keys": [{"type": "Edm.String"}]}, {"keys": "A"}, None):
+        for version in ("v2", "v4"):
+            assert key_is_addressable(keyless, version) is False, keyless
+    # A stored keyless set with by-key operations ticked: search drops them.
+    stored = {**catalogue()["pr4"]}
+    stored["definition"] = {
+        "entity_sets": [{**_entity_set("A_NoKey", ALL_OPS), "keys": []}], "operations": [],
+    }
+    for version in ("v2", "v4"):
+        found = search_catalogue(
+            [{**stored, "odata_version": version}], "", detail="full", allow_write=True
+        )
+        (match,) = found["matches"]
+        assert match["operations"] == ["list", "create"] and match["key"] == []
