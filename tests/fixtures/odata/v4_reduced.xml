@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-written EDMX 4.0 of a purchase-requisition style OData V4 service.
+     Structurally faithful (vocabulary references, navigation property
+     bindings, a bound action, a function import, annotation blocks),
+     generic names only; not a copy of any system's $metadata. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:Reference Uri="https://example.com/vocabularies/Common.xml">
+    <edmx:Include Namespace="com.sap.vocabularies.Common.v1" Alias="Common"/>
+  </edmx:Reference>
+  <edmx:Reference Uri="https://example.com/vocabularies/Capabilities.xml">
+    <edmx:Include Namespace="Org.OData.Capabilities.V1" Alias="Capabilities"/>
+  </edmx:Reference>
+  <edmx:DataServices>
+    <Schema Namespace="com.example.pr.v0001" Alias="SAP__self" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="PurchaseRequisitionType">
+        <Key>
+          <PropertyRef Name="PurchaseRequisition"/>
+        </Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String" Nullable="false" MaxLength="10">
+          <Annotation Term="Common.Label" String="Purchase requisition"/>
+        </Property>
+        <Property Name="PurReqnDescription" Type="Edm.String" MaxLength="40"/>
+        <Property Name="CreatedByUser" Type="Edm.String" MaxLength="12">
+          <Annotation Term="Common.Label" String="Created by"/>
+        </Property>
+        <Property Name="CreationDate" Type="Edm.Date"/>
+        <NavigationProperty Name="_Item" Type="Collection(com.example.pr.v0001.PurchaseRequisitionItemType)" Partner="_Header"/>
+      </EntityType>
+      <EntityType Name="PurchaseRequisitionItemType">
+        <Key>
+          <PropertyRef Name="PurchaseRequisition"/>
+          <PropertyRef Name="PurchaseRequisitionItem"/>
+        </Key>
+        <Property Name="PurchaseRequisition" Type="Edm.String" Nullable="false" MaxLength="10"/>
+        <Property Name="PurchaseRequisitionItem" Type="Edm.String" Nullable="false" MaxLength="5">
+          <Annotation Term="Common.Label" String="Item"/>
+        </Property>
+        <Property Name="Material" Type="Edm.String" MaxLength="40"/>
+        <Property Name="RequestedQuantity" Type="Edm.Decimal" Precision="13" Scale="3"/>
+        <NavigationProperty Name="_Header" Type="com.example.pr.v0001.PurchaseRequisitionType" Nullable="false" Partner="_Item"/>
+      </EntityType>
+      <Action Name="Release" IsBound="true">
+        <Annotation Term="Common.Label" String="Release requisition"/>
+        <Parameter Name="_it" Type="com.example.pr.v0001.PurchaseRequisitionType" Nullable="false"/>
+        <Parameter Name="Note" Type="Edm.String" MaxLength="80"/>
+        <ReturnType Type="com.example.pr.v0001.PurchaseRequisitionType" Nullable="false"/>
+      </Action>
+      <Function Name="GetOpenCount">
+        <Parameter Name="Plant" Type="Edm.String" Nullable="false" MaxLength="4"/>
+        <ReturnType Type="Edm.Int32" Nullable="false"/>
+      </Function>
+      <EntityContainer Name="Container">
+        <EntitySet Name="PurchaseRequisition" EntityType="com.example.pr.v0001.PurchaseRequisitionType">
+          <NavigationPropertyBinding Path="_Item" Target="PurchaseRequisitionItem"/>
+        </EntitySet>
+        <EntitySet Name="PurchaseRequisitionItem" EntityType="com.example.pr.v0001.PurchaseRequisitionItemType">
+          <NavigationPropertyBinding Path="_Header" Target="PurchaseRequisition"/>
+        </EntitySet>
+        <FunctionImport Name="GetOpenCount" Function="com.example.pr.v0001.GetOpenCount"/>
+      </EntityContainer>
+      <Annotations Target="SAP__self.PurchaseRequisitionType">
+        <Annotation Term="Common.Label" String="Purchase requisition header"/>
+      </Annotations>
+      <Annotations Target="SAP__self.PurchaseRequisitionType/PurReqnDescription">
+        <Annotation Term="Common.Label" String="Description"/>
+      </Annotations>
+      <Annotations Target="SAP__self.Container/PurchaseRequisition">
+        <Annotation Term="Capabilities.DeleteRestrictions">
+          <Record>
+            <PropertyValue Property="Deletable" Bool="false"/>
+          </Record>
+        </Annotation>
+        <Annotation Term="Capabilities.FilterRestrictions">
+          <Record>
+            <PropertyValue Property="NonFilterableProperties">
+              <Collection>
+                <PropertyPath>CreatedByUser</PropertyPath>
+              </Collection>
+            </PropertyValue>
+          </Record>
+        </Annotation>
+      </Annotations>
+      <Annotations Target="SAP__self.Container/PurchaseRequisitionItem">
+        <Annotation Term="Capabilities.InsertRestrictions">
+          <Record>
+            <PropertyValue Property="Insertable" Bool="false"/>
+          </Record>
+        </Annotation>
+        <Annotation Term="Capabilities.UpdateRestrictions">
+          <Record>
+            <PropertyValue Property="Updatable" Bool="false"/>
+          </Record>
+        </Annotation>
+      </Annotations>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

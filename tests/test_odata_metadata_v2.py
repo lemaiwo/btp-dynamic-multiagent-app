@@ -311,6 +311,42 @@ def test_the_association_set_decides_between_entity_sets_of_one_type():
     assert all(n.target for e in md.entity_sets for n in e.navigations)
 
 
+def test_association_sets_that_disagree_about_one_entity_set_resolve_nothing():
+    """One (association, role, entity set) with two different targets is not guessed."""
+    md = parse_metadata(
+        _doc(
+            _NAV_TYPES + '<EntityContainer Name="C">'
+            '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+            '<EntitySet Name="ArchivedOrders" EntityType="NS.OrderType"/>'
+            '<EntitySet Name="Notes" EntityType="NS.NoteType"/>'
+            '<EntitySet Name="ArchivedNotes" EntityType="NS.NoteType"/>'
+            '<AssociationSet Name="S1" Association="NS.A">'
+            '<End EntitySet="Orders" Role="O"/><End EntitySet="Notes" Role="N"/></AssociationSet>'
+            '<AssociationSet Name="S2" Association="NS.A">'
+            '<End EntitySet="Orders" Role="O"/><End EntitySet="ArchivedNotes" Role="N"/>'
+            "</AssociationSet>"
+            # A third one must not bring the first answer back, and repeating
+            # the same pair is no disagreement.
+            '<AssociationSet Name="S3" Association="NS.A">'
+            '<End EntitySet="Orders" Role="O"/><End EntitySet="Notes" Role="N"/></AssociationSet>'
+            '<AssociationSet Name="S4" Association="NS.A">'
+            '<End EntitySet="ArchivedOrders" Role="O"/><End EntitySet="ArchivedNotes" Role="N"/>'
+            "</AssociationSet>"
+            '<AssociationSet Name="S5" Association="NS.A">'
+            '<End EntitySet="ArchivedOrders" Role="O"/><End EntitySet="ArchivedNotes" Role="N"/>'
+            "</AssociationSet></EntityContainer>"
+        ),
+        "v2",
+    )
+    sets = _sets(md)
+    assert sets["Orders"].navigations == ()
+    assert [(n.name, n.target) for n in sets["ArchivedOrders"].navigations] == [
+        ("to_Note", "ArchivedNotes")
+    ]
+    assert SkippedElement("navigation", "Orders", 1, "unresolved_target") in md.skipped
+    assert SkippedElement("navigation", "ArchivedOrders", 1, "unresolved_target") not in md.skipped
+
+
 def test_action_for_binds_only_when_one_entity_set_has_the_type():
     md = parse_metadata(
         _doc(
@@ -643,15 +679,15 @@ def test_absurd_nesting_is_refused():
         parse_metadata(deep, "v2")
 
 
-def test_v4_is_not_available_yet_and_a_v4_document_is_not_v2():
-    with pytest.raises(MetadataError, match="V4 parsing is not available yet"):
+def test_a_document_of_the_other_version_is_refused():
+    with pytest.raises(MetadataError, match="^the document is OData V2, not V4$"):
         parse_metadata(XML, "v4")
     v4 = (
         b'<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">'
         b'<edmx:DataServices><Schema Namespace="NS" xmlns="http://docs.oasis-open.org/odata/ns/edm"/>'
         b"</edmx:DataServices></edmx:Edmx>"
     )
-    with pytest.raises(MetadataError, match="V4"):
+    with pytest.raises(MetadataError, match="^the document is OData V4, not V2$"):
         parse_metadata(v4, "v2")
     with pytest.raises(MetadataError):
         parse_metadata(XML, "v3")  # type: ignore[arg-type]
