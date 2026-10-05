@@ -142,6 +142,41 @@ def _principal_claim(payload: dict[str, Any]) -> str | None:
     return None
 
 
+# Claims that identify one issued token; compared one by one below.
+_TOKEN_IDENTITY_CLAIMS = ("jti", "iat", "exp", "iss", "user_uuid", "sub", "user_name", "origin")
+
+
+def bound_token_principal() -> str | None:
+    """The principal of the token bound to this context, or ``None``.
+
+    For code that must name whose token is *sent* (an audit record), as
+    opposed to ``current_principal``, which ``run_as`` rebinds to the run-as
+    user while the trigger's token stays bound.
+
+    The answer comes from ``current_claims`` -- the claims the middleware
+    validated -- and only when they demonstrably belong to ``current_jwt``:
+    the token is decoded WITHOUT verification (no JWKS fetch, no second
+    validation) merely to compare its identifying claims with the bound
+    ones. ``None`` when no token or no claims are bound, when the token
+    cannot be decoded, when any identifying claim differs (stale claims
+    next to another token), or when the claims name no principal. The
+    unverified decode is never the source of the answer.
+    """
+    token = current_jwt.get()
+    claims = current_claims.get()
+    if not token or not isinstance(claims, dict):
+        return None
+    try:
+        own = jwt.decode(token, options={"verify_signature": False})
+    except Exception:  # noqa: BLE001 - not a JWT we can compare against
+        return None
+    if not isinstance(own, dict):
+        return None
+    if any(own.get(name) != claims.get(name) for name in _TOKEN_IDENTITY_CLAIMS):
+        return None
+    return _principal_claim(claims)
+
+
 # ---------------------------------------------------------------------------
 # XSUAA credentials from VCAP_SERVICES
 # ---------------------------------------------------------------------------

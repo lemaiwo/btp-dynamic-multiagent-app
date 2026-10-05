@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
+import jwt as pyjwt
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -43,12 +44,17 @@ for _v in (
 ):
     os.environ.pop(_v, None)
 
-from agents.auth import current_claims, current_jwt, current_principal  # noqa: E402
+from agents.auth import (  # noqa: E402
+    bound_token_principal,
+    current_claims,
+    current_jwt,
+    current_principal,
+)
 from agents.odata import tools as tools_module  # noqa: E402
 from agents.odata import urls as urls_module  # noqa: E402
 from agents.odata.models import validate_odata_service  # noqa: E402
 from agents.odata.tools import WriteAudit, odata_toolset  # noqa: E402
-from tests.odata_helpers import FakeResolver, v2_error  # noqa: E402
+from tests.odata_helpers import FakeResolver, service_payload, v2_error  # noqa: E402
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -154,6 +160,7 @@ class Sap:
         self.crossed: list[str] = []
         self.write_answer: Any = None  # a Response, or a callable(request)
         self.read_answer: Any = None
+        self.fetch_answer: httpx.Response | None = None  # instead of a CSRF token
 
     @property
     def writes(self) -> list[httpx.Request]:
@@ -168,6 +175,8 @@ class Sap:
         caller = request.headers.get("Authorization", "").removeprefix("Bearer ")
         await asyncio.sleep(0)  # let another run in, as a real round trip would
         if request.headers.get("X-CSRF-Token") == "Fetch":
+            if self.fetch_answer is not None:
+                return self.fetch_answer
             token, cookie = f"T-{caller}", f"S-{caller}"
             self.issued[caller] = (token, cookie)
             return httpx.Response(
@@ -203,8 +212,29 @@ class Sap:
         return httpx.Response(204)
 
 
+class Recorder:
+    """A recorder that keeps what it is given, and what had happened by then."""
+
+    def __init__(self, world: "World") -> None:
+        self.world = world
+        self.intents: list[WriteAudit] = []
+        self.results: list[WriteAudit] = []
+        self.tokens: list[Any] = []
+        self.seen_at_intent: list[tuple[int, int, int]] = []
+
+    async def intent(self, record: WriteAudit) -> Any:
+        w = self.world
+        self.seen_at_intent.append((len(w.sap.requests), len(w.built), len(w.resolved)))
+        self.intents.append(record)
+        return ("row", record.call_id)
+
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        self.tokens.append(token)
+        self.results.append(record)
+
+
 class World:
-    """One toolset on the mock SAP, with the audit hook recorded."""
+    """One toolset on the mock SAP, with the audit recorder's calls kept."""
 
     def __init__(
         self,
@@ -215,7 +245,7 @@ class World:
         self.sap = Sap()
         self.built: list[str] = []
         self.resolved: list[tuple[str, str | None]] = []
-        self.audits: list[WriteAudit] = []
+        self.recorder = kw.pop("recorder_type", Recorder)(self)
         world = self
 
         class Recording(FakeResolver):
@@ -229,10 +259,7 @@ class World:
             world.built.append(destination)
             return Recording(name=destination)
 
-        async def on_write(record: WriteAudit) -> None:
-            world.audits.append(record)
-
-        kw.setdefault("on_write", on_write)
+        kw.setdefault("recorder", self.recorder)
         kw.setdefault("resolver_factory", factory)
         self.toolset = odata_toolset(
             oauth if oauth is not None else {"services": ["pr", "pr-jobs"], "allow_write": True},
@@ -251,8 +278,18 @@ class World:
         return await self.toolset.tools["search_operations"].function(**args)
 
     @property
+    def audits(self) -> list[WriteAudit]:
+        """The result records, in order."""
+        return self.recorder.results
+
+    @property
     def nothing_sent(self) -> bool:
-        return self.sap.requests == [] and self.resolved == [] and self.audits == []
+        return (
+            self.sap.requests == []
+            and self.resolved == []
+            and self.audits == []
+            and self.recorder.intents == []
+        )
 
 
 class signed_in:
@@ -459,9 +496,17 @@ async def test_write_through_a_signed_in_user_service_without_user_is_no_user():
 
 
 async def test_function_imports_stay_refused(alice):
+    """Allowed by both switches, but not built yet: its own code, and not offered."""
     w = World()
     out = await w.run(target="Release", operation="call")
-    assert out["error"]["code"] == "write_not_allowed" and w.nothing_sent
+    assert out["error"]["code"] == "not_available" and w.nothing_sent
+    closed = World({"services": ["pr"]})
+    out = await closed.run(target="Release", operation="call")
+    assert out["error"]["code"] == "write_not_allowed" and closed.nothing_sent
+    for world in (w, closed):
+        for query in ("", "Release", "release"):
+            found = await world.search(query=query, detail="full")
+            assert "Release" not in {m["target"] for m in found["matches"]}
 
 
 # -- the ETag handle ----------------------------------------------------------
@@ -546,6 +591,10 @@ async def test_a_handle_is_bound_to_the_user_and_the_token_it_was_issued_for():
     with signed_in(ALICE, token="jwt-of-alice-after-refresh"):
         out = await w.run(**{**UPDATE, "etag": handle})
         assert out["error"]["code"] == "invalid_etag"
+    # Alice's own token under another name (a run-as job she triggered): the
+    # handle was issued to Alice's request, not to that run.
+    with signed_in("job-user", token=f"jwt-of-{ALICE}"):
+        assert (await w.run(**{**UPDATE, "etag": handle}))["error"]["code"] == "invalid_etag"
     # Somebody else's token under Alice's name (a run-as job) is not Alice either.
     with signed_in(ALICE, token=f"jwt-of-{BOB}"):
         assert (await w.run(**{**UPDATE, "etag": handle}))["error"]["code"] == "invalid_etag"
@@ -712,28 +761,46 @@ async def test_a_destination_that_fails_before_the_write_changed_nothing(alice, 
     assert [a.outcome for a in w.audits] == ["refused"]
 
 
-# -- the audit hook -----------------------------------------------------------
+# -- the audit recorder ----------------------------------------------------------
 
 
-async def test_the_hook_is_called_once_per_write_that_was_to_be_sent(alice):
+def _token(**claims: Any) -> str:
+    """A real (HS256) JWT; nothing here verifies its signature."""
+    return pyjwt.encode(claims, "k" * 32, algorithm="HS256")
+
+
+async def test_intent_before_anything_and_one_result_per_write(alice):
     w = World(catalogue=snapshot(operations=ALL_OPS))
-    # Refused before the decision to send: no call.
+    # Refused before the decision to send: nothing is recorded.
     await w.run(**{**UPDATE, "body": {"Nope": 1}})
     await w.run(**{**UPDATE, "etag": "zzz"})
     await w.run(operation="get", key=KEY)
     await w.run(operation="list")
-    assert w.audits == []
+    assert w.recorder.intents == [] and w.audits == []
+    seen = len(w.sap.requests), len(w.built), len(w.resolved)
     await w.run(operation="update", key=KEY, body={"Plant": "SECRET-VALUE", "RequestedQuantity": 1})
+    # The intent was recorded before a client existed or anything more was sent.
+    assert w.recorder.seen_at_intent == [seen]
     await w.run(operation="create", body={**KEY, "Plant": "SECRET-VALUE"})
     w.sap.write_answer = v2_error(400, "SY/530", "locked")
     await w.run(operation="delete", key=KEY)
-    assert [(a.operation, a.outcome, a.status) for a in w.audits] == [
-        ("update", "ok", 204),
-        ("create", "ok", 201),
-        ("delete", "sap_error", 400),
+    assert [(a.operation, a.outcome, a.phase, a.status) for a in w.audits] == [
+        ("update", "ok", "write", 204),
+        ("create", "ok", "write", 201),
+        ("delete", "sap_error", "write", 400),
     ]
+    assert [(a.operation, a.outcome, a.phase, a.status) for a in w.recorder.intents] == [
+        ("update", "intent", "token", None),
+        ("create", "intent", "token", None),
+        ("delete", "intent", "token", None),
+    ]
+    # One call id per call, the same in both records; the intent's token comes back.
+    ids = [a.call_id for a in w.audits]
+    assert ids == [a.call_id for a in w.recorder.intents] and len(set(ids)) == 3
+    assert w.recorder.tokens == [("row", call_id) for call_id in ids]
     update, create, delete = w.audits
     assert update == WriteAudit(
+        call_id=update.call_id,
         agent="buyer",
         run_id="run-1",
         service="pr",
@@ -742,46 +809,123 @@ async def test_the_hook_is_called_once_per_write_that_was_to_be_sent(alice):
         key=KEY,
         fields=("Plant", "RequestedQuantity"),
         outcome="ok",
+        phase="write",
         status=204,
         sent_as=update.sent_as,
         run_principal=ALICE,
         token_digest=update.token_digest,
+        created_key=None,
     )
-    assert create.key is None
+    assert create.key is None and create.created_key == KEY
     assert create.fields == ("PurchaseRequisition", "PurchaseRequisitionItem", "Plant")
-    assert delete.fields == () and delete.key == KEY
-    for record in w.audits:
-        assert "SECRET-VALUE" not in repr(record) and "jwt-of-" not in repr(record)
-        assert record.token_digest and record.token_digest not in ("", f"jwt-of-{ALICE}")
+    assert delete.fields == () and delete.key == KEY and delete.created_key is None
+    assert all(a.created_key is None for a in w.recorder.intents)
+    for record in (*w.audits, *w.recorder.intents):
+        text = repr(record)
+        for secret in ("SECRET-VALUE", "jwt-of-", STAMP, NEW_STAMP, "T-user", "S-user"):
+            assert secret not in text
+        assert record.token_digest and len(record.token_digest) == 64
 
 
-async def test_the_hook_gets_the_identity_of_the_token_that_was_sent():
-    """A job run keeps the trigger's token while the principal names the run-as user."""
-    w = World()
-    claims = current_claims.set({"user_uuid": "uuid-of-alice", "email": ALICE})
-    try:
-        with signed_in("job-user", token=f"jwt-of-{ALICE}"):
-            assert (await w.run(**UPDATE))["ok"] is True
-    finally:
-        current_claims.reset(claims)
-    (record,) = w.audits
-    assert record.run_principal == "job-user" and record.sent_as == "uuid-of-alice"
-    assert w.resolved[-1] == ("S4_ODATA_USER", f"jwt-of-{ALICE}")
-    # Without validated claims, the sender is named by the token's digest, never by the principal.
-    with signed_in("job-user", token=f"jwt-of-{BOB}"):
-        await w.run(**UPDATE)
-    record = w.audits[-1]
-    assert record.sent_as == "token:" + record.token_digest and record.run_principal == "job-user"
-    assert record.token_digest != w.audits[0].token_digest
-    # A technical-user service sends the destination's credential, whoever is signed in.
-    with signed_in(ALICE):
-        await w.run(**{**UPDATE, "service": "pr-jobs"})
-    record = w.audits[-1]
-    assert record.sent_as == "technical:S4_ODATA_TECH" and record.token_digest is None
-    assert record.run_principal == ALICE
+async def test_the_created_key_is_taken_from_the_answer_or_left_out(alice):
+    w = World(catalogue=snapshot(operations=ALL_OPS))
+    partial = _row()
+    del partial["d"]["PurchaseRequisitionItem"]
+    w.sap.write_answer = httpx.Response(201, json=partial)
+    out = await w.run(operation="create", body={**KEY, "Plant": "1000"})
+    assert out["status"] == 201 and "etag" not in out
+    # The body named the key, the answer did not: no guess.
+    assert w.audits[-1].outcome == "ok" and w.audits[-1].created_key is None
+    w.sap.write_answer = httpx.Response(201)
+    await w.run(operation="create", body={**KEY, "Plant": "1000"})
+    assert w.audits[-1].outcome == "ok" and w.audits[-1].created_key is None
 
 
-async def test_the_hook_is_called_when_the_write_is_cancelled(alice):
+@pytest.mark.parametrize("failure", ["raises", "hangs"])
+async def test_without_an_intent_record_nothing_is_sent(alice, caplog, monkeypatch, failure):
+    monkeypatch.setattr(tools_module, "AUDIT_INTENT_TIMEOUT_SECONDS", 0.05)
+
+    class Broken(Recorder):
+        async def intent(self, record: WriteAudit) -> Any:
+            if failure == "raises":
+                raise RuntimeError("audit store down: secret-detail")
+            await asyncio.Event().wait()
+
+    w = World(catalogue=snapshot(operations=ALL_OPS), recorder_type=Broken)
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        for call in (UPDATE, {"operation": "create", "body": {"Plant": "1"}},
+                     {"operation": "delete", "key": KEY}):
+            out = await w.run(**call)
+            assert out["error"]["code"] == "audit_unavailable", out
+            assert "nothing was changed" in out["error"]["message"]
+    assert w.recorder.results == [] and w.toolset.http_clients == []
+    assert w.sap.requests == [] and w.built == [] and w.resolved == []
+    assert "secret-detail" not in caplog.text
+    lines = [r for r in caplog.records if r.name == "agents.odata.audit"]
+    assert len(lines) == 3 and all(r.levelno == logging.ERROR for r in lines)
+    assert "operation=update" in lines[0].getMessage() and "10000001" not in caplog.text
+
+
+class _ResultFails(Recorder):
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        raise RuntimeError("audit store down: secret-detail")
+
+
+class _ResultCancelsItself(Recorder):
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        asyncio.current_task().cancel()
+        await asyncio.sleep(0)
+
+
+class _ResultIsSlow(Recorder):
+    def __init__(self, world: Any) -> None:
+        super().__init__(world)
+        self.release = asyncio.Event()
+
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        await self.release.wait()
+        await super().result(token, record)
+
+
+def _with_recorder(kind: type) -> World:
+    return World(recorder_type=kind)
+
+
+@pytest.mark.parametrize("kind, reason", [
+    (_ResultFails, "RuntimeError"),
+    (_ResultCancelsItself, "cancelled"),
+    (_ResultIsSlow, "within"),
+])
+async def test_a_recorder_that_fails_after_the_write_changes_no_answer(
+    alice, caplog, monkeypatch, kind, reason
+):
+    monkeypatch.setattr(tools_module, "AUDIT_RESULT_TIMEOUT_SECONDS", 0.05)
+    w = _with_recorder(kind)
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        out = await w.run(**{**UPDATE, "body": {"Plant": "SECRET-VALUE"}})
+        await asyncio.sleep(0)  # let the task's done-callback run
+    assert out == {"ok": True, "status": 204} and len(w.sap.writes) == 1
+    # The record is not lost: all of it, minus the key values, on the audit logger.
+    (line,) = [r for r in caplog.records if r.name == "agents.odata.audit"]
+    text = line.getMessage()
+    assert line.levelno == logging.ERROR and reason in text
+    for part in ("operation=update", "outcome=ok", "phase=write", "status=204", "service='pr'",
+                 f"target='{ITEM}'", "fields=['Plant']", "agent='buyer'", "run_id='run-1'",
+                 "call_id=", "sent_as=", f"run_principal='{ALICE}'", "token_digest=",
+                 "key_fields=['PurchaseRequisition', 'PurchaseRequisitionItem']"):
+        assert part in text, part
+    for secret in ("10000001", "00010", "SECRET-VALUE", "secret-detail", "jwt-of-"):
+        assert secret not in caplog.text
+    if kind is _ResultIsSlow:
+        # Still running, and still held: a slow recorder is not abandoned.
+        (task,) = w.toolset.audit_tasks
+        w.recorder.release.set()
+        await task
+        assert [a.outcome for a in w.recorder.results] == ["ok"]
+    assert not w.toolset.audit_tasks
+
+
+async def test_the_result_is_recorded_when_the_write_is_cancelled(alice):
     w = World()
     arrived, never = asyncio.Event(), asyncio.Event()
 
@@ -796,26 +940,157 @@ async def test_the_hook_is_called_when_the_write_is_cancelled(alice):
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert [(a.operation, a.outcome, a.status) for a in w.audits] == [("update", "cancelled", None)]
+    assert [(a.operation, a.outcome, a.phase, a.status) for a in w.audits] == [
+        ("update", "cancelled", "write", None)
+    ]
+    assert w.audits[0].call_id == w.recorder.intents[0].call_id
     # The toolset is still usable.
     w.sap.write_answer = None
     assert (await w.run(**UPDATE))["ok"] is True and len(w.audits) == 2
 
 
-async def test_a_failing_hook_does_not_change_what_the_write_answered(alice, caplog):
-    async def failing(_record: WriteAudit) -> None:
-        raise RuntimeError("audit store down: secret-detail")
+async def test_a_second_cancel_does_not_orphan_the_result_record(alice):
+    w = _with_recorder(_ResultIsSlow)
+    arrived, never = asyncio.Event(), asyncio.Event()
 
-    w = World(on_write=failing)
-    with caplog.at_level(logging.DEBUG, logger="agents.odata.tools"):
-        out = await w.run(**UPDATE)
-    assert out == {"ok": True, "status": 204}
-    assert "RuntimeError" in caplog.text and "secret-detail" not in caplog.text
+    async def hang(_request: httpx.Request) -> httpx.Response:
+        arrived.set()
+        await never.wait()
+        return httpx.Response(204)
+
+    w.sap.write_answer = hang
+    task = asyncio.create_task(w.run(**UPDATE))
+    await asyncio.wait_for(arrived.wait(), 2)
+    task.cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not task.done() and len(w.toolset.audit_tasks) == 1  # waiting for the recorder
+    task.cancel()  # ... and cancelled again while it waits
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    (pending,) = w.toolset.audit_tasks
+    assert not pending.done() and w.recorder.results == []
+    w.recorder.release.set()
+    await pending
+    assert [(a.outcome, a.phase) for a in w.recorder.results] == [("cancelled", "write")]
+    assert not w.toolset.audit_tasks
 
 
-async def test_without_a_hook_a_write_just_runs(alice):
-    w = World(on_write=None)
+async def test_the_phase_says_whether_a_modifying_request_was_handed_over(alice):
+    w = World()
+    # SAP refuses the CSRF token request: an error from SAP, but no write left.
+    w.sap.fetch_answer = v2_error(403, "SY/1", "No authorization")
+    out = await w.run(**UPDATE)
+    assert out["error"]["code"] == "sap_error" and w.sap.writes == []
+    assert (w.audits[-1].outcome, w.audits[-1].phase, w.audits[-1].status) == (
+        "sap_error", "token", 403,
+    )
+    # The same answer to the write itself.
+    w.sap.fetch_answer = None
+    w.sap.write_answer = v2_error(403, "SY/1", "No authorization")
+    await w.run(**UPDATE)
+    assert (w.audits[-1].outcome, w.audits[-1].phase, w.audits[-1].status) == (
+        "sap_error", "write", 403,
+    )
+    assert len(w.sap.writes) == 1
+
+    # A destination that cannot be resolved: nothing got past the token stage.
+    from agents.destination import DestinationError
+
+    class Down(FakeResolver):
+        async def resolve(self, **_kw):
+            raise DestinationError("destination service said 503")
+
+    down = World(resolver_factory=lambda name: Down(name=name))
+    await down.run(**UPDATE)
+    assert (down.audits[-1].outcome, down.audits[-1].phase) == ("refused", "token")
+
+
+async def test_the_recorder_gets_the_identity_of_the_token_that_was_sent():
+    """A job run keeps the trigger's token while the principal names the run-as user."""
+    w = World()
+    alice_claims = {"user_uuid": "uuid-of-alice", "email": ALICE, "jti": "a1", "iat": 1}
+    alice_jwt = _token(**alice_claims)
+    claims = current_claims.set(alice_claims)
+    try:
+        with signed_in("job-user", token=alice_jwt):
+            assert (await w.run(**UPDATE))["ok"] is True
+        record = w.audits[-1]
+        assert record.run_principal == "job-user" and record.sent_as == "uuid-of-alice"
+        assert w.resolved[-1] == ("S4_ODATA_USER", alice_jwt)
+        assert w.recorder.intents[-1].sent_as == "uuid-of-alice"
+        # Stale claims next to ANOTHER token: the sender is that token, named by its digest.
+        bob_jwt = _token(user_uuid="uuid-of-bob", email=BOB, jti="b1", iat=1)
+        with signed_in("job-user", token=bob_jwt):
+            await w.run(**UPDATE)
+        record = w.audits[-1]
+        assert record.sent_as == "token:" + record.token_digest
+        assert "alice" not in record.sent_as and record.run_principal == "job-user"
+        assert record.token_digest != w.audits[0].token_digest
+    finally:
+        current_claims.reset(claims)
+    # No validated claims at all: the digest, never the principal.
+    with signed_in(ALICE, token=alice_jwt):
+        await w.run(**UPDATE)
+    record = w.audits[-1]
+    assert record.sent_as == "token:" + record.token_digest and record.run_principal == ALICE
+    # A technical-user service sends the destination's credential, whoever is signed in.
+    with signed_in(ALICE):
+        await w.run(**{**UPDATE, "service": "pr-jobs"})
+    record = w.audits[-1]
+    assert record.sent_as == "technical:S4_ODATA_TECH" and record.token_digest is None
+    assert record.run_principal == ALICE
+
+
+def test_bound_token_principal_needs_claims_that_are_the_tokens_own():
+    claims = {"user_uuid": "uuid-of-alice", "jti": "a1", "iat": 1, "exp": 2, "origin": "ias"}
+    token = _token(**claims)
+
+    def bound(jwt_value: str | None, bound_claims: dict | None) -> str | None:
+        a, b = current_jwt.set(jwt_value), current_claims.set(bound_claims)
+        try:
+            return bound_token_principal()
+        finally:
+            current_claims.reset(b)
+            current_jwt.reset(a)
+
+    assert bound(token, claims) == "uuid-of-alice"
+    # Extra claims the validator added or the token carries besides do not matter.
+    assert bound(token, {**claims, "scope": ["x"]}) == "uuid-of-alice"
+    assert bound(token, None) is None and bound(None, claims) is None
+    assert bound("not-a-jwt", claims) is None
+    for name, other in (("user_uuid", "uuid-of-bob"), ("jti", "b1"), ("iat", 5), ("exp", 9),
+                        ("origin", "other"), ("sub", "someone")):
+        assert bound(token, {**claims, name: other}) is None, name
+        assert bound(_token(**{**claims, name: other}), claims) is None, name
+    # Claims that name nobody name nobody.
+    anonymous = {"jti": "c1", "iat": 1}
+    assert bound(_token(**anonymous), anonymous) is None
+
+
+async def test_without_a_recorder_a_write_just_runs(alice):
+    w = World(recorder=None)
     assert (await w.run(**UPDATE)) == {"ok": True, "status": 204}
+
+
+async def test_an_applied_write_is_never_reported_as_failed_afterwards(alice, monkeypatch, caplog):
+    """Whatever breaks after SAP confirmed: the model must not be invited to repeat."""
+    w = World(catalogue=snapshot(operations=ALL_OPS))
+    real = tools_module.clip_result
+
+    def broken(result: dict, *a: Any, **kw: Any) -> dict:
+        if "items" in result or "truncated" in result:  # reads pass
+            return real(result, *a, **kw)
+        raise RuntimeError("bug https://s4.internal:44300/sap")
+
+    monkeypatch.setattr(tools_module, "clip_result", broken)
+    with caplog.at_level(logging.DEBUG, logger="agents.odata.tools"):
+        assert await w.run(**UPDATE) == {"ok": True, "status": 204}
+        assert await w.run(operation="delete", key=KEY) == {"ok": True, "status": 204}
+        out = await w.run(operation="create", body={**KEY, "Plant": "1"})
+    assert out == {"item": None, "status": 201, "truncated": True}
+    assert [a.outcome for a in w.audits] == ["ok", "ok", "ok"] and len(w.sap.writes) == 3
+    assert "RuntimeError" in caplog.text and "s4.internal" not in caplog.text
 
 
 # -- two users at once ---------------------------------------------------------
@@ -871,6 +1146,151 @@ async def test_two_users_writing_at_the_same_time_through_one_toolset():
     assert len(w.sap.writes) == 12
 
 
+async def test_two_runs_of_the_same_user_at_the_same_time(alice):
+    """One user, two runs (a sub-agent, a second chat turn) on one toolset."""
+    w = World(catalogue=snapshot(operations=ALL_OPS))
+
+    async def run(item: str) -> None:
+        key = {"PurchaseRequisition": "10000001", "PurchaseRequisitionItem": item}
+        for n in range(5):
+            got = await w.run(operation="get", key=key)
+            out = await w.run(
+                operation="update", key=key, body={"Plant": f"{item}-{n}"}, etag=got["etag"]
+            )
+            assert out == {"ok": True, "status": 204}, out
+
+    await asyncio.gather(run("00010"), run("00020"))
+    # One identity: one SAP session, used by both runs; every write its own entity.
+    assert len(w.sap.fetches) == 1 and w.sap.crossed == [] and len(w.sap.writes) == 10
+    for write in w.sap.writes:
+        item = json.loads(write.content)["Plant"].split("-")[0]
+        assert f"PurchaseRequisitionItem='{item}'" in write.url.path
+        assert write.headers["If-Match"] == RAW_ETAG
+    assert len({a.call_id for a in w.audits}) == 10
+    assert len({a.token_digest for a in w.audits}) == 1
+    # Both runs read the SAME entity and then both change it: the handle is one
+    # per entity, so the second change is told to read again instead of
+    # overwriting the first with a version it never saw.
+    first, second = await asyncio.gather(
+        w.run(operation="get", key=KEY), w.run(operation="get", key=KEY)
+    )
+    assert first["etag"] == second["etag"]
+    outs = await asyncio.gather(
+        w.run(operation="update", key=KEY, body={"Plant": "a"}, etag=first["etag"]),
+        w.run(operation="update", key=KEY, body={"Plant": "b"}, etag=second["etag"]),
+    )
+    assert all(out == {"ok": True, "status": 204} for out in outs)  # both passed the check
+    out = await w.run(operation="update", key=KEY, body={"Plant": "c"}, etag=first["etag"])
+    assert out["error"]["code"] == "invalid_etag"
+
+
+# -- search offers only what execute runs ---------------------------------------
+
+V4_PATH = "/sap/opu/odata4/sap/api_purchasereq/srvd_a2x/sap/purchaserequisition/0001"
+_SWITCH_CODES = {
+    "unknown_service", "service_disabled", "unknown_target", "operation_disabled",
+    "write_not_allowed", "not_available",
+}
+
+
+def _v4_catalogue() -> dict[str, dict]:
+    catalogue = snapshot(operations=ALL_OPS)
+    v4 = service_payload(
+        name="pr-v4",
+        odata_version="v4",
+        service_path=V4_PATH,
+        user_context=True,
+        definition={
+            "entity_sets": [_entity_set(ITEM, ALL_OPS), _entity_set("A_Twin", ALL_OPS)],
+            "operations": [
+                {
+                    "name": "Release",
+                    "qualified_name": "SRV.Release",
+                    "kind": "action",
+                    "http_method": "POST",
+                    "enabled": True,
+                    "changes_data": True,
+                },
+                {
+                    "name": "CountOpen",
+                    "qualified_name": "SRV.CountOpen",
+                    "kind": "function",
+                    "http_method": "GET",
+                    "enabled": True,
+                    "changes_data": False,
+                },
+            ],
+        },
+    )
+    catalogue["pr"]["definition"]["operations"].append(
+        {
+            "name": "CountOpen",
+            "kind": "function_import",
+            "http_method": "GET",
+            "enabled": True,
+            "changes_data": False,
+            "parameters": [],
+        }
+    )
+    return {**catalogue, "pr-v4": {**v4, "id": 3, "counts": {}, "has_write": True, "used_by": []}}
+
+
+@pytest.mark.parametrize("allow_write", [True, False])
+async def test_whatever_search_returns_execute_does_not_refuse_by_a_switch(alice, allow_write):
+    oauth = {"services": ["pr", "pr-jobs", "pr-v4"], "allow_write": allow_write}
+    w = World(oauth, _v4_catalogue())
+    offered: list[tuple[str, str, str]] = []
+    for service in ("pr", "pr-jobs", "pr-v4"):
+        found = await w.search(query="", service=service)
+        assert found["total"] == len(found["matches"]) > 0
+        for match in found["matches"]:
+            assert match["operations"], match
+            offered += [(service, match["target"], op) for op in match["operations"]]
+        full = await w.search(query="", service=service, detail="full")
+        for match in full["matches"]:
+            writable = [f["name"] for f in match.get("fields", []) if f.get("writable")]
+            can_write = {"create", "update"} & set(match["operations"])
+            assert bool(writable) == bool(can_write), match["target"]
+    for service, target, operation in offered:
+        out = await w.run(service=service, target=target, operation=operation)
+        code = out.get("error", {}).get("code")
+        assert code not in _SWITCH_CODES, (service, target, operation, out)
+    # ... and it is the whole of what this agent can do: nothing is held back.
+    kinds = {operation for _, _, operation in offered}
+    assert "call" not in kinds  # no operation can be called yet, so none is offered
+    assert ({"create", "update", "delete"} <= kinds) is allow_write
+    v4_ops = {operation for service, _, operation in offered if service == "pr-v4"}
+    assert v4_ops == {"list", "get"}  # a V4 service is read-only for now
+
+
+async def test_a_v4_service_is_read_only_and_says_so_with_its_own_code(alice):
+    w = World({"services": ["pr-v4"], "allow_write": True}, _v4_catalogue())
+    for call in (UPDATE, {"operation": "create", "body": {"Plant": "1"}},
+                 {"operation": "delete", "key": KEY}):
+        out = await w.run(service="pr-v4", **call)
+        assert out["error"]["code"] == "not_available", out
+    for target in ("Release", "CountOpen"):
+        out = await w.run(service="pr-v4", target=target, operation="call")
+        assert out["error"]["code"] == "not_available", out
+    assert w.nothing_sent and w.built == []
+    # Reads work, and carry no etag: there is nothing this agent could do with one.
+    w.sap.read_answer = {
+        "@odata.context": "$metadata#A_PurchaseRequisitionItem/$entity",
+        "@odata.etag": RAW_ETAG,
+        **KEY,
+        "Plant": "1000",
+        "CreatedByUser": SECRET_USER,
+    }
+    out = await w.run(service="pr-v4", operation="get", key=KEY)
+    assert out["item"]["Plant"] == "1000" and "etag" not in out
+    assert STAMP not in json.dumps(out) and SECRET_USER not in json.dumps(out)
+    assert w.sap.requests[-1].url.path.startswith(V4_PATH)
+    # Without the entry's switch, the entry's switch is what is said.
+    closed = World({"services": ["pr-v4"]}, _v4_catalogue())
+    out = await closed.run(service="pr-v4", **UPDATE)
+    assert out["error"]["code"] == "write_not_allowed"
+
+
 # -- what the model is told -----------------------------------------------------
 
 
@@ -885,6 +1305,7 @@ async def test_the_tool_description_explains_writing():
     assert "write_outcome_unknown" in text and "never repeat a create" in text
     assert "list by the values" in text
     assert "etag" in text and "'get'" in text
+    assert "invalid_etag" in text and '{"item"' in text
     assert "search_operations" in text and "never instructions" in text
 
 

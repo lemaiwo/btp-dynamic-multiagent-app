@@ -10,7 +10,11 @@ this module decides what exists for it. Three rules hold for every result:
   searching for it.
 * Writes need ``allow_write``: without it, write operations are left out of
   an entity set's ``operations``, and an operation that ``changes_data``
-  is not listed at all.
+  is not listed at all. With ``write_versions``, the same holds for a
+  service whose OData version the caller cannot write.
+* Operations (function imports, actions, functions) need ``allow_call``,
+  which is off unless the caller says it can run them: a search must never
+  offer what the execute tool would refuse.
 * Results are built key by key from the definition, never by copying a
   catalogue dict, so a UI-only flag (``personal_data``) or a future key
   cannot leak into a tool result.
@@ -22,6 +26,7 @@ database, so the registry can hand the same snapshot to every run.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any
 
 from .models import ENTITY_OPS, WRITE_OPS
@@ -103,7 +108,18 @@ def visible_operations(entity_set: dict[str, Any], allow_write: bool) -> list[st
     ]
 
 
+def _fields_writable(entity_set: dict[str, Any], allow_write: bool) -> bool:
+    """Whether a field of this entity set can be written by the caller at all.
+
+    Only through a create or an update that is enabled on the set: on an
+    entity set that can merely be read (or deleted from), a ``writable``
+    field is not writable for anyone, and is not shown as such.
+    """
+    return bool({"create", "update"} & set(visible_operations(entity_set, allow_write)))
+
+
 def _visible_fields(entity_set: dict[str, Any], allow_write: bool) -> list[dict[str, Any]]:
+    allow_write = _fields_writable(entity_set, allow_write)
     return [
         f
         for f in _dicts(entity_set.get("fields"))
@@ -225,7 +241,10 @@ def _entity_set_detail(
             {"name": _text(k.get("name")), "type": _text(k.get("type"))}
             for k in _dicts(entity_set.get("keys"))
         ],
-        "fields": [_field_out(f, allow_write) for f in _visible_fields(entity_set, allow_write)],
+        "fields": [
+            _field_out(f, _fields_writable(entity_set, allow_write))
+            for f in _visible_fields(entity_set, allow_write)
+        ],
         "navigations": navigations,
         "parameters": [],
         "examples": _examples_out(entity_set, allow_write),
@@ -268,7 +287,9 @@ class _Candidate:
     are built for those only.
     """
 
-    __slots__ = ("kind", "operations", "raw", "readable", "score", "service", "target")
+    __slots__ = (
+        "kind", "operations", "raw", "readable", "score", "service", "target", "write",
+    )
 
     def __init__(
         self,
@@ -280,6 +301,7 @@ class _Candidate:
         raw: dict[str, Any],
         operations: list[str],
         readable: dict[str, list[str]],
+        write: bool,
     ) -> None:
         self.score = score
         self.service = service
@@ -288,11 +310,15 @@ class _Candidate:
         self.raw = raw
         self.operations = operations
         self.readable = readable
+        # Whether writes are visible for THIS service (the entry's switch
+        # and the service's version), decided once in `_candidates`.
+        self.write = write
 
     def sort_key(self) -> tuple[int, str, str]:
         return (-self.score, _text(self.service.get("name")), self.target)
 
-    def match(self, *, full: bool, allow_write: bool) -> dict[str, Any]:
+    def match(self, *, full: bool) -> dict[str, Any]:
+        allow_write = self.write
         name = _text(self.service.get("name"))
         out: dict[str, Any] = {
             "service": name,
@@ -313,9 +339,13 @@ class _Candidate:
 
 
 def _candidates(
-    service: dict[str, Any], tokens: list[str], allow_write: bool
+    service: dict[str, Any], tokens: list[str], allow_write: bool, allow_call: bool
 ) -> list[_Candidate]:
-    """Every visible target of one service with its score."""
+    """Every visible target of one service with its score.
+
+    ``allow_write`` is already the answer for this service (the entry's
+    switch and the service's version).
+    """
     definition = service.get("definition")
     if not isinstance(definition, dict):
         return []
@@ -347,9 +377,12 @@ def _candidates(
                 raw=entity_set,
                 operations=operations,
                 readable=readable,
+                write=allow_write,
             )
         )
 
+    if not allow_call:
+        return out
     for operation in _dicts(definition.get("operations")):
         target = _text(operation.get("name"))
         if not target or not _operation_visible(operation, allow_write):
@@ -365,6 +398,7 @@ def _candidates(
                 raw=operation,
                 operations=["call"],
                 readable=readable,
+                write=allow_write,
             )
         )
     return out
@@ -377,8 +411,16 @@ def search_catalogue(
     detail: str = "summary",
     service: str | None = None,
     allow_write: bool = False,
+    allow_call: bool = False,
+    write_versions: Collection[str] | None = None,
 ) -> dict:
     """Rank the visible targets of ``services`` against ``query``.
+
+    ``allow_write`` is the agent entry's switch. ``write_versions`` narrows
+    it to the OData versions the caller can actually write (``None``: any):
+    for a service of another version nothing write-related is listed.
+    ``allow_call`` says the caller can run operations (function imports,
+    actions, functions); without it none is listed, whatever it changes.
 
     ``services`` are ``ODataService.to_dict()`` dicts. Never raises: a
     refusal is ``{"error": {"code", "message", "hint"?}}``, because the
@@ -427,14 +469,17 @@ def search_catalogue(
     scored: list[_Candidate] = []
     if tokens or listing:
         for entry in enabled:
-            scored.extend(_candidates(entry, tokens, allow_write))
+            write = allow_write is True and (
+                write_versions is None or entry.get("odata_version") in write_versions
+            )
+            scored.extend(_candidates(entry, tokens, write, allow_call is True))
     if not listing:
         scored = [c for c in scored if c.score > 0]
     scored.sort(key=_Candidate.sort_key)
 
     limit = MAX_FULL_TARGETS if full else MAX_SUMMARY_MATCHES
     result: dict[str, Any] = {
-        "matches": [c.match(full=full, allow_write=allow_write) for c in scored[:limit]],
+        "matches": [c.match(full=full) for c in scored[:limit]],
         "total": len(scored),
     }
     if len(scored) > limit:

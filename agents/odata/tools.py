@@ -21,24 +21,29 @@ does not release. Where this agent can change an entity, a ``get`` answers
 with an opaque handle instead (``_EtagHandles``); the ETag stays here, tied
 to the identity, service, entity set and key it was read for.
 
-Every modifying call that got as far as being sent is reported once to the
-toolset's ``on_write`` hook (``WriteAudit``), whatever became of it.
+Every modifying call that passed all checks is recorded in two phases by
+the toolset's ``recorder`` (``WriteRecorder``, ``WriteAudit``): the intent
+before anything is built or sent -- no intent, no write -- and the result
+exactly once afterwards, whatever became of the call.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import functools
 import hashlib
 import inspect
 import logging
 import re
 import secrets
 import time
+import uuid
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Any, Literal
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from typing import Any, Literal, Protocol
 
 import httpx
 from pydantic import ValidationError
@@ -62,8 +67,12 @@ from .search import MAX_FULL_TARGETS, MAX_SUMMARY_MATCHES, search_catalogue
 from .session import CsrfSessionStore, NoCookieJar
 from .urls import MAX_FILTER_CHARS
 from .v2 import V2Dialect
+from .v4 import V4Dialect
 
 logger = logging.getLogger(__name__)
+# Where the record of a write goes when the recorder could not take it: the
+# last trace of a change in SAP must not depend on the recorder working.
+audit_logger = logging.getLogger("agents.odata.audit")
 
 DEFAULT_TOP = 50
 MAX_TOP = 200
@@ -74,13 +83,29 @@ MAX_EXPAND = 3
 # an agent that reads many entities cannot grow it.
 ETAG_HANDLE_TTL_SECONDS = 15 * 60
 ETAG_HANDLE_MAX = 1024
-# What became of a modifying call, for the audit hook.
+# What became of a modifying call, for the audit record ("intent": not yet known).
 WRITE_OUTCOMES = ("ok", "refused", "sap_error", "unknown", "cancelled")
+# How long the recorder may take. The intent is awaited before the write, so
+# a recorder that hangs there stops the write (fail closed); the result is
+# awaited after it, so one that hangs there must not keep a write that
+# already happened from the model.
+AUDIT_INTENT_TIMEOUT_SECONDS = 10.0
+AUDIT_RESULT_TIMEOUT_SECONDS = 10.0
 
 OPERATIONS = (*ENTITY_OPS, "call")
 # One dialect object per protocol version this module can send. A version
 # that is not here is refused, never sent with another version's rules.
-_DIALECTS: dict[str, Any] = {"v2": V2Dialect()}
+_DIALECTS: dict[str, Any] = {"v2": V2Dialect(), "v4": V4Dialect()}
+# What `execute_operation` can do beyond reading, said once so that
+# `search_operations` offers exactly that: the versions whose dialect can
+# write, and whether operations (function imports, actions, functions) can
+# be called at all (not yet).
+_WRITE_VERSIONS = frozenset(
+    version
+    for version, dialect in _DIALECTS.items()
+    if getattr(dialect, "supports_write", False) is True
+)
+_CALLS_AVAILABLE = False
 _NO_USER_HINT = (
     "this service runs as the signed-in user and this run has none; "
     "use a service that runs as a technical user"
@@ -110,8 +135,13 @@ _SCRUB: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 __all__ = [
+    "AUDIT_INTENT_TIMEOUT_SECONDS",
+    "AUDIT_RESULT_TIMEOUT_SECONDS",
     "NoUsableServiceError",
+    "NoWriteRecorder",
+    "WRITE_OUTCOMES",
     "WriteAudit",
+    "WriteRecorder",
     "attached_services",
     "DEFAULT_TOP",
     "ETAG_HANDLE_MAX",
@@ -262,6 +292,16 @@ def _absent(value: object) -> bool:
     return value is None or (isinstance(value, (str, list, dict)) and not value)
 
 
+def _key_of(entity_set: EntitySetDef, item: object) -> dict[str, Any] | None:
+    """The key of an entity SAP returned, when all its key fields came back."""
+    names = [k.name for k in entity_set.keys]
+    if not names or not isinstance(item, dict):
+        return None
+    if any(item.get(name) is None for name in names):
+        return None
+    return {name: item[name] for name in names}
+
+
 def _now() -> float:
     """The clock of the handle store (a seam for the tests)."""
     return time.monotonic()
@@ -318,40 +358,56 @@ def _sender(raw: dict[str, Any]) -> tuple[str, str | None]:
     For the audit, and deliberately not ``current_principal``: a job run can
     carry the token of whoever triggered it while the principal names the
     run-as user. A signed-in-user service is therefore named by the claims
-    the middleware validated for the bound JWT (``current_claims``; it is
-    not rebound by ``run_as``), and when there are none by the token's
-    digest. A technical-user service sends the destination's credential.
-    The token itself is never returned.
+    the middleware validated for the bound JWT, and only when those claims
+    are that token's (``agents.auth.bound_token_principal``); otherwise by
+    the token's digest, never by a guess. A technical-user service sends
+    the destination's credential. The token itself is never returned.
     """
     if raw["user_context"] is not True:
         return f"technical:{raw['destination']}", None
-    from agents import auth
+    from agents.auth import bound_token_principal
 
     digest = _token_digest()
-    claims = auth.current_claims.get()
-    named = auth._principal_claim(claims) if isinstance(claims, dict) else None
-    return (named or f"token:{digest}"), digest
+    return (bound_token_principal() or f"token:{digest}"), digest
 
 
 @dataclass(frozen=True)
 class WriteAudit:
-    """One modifying call, as the ``on_write`` hook of the toolset gets it.
+    """One modifying call, as the toolset's recorder gets it (twice).
 
-    ``fields`` are the NAMES of the body fields (``WritePlan.fields``),
-    never values. ``outcome`` is one of ``WRITE_OUTCOMES``: ``ok``;
-    ``refused`` (nothing was sent: the destination or the connection failed
-    first); ``sap_error`` (SAP answered with an error, ``status`` says
-    which); ``unknown`` (the change may or may not have been applied);
-    ``cancelled`` (the run was cancelled while the call was in flight, so
-    the outcome is unknown too).
+    The same ``call_id`` in the intent and in the result record.
 
-    Two identities, on purpose: ``sent_as`` is derived from the credential
-    that was actually sent (``_sender``), ``run_principal`` is
-    ``current_principal`` -- in a job run the run-as user, which can differ
-    from the token's owner. ``token_digest`` is the SHA-256 of the JWT sent
-    (``None`` for a technical-user service); the token is never here.
+    * ``outcome``: ``"intent"`` in the intent record (written before
+      anything is built or sent); in the result record one of
+      ``WRITE_OUTCOMES``: ``ok``; ``refused`` (nothing was changed: the
+      destination or the connection failed first); ``sap_error`` (SAP
+      answered with an error, ``status`` says which); ``unknown`` (the
+      change may or may not have been applied); ``cancelled`` (the run was
+      cancelled while the call was in flight, so the outcome is unknown
+      too).
+    * ``phase``: whether a modifying request left this app. ``"token"``:
+      none did (the call ended while the connection was set up or the CSRF
+      token was fetched) -- nothing was changed, whatever ``outcome`` says.
+      ``"write"``: one was handed to an open connection at least once. For
+      an error it is the client's own word (``ODataError.sent``); for a
+      success it is ``write``; only for a cancelled run, which leaves no
+      error to ask, it is what ``_PhasedSessions`` saw.
+    * ``status``: the HTTP status of the answer, when there was one.
+    * ``key``: the key the call named (``None`` for a create);
+      ``created_key``: for a create that succeeded, the key of the created
+      entity taken from SAP's answer when all its key fields came back,
+      else ``None`` -- never a guess.
+    * ``fields``: the NAMES of the body fields (``WritePlan.fields``).
+    * Two identities, on purpose: ``sent_as`` is derived from the
+      credential that was actually sent (``_sender``), ``run_principal`` is
+      ``current_principal`` -- in a job run the run-as user, which can
+      differ from the token's owner. ``token_digest`` is the SHA-256 of the
+      JWT sent (``None`` for a technical-user service).
+
+    Never in a record: a body value, a token, a cookie, an ETag.
     """
 
+    call_id: str
     agent: str
     run_id: str | None
     service: str
@@ -360,10 +416,86 @@ class WriteAudit:
     key: dict[str, Any] | None
     fields: tuple[str, ...]
     outcome: str
+    phase: str
     status: int | None
     sent_as: str
     run_principal: str | None
     token_digest: str | None
+    created_key: dict[str, Any] | None = None
+
+
+class WriteRecorder(Protocol):
+    """Where the toolset records its modifying calls (the storage is not here).
+
+    ``intent`` is awaited after every check of a write passed and BEFORE a
+    client is built or anything is sent. If it raises, or takes longer than
+    ``AUDIT_INTENT_TIMEOUT_SECONDS``, the write is not sent and the model is
+    told so (``audit_unavailable``): no record, no change. What it returns
+    is handed back unchanged as ``token`` (a row id, say).
+
+    ``result`` is awaited exactly once for every call whose ``intent``
+    returned, with a record of the same ``call_id`` -- also for an unknown
+    outcome and a cancelled run. It can no longer change what the model is
+    told: when it raises, is cancelled or takes longer than
+    ``AUDIT_RESULT_TIMEOUT_SECONDS``, the record is written to the
+    ``agents.odata.audit`` logger instead (without key values) and the
+    write's own answer stands. It runs in its own task, shielded from the
+    run's cancellation, with the request's context variables.
+    """
+
+    async def intent(self, record: WriteAudit) -> Any: ...
+
+    async def result(self, token: Any, record: WriteAudit) -> None: ...
+
+
+class NoWriteRecorder:
+    """The default recorder: nothing is recorded."""
+
+    async def intent(self, record: WriteAudit) -> Any:
+        return None
+
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        return None
+
+
+def _audit_text(record: WriteAudit) -> str:
+    """A record for a log line: everything but the key VALUES."""
+    names = sorted(record.key) if isinstance(record.key, dict) else None
+    return (
+        f"call_id={record.call_id} agent={record.agent!r} run_id={record.run_id!r} "
+        f"service={record.service!r} target={record.target!r} "
+        f"operation={record.operation} key_fields={names} fields={list(record.fields)} "
+        f"outcome={record.outcome} phase={record.phase} status={record.status} "
+        f"sent_as={record.sent_as!r} run_principal={record.run_principal!r} "
+        f"token_digest={record.token_digest} "
+        f"created_key={'yes' if record.created_key else 'no'}"
+    )
+
+
+# How far the write of the current task got ({"phase": "token" | "write"}),
+# set and reset by `_send_write` in that same task.
+_write_phase: ContextVar[dict[str, str] | None] = ContextVar("odata_write_phase", default=None)
+
+
+class _PhasedSessions(CsrfSessionStore):
+    """The CSRF session store, noting when a write gets past the token stage.
+
+    The client asks the store for the caller's session right before it
+    sends a modifying request, and for nothing else. So while ``get`` has
+    not returned, no modifying request can have left; once it has, the next
+    thing is the write. Used only for a call that ends without an error
+    that says it (a cancellation, an exception the client did not
+    classify); every ``ODataError`` carries ``sent`` itself.
+    """
+
+    async def get(self, key: Any, fetch: Any) -> Any:
+        holder = _write_phase.get()
+        if holder is not None:
+            holder["phase"] = "token"
+        session = await super().get(key, fetch)
+        if holder is not None:
+            holder["phase"] = "write"
+        return session
 
 
 _HandleScope = tuple[str, str, str, str]  # identity, service, entity set, key predicate
@@ -378,7 +510,14 @@ class _EtagHandles:
     another user's, another entity's, a string that merely looks like an
     ETag) resolves to ``None``, and the caller refuses them all alike, so a
     refusal tells nothing about what exists. At most ``ETAG_HANDLE_MAX``
-    entries; the oldest go first, and losing one costs a read.
+    entries, a bound shared by every user of the agent (the toolset is one
+    object for all of them); the oldest go first, and losing one costs its
+    owner a ``get``.
+
+    Reading an entity again returns the SAME handle while its ETag is
+    unchanged and a new one otherwise. A model can therefore tell from two
+    reads whether the entity changed in between -- which it could also tell
+    from the fields it may read; nothing else about the ETag shows.
     """
 
     def __init__(self) -> None:
@@ -451,10 +590,6 @@ class _EtagHandles:
             self._remove(known)
 
 
-async def _no_audit(record: WriteAudit) -> None:
-    """The default ``on_write`` hook: nothing is recorded."""
-
-
 def odata_toolset(
     oauth: dict[str, Any],
     *,
@@ -466,7 +601,7 @@ def odata_toolset(
     proxy_transport: httpx.AsyncBaseTransport | None = None,
     resolver_factory: Callable[[str], Any] | None = None,
     connectivity: Any = None,
-    on_write: Callable[[WriteAudit], Awaitable[None]] | None = None,
+    recorder: WriteRecorder | None = None,
 ) -> FunctionToolset:
     """The OData toolset for one agent, ready for ``Agent(toolsets=...)``.
 
@@ -484,14 +619,11 @@ def odata_toolset(
     ``connectivity`` are for ``execute_operation``; nothing is resolved or
     connected while the toolset is built.
 
-    ``on_write`` is the audit hook: an async callable that is awaited
-    exactly once with a ``WriteAudit`` for every create, update or delete
-    that passed all checks and was handed to the client -- also when the
-    outcome is unknown and when the run is cancelled in flight. It is not
-    called for a call refused by a check (nothing was going to be sent). It
-    runs after the outcome is known, shielded from cancellation; an
-    exception it raises is logged by type and does not change the answer of
-    the write, which has already happened. Default: nothing is recorded.
+    ``recorder`` records every create, update and delete in two phases
+    (``WriteRecorder``): the intent after all checks and before anything is
+    built or sent -- if that fails, the write is not sent -- and the result
+    exactly once afterwards. A call refused by a check is not recorded
+    (nothing was going to be sent). Default: ``NoWriteRecorder``.
     """
     if auth_mode != "destination":
         raise ValueError(
@@ -534,8 +666,15 @@ def odata_toolset(
             service: Limit the search to one service name from an earlier
                 result.
         """
+        # Only what execute_operation below can actually run is offered.
         return search_catalogue(
-            attached, query, detail=detail, service=service, allow_write=allow_write
+            attached,
+            query,
+            detail=detail,
+            service=service,
+            allow_write=allow_write,
+            allow_call=_CALLS_AVAILABLE,
+            write_versions=_WRITE_VERSIONS,
         )
 
     toolset.add_function(search_operations)
@@ -556,9 +695,12 @@ def odata_toolset(
     # One CSRF session store and one handle store per toolset object: both
     # are keyed by the identity of the request, and the registry shares the
     # toolset between every user of the agent.
-    sessions = CsrfSessionStore()
+    sessions = _PhasedSessions()
     handles = _EtagHandles()
-    audit_hook = on_write or _no_audit
+    audit = recorder if recorder is not None else NoWriteRecorder()
+    # The recorder's result tasks that are still running, held here so that
+    # one outliving its caller (a timeout, a second cancel) is not collected.
+    audit_tasks: set[asyncio.Task[None]] = set()
 
     def _rules(entry: _Service) -> tuple[ODataClient, ServiceDefinition, Any]:
         """The catalogue rules of a service, the definition and its dialect.
@@ -571,7 +713,7 @@ def odata_toolset(
         dialect = _DIALECTS.get(raw.get("odata_version"))  # type: ignore[arg-type]
         if dialect is None:
             raise ODataError(
-                "service_disabled", "OData V4 services cannot be called yet; only V2 can"
+                "service_disabled", "services of this OData version cannot be called"
             )
         # Whose identity a request carries is decided here and nowhere else,
         # so it is not guessed from a value that is not exactly a boolean.
@@ -705,29 +847,73 @@ def odata_toolset(
             dialect.key_segment(entity_set, key),
         )
 
-    def _hands_out_etags(entity_set: EntitySetDef) -> bool:
+    def _hands_out_etags(entity_set: EntitySetDef, dialect: Any) -> bool:
         """Whether this agent can change or delete an entity of the set at all.
 
         Only then is an ETag of any use to the model, and only then does a
         result carry a handle; every other result has no ``etag``.
         """
-        return allow_write and bool({"update", "delete"} & set(entity_set.operations))
+        return (
+            allow_write
+            and getattr(dialect, "supports_write", False) is True
+            and bool({"update", "delete"} & set(entity_set.operations))
+        )
 
-    async def _audit(record: WriteAudit) -> None:
-        """Hand one modifying call to the hook; never changes the call's outcome."""
-        try:
-            # Shielded: the record of a write that went out must not be lost
-            # because the run is being cancelled around it.
-            await asyncio.shield(asyncio.ensure_future(audit_hook(record)))
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - the write has already happened
-            logger.error(
-                "odata: the write audit hook failed for service '%s' (%s at %s)",
-                record.service,
+    def _result_settled(record: WriteAudit, task: asyncio.Task[None]) -> None:
+        """The recorder's result task ended: let go of it, and if it did not
+        record, write the record to the audit log instead."""
+        audit_tasks.discard(task)
+        if task.cancelled():
+            audit_logger.error(
+                "odata audit: result NOT recorded (the recorder was cancelled): %s",
+                _audit_text(record),
+            )
+            return
+        exc = task.exception()
+        if exc is not None:
+            audit_logger.error(
+                "odata audit: result NOT recorded (%s at %s): %s",
                 type(exc).__name__,
                 _origin(exc),
+                _audit_text(record),
             )
+
+    async def _record_result(token: Any, record: WriteAudit) -> None:
+        """Hand the result of one modifying call to the recorder.
+
+        Never changes the answer of the call: the write has happened (or
+        not) by now. The recorder runs in its own task, which this toolset
+        holds until it is done and which a cancellation of the run does not
+        reach. A recorder that fails or is cancelled is logged with the
+        whole record by ``_result_settled``; one that is slow is logged
+        here and left to finish.
+        """
+
+        async def run() -> None:
+            await audit.result(token, record)
+
+        task = asyncio.ensure_future(run())
+        audit_tasks.add(task)
+        task.add_done_callback(functools.partial(_result_settled, record))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), AUDIT_RESULT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            audit_logger.error(
+                "odata audit: result not recorded within %ss (the recorder is still "
+                "running): %s",
+                AUDIT_RESULT_TIMEOUT_SECONDS,
+                _audit_text(record),
+            )
+        except asyncio.CancelledError:
+            # Two different things end up here. The run itself is being
+            # cancelled (again): pass that on; the recorder's task goes on
+            # behind the shield. Or only the recorder's own task was
+            # cancelled: that is the recorder failing, not this call.
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        except Exception:  # noqa: BLE001 - logged with the record by _result_settled
+            pass
 
     async def _send_write(
         entry: _Service,
@@ -742,19 +928,51 @@ def odata_toolset(
     ) -> dict[str, Any]:
         """Send one write that passed every check. THE place a write leaves from.
 
-        Everything a record of the call needs is known here and only here:
-        the service, the entity set, the operation, the key, the body's
-        field names, what became of it and the HTTP status. The hook is
-        awaited exactly once per call of this function, in the ``finally``,
-        so that holds for an error, an unknown outcome and a cancellation
-        alike. (W5: an "intent" record written before the request would go
-        at the top of the ``try``.)
+        Everything a record of the call needs is known here and only here.
+        Order: the intent is recorded -- or the call ends here, with nothing
+        built and nothing sent; then the client is built and the write
+        sent; then, in the ``finally``, the result is recorded exactly
+        once, for an error, an unknown outcome and a cancellation alike.
         """
         from agents.auth import current_principal
 
         name = entry.raw["name"]
         sent_as, token_digest = _sender(entry.raw)
+        record = WriteAudit(
+            call_id=uuid.uuid4().hex,
+            agent=agent_name,
+            run_id=run_id,
+            service=name,
+            target=entity_set.name,
+            operation=operation,
+            key=dict(key) if isinstance(key, dict) else None,
+            fields=fields,
+            outcome="intent",
+            phase="token",
+            status=None,
+            sent_as=sent_as,
+            run_principal=current_principal.get(),
+            token_digest=token_digest,
+        )
+        try:
+            token = await asyncio.wait_for(audit.intent(record), AUDIT_INTENT_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - no record, no write (a cancellation passes)
+            audit_logger.error(
+                "odata audit: intent NOT recorded (%s at %s); the write was not sent: %s",
+                type(exc).__name__,
+                _origin(exc),
+                _audit_text(record),
+            )
+            raise ODataError(
+                "audit_unavailable",
+                "nothing was changed; the audit record could not be written",
+                hint="changes cannot be made right now; tell the user instead of retrying",
+            ) from None
+
+        holder = {"phase": "token"}
+        marker = _write_phase.set(holder)
         outcome, status = "cancelled", None
+        created_key: dict[str, Any] | None = None
         try:
             try:
                 client = _client(entry, dialect)
@@ -790,8 +1008,6 @@ def odata_toolset(
                     "the destination of this service could not be used; nothing was changed",
                 ) from None
             except Exception as exc:  # noqa: BLE001 - every failure of a write gets a verdict
-                # Not classified by the client, so nobody knows how far the
-                # request got: said as it is, and never sent again.
                 logger.error(
                     "odata: %s on service '%s' failed (%s at %s)",
                     operation,
@@ -799,43 +1015,56 @@ def odata_toolset(
                     type(exc).__name__,
                     _origin(exc),
                 )
+                if holder["phase"] != "write":
+                    # It never got past the token stage: nothing left.
+                    raise ODataError(
+                        "destination_error",
+                        "the call could not be completed; nothing was changed",
+                    ) from None
+                # Not classified by the client and past the token stage, so
+                # nobody knows how far the request got: said as it is, and
+                # never sent again.
                 raise ODataError(
                     "write_outcome_unknown",
                     "the call failed while the change was being sent: it is not known "
                     "whether SAP applied it. The request was not repeated",
                     hint=_UNKNOWN_CREATE_HINT if operation == "create" else _UNKNOWN_OUTCOME_HINT,
+                    sent=True,
                 ) from None
             outcome = "ok"
+            holder["phase"] = "write"
             status = result.get("status") if isinstance(result.get("status"), int) else None
+            if operation == "create":
+                created_key = _key_of(entity_set, result.get("item"))
             return result
         except ODataError as exc:
             status = exc.status
-            if exc.code == "write_outcome_unknown":
-                outcome = "unknown"
-            elif exc.code in ("sap_error", "etag_required"):
+            # Whether a modifying request left the app is the client's word.
+            left = getattr(exc, "sent", False) is True
+            holder["phase"] = "write" if left else "token"
+            if exc.code in ("sap_error", "etag_required"):
                 outcome = "sap_error"
+            elif exc.code == "write_outcome_unknown" and left:
+                outcome = "unknown"
             else:
+                # Nothing was changed. (Also an "unknown" that never left:
+                # there is nothing unknown about a request that was not sent.)
                 outcome = "refused"
             raise
         except DestinationUserRequired:
-            outcome = "refused"
+            outcome, holder["phase"] = "refused", "token"
             raise
         finally:
-            await _audit(
-                WriteAudit(
-                    agent=agent_name,
-                    run_id=run_id,
-                    service=name,
-                    target=entity_set.name,
-                    operation=operation,
-                    key=dict(key) if isinstance(key, dict) else None,
-                    fields=fields,
+            _write_phase.reset(marker)
+            await _record_result(
+                token,
+                replace(
+                    record,
                     outcome=outcome,
+                    phase=holder["phase"],
                     status=status,
-                    sent_as=sent_as,
-                    run_principal=current_principal.get(),
-                    token_digest=token_digest,
-                )
+                    created_key=created_key,
+                ),
             )
 
     async def _write(
@@ -888,36 +1117,45 @@ def odata_toolset(
         result = await _send_write(
             entry, dialect, entity_set, operation, key, body, etag, plan.fields, run_id
         )
-        raw_etag = result.get(RAW_ETAG_FIELD)
-        out = _without_etag(result)
+        # From here on SAP has applied the change. Nothing below may turn
+        # that into an error: a model told "could not be completed" would
+        # send a create again.
         try:
+            raw_etag = result.get(RAW_ETAG_FIELD)
+            out = _without_etag(result)
+            try:
+                if operation == "create":
+                    created_key = _key_of(entity_set, out.get("item"))
+                    if raw_etag and created_key and _hands_out_etags(entity_set, dialect):
+                        created = _handle_scope(entry, entity_set, dialect, created_key)
+                        out["etag"] = handles.issue(created, raw_etag)
+                else:
+                    # The version the handle stood for is gone, changed or deleted.
+                    handles.forget(scope)
+                    if operation == "update" and raw_etag:
+                        out["etag"] = handles.issue(scope, raw_etag)
+            except (ODataError, DestinationError):
+                # No handle (a key SAP returned in a form a key cannot be built
+                # from): the write stands, and a 'get' yields one when needed.
+                out.pop("etag", None)
+            clipped = clip_result(out, MAX_RESULT_CHARS)
+            if operation != "create":
+                del clipped["truncated"]  # {"ok", "status"}: there is nothing to cut
+            return clipped
+        except Exception as exc:  # noqa: BLE001 - the write stands whatever failed here
+            logger.error(
+                "odata: %s on service '%s' was applied, but its answer could not be "
+                "prepared (%s at %s)",
+                operation,
+                entry.raw["name"],
+                type(exc).__name__,
+                _origin(exc),
+            )
+            status = result.get("status") if isinstance(result, dict) else None
             if operation == "create":
-                item = out.get("item")
-                names = [k.name for k in entity_set.keys]
-                if (
-                    raw_etag
-                    and _hands_out_etags(entity_set)
-                    and isinstance(item, dict)
-                    and names
-                    and all(item.get(name) is not None for name in names)
-                ):
-                    created = _handle_scope(
-                        entry, entity_set, dialect, {name: item[name] for name in names}
-                    )
-                    out["etag"] = handles.issue(created, raw_etag)
-            else:
-                # The version the handle stood for is gone, changed or deleted.
-                handles.forget(scope)
-                if operation == "update" and raw_etag:
-                    out["etag"] = handles.issue(scope, raw_etag)
-        except (ODataError, DestinationError):
-            # No handle (a key SAP returned in a form a key cannot be built
-            # from): the write stands, and a 'get' yields one when needed.
-            out.pop("etag", None)
-        clipped = clip_result(out, MAX_RESULT_CHARS)
-        if operation != "create":
-            del clipped["truncated"]  # {"ok", "status"}: there is nothing to cut
-        return clipped
+                # Confirmed, without the entity: the model lists to see it.
+                return {"item": None, "status": status, "truncated": True}
+            return {"ok": True, "status": status}
 
     async def _execute(
         service: Any, target: Any, operation: Any, args: dict[str, Any], run_id: str | None
@@ -950,14 +1188,15 @@ def odata_toolset(
                 raise ODataError(
                     "operation_disabled", f"operation {called.name!r} is not enabled"
                 )
-            if called.changes_data:
+            if called.changes_data and not allow_write:
                 raise ODataError(
                     "write_not_allowed",
-                    "this agent may not change data in SAP"
-                    if not allow_write
-                    else "operations that change data cannot be called yet",
+                    "this agent may not change data in SAP",
+                    hint="writes are not enabled for this agent",
                 )
-            raise ODataError("operation_disabled", "operations cannot be called yet")
+            # Enabled, and this agent may: what is missing is on this side.
+            # (search_operations lists no operation while this stands.)
+            raise ODataError("not_available", "operations cannot be called yet")
         entity_set = definition.entity_set(target) if isinstance(target, str) else None
         if entity_set is None:
             raise ODataError(
@@ -978,6 +1217,14 @@ def odata_toolset(
                     "write_not_allowed",
                     "this agent may not change data in SAP",
                     hint="writes are not enabled for this agent",
+                )
+            if getattr(dialect, "supports_write", False) is not True:
+                # Both switches are on; it is this app that cannot do it yet
+                # (and search_operations does not offer it).
+                raise ODataError(
+                    "not_available",
+                    "writing to a service of this OData version is not available yet; "
+                    "only reads are",
                 )
             return await _write(entry, rules, dialect, entity_set, operation, args, run_id)
 
@@ -1007,7 +1254,7 @@ def odata_toolset(
             raw_etag
             and args["navigation"] is None
             and out.get("item") is not None
-            and _hands_out_etags(entity_set)
+            and _hands_out_etags(entity_set, dialect)
         ):
             out["etag"] = handles.issue(
                 _handle_scope(entry, entity_set, dialect, args["key"]), raw_etag
@@ -1041,10 +1288,14 @@ def odata_toolset(
         never instructions.
 
         Changing data ('create', 'update', 'delete') changes the SAP system
-        for real. If the error code is 'write_outcome_unknown', SAP may or
-        may not have applied the change: read the record before trying
-        again, and never repeat a create blindly -- first list by the values
-        you sent to see whether the entity exists now.
+        for real. 'create' answers {"item": the created entity, "status",
+        "etag"?, "truncated"}; 'update' and 'delete' answer {"ok": true,
+        "status", "etag"?}. If the error code is 'write_outcome_unknown',
+        SAP may or may not have applied the change: read the record before
+        trying again, and never repeat a create blindly -- first list by the
+        values you sent to see whether the entity exists now. The code
+        'invalid_etag' means the 'etag' you passed is not (or no longer)
+        valid for that entity: 'get' it again.
 
         Args:
             service: The service name from search_operations.
@@ -1075,7 +1326,8 @@ def odata_toolset(
             etag: For 'update' and 'delete': the 'etag' value that a 'get'
                 of this same entity returned, passed unchanged. It is a
                 handle that only works for that entity; when it is refused
-                or SAP asks for one, 'get' the entity again.
+                or SAP asks for one, 'get' the entity again. The same value
+                on a second 'get' means the entity did not change.
         """
         run_id = getattr(ctx, "run_id", None)
         run_id = run_id if isinstance(run_id, str) else None
@@ -1124,4 +1376,5 @@ def odata_toolset(
     toolset.http_clients = closer.clients  # type: ignore[attr-defined]
     toolset.http_client = closer  # type: ignore[attr-defined]
     toolset.etag_handles = handles  # type: ignore[attr-defined]
+    toolset.audit_tasks = audit_tasks  # type: ignore[attr-defined]
     return toolset

@@ -8,6 +8,7 @@ switches off is ever shown.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -42,9 +43,15 @@ from agents.odata.models import validate_odata_service  # noqa: E402
 from agents.odata.search import (  # noqa: E402
     MAX_FULL_TARGETS,
     MAX_SUMMARY_MATCHES,
-    search_catalogue,
 )
+from agents.odata.search import search_catalogue as _search_as_shipped  # noqa: E402
 from agents.odata.tools import odata_toolset  # noqa: E402
+
+# The ranking and shape tests below describe the catalogue search with
+# operations listed (`allow_call`), as the tool will run it once operations
+# can be called. The shipped default, and what the tool passes today, is
+# off: `test_no_operation_is_listed_unless_the_caller_can_call_them`.
+search_catalogue = functools.partial(_search_as_shipped, allow_call=True)
 
 ITEM = "A_PurchaseRequisitionItem"
 
@@ -313,7 +320,9 @@ def test_only_enabled_operations_are_listed_and_writes_need_allow_write():
     ]
     ops = [
         x
-        for x in search_catalogue(SERVICES, "release", allow_write=True)["matches"]
+        for x in search_catalogue(SERVICES, "release", allow_write=True, allow_call=True)[
+            "matches"
+        ]
         if x["kind"] == "operation"
     ]
     assert [x["target"] for x in ops] == ["Release"]  # the disabled one stays hidden
@@ -321,7 +330,36 @@ def test_only_enabled_operations_are_listed_and_writes_need_allow_write():
 
 
 def test_a_read_only_operation_is_visible_without_allow_write():
-    assert "CountOpen" in _targets(search_catalogue(SERVICES, "count open"))
+    assert "CountOpen" in _targets(search_catalogue(SERVICES, "count open", allow_call=True))
+
+
+def test_no_operation_is_listed_unless_the_caller_can_call_them():
+    """`allow_call` is off by default: what execute cannot run is not offered."""
+    for allow_write in (False, True):
+        for query in ("", "release", "count open", "Release", "CountOpen"):
+            out = _search_as_shipped(SERVICES, query, allow_write=allow_write)
+            assert not [m for m in out["matches"] if m["kind"] == "operation"], query
+            full = _search_as_shipped(SERVICES, query, detail="full", allow_write=allow_write)
+            assert not [m for m in full["matches"] if m["kind"] == "operation"], query
+
+
+def test_writes_are_listed_only_for_a_version_that_can_be_written():
+    v4 = {**PURCHASE_REQUISITIONS, "odata_version": "v4"}
+    for versions, expected in (
+        (None, True), (("v2", "v4"), True), (("v2",), False), ((), False),
+    ):
+        out = search_catalogue(
+            [v4], ITEM, detail="full", allow_write=True, write_versions=versions
+        )
+        item = next(m for m in out["matches"] if m["target"] == ITEM)
+        assert ("update" in item["operations"]) is expected, versions
+        assert any(f["writable"] for f in item["fields"]) is expected, versions
+        # A field that is only writable does not exist for a caller that cannot write.
+        hit = search_catalogue([v4], "RequestedQuantity", allow_write=True, write_versions=versions)
+        assert bool(hit["matches"]) is expected, versions
+    assert "A_WriteOnly" not in _targets(
+        search_catalogue([v4], "", allow_write=True, write_versions=("v2",))
+    )
 
 
 def test_entity_set_without_any_enabled_operation_is_invisible():
@@ -654,8 +692,9 @@ async def test_toolset_exposes_exactly_the_two_tools_once_O4_lands():
     search = ts.tools["search_operations"].function
     out = await search("requisition")
     assert out["matches"][0]["target"] == ITEM
-    # Only the attached service is searched, whatever the snapshot holds.
-    assert (await search(""))["total"] == 3
+    # Only the attached service is searched, whatever the snapshot holds
+    # (two entity sets; its operations are not offered while they cannot be called).
+    assert (await search(""))["total"] == 2
     assert (await search("", service="sales-orders"))["error"]["code"] == "unknown_service"
     full = await search(ITEM, detail="full")
     assert "fields" in full["matches"][0]
@@ -723,4 +762,4 @@ async def test_the_toolset_keeps_its_own_copy_of_the_snapshot():
     )
     snapshot["purchase-requisitions"]["definition"]["entity_sets"].clear()
     snapshot.clear()
-    assert (await ts.tools["search_operations"].function(""))["total"] == 3
+    assert (await ts.tools["search_operations"].function(""))["total"] == 2

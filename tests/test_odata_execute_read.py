@@ -936,11 +936,65 @@ async def test_a_snapshot_entry_with_an_unusable_identity_or_version_is_refused(
         out = await w.run("execute_operation", **BASE)
         assert out["error"]["code"] == "service_disabled", change
         assert w.requests == [] and w.built == []
-    v4 = {**SNAPSHOT, "purchase-requisitions": {**USER_SERVICE, "odata_version": "v4"}}
-    w = World(snapshot=v4)
+    v3 = {**SNAPSHOT, "purchase-requisitions": {**USER_SERVICE, "odata_version": "v3"}}
+    w = World(snapshot=v3)
     out = await w.run("execute_operation", **BASE)
-    assert out["error"]["code"] == "service_disabled" and "V4" in out["error"]["message"]
-    assert w.requests == []
+    assert out["error"]["code"] == "service_disabled" and "version" in out["error"]["message"]
+    assert w.requests == [] and w.built == []
+
+
+async def test_a_v4_service_is_read_through_the_tool(alice):
+    """The V4 dialect behind the same two tools: V4 options out, V4 payload in."""
+    v4 = _service(
+        name="purchase-requisitions",
+        title="Purchase requisitions",
+        purpose="Read purchase requisitions",
+        destination="S4_ODATA_USER",
+        user_context=True,
+        odata_version="v4",
+        service_path="/sap/opu/odata4/sap/api_purchasereq/srvd_a2x/sap/purchasereq/0001",
+        definition={"entity_sets": _DEFINITION["entity_sets"], "operations": []},
+    )
+    row = {
+        "@odata.etag": 'W/"20260101000000"',
+        "@odata.id": f"{ITEM}(PurchaseRequisition='10000001',PurchaseRequisitionItem='00010')",
+        "PurchaseRequisition": "10000001",
+        "PurchaseRequisitionItem": "00010",
+        "PurReqnReleaseStatus": "B",
+        "RequestedQuantity": 5,
+        "CreatedByUser": SECRET_USER,
+        "CreatedByUser@odata.type": "#String",
+        "to_PurchaseReqn@odata.navigationLink": f"https://s4.internal:44300/x/{SECRET_USER}",
+    }
+    page = {"@odata.context": "$metadata#" + ITEM, "@odata.count": 7, "value": [row]}
+    w = World(page, {"@odata.context": "$metadata#" + ITEM + "/$entity", **row},
+              snapshot={"purchase-requisitions": v4})
+    out = await w.run(
+        "execute_operation", **BASE, filter="PurReqnReleaseStatus eq 'B'", top=1,
+        orderby=["PurchaseRequisition desc"],
+    )
+    assert out["items"] == [
+        {"PurchaseRequisition": "10000001", "PurchaseRequisitionItem": "00010",
+         "PurReqnReleaseStatus": "B"}
+    ]
+    assert out["count"] == 7 and out["truncated"] is False
+    sent = w.requests[0]
+    assert sent.url.path.endswith("/purchasereq/0001/" + ITEM)
+    assert sent.url.params["$count"] == "true" and "$inlinecount" not in sent.url.params
+    assert sent.url.params["$filter"] == "PurReqnReleaseStatus eq 'B'"
+    assert sent.url.params["$top"] == "1"
+    assert sent.headers["authorization"] == "Bearer user-token-of-alice@example.com"
+    got = await w.run(
+        "execute_operation", **{**BASE, "operation": "get"},
+        key={"PurchaseRequisition": "10000001", "PurchaseRequisitionItem": "00010"},
+    )
+    assert got["item"]["PurReqnReleaseStatus"] == "B" and "etag" not in got
+    text = json.dumps([out, got])
+    assert SECRET_USER not in text and "20260101" not in text and "@odata" not in text
+    # A filter the catalogue does not allow is refused before any request, as for V2.
+    refused = await w.run("execute_operation", **BASE, filter="CreatedByUser eq 'X'")
+    assert refused["error"]["code"] in ("field_not_filterable", "unknown_field")
+    assert len(w.requests) == 2
 
 
 # -- writes and calls: later tasks -------------------------------------------
@@ -970,7 +1024,7 @@ async def test_call_is_checked_against_the_catalogue_and_not_sent_yet(alice):
         ("Nope", "unknown_target"),
         (ITEM, "unknown_target"),  # an entity set is not an operation
         ("Off", "operation_disabled"),
-        ("CountOpen", "operation_disabled"),  # enabled, read-only: arrives with W4
+        ("CountOpen", "not_available"),  # enabled, read-only: arrives with W4
     ):
         out = await w.run("execute_operation", **{**BASE, "target": target, "operation": "call"})
         assert out["error"]["code"] == code, (target, out)
