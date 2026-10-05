@@ -67,6 +67,12 @@ _INTEGER_RANGES = {
 # The V2 JSON date as a read returns it, which a model hands back unchanged.
 _JSON_DATE = re.compile(r"/Date\(-?[0-9]{1,15}\)/")
 _JSON_DATE_OFFSET = re.compile(r"/Date\(-?[0-9]{1,15}(?:[+-][0-9]{4})?\)/")
+_DATE_HINTS = {
+    "Edm.DateTime": "write it as 2026-10-05T00:00:00 (date and time, no time zone), "
+    "or hand back the /Date(...)/ value a read returned",
+    "Edm.DateTimeOffset": "write it in UTC as 2026-10-05T12:00:00Z (no other offset is "
+    "accepted), or hand back the /Date(...)/ value a read returned",
+}
 _ISO = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,7}))?)?"
     r"(Z|[+-][0-9]{2}:[0-9]{2})?"
@@ -202,16 +208,13 @@ class V2Dialect:
         millis += int((match.group(7) or "0").ljust(3, "0")[:3])
         if not with_offset:
             return f"/Date({millis})/"
-        zone = match.group(8)
-        minutes = 0
-        if zone != "Z":
-            hours, mins = int(zone[1:3]), int(zone[4:6])
-            if hours > 14 or mins > 59:
-                raise ValueError("not an offset")
-            minutes = (hours * 60 + mins) * (-1 if zone[0] == "-" else 1)
-        # The ticks are the UTC instant; the offset says where it was meant.
-        millis -= minutes * 60_000
-        return f"/Date({millis}{'-' if minutes < 0 else '+'}{abs(minutes):04d})/"
+        # UTC only. Whether Gateway reads the ticks of `/Date(ms+mmmm)/` as
+        # the UTC instant or as local time is not verified against a live
+        # system, and a wrong guess would silently store a shifted timestamp.
+        # With a zero offset both readings are the same instant.
+        if match.group(8) not in ("Z", "+00:00"):
+            raise ValueError("only UTC is accepted")
+        return f"/Date({millis}+0000)/"
 
     def _json_value(self, edm_type: str, value: Any) -> Any:
         """``value`` in the form V2 JSON carries ``edm_type`` in a request.
@@ -324,6 +327,7 @@ class V2Dialect:
                 raise ODataError(
                     "invalid_argument",
                     f"the value of field {definition.name!r} is not a valid {shown} value",
+                    hint=_DATE_HINTS.get(definition.type),
                 ) from None
         return out
 

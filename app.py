@@ -25,6 +25,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs "HTTP Request: <METHOD> <url>" at INFO for every request, with the
+# URL as it is sent: back-end host, key values in the path and query values
+# (an OData $filter, a search term) of every user. None of that belongs in the
+# platform log, so both libraries only log warnings and errors.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger("app")
 
 # Import after load_dotenv so SAP AI Core & XSUAA env vars are available.

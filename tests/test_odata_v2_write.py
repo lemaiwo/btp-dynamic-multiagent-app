@@ -48,6 +48,7 @@ from agents.odata.client import (  # noqa: E402
     RAW_ETAG_FIELD,
     ODataClient,
     ODataError,
+    ReadQuery,
     WritePlan,
 )
 from agents.odata.models import ServiceDefinition  # noqa: E402
@@ -140,6 +141,9 @@ class Sap:
         self.answers = list(answers)
         self.accepted = 0
         self.fetch_answer = None  # a callable(request) overriding the token answer
+        # Answers given to the next modifying requests BEFORE any CSRF check
+        # (a 401 from the ICF, a 403 Required), one each, in order.
+        self.pre: list[httpx.Response] = []
 
     # what the tests look at
     @property
@@ -178,6 +182,8 @@ class Sap:
             )
         if request.method == "GET":
             return httpx.Response(200, json={"d": {"results": []}})
+        if self.pre:
+            return self.pre.pop(0)
         token = request.headers.get("X-CSRF-Token", "")
         cookie = request.headers.get("Cookie", "")
         expected = self.issued.get(caller)
@@ -318,18 +324,70 @@ async def test_a_token_request_that_fails_changes_nothing():
     assert error.code == "destination_error" and "s4.internal" not in error.message
 
 
-async def test_a_rotated_session_cookie_makes_the_next_write_fetch_again():
-    rotate = httpx.Response(204, headers={"Set-Cookie": f"{COOKIE_NAME}=S-rotated; path=/"})
-    same = httpx.Response(204, headers={"Set-Cookie": "sap-usercontext=sap-client=100; path=/"})
-    sap = Sap(same, rotate, httpx.Response(204))
+async def test_get_hands_out_only_an_etag_a_write_would_accept():
+    row = {"__metadata": {"etag": "*"}, "Plant": "1000"}
+    for headers in ({}, {"ETag": "not-a-tag"}, {"ETag": 'W/"a", "b"'}):
+        sap = Sap()
+        sap.handler = lambda request, h=headers: httpx.Response(200, json={"d": row}, headers=h)
+        result = await client(sap).get(ES, KEY, select=[], expand=[])
+        assert RAW_ETAG_FIELD not in result and result["item"] == {"Plant": "1000"}
+    sap = Sap()
+    sap.handler = lambda request: httpx.Response(200, json={"d": row}, headers={"ETag": ETAG})
+    c = client(sap)
+    result = await c.get(ES, KEY, select=[], expand=[])
+    assert result[RAW_ETAG_FIELD] == ETAG
+    c.check_write(ES, "update", key=KEY, body={"Plant": "1"}, etag=result[RAW_ETAG_FIELD])
+
+
+async def test_a_rotated_session_cookie_is_used_for_the_next_write_without_a_new_fetch():
+    sap = Sap()
+
+    def rotate(request):
+        token, _ = sap.issued[TECH]
+        sap.issued[TECH] = (token, "S-rotated")  # SAP moved the session on
+        return httpx.Response(204, headers={"Set-Cookie": f"{COOKIE_NAME}=S-rotated; path=/"})
+
+    sap.answers = [httpx.Response(204), rotate, httpx.Response(204)]
     store = CsrfSessionStore()
     c = client(sap, store=store)
     await c.delete(ES, KEY)
     await c.delete(ES, KEY)
-    assert len(sap.fetches) == 1 and len(store) == 0
     await c.delete(ES, KEY)
-    assert len(sap.fetches) == 2
-    assert "S-rotated" not in sap.last.headers["Cookie"]  # only what a fetch issued
+    assert len(sap.fetches) == 1 and len(store) == 1 and len(sap.writes) == 3
+    assert sap.last.headers["Cookie"] == (
+        f"{COOKIE_NAME}=S-rotated; sap-usercontext=sap-client=100"
+    )
+    assert sap.last.headers["X-CSRF-Token"] == f"T-{TECH}-1"
+
+
+# -- the destination's own 401 retry -----------------------------------------
+# `DestinationAuth` re-sends a request once after a 401 (its cached credential
+# aged out), also a POST. A 401 is a refusal before processing, so the repeat
+# cannot apply a change twice; these tests pin how far the repeats can go.
+
+
+async def test_a_401_is_resent_once_by_the_destination_auth_and_creates_once():
+    sap = Sap()
+    sap.pre = [httpx.Response(401)]
+    result = await client(sap).create(ES, {"Plant": "1000"})
+    assert result["status"] == 201 and result["item"]["Plant"] == "1000"
+    assert len(sap.writes) == 2 and sap.accepted == 1 and len(sap.fetches) == 1
+
+
+async def test_401_and_csrf_retries_together_are_bounded_at_four_sends():
+    required = httpx.Response(403, headers={"X-CSRF-Token": "Required"})
+    sap = Sap()
+    sap.pre = [httpx.Response(401), required, httpx.Response(401)]
+    result = await client(sap).create(ES, {"Plant": "1000"})
+    assert result["status"] == 201
+    assert len(sap.writes) == 4 and sap.accepted == 1 and len(sap.fetches) == 2
+
+    # And it stops there: refusals all the way down are an error, not a loop.
+    sap = Sap()
+    sap.pre = [httpx.Response(401), required, httpx.Response(401), httpx.Response(401)]
+    error = await refused(client(sap).create(ES, {"Plant": "1000"}))
+    assert error.code == "sap_error" and error.status == 401
+    assert len(sap.writes) == 4 and sap.accepted == 0 and len(sap.fetches) == 2
 
 
 # -- identities --------------------------------------------------------------
@@ -506,10 +564,71 @@ async def test_create_returns_the_created_item_and_etag_filtered_to_selectable_f
 
 
 async def test_create_without_an_echo_still_succeeds():
-    for answer in (httpx.Response(204), httpx.Response(201, text="<html>ok</html>")):
-        sap = Sap(answer)
-        result = await client(sap).create(ES, {"Plant": "1000"})
-        assert result == {"item": {}, "status": answer.status_code}
+    sap = Sap(httpx.Response(201))
+    assert await client(sap).create(ES, {"Plant": "1000"}) == {"item": {}, "status": 201}
+
+
+LOGON_PAGE = {"content-type": "text/html; charset=utf-8"}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        httpx.Response(200, headers=LOGON_PAGE, text="<html><form>Logon</form></html>"),
+        httpx.Response(201, headers=LOGON_PAGE, text="<html><form>Logon</form></html>"),
+        httpx.Response(204, headers=LOGON_PAGE, text="<html>odd</html>"),
+        httpx.Response(202),
+        httpx.Response(200, text="OK"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["create", "update", "delete"])
+async def test_a_2xx_that_is_not_the_answer_of_a_write_is_not_reported_as_success(
+    operation, answer
+):
+    """A sign-in page arrives as ``200 text/html``: that is not a write."""
+    sap = Sap(answer)
+    c = client(sap)
+    call = {
+        "create": lambda: c.create(ES, {"Plant": "1000"}),
+        "update": lambda: c.update(ES, KEY, {"Plant": "1000"}),
+        "delete": lambda: c.delete(ES, KEY),
+    }[operation]
+    error = await refused(call())
+    assert error.code == "write_outcome_unknown" and error.status == answer.status_code
+    assert "read the entity first" in error.hint and "Logon" not in error.message
+    assert len(sap.writes) == 1
+
+
+async def test_what_counts_as_a_successful_write():
+    # create: 201, or 200 with the entity; nothing else.
+    for answer in (httpx.Response(200, json=CREATED), httpx.Response(201, json=CREATED)):
+        result = await client(Sap(answer)).create(ES, {"Plant": "1000"})
+        assert result["item"]["Plant"] == "1000" and result["status"] == answer.status_code
+    for answer in (
+        httpx.Response(200),
+        httpx.Response(204),
+        httpx.Response(201, json={"unexpected": 1}),
+    ):
+        error = await refused(client(Sap(answer)).create(ES, {"Plant": "1000"}))
+        assert error.code == "write_outcome_unknown"
+    # update / delete: 204, or 200 with nothing or JSON.
+    for answer in (httpx.Response(204), httpx.Response(200), httpx.Response(200, json={"d": {}})):
+        c = client(Sap(answer))
+        assert (await c.update(ES, KEY, {"Plant": "1"}))["ok"] is True
+        assert await c.delete(ES, KEY) == {"ok": True, "status": answer.status_code}
+    error = await refused(client(Sap(httpx.Response(201))).delete(ES, KEY))
+    assert error.code == "write_outcome_unknown"
+
+
+async def test_a_gateway_timeout_on_a_write_leaves_the_outcome_open():
+    for status in (502, 504):
+        error = await refused(client(Sap(httpx.Response(status, text="x"))).delete(ES, KEY))
+        assert error.code == "write_outcome_unknown" and error.status == status
+    # An OData error envelope is SAP's own answer: the change was refused.
+    error = await refused(client(Sap(v2_error(502, "A", "b"))).delete(ES, KEY))
+    assert error.code == "sap_error"
+    error = await refused(client(Sap(v2_error(500, "A", "b"))).delete(ES, KEY))
+    assert error.code == "sap_error"
 
 
 async def test_body_values_are_encoded_by_edm_type():
@@ -523,7 +642,7 @@ async def test_body_values_are_encoded_by_edm_type():
             "BigNumber": 9007199254740993,
             "IsClosed": "true",
             "DeliveryDate": "2026-10-05T00:00:00",
-            "ChangedAt": "2026-10-05T12:00:00+02:00",
+            "ChangedAt": "2026-10-05T12:00:00Z",
             "InternalNote": None,
         },
     )
@@ -534,12 +653,35 @@ async def test_body_values_are_encoded_by_edm_type():
         "BigNumber": "9007199254740993",
         "IsClosed": True,
         "DeliveryDate": "/Date(1791158400000)/",
-        "ChangedAt": "/Date(1791194400000+0120)/",
+        "ChangedAt": "/Date(1791201600000+0000)/",
         "InternalNote": None,
     }
     # The form a read returned is handed back unchanged.
-    await client(sap).create(ES, {"DeliveryDate": "/Date(1791158400000)/"})
-    assert body_of(sap.last) == {"DeliveryDate": "/Date(1791158400000)/"}
+    echoed = {"DeliveryDate": "/Date(1791158400000)/", "ChangedAt": "/Date(1791194400000+0120)/"}
+    await client(sap).create(ES, echoed)
+    assert body_of(sap.last) == echoed
+    await client(sap).create(ES, {"ChangedAt": "2026-10-05T12:00:00+00:00"})
+    assert body_of(sap.last) == {"ChangedAt": "/Date(1791201600000+0000)/"}
+
+
+@pytest.mark.parametrize(
+    "field, value, accepted",
+    [
+        ("DeliveryDate", "2031-03-04", "2026-10-05T00:00:00"),
+        ("DeliveryDate", "2031-03-04T00:00:00Z", "2026-10-05T00:00:00"),
+        ("ChangedAt", "2031-03-04T12:00:00+02:00", "2026-10-05T12:00:00Z"),
+        ("ChangedAt", "2031-03-04T12:00:00-00:30", "2026-10-05T12:00:00Z"),
+        ("ChangedAt", "2031-03-04T12:00:00", "2026-10-05T12:00:00Z"),
+    ],
+)
+def test_a_refused_date_value_says_which_form_is_accepted(field, value, accepted):
+    c = ODataClient(None, SERVICE, V2Dialect())
+    with pytest.raises(ODataError) as excinfo:
+        c.check_write(ES, "create", body={field: value})
+    error = excinfo.value
+    assert error.code == "invalid_argument" and field in error.message
+    assert accepted in error.hint and "/Date(" in error.hint
+    assert "2031" not in error.hint + error.message  # the value is not repeated
 
 
 # -- the gate ----------------------------------------------------------------
@@ -622,6 +764,11 @@ def test_check_write_order_and_plan():
     assert plan.body == {"Plant": "VAL-1"} and plan.fields == ("Plant",)
     assert plan.path == KEYED and plan.etag == ETAG and plan.operation == "update"
     assert "VAL-1" not in repr(plan) and "20261005" not in repr(plan)
+    # Neither the path (key values) nor the catalogue entry, only names.
+    assert "10000001" not in repr(plan) and "CreatedByUser" not in repr(plan)
+    assert repr(plan) == (
+        "WritePlan(operation='update', entity_set='A_PurchaseRequisitionItem', fields=('Plant',))"
+    )
     plan = c.check_write(ES, "delete", key=KEY)
     assert plan.body is None and plan.fields == () and plan.etag is None
 
@@ -629,17 +776,124 @@ def test_check_write_order_and_plan():
 # -- unknown outcome, secrets ------------------------------------------------
 
 
-async def test_a_network_error_on_a_write_is_never_retried_and_says_the_outcome_is_unknown():
+class Odd(Exception):
+    """Not an httpx error: a custom transport's own failure."""
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ReadTimeout("timed out reading https://s4.internal:44300" + KEYED),
+        httpx.WriteError("broken pipe"),
+        httpx.RemoteProtocolError("server disconnected"),
+        httpx.StreamError("stream consumed"),
+        Odd("https://s4.internal:44300 went away"),
+        TimeoutError("inner timeout"),
+    ],
+)
+async def test_a_failure_while_sending_is_never_retried_and_says_the_outcome_is_unknown(exc):
     def lost(request):
-        raise httpx.ReadTimeout("timed out reading https://s4.internal:44300" + KEYED)
+        raise exc
 
     sap = Sap(lost)
-    store = CsrfSessionStore()
-    error = await refused(client(sap, store=store).update(ES, KEY, {"Plant": "1"}))
+    error = await refused(client(sap).update(ES, KEY, {"Plant": "1"}))
     assert error.code == "write_outcome_unknown" and error.status is None
-    assert "not known" in error.message and "read the entity" in error.hint
+    assert "not known" in error.message and "read the entity first" in error.hint
     assert len(sap.writes) == 1  # sent once, not again
     assert "s4.internal" not in error.message + error.hint
+    assert error.__cause__ is None and error.__suppress_context__
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectError("no route to https://s4.internal:44300"),
+        httpx.ConnectTimeout("connect timed out"),
+        httpx.PoolTimeout("no connection free"),
+    ],
+)
+async def test_a_connection_that_was_never_made_changed_nothing(exc):
+    def never(request):
+        raise exc
+
+    sap = Sap(never)
+    error = await refused(client(sap).update(ES, KEY, {"Plant": "1"}))
+    assert error.code == "destination_error" and "nothing was changed" in error.message
+    assert len(sap.writes) == 1 and "s4.internal" not in error.message
+
+
+async def test_a_destination_error_and_a_cancellation_pass_through():
+    from agents.destination import DestinationError
+
+    def refuse(request):
+        raise DestinationError("the destination could not be resolved")
+
+    with pytest.raises(DestinationError):
+        await client(Sap(refuse)).delete(ES, KEY)
+
+    started = asyncio.Event()
+
+    class Slow(Sap):
+        async def handler(self, request):
+            if request.method != "GET":
+                started.set()
+                await asyncio.sleep(30)
+            return await super().handler(request)
+
+    sap = Slow()
+    c = client(sap)
+    task = asyncio.create_task(c.delete(ES, KEY))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Nothing is left half-open: the same client serves the next call.
+    assert (await client(Sap()).delete(ES, KEY))["ok"] is True
+    assert c._http.is_closed is False
+
+
+async def test_the_platform_log_carries_no_host_key_or_filter_value(caplog):
+    """With the app's logging set up, at INFO on the ROOT logger.
+
+    `httpx` logs ``HTTP Request: <METHOD> <url>`` at INFO by itself, after
+    the destination rewrite: host, key predicate and ``$filter`` values of
+    every user. ``app.py`` turns that down; this drives a read and a write
+    through the real client and looks at everything that was logged.
+    """
+    import app  # noqa: F401 - the application's logging configuration
+
+    caplog.set_level(logging.INFO)  # the root logger, as in the platform log
+    sap = Sap()
+    c = client(sap)
+    listing = DEFINITION["entity_sets"][0]
+    service = service_payload(
+        definition={
+            **DEFINITION,
+            "entity_sets": [
+                {
+                    **listing,
+                    "fields": [
+                        {**f, "filterable": True} if f["name"] == "Plant" else f
+                        for f in listing["fields"]
+                    ],
+                },
+                DEFINITION["entity_sets"][1],
+            ],
+        }
+    )
+    reader = client(sap, service)
+    es = ServiceDefinition.model_validate(service["definition"]).entity_set(ES.name)
+    await reader.list(
+        es,
+        ReadQuery(select=[], filter="Plant eq 'FILTER-VAL'", expand=[], orderby=[], top=5, skip=0),
+    )
+    await reader.get(es, KEY, select=[], expand=[])
+    await c.update(ES, KEY, {"Plant": "BODY-VAL"}, etag=ETAG)
+    assert "FILTER-VAL" in str(sap.requests[0].url.params) and len(sap.writes) == 1
+    assert "odata: update on entity set" in caplog.text  # something was logged at all
+    for secret in ("s4.internal", "10000001", "00010", "FILTER-VAL", "BODY-VAL", SERVICE_PATH):
+        assert secret not in caplog.text, secret
+    assert not [r for r in caplog.records if r.name.startswith(("httpx", "httpcore"))]
 
 
 async def test_token_and_cookie_are_never_in_an_error_message_or_log(caplog):
