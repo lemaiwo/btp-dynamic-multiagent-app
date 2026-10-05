@@ -50,6 +50,12 @@ DESTINATION_PATH = "/destination-configuration/v1/destinations/"
 # Additional destination properties of this form are sent as request headers.
 _STATIC_HEADER_PREFIX = "URL.headers."
 
+# ... and of this form as query parameters on every request (`sap-client`).
+_STATIC_QUERY_PREFIX = "URL.queries."
+
+# `ProxyType` of a destination that is reached through the Cloud Connector.
+PROXY_TYPE_ON_PREMISE = "OnPremise"
+
 # The header the destination service reads the end user's token from, for the
 # user-propagating authentication types. Case-insensitive on the wire; this
 # spelling is the one the service documents.
@@ -197,6 +203,14 @@ class Destination:
     # True when this was resolved with a user's token, so a log line can say
     # whose credential a request carried.
     per_user: bool = False
+    # ``ProxyType``: "OnPremise" (through the connectivity proxy and the Cloud
+    # Connector), "Internet", or empty when the response did not say.
+    proxy_type: str = ""
+    # ``CloudConnectorLocationId``: which Cloud Connector, when the subaccount
+    # has more than one.
+    location_id: str = ""
+    # ``URL.queries.<name>`` properties, sent as query parameters.
+    queries: dict[str, str] = field(default_factory=dict)
 
 
 # Destination property names whose value is a credential. Matched
@@ -492,17 +506,46 @@ class DestinationResolver:
             and key[len(_STATIC_HEADER_PREFIX):]
             and str(value or "").strip()
         }
+        proxy_type = str(config.get("ProxyType") or "").strip()
+        location_id = str(config.get("CloudConnectorLocationId") or "").strip()
+        queries: dict[str, str] = {
+            key[len(_STATIC_QUERY_PREFIX):]: str(value).strip()
+            for key, value in config.items()
+            if key.startswith(_STATIC_QUERY_PREFIX)
+            and key[len(_STATIC_QUERY_PREFIX):]
+            and str(value or "").strip()
+        }
         lifetime = DEFAULT_LIFETIME_SECONDS
         tokens = (payload or {}).get("authTokens") or []
         if not tokens:
+            # An OnPremise PrincipalPropagation destination carries no token
+            # of its own: the user's identity travels to the Cloud Connector
+            # in the connectivity proxy's headers (agents.destination_auth).
+            # So "no authTokens" is the normal answer here -- but only for a
+            # resolution made for a user. Resolved as the application it must
+            # fail, whatever `require_credential` says: accepting it would
+            # leave a request with no caller identity at all.
+            principal_propagation = (
+                auth_type == "PrincipalPropagation"
+                and proxy_type == PROXY_TYPE_ON_PREMISE
+            )
+            if principal_propagation and not per_user:
+                raise DestinationError(
+                    f"destination {self.name!r} uses PrincipalPropagation, which "
+                    f"needs the signed-in user; resolve it with user context or "
+                    f"use a technical-user destination"
+                )
             if (
-                any(k.lower() == "authorization" for k in headers)
+                principal_propagation
+                or any(k.lower() == "authorization" for k in headers)
                 or not self.require_credential
             ):
                 deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
                 return Destination(
                     url=url, headers=headers, expires_at=deadline,
                     auth_type=auth_type, per_user=per_user,
+                    proxy_type=proxy_type, location_id=location_id,
+                    queries=queries,
                 )
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
@@ -543,6 +586,7 @@ class DestinationResolver:
         return Destination(
             url=url, headers=headers, expires_at=deadline,
             auth_type=auth_type, per_user=per_user,
+            proxy_type=proxy_type, location_id=location_id, queries=queries,
         )
 
 
@@ -563,3 +607,289 @@ def resolver_from_environment(
         prefix = f"{server_key}: " if server_key else ""
         raise DestinationError(f"{prefix}{MISSING_BINDING_MESSAGE}")
     return DestinationResolver(name, config, require_credential=require_credential)
+
+
+# --- connectivity service (OnPremise destinations) ---------------------------
+#
+# A destination with ProxyType "OnPremise" is not reachable directly: requests
+# go through the connectivity service's HTTP proxy, which wants a token of its
+# own in `Proxy-Authorization`. That token is the application's
+# (client_credentials) for a technical-user destination, or one exchanged from
+# the signed-in user's JWT for principal propagation. Sending them is
+# agents.destination_auth's job; this part only reads the binding and keeps
+# the tokens.
+
+JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
+
+@dataclass(frozen=True)
+class ConnectivityConfig:
+    """Credentials and proxy address of the connectivity service binding."""
+
+    client_id: str
+    # Out of repr() for the same reason as DestinationServiceConfig's.
+    client_secret: str = field(repr=False)
+    token_url: str
+    proxy_host: str
+    proxy_port: int
+
+
+def _proxy_port(value: Any) -> int | None:
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _connectivity_from_vcap(raw: str | None) -> ConnectivityConfig | None:
+    if not raw:
+        return None
+    try:
+        services = json.loads(raw)
+        bindings = services.get("connectivity") or []
+    except (TypeError, ValueError, AttributeError):
+        # Same rule as _config_from_vcap: an unusable VCAP_SERVICES must not
+        # stop the environment fallback.
+        logger.warning("Could not parse VCAP_SERVICES for connectivity", exc_info=True)
+        return None
+    if not isinstance(bindings, list):
+        logger.warning(
+            "VCAP_SERVICES 'connectivity' is not a list; ignoring the binding"
+        )
+        return None
+    for entry in bindings:
+        if not isinstance(entry, dict):
+            continue
+        creds = entry.get("credentials") or {}
+        if not isinstance(creds, dict):
+            continue
+        client_id = str(creds.get("clientid") or "").strip()
+        secret = str(creds.get("clientsecret") or "").strip()
+        uaa = str(creds.get("token_service_url") or creds.get("url") or "").strip()
+        host = str(creds.get("onpremise_proxy_host") or "").strip()
+        port = _proxy_port(
+            creds.get("onpremise_proxy_http_port") or creds.get("onpremise_proxy_port")
+        )
+        if client_id and secret and uaa and host and port:
+            return ConnectivityConfig(
+                client_id=client_id,
+                client_secret=secret,
+                token_url=_token_url_from_uaa(uaa),
+                proxy_host=host,
+                proxy_port=port,
+            )
+    return None
+
+
+def connectivity_config_from_environment(
+    environ: Mapping[str, str],
+) -> ConnectivityConfig | None:
+    """The connectivity service binding, or None when there is none.
+
+    VCAP_SERVICES first, then CONNECTIVITY_* (a local run against a service
+    key), the same order as :func:`config_from_environment`. None is a normal
+    answer: only OnPremise destinations need the binding, and the caller says
+    so when one is used without it.
+    """
+    from_vcap = _connectivity_from_vcap(environ.get("VCAP_SERVICES"))
+    if from_vcap is not None:
+        return from_vcap
+
+    client_id = str(environ.get("CONNECTIVITY_CLIENT_ID") or "").strip()
+    secret = str(environ.get("CONNECTIVITY_CLIENT_SECRET") or "").strip()
+    token_url = str(environ.get("CONNECTIVITY_TOKEN_URL") or "").strip()
+    uaa = str(environ.get("CONNECTIVITY_UAA_URL") or "").strip()
+    if not token_url and uaa:
+        token_url = _token_url_from_uaa(uaa)
+    host = str(environ.get("CONNECTIVITY_PROXY_HOST") or "").strip()
+    port = _proxy_port(environ.get("CONNECTIVITY_PROXY_PORT"))
+
+    if client_id and secret and token_url and host and port:
+        return ConnectivityConfig(
+            client_id=client_id,
+            client_secret=secret,
+            token_url=token_url,
+            proxy_host=host,
+            proxy_port=port,
+        )
+    return None
+
+
+class ConnectivityTokens:
+    """Tokens for the connectivity proxy: the application's, and one per user.
+
+    Same shape as :class:`DestinationResolver`'s cache, for the same reasons:
+    in memory only, refetched :data:`EXPIRY_SKEW_SECONDS` early, and the
+    per-user tokens in their own bounded LRU, apart from the app-level slot.
+    The two are different identities towards the Cloud Connector -- a user
+    token decides *who the SAP system sees* -- so neither method ever answers
+    from the other's cache, and :meth:`user_token` has no fall-back to the
+    application's token.
+    """
+
+    def __init__(
+        self,
+        config: ConnectivityConfig,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.config = config
+        self._transport = transport
+        # (token, monotonic deadline with the skew already subtracted)
+        self._app: tuple[str, float] | None = None
+        self._per_user: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        self._lock = asyncio.Lock()
+
+    def invalidate(self, principal: str | None = None) -> None:
+        """Drop the app token, or with ``principal`` only that user's.
+
+        A 407 from the proxy under one user says nothing about anyone else's
+        token. ``principal`` is the cache key: the principal the token was
+        requested with, or :meth:`user_key` of the JWT when there was none.
+        """
+        if principal is None:
+            self._app = None
+        else:
+            self._per_user.pop(principal, None)
+
+    def invalidate_all(self) -> None:
+        self._app = None
+        self._per_user.clear()
+
+    @property
+    def cached_principals(self) -> list[str]:
+        """The cache keys with a per-user token. For tests and diagnostics."""
+        return list(self._per_user)
+
+    @staticmethod
+    def user_key(principal: str | None, user_jwt: str) -> str:
+        """The cache key of a user token; see ``DestinationResolver._user_key``."""
+        if principal:
+            return principal
+        return "token:" + hashlib.sha256(user_jwt.encode("utf-8")).hexdigest()
+
+    async def app_token(self, *, force: bool = False) -> str:
+        """The application's token (client_credentials), fetched or cached."""
+        current = self._app
+        if not force and current is not None and time.monotonic() < current[1]:
+            return current[0]
+        async with self._lock:
+            current = self._app
+            if not force and current is not None and time.monotonic() < current[1]:
+                return current[0]
+            fetched = await self._request({"grant_type": "client_credentials"})
+            self._app = fetched
+            return fetched[0]
+
+    async def user_token(
+        self, user_jwt: str, principal: str | None, *, force: bool = False
+    ) -> str:
+        """A token for the signed-in user, exchanged from their XSUAA JWT.
+
+        Cached under ``principal`` (or a digest of the JWT), never in the app
+        slot. Without a JWT this raises: answering with the application's
+        token would make the proxy call run under the wrong identity.
+        """
+        if not user_jwt or not isinstance(user_jwt, str):
+            raise DestinationError(
+                "the connectivity service needs the signed-in user's token for "
+                "principal propagation, and none was given"
+            )
+        key = self.user_key(principal, user_jwt)
+        hit = self._per_user.get(key)
+        if not force and hit is not None and time.monotonic() < hit[1]:
+            self._per_user.move_to_end(key)
+            return hit[0]
+        async with self._lock:
+            hit = self._per_user.get(key)
+            if not force and hit is not None and time.monotonic() < hit[1]:
+                self._per_user.move_to_end(key)
+                return hit[0]
+            fetched = await self._request(
+                {
+                    "grant_type": JWT_BEARER_GRANT,
+                    "assertion": user_jwt,
+                    "token_format": "jwt",
+                    "response_type": "token",
+                },
+                secrets=(user_jwt,),
+                what="user token",
+            )
+            self._per_user.pop(key, None)
+            self._per_user[key] = fetched
+            while len(self._per_user) > PER_USER_CACHE_MAX:
+                self._per_user.popitem(last=False)
+            return fetched[0]
+
+    def _scrub(self, text: str, secrets: tuple[str, ...]) -> str:
+        # The endpoint's own message is the useful part of an error, but an
+        # endpoint (or a proxy in front of it) that echoes the request must
+        # not get the client secret or a user's JWT into a log line.
+        for secret in (self.config.client_secret, *secrets):
+            if secret:
+                text = text.replace(secret, "***")
+        return text
+
+    async def _request(
+        self,
+        form: dict[str, str],
+        *,
+        secrets: tuple[str, ...] = (),
+        what: str = "token",
+    ) -> tuple[str, float]:
+        data = {
+            **form,
+            "client_id": self.config.client_id,
+            "client_secret": self.config.client_secret,
+        }
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0), transport=self._transport
+        ) as http:
+            try:
+                response = await http.post(
+                    self.config.token_url,
+                    data=data,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+            except httpx.HTTPError as exc:
+                raise DestinationError(
+                    f"could not reach the connectivity service token endpoint: "
+                    f"{type(exc).__name__}: {self._scrub(str(exc), secrets)}"
+                ) from None
+        if response.status_code >= 400:
+            raise DestinationError(
+                f"connectivity service {what} request returned "
+                f"{response.status_code}: {self._scrub(response.text[:400], secrets)}"
+            )
+        try:
+            body = response.json() or {}
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        token = str(body.get("access_token") or "")
+        if not token:
+            raise DestinationError(
+                f"connectivity service {what} response carried no access_token"
+            )
+        try:
+            lifetime = int(float(body.get("expires_in")))
+        except (TypeError, ValueError):
+            lifetime = DEFAULT_LIFETIME_SECONDS
+        deadline = time.monotonic() + max(lifetime - EXPIRY_SKEW_SECONDS, 1)
+        return token, deadline
+
+
+def connectivity_from_environment() -> ConnectivityTokens | None:
+    """Connectivity tokens from the ambient binding, or None without one.
+
+    None rather than an error, unlike :func:`resolver_from_environment`: an
+    app with only Internet destinations has no connectivity binding and needs
+    none. Each call returns a new instance with an empty cache, so a caller
+    keeps the one it built for as long as its HTTP client lives.
+    """
+    import os
+
+    config = connectivity_config_from_environment(os.environ)
+    return ConnectivityTokens(config) if config is not None else None
