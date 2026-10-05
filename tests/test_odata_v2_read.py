@@ -42,6 +42,7 @@ from agents.odata.client import (  # noqa: E402
     MAX_NEXT_HOPS,
     ODataClient,
     ODataError,
+    ReadPlan,
     ReadQuery,
     clip_result,
 )
@@ -885,3 +886,229 @@ def test_clip_result_handles_an_item_a_call_result_and_the_impossible():
         "status": 204,
         "truncated": False,
     }
+
+
+# -- review follow-up --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "edm_type, bad",
+    [
+        ("Edm.Int32", "5\n"),
+        ("Edm.Int64", "\u0665"),  # ARABIC-INDIC DIGIT FIVE
+        ("Edm.Int32", "1\u0662"),
+        ("Edm.Decimal", "1.5\n"),
+        ("Edm.Decimal", "\u0661.5"),
+        ("Edm.Double", "1.5\n"),
+        ("Edm.Double", "\uff11"),  # FULLWIDTH DIGIT ONE
+        ("Edm.Guid", GUID + "\n"),
+        ("Edm.DateTime", "2026-01-31T10:00:00\n"),
+        ("Edm.DateTime", "2026-01-31T10:0\u0660"),
+        ("Edm.DateTimeOffset", "2026-01-31T10:00:00Z\n"),
+        ("Edm.Time", "PT10H\n"),
+        ("Edm.Time", "PT\u0661H"),
+    ],
+)
+def test_typed_literals_match_the_whole_value_in_ascii_digits(edm_type, bad):
+    with pytest.raises(ODataError) as excinfo:
+        V2Dialect().literal(edm_type, bad)
+    assert excinfo.value.code == "invalid_argument"
+
+
+def test_a_blank_filter_is_no_filter():
+    d = V2Dialect()
+    for blank in ("", "   ", None):
+        assert "$filter" not in d.read_params(query(filter=blank))
+    assert d.read_params(query(filter="  A eq 1 "))["$filter"] == "A eq 1"
+
+
+async def test_a_blank_filter_is_not_sent_and_a_filter_is_stripped():
+    sap = Sap(page([ROW]))
+    await client(sap).list(ES_ITEM, query(filter="   "))
+    assert "$filter" not in sap.requests[0].url.params
+    await client(sap).list(ES_ITEM, query(filter="  Plant eq '1000'  "))
+    assert sap.requests[1].url.params["$filter"] == "Plant eq '1000'"
+    with pytest.raises(ODataError) as excinfo:
+        await client(sap).list(ES_ITEM, query(filter=5))
+    assert excinfo.value.code == "invalid_argument"
+
+
+def _service_with(header_ops, item_ops=("list", "get")):
+    definition = service_payload()["definition"]
+    definition["entity_sets"][0]["operations"] = list(header_ops)
+    definition["entity_sets"][1]["operations"] = list(item_ops)
+    service = service_payload(definition=definition)
+    parsed = ServiceDefinition.model_validate(service["definition"])
+    return (
+        service,
+        parsed.entity_set("A_PurchaseRequisitionHeader"),
+        parsed.entity_set("A_PurchaseRequisitionItem"),
+    )
+
+
+@pytest.mark.parametrize("header_ops", [[], ["list"]])
+async def test_a_navigation_needs_get_on_the_parent_entity_set(header_ops):
+    service, header, items = _service_with(header_ops)
+    sap = Sap(page([ROW]))
+    with pytest.raises(ODataError) as excinfo:
+        await client(sap, service).list(
+            header, query(), key={"PurchaseRequisition": "1"}, navigation="to_PurchaseReqnItem"
+        )
+    assert excinfo.value.code == "operation_disabled"
+    assert "A_PurchaseRequisitionHeader" in excinfo.value.message
+    assert sap.requests == []
+    # The other direction: the single navigation of an item whose own 'get' is off.
+    service, header, items = _service_with(["get"], ["list"])
+    with pytest.raises(ODataError) as excinfo:
+        await client(sap, service).get(
+            items, KEY, select=[], expand=[], navigation="to_PurchaseReqn"
+        )
+    assert excinfo.value.code == "operation_disabled" and sap.requests == []
+    # The parent's 'get' is enough; its 'list' is not needed.
+    service, header, items = _service_with(["get"])
+    await client(sap, service).list(
+        header, query(), key={"PurchaseRequisition": "1"}, navigation="to_PurchaseReqnItem"
+    )
+    assert len(sap.requests) == 1
+
+
+async def test_an_expand_whose_target_has_no_selectable_field_is_refused():
+    item_fields = [{"name": "PurchaseRequisition"}, {"name": "PurchaseRequisitionItem"}]
+    target = EntitySetDef(
+        name="A_PurchaseRequisitionItem",
+        keys=[{"name": "PurchaseRequisition"}, {"name": "PurchaseRequisitionItem"}],
+        operations=[],
+        fields=item_fields,
+    )
+    # The models refuse list/get without a selectable field, so this state
+    # cannot be saved; the client must not depend on that.
+    object.__setattr__(target, "operations", ["list", "get"])
+    definition = ServiceDefinition.model_construct(entity_sets=[ES_HEADER, target], operations=[])
+    sap = Sap(page([HEADER_ROW]))
+    odata = ODataClient(sap_v2(sap), dict(SERVICE, definition=definition), V2Dialect())
+    with pytest.raises(ODataError) as excinfo:
+        await odata.list(ES_HEADER, query(expand=["to_PurchaseReqnItem"]))
+    assert excinfo.value.code == "operation_disabled" and sap.requests == []
+
+
+# -- check_read --------------------------------------------------------------
+
+
+def test_check_read_returns_the_plan_of_a_list_without_sending():
+    sap = Sap(page([ROW]))
+    plan = client(sap).check_read(
+        ES_HEADER,
+        "list",
+        key={"PurchaseRequisition": "10000001"},
+        navigation="to_PurchaseReqnItem",
+        select=["Plant"],
+        expand=["to_PurchaseReqn"],
+        orderby=["Plant  desc"],
+        filter=" Plant eq '1000' ",
+        top=5,
+        skip=10,
+        count=False,
+    )
+    assert sap.requests == []
+    assert isinstance(plan, ReadPlan)
+    assert plan.operation == "list"
+    assert (
+        plan.path == SERVICE_PATH + "/A_PurchaseRequisitionHeader('10000001')/to_PurchaseReqnItem"
+    )
+    assert plan.target == ES_ITEM  # the navigation's target, from the client's catalogue
+    assert plan.names == ["Plant"]
+    assert [(nav.name, target.name) for nav, target in plan.expands] == [
+        ("to_PurchaseReqn", "A_PurchaseRequisitionHeader")
+    ]
+    assert plan.query == ReadQuery(
+        select=[
+            "Plant",
+            "to_PurchaseReqn/PurchaseRequisition",
+            "to_PurchaseReqn/PurReqnDescription",
+        ],
+        filter="Plant eq '1000'",
+        expand=["to_PurchaseReqn"],
+        orderby=["Plant desc"],
+        top=5,
+        skip=10,
+        count=False,
+    )
+
+
+def test_check_read_of_a_get_has_no_paging_and_refuses_list_options():
+    odata = client(Sap())
+    plan = odata.check_read(ES_ITEM, "get", key=KEY)
+    assert plan.path.endswith("(PurchaseRequisition='10000001',PurchaseRequisitionItem='00010')")
+    assert plan.target is ES_ITEM
+    assert plan.names == ["PurchaseRequisition", "PurchaseRequisitionItem", "Plant", "Material"]
+    assert plan.query == ReadQuery(
+        select=plan.names, filter=None, expand=[], orderby=[], top=0, skip=0, count=False
+    )
+    for extra in ({"filter": "Plant eq '1'"}, {"orderby": ["Plant"]}, {"top": 5}, {"skip": 1}):
+        with pytest.raises(ODataError) as excinfo:
+            odata.check_read(ES_ITEM, "get", key=KEY, **extra)
+        assert excinfo.value.code == "invalid_argument"
+    for operation in ("create", "delete", "call", None, "LIST"):
+        with pytest.raises(ODataError) as excinfo:
+            odata.check_read(ES_ITEM, operation, key=KEY)
+        assert excinfo.value.code == "invalid_argument"
+    with pytest.raises(ODataError) as excinfo:
+        odata.check_read(ES_ITEM, "list")  # a list needs its page size
+    assert excinfo.value.code == "invalid_argument"
+
+
+def test_check_read_refuses_in_one_fixed_order():
+    """operation -> key -> navigation -> select -> expand -> orderby -> filter -> top/skip."""
+    service, header, items = _service_with([], ["get"])
+    odata = client(Sap(), service)
+    everything_wrong = {
+        "key": {"Wrong": "1"},
+        "navigation": "to_Nowhere",
+        "select": ["Nope"],
+        "expand": ["to_Nowhere"],
+        "orderby": ["Nope"],
+        "filter": "Nope eq 1",
+        "top": 0,
+        "skip": -1,
+    }
+
+    def code(entity_set, client_=odata, **fixed):
+        with pytest.raises(ODataError) as excinfo:
+            client_.check_read(entity_set, "list", **{**everything_wrong, **fixed})
+        return excinfo.value.code
+
+    assert code(header) == "operation_disabled"  # the parent's get is off
+    ok = client(Sap())
+    assert code(ES_HEADER, ok) == "invalid_key"
+    key = {"PurchaseRequisition": "1"}
+    assert code(ES_HEADER, ok, key=key) == "unknown_target"
+    nav = {"key": key, "navigation": "to_PurchaseReqnItem"}
+    assert code(ES_HEADER, ok, **nav) == "unknown_field"  # select
+    assert code(ES_HEADER, ok, **nav, select=["CreatedByUser"]) == "field_not_selectable"
+    assert code(ES_HEADER, ok, **nav, select=["Plant"]) == "unknown_target"  # expand
+    nav.update(select=["Plant"], expand=[])
+    assert code(ES_HEADER, ok, **nav) == "unknown_field"  # orderby
+    assert code(ES_HEADER, ok, **nav, orderby=["Plant sideways"]) == "invalid_argument"
+    nav["orderby"] = ["Plant"]
+    assert code(ES_HEADER, ok, **nav) == "unknown_field"  # filter
+    assert code(ES_HEADER, ok, **nav, filter="CreatedByUser eq 'x'") == "field_not_filterable"
+    nav["filter"] = "Plant eq '1'"
+    assert code(ES_HEADER, ok, **nav) == "invalid_argument"  # top
+    assert code(ES_HEADER, ok, **nav, top=5) == "invalid_argument"  # skip
+    assert ok.check_read(ES_HEADER, "list", **nav, top=5, skip=0).query.top == 5
+    # Without a navigation: the entity set's own operation, then the stray key.
+    assert code(items, odata, navigation=None) == "operation_disabled"
+    assert code(ES_ITEM, ok, navigation=None, key=key) == "invalid_argument"
+
+
+async def test_list_and_get_send_exactly_what_check_read_planned():
+    sap = Sap(page([ROW]), {"d": ROW})
+    odata = client(sap)
+    plan = odata.check_read(ES_ITEM, "list", select=["Plant"], orderby=["Plant"], top=7, skip=0)
+    await odata.list(ES_ITEM, query(select=["Plant"], orderby=["Plant"], top=7))
+    assert sap.requests[0].url.path == plan.path
+    assert dict(sap.requests[0].url.params) == V2Dialect().read_params(plan.query)
+    plan = odata.check_read(ES_ITEM, "get", key=KEY, select=["Plant"])
+    await odata.get(ES_ITEM, KEY, select=["Plant"], expand=[])
+    assert sap.requests[1].url.path == plan.path
+    assert dict(sap.requests[1].url.params) == V2Dialect().read_params(plan.query)

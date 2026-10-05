@@ -99,6 +99,26 @@ class ReadQuery:
     count: bool = True
 
 
+@dataclass(frozen=True)
+class ReadPlan:
+    """A read that passed every catalogue check (``ODataClient.check_read``).
+
+    ``path`` is the confined, relative request path; ``target`` the entity
+    set whose fields the answer has (the navigation's target, else the entity
+    set itself); ``names`` the fields a row is cut to; ``expands`` the
+    expanded navigations with their target entity sets; ``query`` what goes
+    to the dialect's ``read_params`` (its ``select`` already carries the
+    expanded targets' fields; ``top == 0`` for a ``get``).
+    """
+
+    operation: str
+    path: str
+    target: EntitySetDef
+    names: list[str]
+    expands: list[tuple[NavigationDef, EntitySetDef]]
+    query: ReadQuery
+
+
 def _shown(name: object) -> str:
     """A name for a refusal: repeated only when it has the form of a name."""
     if isinstance(name, str) and re.fullmatch(EDM_NAME_RE, name) and len(name) <= 64:
@@ -146,7 +166,8 @@ class ODataClient:
     ) -> None:
         self._http = http
         self._dialect = dialect
-        self._sessions = sessions  # CSRF token store, used by the write path
+        # The CSRF token store of the write path; a read neither needs nor touches it.
+        self._sessions = sessions
         service = service if isinstance(service, dict) else {}
         try:
             self._service_path = confine_service_path(service.get("service_path"))  # type: ignore[arg-type]
@@ -231,8 +252,17 @@ class ODataClient:
                 segments = [segment + self._dialect.key_segment(entity_set, key)]
             target = entity_set
         else:
+            # Following a navigation by key reads *through* the parent entity:
+            # whether it exists and what it links to is an answer about it.
+            if "get" not in entity_set.operations:
+                raise ODataError(
+                    "operation_disabled",
+                    f"'get' is not enabled for entity set {entity_set.name!r}, "
+                    f"so its navigations cannot be followed",
+                )
+            keyed = segment + self._dialect.key_segment(entity_set, key)
             nav, target = self._navigation_target(entity_set, navigation, operation)
-            segments = [segment + self._dialect.key_segment(entity_set, key), nav.name]
+            segments = [keyed, nav.name]
         try:
             return join_path(self._service_path, *segments), target
         except ValueError:
@@ -278,8 +308,17 @@ class ODataClient:
             nav, nav_target = self._navigation_target(target, name, None)
             if any(nav.name == seen.name for seen, _ in expands):
                 continue
+            readable = nav_target.selectable_names()
+            if not readable:
+                # Nothing of it could be returned, and `$expand` without a
+                # `$select` path for it would transport the whole entity.
+                raise ODataError(
+                    "operation_disabled",
+                    f"entity set {nav_target.name!r} has no readable field, "
+                    f"so navigation {nav.name!r} cannot be expanded",
+                )
             expands.append((nav, nav_target))
-            sent.extend(f"{nav.name}/{field}" for field in nav_target.selectable_names())
+            sent.extend(f"{nav.name}/{field}" for field in readable)
         return names, expands, sent
 
     @staticmethod
@@ -307,6 +346,106 @@ class ODataClient:
                 )
             out.append(field.name + (f" {match.group(2)}" if match.group(2) else ""))
         return out
+
+    def check_read(
+        self,
+        entity_set: EntitySetDef,
+        operation: str,
+        *,
+        key: Any = None,
+        navigation: Any = None,
+        select: Any = None,
+        expand: Any = None,
+        orderby: Any = None,
+        filter: Any = None,
+        top: Any = None,
+        skip: Any = None,
+        count: bool = True,
+    ) -> ReadPlan:
+        """Every catalogue check of a read, without sending anything.
+
+        ``list`` and ``get`` run exactly this before they send, and a caller
+        that wants the refusal first (the execute tool) calls it directly, so
+        the same call always gets the same refusal. The first failing check
+        raises ``ODataError``; the order is fixed:
+
+        1. ``operation`` is ``"list"`` or ``"get"`` (``invalid_argument``);
+        2. the operation is enabled: without a navigation, ``operation`` on
+           ``entity_set``; with one, ``get`` on ``entity_set`` -- following a
+           navigation by key reads through that entity
+           (``operation_disabled``);
+        3. the key: exactly the key fields with valid values for a ``get``
+           and for a navigation (``invalid_key``); none on a plain ``list``
+           (``invalid_argument``);
+        4. the navigation: one of ``entity_set`` (``unknown_target``), a
+           collection for ``list`` / a single entity for ``get``
+           (``invalid_argument``), its target in the catalogue
+           (``unknown_target``) with that operation enabled
+           (``operation_disabled``); from here on every name is checked
+           against the *target* entity set;
+        5. ``select``: known (``unknown_field``) and selectable
+           (``field_not_selectable``) fields; empty means all selectable;
+        6. ``expand``: navigations of the target (``unknown_target``) whose
+           own target is in the catalogue with the matching read enabled and
+           at least one selectable field (``operation_disabled``);
+        7. ``orderby``: ``Field [asc|desc]`` (``invalid_argument``) on known
+           (``unknown_field``), selectable (``field_not_selectable``) fields;
+        8. ``filter``: a string, checked by ``urls.check_filter``
+           (``invalid_argument``, ``unknown_field``, ``field_not_filterable``);
+           it is stripped, and a blank one is no filter;
+        9. ``top`` (1..``MAX_PAGE_SIZE``) and ``skip`` (>= 0, ``None`` = 0)
+           (``invalid_argument``).
+
+        For a ``get``, steps 7-9 are one rule: ``orderby``, ``filter``,
+        ``top`` and ``skip`` must be absent (``invalid_argument``).
+        """
+        if operation not in ("list", "get"):
+            raise ODataError("invalid_argument", "a read is either 'list' or 'get'")
+        path, target = self._resolve(entity_set, key, navigation, operation)
+        names, expands, sent = self._projection(target, select, expand)
+        expand_names = [nav.name for nav, _ in expands]
+        if operation == "get":
+            if orderby or (filter is not None and filter != "") or top is not None or skip:
+                raise ODataError(
+                    "invalid_argument", "orderby, filter, top and skip are only used with 'list'"
+                )
+            query = ReadQuery(
+                select=sent,
+                filter=None,
+                expand=expand_names,
+                orderby=[],
+                top=0,
+                skip=0,
+                count=False,
+            )
+            return ReadPlan(operation, path, target, names, expands, query)
+        ordered = self._orderby(target, orderby)
+        if filter is not None and not isinstance(filter, str):
+            raise ODataError("invalid_argument", "filter must be a string")
+        filter = (filter or "").strip() or None
+        if filter:
+            try:
+                check_filter(filter, {f.name: f for f in target.fields})
+            except FilterError as exc:
+                raise ODataError(exc.code, exc.message) from None
+        skip = 0 if skip is None else skip
+        for label, number, low in (("top", top, 1), ("skip", skip, 0)):
+            if isinstance(number, bool) or not isinstance(number, int) or number < low:
+                raise ODataError(
+                    "invalid_argument", f"{label} must be an integer of at least {low}"
+                )
+        if top > MAX_PAGE_SIZE:
+            raise ODataError("invalid_argument", f"top must be at most {MAX_PAGE_SIZE}")
+        query = ReadQuery(
+            select=sent,
+            filter=filter,
+            expand=expand_names,
+            orderby=ordered,
+            top=top,
+            skip=skip,
+            count=bool(count),
+        )
+        return ReadPlan(operation, path, target, names, expands, query)
 
     # -- the call -----------------------------------------------------------
     async def _fetch(self, url: str, params: dict[str, str] | None) -> tuple[Any, httpx.Headers]:
@@ -414,33 +553,33 @@ class ODataClient:
 
         With ``navigation`` the fields, the filter and the sort order are
         those of the navigation's target entity set.
+
+        When the back end pages on its own, its paging link is followed
+        through ``urls.confine_next_link``: the link's host is dropped and
+        only its path is used, so the follow-up request always goes through
+        the destination like the first one, never to the host the link
+        names. The link's query string is *not* trusted and not checked: it
+        is the back end's own continuation of this resource (it may carry a
+        different ``$select``), which is safe because every row, of every
+        page, is cut to the catalogue's selectable fields that were asked
+        for before it is returned.
         """
-        path, target = self._resolve(entity_set, key, navigation, "list")
-        names, expands, sent = self._projection(target, query.select, query.expand)
-        orderby = self._orderby(target, query.orderby)
-        for label, number, low in (("top", query.top, 1), ("skip", query.skip, 0)):
-            if isinstance(number, bool) or not isinstance(number, int) or number < low:
-                raise ODataError(
-                    "invalid_argument", f"{label} must be an integer of at least {low}"
-                )
-        if query.top > MAX_PAGE_SIZE:
-            raise ODataError("invalid_argument", f"top must be at most {MAX_PAGE_SIZE}")
-        if query.filter:
-            try:
-                check_filter(query.filter, {f.name: f for f in target.fields})
-            except FilterError as exc:
-                raise ODataError(exc.code, exc.message) from None
-        params = self._dialect.read_params(
-            ReadQuery(
-                select=sent,
-                filter=query.filter or None,
-                expand=[nav.name for nav, _ in expands],
-                orderby=orderby,
-                top=query.top,
-                skip=query.skip,
-                count=bool(query.count),
-            )
+        plan = self.check_read(
+            entity_set,
+            "list",
+            key=key,
+            navigation=navigation,
+            select=query.select,
+            expand=query.expand,
+            orderby=query.orderby,
+            filter=query.filter,
+            top=query.top,
+            skip=query.skip,
+            count=query.count,
         )
+        path, target, names, expands = plan.path, plan.target, plan.names, plan.expands
+        query = plan.query
+        params = self._dialect.read_params(query)
         payload, _ = await self._fetch(path, params)
         rows, count, next_link = self._dialect.parse_list(payload)
         rows = list(rows)
@@ -483,19 +622,11 @@ class ODataClient:
         navigation: str | None = None,
     ) -> dict:
         """One entity by key, or the single entity a navigation leads to."""
-        path, target = self._resolve(entity_set, key, navigation, "get")
-        names, expands, sent = self._projection(target, select, expand)
-        params = self._dialect.read_params(
-            ReadQuery(
-                select=sent,
-                filter=None,
-                expand=[nav.name for nav, _ in expands],
-                orderby=[],
-                top=0,
-                skip=0,
-                count=False,
-            )
+        plan = self.check_read(
+            entity_set, "get", key=key, navigation=navigation, select=select, expand=expand
         )
+        path, target, names, expands = plan.path, plan.target, plan.names, plan.expands
+        params = self._dialect.read_params(plan.query)
         payload, headers = await self._fetch(path, params)
         if payload is None or (isinstance(payload, dict) and payload.get("d", ...) is None):
             # A single-valued navigation that leads nowhere.

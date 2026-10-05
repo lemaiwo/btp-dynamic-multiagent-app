@@ -30,14 +30,15 @@ from .models import EntitySetDef
 MAX_KEY_VALUE_CHARS = 255
 _MAX_ERROR_BODY = 20_000
 
-_INTEGER = re.compile(r"^-?\d{1,19}$")
-_DECIMAL = re.compile(r"^-?\d{1,40}(?:\.\d{1,40})?$")
-_GUID = re.compile(r"^[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$")
-_DATETIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?$")
-_DATETIMEOFFSET = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,7})?)?(?:Z|[+-]\d{2}:\d{2})$"
-)
-_TIME = re.compile(r"^PT(?:\d{1,2}H)?(?:\d{1,2}M)?(?:\d{1,2}(?:\.\d{1,7})?S)?$")
+# Used with `fullmatch` only, and with `[0-9]`: `$` also matches before a
+# trailing newline, and `\d` matches every Unicode decimal digit.
+_INTEGER = re.compile(r"-?[0-9]{1,19}")
+_DECIMAL = re.compile(r"-?[0-9]{1,40}(?:\.[0-9]{1,40})?")
+_GUID = re.compile(r"[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}")
+_CLOCK = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,7})?)?"
+_DATETIME = re.compile(_CLOCK)
+_DATETIMEOFFSET = re.compile(_CLOCK + r"(?:Z|[+-][0-9]{2}:[0-9]{2})")
+_TIME = re.compile(r"PT(?:[0-9]{1,2}H)?(?:[0-9]{1,2}M)?(?:[0-9]{1,2}(?:\.[0-9]{1,7})?S)?")
 _INTEGER_TYPES = {
     "Edm.Byte": "",
     "Edm.SByte": "",
@@ -97,25 +98,25 @@ class V2Dialect:
             raise _refuse(edm_type)
         if edm_type in _INTEGER_TYPES:
             text = str(value) if isinstance(value, int) else value
-            if not isinstance(text, str) or not _INTEGER.match(text):
+            if not isinstance(text, str) or not _INTEGER.fullmatch(text):
                 raise _refuse(edm_type)
             return text + _INTEGER_TYPES[edm_type]
         if edm_type == "Edm.Decimal":
             text = str(value) if isinstance(value, int) else value
             if isinstance(value, float) and math.isfinite(value):
                 text = repr(value)
-            if not isinstance(text, str) or not _DECIMAL.match(text):
+            if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
                 raise _refuse(edm_type)
             return text + "M"
         if edm_type in _FLOAT_TYPES:
-            if isinstance(value, str) and _DECIMAL.match(value):
+            if isinstance(value, str) and _DECIMAL.fullmatch(value):
                 return value + _FLOAT_TYPES[edm_type]
             if isinstance(value, (int, float)) and math.isfinite(value):
                 return repr(float(value)) + _FLOAT_TYPES[edm_type]
             raise _refuse(edm_type)
         if edm_type in _PATTERN_TYPES:
             prefix, pattern = _PATTERN_TYPES[edm_type]
-            if not isinstance(value, str) or not pattern.match(value):
+            if not isinstance(value, str) or not pattern.fullmatch(value):
                 raise _refuse(edm_type)
             return f"{prefix}'{value}'"
         raise _refuse(edm_type)
@@ -166,8 +167,9 @@ class V2Dialect:
         params = {"$format": "json"}
         if query.select:
             params["$select"] = ",".join(query.select)
-        if query.filter:
-            params["$filter"] = query.filter
+        filter_ = query.filter.strip() if isinstance(query.filter, str) else ""
+        if filter_:  # a blank filter is no filter: `$filter=` alone is an error to SAP
+            params["$filter"] = filter_
         if query.expand:
             params["$expand"] = ",".join(query.expand)
         if query.orderby:

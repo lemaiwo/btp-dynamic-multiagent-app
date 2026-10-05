@@ -284,3 +284,31 @@ def test_filter_refusal_names_the_field_but_never_a_literal():
     with pytest.raises(FilterError) as excinfo:
         check_filter("A" * 300 + " eq 1", _fields())
     assert len(excinfo.value.message) <= 200
+
+
+# -- review follow-up --------------------------------------------------------
+
+
+def test_a_field_named_like_an_operator_word_is_still_a_field():
+    fields = {
+        "Plant": FieldDef(name="Plant", selectable=True, filterable=True),
+        "in": FieldDef(name="in"),
+        "null": FieldDef(name="null"),
+        "and": FieldDef(name="and"),
+        "has": FieldDef(name="has", selectable=True, filterable=True),
+        "length": FieldDef(name="length"),
+    }
+    check_filter("Plant eq '1' or has eq 1", fields)
+    for expr in (
+        "in eq 'x'",
+        "Plant eq '1' or in eq 'x'",
+        "Plant eq null",
+        "Plant eq '1' and Plant eq '2'",
+        "Plant in ('1')",
+        "length(Plant) eq 1",
+    ):
+        with pytest.raises(FilterError) as excinfo:
+            check_filter(expr, fields)
+        assert excinfo.value.code == "field_not_filterable"
+    # Without such fields the words are operators, as before.
+    check_filter("Plant eq null and Plant in ('1') and length(Plant) eq 1", _fields())

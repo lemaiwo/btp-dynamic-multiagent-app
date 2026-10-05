@@ -242,17 +242,23 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef]) -> None:
             called = expr[position:].lstrip(" ").startswith("(")
             identifiers.append((token.group("ident"), called))
     for name, called in identifiers:
+        shown = name if len(name) <= _SHOWN_NAME else name[:_SHOWN_NAME] + "..."
+        # A field wins over an operator word or a function of the same name:
+        # an entity set may have a field called `in`, `has` or `null`, and
+        # reading the name as an operator would let it into a filter unseen.
+        field = fields.get(name)
+        if field is not None:
+            if not field.filterable:
+                raise FilterError(
+                    "field_not_filterable", f"field {shown!r} cannot be used in a filter"
+                )
+            continue
         if name in _FILTER_WORDS:
             continue
-        shown = name if len(name) <= _SHOWN_NAME else name[:_SHOWN_NAME] + "..."
         if called:
             if name not in _FILTER_FUNCTIONS:
                 raise FilterError(
                     "invalid_argument", f"function {shown!r} is not supported in a filter"
                 )
             continue
-        field = fields.get(name)
-        if field is None:
-            raise FilterError("unknown_field", f"{shown!r} is not a field of this entity set")
-        if not field.filterable:
-            raise FilterError("field_not_filterable", f"field {shown!r} cannot be used in a filter")
+        raise FilterError("unknown_field", f"{shown!r} is not a field of this entity set")
