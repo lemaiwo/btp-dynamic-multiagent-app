@@ -115,6 +115,51 @@ export interface DestinationField {
     hint: string;
     /** Whether a screen reader is given the hint as the field's description. */
     hintDescribes: boolean;
+    /** The text of the element the description points to, as it is in the page. */
+    describedText: string;
+    /** The text of the label whose `for` is the field's input. */
+    label: string;
+    /** What the input shows right now (while typing, the combo box's completion included). */
+    shown: string;
+}
+
+function destinationInput(element: UI5Element): HTMLInputElement {
+    return control<ComboBox>(element, DESTINATION).getFocusDomRef() as HTMLInputElement;
+}
+
+/**
+ * Types `text` into the destination field key by key, the way keystrokes
+ * arrive: each character replaces what is selected (the tail the combo box
+ * completed the last key to) and an `input` event is fired, so the combo
+ * box completes again as it does for a user. (OPA's EnterText sets the
+ * value and leaves the field in one go; it never shows what a half-typed
+ * name is completed to.) The field is emptied first.
+ */
+export function typeDestination(element: UI5Element, text: string): void {
+    const input = destinationInput(element);
+    input.focus();
+    input.setSelectionRange(0, input.value.length);
+    text.split("").forEach((key) => {
+        const start = input.selectionStart ?? input.value.length;
+        const end = input.selectionEnd ?? start;
+        input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+        input.value = input.value.slice(0, start) + key + input.value.slice(end);
+        input.setSelectionRange(start + 1, start + 1);
+        input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: key }));
+    });
+}
+
+/** A key that is not a character, pressed in the destination field. */
+export function keyInDestination(element: UI5Element, key: "Enter" | "ArrowDown"): void {
+    const keyCode = key === "Enter" ? 13 : 40;
+    destinationInput(element).dispatchEvent(new KeyboardEvent("keydown", {
+        key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true
+    } as KeyboardEventInit));
+}
+
+/** Leaves the destination field for the one above it, as a click there does. */
+export function leaveDestination(element: UI5Element): void {
+    control<Input>(element, "odataNotFor").focus();
 }
 
 export function destinationOf(element: UI5Element): DestinationField {
@@ -127,7 +172,12 @@ export function destinationOf(element: UI5Element): DestinationField {
         stateText: field.getValueStateText(),
         choices: field.getItems().map((item) => [item.getText(), (item as ListItem).getAdditionalText()]),
         hint: hint.getVisible() ? hint.getText(false) : "",
-        hintDescribes: described.indexOf(hint.getId()) !== -1
+        hintDescribes: described.indexOf(hint.getId()) !== -1,
+        describedText: described.map((id) => (id && document.getElementById(id)?.textContent) || "").join(""),
+        label: Array.from(document.querySelectorAll("label"))
+            .filter((label) => label.htmlFor === destinationInput(element).id)
+            .map((label) => label.textContent ?? "").join("|"),
+        shown: destinationInput(element).value
     };
 }
 

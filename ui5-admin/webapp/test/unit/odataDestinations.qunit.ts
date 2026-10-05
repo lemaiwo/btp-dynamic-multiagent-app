@@ -101,7 +101,8 @@ QUnit.test("runs as the signed-in user through a fixed account is a mismatch, an
     assert.strictEqual(odataDestinations.notice(LIST, "S4_DEV_USER", false), "needsUser");
     assert.strictEqual(odataDestinations.notice(LIST, "S4_DEV_USER", true), "");
     assert.strictEqual(odataDestinations.notice(LIST, "  S4_DEV_USER ", false), "needsUser", "as the server reads the name");
-    assert.strictEqual(odataDestinations.notice(LIST, "s4_dev_user", false), "notListed", "names are case-sensitive");
+    assert.strictEqual(odataDestinations.notice(LIST, "s4_dev_user", false), "otherCase",
+        "names are case-sensitive: not the listed one, so not judged as it");
 });
 
 QUnit.test("no mismatch without a list, and none for a name that is not offered", function (assert) {
@@ -169,4 +170,47 @@ QUnit.test("the hint under the field", function (assert) {
     );
     assert.strictEqual(odataDestinations.hint(list([]), text), "odataDestinationsNone",
         "an empty list is said, or the empty dropdown looks broken");
+});
+
+QUnit.test("a name that differs from a listed one only in case is said, with the listed spelling", function (assert) {
+    assert.strictEqual(odataDestinations.notice(LIST, "s4_dev_basic", false), "otherCase");
+    assert.strictEqual(odataDestinations.notice(LIST, "s4_dev_basic", true), "otherCase",
+        "no mismatch is claimed for a name that is not the listed one");
+    assert.strictEqual(odataDestinations.listedAs(LIST, "s4_dev_basic"), "S4_DEV_BASIC");
+    assert.strictEqual(odataDestinations.listedAs(LIST, " S4_Dev_User "), "S4_DEV_USER");
+    assert.strictEqual(odataDestinations.listedAs(LIST, "S4_DEV_BASIC"), "", "the listed spelling itself");
+    assert.strictEqual(odataDestinations.listedAs(LIST, "s4_dev_rfc"), "", "not a destination that can be used");
+    assert.strictEqual(odataDestinations.listedAs(LIST, "S4_NEW"), "");
+    assert.strictEqual(odataDestinations.listedAs("unavailable", "s4_dev_basic"), "");
+    assert.strictEqual(
+        odataDestinations.notice(list([BASIC], { truncated: true }), "s4_dev_basic", false), "otherCase",
+        "what an incomplete list holds is enough to say it"
+    );
+    assert.strictEqual(odataDestinations.noticeState("otherCase"), "Information");
+    assert.strictEqual(
+        odataDestinations.noticeText("otherCase", text, "S4_DEV_BASIC"), "odataDestinationOtherCase(S4_DEV_BASIC)"
+    );
+});
+
+QUnit.test("the field keeps what was typed, not what the list completed it to", function (assert) {
+    assert.strictEqual(odataDestinations.kept("S4_NEW", "S4_NEW_PP"), "S4_NEW", "a completed prefix");
+    assert.strictEqual(odataDestinations.kept("s4_dev_basic", "S4_DEV_BASIC"), "s4_dev_basic", "a folded case");
+    assert.strictEqual(odataDestinations.kept("S4_DEV", "S4_DEV"), "S4_DEV");
+    assert.strictEqual(odataDestinations.kept("", "S4_DEV"), "", "an emptied field stays empty");
+    assert.strictEqual(odataDestinations.kept(undefined, "S4_DEV_USER"), "S4_DEV_USER", "picked from the list: nothing was typed");
+});
+
+QUnit.test("what was typed is followed key by key, in the case it was typed in", function (assert) {
+    // The field shows the listed spelling of what was typed so far, with
+    // its completion; the next key lands behind the typed part.
+    assert.strictEqual(odataDestinations.typedText(undefined, "s"), "s", "the first key");
+    assert.strictEqual(odataDestinations.typedText("s", "S4"), "s4", "the field had made S of s");
+    assert.strictEqual(odataDestinations.typedText("s4_dev_basi", "S4_DEV_BASIc"), "s4_dev_basic");
+    assert.strictEqual(odataDestinations.typedText("S4_NE", "S4_NEW"), "S4_NEW");
+    assert.strictEqual(odataDestinations.typedText("s4_dev", "S4_DE"), "s4_de", "a key deleted at the end");
+    assert.strictEqual(odataDestinations.typedText("s4_dev", ""), "", "everything deleted");
+    assert.strictEqual(odataDestinations.typedText("s4_dev", "S4_xEV"), "s4_xEV",
+        "changed in the middle: as typed up to there, then as the field shows it");
+    assert.strictEqual(odataDestinations.typedText("abc", "S4_DEV"), "S4_DEV", "replaced as a whole (pasted)");
+    assert.strictEqual(odataDestinations.typedText(undefined, "S4_DEV_USERx"), "S4_DEV_USERx", "typed behind a picked name");
 });

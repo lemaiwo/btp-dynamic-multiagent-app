@@ -119,6 +119,33 @@ export default class ODataServiceDetail extends ODataController {
      *  visit of the page is dropped. */
     private destinationsCount = 0;
 
+    /** The text the admin typed into the destination field since an item
+     *  was last picked; undefined when what the field holds was picked. */
+    private typedDestination?: string;
+
+    /** The combo box is handling a keystroke: a selection it reports now
+     *  is its own completion of the typed text, not a pick. */
+    private typingDestination = false;
+
+    /**
+     * Hears a keystroke in the destination field before the combo box
+     * does (capture phase): at this moment the input holds the new key
+     * and no completion yet. The combo box then completes the text to the
+     * first listed name that starts with it and rewrites all of it in the
+     * listed case, and would store that; `typedText` follows what was
+     * really typed across those rewrites.
+     */
+    private readonly onDestinationInput = (event: globalThis.Event): void => {
+        const field = this.byId("odataDestination") as ComboBox | undefined;
+        if (field && event.target === field.getFocusDomRef()) {
+            this.typedDestination = odataDestinations.typedText(
+                this.typedDestination, (event.target as HTMLInputElement).value
+            );
+            this.typingDestination = true;
+            this.onDestinationTyping();
+        }
+    };
+
     /** The dialog of one entity set; it is open while `entityOpen`. */
     private entityDialog?: EntitySetDialog;
     private entityOpen = false;
@@ -156,10 +183,19 @@ export default class ODataServiceDetail extends ODataController {
         // under it; `notice`: what there is to say about the name in it
         // (a `DestinationNotice`). Apart from `svc`, which is replaced on
         // every load and save.
-        this.setModel(new JSONModel({ items: [], hint: "", notice: "" }), "dest");
-        // A combo box has no liveChange: typing is heard on its input.
+        // `noticeText`: the notice in words.
+        this.setModel(new JSONModel({ items: [], hint: "", notice: "", noticeText: "" }), "dest");
+        // A combo box has no liveChange: typing is heard on its input, once
+        // before the combo box handles the keystroke (`onDestinationInput`)
+        // and once after it did (event delegates run after the control).
+        document.addEventListener("input", this.onDestinationInput, true);
+        // The keys the combo box moves through its list with: from there on
+        // the field holds a picked name, and nothing typed is left to keep.
+        const picked = (): void => { this.typedDestination = undefined; };
         (this.byId("odataDestination") as ComboBox).addEventDelegate({
-            oninput: () => this.onDestinationTyping()
+            oninput: () => { this.typingDestination = false; },
+            onsapdown: picked, onsapup: picked, onsaphome: picked, onsapend: picked,
+            onsappagedown: picked, onsappageup: picked
         });
         this.getRouter().getRoute(ROUTE)?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const name = (event.getParameter("arguments") as { serviceName: string }).serviceName;
@@ -266,6 +302,7 @@ export default class ODataServiceDetail extends ODataController {
         this.entityDialog?.dismiss();
         this.slotObserver?.disconnect();
         window.removeEventListener("beforeunload", this.onBeforeUnload);
+        document.removeEventListener("input", this.onDestinationInput, true);
         this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
         this.getRouter().detachBypassed(this.onLeft, this);
         this.getOwnerComponentTyped().setLeaveGuard(undefined);
@@ -400,6 +437,7 @@ export default class ODataServiceDetail extends ODataController {
             entitySearch: search
         });
         this.filterEntitySets(search);
+        this.typedDestination = undefined;
         this.checkDestination();
     }
 
@@ -440,6 +478,7 @@ export default class ODataServiceDetail extends ODataController {
             this.serviceName = undefined;
             model.setData({ ...this.blankState(this.text("odataNewService")), isNew: true, loaded: true });
             this.filterEntitySets("");
+            this.typedDestination = undefined;
             this.checkDestination();
             return;
         }
@@ -510,20 +549,25 @@ export default class ODataServiceDetail extends ODataController {
      * identity the service runs as.
      *
      * `announce`: the cause is not the field itself (Runs as changed, the
-     * list arrived), so a new warning is said; one that comes from typing
-     * in the field is read with the field, like its errors.
+     * list arrived), so a new notice is said; one that comes from typing
+     * in the field is read with the field, like its errors. `always`: said
+     * even when it is the notice that was there before (after a change of
+     * Runs as the admin wants to know what holds now).
      */
-    private checkDestination(announce = false, name = this.data().destination): void {
+    private checkDestination(announce = false, name = this.data().destination, always = false): void {
         const model = this.getModel("dest") as JSONModel;
-        const notice: DestinationNotice = this.svc().getProperty("/loaded") === true
+        const loaded = this.svc().getProperty("/loaded") === true;
+        const notice: DestinationNotice = loaded
             ? odataDestinations.notice(this.destinations, name, this.data().user_context === true)
             : "";
-        if (notice === model.getProperty("/notice")) {
-            return;
-        }
+        const words = odataDestinations.noticeText(
+            notice, (key, args) => this.text(key, args), odataDestinations.listedAs(this.destinations, name)
+        );
+        const changed = notice !== model.getProperty("/notice") || words !== model.getProperty("/noticeText");
         model.setProperty("/notice", notice);
-        if (announce && notice && !this.svc().getProperty("/errors/destination")) {
-            InvisibleMessage.getInstance().announce(this.formatDestinationStateText("", notice), InvisibleMessageMode.Polite);
+        model.setProperty("/noticeText", words);
+        if (announce && words && (changed || always) && !this.svc().getProperty("/errors/destination")) {
+            InvisibleMessage.getInstance().announce(words, InvisibleMessageMode.Polite);
         }
     }
 
@@ -533,21 +577,52 @@ export default class ODataServiceDetail extends ODataController {
         this.svc().setProperty("/errors/destination", "");
         this.svc().setProperty("/saveError", "");
         (this.getModel("dest") as JSONModel).setProperty("/notice", "");
+        (this.getModel("dest") as JSONModel).setProperty("/noticeText", "");
     }
 
-    /** A name was picked or typed (the field was left, or Enter). */
+    /**
+     * The field was left, or Enter was pressed in it, or an item was
+     * picked.
+     *
+     * What is stored is what the admin typed. The combo box hands over its
+     * completion instead (a typed beginning of a listed name becomes that
+     * name, and a name in another case the listed spelling), which can be
+     * another destination than the one meant: one that is not listed yet.
+     * So typed text is put back, in the model and in the field.
+     */
     public onDestinationChange(event: Event): void {
+        const field = event.getSource() as ComboBox;
+        if (event.getParameter("itemPressed" as never)) {
+            // A click on an item, also on the one the typed text was
+            // completed to (which is no change of the selection).
+            this.typedDestination = undefined;
+        }
+        const name = odataDestinations.kept(this.typedDestination, field.getValue());
+        if (name !== field.getValue()) {
+            // Without its item first: setting the value alone would leave
+            // the completed item selected.
+            field.setSelectedItem(null);
+            field.setValue(name);
+            this.svc().setProperty("/data/destination", name);
+        }
         this.onEdit(event);
         // From the field: the binding writes the model in the same event.
-        this.checkDestination(false, (event.getSource() as ComboBox).getValue());
+        this.checkDestination(false, name);
     }
 
-    /** An item got the selection, by a click or by the arrow keys (which
-     *  put its name in the field at once): the name is judged right away.
-     *  Typing that matches no item also ends here, without an item. */
+    /**
+     * An item got the selection. By a click or by the arrow keys (which put
+     * its name in the field at once) it is a pick: the name is judged right
+     * away and nothing typed is left to keep (see also the key delegate in
+     * `onInit` and `itemPressed` in `onDestinationChange`, for a pick that
+     * does not change the selection). While a keystroke is handled
+     * it is the combo box's completion of the typed text, and is ignored.
+     * Typing that matches no item also ends here, without an item.
+     */
     public onDestinationSelect(event: Event): void {
         const item = (event.getSource() as ComboBox).getSelectedItem();
-        if (item) {
+        if (item && !this.typingDestination) {
+            this.typedDestination = undefined;
             this.checkDestination(false, item.getText());
         }
     }
@@ -558,8 +633,8 @@ export default class ODataServiceDetail extends ODataController {
         return error ? ValueState.Error : ValueState[odataDestinations.noticeState(notice ?? "")];
     }
 
-    public formatDestinationStateText(error: string | undefined, notice: DestinationNotice | undefined): string {
-        return error || odataDestinations.noticeText(notice ?? "", (key, args) => this.text(key, args));
+    public formatDestinationStateText(error: string | undefined, words: string | undefined): string {
+        return error || words || "";
     }
 
     public onRetry(): void {
@@ -1129,7 +1204,7 @@ export default class ODataServiceDetail extends ODataController {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/user_context", key === "user");
         this.svc().setProperty("/saveError", "");
-        this.checkDestination(true);
+        this.checkDestination(true, undefined, true);
     }
 
     public onVersionChange(event: Event): void {

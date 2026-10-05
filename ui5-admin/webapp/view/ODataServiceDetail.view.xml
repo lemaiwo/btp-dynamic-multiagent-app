@@ -259,7 +259,7 @@
                             items="{ path: 'dest>/items', templateShareable: false }"
                             showSecondaryValues="true"
                             valueState="{ parts: ['svc>/errors/destination', 'dest>/notice'], formatter: '.formatDestinationState' }"
-                            valueStateText="{ parts: ['svc>/errors/destination', 'dest>/notice'], formatter: '.formatDestinationStateText' }"
+                            valueStateText="{ parts: ['svc>/errors/destination', 'dest>/noticeText'], formatter: '.formatDestinationStateText' }"
                             class="odataTechnical"
                             app:field="destination"
                             ariaDescribedBy="odataDestinationHint"

@@ -933,7 +933,7 @@ QUnit.test("the destinations are read once from odata/destinations, as the serve
 
     assert.deepEqual(this.backend.requests, ["GET odata/destinations"]);
     assert.deepEqual(list.items.map((item) => item.name), [
-        "S4 DEV invalid", "S4_DEV_BASIC", "S4_DEV_RFC", "S4_DEV_USER", "S4_ODATA_TECH", "S4_ODATA_USER"
+        "S4 DEV invalid", "S4_DEV", "S4_DEV_BASIC", "S4_DEV_RFC", "S4_DEV_USER", "S4_ODATA_TECH", "S4_ODATA_USER"
     ], "sorted by name, case-insensitively");
     assert.deepEqual(
         list.items.filter((item) => item.user_propagating).map((item) => item.name), ["S4_DEV_USER", "S4_ODATA_USER"]

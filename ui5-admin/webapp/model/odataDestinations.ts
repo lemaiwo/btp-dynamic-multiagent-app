@@ -29,9 +29,10 @@ export interface DestinationChoice {
  * `fixedAccount` -- the service runs as the signed-in user, the destination
  * signs in with one account; `needsUser` -- the reverse; `notListed` -- not
  * among the destinations of a complete list; `notUsable` -- listed, but not
- * an HTTP destination.
+ * an HTTP destination; `otherCase` -- not listed as typed, but a listed name
+ * differs from it only in upper and lower case (`listedAs` is that name).
  */
-export type DestinationNotice = "" | "fixedAccount" | "needsUser" | "notListed" | "notUsable";
+export type DestinationNotice = "" | "fixedAccount" | "needsUser" | "notListed" | "notUsable" | "otherCase";
 
 const SEPARATOR = " · ";
 
@@ -39,7 +40,8 @@ const NOTICE_TEXT: Record<Exclude<DestinationNotice, "">, string> = {
     fixedAccount: "odataDestinationFixedAccount",
     needsUser: "odataDestinationNeedsUser",
     notListed: "odataDestinationNotListed",
-    notUsable: "odataDestinationNotUsable"
+    notUsable: "odataDestinationNotUsable",
+    otherCase: "odataDestinationOtherCase"
 };
 
 function listOf(state: DestinationsState): ODataDestinationList | undefined {
@@ -79,6 +81,18 @@ function usable(state: DestinationsState): ODataDestination[] {
 
 function unusableCount(state: DestinationsState): number {
     return (listOf(state)?.items ?? []).filter((item) => !item.usable).length;
+}
+
+/** The usable destination whose name is `name` in another case, if `name`
+ *  itself is not one. Names are case-sensitive: the two are different
+ *  destinations to the destination service. */
+function listedAs(state: DestinationsState, name: string): string {
+    const wanted = (name ?? "").trim();
+    const names = usable(state).map((item) => item.name);
+    if (!wanted || names.indexOf(wanted) !== -1) {
+        return "";
+    }
+    return names.filter((listed) => listed.toLowerCase() === wanted.toLowerCase())[0] ?? "";
 }
 
 /** Whether every destination a service could name is in the list. */
@@ -129,6 +143,40 @@ export default {
 
     unusableCount,
 
+    listedAs,
+
+    /**
+     * The text the admin has typed, after one more keystroke.
+     *
+     * `shown` is what the input holds at that keystroke. It is not simply
+     * what was typed: after every key the combo box rewrites the input to
+     * the listed spelling of the name it completes to, so the keys typed
+     * before are shown in the list's case. `before` is what was typed up
+     * to the last key (undefined: nothing, the field held a picked or
+     * stored name). The part of `shown` that still agrees with `before`,
+     * case aside, is taken from `before`; the rest is new and taken as
+     * shown.
+     */
+    typedText(before: string | undefined, shown: string): string {
+        const typed = before ?? shown;
+        let same = 0;
+        while (same < typed.length && same < shown.length
+            && typed[same].toLowerCase() === shown[same].toLowerCase()) {
+            same++;
+        }
+        return typed.slice(0, same) + shown.slice(same);
+    },
+
+    /**
+     * What the field holds after it was left: `typed`, the text the admin
+     * typed, whatever the combo box made of it (`value`: it completes a
+     * typed beginning to the first listed name that starts with it, in the
+     * listed case). Without typed text -- an item was picked -- `value`.
+     */
+    kept(typed: string | undefined, value: string): string {
+        return typed === undefined ? value : typed;
+    },
+
     /**
      * What to say about `name` for a service that runs as the signed-in
      * user (`userContext`) or as a technical user. Nothing without a list,
@@ -153,6 +201,9 @@ export default {
         if (list.items.some((item) => !item.usable && item.reason === "not_http" && item.name === wanted)) {
             return "notUsable";
         }
+        if (listedAs(list, wanted)) {
+            return "otherCase";
+        }
         return isComplete(list) ? "notListed" : "";
     },
 
@@ -161,11 +212,15 @@ export default {
         if (!notice) {
             return "None";
         }
-        return notice === "notListed" ? "Information" : "Warning";
+        return notice === "notListed" || notice === "otherCase" ? "Information" : "Warning";
     },
 
-    noticeText(notice: DestinationNotice, text: Translate): string {
-        return notice ? text(NOTICE_TEXT[notice]) : "";
+    /** `listed`: for `otherCase`, the listed spelling (`listedAs`). */
+    noticeText(notice: DestinationNotice, text: Translate, listed = ""): string {
+        if (!notice) {
+            return "";
+        }
+        return notice === "otherCase" ? text(NOTICE_TEXT[notice], [listed]) : text(NOTICE_TEXT[notice]);
     },
 
     /** The line under the field: why the dropdown may not be the whole truth. */

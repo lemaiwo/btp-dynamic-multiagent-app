@@ -47,7 +47,7 @@ export default class FakeBackend {
     /**
      * How GET odata/destinations answers: `ok` -- the whole list;
      * `unavailable` -- no list at all (503 `no_destination_service`);
-     * `truncated` -- the first two, with `truncated: true`; `partial` -- the
+     * `truncated` -- the first three usable ones, with `truncated: true`; `partial` -- the
      * instance level only, with a `level_unavailable` warning for the
      * subaccount; `held` -- no answer until `releaseDestinations()`.
      */
@@ -1244,8 +1244,9 @@ export default class FakeBackend {
      * What a destination service with two levels would list. Generic names
      * only. The two destinations the seeded services use are among them, so
      * that a stored service is the ordinary case: its destination is listed
-     * and matches its identity. No name here is the beginning of another: a
-     * combo box completes what is typed to the first item that starts with it.
+     * and matches its identity. `S4_DEV` is the beginning of other names on
+     * purpose: a combo box completes what is typed to the first item that
+     * starts with it, and the field must keep what was typed all the same.
      */
     private seedDestinations(): void {
         const item = (name: string, over: Partial<ODataDestination>): ODataDestination => ({
@@ -1262,6 +1263,7 @@ export default class FakeBackend {
                 description: "Development system, as the signed-in user"
             }),
             item("S4_ODATA_TECH", { ...onPremise, description: "Development system, technical user for jobs" }),
+            item("S4_DEV", { authentication: "OAuth2ClientCredentials" }),
             item("S4_DEV_BASIC", { level: "instance", shadows_subaccount: true }),
             item("S4_DEV_USER", { authentication: "OAuth2SAMLBearerAssertion", user_propagating: true }),
             item("S4_DEV_RFC", { type: "RFC", authentication: "", usable: false, reason: "not_http" }),
@@ -1276,8 +1278,8 @@ export default class FakeBackend {
         let items = this.odataDestinations.slice().sort((a, b) => (lower(a) < lower(b) ? -1 : lower(a) > lower(b) ? 1 : 0));
         const list: ODataDestinationList = { items, truncated: false, skipped: 0, warnings: [] };
         if (this.destinationsMode === "truncated") {
-            // Two that can be used, so that the cut list still offers something.
-            items = items.filter((entry) => entry.usable).slice(0, 2);
+            // Some that can be used, so that the cut list still offers something.
+            items = items.filter((entry) => entry.usable).slice(0, 3);
             return { ...list, items, truncated: true };
         }
         if (this.destinationsMode === "partial") {
