@@ -1,15 +1,9 @@
 """What is specific to OData V2 (SAP Gateway): literals, options, payloads.
 
-The key predicate is the one place where a value chosen by a model becomes
-part of the request *path*. It therefore leaves this module in a form that
-cannot be anything but one segment: every value is written as a typed
-literal by positive recognition (a quote inside a string is doubled, every
-other type must match its exact form), percent-encoded, and string values
-that contain ``/ \\ % ? #`` are refused outright. The last rule is stricter
-than the protocol: ``DestinationAuth`` rebuilds the request URL from the
-*decoded* path, so an encoded ``%2F`` in a key would reach SAP as a real
-``/`` and an encoded ``%`` would start an escape. ``urls.join_path`` checks
-the result again.
+Every value is written as a typed literal by positive recognition (a quote
+inside a string is doubled, every other type must match its exact form).
+How a key predicate is built from those literals, and how an error envelope
+is read, is the same for V2 and V4 and lives in ``common``.
 
 No refusal repeats a value.
 """
@@ -17,19 +11,18 @@ No refusal repeats a value.
 from __future__ import annotations
 
 import calendar
-import html
 import math
 import re
 from typing import Any
-from urllib.parse import quote
 
 import httpx
 
+from . import common
 from .client import ODataError, ReadQuery
+from .common import refuse as _refuse
 from .models import EntitySetDef
 
-MAX_KEY_VALUE_CHARS = 255
-_MAX_ERROR_BODY = 20_000
+MAX_KEY_VALUE_CHARS = common.MAX_KEY_VALUE_CHARS
 
 # Used with `fullmatch` only, and with `[0-9]`: `$` also matches before a
 # trailing newline, and `\d` matches every Unicode decimal digit.
@@ -54,7 +47,6 @@ _PATTERN_TYPES = {
     "Edm.Time": ("time", _TIME),
     "Edm.Guid": ("guid", _GUID),
 }
-_KEY_BREAKERS = ("/", "\\", "%", "?", "#")
 
 # -- request bodies -------------------------------------------------------------
 _INTEGER_RANGES = {
@@ -78,24 +70,13 @@ _ISO = re.compile(
     r"(Z|[+-][0-9]{2}:[0-9]{2})?"
 )
 
-_XML_CODE = re.compile(r"<code[^<>]*>([^<]{0,200})</code>")
-_XML_MESSAGE = re.compile(r"<message[^<>]*>([^<]{0,2000})</message>")
-
-
-def _refuse(edm_type: str) -> ODataError:
-    shown = (
-        edm_type
-        if isinstance(edm_type, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,64}", edm_type)
-        else "that type"
-    )
-    return ODataError("invalid_argument", f"the value is not a valid {shown} value")
-
-
 class V2Dialect:
     """OData V2 as SAP Gateway speaks it."""
 
     version = "v2"
     supports_write = True
+    # Sent with every request of this version; V2 needs none.
+    request_headers: dict[str, str] = {}
 
     # -- literals -----------------------------------------------------------
     def literal(self, edm_type: str, value: Any) -> str:
@@ -135,8 +116,11 @@ class V2Dialect:
         if edm_type in _FLOAT_TYPES:
             if isinstance(value, str) and _DECIMAL.fullmatch(value):
                 return value + _FLOAT_TYPES[edm_type]
-            if isinstance(value, (int, float)) and math.isfinite(value):
-                return repr(float(value)) + _FLOAT_TYPES[edm_type]
+            try:
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    return repr(float(value)) + _FLOAT_TYPES[edm_type]
+            except OverflowError:  # an integer no float can hold
+                pass
             raise _refuse(edm_type)
         if edm_type in _PATTERN_TYPES:
             prefix, pattern = _PATTERN_TYPES[edm_type]
@@ -148,42 +132,10 @@ class V2Dialect:
     def key_segment(self, entity_set: EntitySetDef, key: dict) -> str:
         """The key predicate, percent-encoded: ``('4500000001')`` or ``(A='x',B='00010')``.
 
-        The key must name exactly the key fields of the entity set.
+        The key must name exactly the key fields of the entity set
+        (``common.key_segment``, with this dialect's literals).
         """
-        names = [k.name for k in entity_set.keys]
-        if not names:
-            raise ODataError("invalid_key", f"entity set {entity_set.name!r} has no key")
-        expected = ", ".join(names)
-        if not isinstance(key, dict) or set(key) != set(names):
-            raise ODataError(
-                "invalid_key",
-                f"the key of entity set {entity_set.name!r} is exactly: {expected}",
-            )
-        parts: list[str] = []
-        for definition in entity_set.keys:
-            value = key[definition.name]
-            if isinstance(value, str) and (
-                not value
-                or len(value) > MAX_KEY_VALUE_CHARS
-                or ".." in value
-                or any(ch in value for ch in _KEY_BREAKERS)
-            ):
-                raise ODataError(
-                    "invalid_key",
-                    f"the value of key {definition.name!r} is empty, too long or contains "
-                    f"one of / \\ % ? # or '..', which a key in a URL path cannot carry here",
-                )
-            try:
-                literal = self.literal(definition.type, value)
-            except ODataError:
-                raise ODataError(
-                    "invalid_key",
-                    f"the value of key {definition.name!r} is not a valid {definition.type} value",
-                ) from None
-            parts.append(quote(literal, safe="'"))
-        if len(parts) == 1:
-            return f"({parts[0]})"
-        return "(" + ",".join(f"{name}={part}" for name, part in zip(names, parts)) + ")"
+        return common.key_segment(self.literal, entity_set, key)
 
     # -- request bodies -----------------------------------------------------
     def update_request(self, path: str, body: dict | None) -> tuple[str, dict[str, str]]:
@@ -409,34 +361,9 @@ class V2Dialect:
     def parse_error(self, response: httpx.Response) -> tuple[str, str]:
         """``(code, text)`` of an OData error envelope, or ``("", "")``.
 
-        Only a real envelope is read: JSON ``{"error": {"code", "message":
-        {"value"}}}`` or its XML form. An HTML error page (the ICF or a
-        proxy answering instead of Gateway) yields nothing, so none of its
-        markup, host names or dump text reaches a model.
+        The V2 envelope is ``{"error": {"code", "message": {"value"}}}``
+        (``common.read_error`` explains what is not read).
         """
-        content_type = response.headers.get("content-type", "").lower()
-        if "html" in content_type:
-            return "", ""
-        try:
-            text = response.text[:_MAX_ERROR_BODY]
-        except Exception:  # noqa: BLE001 - an undecodable body is no envelope
-            return "", ""
-        if "xml" in content_type:
-            code, message = _XML_CODE.search(text), _XML_MESSAGE.search(text)
-            if not message:
-                return "", ""
-            return (
-                html.unescape(code.group(1)).strip() if code else "",
-                html.unescape(message.group(1)).strip(),
-            )
-        try:
-            error = response.json().get("error")
-        except (ValueError, AttributeError):
-            return "", ""
-        if not isinstance(error, dict):
-            return "", ""
-        code = error.get("code")
-        message = error.get("message")
-        if isinstance(message, dict):
-            message = message.get("value")
-        return (code if isinstance(code, str) else "", message if isinstance(message, str) else "")
+        return common.read_error(
+            response, lambda message: message.get("value") if isinstance(message, dict) else message
+        )

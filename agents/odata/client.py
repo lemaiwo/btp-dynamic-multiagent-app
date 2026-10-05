@@ -53,7 +53,18 @@ their own gate, ``check_write``, and three rules of their own:
   body that is an error) and a bare 502/504 from a gateway: success is
   recognised positively. Cookies of an answer are taken into the stored
   session only after that verdict, and an answer that fails it ends the
-  session: what a sign-in page sets is never sent with a later write.
+  session: what a sign-in page sets is never sent with a later write. The
+  same holds for an answer of 300 or above, SAP's own refusals included:
+  its cookies are not taken and the session stays as it was sent. Should
+  SAP have moved the session on with a refusal, the next write is refused
+  with ``403`` / ``X-CSRF-Token: Required`` and renews once, as above.
+* Every ``ODataError`` says whether the change left this app: ``sent`` is
+  ``False`` for whatever is raised before the modifying request goes out
+  (a catalogue refusal, a failed CSRF token request, a connection that was
+  never made -- "nothing was changed") and ``True`` from the moment a
+  modifying request was handed to an open connection, whatever came back.
+  A ``DestinationError`` that passes through a write is always from before
+  the first send.
 * No token, cookie, body value or host appears in an error, a log line or a
   ``repr`` of this module.
 """
@@ -133,16 +144,33 @@ class ODataError(Exception):
 
     ``code`` is one of the tool error codes; ``message`` is short and safe
     to show (no URL, no token, no markup from an error page).
+
+    ``sent`` is about writes and answers one question for an audit record:
+    did a modifying request leave this app? ``False`` (the default, and
+    always for a read) means it did not -- the error was raised before the
+    modifying request went out, so SAP cannot have changed anything because
+    of this call. ``True`` means a modifying request was handed to an open
+    connection at least once, whatever happened next: SAP refused it, the
+    connection broke, the answer was not recognisable. It says nothing about
+    whether SAP applied the change; ``code`` does (``write_outcome_unknown``
+    for "not known"). It is not part of ``to_dict``.
     """
 
     def __init__(
-        self, code: str, message: str, *, status: int | None = None, hint: str | None = None
+        self,
+        code: str,
+        message: str,
+        *,
+        status: int | None = None,
+        hint: str | None = None,
+        sent: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
         self.hint = hint
+        self.sent = sent
 
     def to_dict(self) -> dict[str, str]:
         out = {"code": self.code, "message": self.message}
@@ -635,7 +663,8 @@ class ODataClient:
             # CSRF token is asked for: nothing of this call is sent.
             raise ODataError(
                 "operation_disabled",
-                "writing to an OData V4 service is not supported yet; only reads are",
+                getattr(self._dialect, "write_refusal", None)
+                or "writing is not supported for the OData version of this service",
             )
         segment = entity_set.path or entity_set.name
         if operation == "create":
@@ -732,6 +761,14 @@ class ODataClient:
             hint=_STATUS_HINTS.get(status),
         )
 
+    def _headers(self, **extra: str) -> dict[str, str]:
+        """The headers of a request: JSON, plus what the dialect always sends."""
+        return {
+            "Accept": "application/json",
+            **getattr(self._dialect, "request_headers", {}),
+            **extra,
+        }
+
     async def _fetch(self, url: str, params: dict[str, str] | None) -> tuple[Any, httpx.Headers]:
         """GET ``url`` (relative) and return the decoded JSON and the headers.
 
@@ -744,7 +781,7 @@ class ODataClient:
                 "GET",
                 url,
                 params=params,
-                headers={"Accept": "application/json"},
+                headers=self._headers(),
                 follow_redirects=False,
             ) as response:
                 status = response.status_code
@@ -949,13 +986,18 @@ class ODataClient:
         Runs in the caller's own context (``CsrfSessionStore.get``), so the
         destination resolves the caller's credential and the token and the
         cookies that come back are that identity's. The body is not read.
+
+        This is not the write: whatever goes wrong here, the change was not
+        sent by it, and every error says "nothing was changed". A
+        ``DestinationError`` (no signed-in user, the destination could not
+        be resolved) passes through; a cancellation is not caught.
         """
         body = bytearray()
         try:
             async with self._http.stream(
                 "GET",
                 join_path(self._service_path) + "/",
-                headers={"Accept": "application/json", "X-CSRF-Token": "Fetch"},
+                headers=self._headers(**{"X-CSRF-Token": "Fetch"}),
                 follow_redirects=False,
             ) as response:
                 status = response.status_code
@@ -967,15 +1009,21 @@ class ODataClient:
                         body += chunk
                         if len(body) > MAX_RESPONSE_BYTES:
                             break
-        except (httpx.HTTPError, httpx.InvalidURL) as exc:
-            # Nothing was changed: this was the token request, not the write.
+        except DestinationError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - not the write: nothing was changed
+            # The exception text can carry the URL; only its type is logged.
             logger.warning("odata: CSRF token request failed (%s)", type(exc).__name__)
             raise ODataError(
                 "destination_error",
                 "the OData service could not be reached; nothing was changed",
             ) from None
         if status >= 300:
-            raise self._sap_error(status, content_type, bytes(body))
+            error = self._sap_error(status, content_type, bytes(body))
+            suffix = " (the CSRF token request was refused; nothing was changed)"
+            error.message = error.message[: MAX_MESSAGE_CHARS - len(suffix)] + suffix
+            error.args = (error.message,)
+            raise error
         if not _CSRF_TOKEN.fullmatch(token) or token.lower() in ("required", "fetch"):
             raise ODataError(
                 "sap_error",
@@ -1000,10 +1048,10 @@ class ODataClient:
 
         * a ``DestinationError`` (the destination could not be resolved, no
           signed-in user) and a connection that was never made: nothing was
-          sent, and the caller is told so;
+          sent, and the caller is told so (``sent`` stays ``False``);
         * any other failure before SAP's status line arrived -- an httpx
           error, a transport's own exception, an inner timeout -- leaves the
-          outcome open: ``write_outcome_unknown``;
+          outcome open: ``write_outcome_unknown`` with ``sent=True``;
         * once the status is known it stands; a body that could not be read
           or is too large is ``None``.
 
@@ -1046,6 +1094,7 @@ class ODataClient:
                     "the connection failed while the change was being sent: it is not "
                     "known whether SAP applied it. The request was not repeated",
                     hint=_outcome_hint(operation),
+                    sent=True,
                 ) from None
             body = None
         return status, answer, None if body is None else bytes(body)
@@ -1130,10 +1179,15 @@ class ODataClient:
         """Send ``plan`` with the caller's CSRF session.
 
         ``(status, headers, decoded JSON body or None)`` of a write SAP
-        confirmed (``_confirmed``); everything else raises.
+        confirmed (``_confirmed``); everything else raises. Every
+        ``ODataError`` leaves with ``sent`` set: ``False`` until the first
+        modifying request was handed to an open connection, ``True`` from
+        then on -- also for a failure of the token renewal or of the second
+        send after SAP refused the first one unprocessed (403 ``Required``):
+        nothing was changed then, but a modifying request did go out.
         """
         sessions, key = self._session_key()
-        headers = {"Accept": "application/json", **extra}
+        headers = self._headers(**extra)
         content: bytes | None = None
         if plan.body is not None:
             content = json.dumps(plan.body).encode("utf-8")
@@ -1141,29 +1195,73 @@ class ODataClient:
         if plan.etag is not None:
             headers["If-Match"] = plan.etag
         session = await sessions.get(key, self._fetch_session)
-        attempt = 0
-        while True:
-            attempt += 1
-            sent = dict(headers)
-            sent["X-CSRF-Token"] = session.token
-            cookie = session.cookie_header()
-            if cookie:
-                # Explicitly, from this identity's own entry, for this request only.
-                sent["Cookie"] = cookie
-            status, answer, body = await self._modify(
-                method, plan.path, sent, content, operation=plan.operation
+        left = False  # a modifying request went out at least once
+        try:
+            attempt = 0
+            while True:
+                attempt += 1
+                sent = dict(headers)
+                sent["X-CSRF-Token"] = session.token
+                cookie = session.cookie_header()
+                if cookie:
+                    # Explicitly, from this identity's own entry, for this request only.
+                    sent["Cookie"] = cookie
+                # `_modify` says itself whether its request got out (a
+                # connection that was never made did not).
+                status, answer, body = await self._modify(
+                    method, plan.path, sent, content, operation=plan.operation
+                )
+                left = True
+                stale = (
+                    status == 403 and answer.get("x-csrf-token", "").strip().lower() == "required"
+                )
+                if not stale:
+                    break
+                if attempt == 2:
+                    # Refused twice: the error below is the answer. The entry is
+                    # of no use to the next call either (unless it is newer already).
+                    sessions.drop(key, session)
+                    break
+                # SAP refused the request before processing it, so sending it
+                # again changes nothing twice. Once.
+                session = await self._renew(sessions, key, session)
+            return status, answer, self._settle(plan, sessions, key, session, status, answer, body)
+        except ODataError as exc:
+            exc.sent = exc.sent or left
+            raise
+        except DestinationError as exc:
+            if not left:
+                raise  # before the first send: the caller maps it, as on a read
+            # The first send was refused unprocessed, and the renewal or the
+            # second send could not use the destination. The text can name
+            # the destination or its URL: only the type is logged.
+            logger.warning(
+                "odata: destination failed after a refused %s (%s)",
+                plan.operation,
+                type(exc).__name__,
             )
-            stale = status == 403 and answer.get("x-csrf-token", "").strip().lower() == "required"
-            if not stale:
-                break
-            if attempt == 2:
-                # Refused twice: the error below is the answer. The entry is
-                # of no use to the next call either (unless it is newer already).
-                sessions.drop(key, session)
-                break
-            # SAP refused the request before processing it, so sending it
-            # again changes nothing twice. Once.
-            session = await self._renew(sessions, key, session)
+            raise ODataError(
+                "destination_error",
+                "SAP asked for a new CSRF token and the destination could not be used "
+                "to get one or to send the change again; nothing was changed",
+                sent=True,
+            ) from None
+
+    def _settle(
+        self,
+        plan: WritePlan,
+        sessions: Any,
+        key: Any,
+        session: CsrfSession,
+        status: int,
+        answer: httpx.Headers,
+        body: bytes | None,
+    ) -> Any:
+        """The verdict on the answer of a modifying request that was sent.
+
+        The decoded body of a confirmed write; every other answer raises.
+        """
+        stale = status == 403 and answer.get("x-csrf-token", "").strip().lower() == "required"
         logger.info(
             "odata: %s on entity set %s answered HTTP %s",
             plan.operation,
@@ -1171,6 +1269,8 @@ class ODataClient:
             status,
         )
         if status >= 300:
+            # The session stays as it was sent: cookies of a refusal are not
+            # taken (see the module docstring).
             error = self._sap_error(status, answer.get("content-type", ""), body)
             if status == 428:
                 raise ODataError(
@@ -1212,7 +1312,7 @@ class ODataClient:
         rotated = cookies_from_response(httpx.Response(status, headers=answer))
         if any(session.cookies.get(name) != value for name, value in rotated.items()):
             sessions.update(key, session, {**session.cookies, **rotated})
-        return status, answer, decoded
+        return decoded
 
     async def create(self, entity_set: EntitySetDef, body: dict) -> dict:
         """Create one entity. ``{"item", "status"}`` plus the raw ETag if any.

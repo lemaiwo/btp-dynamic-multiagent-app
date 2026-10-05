@@ -272,8 +272,18 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef], *, version: str = "v
     stay refused in both: a path leads to fields of another entity set, and
     nothing here could check those. In V4 a field must also have a type that
     can be compared (``V4_COMPARABLE_TYPES``): a complex or collection-valued
-    field is no filter target, and a field of an enumeration type only where
-    the expression holds a member literal of exactly that type.
+    field is never a filter target, even when it is marked filterable.
+
+    An enumeration is the one non-primitive type that can be compared, and
+    the type string alone does not say whether ``SRV.Status`` is one. It is
+    recognised by position and by the catalogue: a member literal is accepted
+    only directly after ``<field of exactly that type> eq|ne|has``, or inside
+    that field's ``in (...)`` list, and only with members the field's
+    ``values`` list. A field of such a type is a filter target only in those
+    places; a complex field has no listed values, so writing its type name
+    in front of a quote gets it nowhere. In V4 a name directly in front of a
+    quote is always a type prefix (``guid'..'``, ``Field'x'``) and refused,
+    whatever the name is.
     """
     grammar = _GRAMMARS.get(version) if isinstance(version, str) else None
     if grammar is None:
@@ -289,8 +299,8 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef], *, version: str = "v
         raise FilterError("invalid_argument", "filter must not contain control characters")
     # Tokenise the whole expression first, so that an expression the
     # tokeniser cannot read is refused as such whatever names it mentions.
-    identifiers: list[tuple[str, bool, bool]] = []  # (name, is a call, is a literal prefix)
-    enum_types: set[str] = set()
+    # (kind, text, is a call, stands directly before a quote); no spaces.
+    found: list[tuple[str, str, bool, bool]] = []
     position = 0
     while position < len(expr):
         token = tokens.match(expr, position)
@@ -302,21 +312,25 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef], *, version: str = "v
                 f"operators and the supported functions",
             )
         position = token.end()
-        if token.lastgroup == "ident":
-            rest = expr[position:]
-            identifiers.append(
-                (token.group("ident"), rest.lstrip(" ").startswith("("), rest.startswith("'"))
-            )
-        elif token.lastgroup == "enum":
-            type_name = token.group("enum").partition("'")[0]
-            if type_name.startswith("Edm."):
-                raise FilterError(
-                    "invalid_argument",
-                    "an OData V4 value is written without a type name in front of it",
-                )
-            enum_types.add(type_name)
-    for name, called, prefixes in identifiers:
+        kind = token.lastgroup or ""
+        if kind == "space":
+            continue
+        rest = expr[position:]
+        found.append((kind, token.group(), rest.lstrip(" ").startswith("("), rest.startswith("'")))
+    enum_fields = _check_enum_literals(found, fields) if version == "v4" else set()
+    for index, (kind, name, called, prefixes) in enumerate(found):
+        if kind != "ident":
+            continue
         shown = name if len(name) <= _SHOWN_NAME else name[:_SHOWN_NAME] + "..."
+        if version == "v4" and prefixes and (name in fields or name not in words):
+            # `guid'..'`, `datetime'..'`, `binary'..'`: the V2 way of writing
+            # a value. Checked before the name is looked up, so that a field
+            # name in front of a quote is not waved through as a field.
+            raise FilterError(
+                "invalid_argument",
+                "an OData V4 value is written without a type name in front of it "
+                "(a GUID, a date and a timestamp are bare; a text is in single quotes)",
+            )
         # A field wins over an operator word or a function of the same name:
         # an entity set may have a field called `in`, `has` or `null`, and
         # reading the name as an operator would let it into a filter unseen.
@@ -326,23 +340,18 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef], *, version: str = "v
                 raise FilterError(
                     "field_not_filterable", f"field {shown!r} cannot be used in a filter"
                 )
-            if version == "v4":
-                edm_type = getattr(field, "type", "Edm.String")
-                if edm_type not in V4_COMPARABLE_TYPES and edm_type not in enum_types:
-                    raise FilterError(
-                        "field_not_filterable",
-                        f"field {shown!r} has a type that cannot be compared in a filter",
-                    )
+            if (
+                version == "v4"
+                and getattr(field, "type", "Edm.String") not in V4_COMPARABLE_TYPES
+                and index not in enum_fields
+            ):
+                raise FilterError(
+                    "field_not_filterable",
+                    f"field {shown!r} has a type that cannot be compared in a filter",
+                )
             continue
         if name in words:
             continue
-        if version == "v4" and prefixes:
-            # `guid'..'`, `datetime'..'`, `binary'..'`: the V2 way of writing a value.
-            raise FilterError(
-                "invalid_argument",
-                "an OData V4 value is written without a type name in front of it "
-                "(a GUID, a date and a timestamp are bare; a text is in single quotes)",
-            )
         if called:
             if name not in functions:
                 raise FilterError(
@@ -350,3 +359,67 @@ def check_filter(expr: str, fields: Mapping[str, FieldDef], *, version: str = "v
                 )
             continue
         raise FilterError("unknown_field", f"{shown!r} is not a field of this entity set")
+
+
+def _check_enum_literals(
+    found: list[tuple[str, str, bool, bool]], fields: Mapping[str, FieldDef]
+) -> set[int]:
+    """Check every enumeration literal's place; the positions of their fields.
+
+    A literal ``Ns.Type'A,B'`` must stand directly after ``<field> eq``,
+    ``<field> ne`` or ``<field> has``, or in the list of ``<field> in (...)``
+    (a list of such literals only up to it), where the field's type is
+    exactly ``Ns.Type`` and its catalogue ``values`` list every member. The
+    returned set holds the token positions of the fields that were compared
+    that way: only there is a field of a non-primitive type a filter target.
+    """
+
+    def word(index: int, *names: str) -> bool:
+        # An operator word, unless the entity set has a field of that name.
+        return (
+            index >= 0
+            and found[index][0] == "ident"
+            and found[index][1] in names
+            and found[index][1] not in fields
+        )
+
+    compared: set[int] = set()
+    for index, (kind, text, _, _) in enumerate(found):
+        if kind != "enum":
+            continue
+        type_name, _, members = text.partition("'")
+        if type_name.startswith("Edm."):
+            raise FilterError(
+                "invalid_argument",
+                "an OData V4 value is written without a type name in front of it",
+            )
+        owner = -1
+        if word(index - 1, "eq", "ne", "has"):
+            owner = index - 2
+        else:
+            start = index - 1
+            while (
+                start >= 1 and found[start][:2] == ("punct", ",") and found[start - 1][0] == "enum"
+            ):
+                start -= 2
+            if start >= 0 and found[start][:2] == ("punct", "(") and word(start - 1, "in"):
+                owner = start - 2
+        field = fields.get(found[owner][1]) if owner >= 0 and found[owner][0] == "ident" else None
+        if field is None or getattr(field, "type", None) != type_name:
+            raise FilterError(
+                "invalid_argument",
+                "an enumeration value can only stand directly after a field of exactly its "
+                "type and eq, ne or has, or in that field's in (...) list",
+            )
+        allowed = {entry.value for entry in getattr(field, "values", None) or []}
+        if not allowed:
+            # Nothing says this type is an enumeration: the field stays what
+            # its type string makes it, and the field check refuses it.
+            continue
+        if any(member not in allowed for member in members[:-1].split(",")):
+            raise FilterError(
+                "invalid_argument",
+                f"field {field.name!r} is compared with a value the catalogue does not list for it",
+            )
+        compared.add(owner)
+    return compared

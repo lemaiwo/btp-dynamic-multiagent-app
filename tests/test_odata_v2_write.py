@@ -1070,3 +1070,228 @@ async def test_token_and_cookie_are_never_in_an_error_message_or_log(caplog):
     ):
         assert secret not in text, secret
     assert "odata: update on entity set A_PurchaseRequisitionItem answered HTTP 400" in own
+
+
+# -- did anything leave the app? (``ODataError.sent``) ------------------------
+
+UNKNOWN = "write_outcome_unknown"
+
+
+class RenewFails(Sap):
+    """Hands out one token; the request for the next one meets ``failure``."""
+
+    def __init__(self, failure, *answers) -> None:
+        super().__init__(*answers)
+        self.failure = failure
+
+    async def handler(self, request):
+        if request.headers.get("X-CSRF-Token") == "Fetch" and self.generation:
+            self.requests.append(request)
+            if isinstance(self.failure, Exception):
+                raise self.failure
+            return self.failure
+        return await super().handler(request)
+
+
+def test_sent_is_false_unless_said_otherwise():
+    error = ODataError("sap_error", "x", status=400)
+    assert error.sent is False and "sent" not in error.to_dict()
+    assert ODataError("sap_error", "x", sent=True).sent is True
+
+
+async def test_a_refusal_before_the_token_request_was_not_sent():
+    sap = Sap()
+    c = client(sap)
+    for call in (
+        c.update(ES, {"PurchaseRequisition": "1"}, {"Plant": "1"}),  # invalid_key
+        c.create(ES, {"CreatedByUser": "x"}),
+        c.delete(ES_RO, KEY),
+        c.update(ES, KEY, {"Plant": "1"}, etag="*"),
+    ):
+        error = await refused(call)
+        assert error.sent is False
+    http = sap_v2(sap.handler, resolver=FakeResolver())
+    no_store = ODataClient(http, SERVICE, V2Dialect())
+    error = await refused(no_store.delete(ES, KEY))
+    assert error.code == "destination_error" and error.sent is False
+    mismatch = client(sap, USER_SERVICE, user_context=False)
+    error = await refused(mismatch.delete(ES, KEY))
+    assert error.code == "destination_error" and error.sent is False
+    assert sap.requests == []
+
+
+@pytest.mark.parametrize(
+    "failure, code, status",
+    [
+        (v2_error(403, "SY/1", "No authorization"), "sap_error", 403),
+        (httpx.Response(500, headers=LOGON_PAGE, text="<html/>"), "sap_error", 500),
+        (httpx.Response(200), "sap_error", 200),  # no token handed out
+        (httpx.ReadTimeout("timed out at https://s4.internal:44300"), "destination_error", None),
+        (httpx.ConnectError("no route"), "destination_error", None),
+        (RuntimeError("bug at https://s4.internal:44300"), "destination_error", None),
+        (TimeoutError("inner"), "destination_error", None),
+    ],
+)
+@pytest.mark.parametrize("operation", ["create", "update", "delete"])
+async def test_a_failed_token_request_changed_nothing_and_sent_nothing(
+    operation, failure, code, status
+):
+    def answer(_request):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    sap = Sap()
+    sap.fetch_answer = answer
+    c = client(sap)
+    call = {
+        "create": lambda: c.create(ES, {"Plant": "1000"}),
+        "update": lambda: c.update(ES, KEY, {"Plant": "1000"}),
+        "delete": lambda: c.delete(ES, KEY),
+    }[operation]
+    error = await refused(call())
+    assert (error.code, error.status) == (code, status)
+    assert error.sent is False and sap.writes == []
+    assert "nothing was changed" in error.message
+    assert "s4.internal" not in error.message and len(error.message) <= 500
+    assert error.__cause__ is None
+    assert error.__context__ is None or error.__suppress_context__
+
+
+async def test_a_refused_token_request_keeps_saps_own_text():
+    sap = Sap()
+    sap.fetch_answer = lambda _r: v2_error(403, "SY/1", "No authorization")
+    error = await refused(client(sap).delete(ES, KEY))
+    assert error.message.startswith("SY/1: No authorization")
+    assert "not authorised" in error.hint
+
+
+async def test_a_connection_that_was_never_made_was_not_sent():
+    def never(_request):
+        raise httpx.ConnectError("no route")
+
+    error = await refused(client(Sap(never)).update(ES, KEY, {"Plant": "1"}))
+    assert error.code == "destination_error" and error.sent is False
+
+
+@pytest.mark.parametrize(
+    "answer, code",
+    [
+        (v2_error(400, "ZX/001", "Invalid value"), "sap_error"),
+        (v2_error(403, "SY/1", "No authorization"), "sap_error"),
+        (v2_error(412, "A", "b"), "sap_error"),
+        (v2_error(428, "A", "b"), "etag_required"),
+        (v2_error(500, "A", "b"), "sap_error"),
+        (httpx.Response(504, text="x"), "write_outcome_unknown"),
+        (httpx.Response(200, headers=LOGON_PAGE, text="<html>Logon</html>"), UNKNOWN),
+        (httpx.Response(202), "write_outcome_unknown"),
+        (httpx.ReadTimeout("timed out"), "write_outcome_unknown"),
+        (Odd("gone"), "write_outcome_unknown"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["create", "update", "delete"])
+async def test_everything_after_the_send_says_sent(operation, answer, code):
+    def respond(_request):
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    sap = Sap(respond)
+    c = client(sap)
+    call = {
+        "create": lambda: c.create(ES, {"Plant": "1000"}),
+        "update": lambda: c.update(ES, KEY, {"Plant": "1000"}),
+        "delete": lambda: c.delete(ES, KEY),
+    }[operation]
+    error = await refused(call())
+    assert error.code == code and error.sent is True and len(sap.writes) == 1
+
+
+async def test_a_csrf_refusal_that_stays_says_sent():
+    sap = Sap()
+    sap.pre = [httpx.Response(403, headers={"X-CSRF-Token": "Required"})] * 2
+    error = await refused(client(sap).delete(ES, KEY))
+    assert error.code == "sap_error" and error.sent is True and len(sap.writes) == 2
+
+
+@pytest.mark.parametrize(
+    "failure, code",
+    [
+        (v2_error(403, "SY/1", "No authorization"), "sap_error"),
+        (httpx.ReadTimeout("timed out"), "destination_error"),
+        (RuntimeError("bug"), "destination_error"),
+    ],
+)
+async def test_a_failed_renewal_after_a_refused_send_says_sent_and_nothing_changed(failure, code):
+    """The change went out once and SAP refused it unprocessed (403 Required)."""
+    sap = RenewFails(failure)
+    sap.pre = [httpx.Response(403, headers={"X-CSRF-Token": "Required"})]
+    error = await refused(client(sap).update(ES, KEY, {"Plant": "1"}))
+    assert error.code == code and error.sent is True
+    assert "nothing was changed" in error.message
+    assert len(sap.writes) == 1 and len(sap.fetches) == 2
+
+
+async def test_a_second_send_that_never_connects_still_says_sent():
+    calls = []
+
+    class SecondSendFails(Sap):
+        async def handler(self, request):
+            if request.method != "GET":
+                calls.append(request)
+                if len(calls) == 2:
+                    raise httpx.ConnectError("no route")
+            return await super().handler(request)
+
+    sap = SecondSendFails()
+    sap.pre = [httpx.Response(403, headers={"X-CSRF-Token": "Required"})]
+    error = await refused(client(sap).delete(ES, KEY))
+    assert error.code == "destination_error" and "nothing was changed" in error.message
+    assert error.sent is True and len(calls) == 2
+
+
+async def test_a_destination_failure_on_the_second_send_is_a_sent_error():
+    from agents.destination import DestinationError
+
+    calls = []
+
+    class SecondSendFails(Sap):
+        async def handler(self, request):
+            if request.method != "GET":
+                calls.append(request)
+                if len(calls) == 2:
+                    raise DestinationError("could not resolve https://dest.example")
+            return await super().handler(request)
+
+    sap = SecondSendFails()
+    sap.pre = [httpx.Response(403, headers={"X-CSRF-Token": "Required"})]
+    error = await refused(client(sap).delete(ES, KEY))
+    assert isinstance(error, ODataError) and error.code == "destination_error"
+    assert error.sent is True and "nothing was changed" in error.message
+    assert "dest.example" not in error.message
+
+
+async def test_a_4xx_keeps_the_session_without_its_cookies_and_the_next_write_renews():
+    """SAP may move the session on with a refusal. Those cookies are not taken
+    (only a confirmed write is known to be SAP's own answer), so the next
+    write goes out with the session as it was, SAP asks for a new token, and
+    the client renews once."""
+    refusal = httpx.Response(
+        400,
+        headers={"Set-Cookie": f"{COOKIE_NAME}=ROTATED-ON-400; path=/"},
+        json={"error": {"code": "ZX/001", "message": {"value": "Invalid value"}}},
+    )
+    sap = Sap(refusal, httpx.Response(204))
+    store = CsrfSessionStore()
+    c = client(sap, store=store)
+    error = await refused(c.update(ES, KEY, {"Plant": "1"}))
+    assert error.code == "sap_error" and error.sent is True
+    assert len(store) == 1 and len(sap.fetches) == 1  # the session is kept
+    sap.expire(TECH)  # SAP now only knows the session it rotated to
+    assert (await c.update(ES, KEY, {"Plant": "1"}))["ok"] is True
+    assert len(sap.fetches) == 2 and len(sap.writes) == 3
+    first_retry, renewed = sap.writes[1], sap.writes[2]
+    assert f"S-{TECH}-1" in first_retry.headers["Cookie"]
+    assert f"S-{TECH}-2" in renewed.headers["Cookie"]
+    for request in sap.requests:
+        assert "ROTATED-ON-400" not in request.headers.get("Cookie", "")

@@ -11,9 +11,9 @@ What differs from V2:
 * A key predicate holds V4 literals: a string in single quotes with a quote
   doubled, everything else bare -- no ``guid'..'`` / ``datetime'..'`` prefix
   and no ``L`` / ``M`` / ``d`` suffix. As in V2 every value is written by
-  positive recognition of its EDM type, percent-encoded, and a string with
-  ``/ \\ % ? #`` or ``..`` is refused (``v2`` explains why: the request URL
-  is rebuilt from the decoded path). A type this module does not know -- an
+  positive recognition of its EDM type; the predicate itself is built by
+  ``common.key_segment``, the same code for both versions. A type this
+  module does not know -- an
   enumeration, a complex type, a collection, ``Edm.Binary`` -- is refused,
   never guessed: the type string comes verbatim from ``$metadata``, and its
   name alone does not say what kind of type it is.
@@ -25,6 +25,9 @@ What differs from V2:
 * The error envelope is ``{"error": {"code", "message", "details"}}`` with a
   plain string as the message. Only code and message are read; ``details``
   and ``innererror`` can name hosts, users and internal objects.
+* Every request says ``OData-MaxVersion: 4.0``, so a service that could
+  answer in a later format does not. That is a request header, not a way of
+  finding out the version.
 
 Writes and actions are not part of this module yet: ``supports_write`` is
 ``False`` and ``ODataClient.check_write`` refuses before anything is sent.
@@ -36,19 +39,17 @@ format and are not verified against a live system.
 from __future__ import annotations
 
 import datetime
-import html
 import math
 import re
 from typing import Any
 
 import httpx
 
+from . import common
 from .client import ODataError, ReadQuery
+from .common import refuse as _refuse
 from .models import EntitySetDef
 from .urls import V4_COMPARABLE_TYPES
-from .v2 import _XML_CODE, _XML_MESSAGE, V2Dialect
-
-_MAX_ERROR_BODY = 20_000
 
 # Used with `fullmatch` only, and with `[0-9]`: `$` also matches before a
 # trailing newline, and `\d` matches every Unicode decimal digit.
@@ -69,15 +70,6 @@ _INTEGER_RANGES = {
     "Edm.Int64": (-(2**63), 2**63 - 1),
 }
 _NOT_YET = "writing to an OData V4 service is not supported yet; only reads are"
-
-
-def _refuse(edm_type: object) -> ODataError:
-    shown = (
-        edm_type
-        if isinstance(edm_type, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,64}", edm_type)
-        else "that type"
-    )
-    return ODataError("invalid_argument", f"the value is not a valid {shown} value")
 
 
 def _is_date(text: str) -> bool:
@@ -119,8 +111,12 @@ class V4Dialect:
     """OData V4 as SAP's RAP and Gateway V4 services speak it (reads)."""
 
     version = "v4"
-    # `ODataClient.check_write` refuses a write while this is False.
+    # `ODataClient.check_write` refuses a write while this is False, with
+    # this text (its one source).
     supports_write = False
+    write_refusal = _NOT_YET
+    # Sent with every request of this version.
+    request_headers: dict[str, str] = {"OData-MaxVersion": "4.0"}
 
     # -- literals -----------------------------------------------------------
     def literal(self, edm_type: str, value: Any) -> str:
@@ -163,10 +159,13 @@ class V4Dialect:
         if edm_type in ("Edm.Double", "Edm.Single"):
             if isinstance(value, str) and _DECIMAL.fullmatch(value):
                 return value
-            if isinstance(value, (int, float)) and math.isfinite(value):
-                text = repr(float(value))
-                if _DECIMAL.fullmatch(text):  # no exponent form in a path segment
-                    return text
+            try:
+                if isinstance(value, (int, float)) and math.isfinite(value):
+                    text = repr(float(value))
+                    if _DECIMAL.fullmatch(text):  # no exponent form in a path segment
+                        return text
+            except OverflowError:  # an integer no float can hold
+                pass
             raise _refuse(edm_type)
         if not isinstance(value, str):
             raise _refuse(edm_type)
@@ -188,10 +187,13 @@ class V4Dialect:
             return f"duration'{value}'"
         raise _refuse(edm_type)
 
-    # The predicate is built exactly as in V2 -- the same checks on the key
-    # names and on what a string value may contain, each value percent-
-    # encoded -- and differs only in `self.literal`, which is V4's above.
-    key_segment = V2Dialect.key_segment
+    def key_segment(self, entity_set: EntitySetDef, key: dict) -> str:
+        """The key predicate, percent-encoded: ``('1')`` or ``(A='x',B=2026-10-05)``.
+
+        The key must name exactly the key fields of the entity set
+        (``common.key_segment``, with this dialect's literals).
+        """
+        return common.key_segment(self.literal, entity_set, key)
 
     def comparable(self, edm_type: str) -> bool:
         """Whether a field of ``edm_type`` may be a sort (or filter) target.
@@ -251,14 +253,27 @@ class V4Dialect:
         return payload.get(f"@{name}") if value is None else value
 
     @staticmethod
-    def _is_error(payload: dict) -> bool:
-        return "error" in payload
+    def _properties(payload: dict) -> list[str]:
+        """The keys of ``payload`` that are properties, not annotations."""
+        return [k for k in payload if isinstance(k, str) and "@" not in k]
+
+    def _is_error(self, payload: dict) -> bool:
+        """Whether ``payload`` is an error envelope and nothing else.
+
+        An entity type may have a property called ``error``, so the key
+        alone does not decide for a read: the envelope is an *object* under
+        ``error`` with no other property beside it. (A write is stricter,
+        ``ODataClient._is_entity``: there a wrong "yes" claims a change.)
+        """
+        return isinstance(payload.get("error"), dict) and self._properties(payload) == ["error"]
 
     def parse_list(self, payload: Any) -> tuple[list[dict], int | None, str | None]:
         """``(rows, count, next link)`` of ``{"value": [...]}``."""
+        # A collection has no properties of its own, so `error` beside
+        # `value` is never one: refused here whatever it holds.
         if (
             not isinstance(payload, dict)
-            or self._is_error(payload)
+            or "error" in payload
             or not isinstance(payload.get("value"), list)
         ):
             raise ODataError("sap_error", "the OData service answered in an unexpected shape")
@@ -289,7 +304,7 @@ class V4Dialect:
         """
         if not isinstance(payload, dict) or self._is_error(payload):
             raise ODataError("sap_error", "the OData service answered in an unexpected shape")
-        properties = [k for k in payload if isinstance(k, str) and "@" not in k]
+        properties = self._properties(payload)
         if not properties or (properties == ["value"] and isinstance(payload["value"], list)):
             raise ODataError("sap_error", "the OData service answered in an unexpected shape")
         etag = self._control(payload, "etag")
@@ -299,40 +314,26 @@ class V4Dialect:
         """Whether ``payload`` says "no entity" (a navigation that leads nowhere).
 
         V4 answers that with ``204 No Content``, which the client sees as no
-        payload at all; ``@odata.null`` is the form a few services send.
+        payload at all. Two other forms are in use: ``@odata.null``, and the
+        single-value wrapper ``{"@odata.context": .., "value": null}`` --
+        told apart from an entity with a property called ``value`` by the
+        context annotation beside a ``value`` that is the only property.
         """
-        return isinstance(payload, dict) and self._control(payload, "null") is True
+        if not isinstance(payload, dict):
+            return False
+        if self._control(payload, "null") is True:
+            return True
+        return (
+            self._properties(payload) == ["value"]
+            and payload["value"] is None
+            and self._control(payload, "context") is not None
+        )
 
     def parse_error(self, response: httpx.Response) -> tuple[str, str]:
         """``(code, text)`` of an OData error envelope, or ``("", "")``.
 
-        Only a real envelope is read: JSON ``{"error": {"code", "message"}}``
-        with a string as the message, or the XML form the ICF layer in front
-        of a service can answer with. ``details`` and ``innererror`` are not
-        read. An HTML error page yields nothing, so none of its markup, host
-        names or dump text reaches a model.
+        The V4 envelope is ``{"error": {"code", "message"}}`` with a string
+        as the message; ``details`` and ``innererror`` are not read
+        (``common.read_error`` explains what else is not).
         """
-        content_type = response.headers.get("content-type", "").lower()
-        if "html" in content_type:
-            return "", ""
-        try:
-            text = response.text[:_MAX_ERROR_BODY]
-        except Exception:  # noqa: BLE001 - an undecodable body is no envelope
-            return "", ""
-        if "xml" in content_type:
-            code, message = _XML_CODE.search(text), _XML_MESSAGE.search(text)
-            if not message:
-                return "", ""
-            return (
-                html.unescape(code.group(1)).strip() if code else "",
-                html.unescape(message.group(1)).strip(),
-            )
-        try:
-            error = response.json().get("error")
-        except (ValueError, AttributeError):
-            return "", ""
-        if not isinstance(error, dict):
-            return "", ""
-        code = error.get("code")
-        message = error.get("message")
-        return (code if isinstance(code, str) else "", message if isinstance(message, str) else "")
+        return common.read_error(response, lambda message: message)

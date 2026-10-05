@@ -320,8 +320,14 @@ V4_GUID = "01234567-89ab-cdef-0123-456789abcdef"
 
 
 def _v4_fields():
-    def field(name, edm="Edm.String", filterable=True):
-        return FieldDef(name=name, type=edm, selectable=filterable, filterable=filterable)
+    def field(name, edm="Edm.String", filterable=True, values=()):
+        return FieldDef(
+            name=name,
+            type=edm,
+            selectable=filterable,
+            filterable=filterable,
+            values=[{"value": v, "meaning": v} for v in values],
+        )
 
     return {
         "Plant": field("Plant"),
@@ -332,7 +338,7 @@ def _v4_fields():
         "Lead": field("Lead", "Edm.Duration"),
         "Id": field("Id", "Edm.Guid"),
         "Released": field("Released", "Edm.Boolean"),
-        "Status": field("Status", "SRV.Status"),
+        "Status": field("Status", "SRV.Status", values=("Open", "Closed")),
         "Address": field("Address", "SRV.Address"),
         "Tags": field("Tags", "Collection(Edm.String)"),
         "Blob": field("Blob", "Edm.Binary"),
@@ -360,27 +366,14 @@ def _v4_fields():
         "date(ChangedAt) eq 2026-10-05 and time(ChangedAt) lt 12:30:00",
         "StartTime ge 08:00 and StartTime lt 17:30:00.5",
         "Lead gt duration'PT12H' and Lead le duration'P1DT2H3M4.5S'",
-        "Status eq SRV.Status'Open' or Status has Some.Deep.Namespace.Flags'A,B'"
-        " or Status eq Some.Deep.Namespace.Flags'A'",
+        "Status eq SRV.Status'Open' or Status has SRV.Status'Open,Closed'",
         "Released eq true",
         "  Plant   eq   '1'  ",
         "",
     ],
 )
 def test_v4_filter_accepts_the_v4_grammar(expr):
-    fields = _v4_fields()
-    fields["Status"] = FieldDef(
-        name="Status",
-        type="Some.Deep.Namespace.Flags" if "Deep" in expr and "SRV" not in expr else "SRV.Status",
-        selectable=True,
-        filterable=True,
-    )
-    if "SRV.Status'" in expr and "Deep" in expr:
-        # Two enum types in one expression: each field needs its own.
-        fields["Status"] = FieldDef(
-            name="Status", type="SRV.Status", selectable=True, filterable=True
-        )
-    check_filter(expr, fields, version="v4")
+    check_filter(expr, _v4_fields(), version="v4")
 
 
 @pytest.mark.parametrize(
@@ -449,7 +442,6 @@ def test_v4_filter_accepts_the_v4_grammar(expr):
         ("Tags eq 'x'", "field_not_filterable"),
         ("Blob eq 'AAEC'", "field_not_filterable"),
         ("Status eq 'Open'", "field_not_filterable"),
-        ("Status eq SRV.Other'Open'", "field_not_filterable"),
         ("Status eq SRV.Status'Open' and Address eq null", "field_not_filterable"),
     ],
 )
@@ -484,7 +476,8 @@ def test_v4_filter_refusal_never_repeats_a_literal():
         "CreatedByUser eq 'alice@example.com'",
         "Plant eq 's3cr3t'&x",
         "Plant eq guid's3cr3t'",
-        "Address eq SRV.Other's3cr3t'",
+        "Address eq SRV.Address's3cr3t'",
+        "Status eq SRV.Status's3cr3t'",
     ):
         with pytest.raises(FilterError) as excinfo:
             check_filter(expr, _v4_fields(), version="v4")
@@ -498,3 +491,78 @@ def test_v4_filter_refusal_never_repeats_a_literal():
     for hostile in ("1" * 999 + "x", "A." * 400 + "'", "-" * 999, "0-" * 499):
         with pytest.raises(FilterError):
             check_filter("Plant eq " + hostile, _v4_fields(), version="v4")
+
+
+# -- V42 review follow-up ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "Status eq SRV.Status'Open'",
+        "Status ne SRV.Status'Closed' and Plant eq '1'",
+        "Status has SRV.Status'Open,Closed'",
+        "Status in (SRV.Status'Open', SRV.Status'Closed')",
+        "Status in (SRV.Status'Open')",
+        "not (Status eq SRV.Status'Open') or Status eq SRV.Status'Closed'",
+        "Plant eq'x'",  # an operator word before a quote is still an operator
+    ],
+)
+def test_v4_enum_literal_right_after_its_own_field(expr):
+    check_filter(expr, _v4_fields(), version="v4")
+
+
+@pytest.mark.parametrize(
+    "expr, code",
+    [
+        # The literal must stand directly after `<its field> eq|ne|has`, or in that field's list.
+        ("Plant eq SRV.Status'Open' and Status eq SRV.Status'Open'", "invalid_argument"),
+        ("Plant eq SRV.Status'Open'", "invalid_argument"),
+        ("SRV.Status'Open' eq Status", "invalid_argument"),
+        ("Status gt SRV.Status'Open'", "invalid_argument"),
+        ("Status eq (SRV.Status'Open')", "invalid_argument"),
+        ("contains(Plant, SRV.Status'Open') and Status eq SRV.Status'Open'", "invalid_argument"),
+        ("Plant in (SRV.Status'Open')", "invalid_argument"),
+        ("Status in ('x', SRV.Status'Open')", "invalid_argument"),
+        ("Status eq SRV.Status'Open' or (SRV.Status'Open')", "invalid_argument"),
+        ("Status eq SRV.Other'Open'", "invalid_argument"),
+        ("Status eq SRV.Status'Open' SRV.Status'Closed'", "invalid_argument"),
+        ("SRV.Status'Open'", "invalid_argument"),
+        # A member the catalogue does not list for the field.
+        ("Status eq SRV.Status'Deleted'", "invalid_argument"),
+        ("Status has SRV.Status'Open,Deleted'", "invalid_argument"),
+        ("Status in (SRV.Status'Open', SRV.Status'Deleted')", "invalid_argument"),
+        # Every use of the field needs it, not just one of them.
+        ("Status eq SRV.Status'Open' and Status eq null", "field_not_filterable"),
+        ("Status eq SRV.Status'Open' and Status eq 'Open'", "field_not_filterable"),
+        ("Status eq Status", "field_not_filterable"),
+        # A complex type has no listed values: its name before a quote proves nothing.
+        ("Address eq SRV.Address'x'", "field_not_filterable"),
+        ("Address has SRV.Address'City'", "field_not_filterable"),
+        ("Tags eq SRV.Status'Open'", "invalid_argument"),
+        ("CreatedByUser eq 'x' and Status eq SRV.Status'Open'", "field_not_filterable"),
+        # A name directly before a quote is a type prefix, whatever the name is.
+        ("Plant'x'", "invalid_argument"),
+        ("Plant eq Plant'x'", "invalid_argument"),
+        ("Plant eq '1' and Quantity'1'", "invalid_argument"),
+        ("abcdef01'x' eq 1", "invalid_argument"),
+    ],
+)
+def test_v4_enum_and_prefix_refusals(expr, code):
+    with pytest.raises(FilterError) as excinfo:
+        check_filter(expr, _v4_fields(), version="v4")
+    assert excinfo.value.code == code, excinfo.value.message
+    assert "Deleted" not in excinfo.value.message and "Open" not in excinfo.value.message
+
+
+def test_a_field_named_like_an_operator_does_not_stand_in_for_one():
+    fields = _v4_fields()
+    fields["eq"] = FieldDef(name="eq", selectable=True, filterable=True)
+    # `eq` is a field here, so `Status eq <literal>` is three operands, not a comparison.
+    with pytest.raises(FilterError) as excinfo:
+        check_filter("Status eq SRV.Status'Open'", fields, version="v4")
+    assert excinfo.value.code == "invalid_argument"
+    with pytest.raises(FilterError):
+        check_filter("Plant eq'x'", fields, version="v4")
+    # V2 is untouched by the V4 prefix rule.
+    check_filter("Plant eq'x'", _v4_fields())

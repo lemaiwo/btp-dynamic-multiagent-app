@@ -87,7 +87,15 @@ DEFINITION = {
                 _f("Uuid", "Edm.Guid", filterable=True),
                 _f("Quantity", "Edm.Decimal", filterable=True),
                 _f("IsReleased", "Edm.Boolean", filterable=True),
-                _f("Status", "SRV.Status", filterable=True),
+                _f(
+                    "Status",
+                    "SRV.Status",
+                    filterable=True,
+                    values=[
+                        {"value": "Open", "meaning": "Open"},
+                        {"value": "Closed", "meaning": "Closed"},
+                    ],
+                ),
                 _f("Address", "SRV.Address", filterable=True),
                 _f("Tags", "Collection(Edm.String)", filterable=True),
                 _f("Picture", "Edm.Stream", filterable=True),
@@ -389,7 +397,7 @@ def test_parse_list_and_entity():
         "x",
         {},
         {"error": {"code": "A", "message": "b"}},
-        {"error": {"code": "A", "message": "b"}, "PurchaseRequisition": "1"},
+        {"@odata.context": CONTEXT, "error": {"code": "A", "message": "b"}},
         {"@odata.context": CONTEXT, "value": [{"A": 1}]},  # a collection, not an entity
         {"@odata.context": CONTEXT},  # nothing but bookkeeping
     ):
@@ -785,8 +793,9 @@ async def test_a_v4_filter_travels_as_one_parameter_value(expr):
         ("Tags eq 'a'", "field_not_filterable"),
         ("Picture eq 'x'", "field_not_filterable"),
         ("Status eq 'Open'", "field_not_filterable"),  # an enum needs its typed literal
-        ("Status eq SRV.Other'Open'", "field_not_filterable"),
-        ("Address eq SRV.Status'Open' and Status eq SRV.Status'Open'", "field_not_filterable"),
+        ("Status eq SRV.Other'Open'", "invalid_argument"),
+        ("Address eq SRV.Address'x'", "field_not_filterable"),
+        ("Address eq SRV.Status'Open' and Status eq SRV.Status'Open'", "invalid_argument"),
         ("Description eq Edm.String'x'", "invalid_argument"),
     ],
 )
@@ -965,3 +974,111 @@ async def test_a_v4_write_is_refused_before_anything_is_sent(operation, kwargs):
         with pytest.raises(ODataError) as excinfo:
             refuse()
         assert excinfo.value.code == "operation_disabled"
+
+
+# -- review follow-up ---------------------------------------------------------
+
+
+def _one_set(*fields, keys=("Id",)):
+    es = EntitySetDef.model_validate(
+        {
+            "name": "Things",
+            "keys": [{"name": k} for k in keys],
+            "operations": ["list", "get"],
+            "fields": list(fields),
+        }
+    )
+    definition = {"entity_sets": [es.model_dump(mode="json")], "operations": []}
+    return es, service_payload(odata_version="v4", service_path=V4_PATH, definition=definition)
+
+
+async def test_an_entity_with_a_property_called_error_can_be_read():
+    es, service = _one_set(_f("Id"), _f("error"), _f("detail", "SRV.Detail"))
+    for row in (
+        {"@odata.context": CONTEXT, "Id": "1", "error": "E1"},
+        {"Id": "1", "error": {"code": "E1", "message": "a field, not an envelope"}},
+        {"error": "E1"},  # not an object: not an envelope
+    ):
+        got = await client(Sap(row), service).get(es, {"Id": "1"}, select=[], expand=[])
+        assert got["item"]["error"] == row["error"]
+    listed = await client(Sap(page([{"Id": "1", "error": "E1"}])), service).list(es, query())
+    assert listed["items"] == [{"Id": "1", "error": "E1"}]
+    # The envelope itself -- an object under `error` and no other property -- in a 200.
+    for envelope in (
+        {"error": {"code": "A", "message": "b"}},
+        {"@odata.context": CONTEXT, "error": {"code": "A", "message": "b"}},
+        {"error": {}},
+    ):
+        error = await refused(
+            client(Sap(envelope), service).get(es, {"Id": "1"}, select=[], expand=[])
+        )
+        assert error.code == "sap_error"
+    # A write stays strict: any top-level `error` is not a confirmation.
+    rules = ODataClient(None, service, V4Dialect())
+    assert rules._is_entity({"Id": "1"}) is True
+    assert rules._is_entity({"Id": "1", "error": "E1"}) is False
+    assert rules._is_entity({"Id": "1", "error": {"code": "A"}}) is False
+
+
+async def test_a_null_value_wrapper_is_no_item():
+    answer = {"@odata.context": CONTEXT, "value": None}
+    result = await client(Sap(answer)).get(ES_ITEM, KEY, select=[], expand=[], navigation="_Header")
+    assert result == {"item": None, "truncated": False}
+    # An entity that really has a field called `value` is still an entity.
+    es, service = _one_set(_f("Id"), _f("value"))
+    got = await client(Sap({"Id": "1", "value": None}), service).get(
+        es, {"Id": "1"}, select=[], expand=[]
+    )
+    assert got["item"] == {"Id": "1", "value": None}
+
+
+@pytest.mark.parametrize("dialect", [V2Dialect(), V4Dialect()])
+@pytest.mark.parametrize("edm_type", ["Edm.Double", "Edm.Single"])
+def test_a_huge_number_as_a_float_key_is_an_invalid_key(dialect, edm_type):
+    for huge in (10**400, -(10**400)):
+        with pytest.raises(ODataError) as excinfo:
+            dialect.literal(edm_type, huge)
+        assert excinfo.value.code == "invalid_argument"
+        with pytest.raises(ODataError) as excinfo:
+            dialect.key_segment(keyed({"K": edm_type}), {"K": huge})
+        assert excinfo.value.code == "invalid_key"
+    assert dialect.literal(edm_type, 2).startswith("2.0")
+
+
+async def test_v4_requests_say_which_version_they_speak():
+    other = dict(ITEM_ROW, PurchaseRequisitionItem="00020")
+    sap = Sap(
+        page([ITEM_ROW], **{"@odata.nextLink": "PurchaseRequisitionItem?$skiptoken=1"}),
+        page([other]),
+        ITEM_ROW,
+    )
+    c = client(sap)
+    await c.list(ES_ITEM, query(top=5))
+    await c.get(ES_ITEM, KEY, select=[], expand=[])
+    assert len(sap.requests) == 3
+    for request in sap.requests:
+        assert request.headers["OData-MaxVersion"] == "4.0"
+        assert request.headers["Accept"] == "application/json"
+    # V2 sends no such header.
+    v2_service = service_payload()
+    es = ServiceDefinition.model_validate(v2_service["definition"]).entity_set(
+        "A_PurchaseRequisitionItem"
+    )
+    sap = Sap({"d": {"results": []}})
+    await ODataClient(sap_v2(sap), v2_service, V2Dialect()).list(es, query(top=5))
+    assert "odata-maxversion" not in sap.requests[0].headers
+
+
+def test_the_write_refusal_has_one_source_and_was_not_sent():
+    c = client(Sap(page([])), sessions=CsrfSessionStore())
+    with pytest.raises(ODataError) as excinfo:
+        c.check_write(ES_HEADER, "delete", key={"PurchaseRequisition": "1"})
+    assert excinfo.value.message == V4Dialect.write_refusal and excinfo.value.sent is False
+    with pytest.raises(ODataError) as excinfo:
+        V4Dialect().encode_body(ES_HEADER, {"Description": "x"})
+    assert excinfo.value.message == V4Dialect.write_refusal
+
+
+async def test_a_read_error_never_says_sent():
+    error = await refused(client(Sap(v4_error(400, "A", "b"))).list(ES_ITEM, query()))
+    assert error.sent is False and "sent" not in error.to_dict()
