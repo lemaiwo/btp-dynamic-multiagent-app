@@ -520,6 +520,99 @@ async def test_delete_in_use_is_409_naming_the_agents(client, created):
     assert r.status_code == 409 and "'buyer'" in r.json()["detail"]
 
 
+# --- delete locks the service row before it looks for referrers -------------------
+#
+# SQLite has no row locks, so these tests prove the order of the calls and the
+# statement that is sent. That the lock really makes a concurrent agent save
+# wait (and the delete then answer 409) can only be shown on Postgres.
+
+
+def _trace_delete(monkeypatch) -> list[tuple[str, int]]:
+    """Record ``(step, id(session))`` of the delete route's three steps and
+    fail on an unlocked read of the service."""
+    from agents.odata import admin_routes
+
+    trail: list[tuple[str, int]] = []
+
+    def spy(step: str, real):
+        async def wrapper(session, *args: Any, **kwargs: Any):
+            trail.append((step, id(session)))
+            return await real(session, *args, **kwargs)
+
+        return wrapper
+
+    async def unlocked(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("delete read the service without locking it")
+
+    for step, attr in (
+        ("lock", "_lock_odata_service"),
+        ("referrers", "odata_service_referrers"),
+        ("delete", "delete_odata_service"),
+    ):
+        monkeypatch.setattr(admin_routes, attr, spy(step, getattr(admin_routes, attr)))
+    monkeypatch.setattr(admin_routes, "get_odata_service", unlocked)
+    return trail
+
+
+async def test_delete_locks_the_row_then_checks_referrers_then_deletes(
+    client, created, monkeypatch
+):
+    trail = _trace_delete(monkeypatch)
+    assert (await client.delete(ONE)).status_code == 204
+    assert [step for step, _ in trail] == ["lock", "referrers", "delete"]
+    # One session, so one transaction: the lock is held until the delete commits.
+    assert len({session for _, session in trail}) == 1
+    async with SessionLocal() as s:
+        assert await get_odata_service(s, "purchase-requisitions") is None
+
+
+async def test_delete_in_use_checks_under_the_lock_and_deletes_nothing(
+    client, created, monkeypatch
+):
+    async with SessionLocal() as s:
+        s.add(_agent_row("buyer", enabled=1))
+        await s.commit()
+    trail = _trace_delete(monkeypatch)
+    r = await client.delete(ONE)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "Service 'purchase-requisitions' is used by agent(s) 'buyer'"
+    assert [step for step, _ in trail] == ["lock", "referrers"]
+    assert len({session for _, session in trail}) == 1
+    async with SessionLocal() as s:
+        assert await get_odata_service(s, "purchase-requisitions") is not None
+
+
+async def test_delete_of_an_unknown_name_stops_after_the_lock(client, monkeypatch):
+    trail = _trace_delete(monkeypatch)
+    r = await client.delete(f"{BASE}/nope")
+    assert r.status_code == 404 and r.json() == {"detail": "Service not found"}
+    assert [step for step, _ in trail] == ["lock"]
+
+
+def test_the_lock_statement_is_an_exclusive_row_lock_on_postgres_only():
+    """The clause is left to the dialect, as on the agent-save side
+    (``existing_odata_service_names(lock=True)``): Postgres gets ``FOR
+    UPDATE``, SQLite compiles the same statement without it."""
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from agents.odata import admin_routes
+
+    query = admin_routes._locked_service_query("purchase-requisitions")
+    on_postgres = str(query.compile(dialect=postgresql.dialect()))
+    assert on_postgres.rstrip().endswith("FOR UPDATE")  # exclusive: not FOR SHARE, no NOWAIT
+    assert "odata_services.name = " in on_postgres
+    assert "FOR " not in str(query.compile(dialect=sqlite.dialect()))
+
+
+async def test_the_lock_helper_runs_the_locked_statement_in_the_given_session(created):
+    from agents.odata import admin_routes
+
+    async with SessionLocal() as s:
+        row = await admin_routes._lock_odata_service(s, "purchase-requisitions")
+        assert isinstance(row, ODataService) and row.name == "purchase-requisitions"
+        assert await admin_routes._lock_odata_service(s, "nope") is None
+
+
 # --- authorization ------------------------------------------------------------
 
 

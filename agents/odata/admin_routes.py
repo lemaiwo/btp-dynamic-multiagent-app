@@ -24,9 +24,12 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints, ValidationError
+from sqlalchemy import Select, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.auth import require_admin
 from agents.db import (
+    ODataService,
     SessionLocal,
     create_odata_service,
     delete_odata_service,
@@ -141,6 +144,22 @@ def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:
         raise _refuse("; ".join(lines)) from None
 
 
+def _locked_service_query(name: str) -> Select[tuple[ODataService]]:
+    """The service row, with an exclusive row lock where the database has one.
+
+    No dialect switch here, as on the agent-save side
+    (`agents.db.existing_odata_service_names`): SQLAlchemy sends ``FOR
+    UPDATE`` to Postgres and leaves it out for SQLite, which has no row
+    locks and serialises writers anyway.
+    """
+    return select(ODataService).where(ODataService.name == name).with_for_update()
+
+
+async def _lock_odata_service(session: AsyncSession, name: str) -> ODataService | None:
+    """Load the service and hold its row until the session's transaction ends."""
+    return (await session.execute(_locked_service_query(name))).scalar_one_or_none()
+
+
 def _copy_title(title: str) -> str:
     """``<title> (copy)``, shortened so it still fits the title limit."""
     return title[: _TITLE_MAX - len(_COPY_SUFFIX)].rstrip() + _COPY_SUFFIX
@@ -210,10 +229,30 @@ async def api_delete_odata_service(name: str) -> None:
     that lost its only service would be saved in a state it cannot run in.
     The admin removes it from the agents first; disabled agents count,
     because turning one back on would break it.
+
+    Lock, check, delete, in one transaction. An agent save takes a shared
+    lock on the services it attaches before it writes the agent
+    (`agents.admin._unknown_odata_services`), so the two exclude each other
+    on the service row:
+
+    - the save got there first: the lock below waits for its commit, and the
+      referrer check, a new statement, then sees that agent -> 409;
+    - the delete got there first: the save waits, then no longer finds the
+      row and refuses the agent ("unknown OData service").
+
+    Checking before locking would let a delete that had passed its check
+    wait out the save and still go through. The check relies on READ
+    COMMITTED (the Postgres default, which the engine keeps): under a
+    transaction-wide snapshot it would not see the agent it waited for.
+
+    No deadlock: this transaction waits only for this one row, before it
+    holds anything. Once it has the lock, the agent read takes no row lock
+    and the delete is of the row it already holds, so nothing a save holds
+    can make it wait while a save waits for it.
     """
     name = _service_name(name)
     async with SessionLocal() as session:
-        row = await get_odata_service(session, name)
+        row = await _lock_odata_service(session, name)
         if row is None:
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
         referrers = (await odata_service_referrers(session, name)).get(name, [])
