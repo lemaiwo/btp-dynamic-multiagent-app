@@ -867,11 +867,23 @@ function toggleDcr(cb) {
 
 function collectMcpServers() {
     const out = [];
+    let seenOData = false;
     document.querySelectorAll('#agent-mcp-servers .mcp-server-row').forEach(r => {
         const url = r.querySelector('.mcp-url').value.trim();
         if (!url) return;
         const mode = r.querySelector('.mcp-auth-mode').value;
         const server = {url, auth_mode: mode};
+        if (destinationBuiltinOf(r) === ODATA_BUILTIN) {
+            // Refused here rather than posted: the server would answer 422
+            // for both, with the other mode's fields named as stray keys.
+            if (seenOData) {
+                throw new Error('An agent takes one builtin:odata entry: pick all its services in the first one and remove the second.');
+            }
+            seenOData = true;
+            if (mode !== 'destination') {
+                throw new Error('builtin:odata needs the auth mode "BTP destination".');
+            }
+        }
         if (mode === 'oauth2') {
             const scope = r.querySelector('.oauth-scope').value.trim();
             if (r.querySelector('.oauth-dcr').checked) {
@@ -1865,6 +1877,7 @@ async function openAgentModal() {
     document.getElementById('agent-description').value = '';
     document.getElementById('agent-instructions').value = '';
     renderMcpServers([]);
+    loadODataCatalogue();
     renderAgentSkillChecks([]);
     renderAgentPeerChecks([], '');
     renderAgentWhereUsed(null);
@@ -1899,6 +1912,9 @@ function updateEndpointHint() {
             + 'and authorize the run-as account.';
     }
     document.getElementById('agent-endpoint-hint').innerHTML = html;
+    // Rows were added or removed, or the API switch moved: which row holds
+    // the one builtin:odata entry and its job-run warning follow both.
+    syncODataRows();
 }
 
 // --- run-as identity helpers ----------------------------------------------
@@ -1997,6 +2013,7 @@ async function editAgent(id) {
         ? a.mcp_servers
         : [{url: a.mcp_url || '', auth_mode: a.auth_mode || 'jwt'}];
     renderMcpServers(servers);
+    loadODataCatalogue();
     renderAgentSkillChecks(a.skills || []);
     renderAgentPeerChecks(a.peers || [], a.name);
     loadAgentWhereUsed(a.id);
@@ -2447,7 +2464,12 @@ const DESTINATION_FIELDS = {
     'builtin:sapnotes':      ['min_score', 'lookback'],
     'builtin:sapnotedetail': [],
     'builtin:smtp':          ['recipients', 'from', 'allow_send', 'theme'],
+    // No destination name and no user_context: both belong to each catalogue
+    // service (`_validate_odata_entry` in agents/admin.py refuses any key but
+    // these two). Collected by `collectODataConfig`, not the generic branch.
+    'builtin:odata':         ['services', 'allow_write'],
 };
+const ODATA_BUILTIN = 'builtin:odata';
 // A remote MCP server (an http(s) url) through a destination: the destination
 // names the host and holds the credential, so its name and `user_context` are
 // all that is stored (the remote branch of `_clean_destination`). Dropping
@@ -2472,8 +2494,21 @@ function destinationFieldsHtml() {
     return `
         <div class="mcp-destination" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
             <div class="form-grid">
-                <label class="full">Destination name
+                <label class="full dest-field-destination">Destination name
                     <input type="text" class="dest-destination" placeholder="MY_DESTINATION">
+                </label>
+                <label class="full dest-field-services">OData services
+                    <select multiple class="dest-services" size="6" style="width:100%"
+                            onchange="odataSelectionChanged(this.closest('.mcp-server-row'))"></select>
+                    <span class="dest-services-note" style="display:block;color:var(--muted);font-size:12px;font-weight:normal"></span>
+                    <span class="dest-odata-warning" style="display:block;color:var(--warn);font-size:12px;font-weight:normal"></span>
+                </label>
+                <label class="full dest-field-allow_write" style="font-weight:600">
+                    <input type="checkbox" class="dest-allow_write"> Allow writes
+                    <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
+                        Opens the write operations enabled in the catalogue for these services.
+                        Off: this agent can only read.
+                    </span>
                 </label>
                 <label class="full dest-field-user_context" style="font-weight:600">
                     <input type="checkbox" class="dest-user_context" onchange="userContextToggled(this.closest('.mcp-server-row'))">
@@ -2545,6 +2580,17 @@ function fillDestinationFields(row, oauth) {
     row.querySelector('.dest-user_context').checked = oauth.user_context === true;
     row.querySelector('.dest-allow_send').checked = oauth.allow_send === true;
     row.querySelector('.dest-allow_comment').checked = oauth.allow_comment === true;
+    // Only the JSON boolean opens writes; the server refuses anything else.
+    row.querySelector('.dest-allow_write').checked = oauth.allow_write === true;
+    // The stored names, in the stored order: kept on the row so that a save
+    // without changes posts the same list, whatever order the catalogue has
+    // and whether or not it could be loaded.
+    const stored = [];
+    (Array.isArray(oauth.services) ? oauth.services : []).forEach(n => {
+        if (typeof n === 'string' && n && !stored.includes(n)) stored.push(n);
+    });
+    row.dataset.odataServices = JSON.stringify(stored);
+    renderODataServiceOptions(row, stored);
     const theme = oauth.theme;
     row.querySelector('.dest-theme').value =
         theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
@@ -2572,6 +2618,9 @@ function syncDestinationFields(row) {
     box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
         const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
         let show = wanted.includes(key);
+        // Every type names its destination, except builtin:odata: there the
+        // destination belongs to each catalogue service.
+        if (key === 'destination') show = builtin !== ODATA_BUILTIN;
         // A destination resolved as the user reads /me: no mailbox to name.
         if (key === 'mailbox' && userContext) show = false;
         // Graph refuses application posts, so Teams posts only as the user.
@@ -2581,7 +2630,9 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sapnotes, builtin:sapnotedetail).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+    } else if (builtin === ODATA_BUILTIN) {
+        hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (isRemoteMcpUrl(builtin)) {
         hint = 'The destination names the MCP server\'s host and holds its credential; the URL above contributes only its path. '
             + (userContext
@@ -2599,11 +2650,195 @@ function syncDestinationFields(row) {
             : 'The destination holds an app-level credential (OAuth2ClientCredentials or a static URL.headers.Authorization).';
     }
     row.querySelector('.dest-hint').textContent = hint;
+    row.dataset.destHint = hint;
+    // The url may have become, or stopped being, builtin:odata: that changes
+    // which row is the agent's one odata entry.
+    syncODataRows();
+}
+
+// --- builtin:odata -----------------------------------------------------------
+// The entry of an agent is {services: [names], allow_write?: true} and nothing
+// else. The services themselves (destination, identity, entity sets, which
+// operations are enabled) are edited in the UI5 admin; this page only attaches
+// existing ones, so there is no free-text field for a name. Titles and
+// purposes are admin-written text: every node below is built with
+// createElement/textContent, never from an HTML string.
+//
+// state: 'loading' until the first answer, 'ok' with `items`, or 'error'.
+let odataCatalogue = {state: 'loading', items: []};
+let _odataLoadSeq = 0;
+
+/** Sets the catalogue (null = not known yet) and redraws every row's picker. */
+function setODataCatalogue(items, state) {
+    const clean = (Array.isArray(items) ? items : []).filter(s =>
+        s && typeof s === 'object' && typeof s.name === 'string' && s.name);
+    odataCatalogue = {state: state || (Array.isArray(items) ? 'ok' : 'loading'), items: clean};
+    document.querySelectorAll('#agent-mcp-servers .mcp-server-row').forEach(row =>
+        renderODataServiceOptions(row));
+    syncODataRows();
+}
+
+/** Fetches the catalogue when the agent editor opens. */
+async function loadODataCatalogue() {
+    const seq = ++_odataLoadSeq;
+    setODataCatalogue(null);
+    let items = null;
+    try {
+        const res = await api('/odata/services');
+        if (res.ok) {
+            const body = await res.json();
+            if (Array.isArray(body)) items = body;
+        }
+    } catch (e) { /* reported below, as a catalogue that could not be loaded */ }
+    // An answer for an editor that was opened again meanwhile is stale.
+    if (seq !== _odataLoadSeq) return;
+    if (items) setODataCatalogue(items);
+    else setODataCatalogue(null, 'error');
+}
+
+function storedODataServices(row) {
+    try {
+        const stored = JSON.parse(row.dataset.odataServices || '[]');
+        return Array.isArray(stored) ? stored.filter(n => typeof n === 'string') : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function pickedODataServices(row) {
+    return [...row.querySelector('.dest-services').options].filter(o => o.selected).map(o => o.value);
+}
+
+/** The catalogue as options, plus every picked name the catalogue lacks. */
+function renderODataServiceOptions(row, selected) {
+    const select = row.querySelector('.dest-services');
+    if (!select) return;
+    const picked = selected || pickedODataServices(row);
+    select.textContent = '';
+    const known = new Set();
+    odataCatalogue.items.forEach(s => {
+        if (known.has(s.name)) return;
+        known.add(s.name);
+        const opt = document.createElement('option');
+        opt.value = s.name;
+        opt.textContent = (s.title ? String(s.title) + ' (' + s.name + ')' : s.name)
+            + ' \u2014 ' + String(s.odata_version || '').toUpperCase()
+            + ' \u2014 runs as ' + (s.user_context === true ? 'signed-in user' : 'technical user')
+            + (s.enabled === false ? ' \u2014 disabled' : '');
+        if (s.purpose) opt.title = String(s.purpose);
+        opt.selected = picked.includes(s.name);
+        select.appendChild(opt);
+    });
+    // A stored name the catalogue no longer has is shown, not dropped: saving
+    // would otherwise detach it without a word. It is only called missing
+    // when the catalogue is actually known.
+    picked.forEach(name => {
+        if (known.has(name)) return;
+        known.add(name);
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = odataCatalogue.state === 'ok' ? name + ' (not in catalogue)' : name;
+        opt.selected = true;
+        select.appendChild(opt);
+    });
+    select.style.display = select.options.length ? '' : 'none';
+    syncODataNotes(row);
+}
+
+function odataSelectionChanged(row) {
+    syncODataNotes(row);
+}
+
+/** The lines under the picker: what the catalogue says about the selection. */
+function syncODataNotes(row) {
+    const note = row.querySelector('.dest-services-note');
+    const warning = row.querySelector('.dest-odata-warning');
+    if (!note || !warning) return;
+    const picked = pickedODataServices(row);
+    const byName = new Map(odataCatalogue.items.map(s => [s.name, s]));
+    const quoted = names => names.map(n => "'" + n + "'").join(', ');
+    const lines = [];
+    if (odataCatalogue.state === 'loading') {
+        lines.push('Loading the OData catalogue\u2026');
+    } else if (odataCatalogue.state === 'error') {
+        lines.push('The OData catalogue could not be loaded, so no service can be picked here. '
+            + 'Check the services in the UI5 admin (OData services) and open this agent again.'
+            + (picked.length ? ' The attached services are kept as they are.' : ''));
+    } else {
+        if (!odataCatalogue.items.length) {
+            lines.push('The OData catalogue is empty. Create a service in the UI5 admin (OData services) first; '
+                + 'this page only attaches existing ones.');
+        } else {
+            lines.push('Hold Ctrl (Cmd on a Mac) to pick more than one.');
+        }
+        const missing = picked.filter(n => !byName.has(n));
+        if (missing.length) {
+            lines.push('Not in the catalogue any more: ' + quoted(missing) + '. Deselect '
+                + (missing.length > 1 ? 'them' : 'it') + ' before saving; a save that names a deleted service is refused.');
+        }
+        const disabled = picked.filter(n => byName.has(n) && byName.get(n).enabled === false);
+        if (disabled.length) {
+            lines.push('Disabled in the catalogue: ' + quoted(disabled)
+                + '. It stays attached, but the agent cannot use it until it is enabled.');
+        }
+    }
+    note.textContent = '';
+    lines.forEach(text => {
+        const line = document.createElement('span');
+        line.style.display = 'block';
+        line.textContent = text;
+        note.appendChild(line);
+    });
+    // A run started through the API has no signed-in user, so a service that
+    // runs as one is refused there (error code no_user). Say it at the place
+    // where the service is picked.
+    const exposeApi = document.getElementById('agent-expose-api');
+    const asUser = picked.filter(n => byName.has(n) && byName.get(n).user_context === true)
+        .map(n => '"' + String(byName.get(n).title || n) + '"');
+    warning.textContent = exposeApi && exposeApi.checked && asUser.length
+        ? asUser.join(', ') + (asUser.length > 1 ? ' run' : ' runs') + ' as the signed-in user. '
+            + 'This agent is available via API (job runs), and such a run has no signed-in user, '
+            + 'so calls to ' + (asUser.length > 1 ? 'those services' : 'that service') + ' are refused there.'
+        : '';
+}
+
+/** An agent takes one builtin:odata entry: a second row offers no services. */
+function syncODataRows() {
+    let seen = false;
+    document.querySelectorAll('#agent-mcp-servers .mcp-server-row').forEach(row => {
+        if (!row.querySelector('.dest-services')) return;
+        if (destinationBuiltinOf(row) !== ODATA_BUILTIN) return;
+        const duplicate = seen;
+        seen = true;
+        row.querySelector('.dest-field-services').style.display = duplicate ? 'none' : '';
+        row.querySelector('.dest-field-allow_write').style.display = duplicate ? 'none' : '';
+        row.querySelector('.dest-hint').textContent = duplicate
+            ? 'This agent already has a builtin:odata entry, and an agent takes one. '
+                + 'Pick all its services in that entry and remove this row.'
+            : (row.dataset.destHint || '');
+        syncODataNotes(row);
+    });
+}
+
+/** The builtin:odata block: the picked services and, only when on, the write switch. */
+function collectODataConfig(row) {
+    const picked = pickedODataServices(row);
+    // Stored names keep their stored order; newly picked ones follow.
+    const services = storedODataServices(row).filter(n => picked.includes(n));
+    picked.forEach(n => { if (!services.includes(n)) services.push(n); });
+    if (!services.length) throw new Error('Select at least one OData service');
+    const oauth = {services};
+    // Only ever sent as the JSON boolean true; off means the key is absent.
+    if (row.querySelector('.dest-allow_write').checked) oauth.allow_write = true;
+    return oauth;
 }
 
 /** The config block for a destination server, shaped as the API stores it. */
 function collectDestinationConfig(row) {
     const builtin = destinationBuiltinOf(row);
+    // Before the generic branch: this entry has no destination name, and a
+    // leftover field of another built-in in the block is a 422.
+    if (builtin === ODATA_BUILTIN) return collectODataConfig(row);
     const wanted = destinationFieldsFor(builtin) || [];
     const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
     DESTINATION_TEXT_KEYS.forEach(k => {
