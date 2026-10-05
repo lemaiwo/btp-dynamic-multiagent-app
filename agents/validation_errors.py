@@ -40,12 +40,15 @@ What can still carry client text, and what is done about it:
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+
+from agents.loc_fields import UNKNOWN_FIELD, loc_field
+
+__all__ = ["UNKNOWN_FIELD", "encodable", "install_validation_handler", "validation_item"]
 
 
 def encodable(text: str) -> str:
@@ -58,19 +61,11 @@ _FIXED_MESSAGES = {
     "union_tag_invalid": "Input tag is not one of the expected values",
 }
 
-# What a location part may look like to be repeated: every field of the
-# request models does, and so does an honestly mistyped one.
-_LOC_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-UNKNOWN_FIELD = "<unknown field>"
-
-
 def _loc_part(part: Any) -> int | str:
     if isinstance(part, int) and not isinstance(part, bool):
         return part
-    # fullmatch: a trailing newline does not pass.
-    if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part):
-        return part
-    return UNKNOWN_FIELD
+    # A key is repeated only when it has the form of a field name.
+    return loc_field(part)
 
 
 def validation_item(err: dict[str, Any]) -> dict[str, Any]:

@@ -116,6 +116,9 @@ _DESTINATION_TEXT = (
     "(the application log has the reason)"
 )
 _UNREACHABLE_TEXT = "the OData service could not be reached"
+_FAILED_TEXT = (
+    "the $metadata preview failed unexpectedly; the application log has the reason"
+)
 _BUSY_TEXT = (
     "other $metadata previews are running; wait for them to finish and try again"
 )
@@ -570,7 +573,17 @@ def build_preview(parsed: ParsedMetadata, stored: dict[str, Any] | None = None) 
     service has and the document no longer declares, compared with
     everything the parser read, not with what is shown. When the parser
     itself stopped early (``parsed.truncated``) that cannot be known:
-    both lists are then empty and ``removed_complete`` is false.
+    ``removed_complete`` is then false and both lists, and their counts in
+    ``summary``, are ``None`` -- unknown, which is not the same as none.
+
+    A stored entity set that the document still declares but that the
+    parser left out (its key cannot be represented any more, say) is not
+    removed: it is listed in ``skipped_stored_entity_sets`` as ``{name,
+    reason}`` -- from what the parser read, so possibly incomplete when
+    ``removed_complete`` is false. Each ``skipped`` entry carries the
+    ``entity_type`` of its entity set (``""`` when unknown or not an EDM
+    name): a skipped property of a type that several sets share is listed
+    under the first of them only.
     """
     stored_sets = _stored_sets(stored) if stored is not None else None
     stored_operations = (
@@ -597,18 +610,32 @@ def build_preview(parsed: ParsedMetadata, stored: dict[str, Any] | None = None) 
     ]
     truncated = truncated or any(o["truncated"] for o in operations)
 
-    removed_sets: list[str] = []
-    removed_operations: list[str] = []
     removed_complete = not parsed.truncated
-    if stored_sets is not None and stored_operations is not None and removed_complete:
+    removed_sets: list[str] | None = [] if removed_complete else None
+    removed_operations: list[str] | None = [] if removed_complete else None
+    skipped_stored: list[dict[str, str]] = []
+    if stored_sets is not None and stored_operations is not None:
         in_document = {e.name for e in parsed.entity_sets}
-        removed_sets = [name for name in stored_sets if name not in in_document]
-        operations_in_document = {o.name for o in parsed.operations}
-        removed_operations = [
-            o["name"]
-            for o in _names((stored or {}).get("operations"))
-            if o["name"] not in operations_in_document
+        # Declared, but left out by the parser: the first reason per name.
+        left_out: dict[str, str] = {}
+        for entry in parsed.skipped:
+            if entry.kind == "entity_set" and entry.entity_set:
+                left_out.setdefault(entry.entity_set, entry.reason)
+        skipped_stored = [
+            {"name": name, "reason": left_out[name]}
+            for name in stored_sets
+            if name not in in_document and name in left_out
         ]
+        if removed_complete:
+            removed_sets = [
+                name for name in stored_sets if name not in in_document and name not in left_out
+            ]
+            operations_in_document = {o.name for o in parsed.operations}
+            removed_operations = [
+                o["name"]
+                for o in _names((stored or {}).get("operations"))
+                if o["name"] not in operations_in_document
+            ]
     return {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "entity_sets": entity_sets,
@@ -619,29 +646,36 @@ def build_preview(parsed: ParsedMetadata, stored: dict[str, Any] | None = None) 
                 "entity_set": s.entity_set,
                 "position": s.position,
                 "reason": s.reason,
+                "entity_type": s.entity_type,
             }
             for s in parsed.skipped[:MAX_PREVIEW_SKIPPED]
         ],
         "removed_entity_sets": removed_sets,
         "removed_operations": removed_operations,
         "removed_complete": removed_complete,
+        "skipped_stored_entity_sets": skipped_stored,
         "summary": {
             "entity_sets": len(entity_sets),
             "operations": len(operations),
             "in_service": sum(1 for e in entity_sets if e["status"] == "in_service"),
             "changed": sum(1 for e in entity_sets if e["status"] == "changed"),
             "skipped": len(parsed.skipped),
-            "removed_entity_sets": len(removed_sets),
-            "removed_operations": len(removed_operations),
+            "removed_entity_sets": None if removed_sets is None else len(removed_sets),
+            "removed_operations": (
+                None if removed_operations is None else len(removed_operations)
+            ),
+            "skipped_stored_entity_sets": len(skipped_stored),
         },
         "truncated": truncated,
         # Of the whole document. When the parser stopped early these count
-        # the declared ELEMENTS (also ones it would have skipped).
+        # the declared ELEMENTS (also ones it would have skipped) -- but
+        # never fewer than were read: one V4 action is one element however
+        # many imports make an operation of it.
         "totals": {
-            "entity_sets": parsed.entity_sets_declared
+            "entity_sets": max(parsed.entity_sets_declared, len(parsed.entity_sets))
             if parsed.truncated
             else len(parsed.entity_sets),
-            "operations": parsed.operations_declared
+            "operations": max(parsed.operations_declared, len(parsed.operations))
             if parsed.truncated
             else len(parsed.operations),
             "skipped": len(parsed.skipped),
@@ -729,10 +763,18 @@ async def run_preview(
                 # request has long been answered or dropped.
                 job.add_done_callback(_release)
                 answer = await asyncio.shield(job)
+        except PreviewError:
+            raise
         except TimeoutError:
             raise _timed_out() from None
         except MetadataError as exc:  # fixed texts that never quote the document
             raise PreviewError(422, "invalid_metadata", str(exc)) from None
+        except Exception as exc:
+            # A defect, in the parse thread or here. Its text may quote the
+            # document or a URL: the type is logged, a fixed text answered,
+            # and the refusal below writes the preview's log line.
+            logger.error("odata metadata: preview failed (%s)", type(exc).__name__)
+            raise PreviewError(500, "preview_failed", _FAILED_TEXT) from None
         finally:
             if job is None:
                 _active -= 1

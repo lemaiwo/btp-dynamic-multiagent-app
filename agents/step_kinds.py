@@ -55,6 +55,8 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from agents.loc_fields import loc_field
+
 logger = logging.getLogger(__name__)
 
 AGENT_KIND = "agent"
@@ -268,15 +270,10 @@ CONFIG_MODELS: dict[str, type[BaseModel]] = {
 }
 
 
-_LOC_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-
-
 def _loc_part(part: Any) -> str:
     if isinstance(part, int) and not isinstance(part, bool):
         return str(part)
-    if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part):
-        return part
-    return "<unknown field>"
+    return loc_field(part)
 
 
 def _describe_validation_error(e: ValidationError) -> str:

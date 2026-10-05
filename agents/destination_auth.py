@@ -125,6 +125,8 @@ class DestinationAuth(httpx.Auth):
         self.expected_hosts = tuple(h.lower() for h in expected_hosts)
         self.server_key = server_key or "destination"
         self._proxy_noted = False
+        # Where `_apply` last pointed a request; see `_shape`.
+        self._applied: httpx.URL | None = None
 
     @property
     def destination_name(self) -> str:
@@ -201,6 +203,7 @@ class DestinationAuth(httpx.Auth):
             request.headers["Host"] = target.netloc.decode("ascii")
         for key, value in destination.headers.items():
             request.headers[key] = value
+        self._applied = request.url
 
     def send_through(self, request: httpx.Request, destination: Destination) -> None:
         """Shape ``request`` for ``destination``, just before it is sent.
@@ -210,15 +213,41 @@ class DestinationAuth(httpx.Auth):
         destination first (raise a :class:`DestinationError`; nothing is
         sent), must call ``super().send_through(...)`` to get the URL
         rewrite, the https and host rules and the destination's headers,
-        and may pin headers of its own afterwards.
+        and may pin headers of its own afterwards. It does not decide where
+        the request goes: the flow sends only a request that still points
+        at the scheme, host and port those rules chose (``_shape``).
         """
         self._apply(request, destination)
+
+    def _shape(self, request: httpx.Request, destination: Destination) -> None:
+        """``send_through``, then the check that it left the target alone.
+
+        The https and host rules run inside ``_apply``. An override that
+        never reaches it, or that moves the request afterwards, would send
+        the destination's credential past them, so such a request is not
+        sent. No ``await`` lies between the two steps: ``_applied`` cannot
+        be another request's.
+        """
+        self._applied = None
+        self.send_through(request, destination)
+        applied, self._applied = self._applied, None
+        url = request.url
+        if applied is None or (url.scheme, url.host, url.port) != (
+            applied.scheme,
+            applied.host,
+            applied.port,
+        ):
+            raise DestinationError(
+                f"{self.server_key}: the request for destination "
+                f"{self.destination_name!r} does not point where the destination "
+                f"rules put it; refusing to send"
+            )
 
     # -- the flow -----------------------------------------------------------
     async def async_auth_flow(self, request):  # type: ignore[override]
         token, principal = self._user()
         destination = await self._resolve(token, principal)
-        self.send_through(request, destination)
+        self._shape(request, destination)
         response = yield request
 
         if response.status_code == 401 and self.retry_on_401:
@@ -231,7 +260,7 @@ class DestinationAuth(httpx.Auth):
             else:
                 self._resolver.invalidate()
             destination = await self._resolve(token, principal, force=True)
-            self.send_through(request, destination)
+            self._shape(request, destination)
             yield request
 
     def sync_auth_flow(self, request):  # type: ignore[override]

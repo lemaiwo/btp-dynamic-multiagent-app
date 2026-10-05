@@ -60,11 +60,10 @@ from agents.db import (
 )
 from agents.odata import preview
 from agents.odata.models import (
-    _LOC_FIELD_RE,
-    _UNKNOWN_FIELD,
     DESTINATION_NAME_RE,
     MAX_DEFINITION_BYTES,
     SERVICE_NAME_RE,
+    loc_path,
 )
 from agents.odata.urls import confine_service_path
 
@@ -212,16 +211,8 @@ def _body_loc(parts: tuple[Any, ...]) -> str:
     """Where a refused body field is. A key is the client's own text -- an
     unknown key arrives here like any other, and a URL pasted where a key
     belongs would come back -- so it is named only when it has the form of
-    a field name; the rule of ``agents.odata.models._loc``."""
-    shown = [
-        str(part)
-        if isinstance(part, int) and not isinstance(part, bool)
-        else part
-        if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part)
-        else _UNKNOWN_FIELD
-        for part in parts
-    ]
-    return ".".join(shown) or "body"
+    a field name; the rule of ``agents.loc_fields``."""
+    return loc_path(parts, "body")
 
 
 def _model_body(model: type[_Body], data: dict[str, Any]) -> _Body:
@@ -535,8 +526,15 @@ async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
 
     Answer (``preview.build_preview``): ``{fetched_at, entity_sets,
     operations, skipped, removed_entity_sets, removed_operations,
-    removed_complete, summary, truncated, totals, warnings}``: names,
-    types and labels. What the service DECLARES sits under ``declared``
+    removed_complete, skipped_stored_entity_sets, summary, truncated,
+    totals, warnings}``: names, types and labels. ``removed_entity_sets``,
+    ``removed_operations`` and their counts in ``summary`` are ``null``
+    when ``removed_complete`` is false (the document was not read to its
+    end: unknown, not none). ``skipped_stored_entity_sets`` (``{name,
+    reason}``) are stored entity sets the document still declares but the
+    parser left out; they are not "removed". A ``skipped`` entry is
+    ``{kind, entity_set, position, reason, entity_type}``. What the
+    service DECLARES sits under ``declared``
     (per field: ``filterable`` / ``creatable`` / ``updatable``; per entity
     set: ``creatable`` / ``updatable`` / ``deletable``), and an operation's
     ``suggested: {changes_data, known}`` is a suggestion (``known`` false:
@@ -561,7 +559,8 @@ async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
     ``not_xml`` (a sign-in page, a compressed answer), ``too_large``; 504
     ``timeout`` (fetch plus parse, ``preview.PREVIEW_BUDGET_SECONDS``); 422
     ``invalid_metadata`` (the parser's fixed text, e.g. a version mismatch
-    or a document over its work budget).
+    or a document over its work budget); 500 ``preview_failed`` (a defect:
+    fixed text, the exception's type in the log).
 
     ``preview.run_preview`` writes the one log line: what was asked, the
     caller's principal, how the destination was resolved, the outcome,

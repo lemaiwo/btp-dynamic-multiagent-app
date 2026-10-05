@@ -712,3 +712,89 @@ async def test_graph_caches_drop_expired_entries_on_insert():
     for cache in (outlook._folders, teams._channels):
         assert [k[0] for k in cache] == ["alice@example.com", "bob@example.com"]
     assert bob_old not in outlook._folders
+
+
+# ---------------------------------------------------------------------------
+# `send_through` is a hook AROUND the destination being applied: whatever an
+# override does, the request leaves for the host and scheme the destination
+# rules chose, or not at all.
+# ---------------------------------------------------------------------------
+
+from agents.destination_auth import PLACEHOLDER_BASE, DestinationAuth  # noqa: E402
+
+
+async def _send_with(auth_class, recorder, **options):
+    resolver = FakeResolver("https://api.example.com/base")
+    auth = auth_class(resolver, server_key="builtin:test", **options)
+    async with httpx.AsyncClient(
+        base_url=PLACEHOLDER_BASE, auth=auth, transport=recorder.transport()
+    ) as http:
+        return await http.get("/v1/things")
+
+
+async def test_an_override_may_pin_headers_after_the_destination_is_applied():
+    class Pinned(DestinationAuth):
+        def send_through(self, request, destination):
+            super().send_through(request, destination)
+            request.headers["Accept"] = "application/xml"
+
+    recorder = Recorder(lambda request: httpx.Response(200))
+    assert (await _send_with(Pinned, recorder)).status_code == 200
+    (sent,) = recorder.requests
+    assert str(sent.url) == "https://api.example.com/base/v1/things"
+    assert sent.headers["Authorization"] == "Bearer dest-token"
+    assert sent.headers["Accept"] == "application/xml"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda url: url.copy_with(host="elsewhere.example.org"),
+        lambda url: url.copy_with(scheme="http"),
+        lambda url: url.copy_with(port=8443),
+    ],
+    ids=["host", "scheme", "port"],
+)
+async def test_an_override_cannot_send_the_credential_somewhere_else(change):
+    class Moved(DestinationAuth):
+        def send_through(self, request, destination):
+            super().send_through(request, destination)
+            request.url = change(request.url)
+
+    recorder = Recorder(lambda request: httpx.Response(200))
+    with pytest.raises(DestinationError, match="refusing to send") as caught:
+        await _send_with(Moved, recorder)
+    assert recorder.requests == []
+    assert "example" not in str(caught.value)  # names no host
+
+
+async def test_an_override_that_never_applies_the_destination_sends_nothing():
+    class Skipped(DestinationAuth):
+        def send_through(self, request, destination):
+            request.headers["Authorization"] = "Bearer of-its-own"
+
+    recorder = Recorder(lambda request: httpx.Response(200))
+    with pytest.raises(DestinationError, match="refusing to send"):
+        await _send_with(Skipped, recorder)
+    assert recorder.requests == []
+
+
+async def test_the_retry_after_a_401_is_checked_like_the_first_attempt():
+    class MovedOnRetry(DestinationAuth):
+        attempts = 0
+
+        def send_through(self, request, destination):
+            super().send_through(request, destination)
+            self.attempts += 1
+            if self.attempts == 2:
+                request.url = request.url.copy_with(host="elsewhere.example.org")
+
+    hosts: list[str] = []  # at the moment of sending: the request object is reused
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(401)
+
+    with pytest.raises(DestinationError, match="refusing to send"):
+        await _send_with(MovedOnRetry, Recorder(refuse))
+    assert hosts == ["api.example.com"]

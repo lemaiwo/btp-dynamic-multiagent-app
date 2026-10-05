@@ -35,6 +35,8 @@ from pydantic import (
     model_validator,
 )
 
+from agents.loc_fields import loc_field
+
 from .urls import confine_service_path
 
 SERVICE_NAME_RE = r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"  # the slug agents and server entries use
@@ -55,10 +57,9 @@ MAX_DEFINITION_BYTES = 2_000_000
 # URL allows: no '/', '?', '#', '%', whitespace or parentheses.
 # Used with `fullmatch`: Python's `$` would also accept a trailing "\n".
 _ENTITY_PATH_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
-# How many problems one refusal lists, and how long one `loc` part may be
-# (a `loc` part can be an unknown key, i.e. text the caller typed).
+# How many problems one refusal lists. (How a `loc` part is shown -- it can
+# be an unknown key, i.e. text the caller typed -- is `agents.loc_fields`.)
 _MAX_REPORTED_ERRORS = 20
-_MAX_LOC_PART = 64
 
 EdmName = Annotated[str, StringConstraints(pattern=EDM_NAME_RE)]
 EdmType = Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -360,10 +361,17 @@ class ODataServicePayload(_Model):
         return self.definition.has_write()
 
 
-# What a location part may look like to be repeated: every field of the
-# models above does, and so does an honestly mistyped one.
-_LOC_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,%d}" % (_MAX_LOC_PART - 1))
-_UNKNOWN_FIELD = "<unknown field>"
+def loc_path(parts: tuple[Any, ...], root: str) -> str:
+    """Where a problem is, as ``a.0.b``; ``root`` when it is the whole input.
+
+    A list index is repeated as it is, a key only when it has the form of a
+    field name (``agents.loc_fields``: the one rule of every gate).
+    """
+    shown = [
+        str(part) if isinstance(part, int) and not isinstance(part, bool) else loc_field(part)
+        for part in parts
+    ]
+    return ".".join(shown) or root
 
 
 def _loc(parts: tuple[Any, ...]) -> str:
@@ -376,15 +384,7 @@ def _loc(parts: tuple[Any, ...]) -> str:
     (`fullmatch`: a trailing newline does not pass); anything else is
     ``<unknown field>``.
     """
-    shown = [
-        str(part)
-        if isinstance(part, int) and not isinstance(part, bool)
-        else part
-        if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part)
-        else _UNKNOWN_FIELD
-        for part in parts
-    ]
-    return ".".join(shown) or "service"
+    return loc_path(parts, "service")
 
 
 def validate_odata_service(data: dict[str, Any]) -> dict[str, Any]:

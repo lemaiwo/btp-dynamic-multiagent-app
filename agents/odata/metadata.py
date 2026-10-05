@@ -63,7 +63,9 @@ document text); one odd element does not make the whole service unreadable.
 A skipped PROPERTY of a type that several entity sets share is recorded once,
 under the first entity set of the result that has the type; a skipped
 navigation is recorded per set (its target depends on the set). Positions
-are relative to the set's type chain.
+are relative to the set's type chain. Every entry also names the set's
+entity type (``SkippedElement.entity_type``), which is what explains a
+field that is missing from the OTHER sets of that type.
 
 A remote system chooses this document, so the work it can cause is bounded
 here and not by its size alone: fields and keys are built once per entity
@@ -73,6 +75,25 @@ only counted: ``ParsedMetadata.truncated``, ``entity_sets_declared``,
 ``operations_declared``), and one budget (``MAX_PARSE_WORK``: properties,
 navigations, parameters and skipped entries examined) ends the parse with a
 fixed-text ``MetadataError`` instead of letting it run on.
+
+The budget is charged where the work happens, so that one unit never hides
+a scan whose size the document chooses. The rules the code keeps to:
+
+* An element's children are never searched with ``find`` / ``findall``:
+  ``_Work.kids`` groups them by tag once per element (linear in the
+  document, like reading it), and every later lookup is a dict access.
+* What is read of ONE element -- a property's name, type, label and
+  annotations, a navigation's association and end, an import's label -- is
+  read once and kept, however many derived types, entity sets or overloads
+  come back to it. The per-set and per-type loops then only combine those
+  results, one unit per item.
+* A lookup that returns a list (annotations of a term for a target, the
+  values of a restriction record, its property paths, the parts of a key)
+  costs one unit per item returned, each time it is asked.
+* A string that many elements share (a namespace, a container or type
+  name, a role) is charged by its length where it is copied into a target
+  or compared again: ``_Work.spend_text``, nothing for the first
+  ``_TEXT_UNIT`` characters, so a real document pays nothing here.
 
 ``parse_metadata`` is synchronous CPU work (up to ``MAX_METADATA_BYTES`` of
 XML): a route or tool must call it through ``asyncio.to_thread`` and not on
@@ -85,7 +106,7 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 from xml.parsers import expat
 
@@ -121,6 +142,9 @@ _TEXT_ELEMENTS = frozenset({"String", "Bool", "PropertyPath"})
 # would be a value the document never gave ("false" followed by padding
 # would read as false).
 _MAX_TEXT_CHARS = 1024
+# `_Work.spend_text`: one unit of the budget per this many characters of a
+# shared string that is copied or compared once more.
+_TEXT_UNIT = 4096
 
 _DTD_RE = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
 _NAME_RE = re.compile(EDM_NAME_RE)
@@ -174,6 +198,21 @@ _TERM_FILTER = f"{_CAPABILITIES}.FilterRestrictions"
 _TERM_OPTIONAL = f"{_CORE}.OptionalParameter"
 _TERM_COMPUTED = f"{_CORE}.Computed"
 _TERM_IMMUTABLE = f"{_CORE}.Immutable"
+# Last segment of every term the parser reads -> (vocabulary, full name).
+# An annotation with any other term is never looked at again.
+_TERMS = {
+    term.rpartition(".")[2]: (term.rpartition(".")[0], term)
+    for term in (
+        _TERM_LABEL,
+        _TERM_INSERT,
+        _TERM_UPDATE,
+        _TERM_DELETE,
+        _TERM_FILTER,
+        _TERM_OPTIONAL,
+        _TERM_COMPUTED,
+        _TERM_IMMUTABLE,
+    )
+}
 
 
 class MetadataError(ValueError):
@@ -235,12 +274,19 @@ class SkippedElement:
     property of a type that several entity sets share is recorded once
     (under the first set of the result with that type), a navigation once
     per set; the position is relative to the set's type chain.
+
+    ``entity_type`` is the entity type of that set (for kind ``entity_set``
+    the element's own), given only when it has the form of an EDM name, else
+    ``""``; always ``""`` for an operation. It explains, it does not
+    identify: two entries are equal when kind, entity set, position and
+    reason are.
     """
 
     kind: str  # "entity_set" | "property" | "navigation" | "operation"
     entity_set: str  # the owning (or, for kind "entity_set", the own) set; "" when none or invalid
     position: int  # 1-based, see SKIP_REASONS for what is counted
     reason: str  # one of SKIP_REASONS
+    entity_type: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -270,6 +316,46 @@ class _Work:
     def __init__(self) -> None:
         self.spent = 0
         self.truncated = False
+        # id(element) -> its children by tag. The elements live as long as
+        # the tree, which outlives every use of this object.
+        self._kids: dict[int, dict[str, list[ET.Element]]] = {}
+        self._labels: dict[str, str] = {}
+
+    def kids(self, element: ET.Element | None, tag: str) -> list[ET.Element] | tuple[()]:
+        """The children of ``element`` with that tag, in document order.
+
+        Grouped once per element and not charged: that is one pass over
+        children the tree builder has already made, and it happens once.
+        The caller pays for the items it then looks at.
+        """
+        if element is None or not len(element):
+            return ()
+        index = self._kids.get(id(element))
+        if index is None:
+            index = self._kids[id(element)] = {}
+            for child in element:
+                index.setdefault(child.tag, []).append(child)
+        return index.get(tag, ())
+
+    def first(self, element: ET.Element | None, tag: str) -> ET.Element | None:
+        found = self.kids(element, tag)
+        return found[0] if found else None
+
+    def label(self, text: str | None) -> str:
+        """``_clean_label``, once per distinct text."""
+        if not text:
+            return ""
+        known = self._labels.get(text)
+        if known is None:
+            known = self._labels[text] = _clean_label(text)
+        return known
+
+    def spend_text(self, *texts: str) -> None:
+        """Charge for strings that many elements share and that are copied
+        or compared once more: one unit per ``_TEXT_UNIT`` characters."""
+        units = sum(len(text) for text in texts) // _TEXT_UNIT
+        if units:
+            self.spend(units)
 
     def spend(self, units: int = 1) -> None:
         self.spent += units
@@ -407,19 +493,37 @@ def _clean_label(text: str | None) -> str:
 
     Format characters (category Cf: bidi overrides and isolates, zero-width
     characters, BOM) are dropped: in an admin table they can reorder or hide
-    what the line says. Other control characters become a space.
+    what the line says. Other control characters become a space, and runs
+    of white space one space. Reading stops with the character that fills
+    ``MAX_LABEL_CHARS``: the rest of a long text decides nothing.
     """
-    text = "".join(
-        " " if unicodedata.category(ch) == "Cc" else ch
-        for ch in text or ""
-        if unicodedata.category(ch) != "Cf"
-    )
-    return " ".join(text.split())[:MAX_LABEL_CHARS]
+    out: list[str] = []
+    gap = False
+    for ch in text or "":
+        category = unicodedata.category(ch)
+        if category == "Cf":
+            continue
+        if category == "Cc" or ch.isspace():
+            gap = bool(out)
+            continue
+        if gap:
+            out.append(" ")
+            gap = False
+        out.append(ch)
+        if len(out) >= MAX_LABEL_CHARS:
+            break
+    return "".join(out)[:MAX_LABEL_CHARS]
 
 
-def _label(element: ET.Element | None) -> str:
+def _label(element: ET.Element | None, work: _Work) -> str:
     """The ``sap:label`` of a V2 element."""
-    return "" if element is None else _clean_label(element.get("label"))
+    return "" if element is None else work.label(element.get("label"))
+
+
+def _safe_type(entity_type: str) -> str:
+    """An entity type name for a skipped entry: only when it has the form
+    of an EDM name, like every other text such an entry carries."""
+    return entity_type if _NAME_RE.fullmatch(entity_type) else ""
 
 
 def _name(element: ET.Element) -> str | None:
@@ -460,17 +564,24 @@ class _Schemas:
         # id(element) -> canonical name, for entity types and containers. The
         # elements live as long as the tree, which outlives this object's use.
         self._names: dict[int, str] = {}
-        self._namespaces: list[str] = []
-        self._aliases: list[tuple[str, str]] = []
+        self._namespaces: set[str] = set()
+        # Alias -> namespace; of two schemas with one alias the first counts.
+        self._aliases: dict[str, str] = {}
+        # Up to the last dot of a reference -> how `canonical` rewrites it.
+        self._prefixes: dict[str, tuple[int, str] | None] = {}
         for schema in schemas:
             namespace = (schema.get("Namespace") or "").strip()
             alias = (schema.get("Alias") or "").strip()
             prefixes = [p for p in (namespace, alias) if p]
             if namespace:
-                self._namespaces.append(namespace)
+                self._namespaces.add(namespace)
                 if alias:
-                    self._aliases.append((alias, namespace))
+                    self._aliases.setdefault(alias, namespace)
+            # The schema's names are copied into every name below.
+            shared = (len(namespace) + len(alias)) // _TEXT_UNIT
             for child in schema:
+                if shared:
+                    self.work.spend(shared)
                 if child.tag == "EntityContainer":
                     self.containers.append(child)
                     container = child.get("Name") or ""
@@ -487,9 +598,7 @@ class _Schemas:
                     self._names[id(child)] = canonical
                 for prefix in prefixes or [""]:
                     table.setdefault(f"{prefix}.{name}" if prefix else name, (canonical, child))
-        # Longest first, so that a namespace which extends another one wins.
-        self._namespaces.sort(key=len, reverse=True)
-        self._aliases.sort(key=lambda pair: len(pair[0]), reverse=True)
+        self._longest = max(map(len, (*self._namespaces, *self._aliases)), default=0)
 
     def name_of(self, element: ET.Element | None) -> str:
         """The canonical name of an entity type or container of the document."""
@@ -499,15 +608,49 @@ class _Schemas:
         """A qualified name with a schema alias replaced by its namespace.
 
         Purely textual, so it also serves names that have no lookup table
-        here (actions, functions, containers).
+        here (actions, functions, containers). A name that starts with a
+        schema's namespace is left alone; otherwise the longest alias it
+        starts with is replaced. Both depend only on the name up to its
+        last dot, so the answer is worked out once per such prefix and not
+        by trying every schema for every reference.
         """
         ref = (ref or "").strip()
-        if any(ref.startswith(f"{namespace}.") for namespace in self._namespaces):
+        cut = ref.rfind(".")
+        if cut < 0:
             return ref
-        for alias, namespace in self._aliases:
-            if ref.startswith(f"{alias}."):
-                return namespace + ref[len(alias) :]
-        return ref
+        prefix = ref[:cut]
+        if prefix in self._prefixes:
+            found = self._prefixes[prefix]
+        else:
+            found = self._prefixes[prefix] = self._resolve_prefix(prefix)
+        if found is None:
+            return ref
+        length, namespace = found
+        self.work.spend_text(namespace)
+        return namespace + ref[length:]
+
+    def _resolve_prefix(self, prefix: str) -> tuple[int, str] | None:
+        """``(alias length, namespace)`` for a prefix that starts with an
+        alias and with no namespace; else ``None``. Every head of the prefix
+        that ends at a dot (or is all of it) is tried, shortest first, one
+        unit each plus its length."""
+        found: tuple[int, str] | None = None
+        end = prefix.find(".")
+        while True:
+            stop = len(prefix) if end < 0 else end
+            if stop > self._longest:
+                break
+            self.work.spend(1 + stop // _TEXT_UNIT)
+            head = prefix[:stop]
+            if head in self._namespaces:
+                return None
+            namespace = self._aliases.get(head)
+            if namespace is not None:
+                found = (stop, namespace)  # a longer alias replaces a shorter one
+            if end < 0:
+                break
+            end = prefix.find(".", end + 1)
+        return found
 
     def entity_type(self, ref: str | None) -> tuple[str, ET.Element] | None:
         return self.entity_types.get((ref or "").strip())
@@ -548,19 +691,23 @@ class _SetDraft:
     container: ET.Element
     type_element: ET.Element | None
     entity_type: str
+    safe_type: str  # `entity_type` for a skipped entry, see `_safe_type`
     chain: list[ET.Element]
     fields: tuple[ParsedField, ...]
     keys: tuple[KeyDef, ...]
 
 
-# (type chain, entity set name, container, EntitySet element) -> fields, skipped
+# (type chain, entity set name, container, EntitySet element) -> the fields,
+# and (position, reason) for each property that was left out.
 _FieldsOf = Callable[
     [list[ET.Element], str, ET.Element, ET.Element],
-    tuple[tuple[ParsedField, ...], list[SkippedElement]],
+    tuple[tuple[ParsedField, ...], list[tuple[int, str]]],
 ]
 
 
-def _keys(chain: list[ET.Element], fields: tuple[ParsedField, ...]) -> tuple[KeyDef, ...] | None:
+def _keys(
+    chain: list[ET.Element], fields: tuple[ParsedField, ...], work: _Work
+) -> tuple[KeyDef, ...] | None:
     """The key, ``()`` for a type that declares none, ``None`` when it cannot be represented.
 
     A key part must be one of the parsed fields: a part that names no
@@ -570,10 +717,13 @@ def _keys(chain: list[ET.Element], fields: tuple[ParsedField, ...]) -> tuple[Key
     """
     types = {f.name: f.type for f in fields}
     for entity_type in chain:  # the key is declared once, on the root of the hierarchy
-        key = entity_type.find("Key")
+        key = work.first(entity_type, "Key")
         if key is None:
             continue
-        names = list(dict.fromkeys(ref.get("Name") or "" for ref in key.findall("PropertyRef")))
+        refs = work.kids(key, "PropertyRef")
+        # A base type's key is read again for every type derived from it.
+        work.spend(len(refs))
+        names = list(dict.fromkeys(ref.get("Name") or "" for ref in refs))
         if any(name not in types for name in names):
             return None
         return tuple(KeyDef(name=name, type=types[name]) for name in names)
@@ -591,50 +741,68 @@ def _entity_set_drafts(
     At most ``MAX_PARSED_ENTITY_SETS`` are built; the elements after that
     are counted only (``schemas.work.truncated``). The key is worked out
     once per entity type: every variant of a type's fields has the same
-    names and types.
+    names and types. A set of a type whose key is already known to be
+    unusable is skipped without reading anything else of it -- such a set
+    is never kept, so nothing stops a document from repeating it.
     """
+    work = schemas.work
     drafts: dict[str, _SetDraft] = {}
     key_memo: dict[int, tuple[KeyDef, ...] | None] = {}
-    declared = sum(len(container.findall("EntitySet")) for container in schemas.containers)
+    declared = sum(len(work.kids(container, "EntitySet")) for container in schemas.containers)
     position = 0
     for container in schemas.containers:
-        for element in container.findall("EntitySet"):
+        for element in work.kids(container, "EntitySet"):
             if len(drafts) >= MAX_PARSED_ENTITY_SETS:
-                schemas.work.truncated = True
+                work.truncated = True
                 return drafts, declared
             position += 1
             name = _name(element)
             if name is None:
                 skipped.append(SkippedElement("entity_set", "", position, "invalid_name"))
                 continue
-            if name in drafts:
-                skipped.append(SkippedElement("entity_set", name, position, "duplicate_name"))
-                continue
             resolved = schemas.entity_type(element.get("EntityType"))
             entity_type = schemas.canonical_type(element.get("EntityType"))
+            if name in drafts:
+                skipped.append(
+                    SkippedElement(
+                        "entity_set", name, position, "duplicate_name", _safe_type(entity_type)
+                    )
+                )
+                continue
             if len(entity_type) > _MAX_TYPE_CHARS:
                 skipped.append(SkippedElement("entity_set", name, position, "invalid_type"))
                 continue
+            safe_type = _safe_type(entity_type)
+            unusable = SkippedElement(
+                "entity_set", name, position, "unrepresentable_key", safe_type
+            )
             # A set whose type is not in the document is still listed (empty),
             # so the admin sees it exists instead of wondering where it went.
             chain = schemas.chain(resolved[1]) if resolved else []
-            fields, skipped_fields = fields_of(chain, name, container, element)
             memo_key = id(chain[-1]) if chain else 0
+            if key_memo.get(memo_key, _NO_KEY_MEMO) is None:
+                skipped.append(unusable)
+                continue
+            fields, skipped_fields = fields_of(chain, name, container, element)
             keys = key_memo.get(memo_key, _NO_KEY_MEMO)  # type: ignore[assignment]
             if keys is _NO_KEY_MEMO:
-                schemas.work.spend(len(fields))
-                keys = key_memo[memo_key] = _keys(chain, fields)
+                work.spend(len(fields))
+                keys = key_memo[memo_key] = _keys(chain, fields, work)
             if keys is None:
                 # One entry for the whole set; its properties are not listed.
-                skipped.append(SkippedElement("entity_set", name, position, "unrepresentable_key"))
+                skipped.append(unusable)
                 continue
-            skipped.extend(skipped_fields)
+            skipped.extend(
+                SkippedElement("property", name, at, reason, safe_type)
+                for at, reason in skipped_fields
+            )
             drafts[name] = _SetDraft(
                 name=name,
                 element=element,
                 container=container,
                 type_element=resolved[1] if resolved else None,
                 entity_type=entity_type,
+                safe_type=safe_type,
                 chain=chain,
                 fields=fields,
                 keys=keys,
@@ -653,100 +821,154 @@ def _sets_by_type(drafts: dict[str, _SetDraft]) -> dict[str, list[str]]:
 # ------------------------------------------------------------------------- V2
 
 
-def _v2_fields(
-    chain: list[ET.Element], set_name: str, work: _Work
-) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
-    fields: dict[str, ParsedField] = {}
-    skipped: list[SkippedElement] = []
-    position = 0
-    for entity_type in chain:
-        for prop in entity_type.findall("Property"):
-            work.spend()
-            position += 1
-            name, type_name = _name(prop), _type_name(prop)
-            if name is None or type_name is None:
-                reason = "invalid_name" if name is None else "invalid_type"
-                skipped.append(SkippedElement("property", set_name, position, reason))
-                continue
-            fields.setdefault(
-                name,
-                ParsedField(
-                    name=name,
-                    type=type_name,
-                    label=_label(prop),
-                    filterable=_flag(prop, "filterable"),
-                    creatable=_flag(prop, "creatable"),
-                    updatable=_flag(prop, "updatable"),
-                    nullable=(prop.get("Nullable") or "").strip().lower() != "false",
-                ),
-            )
-    return tuple(fields.values()), skipped
+def _v2_property(prop: ET.Element, work: _Work) -> ParsedField | str:
+    """One ``Property`` as a field, or the reason code it is skipped for."""
+    name, type_name = _name(prop), _type_name(prop)
+    if name is None or type_name is None:
+        return "invalid_name" if name is None else "invalid_type"
+    return ParsedField(
+        name=name,
+        type=type_name,
+        label=_label(prop, work),
+        filterable=_flag(prop, "filterable"),
+        creatable=_flag(prop, "creatable"),
+        updatable=_flag(prop, "updatable"),
+        nullable=(prop.get("Nullable") or "").strip().lower() != "false",
+    )
 
 
 def _v2_fields_of(work: _Work) -> _FieldsOf:
-    """``_v2_fields`` once per entity type. In V2 a field depends on its
-    type alone, so the sets of one type share one tuple; the type's skipped
-    properties are handed out with the first of them only."""
+    """The fields of a type chain, once per entity type. In V2 a field
+    depends on its type alone, so the sets of one type share one tuple; the
+    type's skipped properties are handed out with the first of them only.
+    Each ``Property`` element is read once, by the type that declares it;
+    a derived type only walks over what its base types already gave."""
     memo: dict[int, tuple[ParsedField, ...]] = {}
+    own: dict[int, list[ParsedField | str]] = {}
 
     def fields_of(
-        chain: list[ET.Element], name: str, _container: ET.Element, _element: ET.Element
-    ) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
+        chain: list[ET.Element], _name: str, _container: ET.Element, _element: ET.Element
+    ) -> tuple[tuple[ParsedField, ...], list[tuple[int, str]]]:
         if not chain:
             return (), []
         known = memo.get(id(chain[-1]))
         if known is not None:
             return known, []
-        fields, skipped = _v2_fields(chain, name, work)
-        memo[id(chain[-1])] = fields
-        return fields, skipped
+        fields: dict[str, ParsedField] = {}
+        skipped: list[tuple[int, str]] = []
+        position = 0
+        for entity_type in chain:
+            declared = own.get(id(entity_type))
+            if declared is None:
+                declared = own[id(entity_type)] = [
+                    _v2_property(prop, work) for prop in work.kids(entity_type, "Property")
+                ]
+            for parsed in declared:
+                work.spend()
+                position += 1
+                if isinstance(parsed, str):
+                    skipped.append((position, parsed))
+                else:
+                    fields.setdefault(parsed.name, parsed)
+        memo[id(chain[-1])] = tuple(fields.values())
+        return memo[id(chain[-1])], skipped
 
     return fields_of
 
 
+# One `NavigationProperty` as its type declares it: `None` for a name that
+# is not usable, else (name, association, from role, to many) -- with
+# association `None` when the relationship or its `ToRole` end is unknown.
+_V2Nav = tuple[str, str | None, str, bool] | None
+
+
+def _v2_own_navigations(schemas: _Schemas) -> Callable[[ET.Element], list[_V2Nav]]:
+    """The navigation properties an entity type declares, read once per
+    type; and each association's ends by role, read once per association
+    (the first end of a role counts)."""
+    work = schemas.work
+    own: dict[int, list[_V2Nav]] = {}
+    roles: dict[int, dict[str, ET.Element]] = {}
+
+    def end_of(association: ET.Element, role: str) -> ET.Element | None:
+        ends = roles.get(id(association))
+        if ends is None:
+            ends = roles[id(association)] = {}
+            for end in work.kids(association, "End"):
+                declared = end.get("Role")
+                if declared is not None:
+                    ends.setdefault(declared, end)
+        return ends.get(role)
+
+    def navigations(entity_type: ET.Element) -> list[_V2Nav]:
+        known = own.get(id(entity_type))
+        if known is not None:
+            return known
+        known = own[id(entity_type)] = []
+        for nav in work.kids(entity_type, "NavigationProperty"):
+            name = _name(nav)
+            if name is None:
+                known.append(None)
+                continue
+            association = schemas.associations.get((nav.get("Relationship") or "").strip())
+            end = (
+                end_of(association[1], nav.get("ToRole") or "")
+                if association is not None
+                else None
+            )
+            if association is None or end is None:
+                known.append((name, None, "", False))
+            else:
+                known.append(
+                    (
+                        name,
+                        association[0],
+                        nav.get("FromRole") or "",
+                        (end.get("Multiplicity") or "").strip() == "*",
+                    )
+                )
+        return known
+
+    return navigations
+
+
 def _v2_navigations(
     draft: _SetDraft,
-    schemas: _Schemas,
+    work: _Work,
+    own: Callable[[ET.Element], list[_V2Nav]],
     targets: dict[tuple[str, str, str], str],
 ) -> tuple[tuple[ParsedNavigation, ...], list[SkippedElement]]:
     navigations: dict[str, ParsedNavigation] = {}
     skipped: list[SkippedElement] = []
     position = 0
     for entity_type in draft.chain:
-        for nav in entity_type.findall("NavigationProperty"):
-            schemas.work.spend()
+        for nav in own(entity_type):
+            work.spend()
             position += 1
-            name = _name(nav)
-            if name is None:
-                skipped.append(SkippedElement("navigation", draft.name, position, "invalid_name"))
+            if nav is None:
+                skipped.append(
+                    SkippedElement(
+                        "navigation", draft.name, position, "invalid_name", draft.safe_type
+                    )
+                )
                 continue
-            association = schemas.associations.get((nav.get("Relationship") or "").strip())
-            to_role, from_role = nav.get("ToRole") or "", nav.get("FromRole") or ""
-            end = (
-                next((e for e in association[1].findall("End") if e.get("Role") == to_role), None)
-                if association is not None
-                else None
-            )
+            name, association, from_role, collection = nav
             # Only an association set says which entity SET the other end is
             # (several sets can share one entity type); without one for this
             # set the navigation has no known target and is not offered.
-            target = (
-                targets.get((association[0], from_role, draft.name))
-                if association is not None and end is not None
-                else None
-            )
-            if end is None or not target:
+            target = None
+            if association is not None:
+                work.spend_text(from_role)  # compared again for every set of the type
+                target = targets.get((association, from_role, draft.name))
+            if not target:
                 skipped.append(
-                    SkippedElement("navigation", draft.name, position, "unresolved_target")
+                    SkippedElement(
+                        "navigation", draft.name, position, "unresolved_target", draft.safe_type
+                    )
                 )
                 continue
             navigations.setdefault(
-                name,
-                ParsedNavigation(
-                    name=name,
-                    target=target,
-                    collection=(end.get("Multiplicity") or "").strip() == "*",
-                ),
+                name, ParsedNavigation(name=name, target=target, collection=collection)
             )
     return tuple(navigations.values()), skipped
 
@@ -755,6 +977,7 @@ def _v2_operation(
     element: ET.Element, schemas: _Schemas, sets_by_type: dict[str, list[str]]
 ) -> ParsedOperation | str:
     """The function import, or the reason code it is skipped for."""
+    work = schemas.work
     name = _name(element)
     if name is None:
         return "invalid_name"
@@ -764,8 +987,8 @@ def _v2_operation(
         # with GET or POST only, and `OperationDef` stores nothing else.
         return "unsupported_http_method"
     parameters: dict[str, ParamDef] = {}
-    for param in element.findall("Parameter"):
-        schemas.work.spend()
+    for param in work.kids(element, "Parameter"):
+        work.spend()
         # Out parameters are part of the answer, not of the call.
         if (param.get("Mode") or "In").strip().lower() == "out":
             continue
@@ -797,7 +1020,7 @@ def _v2_operation(
         http_method=http_method,
         bound_to=candidates[0] if element.get("action-for") and len(candidates) == 1 else None,
         parameters=tuple(parameters.values()),
-        label=_label(element),
+        label=_label(element, work),
     )
 
 
@@ -813,18 +1036,19 @@ def _v2_navigation_targets(
     ``""``, which the caller treats as no target, instead of letting the
     first association set in the document win.
     """
+    work = schemas.work
     targets: dict[tuple[str, str, str], str] = {}
     for container in schemas.containers:
-        for element in container.findall("AssociationSet"):
+        for element in work.kids(container, "AssociationSet"):
             association = schemas.associations.get((element.get("Association") or "").strip())
             if association is None:
                 continue
             ends = [
                 (end.get("Role") or "", end.get("EntitySet") or "")
-                for end in element.findall("End")
+                for end in work.kids(element, "End")
             ]
             # Every pair of ends is looked at: two in a real association set.
-            schemas.work.spend(len(ends) * len(ends))
+            work.spend(len(ends) * len(ends))
             for from_role, from_set in ends:
                 for to_role, to_set in ends:
                     if from_role == to_role or from_set not in drafts or to_set not in drafts:
@@ -843,16 +1067,17 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
     drafts, sets_declared = _entity_set_drafts(schemas, skipped, _v2_fields_of(work))
     sets_by_type = _sets_by_type(drafts)
     targets = _v2_navigation_targets(schemas, drafts)
+    own_navigations = _v2_own_navigations(schemas)
 
     entity_sets: list[ParsedEntitySet] = []
     for draft in drafts.values():
-        navigations, skipped_navigations = _v2_navigations(draft, schemas, targets)
+        navigations, skipped_navigations = _v2_navigations(draft, work, own_navigations, targets)
         skipped.extend(skipped_navigations)
         entity_sets.append(
             ParsedEntitySet(
                 name=draft.name,
                 entity_type=draft.entity_type,
-                label=_label(draft.element) or _label(draft.type_element),
+                label=_label(draft.element, work) or _label(draft.type_element, work),
                 keys=draft.keys,
                 fields=draft.fields,
                 navigations=navigations,
@@ -864,11 +1089,11 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
 
     operations: dict[str, ParsedOperation] = {}
     operations_declared = sum(
-        len(container.findall("FunctionImport")) for container in schemas.containers
+        len(work.kids(container, "FunctionImport")) for container in schemas.containers
     )
     position = 0
     for container in schemas.containers:
-        for element in container.findall("FunctionImport"):
+        for element in work.kids(container, "FunctionImport"):
             if len(operations) >= MAX_PARSED_OPERATIONS:
                 work.truncated = True
                 break
@@ -905,30 +1130,60 @@ class _Annotations:
     full name, so the alias a document chose for a vocabulary does not matter.
     Annotations with a ``Qualifier`` are alternatives for special consumers
     and are not read.
+
+    Only the terms in ``_TERMS`` are ever asked for, so the annotations are
+    sorted by term once -- per target over all its blocks, and per element
+    when it is first asked about -- and an annotation of any other term is
+    not looked at again. A lookup costs one unit per annotation it returns.
     """
 
     def __init__(self, root: ET.Element, schemas: _Schemas) -> None:
         self._schemas = schemas
+        self._work = work = schemas.work
         self._aliases = dict(_DEFAULT_ALIASES)
         for include in root.iter("Include"):
             namespace = (include.get("Namespace") or "").strip()
             alias = (include.get("Alias") or "").strip()
             if namespace and alias:
                 self._aliases[alias] = namespace
-        self._blocks: dict[str, list[ET.Element]] = {}
+        # target -> term -> annotations, in document order over all blocks.
+        self._blocks: dict[str, dict[str, list[ET.Element]]] = {}
+        # id(element) -> term -> its own annotations.
+        self._inline: dict[int, dict[str, list[ET.Element]]] = {}
+        # id(Record) -> Property -> its PropertyValue children.
+        self._values: dict[int, dict[str | None, list[ET.Element]]] = {}
         for schema in schemas.elements:
-            for block in schema.findall("Annotations"):
+            for block in work.kids(schema, "Annotations"):
                 if not block.get("Qualifier"):
-                    self._blocks.setdefault(self._target(block.get("Target")), []).append(block)
+                    target = self._target(block.get("Target"))
+                    self._sort(block, self._blocks.setdefault(target, {}))
 
     def _target(self, raw: str | None) -> str:
         """``alias.Name(signature)/rest`` -> ``namespace.Name/rest``."""
         head, slash, rest = (raw or "").strip().partition("/")
         return self._schemas.canonical(head.partition("(")[0]) + slash + rest
 
-    def _term(self, raw: str | None) -> str:
+    def target(self, owner: str, name: str = "") -> str:
+        """The target of ``owner`` (a type, an operation) or of ``name``
+        in it (a property, an entity set, an import), as blocks name it."""
+        self._work.spend_text(owner)  # copied for every name in it
+        return f"{owner}/{name}" if name else owner
+
+    def _term(self, raw: str | None) -> str | None:
+        """The full name of the term when it is one the parser reads."""
         prefix, _, name = (raw or "").strip().rpartition(".")
-        return f"{self._aliases.get(prefix, prefix)}.{name}"
+        known = _TERMS.get(name)
+        if known is None or self._aliases.get(prefix, prefix) != known[0]:
+            return None
+        return known[1]
+
+    def _sort(self, source: ET.Element, into: dict[str, list[ET.Element]]) -> None:
+        for annotation in self._work.kids(source, "Annotation"):
+            if annotation.get("Qualifier"):
+                continue
+            term = self._term(annotation.get("Term"))
+            if term is not None:
+                into.setdefault(term, []).append(annotation)
 
     def find_all(self, term: str, element: ET.Element | None, target: str = "") -> list[ET.Element]:
         """Every annotation with that term: on the element, then in the blocks for ``target``.
@@ -937,20 +1192,38 @@ class _Annotations:
         in a block, or in two blocks) and the readers below must not let the
         first one hide a restriction in a later one.
         """
-        sources = [] if element is None else [element]
+        found: list[ET.Element] = []
+        if element is not None and len(element):
+            inline = self._inline.get(id(element))
+            if inline is None:
+                inline = self._inline[id(element)] = {}
+                self._sort(element, inline)
+            found.extend(inline.get(term, ()))
         if target:
-            sources.extend(self._blocks.get(target, ()))
-        return [
-            annotation
-            for source in sources
-            for annotation in source.findall("Annotation")
-            if not annotation.get("Qualifier") and self._term(annotation.get("Term")) == term
-        ]
+            self._work.spend_text(target)  # compared with the block's own copy
+            block = self._blocks.get(target)
+            if block:
+                found.extend(block.get(term, ()))
+        if found:
+            self._work.spend(len(found))
+        return found
+
+    def _expression(self, element: ET.Element, kind: str) -> str | None:
+        """A constant, given as attribute (``String="x"``) or as child (``<String>x</String>``).
+
+        ``""`` for a child element without usable text (empty, or longer than
+        the text cap), which is no value to any reader here.
+        """
+        value = element.get(kind)
+        if value is not None:
+            return value
+        child = self._work.first(element, kind)
+        return None if child is None else child.text or ""
 
     def label(self, element: ET.Element | None, target: str = "") -> str:
         """The first ``Common.Label`` that says something."""
         for annotation in self.find_all(_TERM_LABEL, element, target):
-            label = _clean_label(_expression(annotation, "String"))
+            label = self._work.label(self._expression(annotation, "String"))
             if label:
                 return label
         return ""
@@ -958,13 +1231,21 @@ class _Annotations:
     def _record_values(
         self, term: str, prop: str, element: ET.Element | None, target: str
     ) -> list[ET.Element]:
-        return [
-            value
-            for annotation in self.find_all(term, element, target)
-            for record in annotation.findall("Record")
-            for value in record.findall("PropertyValue")
-            if value.get("Property") == prop
-        ]
+        work = self._work
+        values: list[ET.Element] = []
+        for annotation in self.find_all(term, element, target):
+            records = work.kids(annotation, "Record")
+            work.spend(len(records))
+            for record in records:
+                by_property = self._values.get(id(record))
+                if by_property is None:
+                    by_property = self._values[id(record)] = {}
+                    for value in work.kids(record, "PropertyValue"):
+                        by_property.setdefault(value.get("Property"), []).append(value)
+                matching = by_property.get(prop, ())
+                work.spend(len(matching))
+                values.extend(matching)
+        return values
 
     def declared_false(
         self, term: str, prop: str, element: ET.Element | None, target: str = ""
@@ -978,7 +1259,7 @@ class _Annotations:
         the admin, not a permission.
         """
         return any(
-            (_expression(value, "Bool") or "").strip().lower() == "false"
+            (self._expression(value, "Bool") or "").strip().lower() == "false"
             for value in self._record_values(term, prop, element, target)
         )
 
@@ -986,12 +1267,16 @@ class _Annotations:
         self, term: str, prop: str, element: ET.Element | None, target: str = ""
     ) -> set[str]:
         """The property names a restriction record lists under ``prop``, over all duplicates."""
-        return {
-            (path.text or "").strip()
-            for value in self._record_values(term, prop, element, target)
-            for collection in value.findall("Collection")
-            for path in collection.findall("PropertyPath")
-        }
+        work = self._work
+        names: set[str] = set()
+        for value in self._record_values(term, prop, element, target):
+            collections = work.kids(value, "Collection")
+            work.spend(len(collections))
+            for collection in collections:
+                paths = work.kids(collection, "PropertyPath")
+                work.spend(len(paths))
+                names.update((path.text or "").strip() for path in paths)
+        return names
 
     def declared_true(self, term: str, element: ET.Element | None, target: str = "") -> bool:
         """Whether a boolean tag term (``Core.Computed``) is set, by any of its duplicates.
@@ -1000,69 +1285,57 @@ class _Annotations:
         a value computed from a path are not a declared "yes".
         """
         for annotation in self.find_all(term, element, target):
-            value = _expression(annotation, "Bool")
+            value = self._expression(annotation, "Bool")
             if value is None:
                 # Present without any value expression: the default, true.
-                if len(annotation) == 0 and set(annotation.keys()) <= {"Term"}:
+                # (The count first: the attributes are the document's.)
+                if (
+                    len(annotation) == 0
+                    and len(annotation.attrib) <= 1
+                    and set(annotation.keys()) <= {"Term"}
+                ):
                     return True
             elif value.strip().lower() == "true":
                 return True
         return False
 
 
-def _expression(element: ET.Element, kind: str) -> str | None:
-    """A constant, given as attribute (``String="x"``) or as child (``<String>x</String>``).
-
-    ``""`` for a child element without usable text (empty, or longer than
-    the text cap), which is no value to any reader here.
-    """
-    value = element.get(kind)
-    if value is not None:
-        return value
-    child = element.find(kind)
-    return None if child is None else child.text or ""
-
-
-# One property of a type chain as every set of the type sees it: position,
-# then either a skip reason or (name, type, label, computed, immutable, nullable).
+# One property as its type declares it: a skip reason, or
+# (name, type, label, computed, immutable, nullable).
+_V4Own = tuple[str | None, tuple[str, str, str, bool, bool, bool] | None]
+# The same as every set of a type chain sees it, with its position in the chain.
 _V4Prop = tuple[int, str | None, tuple[str, str, str, bool, bool, bool] | None]
 
 
-def _v4_type_properties(
-    chain: list[ET.Element], schemas: _Schemas, annotations: _Annotations
-) -> list[_V4Prop]:
-    """What the TYPE says about each property; the same for every set of it."""
-    properties: list[_V4Prop] = []
-    position = 0
-    for entity_type in chain:
-        declaring_type = schemas.name_of(entity_type)
-        for prop in entity_type.findall("Property"):
-            schemas.work.spend()
-            position += 1
-            name, type_name = _name(prop), _type_name(prop, default="")
-            if name is None or type_name is None:
-                reason = "invalid_name" if name is None else "invalid_type"
-                properties.append((position, reason, None))
-                continue
-            # A block annotates the property on the type that declares it.
-            target = f"{declaring_type}/{name}"
-            properties.append(
+def _v4_own_properties(
+    entity_type: ET.Element, schemas: _Schemas, annotations: _Annotations
+) -> list[_V4Own]:
+    """What a type says about the properties it declares itself."""
+    declaring_type = schemas.name_of(entity_type)
+    properties: list[_V4Own] = []
+    for prop in schemas.work.kids(entity_type, "Property"):
+        name, type_name = _name(prop), _type_name(prop, default="")
+        if name is None or type_name is None:
+            properties.append(("invalid_name" if name is None else "invalid_type", None))
+            continue
+        # A block annotates the property on the type that declares it.
+        target = annotations.target(declaring_type, name)
+        properties.append(
+            (
+                None,
                 (
-                    position,
-                    None,
-                    (
-                        name,
-                        type_name,
-                        annotations.label(prop, target),
-                        # Computed: the server sets it, a client never does.
-                        # Immutable: a client may set it when creating, not
-                        # afterwards.
-                        annotations.declared_true(_TERM_COMPUTED, prop, target),
-                        annotations.declared_true(_TERM_IMMUTABLE, prop, target),
-                        (prop.get("Nullable") or "").strip().lower() != "false",
-                    ),
-                )
+                    name,
+                    type_name,
+                    annotations.label(prop, target),
+                    # Computed: the server sets it, a client never does.
+                    # Immutable: a client may set it when creating, not
+                    # afterwards.
+                    annotations.declared_true(_TERM_COMPUTED, prop, target),
+                    annotations.declared_true(_TERM_IMMUTABLE, prop, target),
+                    (prop.get("Nullable") or "").strip().lower() != "false",
+                ),
             )
+        )
     return properties
 
 
@@ -1073,18 +1346,34 @@ def _v4_fields_of(schemas: _Schemas, annotations: _Annotations) -> _FieldsOf:
     same property can be filterable in one set and not in another. Sets of
     one type that declare the same restrictions (most declare none) share
     one tuple, and the type's skipped properties are handed out with the
-    first set only.
+    first set only. Each ``Property`` element is read once, by the type
+    that declares it.
     """
     work = schemas.work
+    own: dict[int, list[_V4Own]] = {}
     by_type: dict[int, list[_V4Prop]] = {}
     variants: dict[tuple, tuple[ParsedField, ...]] = {}
 
+    def type_properties(chain: list[ET.Element]) -> list[_V4Prop]:
+        """What the TYPE says about each property; the same for every set of it."""
+        properties: list[_V4Prop] = []
+        for entity_type in chain:
+            declared = own.get(id(entity_type))
+            if declared is None:
+                declared = own[id(entity_type)] = _v4_own_properties(
+                    entity_type, schemas, annotations
+                )
+            for reason, parsed in declared:
+                work.spend()
+                properties.append((len(properties) + 1, reason, parsed))
+        return properties
+
     def fields_of(
         chain: list[ET.Element], set_name: str, container: ET.Element, set_element: ET.Element
-    ) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
+    ) -> tuple[tuple[ParsedField, ...], list[tuple[int, str]]]:
         if not chain:
             return (), []
-        set_target = f"{schemas.name_of(container)}/{set_name}"
+        set_target = annotations.target(schemas.name_of(container), set_name)
 
         def listed(term: str, prop: str) -> frozenset[str]:
             return frozenset(annotations.property_paths(term, prop, set_element, set_target))
@@ -1097,14 +1386,12 @@ def _v4_fields_of(schemas: _Schemas, annotations: _Annotations) -> _FieldsOf:
         non_updatable = listed(_TERM_UPDATE, "NonUpdatableProperties")
 
         type_id = id(chain[-1])
-        skipped: list[SkippedElement] = []
+        skipped: list[tuple[int, str]] = []
         properties = by_type.get(type_id)
         if properties is None:
-            properties = by_type[type_id] = _v4_type_properties(chain, schemas, annotations)
+            properties = by_type[type_id] = type_properties(chain)
             skipped = [
-                SkippedElement("property", set_name, position, reason)
-                for position, reason, _ in properties
-                if reason is not None
+                (position, reason) for position, reason, _ in properties if reason is not None
             ]
         variant = (type_id, nothing_filterable, non_filterable, non_insertable, non_updatable)
         known = variants.get(variant)
@@ -1148,7 +1435,7 @@ def _v4_bindings(
     valid target resolve nothing.
     """
     bindings: dict[str, str] = {}
-    for binding in draft.element.findall("NavigationPropertyBinding"):
+    for binding in schemas.work.kids(draft.element, "NavigationPropertyBinding"):
         schemas.work.spend()
         path = (binding.get("Path") or "").strip()
         if not path:
@@ -1167,34 +1454,63 @@ def _v4_bindings(
     return bindings
 
 
-def _v4_navigations(
-    draft: _SetDraft, bindings: dict[str, str], work: _Work
-) -> tuple[tuple[ParsedNavigation, ...], list[SkippedElement]]:
-    navigations: dict[str, ParsedNavigation] = {}
-    skipped: list[SkippedElement] = []
-    position = 0
-    for entity_type in draft.chain:
-        for nav in entity_type.findall("NavigationProperty"):
-            work.spend()
-            position += 1
+# One `NavigationProperty` as its type declares it: (name, the reason it
+# cannot be offered whatever the set, to many).
+_V4Nav = tuple[str | None, str | None, bool]
+
+
+def _v4_own_navigations(work: _Work) -> Callable[[ET.Element], list[_V4Nav]]:
+    """The navigation properties an entity type declares, read once per type."""
+    own: dict[int, list[_V4Nav]] = {}
+
+    def navigations(entity_type: ET.Element) -> list[_V4Nav]:
+        known = own.get(id(entity_type))
+        if known is not None:
+            return known
+        known = own[id(entity_type)] = []
+        for nav in work.kids(entity_type, "NavigationProperty"):
             name = _name(nav)
             type_ref = (nav.get("Type") or "").strip()
-            target = bindings.get(name or "")
             collection = type_ref.startswith("Collection(")
+            reason = None
             if name is None:
                 reason = "invalid_name"
             elif not type_ref or collection != type_ref.endswith(")"):
                 # No Type, or half a `Collection(...)`: the multiplicity
                 # would be a guess.
                 reason = "invalid_type"
-            elif not target:
+            known.append((name, reason, collection))
+        return known
+
+    return navigations
+
+
+def _v4_navigations(
+    draft: _SetDraft,
+    bindings: dict[str, str],
+    work: _Work,
+    own: Callable[[ET.Element], list[_V4Nav]],
+) -> tuple[tuple[ParsedNavigation, ...], list[SkippedElement]]:
+    navigations: dict[str, ParsedNavigation] = {}
+    skipped: list[SkippedElement] = []
+    position = 0
+    for entity_type in draft.chain:
+        for name, reason, collection in own(entity_type):
+            work.spend()
+            position += 1
+            target = bindings.get(name or "")
+            if reason is None and not target:
                 reason = "unresolved_target"
-            else:
+            if reason is None and name is not None and target:
                 navigations.setdefault(
                     name, ParsedNavigation(name=name, target=target, collection=collection)
                 )
                 continue
-            skipped.append(SkippedElement("navigation", draft.name, position, reason))
+            skipped.append(
+                SkippedElement(
+                    "navigation", draft.name, position, reason or "", draft.safe_type
+                )
+            )
     return tuple(navigations.values()), skipped
 
 
@@ -1207,7 +1523,7 @@ def _v4_parameters(
     (part of the URL), not an argument.
     """
     parameters: dict[str, ParamDef] = {}
-    for param in element.findall("Parameter")[1 if bound else 0 :]:
+    for param in work.kids(element, "Parameter")[1 if bound else 0 :]:
         work.spend()
         name, type_name = _name(param), _type_name(param, default="")
         if name is None or type_name is None:
@@ -1231,6 +1547,7 @@ def _v4_operation(
     annotations: _Annotations,
     sets_by_type: dict[str, list[str]],
     imports: dict[tuple[str, str], list[tuple[ET.Element, ET.Element]]],
+    import_labels: dict[int, str],
 ) -> list[ParsedOperation | str]:
     """What one ``Action`` / ``Function`` gives: operations, or reason codes.
 
@@ -1242,22 +1559,25 @@ def _v4_operation(
     Overloads share one qualified name. The caller keeps the first operation
     of a name (``duplicate_name`` for the rest), and a label given in an
     ``Annotations`` block attaches to every overload of that name, because
-    the block's signature is not compared.
+    the block's signature is not compared. An import's own label is read
+    once (``import_labels``), however many overloads it is an import of.
     """
+    work = schemas.work
     name = _name(element)
+    work.spend_text(namespace)  # copied into every qualified name of the schema
     qualified = f"{namespace}.{name}" if namespace else name or ""
     # models.OperationDef holds the qualified name to the same EDM rule.
     if name is None or not _NAME_RE.fullmatch(qualified):
         return ["invalid_name"]
     bound = (element.get("IsBound") or "").strip().lower() == "true"
-    parameters = _v4_parameters(element, kind, bound, annotations, schemas.work)
+    parameters = _v4_parameters(element, kind, bound, annotations, work)
     if parameters is None:
         return ["invalid_parameter"]
     http_method = "POST" if kind == "action" else "GET"
-    label = annotations.label(element, qualified)
+    label = annotations.label(element, annotations.target(qualified))
 
     if bound:
-        binding = element.find("Parameter")
+        binding = work.first(element, "Parameter")
         type_ref = "" if binding is None else (binding.get("Type") or "").strip()
         # `sets_by_type` holds kept sets only. Several sets of the type, or a
         # collection binding (called on the set, without a key), have no
@@ -1279,11 +1599,16 @@ def _v4_operation(
 
     outcomes: list[ParsedOperation | str] = []
     for container, imported in imports.get((kind, qualified), []):
-        schemas.work.spend()
+        work.spend()
         import_name = _name(imported)
         if import_name is None:
             outcomes.append("invalid_name")
             continue
+        own_label = import_labels.get(id(imported))
+        if own_label is None:
+            own_label = import_labels[id(imported)] = annotations.label(
+                imported, annotations.target(schemas.name_of(container), import_name)
+            )
         outcomes.append(
             ParsedOperation(
                 name=import_name,
@@ -1292,8 +1617,7 @@ def _v4_operation(
                 http_method=http_method,
                 bound_to=None,
                 parameters=parameters,
-                label=annotations.label(imported, f"{schemas.name_of(container)}/{import_name}")
-                or label,
+                label=own_label or label,
             )
         )
     return outcomes or ["not_imported"]
@@ -1304,29 +1628,38 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
     work = schemas.work
     skipped: list[SkippedElement] = _Skips(work)
 
-    def set_target(container: ET.Element, name: str) -> str:
-        return f"{schemas.name_of(container)}/{name}"
-
     # Pass 1: which entity sets exist in the result. Navigations and bindings
     # are resolved afterwards, against these only.
     drafts, sets_declared = _entity_set_drafts(
         schemas, skipped, _v4_fields_of(schemas, annotations)
     )
     sets_by_type = _sets_by_type(drafts)
+    own_navigations = _v4_own_navigations(work)
+    # id(EntityType) -> its label: the fallback of every set of the type.
+    type_labels: dict[int, str] = {}
+
+    def type_label(draft: _SetDraft) -> str:
+        if draft.type_element is None:
+            return annotations.label(None, annotations.target(draft.entity_type))
+        known = type_labels.get(id(draft.type_element))
+        if known is None:
+            known = type_labels[id(draft.type_element)] = annotations.label(
+                draft.type_element, annotations.target(draft.entity_type)
+            )
+        return known
 
     entity_sets: list[ParsedEntitySet] = []
     for draft in drafts.values():
-        target = set_target(draft.container, draft.name)
+        target = annotations.target(schemas.name_of(draft.container), draft.name)
         navigations, skipped_navigations = _v4_navigations(
-            draft, _v4_bindings(draft, schemas, drafts), work
+            draft, _v4_bindings(draft, schemas, drafts), work, own_navigations
         )
         skipped.extend(skipped_navigations)
         entity_sets.append(
             ParsedEntitySet(
                 name=draft.name,
                 entity_type=draft.entity_type,
-                label=annotations.label(draft.element, target)
-                or annotations.label(draft.type_element, draft.entity_type),
+                label=annotations.label(draft.element, target) or type_label(draft),
                 keys=draft.keys,
                 fields=draft.fields,
                 navigations=navigations,
@@ -1355,6 +1688,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
             else:
                 continue
             imports.setdefault(key, []).append((container, child))
+    import_labels: dict[int, str] = {}
 
     operations: dict[str, ParsedOperation] = {}
     operations_declared = sum(
@@ -1375,7 +1709,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
                 break
             position += 1
             for outcome in _v4_operation(
-                element, kind, namespace, schemas, annotations, sets_by_type, imports
+                element, kind, namespace, schemas, annotations, sets_by_type, imports, import_labels
             ):
                 if isinstance(outcome, str):
                     skipped.append(SkippedElement("operation", "", position, outcome))
@@ -1386,6 +1720,11 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
                     # of them: an `Annotations` block targets an operation by
                     # qualified name and the signature is not compared.
                     skipped.append(SkippedElement("operation", "", position, "duplicate_name"))
+                elif len(operations) >= MAX_PARSED_OPERATIONS:
+                    # The cap is on operations BUILT: one unbound action can
+                    # have any number of imports. The rest of them is not read.
+                    work.truncated = True
+                    break
                 else:
                     operations[outcome.name] = outcome
 

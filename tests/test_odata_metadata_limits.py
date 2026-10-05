@@ -234,3 +234,287 @@ def test_a_bytearray_is_parsed_without_being_copied_first():
     document = bytearray(v2(1, 2))
     assert len(parse_metadata(document, "v2").entity_sets) == 1
     assert len(parse_metadata(memoryview(bytes(document)), "v2").entity_sets) == 1
+
+
+# ------------------------------------------------- fix round 2: inner scans
+#
+# One unit of the work budget must not hide a scan whose size the document
+# chooses. Two kinds of assertion, neither on wall time: the budget error
+# where the work is charged per item examined, and -- where the fix is an
+# index or a memo, which is not charged -- the number of tree accesses the
+# parse made, counted by `_Probe` elements.
+
+import random  # noqa: E402
+import xml.etree.ElementTree as ET  # noqa: E402
+
+
+class _Probe(ET.Element):
+    """An element that counts what is read of it: attribute reads, and the
+    children a ``find`` / ``findall`` / iteration walks over."""
+
+    counts = {"reads": 0, "scanned": 0}
+
+    def get(self, key, default=None):
+        _Probe.counts["reads"] += 1
+        return super().get(key, default)
+
+    def find(self, path, namespaces=None):
+        _Probe.counts["scanned"] += len(self)
+        return super().find(path, namespaces)
+
+    def findall(self, path, namespaces=None):
+        _Probe.counts["scanned"] += len(self)
+        return super().findall(path, namespaces)
+
+    def __iter__(self):
+        _Probe.counts["scanned"] += len(self)
+        return iter(self[:])
+
+
+@pytest.fixture
+def steps(monkeypatch):
+    """Tree accesses of the parses in this test, as a callable."""
+    counts = {"reads": 0, "scanned": 0}
+    monkeypatch.setattr(_Probe, "counts", counts)
+    real = ET.TreeBuilder
+    monkeypatch.setattr(metadata.ET, "TreeBuilder", lambda: real(element_factory=_Probe))
+    return lambda: counts["reads"] + counts["scanned"]
+
+
+def linear(document: bytes) -> int:
+    """A generous bound for work that is linear in the document: 40 tree
+    accesses per tag. The scans these tests are about are 10 to 100 times that."""
+    return 40 * document.count(b"<")
+
+
+EMPTY_LABEL = '<Annotation Term="Common.Label" String=""/>'
+
+
+def test_v2_association_ends_are_indexed_once(steps):
+    """N1: the `End` list of an association was scanned per navigation per set."""
+    ends = "".join(f'<End Role="r{i}" Type="NS.T"/>' for i in range(2_000))
+    navigations = "".join(
+        f'<NavigationProperty Name="N{i}" Relationship="NS.A" FromRole="a" ToRole="z"/>'
+        for i in range(20)
+    )
+    document = v2(20, 1, extra=f'<Association Name="A">{ends}</Association>').replace(
+        b"</EntityType>", navigations.encode() + b"</EntityType>"
+    )
+    parsed = parse_metadata(document, "v2")
+    assert len(parsed.entity_sets) == 20
+    assert [s.reason for s in parsed.skipped] == ["unresolved_target"] * 400
+    assert steps() < linear(document)
+
+
+def test_v4_sets_of_a_type_without_a_usable_key_do_not_rescan_annotations(steps):
+    """N1: a set whose type has an unrepresentable key is never kept, so its
+    name can repeat; each repeat read the set's restrictions again."""
+    restricted = (
+        '<Annotation Term="Capabilities.FilterRestrictions"><Record>'
+        '<PropertyValue Property="Filterable" Bool="true"/></Record></Annotation>'
+    )
+    document = (
+        V4_HEAD
+        + '<EntityType Name="T"><Key><PropertyRef Name="Ghost"/></Key>'
+        + '<Property Name="F0" Type="Edm.String"/></EntityType>'
+        + f'<Annotations Target="NS.C/S">{restricted * 300}</Annotations>'
+        + '<EntityContainer Name="C">'
+        + '<EntitySet Name="S" EntityType="NS.T"/>' * 300
+        + "</EntityContainer>"
+        + V4_TAIL
+    ).encode()
+    parsed = parse_metadata(document, "v4")
+    assert parsed.entity_sets == ()
+    assert [s.reason for s in parsed.skipped] == ["unrepresentable_key"] * 300
+    assert steps() < linear(document)
+
+
+def duplicate_properties(block: str, count: int = 300) -> bytes:
+    """A V4 type whose property `P` is declared `count` times, with `block`
+    as the content of the `Annotations` block that targets it."""
+    return (
+        V4_HEAD
+        + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+        + '<Property Name="Id" Type="Edm.String"/>'
+        + '<Property Name="P" Type="Edm.String"/>' * count
+        + f'</EntityType><Annotations Target="NS.T/P">{block}</Annotations>'
+        + '<EntityContainer Name="C"><EntitySet Name="S" EntityType="NS.T"/></EntityContainer>'
+        + V4_TAIL
+    ).encode()
+
+
+def test_v4_duplicate_property_names_are_charged_for_their_annotations(monkeypatch):
+    """N1: properties of one name share the target `Type/Prop`; each read
+    the whole block again for one unit."""
+    refused(duplicate_properties(EMPTY_LABEL * 300), "v4", 5_000, monkeypatch)
+
+
+def test_v4_annotations_that_are_not_read_cost_nothing_per_lookup(steps):
+    """The same shape with annotations the parser has no use for, and a
+    label whose value sits behind many other children."""
+    junk = '<Annotation Term="Custom.Thing" String="x"/>' * 300
+    label = f'<Annotation Term="Common.Label">{"<Junk/>" * 300}<String>Real</String></Annotation>'
+    document = duplicate_properties(junk + label)
+    parsed = parse_metadata(document, "v4")
+    assert [(f.name, f.label) for f in parsed.entity_sets[0].fields] == [("Id", ""), ("P", "Real")]
+    assert steps() < linear(document)
+
+
+def test_v4_overloads_are_charged_for_the_label_scan(monkeypatch):
+    """N1: overloads of one name are skipped at one unit each, after each
+    of them read the operation's `Annotations` block."""
+    overloads = (
+        '<Action Name="A" IsBound="true"><Parameter Name="it" Type="NS.T"/></Action>' * 300
+    )
+    block = f'<Annotations Target="NS.A">{EMPTY_LABEL * 300}</Annotations>'
+    refused(v4(1, 2, extra=overloads + block), "v4", 5_000, monkeypatch)
+
+
+def test_v4_the_type_label_is_read_once_per_type(steps):
+    """N1: the set label's fallback, the type's label, was read per set."""
+    block = f'<Annotations Target="NS.T">{EMPTY_LABEL * 300}</Annotations>'
+    document = v4(300, 2, extra=block)
+    parsed = parse_metadata(document, "v4")
+    assert len(parsed.entity_sets) == 300 and parsed.entity_sets[-1].label == ""
+    assert steps() < linear(document)
+    labelled = v4(3, 2, extra='<Annotations Target="NS.T"><Annotation Term="Common.Label" '
+                  'String="Order"/></Annotations>')
+    assert [e.label for e in parse_metadata(labelled, "v4").entity_sets] == ["Order"] * 3
+
+
+def test_v4_restriction_records_are_charged_per_value_and_path(monkeypatch):
+    values = '<PropertyValue Property="Filterable" Bool="true"/>' * 2_000
+    by_value = (
+        f'<Annotation Term="Capabilities.FilterRestrictions"><Record>{values}</Record></Annotation>'
+    )
+    refused(v4(1, 2, set_body=by_value), "v4", 1_500, monkeypatch)
+    paths = "<PropertyPath>F1</PropertyPath>" * 2_000
+    by_path = (
+        '<Annotation Term="Capabilities.FilterRestrictions"><Record>'
+        f'<PropertyValue Property="NonFilterableProperties"><Collection>{paths}</Collection>'
+        "</PropertyValue></Record></Annotation>"
+    )
+    refused(v4(1, 2, set_body=by_path), "v4", 1_500, monkeypatch)
+
+
+def test_v4_one_action_with_many_imports_stops_at_the_operation_cap():
+    """N3: the cap is on operations BUILT, not on `Action` elements read."""
+    imports = "".join(
+        f'<ActionImport Name="I{i}" Action="NS.Do"/>' for i in range(MAX_PARSED_OPERATIONS + 20)
+    )
+    document = v4(1, 2, extra='<Action Name="Do"/>').replace(
+        b"</EntityContainer>", imports.encode() + b"</EntityContainer>"
+    )
+    parsed = parse_metadata(document, "v4")
+    assert len(parsed.operations) == MAX_PARSED_OPERATIONS and parsed.truncated is True
+    assert parsed.operations[-1].name == f"I{MAX_PARSED_OPERATIONS - 1}"
+    exact = v4(1, 2, extra='<Action Name="Do"/>').replace(
+        b"</EntityContainer>",
+        "".join(
+            f'<ActionImport Name="I{i}" Action="NS.Do"/>' for i in range(MAX_PARSED_OPERATIONS)
+        ).encode()
+        + b"</EntityContainer>",
+    )
+    parsed = parse_metadata(exact, "v4")
+    assert len(parsed.operations) == MAX_PARSED_OPERATIONS and parsed.truncated is False
+
+
+@pytest.mark.parametrize("version", ["v2", "v4"])
+def test_a_shared_base_types_labels_are_cleaned_once(version, monkeypatch):
+    """A long label was cleaned character by character for every derived
+    type that inherits the property."""
+    calls = [0]
+    real = metadata.unicodedata.category
+
+    def category(ch):
+        calls[0] += 1
+        return real(ch)
+
+    monkeypatch.setattr(metadata.unicodedata, "category", category)
+    long_label = "​" * 4_000 + "Amount"  # zero-width, then the label
+    if version == "v2":
+        sap = 'xmlns:sap="http://www.sap.com/Protocols/SAPData"'
+        head = V2_HEAD.replace("<Schema ", f"<Schema {sap} ")
+        base = (
+            '<EntityType Name="B"><Key><PropertyRef Name="Id"/></Key>'
+            f'<Property Name="Id" Type="Edm.String" sap:label="{long_label}"/></EntityType>'
+        )
+        tail = V2_TAIL
+    else:
+        head = V4_HEAD
+        base = (
+            '<EntityType Name="B"><Key><PropertyRef Name="Id"/></Key>'
+            f'<Property Name="Id" Type="Edm.String"><Annotation Term="Common.Label" '
+            f'String="{long_label}"/></Property></EntityType>'
+        )
+        tail = V4_TAIL
+    types = "".join(f'<EntityType Name="D{i}" BaseType="NS.B"/>' for i in range(60))
+    sets = "".join(f'<EntitySet Name="S{i}" EntityType="NS.D{i}"/>' for i in range(60))
+    document = (
+        head + base + types + f'<EntityContainer Name="C">{sets}</EntityContainer>' + tail
+    ).encode()
+    parsed = parse_metadata(document, version)
+    assert len(parsed.entity_sets) == 60
+    assert {e.fields[0].label for e in parsed.entity_sets} == {"Amount"}
+    assert calls[0] < 4 * len(long_label)
+
+
+def test_a_long_shared_name_is_charged_where_it_is_copied(monkeypatch):
+    """A name that many elements share (container, namespace) is copied into
+    a target or a qualified name per element: charged by its length."""
+    name = "C" * 50_000
+    types = "".join(
+        f'<EntityType Name="T{i}"><Key><PropertyRef Name="Ghost"/></Key></EntityType>'
+        for i in range(300)
+    )
+    sets = "".join(f'<EntitySet Name="S{i}" EntityType="NS.T{i}"/>' for i in range(300))
+    document = (
+        V4_HEAD + types + f'<EntityContainer Name="{name}">{sets}</EntityContainer>' + V4_TAIL
+    ).encode()
+    refused(document, "v4", 2_000, monkeypatch)
+    namespace = "N" * 50_000
+    actions = '<Action Name="A"/>' * 300
+    document = (
+        V4_HEAD.replace('Namespace="NS"', f'Namespace="{namespace}"') + actions + V4_TAIL
+    ).encode()
+    refused(document, "v4", 2_000, monkeypatch)
+
+
+def test_a_qualified_name_resolves_as_before():
+    """`_Schemas.canonical` no longer tries every namespace per reference;
+    the rule it replaces is spelled out here and compared on many names."""
+    schemas = (
+        '<Schema Namespace="com.sap.one" Alias="one"/><Schema Namespace="com.sap" Alias="s"/>'
+        '<Schema Namespace="com.sap.one.more" Alias="one.x"/><Schema Namespace="z" Alias="one"/>'
+        '<Schema Namespace="" Alias="none"/><Schema Namespace="s.t"/>'
+    )
+    root, _ = metadata._parse_tree(
+        f'<Edmx xmlns="http://docs.oasis-open.org/odata/ns/edmx">{schemas}</Edmx>'.encode()
+    )
+    elements = list(root.iter("Schema"))
+    resolver = metadata._Schemas(elements)
+    namespaces = sorted(
+        (e.get("Namespace") for e in elements if e.get("Namespace")), key=len, reverse=True
+    )
+    aliases = sorted(
+        ((e.get("Alias"), e.get("Namespace")) for e in elements
+         if e.get("Namespace") and e.get("Alias")),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+
+    def before(ref):
+        ref = (ref or "").strip()
+        if any(ref.startswith(f"{namespace}.") for namespace in namespaces):
+            return ref
+        for alias, namespace in aliases:
+            if ref.startswith(f"{alias}."):
+                return namespace + ref[len(alias):]
+        return ref
+
+    parts = ["com", "sap", "one", "more", "s", "t", "x", "z", "none", "Order", ""]
+    rng = random.Random(7)
+    refs = [None, "", " one.Order ", "one", "one.", ".one", "one.x.Order", "s.t.Order"]
+    refs += [".".join(rng.choice(parts) for _ in range(rng.randint(1, 6))) for _ in range(3_000)]
+    for ref in refs:
+        assert resolver.canonical(ref) == before(ref), ref

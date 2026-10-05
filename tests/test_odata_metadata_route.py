@@ -125,6 +125,7 @@ TOP_KEYS = {
     "removed_entity_sets",
     "removed_operations",
     "removed_complete",
+    "skipped_stored_entity_sets",
     "summary",
     "truncated",
     "totals",
@@ -297,7 +298,9 @@ async def test_v2_preview_lists_what_the_document_declares(client, remote, caplo
         "skipped": 0,
         "removed_entity_sets": 0,
         "removed_operations": 0,
+        "skipped_stored_entity_sets": 0,
     }
+    assert body["skipped_stored_entity_sets"] == []
     assert body["totals"] == {"entity_sets": 2, "operations": 1, "skipped": 0}
 
     # One GET, of exactly the confined path plus $metadata, with no query.
@@ -404,6 +407,7 @@ async def test_what_the_parser_skipped_is_passed_through(client, remote):
             "entity_set": "",
             "position": 1,
             "reason": "unsupported_http_method",
+            "entity_type": "",
         }
     ]
     assert body["summary"]["skipped"] == 1 and body["totals"]["skipped"] == 1
@@ -1273,7 +1277,12 @@ async def test_past_the_parsers_cap_nothing_is_called_removed(client, remote):
     assert (await client.post(SERVICES, json=data)).status_code == 201
     remote.answer(xml(big_v2(MAX_PARSED_ENTITY_SETS + 30, 1, 0)))
     body = (await client.post(URL, json=request(service="purchase-requisitions"))).json()
-    assert body["removed_complete"] is False and body["removed_entity_sets"] == []
+    # Unknown, not "none": the parser stopped before the end of the document.
+    assert body["removed_complete"] is False
+    assert body["removed_entity_sets"] is None and body["removed_operations"] is None
+    assert body["summary"]["removed_entity_sets"] is None
+    assert body["summary"]["removed_operations"] is None
+    assert body["skipped_stored_entity_sets"] == []
     assert body["truncated"] is True
     assert body["totals"]["entity_sets"] == MAX_PARSED_ENTITY_SETS + 30
     assert len(body["entity_sets"]) == MAX_ENTITY_SETS
@@ -1443,3 +1452,111 @@ def test_the_document_is_let_go_once_parsed():
     holder = [bytearray(V2)]
     answer = preview._parse_and_build(holder, "v2", None)
     assert holder == [] and answer["summary"]["entity_sets"] == 2
+
+
+# ------------------------------------------------------------- fix round 2
+
+
+def skipping_v2() -> bytes:
+    """`Bad` is declared but its key names no property; `T` has a property
+    with a name the catalogue cannot hold."""
+    return big_v2(2, 2, 0).replace(
+        b"<EntityContainer ",
+        b'<EntityType Name="B"><Key><PropertyRef Name="Ghost"/></Key>'
+        b'<Property Name="Id" Type="Edm.String"/></EntityType><EntityContainer ',
+    ).replace(
+        b"</EntityType>", b'<Property Name="bad name" Type="Edm.String"/></EntityType>', 1
+    ).replace(b"</EntityContainer>", b'<EntitySet Name="Bad" EntityType="NS.B"/></EntityContainer>')
+
+
+async def test_a_stored_set_the_parser_skips_is_not_called_removed(client, remote):
+    data = stored_service(
+        [{"name": "F0"}, {"name": "F1"}],
+        ["F0"],
+        entity_sets=[
+            {"name": "Bad", "keys": [{"name": "Id"}], "fields": [{"name": "Id"}]},
+            {"name": "GoneSet", "keys": [{"name": "Id"}], "fields": [{"name": "Id"}]},
+        ],
+    )
+    assert (await client.post(SERVICES, json=data)).status_code == 201
+    remote.answer(xml(skipping_v2()))
+    body = (await client.post(URL, json=request(service="purchase-requisitions"))).json()
+    # Still declared, so not removed -- but not usable as it is declared now.
+    assert body["removed_entity_sets"] == ["GoneSet"]
+    assert body["skipped_stored_entity_sets"] == [
+        {"name": "Bad", "reason": "unrepresentable_key"}
+    ]
+    assert body["summary"]["removed_entity_sets"] == 1
+    assert body["summary"]["skipped_stored_entity_sets"] == 1
+    assert body["removed_complete"] is True
+
+
+async def test_a_skipped_entry_names_the_entity_type(client, remote):
+    remote.answer(xml(skipping_v2()))
+    body = (await client.post(URL, json=REQUEST)).json()
+    # The property is listed under the first set of the type only; the type
+    # is what explains the field missing from `S1` as well.
+    assert body["skipped"] == [
+        {"kind": "property", "entity_set": "S0", "position": 3, "reason": "invalid_name",
+         "entity_type": "NS.T"},
+        {"kind": "entity_set", "entity_set": "Bad", "position": 3,
+         "reason": "unrepresentable_key", "entity_type": "NS.B"},
+    ]
+    assert [e["entity_type"] for e in body["entity_sets"]] == ["NS.T", "NS.T"]
+    assert body["skipped_stored_entity_sets"] == []
+
+
+def test_an_entity_type_that_is_no_edm_name_is_not_passed_on():
+    document = skipping_v2().replace(b'Namespace="NS"', b'Namespace="NS &lt;b&gt;"')
+    document = document.replace(b'EntityType="NS.', b'EntityType="NS &lt;b&gt;.')
+    answer = preview.build_preview(parse_metadata(document, "v2"))
+    assert [s["reason"] for s in answer["skipped"]] == ["invalid_name", "unrepresentable_key"]
+    assert [s["entity_type"] for s in answer["skipped"]] == ["", ""]
+
+
+def test_without_a_stored_service_nothing_is_removed_or_skipped_stored():
+    answer = preview.build_preview(parse_metadata(skipping_v2(), "v2"))
+    assert answer["removed_entity_sets"] == [] and answer["removed_operations"] == []
+    assert answer["skipped_stored_entity_sets"] == [] and answer["removed_complete"] is True
+
+
+def test_v4_totals_are_never_below_what_is_shown():
+    from agents.odata.metadata import MAX_PARSED_OPERATIONS
+
+    imports = "".join(
+        f'<ActionImport Name="I{i}" Action="NS.Do"/>' for i in range(MAX_PARSED_OPERATIONS + 5)
+    )
+    document = (
+        '<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">'
+        '<edmx:DataServices><Schema Namespace="NS" xmlns="http://docs.oasis-open.org/odata/ns/edm">'
+        f'<Action Name="Do"/><EntityContainer Name="C">{imports}</EntityContainer>'
+        "</Schema></edmx:DataServices></edmx:Edmx>"
+    ).encode()
+    answer = preview.build_preview(parse_metadata(document, "v4"))
+    assert answer["truncated"] is True and len(answer["operations"]) == MAX_OPERATIONS
+    # One `Action` element, but 400 operations were read from its imports.
+    assert answer["totals"]["operations"] == MAX_PARSED_OPERATIONS
+    assert answer["removed_complete"] is False and answer["removed_operations"] is None
+
+
+async def test_an_unexpected_failure_of_the_parse_is_a_coded_error_and_is_logged(
+    client, remote, monkeypatch, caplog
+):
+    def broken(document, version):
+        raise RuntimeError(f"{SECRET} text of the failure")
+
+    monkeypatch.setattr(preview, "parse_metadata", broken)
+    remote.answer(xml(V2))
+    with caplog.at_level(logging.INFO, logger="agents.odata.preview"):
+        r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 500 and r.headers["x-odata-error"] == "preview_failed"
+    assert r.json()["detail"] == preview._FAILED_TEXT
+    assert preview._FAILED_TEXT.startswith("the $metadata preview failed unexpectedly")
+    assert SECRET not in r.text and SECRET not in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "refused (code=preview_failed status=500)" in caplog.text
+    for _ in range(200):
+        if preview._active == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert preview._active == 0
