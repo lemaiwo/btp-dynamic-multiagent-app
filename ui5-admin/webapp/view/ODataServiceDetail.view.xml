@@ -74,6 +74,17 @@
             </OverflowToolbar>
         </subHeader>
         <content>
+            <!-- Writes that are ticked but not saved: what they will let
+                 agents do, said before Save. Sticky under the toolbar that
+                 holds Save, so it is in view wherever the page is scrolled
+                 to; the controller also announces it to screen readers. -->
+            <MessageStrip
+                id="odataPendingWrites"
+                visible="{= !!${svc>/pendingWrites} }"
+                type="Warning"
+                showIcon="true"
+                class="odataStickyStrip sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{svc>/pendingWrites}" />
             <!-- A service that could not be read is said here, with a retry,
                  and the form stays away: an empty form with a Save button
                  could be saved over the real service. -->
@@ -324,15 +335,6 @@
                     id="odataMetadataInfo"
                     text="{ path: 'svc>/data/metadata_fetched_at', formatter: '.formatMetadataInfo' }"
                     class="odataMeta sapUiTinyMarginBottom" />
-                <!-- Writes that are ticked but not saved: what they will let
-                     agents do, said before Save. -->
-                <MessageStrip
-                    id="odataPendingWrites"
-                    visible="{= !!${svc>/pendingWrites} }"
-                    type="Warning"
-                    showIcon="true"
-                    class="sapUiSmallMarginBottom"
-                    text="{svc>/pendingWrites}" />
                 <!-- The operation names the checkboxes are labelled with:
                      "<operation> <entity set>". -->
                 <core:InvisibleText id="odataOpNameList" text="{i18n>odataOpList}" />
@@ -340,6 +342,7 @@
                 <core:InvisibleText id="odataOpNameCreate" text="{i18n>odataOpCreate}" />
                 <core:InvisibleText id="odataOpNameUpdate" text="{i18n>odataOpUpdate}" />
                 <core:InvisibleText id="odataOpNameDelete" text="{i18n>odataOpDelete}" />
+                <core:InvisibleText id="odataOpWriteName" text="{i18n>odataWriteOperation}" />
                 <!-- Growing: a service can hold 200 entity sets; twenty rows
                      at a time keep the page quick. The search filters all of
                      them, shown or not. -->
@@ -410,7 +413,7 @@
                                     <ObjectIdentifier
                                         title="{svc>title}"
                                         text="{ parts: ['svc>name', 'svc>path'], formatter: '.formatEntityTechnical' }" />
-                                    <core:InvisibleText id="odataEntityRowName" text="{svc>title}" />
+                                    <core:InvisibleText id="odataEntityRowName" text="{svc>label}" />
                                 </VBox>
                                 <VBox>
                                     <Text text="{svc>description}" visible="{svc>described}" />
@@ -464,7 +467,7 @@
                                     enabled="{= !${svc>/busy} }"
                                     valueState="{ path: 'svc>create', formatter: '.formatWriteState' }"
                                     tooltip="{ parts: ['i18n>odataOpCreate', 'svc>title'], formatter: '.formatWriteOperationOf' }"
-                                    ariaLabelledBy="odataOpNameCreate odataEntityRowName"
+                                    ariaLabelledBy="odataOpNameCreate odataEntityRowName odataOpWriteName"
                                     app:op="create"
                                     select=".onToggleOperation" />
                                 <CheckBox
@@ -472,7 +475,7 @@
                                     enabled="{= !${svc>/busy} }"
                                     valueState="{ path: 'svc>update', formatter: '.formatWriteState' }"
                                     tooltip="{ parts: ['i18n>odataOpUpdate', 'svc>title'], formatter: '.formatWriteOperationOf' }"
-                                    ariaLabelledBy="odataOpNameUpdate odataEntityRowName"
+                                    ariaLabelledBy="odataOpNameUpdate odataEntityRowName odataOpWriteName"
                                     app:op="update"
                                     select=".onToggleOperation" />
                                 <CheckBox
@@ -480,7 +483,7 @@
                                     enabled="{= !${svc>/busy} }"
                                     valueState="{ path: 'svc>delete', formatter: '.formatWriteState' }"
                                     tooltip="{ parts: ['i18n>odataOpDelete', 'svc>title'], formatter: '.formatWriteOperationOf' }"
-                                    ariaLabelledBy="odataOpNameDelete odataEntityRowName"
+                                    ariaLabelledBy="odataOpNameDelete odataEntityRowName odataOpWriteName"
                                     app:op="delete"
                                     select=".onToggleOperation" />
                                 <Text

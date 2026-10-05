@@ -738,6 +738,15 @@ QUnit.test("expected_updated_at belongs to an update only, and is a string", asy
     ));
     assert.strictEqual(wrong.status, 422);
     assert.strictEqual(wrong.detail, "expected_updated_at: Input should be a valid string");
+    // A string that is no timestamp of the API is refused as such (422),
+    // not answered as "changed elsewhere" (409).
+    for (const malformed of ["x", "", "2026-10-05", "2026-10-05T09:00:00+00:00\n", "2026-10-05 09:00:00"]) {
+        const refused = await refusal(() => service.updateODataService(
+            "purchase-requisitions", { ...VALID_INPUT, expected_updated_at: malformed }
+        ));
+        assert.strictEqual(refused.status, 422, JSON.stringify(malformed));
+        assert.strictEqual(refused.detail, "expected_updated_at: expected the updated_at this service was loaded with");
+    }
     const create = await refusal(() => service.createODataService(
         { ...VALID_INPUT, name: "suppliers", expected_updated_at: "x" } as ODataServiceInput
     ));

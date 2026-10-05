@@ -306,7 +306,7 @@ QUnit.test("entitySetRow holds what the table shows of an entity set", function 
     assert.deepEqual(row, {
         index: 3, name: "A_Item", title: "Item", path: "", description: "The item.", described: true,
         list: true, get: false, create: false, update: true, delete: false, anyOperation: true,
-        selectable: 1, total: 3, navigationHint: false, note: "", error: ""
+        selectable: 1, total: 3, navigationHint: false, note: "", error: "", label: "Item A_Item"
     });
 
     const bare = odataCatalog.entitySetRow(entitySet("A_Bare", { description: "  ", operations: [], path: "Bare" }), 0);
@@ -512,4 +512,43 @@ QUnit.test("newEntitySetName and emptyEntitySet start an entity set that enables
     const added = odataCatalog.emptyEntitySet("NewEntitySet");
     assert.deepEqual(added.operations, [], "nothing is enabled by default");
     assert.deepEqual(odataCatalog.definitionProblems({ entity_sets: [added], operations: [] }), [], "and it can be saved");
+});
+
+// --- review round 1 ---------------------------------------------------------
+
+QUnit.test("refusalLines says which entity set each part of a refusal is about", function (assert) {
+    const rows = [
+        { name: "A_Item", title: "Item" }, { name: "A_Text", title: "A_Text" }, { name: "A_Item", title: "Item again" }
+    ];
+    const lines = (detail: string) => odataCatalog.refusalLines(odataCatalog.serverErrors(detail), rows);
+    assert.deepEqual(
+        lines("definition.entity_sets.0.fields.4: Value error, field 'B' is filterable but not selectable; "
+            + "a filterable field must also be selectable; title: Field required; "
+            + "definition.entity_sets.1: Value error, entity set 'A_Text' has 'get' but no key; "
+            + "definition.entity_sets.9: Value error, something; "
+            + "definition: Value error, duplicate entity set 'A_Item'"),
+        [
+            "Item (A_Item): fields.4: field 'B' is filterable but not selectable; a filterable field must also be selectable",
+            "title: Field required",
+            "A_Text: entity set 'A_Text' has 'get' but no key",
+            "definition.entity_sets.9: something",
+            "Item (A_Item), Item again (A_Item): duplicate entity set 'A_Item'"
+        ],
+        "title and technical name where a row is named; the location where none is"
+    );
+    assert.deepEqual(lines("Service not found"), []);
+});
+
+QUnit.test("newWrites counts every write as new when the stored service is switched off", function (assert) {
+    assert.deepEqual(
+        odataCatalog.newWrites(WRITING, WRITING, true).map((w) => `${w.name}:${w.operations.join(",")}`),
+        ["A_PurchaseRequisitionItem:update", "A_PurchaseReqnItemText:create,update"],
+        "all writes of the service, in the server's order"
+    );
+    assert.deepEqual(odataCatalog.newWrites(WRITING, WRITING, false), []);
+});
+
+QUnit.test("entitySetRow labels a row by title and technical name", function (assert) {
+    assert.strictEqual(odataCatalog.entitySetRow(entitySet("A_Item", { title: "Item" }), 0).label, "Item A_Item");
+    assert.strictEqual(odataCatalog.entitySetRow(entitySet("A_Item"), 0).label, "A_Item", "not twice when there is no title");
 });

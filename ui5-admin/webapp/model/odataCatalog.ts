@@ -75,6 +75,9 @@ export interface ODataEntityRow {
     note: string;
     /** What a refused save said about this row (a text), or "". */
     error: string;
+    /** Title and technical name, for the accessible name of the row's
+     *  checkboxes: two entity sets can share a title, never a name. */
+    label: string;
 }
 
 /** The write operations a save would newly open on one entity set. */
@@ -290,8 +293,39 @@ function entitySetRow(entitySet: ODataEntitySet, index: number): ODataEntityRow 
         total: fields.length,
         navigationHint: (entitySet.navigations ?? []).length > 0 && ENTITY_OPS.some(on) && !on("get"),
         note: "",
-        error: ""
+        error: "",
+        label: titleOf(entitySet) === entitySet.name ? entitySet.name : `${titleOf(entitySet)} ${entitySet.name}`
     };
+}
+
+function entityLabel(row: { name: string; title: string }): string {
+    return row.title && row.title !== row.name ? `${row.title} (${row.name})` : row.name;
+}
+
+/**
+ * The rows one part of a refusal is about, and its text for a row (with
+ * where inside the entity set, when the location says). See `rowErrors`.
+ */
+function placement(loc: string, message: string, names: readonly string[]): { rows: number[]; text: string } {
+    const match = ENTITY_LOC_RE.exec(loc);
+    if (!match && loc !== "definition") {
+        return { rows: [], text: message };
+    }
+    const named = NAMED_ENTITY_RE.exec(message)?.[1];
+    const text = match?.[2] ? `${match[2]}: ${message}` : message;
+    const index = match ? Number(match[1]) : -1;
+    if (match && index < names.length && (named === undefined || names[index] === named)) {
+        return { rows: [index], text };
+    }
+    const rows: number[] = [];
+    if (named !== undefined) {
+        names.forEach((name, i) => {
+            if (name === named) {
+                rows.push(i);
+            }
+        });
+    }
+    return { rows, text };
 }
 
 // "definition.entity_sets.<n>" and what follows it in a refusal's `loc`.
@@ -364,12 +398,16 @@ export default {
      * `stored`, per entity set (matched by name; an entity set `stored` does
      * not have counts with all its writes). This is what a save newly lets
      * agents with `allow_write` do; switching a write off is not in here.
+     * `switchedOn`: the save also switches the stored, disabled service on.
      */
     newWrites(
-        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
+        switchedOn = false
     ): ODataNewWrite[] {
         const before: Record<string, ODataEntityOp[]> = {};
-        (stored?.entity_sets ?? []).forEach((entitySet) => {
+        // A service that is switched on by this save had no write an agent
+        // could run: every write of it is newly enabled, ticked now or not.
+        (switchedOn ? [] : stored?.entity_sets ?? []).forEach((entitySet) => {
             // Two of a name cannot be saved; if they are there, either's writes count as stored.
             before[`=${entitySet.name}`] = (before[`=${entitySet.name}`] ?? []).concat(writeOpsOf(entitySet));
         });
@@ -428,30 +466,33 @@ export default {
      */
     rowErrors(byLoc: Record<string, string>, names: readonly string[]): Record<number, string> {
         const rows: Record<number, string> = {};
-        const add = (index: number, message: string): void => {
-            rows[index] = rows[index] ? `${rows[index]} ${message}` : message;
-        };
         Object.keys(byLoc).forEach((loc) => {
-            const message = byLoc[loc];
-            const match = ENTITY_LOC_RE.exec(loc);
-            if (!match && loc !== "definition") {
-                return;
-            }
-            const named = NAMED_ENTITY_RE.exec(message)?.[1];
-            const text = match?.[2] ? `${match[2]}: ${message}` : message;
-            const index = match ? Number(match[1]) : -1;
-            if (match && index < names.length && (named === undefined || names[index] === named)) {
-                add(index, text);
-            } else if (named !== undefined) {
-                names.forEach((name, i) => {
-                    if (name === named) {
-                        add(i, text);
-                    }
-                });
-            }
+            const placed = placement(loc, byLoc[loc], names);
+            placed.rows.forEach((index) => {
+                rows[index] = rows[index] ? `${rows[index]} ${placed.text}` : placed.text;
+            });
         });
         return rows;
     },
+
+    /**
+     * The parts of a refused save as lines for above the form, each said
+     * with the entity set it is about: "Item (A_Item): fields.4: ..." in
+     * place of "definition.entity_sets.0.fields.4: ...". A position means
+     * nothing to an admin, and the row it marks may be a screen away. A
+     * part that names no row here keeps its location.
+     */
+    refusalLines(byLoc: Record<string, string>, rows: readonly { name: string; title: string }[]): string[] {
+        const names = rows.map((row) => row.name);
+        return Object.keys(byLoc).map((loc) => {
+            const placed = placement(loc, byLoc[loc], names);
+            const about = placed.rows.map((index) => entityLabel(rows[index])).join(", ");
+            return about ? `${about}: ${placed.text}` : `${loc}: ${byLoc[loc]}`;
+        });
+    },
+
+    /** "Item (A_Item)", or the name alone when that is the title. */
+    entityLabel,
 
     /** A name for an entity set added by hand that no other one has. */
     newEntitySetName(names: readonly string[]): string {

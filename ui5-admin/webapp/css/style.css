@@ -69,7 +69,6 @@
 }
 .odataHint.sapMText,
 .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
-    color: var(--sapContent_LabelColor);
     font-size: 0.75rem;
     /* A form gives its texts the line height of a field; a hint of two
        lines would be spread over two field heights. */
@@ -80,21 +79,35 @@
    (Create, Update, Delete) are tinted, header and cells, so a tick there
    does not read like a tick under List or Get. The column header says
    "Write" as well; the tint is not the only sign. UI5 1.120 does not put
-   the theme parameters on :root, so each var() carries the sap_horizon
-   value as its fallback. */
-.sapMListTbl th.odataWriteCol,
-.sapMListTbl td.odataWriteCol,
-.sapMListTblSubCntRow.odataWriteCol {
-    background-color: var(--sapWarningBackground, #fff8d6);
+   the theme parameters on :root here, so a var(--sap...) resolves to
+   nothing: the colours are the sap_horizon values and apply in that theme
+   only. In the dark and high-contrast themes there is no tint and the
+   texts keep the theme's own colour; the word "Write" carries the meaning. */
+html.sapUiTheme-sap_horizon .sapMListTbl th.odataWriteCol,
+html.sapUiTheme-sap_horizon .sapMListTbl td.odataWriteCol,
+html.sapUiTheme-sap_horizon .sapMListTblSubCntRow.odataWriteCol {
+    background-color: #fff8d6;
 }
 .odataWriteMarker.sapMText {
-    color: var(--sapCriticalTextColor, #a93e00);
     font-size: 0.6875rem;
     line-height: 1.2;
 }
+html.sapUiTheme-sap_horizon .odataWriteMarker.sapMText {
+    color: #a93e00;
+}
 .odataMeta.sapMText {
-    color: var(--sapContent_LabelColor, #556b82);
     font-size: 0.75rem;
+}
+html.sapUiTheme-sap_horizon .odataMeta.sapMText {
+    color: #556b82;
+}
+/* What the ticked, unsaved writes will allow stays under the toolbar with
+   Save while the page scrolls: it must be in view whenever a write is
+   pending, wherever in a long table the tick was set. */
+.odataStickyStrip.sapMMsgStrip {
+    position: sticky;
+    top: 0.5rem;
+    z-index: 2;
 }
 /* A message on a row is a sentence and wraps under the description. */
 .odataRowMessage.sapMObjStatus {
@@ -109,4 +122,9 @@
 }
 .odataRowMessage .sapMObjStatusIcon {
     flex: none;
+}
+/* The hint's grey is sap_horizon's label colour; other themes keep theirs. */
+html.sapUiTheme-sap_horizon .odataHint.sapMText,
+html.sapUiTheme-sap_horizon .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
+    color: #556b82;
 }

@@ -457,6 +457,11 @@ export default class FakeBackend {
     }
 
     private static readonly ODATA_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+    // `_EXPECTED_RE` in agents/odata/admin_routes.py, as a full match (in
+    // JS `$` does not accept a trailing newline). The server then compares
+    // instants; this fake compares the text, which is the same for a client
+    // that hands back what it was given.
+    private static readonly ODATA_EXPECTED_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})?$/;
     private static readonly ODATA_DESTINATION_RE = /^[A-Za-z0-9_.-]{1,200}$/;
     private static readonly ODATA_NAME_MSG = "String should match pattern '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'";
     private static readonly ODATA_DESTINATION_MSG = "String should match pattern '^[A-Za-z0-9_.-]{1,200}$'";
@@ -1074,6 +1079,10 @@ export default class FakeBackend {
             const problems = FakeBackend.validateODataPayload(payload);
             if (expected !== undefined && expected !== null && typeof expected !== "string") {
                 problems.push("expected_updated_at: Input should be a valid string");
+            } else if (typeof expected === "string" && !FakeBackend.ODATA_EXPECTED_RE.test(expected)) {
+                // `_expected_updated_at`: only the format the API emits
+                // `updated_at` in; anything else is a 422, not a 409.
+                problems.push("expected_updated_at: expected the updated_at this service was loaded with");
             }
             if (problems.length) {
                 return this.refused(problems);

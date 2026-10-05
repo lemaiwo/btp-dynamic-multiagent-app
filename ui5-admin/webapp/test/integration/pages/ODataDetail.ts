@@ -224,3 +224,25 @@ export function entityHeader(element: UI5Element): { title: string; metadata: st
         canAdd: control<Button>(element, "odataAddEntitySetButton").getEnabled()
     };
 }
+
+/**
+ * Whether the control `id` is on screen where the user looks: rendered,
+ * wholly inside the window, and not covered by something else.
+ */
+export function inView(element: UI5Element, id: string): boolean {
+    const dom = control<Control>(element, id).getDomRef();
+    if (!dom) {
+        return false;
+    }
+    const rect = dom.getBoundingClientRect();
+    if (rect.height === 0 || rect.top < 0 || rect.bottom > window.innerHeight) {
+        return false;
+    }
+    const top = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return !!top && dom.contains(top);
+}
+
+/** What was last announced to screen readers, politely. */
+export function announced(): string {
+    return document.getElementById("__invisiblemessage-polite")?.textContent ?? "";
+}
