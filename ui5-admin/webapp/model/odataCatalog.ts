@@ -125,8 +125,17 @@ export interface ODataPending {
     fields: ODataNewFieldWrite[];
 }
 
-/** Which fields the entity set dialog lists. */
-export type ODataFieldFilter = "all" | "ticked" | "unticked" | "personal";
+/** Which fields the entity set dialog lists: all; those agents may read;
+ *  those they may write; those with any tick; those with none; those
+ *  marked as personal data. */
+export type ODataFieldFilter = "all" | "read" | "write" | "ticked" | "unticked" | "personal";
+
+/** Why an entity set cannot be removed: an i18n key and the operations
+ *  (by title) it is about. */
+export interface ODataRemovalBlocker {
+    key: "odataRemoveEntityBound" | "odataRemoveEntityReturned";
+    operations: string[];
+}
 
 /** One thing the server would refuse about an entity set: where (the
  *  server's `loc` inside the entity set, "" for the entity set as a whole),
@@ -540,6 +549,7 @@ function fieldMatches(
 ): boolean {
     const ticked = field.selectable === true || field.filterable === true || field.writable === true;
     if ((mode === "ticked" && !ticked) || (mode === "unticked" && ticked)
+        || (mode === "read" && field.selectable !== true) || (mode === "write" && field.writable !== true)
         || (mode === "personal" && field.personal_data !== true)) {
         return false;
     }
@@ -758,6 +768,24 @@ function boundOperations(definition: ODataDefinition | undefined | null, name: s
     return (definition?.operations ?? []).filter((o) => o.bound_to === name).map(operationTitle);
 }
 
+/**
+ * What keeps the entity set `name` from being removed: the operations
+ * bound to it, and the operations that return it. The server refuses a
+ * definition in which `bound_to` or `returns.entity_set` of an operation
+ * names an entity set that is not there (`ServiceDefinition._consistent`
+ * in agents/odata/models.py). One entry per wording; an operation that is
+ * bound to the entity set and returns it is named once, as bound.
+ */
+function removalBlockers(definition: ODataDefinition | undefined | null, name: string): ODataRemovalBlocker[] {
+    const operations = definition?.operations ?? [];
+    const returning = operations.filter((o) => o.bound_to !== name && o.returns?.entity_set === name).map(operationTitle);
+    const blockers: ODataRemovalBlocker[] = [
+        { key: "odataRemoveEntityBound", operations: boundOperations(definition, name) },
+        { key: "odataRemoveEntityReturned", operations: returning }
+    ];
+    return blockers.filter((blocker) => blocker.operations.length > 0);
+}
+
 
 export default {
 
@@ -916,6 +944,7 @@ export default {
     hiddenKeys,
     entitySetIssues,
     boundOperations,
+    removalBlockers,
 
     /** The most fields an entity set may hold. */
     MAX_FIELDS,

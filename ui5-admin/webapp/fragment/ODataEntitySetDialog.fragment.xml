@@ -62,7 +62,7 @@
                     valueStateText="{entity>/errors/description}"
                     liveChange=".onHeadEdit" />
                 <HBox wrap="Wrap" alignItems="Center">
-                    <Label text="{i18n>odataKeys}" class="sapUiTinyMarginEnd" />
+                    <Label id="entityKeysLabel" text="{i18n>odataKeys}" labelFor="entityKeys" class="sapUiTinyMarginEnd" />
                     <HBox id="entityKeys" wrap="Wrap" items="{entity>/keys}">
                         <ObjectStatus text="{entity>text}" inverted="true" class="odataFieldName sapUiTinyMarginEnd" />
                     </HBox>
@@ -86,6 +86,7 @@
             <core:InvisibleText id="entityHintOf" text="{i18n>odataFieldHintOf}" />
             <core:InvisibleText id="entityMeaningsOf" text="{i18n>odataFieldMeaningsOf}" />
             <core:InvisibleText id="entityPersonalOf" text="{i18n>odataPersonalDataOf}" />
+            <core:InvisibleText id="entityFieldFilterLabel" text="{i18n>odataFieldFilterLabel}" />
             <IconTabBar id="entityTabs" expandable="false" selectedKey="{entity>/tab}">
                 <items>
                     <IconTabFilter
@@ -105,9 +106,12 @@
                                 id="entityFieldFilter"
                                 selectedKey="{entity>/filter}"
                                 selectionChange=".onFieldFilter"
+                                ariaLabelledBy="entityFieldFilterLabel"
                                 class="sapUiSmallMarginEnd">
                                 <items>
                                     <SegmentedButtonItem key="all" width="auto" text="{i18n>odataFieldFilterAll}" />
+                                    <SegmentedButtonItem key="read" width="auto" text="{i18n>odataFieldFilterSelected}" />
+                                    <SegmentedButtonItem key="write" width="auto" text="{i18n>odataFieldFilterWritable}" />
                                     <SegmentedButtonItem key="ticked" width="auto" text="{i18n>odataFieldFilterTicked}" />
                                     <SegmentedButtonItem key="unticked" width="auto" text="{i18n>odataFieldFilterUnticked}" />
                                     <SegmentedButtonItem key="personal" width="auto" text="{i18n>odataFieldFilterPersonal}" />

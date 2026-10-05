@@ -680,7 +680,10 @@ export default class FakeBackend {
      * (EDM names, text lengths, one-line texts, value meanings, example
      * queries) are mirrored too: the entity set dialog builds those values
      * (`ENTITY_CASES` in test/unit/odataRuleCases.ts holds both sides to
-     * them). Not mirrored: the size cap and the operation rules.
+     * them). Of the operations: the names an operation gives for the entity
+     * set it is bound to or returns must be entity sets of the definition
+     * (`REMOVAL_CASES` in the same file). Not mirrored: the size cap and the
+     * other operation rules.
      */
     private static odataDefinitionProblems(definition: unknown): string[] {
         if (definition === undefined) {
@@ -779,8 +782,22 @@ export default class FakeBackend {
         if (!problems.length) {
             const names = entitySets.map((e) => e.name);
             const duplicate = names.filter((name, i) => names.indexOf(name) !== i)[0];
+            const operations = (definition as Partial<ODataDefinition>).operations ?? [];
+            // One refusal, the first in the server's order.
+            const dangling = operations.map((operation) => {
+                if (operation.bound_to !== null && operation.bound_to !== undefined && names.indexOf(operation.bound_to) === -1) {
+                    return `bound_to '${operation.bound_to}' of operation '${operation.name}' is not an entity set of this service`;
+                }
+                if (operation.returns && names.indexOf(operation.returns.entity_set) === -1) {
+                    return `returns entity set '${operation.returns.entity_set}' of operation '${operation.name}' `
+                        + "is not an entity set of this service";
+                }
+                return "";
+            }).filter(Boolean)[0];
             if (duplicate !== undefined) {
                 problems.push(`definition: Value error, duplicate entity set '${duplicate}'`);
+            } else if (dangling) {
+                problems.push(`definition: Value error, ${dangling}`);
             }
         }
         return problems;

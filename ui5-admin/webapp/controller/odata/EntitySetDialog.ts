@@ -11,6 +11,7 @@ import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type View from "sap/ui/core/mvc/View";
 import type CheckBox from "sap/m/CheckBox";
+import type ColumnListItem from "sap/m/ColumnListItem";
 import type Dialog from "sap/m/Dialog";
 import type SearchField from "sap/m/SearchField";
 import type SegmentedButton from "sap/m/SegmentedButton";
@@ -19,6 +20,7 @@ import type ListBinding from "sap/ui/model/ListBinding";
 import type {
     ODataDefinition, ODataEntitySet, ODataExampleQuery, ODataField, ODataNavigation, ODataVersion
 } from "../../service/types";
+import type ManagedObject from "sap/ui/base/ManagedObject";
 
 /** What the dialog needs from the page that opens it. */
 export interface EntityDialogContext {
@@ -73,6 +75,9 @@ interface ExampleRow {
     number: number;
 }
 
+/** Where the Read checkbox is among the cells of a row of the fields table. */
+const READ_CELL = 2;
+
 /** How many problems the dialog spells out when Apply is not taken. */
 const ISSUE_CAP = 3;
 
@@ -95,9 +100,12 @@ const HERE: Record<string, string> = {
  * on a field marked as personal data is confirmed in its row).
  *
  * The dialog works on a copy and sends nothing. `open` answers the edited
- * entity set (Apply), the wish to remove it, or nothing (Cancel); the page
- * writes that into its form, and its Save stores it. Apply is not taken
- * while the server would refuse the entity set (`odataCatalog.entitySetIssues`).
+ * entity set (Apply), the wish to remove it, or nothing (Cancel, and a
+ * dialog that was closed for it: `dismiss`, a page that was left); the page
+ * writes that into its form, and its Save stores it. Of an applied entity
+ * set the page takes over what the dialog edits and nothing else. Apply is
+ * not taken while the server would refuse the entity set
+ * (`odataCatalog.entitySetIssues`).
  *
  * A plain class, not a controller: it is the controller object of its
  * fragment only.
@@ -112,6 +120,16 @@ export default class EntitySetDialog {
     private original!: ODataEntitySet;
     private source!: ODataEntitySet;
     private resolve?: (result: EntityDialogResult | undefined) => void;
+    /** What `open` answers once the dialog has closed. */
+    private result?: EntityDialogResult;
+    /** The entity set as the dialog showed it when it opened, canonical:
+     *  what "changed" is measured against. Not the stored one: a field or
+     *  an example that lacks optional keys is not changed by being shown. */
+    private baseline = "";
+    /** Per field (by its position) whether the table lists it. Worked out
+     *  when the search or the filter changes and kept until the next time,
+     *  so that a tick does not take its own row out of the list. */
+    private listed: boolean[] = [];
     /** The fields the last "Tick Read for ..." ticked, for its Undo. */
     private readAllTicked: number[] = [];
 
@@ -135,6 +153,16 @@ export default class EntitySetDialog {
                 (escape.reject as () => void)();
                 this.onCancel();
             });
+            // Answered when the dialog has closed, whoever closed it: the
+            // focus is then back on the page, and a dialog that was closed
+            // from outside (the page was left) does not stay "open".
+            this.dialog.attachAfterClose(() => {
+                const resolve = this.resolve;
+                const result = this.result;
+                this.resolve = undefined;
+                this.result = undefined;
+                resolve?.(result);
+            });
             view.addDependent(this.dialog);
         }
         const source = this.source;
@@ -150,6 +178,9 @@ export default class EntitySetDialog {
             this.tag(row);
             return row;
         });
+        // The binding still holds the filter of the entity set shown before.
+        this.listed = rows.map(() => true);
+        this.result = undefined;
         this.model.setData({
             title: source.title ?? "", name: source.name, description: source.description ?? "",
             canRename: context.canRename, errors: {}, issues: "", keyWarning: "", tab: "fields", filter: "all",
@@ -180,6 +211,7 @@ export default class EntitySetDialog {
         this.applyFilter();
         this.showKeyWarning();
         this.showExampleWarnings();
+        this.baseline = canonical(this.current());
         this.dialog.setTitle(context.text("odataEntityDialogTitle", [odataCatalog.titleOf(source)]));
         this.dialog.setStretch(Device.system.phone === true);
         // A safe start: a text field, not a checkbox and not a button.
@@ -190,11 +222,20 @@ export default class EntitySetDialog {
         });
     }
 
+    /** Closes the dialog; `open` answers `result` when it has closed. */
     private close(result: EntityDialogResult | undefined): void {
+        this.result = result;
         this.dialog?.close();
-        const resolve = this.resolve;
-        this.resolve = undefined;
-        resolve?.(result);
+    }
+
+    /** Closes the dialog as Cancel does, without a question: the page it
+     *  belongs to is left. Does nothing when it is not open, or when it is
+     *  gone already (a view that is destroyed takes its dialog along, and
+     *  nobody is left to be answered). */
+    public dismiss(): void {
+        if (this.resolve && this.dialog && !this.dialog.isDestroyed() && this.dialog.isOpen()) {
+            this.close(undefined);
+        }
     }
 
     // --- state --------------------------------------------------------------
@@ -270,7 +311,7 @@ export default class EntitySetDialog {
     }
 
     private isDirty(): boolean {
-        return canonical(this.current()) !== canonical(this.source);
+        return canonical(this.current()) !== this.baseline;
     }
 
     /** The entity set with the ticks of the rows, for the rules that look
@@ -300,33 +341,39 @@ export default class EntitySetDialog {
         return odataCatalog.fieldMatches(row, search, this.model.getProperty("/filter") as ODataFieldFilter);
     }
 
-    /** How many fields "Tick Read for ..." would tick: those listed that
-     *  are neither readable nor marked as personal data. */
+    /** The fields "Tick Read for ..." would tick: those the table lists
+     *  that are neither readable nor marked as personal data. */
+    private readAllTargets(): FieldRow[] {
+        return this.rows().filter((row) => (
+            this.listed[row.index] === true && row.selectable !== true && row.personal_data !== true
+        ));
+    }
+
     private showReadAll(): void {
-        this.model.setProperty("/readAllCount", this.rows().filter((row) => (
-            row.selectable !== true && row.personal_data !== true && this.matches(row)
-        )).length);
+        this.model.setProperty("/readAllCount", this.readAllTargets().length);
     }
 
     /**
      * Lists the fields the search text and the filter leave. A filter on
      * the binding: no row is worked out again, and only fifty are rendered.
-     * It runs when the search or the filter changes, not on a tick, so a
-     * row does not vanish under the pointer.
+     *
+     * Which fields those are is worked out here, when the search or the
+     * filter changes, and kept (`listed`). The binding runs its filter
+     * again after every change to a row (a growing table compares the rows
+     * before and after), so a filter that looked at the ticks would take
+     * the row out from under the pointer in "Unticked" the moment it is
+     * ticked, with its note and the focus. The footer count and the "Tick
+     * Read for ..." button go by the same list, so they say what is on
+     * screen.
      */
     private applyFilter(): void {
         const binding = this.view.byId("entityFieldsTable")?.getBinding("items") as ListBinding | undefined;
-        // The rows are looked up when the filter runs, not captured here:
-        // the binding keeps its filter and runs it again on the rows of the
+        this.listed = this.rows().map((row) => this.matches(row));
+        // `listed` is read when the filter runs, not captured here: the
+        // binding keeps its filter and runs it again on the rows of the
         // entity set the dialog is opened for next.
-        binding?.filter(new Filter({
-            path: "index",
-            test: (index: number) => {
-                const row = this.rows()[index];
-                return !!row && this.matches(row);
-            }
-        }));
-        this.model.setProperty("/shown", binding ? binding.getLength() : this.rows().length);
+        binding?.filter(new Filter({ path: "index", test: (index: number) => this.listed[index] === true }));
+        this.model.setProperty("/shown", this.listed.filter(Boolean).length);
         this.showReadAll();
     }
 
@@ -437,9 +484,23 @@ export default class EntitySetDialog {
         this.ticksChanged(row.isKey);
     }
 
+    /**
+     * Puts the focus on the Read checkbox of the row a control is in: the
+     * question the row asked goes with the button that answered it, and the
+     * focus would be lost with it.
+     */
+    private focusRead(control: Control): void {
+        let item: ManagedObject | null = control;
+        while (item && item.getMetadata().getName() !== "sap.m.ColumnListItem") {
+            item = item.getParent();
+        }
+        ((item as ColumnListItem | null)?.getCells()[READ_CELL] as Control | undefined)?.focus();
+    }
+
     /** The admin confirmed, in the row, that agents may read this personal data. */
     public onPersonalConfirm(event: Event): void {
         const row = this.rowOf(event);
+        this.focusRead(event.getSource() as Control);
         row.confirm = false;
         row.selectable = true;
         row.note = "";
@@ -449,6 +510,7 @@ export default class EntitySetDialog {
     }
 
     public onPersonalKeep(event: Event): void {
+        this.focusRead(event.getSource() as Control);
         this.rowOf(event).confirm = false;
         this.model.refresh();
     }
@@ -492,9 +554,7 @@ export default class EntitySetDialog {
      * was done can be undone.
      */
     public onReadAll(): void {
-        const targets = this.rows().filter((row) => (
-            row.selectable !== true && row.personal_data !== true && this.matches(row)
-        ));
+        const targets = this.readAllTargets();
         if (!targets.length) {
             return;
         }
@@ -600,7 +660,9 @@ export default class EntitySetDialog {
         this.model.setProperty("/errors", errors);
         if (!messages.length) {
             this.model.setProperty("/issues", "");
-            this.close({ action: "apply", entitySet });
+            // Nothing edited: the entity set as it came, not as the dialog
+            // would write it (with the optional keys it lacked filled in).
+            this.close({ action: "apply", entitySet: this.isDirty() ? entitySet : this.source });
             return;
         }
         const shown = messages.slice(0, ISSUE_CAP).join(" ")
@@ -637,14 +699,17 @@ export default class EntitySetDialog {
 
     /**
      * Removes the entity set from the service, after asking. Not while an
-     * operation is bound to it: the server refuses a definition in which an
-     * operation names an entity set that is not there.
+     * operation is bound to it or returns it: the server refuses a
+     * definition in which an operation names an entity set that is not
+     * there (`odataCatalog.removalBlockers`).
      */
     public onRemove(): void {
         const title = odataCatalog.titleOf(this.source);
-        const bound = odataCatalog.boundOperations(this.context.definition, this.source.name);
-        if (bound.length) {
-            MessageBox.error(this.text("odataRemoveEntityBound", [title, this.source.name, bound.join(", ")]));
+        const blockers = odataCatalog.removalBlockers(this.context.definition, this.source.name);
+        if (blockers.length) {
+            MessageBox.error(blockers.map((blocker) => (
+                this.text(blocker.key, [title, this.source.name, blocker.operations.join(", ")])
+            )).join("\n\n"));
             return;
         }
         const remove = this.text("odataRemove");

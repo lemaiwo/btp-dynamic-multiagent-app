@@ -733,6 +733,9 @@ export interface ODataOperation {
     enabled: boolean;
     /** On, the operation is a write: an agent needs `allow_write` for it. */
     changes_data: boolean;
+    /** The entity set whose entities the operation returns, one or many
+     *  (`ReturnDef`); absent or null when that is not known. */
+    returns?: { entity_set: string; collection: boolean } | null;
 }
 
 export interface ODataDefinition {

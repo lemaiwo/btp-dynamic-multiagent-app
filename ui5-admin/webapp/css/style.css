@@ -157,10 +157,18 @@ html.sapUiTheme-sap_horizon .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
     flex: 1 1 16rem;
     min-width: 0;
 }
-/* The question a row asks before personal data becomes readable. */
+/* The question a row asks before personal data becomes readable. Its
+   border is the theme's colour for a warning (sapCriticalElementColor)
+   where the theme parameters are there as CSS variables; in sap_horizon,
+   where UI5 1.120 does not write them, that parameter's value; in any
+   other theme the text colour. The question is words and two buttons: the
+   border only sets it apart. */
 .odataFieldConfirm.sapMFlexBox {
     margin-top: 0.25rem;
     padding: 0.5rem;
-    border: 1px solid #e76500;
+    border: 1px solid var(--sapCriticalElementColor, currentColor);
     border-radius: 0.5rem;
+}
+html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
+    border-color: var(--sapCriticalElementColor, #e76500);
 }

@@ -2,7 +2,8 @@ import AdminService, { AdminError } from "com/agent/admin/service/AdminService";
 import type { ODataServiceInput } from "com/agent/admin/service/types";
 import FakeBackend from "com/agent/admin/test/integration/FakeBackend";
 import {
-    ENTITY_ACCEPTED, ENTITY_CASES, ONE_LINE_ACCEPTED, RULE_CASES, VALID_INPUT, changed, entityRefusal, withEntitySet,
+    ENTITY_ACCEPTED, ENTITY_CASES, ONE_LINE_ACCEPTED, REMOVAL_CASES, RULE_CASES, VALID_INPUT, changed, entityRefusal,
+    removalDefinition, withEntitySet,
     withField
 } from "./odataRuleCases";
 
@@ -539,6 +540,20 @@ QUnit.test("create answers 422 with the server's text for every entity-set rule 
             ...withEntitySet(changed(accepted.change)), name: `accepted-${ENTITY_ACCEPTED.indexOf(accepted)}`
         });
         assert.strictEqual(created.definition.entity_sets.length, 1, `${accepted.rule}: stored`);
+    }
+});
+
+QUnit.test("a definition whose operation names an entity set that is not there is refused with the server's text", async function (assert) {
+    const service = new AdminService();
+
+    for (const testCase of REMOVAL_CASES) {
+        const error = await refusal(() => service.createODataService({ ...VALID_INPUT, definition: removalDefinition(testCase, true) }));
+        assert.strictEqual(error.status, 422, `${testCase.rule}: 422`);
+        assert.strictEqual(error.detail, testCase.server, `${testCase.rule}: detail`);
+        const created = await service.createODataService({
+            ...VALID_INPUT, name: `whole-${REMOVAL_CASES.indexOf(testCase)}`, definition: removalDefinition(testCase)
+        });
+        assert.strictEqual(created.definition.operations.length, 1, `${testCase.rule}: stored with the entity set`);
     }
 });
 

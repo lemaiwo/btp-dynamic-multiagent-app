@@ -1,4 +1,4 @@
-import type { ODataEntitySet, ODataServiceInput } from "com/agent/admin/service/types";
+import type { ODataDefinition, ODataEntitySet, ODataOperation, ODataServiceInput } from "com/agent/admin/service/types";
 
 /**
  * One table of refused input for the general fields of a catalogue service,
@@ -383,4 +383,56 @@ export function withEntitySet(entitySet: ODataEntitySet): ODataServiceInput {
 /** The 422 detail the server answers for `testCase` on the first entity set. */
 export function entityRefusal(testCase: EntityRuleCase): string {
     return `definition.entity_sets.0${testCase.loc ? `.${testCase.loc}` : ""}: ${testCase.server}`;
+}
+
+// --- removing an entity set ---------------------------------------------------
+
+/**
+ * Why an entity set cannot be removed, held from both sides like the tables
+ * above: `odataCatalog.removalBlockers` must name `clientKey` for the
+ * definition with the entity set, and the fake backend must refuse the
+ * definition without it with the server's text (`ServiceDefinition._consistent`
+ * in agents/odata/models.py). Not a row of `ENTITY_CASES`: those change one
+ * entity set, and this rule is about the operations of the definition.
+ */
+export interface RemovalCase {
+    rule: string;
+    /** What ties the operation "Release" to the entity set A_Item. */
+    operation: Pick<ODataOperation, "bound_to" | "returns">;
+    clientKey: string;
+    /** The whole 422 detail for the definition without A_Item. */
+    server: string;
+}
+
+export const REMOVAL_CASES: RemovalCase[] = [
+    {
+        rule: "an operation is bound to it", operation: { bound_to: "A_Item", returns: null },
+        clientKey: "odataRemoveEntityBound",
+        server: "definition: Value error, bound_to 'A_Item' of operation 'Release' is not an entity set of this service"
+    },
+    {
+        rule: "an operation returns it", operation: { bound_to: null, returns: { entity_set: "A_Item", collection: true } },
+        clientKey: "odataRemoveEntityReturned",
+        server: "definition: Value error, returns entity set 'A_Item' of operation 'Release' is not an entity set of this service"
+    },
+    {
+        rule: "an operation is bound to another entity set and returns it",
+        operation: { bound_to: "A_Other", returns: { entity_set: "A_Item", collection: false } },
+        clientKey: "odataRemoveEntityReturned",
+        server: "definition: Value error, returns entity set 'A_Item' of operation 'Release' is not an entity set of this service"
+    }
+];
+
+/** A definition with A_Item, A_Other and the operation of `testCase`;
+ *  `removed`: without A_Item, as a removal would leave it. */
+export function removalDefinition(testCase: RemovalCase, removed = false): ODataDefinition {
+    const item = validEntitySet();
+    const other = { ...validEntitySet(), name: "A_Other" };
+    return {
+        entity_sets: removed ? [other] : [item, other],
+        operations: [{
+            name: "Release", qualified_name: "", title: "Release item", kind: "function_import", http_method: "POST",
+            parameters: [], description: "", enabled: false, changes_data: true, ...testCase.operation
+        }]
+    };
 }

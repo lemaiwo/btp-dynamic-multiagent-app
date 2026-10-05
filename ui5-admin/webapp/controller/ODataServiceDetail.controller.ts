@@ -31,7 +31,7 @@ import type ListBinding from "sap/ui/model/ListBinding";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
 import type {
-    ODataDefinition, ODataEntityOp, ODataService, ODataServiceInput, ODataServiceUpdate, ODataUsedBy
+    ODataDefinition, ODataEntityOp, ODataEntitySet, ODataService, ODataServiceInput, ODataServiceUpdate, ODataUsedBy
 } from "../service/types";
 
 const ROUTE = "odataServiceDetail";
@@ -68,6 +68,12 @@ interface DuplicateState {
 /** How many entity sets and operations the strip next to Save names; the
  *  Save question lists them all. */
 const STRIP_CAP = 3;
+/** How many field names one entry of that strip spells out. */
+const FIELD_CAP = 3;
+/** What the entity set dialog edits of an entity set: Apply writes these
+ *  back and leaves the rest (keys, path, entity type, operations) as the
+ *  form holds it. */
+const DIALOG_EDITS = ["name", "title", "description", "fields", "navigations", "examples"] as const;
 
 /** The i18n key of each entity-set operation's name. */
 const OP_TEXT: Record<ODataEntityOp, string> = {
@@ -257,6 +263,7 @@ export default class ODataServiceDetail extends ODataController {
     }
 
     public onExit(): void {
+        this.entityDialog?.dismiss();
         this.slotObserver?.disconnect();
         window.removeEventListener("beforeunload", this.onBeforeUnload);
         this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
@@ -274,6 +281,8 @@ export default class ODataServiceDetail extends ODataController {
      *  has a say about leaving, and whatever it held is not a form any
      *  more -- unless it held unsaved changes, then it comes back and asks. */
     private onLeft(): void {
+        // A dialog of this page is not left open over another page.
+        this.entityDialog?.dismiss();
         if (this.keepUnsaved()) {
             return;
         }
@@ -720,18 +729,27 @@ export default class ODataServiceDetail extends ODataController {
      * operation "Release item" (ReleaseItem); the field Note writable on
      * ...": one entry per entity set, per operation and per entity set with
      * fields that become writable. With `cap`, at most that many entries
-     * and the number of the others; `more` words that tail.
+     * and the number of the others (`more` words that tail), and per entry
+     * at most `FIELD_CAP` field names and the number of the others: an
+     * entity set can make hundreds of fields writable at once. Without
+     * `cap` (the Save question) every name is there.
      */
     private writeList(pending: ODataPending, cap = Infinity, more = "odataWriteMore"): string {
         const entries = pending.entitySets.map((write) => this.text("odataWriteItem", [
             write.operations.map((op) => this.text(OP_TEXT[op])).join(", "), write.title, write.name
         ])).concat(pending.operations.map((operation) => (
             this.text("odataWriteOperationItem", [operation.title, operation.name])
-        ))).concat((pending.fields ?? []).map((write) => (
-            this.text(write.fields.length === 1 ? "odataWriteFieldOne" : "odataWriteFieldMany", [
-                write.fields.join(", "), write.title, write.name
-            ])
-        )));
+        ))).concat((pending.fields ?? []).map((write) => {
+            const short = cap !== Infinity && write.fields.length > FIELD_CAP;
+            const names = short
+                ? this.text("odataWriteFieldsMore", [
+                    write.fields.slice(0, FIELD_CAP).join(", "), write.fields.length - FIELD_CAP
+                ])
+                : write.fields.join(", ");
+            return this.text(write.fields.length === 1 ? "odataWriteFieldOne" : "odataWriteFieldMany", [
+                names, write.title, write.name
+            ]);
+        }));
         return entries.length <= cap
             ? entries.join("; ")
             : this.text(more, [entries.slice(0, cap).join("; "), entries.length - cap]);
@@ -957,6 +975,7 @@ export default class ODataServiceDetail extends ODataController {
     /**
      * Adds an entity set by hand, with nothing enabled, and opens it.
      * It gets a free technical name; the dialog is where that is changed.
+     * Cancelled there, it is gone again: Cancel leaves the service as it was.
      */
     public onAddEntitySet(): void {
         const model = this.svc();
@@ -973,7 +992,7 @@ export default class ODataServiceDetail extends ODataController {
         this.clearEntitySearch();
         this.showEntitySets();
         model.setProperty("/saveError", "");
-        void this.openEntitySet(entitySets.length - 1);
+        this.openEntitySet(entitySets.length - 1, true).catch((error: unknown) => ErrorHandler.handle(error));
     }
 
     /** A row of the table was pressed. */
@@ -988,22 +1007,30 @@ export default class ODataServiceDetail extends ODataController {
             this.sayListRefreshed(row.name);
             return;
         }
-        void this.openEntitySet(row.index);
+        this.openEntitySet(row.index).catch((error: unknown) => ErrorHandler.handle(error));
     }
 
     /**
      * Opens the dialog of the entity set at `index` of the definition:
      * fields, keys, navigations, example queries, title and description.
      *
-     * The dialog edits a copy and sends nothing. On Apply the copy takes the
-     * entity set's place in the form, on Remove the entity set leaves it;
-     * either way the rows are worked out again (`showEntitySets`), so the
-     * table, the pending-writes strip and the unsaved-changes check follow
-     * from the definition, and the page's Save is what stores it. The
-     * entity set is found again by identity when the dialog closes: if the
-     * form was loaded anew meanwhile, nothing is written into it.
+     * The dialog edits a copy and sends nothing. On Apply what the dialog
+     * edits of the copy (`DIALOG_EDITS`) is written into the entity set of
+     * the form, on Remove the entity set leaves it; either way the rows are
+     * worked out again (`showEntitySets`), so the table, the pending-writes
+     * strip and the unsaved-changes check follow from the definition, and
+     * the page's Save stores it. The entity set is found again by identity
+     * when the dialog closes: if the form was loaded anew meanwhile,
+     * nothing is written into it.
+     *
+     * `added`: the entity set was just added for this dialog. Left without
+     * Apply (Cancel, or a dialog that could not be shown), it is taken out
+     * of the form again.
+     *
+     * The focus goes back to where the admin was: the row of the entity
+     * set, or Add when there is no such row any more.
      */
-    private async openEntitySet(index: number): Promise<void> {
+    private async openEntitySet(index: number, added = false): Promise<void> {
         const model = this.svc();
         const entitySet = this.definition().entity_sets[index];
         if (!entitySet || this.entityOpen || this.working || model.getProperty("/asking") === true) {
@@ -1023,14 +1050,22 @@ export default class ODataServiceDetail extends ODataController {
                 canRename: !stored.some((candidate) => candidate.name === entitySet.name),
                 text: (key, args) => this.text(key, args)
             });
+        } catch (error) {
+            this.dropAdded(entitySet, added);
+            throw error;
         } finally {
             this.entityOpen = false;
         }
-        if (!result) {
-            return;
-        }
         const entitySets = this.definition().entity_sets;
         const at = entitySets.indexOf(entitySet);
+        if (!result) {
+            if (this.dropAdded(entitySet, added)) {
+                this.focusEntityRow(-1);
+            } else if (at !== -1) {
+                this.focusEntityRow(at);
+            }
+            return;
+        }
         if (at === -1) {
             this.showEntitySets();
             this.sayListRefreshed(entitySet.name);
@@ -1042,10 +1077,42 @@ export default class ODataServiceDetail extends ODataController {
             // by position, would show others. The search stays.
             this.filterEntitySets(model.getProperty("/entitySearch") as string);
         } else {
-            entitySets[at] = result.entitySet;
+            // Only what the dialog edits: the rest of its copy is as old
+            // as the moment the dialog opened.
+            const edited = result.entitySet as unknown as Record<string, unknown>;
+            const target = entitySets[at] as unknown as Record<string, unknown>;
+            DIALOG_EDITS.forEach((key) => {
+                if (edited[key] !== undefined) {
+                    target[key] = edited[key];
+                }
+            });
         }
         model.setProperty("/saveError", "");
         this.showEntitySets(true);
+        this.focusEntityRow(result.action === "remove" ? -1 : at);
+    }
+
+    /** Takes an entity set that was added for a dialog out of the form
+     *  again. Answers whether it did. */
+    private dropAdded(entitySet: ODataEntitySet, added: boolean): boolean {
+        const entitySets = this.definition().entity_sets;
+        const at = added ? entitySets.indexOf(entitySet) : -1;
+        if (at === -1) {
+            return false;
+        }
+        entitySets.splice(at, 1);
+        this.showEntitySets();
+        return true;
+    }
+
+    /** Puts the focus on the row of the entity set at `index` of the
+     *  definition, or on Add when no such row is listed (-1, a row behind
+     *  "More", a row the search hides). */
+    private focusEntityRow(index: number): void {
+        const item = (this.byId("odataEntityTable") as Table | undefined)?.getItems().filter((candidate) => (
+            (candidate.getBindingContext("svc")?.getObject() as ODataEntityRow | undefined)?.index === index
+        ))[0];
+        ((item ?? this.byId("odataAddEntitySetButton")) as Control | undefined)?.focus();
     }
 
     // --- editing ------------------------------------------------------------

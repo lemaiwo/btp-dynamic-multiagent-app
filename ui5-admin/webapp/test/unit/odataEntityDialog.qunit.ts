@@ -1,6 +1,6 @@
-import odataCatalog from "com/agent/admin/model/odataCatalog";
+import odataCatalog, { type ODataFieldFilter } from "com/agent/admin/model/odataCatalog";
 import type { ODataDefinition, ODataEntitySet, ODataField } from "com/agent/admin/service/types";
-import { ENTITY_ACCEPTED, ENTITY_CASES, changed, validEntitySet } from "./odataRuleCases";
+import { ENTITY_ACCEPTED, ENTITY_CASES, REMOVAL_CASES, changed, removalDefinition, validEntitySet } from "./odataRuleCases";
 
 QUnit.module("odataCatalog: the entity set dialog");
 
@@ -51,7 +51,7 @@ QUnit.test("filterFields by text and by all | ticked | unticked | personal data"
         field("RequestedQuantity", { label: "Quantity", writable: true }),
         field("CreatedByUser", { label: "Created by", personal_data: true })
     ];
-    const names = (query: string, mode: "all" | "ticked" | "unticked" | "personal") => (
+    const names = (query: string, mode: ODataFieldFilter) => (
         odataCatalog.filterFields(fields, query, mode).map((f) => f.name)
     );
     assert.deepEqual(names("", "all"), ["PurchaseRequisition", "Plant", "RequestedQuantity", "CreatedByUser"]);
@@ -61,6 +61,10 @@ QUnit.test("filterFields by text and by all | ticked | unticked | personal data"
     assert.deepEqual(names("", "unticked"), ["Plant", "CreatedByUser"]);
     assert.deepEqual(names("", "personal"), ["CreatedByUser"]);
     assert.deepEqual(names("plant", "ticked"), [], "both at once");
+    assert.deepEqual(names("", "read"), ["PurchaseRequisition"], "Read: what agents may read, whatever else is ticked");
+    assert.deepEqual(names("", "write"), ["RequestedQuantity"], "Write: what agents may write, readable or not");
+    assert.deepEqual(names("quantity", "write"), ["RequestedQuantity"]);
+    assert.deepEqual(names("quantity", "read"), []);
 });
 
 QUnit.test("entitySetIssues names, first, what the server refuses first: every rule of the shared table", function (assert) {
@@ -245,4 +249,23 @@ QUnit.test("boundOperations names the operations that keep an entity set from be
     assert.deepEqual(odataCatalog.boundOperations(bound, "A_Item"), ["Release item"]);
     assert.deepEqual(odataCatalog.boundOperations(bound, "A_Text"), []);
     assert.deepEqual(odataCatalog.boundOperations(undefined, "A_Item"), []);
+});
+
+QUnit.test("removalBlockers: an operation bound to an entity set or returning it keeps it from being removed", function (assert) {
+    REMOVAL_CASES.forEach((testCase) => {
+        const whole = removalDefinition(testCase);
+        assert.deepEqual(
+            odataCatalog.removalBlockers(whole, "A_Item"), [{ key: testCase.clientKey, operations: ["Release item"] }], testCase.rule
+        );
+        assert.deepEqual(odataCatalog.removalBlockers(whole, "A_Text"), [], `${testCase.rule}: an entity set no operation names`);
+    });
+    const both = removalDefinition(REMOVAL_CASES[0]);
+    both.operations.push({ ...both.operations[0], name: "Next", title: "", bound_to: null, returns: { entity_set: "A_Item", collection: true } });
+    both.operations.push({ ...both.operations[0], name: "Same", title: "Same", returns: { entity_set: "A_Item", collection: false } });
+    assert.deepEqual(odataCatalog.removalBlockers(both, "A_Item"), [
+        { key: "odataRemoveEntityBound", operations: ["Release item", "Same"] },
+        { key: "odataRemoveEntityReturned", operations: ["Next"] }
+    ], "each wording once; an operation that is bound to it and returns it is named as bound");
+    assert.deepEqual(odataCatalog.removalBlockers(both, "A_Other"), []);
+    assert.deepEqual(odataCatalog.removalBlockers(undefined, "A_Item"), []);
 });

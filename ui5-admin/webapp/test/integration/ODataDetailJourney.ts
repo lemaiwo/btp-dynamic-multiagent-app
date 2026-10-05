@@ -1433,7 +1433,7 @@ opaTest("ticking a write says what it will allow; Save asks with the agents' nam
         Opa5.assert.strictEqual(
             messageOf(dialog),
             `The agent ${agent} uses this service.\n\n`
-            + `Saving enables these write operations in SAP: ${WRITES}.\n\n`
+            + `Saving enables these writes in SAP: ${WRITES}.\n\n`
             + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
             "the question names the entity set, the operation and the agent that can then run it"
         );
@@ -1555,7 +1555,7 @@ opaTest("an agent without Allow writes is named as such, and identity and writes
             `These agents use this service: ${agent}, writer-agent.\n\n`
             + "Runs as changes from \"Signed-in user\" to \"Technical user\". The service then works in chat, "
             + "jobs and workflows, and every user of the agent sees what that SAP user may see.\n\n"
-            + "Saving enables these write operations in SAP: Delete on \"Requisition item\" (A_PurchaseRequisitionItem); "
+            + "Saving enables these writes in SAP: Delete on \"Requisition item\" (A_PurchaseRequisitionItem); "
             + "Delete on \"Requisition header\" (A_PurchaseRequisitionHeader).\n\n"
             + "The agent writer-agent has \"Allow writes\" and will be able to run them.\n\n"
             + `The agent ${agent} uses this service without "Allow writes". Nothing changes for it until that is `
@@ -1598,7 +1598,7 @@ opaTest("a service no agent uses asks before its new writes are saved, and says 
     iSeeADialog(Then, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(
             messageOf(dialog),
-            `Saving enables these write operations in SAP: Delete on "Requisition" (PurchaseReqn).\n\n${NO_AGENTS}\n\n${AUDITED}`,
+            `Saving enables these writes in SAP: Delete on "Requisition" (PurchaseReqn).\n\n${NO_AGENTS}\n\n${AUDITED}`,
             "the question says what is enabled and that no agent uses the service yet"
         );
         Opa5.assert.strictEqual(
@@ -1892,13 +1892,13 @@ opaTest("a service with 200 entity sets renders twenty rows, is searched whole, 
 });
 
 /** Leaves the entity set dialog by its Cancel button. */
-function iCancelTheEntityDialog(When: Common): void {
+function iApplyTheEntityDialog(When: Common): void {
     When.waitFor({
         controlType: "sap.m.Button",
         searchOpenDialogs: true,
-        matchers: withId("entityCancelButton"),
+        matchers: withId("entityApplyButton"),
         actions: new Press(),
-        errorMessage: "No entity set dialog to cancel"
+        errorMessage: "No entity set dialog to apply"
     });
 }
 
@@ -1909,8 +1909,9 @@ opaTest("Add appends an entity set with nothing enabled, and it is saved with th
     iSeeTheService(Then, JOBS, "the service is loaded");
     iEnter(When, "odataEntitySearch", "header");
     iPress(When, "odataAddEntitySetButton");
-    // Add opens the dialog of the new entity set; left as it is, it stays.
-    iCancelTheEntityDialog(When);
+    // Add opens the dialog of the new entity set; applied as it is, it
+    // stays (cancelled, it would be gone again).
+    iApplyTheEntityDialog(When);
     iSee(Then, "the new row", function (page: UI5Element) {
         return entityTitles(page).length === 6;
     }, function (page: UI5Element) {
@@ -1926,8 +1927,9 @@ opaTest("Add appends an entity set with nothing enabled, and it is saved with th
         Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent yet");
     });
     iPress(When, "odataAddEntitySetButton");
-    // Add opens the dialog of the new entity set; left as it is, it stays.
-    iCancelTheEntityDialog(When);
+    // Add opens the dialog of the new entity set; applied as it is, it
+    // stays (cancelled, it would be gone again).
+    iApplyTheEntityDialog(When);
     iSee(Then, "a second new row", function (page: UI5Element) {
         return entityTitles(page).length === 7;
     }, function (page: UI5Element) {
@@ -2140,7 +2142,7 @@ opaTest("a write ticked far down a long table, after More, is said next to Save 
             `the ticked row did not move when the strip appeared (${top} -> ${rowTop(page, ROW)})`
         );
         Opa5.assert.strictEqual(
-            announced(), `${WRITES} will be enabled by Save. Write operations pending: 1.`,
+            announced(), `${WRITES} will be enabled by Save. Writes pending: 1.`,
             "a screen reader is told what changed, and how many are pending"
         );
     });
@@ -2155,7 +2157,7 @@ opaTest("a write ticked far down a long table, after More, is said next to Save 
             `the row did not move when the strip went away (${top} -> ${rowTop(page, ROW)})`
         );
         Opa5.assert.strictEqual(
-            announced(), `${WRITES} is no longer pending. No write operations are pending.`,
+            announced(), `${WRITES} is no longer pending. No writes are pending.`,
             "that nothing is pending any more is announced too"
         );
     });
@@ -2165,7 +2167,7 @@ opaTest("a write ticked far down a long table, after More, is said next to Save 
     iSeeADialog(Then, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(
             messageOf(dialog),
-            `Saving enables these write operations in SAP: ${WRITES}.\n\n${NO_AGENTS}\n\n${AUDITED}`,
+            `Saving enables these writes in SAP: ${WRITES}.\n\n${NO_AGENTS}\n\n${AUDITED}`,
             "Save asks although no agent uses the service"
         );
         Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
@@ -2245,7 +2247,7 @@ opaTest("what Save asks about is worked out against the service as it is stored 
         Opa5.assert.strictEqual(
             messageOf(dialog),
             `The agent ${agent} uses this service.\n\n`
-            + "Saving enables these write operations in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem); "
+            + "Saving enables these writes in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem); "
             + `${ITEM_FIELDS}.\n\n`
             + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
             "a write the stored service does not have is one this save enables, with the fields it can then send"
@@ -2283,7 +2285,7 @@ opaTest("switching a service with writes back on asks about all of them; switchi
             messageOf(dialog),
             `The agent ${agent} uses this service.\n\n`
             + "The service is switched on again: all its write operations become available.\n\n"
-            + `Saving enables these write operations in SAP: ${ALL}.\n\n`
+            + `Saving enables these writes in SAP: ${ALL}.\n\n`
             + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
             "the question lists every write the service has"
         );
@@ -2431,7 +2433,7 @@ opaTest("a service saved as new after it was deleted elsewhere asks about all it
     iSeeADialog(Then, function (dialog: UI5Element) {
         Opa5.assert.strictEqual(
             messageOf(dialog),
-            "Saving enables these write operations in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem); "
+            "Saving enables these writes in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem); "
             + `Create, Update on "Item text" (A_PurchaseReqnItemText); ${RELEASE}; ${ITEM_FIELDS}; ${TEXT_FIELD}.`
             + `\n\n${NO_AGENTS}\n\n${AUDITED}`,
             "a new service is asked about too: its operations and its writable fields"
@@ -2475,7 +2477,7 @@ opaTest("switching on a service whose only writes are operations says so, asks n
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").text, pending(RELEASE), "switching on opens the operation");
         Opa5.assert.strictEqual(
-            announced(), `${RELEASE} will be enabled by Save. Write operations pending: 1.`, "which is announced"
+            announced(), `${RELEASE} will be enabled by Save. Writes pending: 1.`, "which is announced"
         );
     });
     iPress(When, "odataSaveButton");
@@ -2484,7 +2486,7 @@ opaTest("switching on a service whose only writes are operations says so, asks n
             messageOf(dialog),
             `The agent ${agent} uses this service.\n\n`
             + "The service is switched on again: all its write operations become available.\n\n"
-            + `Saving enables these write operations in SAP: ${RELEASE}.\n\n`
+            + `Saving enables these writes in SAP: ${RELEASE}.\n\n`
             + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
             "the question names the operation"
         );
@@ -2596,7 +2598,7 @@ opaTest("a strip for many pending writes names three and counts the rest, and so
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").text, pending(CAPPED), "three entity sets and a count");
         Opa5.assert.strictEqual(
-            announced(), `${CAPPED} will be enabled by Save. Write operations pending: 12.`, "announced as briefly"
+            announced(), `${CAPPED} will be enabled by Save. Writes pending: 12.`, "announced as briefly"
         );
     });
     iSee(Then, "the room kept for the strip", function (page: UI5Element) {
@@ -2614,7 +2616,7 @@ opaTest("a strip for many pending writes names three and counts the rest, and so
         Opa5.assert.strictEqual(
             messageOf(dialog),
             "The service is switched on again: all its write operations become available.\n\n"
-            + `Saving enables these write operations in SAP: ${all}.\n\n${NO_AGENTS}\n\n${AUDITED}`,
+            + `Saving enables these writes in SAP: ${all}.\n\n${NO_AGENTS}\n\n${AUDITED}`,
             "the question lists all twelve"
         );
     }, "the write confirmation");
@@ -2755,7 +2757,7 @@ opaTest("many writes that are no longer pending are announced without pointing a
         return !stripOf(page, "odataPendingWrites").visible && announced().indexOf("no longer pending") !== -1;
     }, function () {
         Opa5.assert.strictEqual(
-            announced(), `${three}; and 9 more is no longer pending. No write operations are pending.`,
+            announced(), `${three}; and 9 more is no longer pending. No writes are pending.`,
             "three and a count, and no \"(Save lists them all)\": Save will not ask about them"
         );
     });
@@ -2779,7 +2781,7 @@ opaTest("unticking one of two pending writes says which one went and how many re
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(
             announced(),
-            "Delete on \"Requisition item\" (A_PurchaseRequisitionItem) is no longer pending. Write operations pending: 1.",
+            "Delete on \"Requisition item\" (A_PurchaseRequisitionItem) is no longer pending. Writes pending: 1.",
             "removed while another remains"
         );
         Opa5.assert.strictEqual(
