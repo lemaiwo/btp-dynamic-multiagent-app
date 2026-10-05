@@ -24,6 +24,7 @@ Endpoints (all require `<xsappname>.admin` XSUAA scope):
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -52,7 +53,7 @@ from agents.builtins import BUILTIN_URLS, is_builtin_url
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
 from agents.odata import BUILTIN_ODATA_URL
-from agents.odata.models import SERVICE_NAME_RE
+from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.slack_tools import BUILTIN_SLACK_URL
@@ -102,6 +103,7 @@ from agents.db import (
     list_workflows,
     normalize_skills_json,
     odata_entries,
+    odata_service_columns,
     odata_service_referrers,
     prepare_servers,
     prepared_server_list,
@@ -1950,6 +1952,13 @@ def _missing_secret_errors(agent: AgentPayload, existing: Any) -> list[str]:
 # of up to MAX_DEFINITION_BYTES that is validated in the request, so the
 # count is bounded like the size of a single one is.
 MAX_IMPORT_ODATA_SERVICES = 200
+# ... and the section as a whole this many characters of JSON: four
+# definitions of the maximum size (4 x 2 MB = 8 MB). Validating and
+# re-serialising a definition costs about 60 ms per MB (measured on a
+# 1.9 MB definition), so a full section is about half a second of CPU, done
+# off the event loop one entry at a time. The count alone would allow
+# 200 x 2 MB = 400 MB, i.e. the better part of a minute.
+MAX_IMPORT_ODATA_CHARS = 4 * MAX_DEFINITION_BYTES
 # What decides whose identity a call carries and which system it reaches.
 _ODATA_SERVICE_IDENTITY_FIELDS = ("destination", "user_context")
 
@@ -1959,7 +1968,10 @@ class _ODataImport:
 
     def __init__(self) -> None:
         self.carried = False  # the bundle has a non-empty catalogue section
-        self.names: set[str] = set()
+        self.names: set[str] = set()  # stored by this import
+        # Every service the bundle names, stored or refused: a refused entry
+        # is not an absent one, so replace must not want to remove it.
+        self.named: set[str] = set()
         self.existing: dict[str, Any] = {}  # name -> row, as before the import
         self.created = 0
         self.updated = 0
@@ -1985,9 +1997,16 @@ async def _import_odata_services(
     on, or re-enable one an admin disabled on this landscape. Entity set
     operations and operation switches default to off and need no such rule.
 
-    The catalogue rows are locked first (all of them: a replace may delete
-    any, and the catalogue is small), before anything else of this
-    transaction takes a lock: see `agents.db.list_odata_services`.
+    The catalogue rows are locked (all of them: a replace may delete any,
+    and the catalogue is small) before this transaction takes a lock on any
+    agent row or a shared lock on a service through an agent's existence
+    check; the orchestrator instructions and the skills of the bundle were
+    flushed before, and no catalogue or agent writer waits for those. See
+    `agents.db.list_odata_services`.
+
+    Cost: the section is bounded in count and in total size before anything
+    is validated, and each entry is validated once, in a worker thread,
+    together with the column values its row gets (`_checked_odata_entry`).
     """
     result = _ODataImport()
     if section is None:
@@ -2002,16 +2021,27 @@ async def _import_odata_services(
         return result
     if not section:
         return result
+    try:
+        size = 0
+        for entry in section:
+            size += len(json.dumps(entry, ensure_ascii=False))
+            if size > MAX_IMPORT_ODATA_CHARS:
+                errors.append("odata_services: the section is too large for one import")
+                return result
+    except (TypeError, ValueError, RecursionError):
+        errors.append("odata_services: expected a list of services")
+        return result
     result.carried = True
     result.existing = {r.name: r for r in await list_odata_services(session, lock=True)}
     for position, entry in enumerate(section, start=1):
         name = entry.get("name") if isinstance(entry, dict) else None
         if isinstance(name, str) and re.fullmatch(SERVICE_NAME_RE, name):
             label = f"OData service '{name}'"
+            result.named.add(name)
         else:
             label = f"OData service #{position}"
         try:
-            data = validate_odata_service(entry)
+            data, columns = await asyncio.to_thread(_checked_odata_entry, entry)
         except ValueError as e:
             errors.append(f"{label}: {e}")
             continue
@@ -2027,23 +2057,29 @@ async def _import_odata_services(
         row = result.existing.get(name)
         if row is None:
             try:
-                await create_odata_service(session, data, commit=False)
+                await create_odata_service(session, data, commit=False, columns=columns)
             except ValueError as e:  # created by someone else since the read
                 errors.append(f"{label}: {e}")
                 continue
             result.created += 1
             continue
-        changed = [
-            field
-            for field in _ODATA_SERVICE_IDENTITY_FIELDS
-            if row.to_export()[field] != data[field]
-        ]
+        # From the columns: `to_export` would parse the stored definition.
+        before = {"destination": row.destination, "user_context": bool(row.user_context)}
+        changed = [f for f in _ODATA_SERVICE_IDENTITY_FIELDS if before[f] != data[f]]
         # By name, so the name cannot differ: a rename is impossible here.
-        await update_odata_service(session, row, data, commit=False)
+        await update_odata_service(session, row, data, commit=False, columns=columns)
         result.updated += 1
         if changed:
             result.identity[name] = changed
     return result
+
+
+def _checked_odata_entry(entry: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One bundle entry as ``(validated data, column values)``, or the
+    ``ValueError`` of `validate_odata_service`. Pure and CPU-bound (up to a
+    2 MB definition through the models), so the import runs it in a thread."""
+    data = validate_odata_service(entry)
+    return data, odata_service_columns(data)
 
 
 @router.post("/api/import", dependencies=[Depends(require_admin)])
@@ -2062,7 +2098,8 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     """
     errors: list[str] = []
     warnings: list[str] = []
-    removed = removed_skills = removed_workflows = removed_services = 0
+    removed = removed_skills = removed_workflows = 0
+    removed_services: list[str] = []
     identity_changes: list[dict[str, Any]] = []
     async with SessionLocal() as session:
         try:
@@ -2211,7 +2248,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 # could not run, so a service still in use is an error.
                 if payload.replace:
                     for name, srow in sorted(odata.existing.items()):
-                        if name in odata.names:
+                        if name in odata.named:
                             continue
                         if used_by.get(name):
                             agents = ", ".join(f"'{a}'" for a in used_by[name])
@@ -2221,7 +2258,11 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                             )
                             continue
                         await delete_odata_service(session, srow, commit=False)
-                        removed_services += 1
+                        removed_services.append(name)
+                    if removed_services:
+                        # A curated definition has no undo; say which went.
+                        names = ", ".join(f"'{n}'" for n in removed_services)
+                        warnings.append(f"OData service(s) removed by replace: {names}")
                 # Allowed, as an admin's own act, but never unseen: an agent
                 # whose service now runs as another identity or reaches
                 # another system. Field and agent names only.
@@ -2259,7 +2300,8 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         "removed": removed,
         "removed_skills": removed_skills,
         "removed_workflows": removed_workflows,
-        "removed_odata_services": removed_services,
+        "removed_odata_services": len(removed_services),
+        "removed_odata_service_names": removed_services,
         # Catalogue services in use whose destination or identity
         # (`user_context`) this import changed: [{service, changed, agents}].
         "odata_identity_changes": identity_changes,

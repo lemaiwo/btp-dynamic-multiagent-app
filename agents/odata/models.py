@@ -360,8 +360,31 @@ class ODataServicePayload(_Model):
         return self.definition.has_write()
 
 
+# What a location part may look like to be repeated: every field of the
+# models above does, and so does an honestly mistyped one.
+_LOC_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,%d}" % (_MAX_LOC_PART - 1))
+_UNKNOWN_FIELD = "<unknown field>"
+
+
 def _loc(parts: tuple[Any, ...]) -> str:
-    return ".".join(str(part)[:_MAX_LOC_PART] for part in parts) or "service"
+    """Where a problem is, as ``a.0.b``.
+
+    A list index is repeated as it is. A key is the client's own text: the
+    key of an unknown field arrives here like any other, and a value pasted
+    where a key belongs (a URL, a token) would come back with its first
+    characters. So a key is named only when it has the form of a field name
+    (`fullmatch`: a trailing newline does not pass); anything else is
+    ``<unknown field>``.
+    """
+    shown = [
+        str(part)
+        if isinstance(part, int) and not isinstance(part, bool)
+        else part
+        if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part)
+        else _UNKNOWN_FIELD
+        for part in parts
+    ]
+    return ".".join(shown) or "service"
 
 
 def validate_odata_service(data: dict[str, Any]) -> dict[str, Any]:

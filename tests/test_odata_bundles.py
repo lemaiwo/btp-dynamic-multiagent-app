@@ -359,6 +359,7 @@ async def test_an_invalid_service_is_one_line_and_nothing_is_imported(client):
         ({"destination": f"https://{SECRET}/x"}, "destination"),
         ({"definition": None}, "definition"),
         ({"unknown_key": SECRET}, "unknown_key"),
+        ({f"https://{SECRET}/pasted-as-a-key": 1}, "<unknown field>"),
         ({"name": "Not A Slug"}, "name"),
     ],
 )
@@ -414,7 +415,11 @@ async def test_replace_with_a_section_removes_the_services_it_does_not_name(clie
         IMPORT, json={"agents": [agent()], "odata_services": [svc()], "replace": True}
     )
     assert r.status_code == 200, r.text
-    assert r.json()["removed_odata_services"] == 2
+    body = r.json()
+    assert body["removed_odata_services"] == 2
+    # A curated definition has no undo: the answer says which ones went.
+    assert body["removed_odata_service_names"] == ["old", "stock"]
+    assert body["warnings"] == ["OData service(s) removed by replace: 'old', 'stock'"]
     assert list(await catalogue()) == ["purchase-requisitions"]
 
 
@@ -422,6 +427,7 @@ async def test_without_replace_nothing_is_removed(client):
     await create(client, svc(), svc("stock"))
     r = await client.post(IMPORT, json={"odata_services": [svc()]})
     assert r.status_code == 200 and r.json()["removed_odata_services"] == 0
+    assert r.json()["removed_odata_service_names"] == [] and r.json()["warnings"] == []
     assert sorted(await catalogue()) == ["purchase-requisitions", "stock"]
 
 
@@ -451,6 +457,148 @@ async def test_replace_removes_a_service_whose_only_user_is_removed_too(client):
     assert (r.json()["removed"], r.json()["removed_odata_services"]) == (1, 1)
     assert await agent_names() == ["stayer"]
     assert list(await catalogue()) == ["purchase-requisitions"]
+
+
+@pytest.mark.parametrize("fault", ["invalid", "no_enabled", "listed_twice"])
+async def test_replace_does_not_call_a_refused_entry_absent(client, fault):
+    """The bundle names the service, so replace must not also report it as
+    one it would remove: one fault, one line."""
+    await create(client, svc(), svc("stock"))
+    assert (await client.post(AGENTS, json=agent("keeper", services=["stock"]))).status_code == 201
+    before = await catalogue()
+    stock = svc("stock")
+    entries = [svc(), stock]
+    if fault == "invalid":
+        stock["title"] = ""
+        expected = "OData service 'stock': title: "
+    elif fault == "no_enabled":
+        del stock["enabled"]
+        expected = "OData service 'stock': enabled: Field required"
+    else:
+        entries = [stock, svc(), svc("stock", title="Again")]
+        expected = "OData service 'stock': listed more than once"
+    bundle = {
+        "agents": [agent("keeper", services=["stock"])],
+        "odata_services": entries,
+        "replace": True,
+    }
+    message = detail(await client.post(IMPORT, json=bundle))
+    assert message.startswith(expected) and message.count("\n") == 0, message
+    assert "cannot be removed" not in message
+    assert await catalogue() == before
+
+
+async def test_a_failing_workflow_rolls_back_the_catalogue_and_the_agents(client):
+    """The last section to be written: by then the services and the agents
+    of the bundle are flushed, and none of it may stay."""
+    await create(client, svc("stock"))
+    assert (await client.post(AGENTS, json=agent("keeper", services=["stock"]))).status_code == 201
+    before = await catalogue()
+    bundle = {
+        "agents": [agent("newcomer")],
+        "odata_services": [svc(), svc("stock", title="Changed", destination="S4_ODATA_TECH")],
+        "workflows": [
+            {
+                "name": "broken",
+                "api_slug": "broken",
+                "steps": [{"position": 1, "agent_name": "nobody-by-that-name"}],
+            }
+        ],
+    }
+    message = detail(await client.post(IMPORT, json=bundle))
+    assert message.startswith("Workflow 'broken': ") and message.count("\n") == 0
+    assert await catalogue() == before and await agent_names() == ["keeper"]
+
+
+# --- cost ---------------------------------------------------------------------
+
+
+async def test_the_section_size_is_bounded(client, monkeypatch):
+    """Up to MAX_IMPORT_ODATA_SERVICES entries of up to 2 MB each would be
+    validated inside one request; the section as a whole has a ceiling, and
+    the refusal is a fixed text."""
+    one = len(json.dumps(svc(), ensure_ascii=False))
+    monkeypatch.setattr(admin, "MAX_IMPORT_ODATA_CHARS", one * 2 + 10)
+    calls: list[str] = []
+    real = admin.validate_odata_service
+    monkeypatch.setattr(
+        admin, "validate_odata_service", lambda d: (calls.append(d["name"]), real(d))[1]
+    )
+    r = await client.post(IMPORT, json={"odata_services": [svc(), svc("stock")]})
+    assert r.status_code == 200, r.text
+    calls.clear()
+    bundle = {"odata_services": [svc(), svc("stock"), svc("one-too-many", title=SECRET)]}
+    r = await client.post(IMPORT, json=bundle)
+    assert detail(r) == "odata_services: the section is too large for one import"
+    assert SECRET not in r.text
+    assert calls == [], "refused before anything is validated"
+    assert sorted(await catalogue()) == ["purchase-requisitions", "stock"]
+    assert admin.MAX_IMPORT_ODATA_CHARS  # the patched one; the real one is checked below
+
+
+def test_the_real_section_ceiling():
+    from agents.odata.models import MAX_DEFINITION_BYTES
+
+    assert admin.MAX_IMPORT_ODATA_CHARS == 4 * MAX_DEFINITION_BYTES
+
+
+async def test_each_entry_is_validated_once_and_off_the_event_loop(client, monkeypatch):
+    import threading
+
+    from agents import db as agents_db
+
+    await create(client, svc("stock"))
+    loop_thread = threading.get_ident()
+    seen: list[tuple[str, bool]] = []
+    real = admin.validate_odata_service
+
+    def validate(data):
+        seen.append((data["name"], threading.get_ident() != loop_thread))
+        return real(data)
+
+    monkeypatch.setattr(admin, "validate_odata_service", validate)
+    # The definition models are not run a second time on the loop when the
+    # row is written, and the stored JSON is not parsed to compare identity.
+    on_loop: list[str] = []
+    real_validate = agents_db._ODataServiceDefinition.model_validate
+
+    def definition_validate(value, *a, **kw):
+        if threading.get_ident() == loop_thread:
+            on_loop.append("definition")
+        return real_validate(value, *a, **kw)
+
+    monkeypatch.setattr(agents_db._ODataServiceDefinition, "model_validate", definition_validate)
+    monkeypatch.setattr(
+        agents_db.ODataService,
+        "to_export",
+        lambda self: on_loop.append("to_export") or {},
+    )
+    r = await client.post(
+        IMPORT, json={"odata_services": [svc(), svc("stock", destination="S4_ODATA_TECH")]}
+    )
+    assert r.status_code == 200, r.text
+    assert seen == [("purchase-requisitions", True), ("stock", True)]
+    assert on_loop == []
+    monkeypatch.undo()
+    stored = await catalogue()
+    assert stored["stock"] == svc("stock", destination="S4_ODATA_TECH")
+    assert stored["purchase-requisitions"] == svc()
+
+
+def test_the_import_lock_is_an_exclusive_row_lock_on_postgres_only():
+    """Compile-only: SQLite has no row locks, so no suite here would notice
+    the clause missing where it matters."""
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from agents.db import _list_odata_services_query
+
+    locked = _list_odata_services_query(lock=True)
+    text = str(locked.compile(dialect=postgresql.dialect()))
+    assert text.rstrip().endswith("FOR UPDATE") and "ORDER BY odata_services.name" in text
+    assert "FOR" not in str(locked.compile(dialect=sqlite.dialect()))
+    assert "FOR" not in str(_list_odata_services_query(lock=False).compile(
+        dialect=postgresql.dialect()
+    ))
 
 
 # --- identity changes ---------------------------------------------------------
@@ -513,7 +661,7 @@ async def test_an_identity_change_counts_the_agents_the_same_bundle_attaches(cli
 # --- reload -------------------------------------------------------------------
 
 
-async def test_import_reloads_exactly_as_before(client, monkeypatch):
+async def test_import_does_not_reload_the_registry(client, monkeypatch):
     """The import route has never rebuilt the registry itself (the admin UIs
     call reload after it); carrying the catalogue does not change that, so a
     catalogue change takes effect at the same reload as the agents'."""

@@ -2274,12 +2274,18 @@ async def delete_skill(session: AsyncSession, skill_id: int) -> bool:
 
 
 # --- OData services ---
-def _odata_columns(data: dict[str, Any]) -> dict[str, Any]:
+def odata_service_columns(data: dict[str, Any]) -> dict[str, Any]:
     """Column values for a service from ``validate_odata_service`` output.
 
     The definition is stored as ``ServiceDefinition.model_dump_json()``, the
     exact text ``MAX_DEFINITION_BYTES`` was measured on, so a definition that
     passed the cap is never larger in the table than the gate allowed.
+
+    Public, and pure, for a caller that writes many services in one request
+    (the bundle import): building the JSON runs the definition models once
+    more, which for a large definition is work to do off the event loop and
+    then hand to `create_odata_service` / `update_odata_service` as
+    ``columns``.
     """
     definition = _ODataServiceDefinition.model_validate(data.get("definition") or {})
     return {
@@ -2308,11 +2314,17 @@ async def list_odata_services(
     it does for the delete route. The name order is the lock order, so two
     such writers cannot wait for each other.
     """
+    result = await session.execute(_list_odata_services_query(lock=lock))
+    return list(result.scalars().all())
+
+
+def _list_odata_services_query(*, lock: bool) -> Any:
+    """The statement of `list_odata_services`; a function of its own so a
+    test can compile it for Postgres (``FOR UPDATE``)."""
     query = select(ODataService).order_by(ODataService.name)
     if lock:
         query = query.with_for_update()
-    result = await session.execute(query)
-    return list(result.scalars().all())
+    return query
 
 
 async def get_odata_service(session: AsyncSession, name: str) -> ODataService | None:
@@ -2407,9 +2419,16 @@ async def _begin_before_savepoint(session: AsyncSession) -> None:
 
 
 async def create_odata_service(
-    session: AsyncSession, data: dict[str, Any], *, commit: bool = True
+    session: AsyncSession,
+    data: dict[str, Any],
+    *,
+    commit: bool = True,
+    columns: dict[str, Any] | None = None,
 ) -> ODataService:
     """Store a new catalogue service; ``data`` is `validate_odata_service` output.
+
+    ``columns`` is `odata_service_columns(data)` when the caller already
+    built it (see there); never anything else.
 
     A taken name is a ``ValueError``. The lookup gives the readable answer;
     the unique constraint closes the check-then-write race, and the insert
@@ -2420,7 +2439,7 @@ async def create_odata_service(
     taken = f"Service name {name!r} already exists"
     if await get_odata_service(session, name) is not None:
         raise ValueError(taken)
-    row = ODataService(name=name, **_odata_columns(data))
+    row = ODataService(name=name, **(columns or odata_service_columns(data)))
     await _begin_before_savepoint(session)
     try:
         async with session.begin_nested():
@@ -2435,16 +2454,23 @@ async def create_odata_service(
 
 
 async def update_odata_service(
-    session: AsyncSession, row: ODataService, data: dict[str, Any], *, commit: bool = True
+    session: AsyncSession,
+    row: ODataService,
+    data: dict[str, Any],
+    *,
+    commit: bool = True,
+    columns: dict[str, Any] | None = None,
 ) -> ODataService:
     """Replace everything but the name with ``data`` (`validate_odata_service` output).
+
+    ``columns`` as in `create_odata_service`.
 
     The name is refused rather than ignored: agents attach a service by
     name, so a silent rename would detach every one of them.
     """
     if data["name"] != row.name:
         raise ValueError("name cannot be changed; duplicate the service instead")
-    for column, value in _odata_columns(data).items():
+    for column, value in (columns or odata_service_columns(data)).items():
         setattr(row, column, value)
     if commit:
         await session.commit()

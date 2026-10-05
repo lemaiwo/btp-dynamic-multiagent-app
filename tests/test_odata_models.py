@@ -421,6 +421,32 @@ def test_validate_odata_service_never_echoes_an_input_value():
         validate_odata_service([secret])  # type: ignore[arg-type]
 
 
+def test_an_unknown_key_is_named_only_when_it_looks_like_a_field_name():
+    """A refused key is the client's own text. A value pasted where a key
+    belongs (a URL, a token) must not come back, not even its first
+    characters; a mistyped field name still should, so it can be fixed."""
+    secret = "hunter2-pasted-by-mistake"
+    data = good()
+    data["sortable"] = True
+    data[f"https://user:{secret}@host/x"] = 1
+    data[secret] = 1  # has a hyphen: no identifier
+    data["x" * 65] = 1
+    data[""] = 1
+    data["definition"]["entity_sets"][0][f"{secret} y"] = 1
+    data["definition"]["entity_sets"][0]["fields"][0]["Tenant_2"] = 1
+    with pytest.raises(ValueError) as err:
+        validate_odata_service(data)
+    text = str(err.value)
+    assert secret not in text and "host" not in text and "xxx" not in text
+    lines = text.split("; ")
+    assert "sortable: Extra inputs are not permitted" in lines
+    assert lines.count("<unknown field>: Extra inputs are not permitted") == 4
+    assert "definition.entity_sets.0.<unknown field>: Extra inputs are not permitted" in lines
+    assert (
+        "definition.entity_sets.0.fields.0.Tenant_2: Extra inputs are not permitted" in lines
+    )
+
+
 def test_a_trailing_newline_is_not_part_of_a_name():
     # Python's `$` also matches before a final "\n"; these values end up in
     # request URLs, so the newline must be refused, not carried along.
