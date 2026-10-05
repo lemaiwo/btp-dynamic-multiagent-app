@@ -418,3 +418,28 @@ def test_validate_odata_service_never_echoes_an_input_value():
         assert loc in text
     with pytest.raises(ValueError, match="expected an object"):
         validate_odata_service([secret])  # type: ignore[arg-type]
+
+
+def test_a_trailing_newline_is_not_part_of_a_name():
+    # Python's `$` also matches before a final "\n"; these values end up in
+    # request URLs, so the newline must be refused, not carried along.
+    refused(with_entity_set(path="A_Item\n"), "path")
+    refused(with_operation(qualified_name="ns.Op\n"), "qualified_name")
+    refused(with_operation(bound_to="A_PurchaseRequisitionItem\n"), "bound_to")
+    refused(with_entity_set(name="A_PurchaseRequisitionItem\n"), "name")
+    refused({**good(), "name": "purchase-requisitions\n"}, "name")
+    refused({**good(), "destination": "S4_ODATA_USER\n"}, "destination")
+    data = good()
+    data["definition"]["entity_sets"][0]["keys"][0]["name"] = "PurchaseRequisition\n"
+    refused(data, "keys")
+    assert ODataServicePayload.model_validate(with_operation(qualified_name="ns.Op"))
+
+
+def test_example_query_lengths():
+    def with_example(**patch: Any) -> dict[str, Any]:
+        return with_entity_set(examples=[{"description": "Open items", **patch}])
+
+    ok = with_example(select=["PurchaseRequisition", "x" * 128], orderby="x" * 300)
+    assert ODataServicePayload.model_validate(ok)
+    refused(with_example(select=["x" * 129]), "select")
+    refused(with_example(orderby="x" * 301), "orderby")

@@ -50,7 +50,8 @@ MAX_DEFINITION_BYTES = 2_000_000
 
 # One URL segment below the service root. Deliberately narrower than what a
 # URL allows: no '/', '?', '#', '%', whitespace or parentheses.
-_ENTITY_PATH_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+# Used with `fullmatch`: Python's `$` would also accept a trailing "\n".
+_ENTITY_PATH_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 # How many problems one refusal lists, and how long one `loc` part may be
 # (a `loc` part can be an unknown key, i.e. text the caller typed).
 _MAX_REPORTED_ERRORS = 20
@@ -114,8 +115,8 @@ class NavigationDef(_Model):
 class ExampleQuery(_Model):
     description: str = Field(min_length=1, max_length=200)
     filter: str = Field(default="", max_length=1000)
-    select: list[str] = Field(default_factory=list)
-    orderby: str = ""
+    select: list[Annotated[str, StringConstraints(max_length=128)]] = Field(default_factory=list)
+    orderby: str = Field(default="", max_length=300)
     top: int | None = Field(default=None, ge=1)
 
 
@@ -136,7 +137,7 @@ class EntitySetDef(_Model):
     def _confined_segment(cls, v: str) -> str:
         # The segment is appended to the service path of every request for
         # this entity set, so it must not be able to leave it.
-        if v and (not _ENTITY_PATH_RE.match(v) or ".." in v or v == "."):
+        if v and (not _ENTITY_PATH_RE.fullmatch(v) or ".." in v or v == "."):
             raise ValueError(
                 "path must be one URL segment of letters, digits, '_', '.' and '-' "
                 "(empty = the entity set name)"
@@ -213,7 +214,8 @@ class OperationDef(_Model):
     @field_validator("qualified_name")
     @classmethod
     def _edm_or_empty(cls, v: str) -> str:
-        if v and not re.match(EDM_NAME_RE, v):
+        # fullmatch, not match: `$` alone would let "ns.Op\n" through.
+        if v and not re.fullmatch(EDM_NAME_RE, v):
             raise ValueError(
                 "qualified_name must be a namespace-qualified name (letters, digits, '_' and '.')"
             )
