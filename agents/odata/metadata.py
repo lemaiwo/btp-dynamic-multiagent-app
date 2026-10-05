@@ -27,15 +27,31 @@ The document comes from a remote system, so it is untrusted input:
 Elements and attributes are matched by local name, so every EDMX 1.0 / EDM
 schema namespace revision and the ``sap:`` / ``m:`` annotation namespaces
 parse the same way. Character data is kept only for the three V4 expression
-elements the parser reads (``String``, ``Bool``, ``PropertyPath``), and at
-most ``_MAX_TEXT_CHARS`` of it per element.
+elements the parser reads (``String``, ``Bool``, ``PropertyPath``); a text
+longer than ``_MAX_TEXT_CHARS`` is treated as absent, never cut.
 
 V2 (EDMX 1.0) and V4 (EDMX 4.0) give the same result shape. V4 says the same
 things elsewhere: labels and capabilities are annotations (inline, or in an
 ``Annotations`` block that names its target), a navigation's target entity
 set is a ``NavigationPropertyBinding`` of the entity set, and operations are
 actions (POST) and functions (GET), bound to an entity or imported into the
-container.
+container. A document is V4 when its root element is in the OASIS EDMX
+namespace, whatever its ``Version`` attribute says.
+
+The capability flags are what the service declares and can only go down:
+absent means ``True``, and where a V4 document says the same thing twice
+with different answers, the restriction wins. Per field, V4 lowers
+``creatable`` / ``updatable`` for ``Core.Computed`` (neither),
+``Core.Immutable`` (not updatable) and the entity set's
+``NonInsertableProperties`` / ``NonUpdatableProperties``.
+``Capabilities.ReadRestrictions`` is not read: the result has no "readable"
+flag to lower.
+
+For whoever builds a catalogue definition from the result:
+``ParsedOperation`` carries no ``changes_data``. Set it from the kind -- a V4
+action changes data, a V4 function does not, and for a V2 function import it
+is unknown, so it is treated as changing data unless it is called with GET
+and the admin says otherwise.
 
 Everything in the result fits the definition models (``agents.odata.models``):
 names match ``EDM_NAME_RE``, an operation's method is GET or POST, a
@@ -78,8 +94,9 @@ _MAX_TYPE_CHARS = 200  # models.EdmType
 # attributes, and free text (documentation, a login page) is not wanted.
 _TEXT_ELEMENTS = frozenset({"String", "Bool", "PropertyPath"})
 # Far above a label (cut to MAX_LABEL_CHARS anyway), a boolean or a property
-# name (EDM_NAME_RE allows 128). A longer text is cut, which can only make a
-# property path match nothing.
+# name (EDM_NAME_RE allows 128). A longer text is dropped as a whole: cut, it
+# would be a value the document never gave ("false" followed by padding
+# would read as false).
 _MAX_TEXT_CHARS = 1024
 
 _DTD_RE = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)", re.IGNORECASE)
@@ -97,8 +114,10 @@ SKIP_REASONS = (
     # The Name is not an EDM_NAME_RE identifier. V4 operation: also its
     # namespace-qualified name, or the name of the import it is called by.
     "invalid_name",
-    # A type name longer than the models accept. V4 navigation: no Type at
-    # all, so nothing says whether it leads to one entity or to many.
+    # A type name longer than the models accept. V4 also: a property without
+    # a Type (no type is assumed for it), and a navigation without one or
+    # with a malformed `Collection(...)`, so that nothing says whether it
+    # leads to one entity or to many.
     "invalid_type",
     "duplicate_name",  # entity_set / operation: an earlier one has the name
     "unrepresentable_key",  # entity_set: a key part is no (parsed) property of it
@@ -106,7 +125,9 @@ SKIP_REASONS = (
     # gives one target entity set that is part of the result.
     "unresolved_target",
     "unsupported_http_method",  # operation (V2): m:HttpMethod is not GET or POST
-    "invalid_parameter",  # operation: a parameter of the call with a bad name or type
+    # operation: a parameter of the call with a bad name or type (V4: or
+    # without a type).
+    "invalid_parameter",
     # operation (V4), bound: the binding parameter is not a single entity of
     # exactly one entity set of the result (missing, a collection, a type no
     # set or several sets have).
@@ -128,6 +149,8 @@ _TERM_UPDATE = f"{_CAPABILITIES}.UpdateRestrictions"
 _TERM_DELETE = f"{_CAPABILITIES}.DeleteRestrictions"
 _TERM_FILTER = f"{_CAPABILITIES}.FilterRestrictions"
 _TERM_OPTIONAL = f"{_CORE}.OptionalParameter"
+_TERM_COMPUTED = f"{_CORE}.Computed"
+_TERM_IMMUTABLE = f"{_CORE}.Immutable"
 
 
 class MetadataError(ValueError):
@@ -229,7 +252,7 @@ def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
     depth = 0
     root_namespace: list[str] = []
     # Per open element: the text collected for it, or None when its text is
-    # not kept. `room` is what the innermost element may still take.
+    # not kept (any more). `room` is what the innermost element may still take.
     texts: list[list[str] | None] = []
     room = 0
 
@@ -265,15 +288,18 @@ def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
     def data(text: str) -> None:
         nonlocal room
         chunks = texts[-1] if texts else None
-        if chunks is None or room <= 0:
+        if chunks is None:
             return
-        chunks.append(text[:room])
         room -= len(text)
+        if room < 0:
+            texts[-1] = None  # too long to be a value: absent, not cut
+        else:
+            chunks.append(text)
 
     parser.StartElementHandler = start
     parser.EndElementHandler = end
     # EDMX 1.0 carries everything in attributes; text is kept for the few V4
-    # expression elements in _TEXT_ELEMENTS only, and bounded.
+    # expression elements in _TEXT_ELEMENTS only, and only up to the cap.
     parser.CharacterDataHandler = data
     # Looked up at call time, so the guard stays one function.
     parser.StartDoctypeDeclHandler = lambda *a: _refuse_dtd(*a)
@@ -335,10 +361,15 @@ def _name(element: ET.Element) -> str | None:
     return value if value and _NAME_RE.fullmatch(value) else None
 
 
-def _type_name(element: ET.Element) -> str | None:
-    """The ``Type`` (default ``Edm.String``), or ``None`` when it is too long."""
-    value = (element.get("Type") or "").strip() or "Edm.String"
-    return value if len(value) <= _MAX_TYPE_CHARS else None
+def _type_name(element: ET.Element, *, default: str = "Edm.String") -> str | None:
+    """The ``Type``, or ``None`` when it is too long or missing without a default.
+
+    ``Edm.String`` for a missing type is the V2 (CSDL 2.0) rule. V4 requires
+    the attribute and passes ``default=""``: a guessed type would decide how
+    a value is quoted in a URL.
+    """
+    value = (element.get("Type") or "").strip() or default
+    return value if value and len(value) <= _MAX_TYPE_CHARS else None
 
 
 class _Schemas:
@@ -764,20 +795,41 @@ class _Annotations:
         prefix, _, name = (raw or "").strip().rpartition(".")
         return f"{self._aliases.get(prefix, prefix)}.{name}"
 
-    def find(self, term: str, element: ET.Element | None, target: str = "") -> ET.Element | None:
-        """The annotation with that term on the element, else in a block for ``target``."""
+    def find_all(self, term: str, element: ET.Element | None, target: str = "") -> list[ET.Element]:
+        """Every annotation with that term: on the element, then in the blocks for ``target``.
+
+        All of them, because a document may say one thing twice (inline and
+        in a block, or in two blocks) and the readers below must not let the
+        first one hide a restriction in a later one.
+        """
         sources = [] if element is None else [element]
         if target:
             sources.extend(self._blocks.get(target, ()))
-        for source in sources:
-            for annotation in source.findall("Annotation"):
-                if not annotation.get("Qualifier") and self._term(annotation.get("Term")) == term:
-                    return annotation
-        return None
+        return [
+            annotation
+            for source in sources
+            for annotation in source.findall("Annotation")
+            if not annotation.get("Qualifier") and self._term(annotation.get("Term")) == term
+        ]
 
     def label(self, element: ET.Element | None, target: str = "") -> str:
-        annotation = self.find(_TERM_LABEL, element, target)
-        return "" if annotation is None else _clean_label(_expression(annotation, "String"))
+        """The first ``Common.Label`` that says something."""
+        for annotation in self.find_all(_TERM_LABEL, element, target):
+            label = _clean_label(_expression(annotation, "String"))
+            if label:
+                return label
+        return ""
+
+    def _record_values(
+        self, term: str, prop: str, element: ET.Element | None, target: str
+    ) -> list[ET.Element]:
+        return [
+            value
+            for annotation in self.find_all(term, element, target)
+            for record in annotation.findall("Record")
+            for value in record.findall("PropertyValue")
+            if value.get("Property") == prop
+        ]
 
     def declared_false(
         self, term: str, prop: str, element: ET.Element | None, target: str = ""
@@ -785,28 +837,55 @@ class _Annotations:
         """Whether a restriction record sets ``prop`` to a constant ``false``.
 
         Absent, or computed from a path, is not a declared "no": the flag
-        stays ``True`` like a missing ``sap:`` annotation in V2. What SAP
-        declares is information for the admin, not a permission.
+        stays ``True`` like a missing ``sap:`` annotation in V2. Among
+        duplicates one constant ``false`` is enough, wherever it stands: a
+        capability can only go down. What SAP declares is information for
+        the admin, not a permission.
         """
-        value = _record_value(self.find(term, element, target), prop)
-        text = None if value is None else _expression(value, "Bool")
-        return text is not None and text.strip().lower() == "false"
+        return any(
+            (_expression(value, "Bool") or "").strip().lower() == "false"
+            for value in self._record_values(term, prop, element, target)
+        )
+
+    def property_paths(
+        self, term: str, prop: str, element: ET.Element | None, target: str = ""
+    ) -> set[str]:
+        """The property names a restriction record lists under ``prop``, over all duplicates."""
+        return {
+            (path.text or "").strip()
+            for value in self._record_values(term, prop, element, target)
+            for collection in value.findall("Collection")
+            for path in collection.findall("PropertyPath")
+        }
+
+    def declared_true(self, term: str, element: ET.Element | None, target: str = "") -> bool:
+        """Whether a boolean tag term (``Core.Computed``) is set, by any of its duplicates.
+
+        Such a term is true when it is merely present. ``Bool="false"`` and
+        a value computed from a path are not a declared "yes".
+        """
+        for annotation in self.find_all(term, element, target):
+            value = _expression(annotation, "Bool")
+            if value is None:
+                # Present without any value expression: the default, true.
+                if len(annotation) == 0 and set(annotation.keys()) <= {"Term"}:
+                    return True
+            elif value.strip().lower() == "true":
+                return True
+        return False
 
 
 def _expression(element: ET.Element, kind: str) -> str | None:
-    """A constant, given as attribute (``String="x"``) or as child (``<String>x</String>``)."""
+    """A constant, given as attribute (``String="x"``) or as child (``<String>x</String>``).
+
+    ``""`` for a child element without usable text (empty, or longer than
+    the text cap), which is no value to any reader here.
+    """
     value = element.get(kind)
     if value is not None:
         return value
     child = element.find(kind)
     return None if child is None else child.text or ""
-
-
-def _record_value(annotation: ET.Element | None, prop: str) -> ET.Element | None:
-    record = None if annotation is None else annotation.find("Record")
-    if record is None:
-        return None
-    return next((v for v in record.findall("PropertyValue") if v.get("Property") == prop), None)
 
 
 def _v4_fields(
@@ -817,18 +896,17 @@ def _v4_fields(
     schemas: _Schemas,
     annotations: _Annotations,
 ) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
-    # Filter restrictions belong to the entity SET, not to the type.
-    restrictions = annotations.find(_TERM_FILTER, set_element, set_target)
+    # These restrictions belong to the entity SET, not to the type: the same
+    # property can be filterable in one set and not in another.
+    def listed(term: str, prop: str) -> set[str]:
+        return annotations.property_paths(term, prop, set_element, set_target)
+
     nothing_filterable = annotations.declared_false(
         _TERM_FILTER, "Filterable", set_element, set_target
     )
-    paths = _record_value(restrictions, "NonFilterableProperties")
-    collection = None if paths is None else paths.find("Collection")
-    non_filterable = (
-        set()
-        if collection is None
-        else {(path.text or "").strip() for path in collection.findall("PropertyPath")}
-    )
+    non_filterable = listed(_TERM_FILTER, "NonFilterableProperties")
+    non_insertable = listed(_TERM_INSERT, "NonInsertableProperties")
+    non_updatable = listed(_TERM_UPDATE, "NonUpdatableProperties")
 
     fields: dict[str, ParsedField] = {}
     skipped: list[SkippedElement] = []
@@ -837,23 +915,26 @@ def _v4_fields(
         declaring_type = schemas.name_of(entity_type)
         for prop in entity_type.findall("Property"):
             position += 1
-            name, type_name = _name(prop), _type_name(prop)
+            name, type_name = _name(prop), _type_name(prop, default="")
             if name is None or type_name is None:
                 reason = "invalid_name" if name is None else "invalid_type"
                 skipped.append(SkippedElement("property", set_name, position, reason))
                 continue
+            # A block annotates the property on the type that declares it.
+            target = f"{declaring_type}/{name}"
+            # Computed: the server sets it, a client never does. Immutable:
+            # a client may set it when creating, not afterwards.
+            computed = annotations.declared_true(_TERM_COMPUTED, prop, target)
+            immutable = annotations.declared_true(_TERM_IMMUTABLE, prop, target)
             fields.setdefault(
                 name,
                 ParsedField(
                     name=name,
                     type=type_name,
-                    # A block annotates the property on the type that declares it.
-                    label=annotations.label(prop, f"{declaring_type}/{name}"),
+                    label=annotations.label(prop, target),
                     filterable=not nothing_filterable and name not in non_filterable,
-                    # V4 has no per-property flag the set-level restrictions
-                    # above would not already cover; absent means true.
-                    creatable=True,
-                    updatable=True,
+                    creatable=not computed and name not in non_insertable,
+                    updatable=not computed and not immutable and name not in non_updatable,
                     nullable=(prop.get("Nullable") or "").strip().lower() != "false",
                 ),
             )
@@ -863,24 +944,32 @@ def _v4_fields(
 def _v4_bindings(
     draft: _SetDraft, schemas: _Schemas, drafts: dict[str, _SetDraft]
 ) -> dict[str, str]:
-    """Navigation property name -> target entity set (``""`` when ambiguous).
+    """Navigation property name -> target entity set (``""`` when there is none to trust).
 
-    Only a binding whose path is the navigation property itself and whose
-    target is an entity set of the result counts. A target may be written as
-    ``Container/EntitySet``; a longer path (a contained entity) is no set.
+    Only a binding whose path is the navigation property itself counts. Its
+    target is an entity set of the result that lives where the binding says:
+    ``Container/EntitySet`` in the container named, a bare ``EntitySet`` in
+    the binding's own container. Anything else (an unknown or skipped set, a
+    set of that name in another container, a longer path to a contained
+    entity) is no target, and bindings of one path that do not agree on one
+    valid target resolve nothing.
     """
-    containers = {schemas.name_of(container) for container in schemas.containers}
     bindings: dict[str, str] = {}
     for binding in draft.element.findall("NavigationPropertyBinding"):
         path = (binding.get("Path") or "").strip()
-        target = (binding.get("Target") or "").strip()
-        head, slash, rest = target.partition("/")
-        if slash:
-            target = rest if schemas.canonical(head) in containers else ""
-        if not path or target not in drafts:
+        if not path:
             continue
+        head, slash, rest = (binding.get("Target") or "").strip().partition("/")
+        found = drafts.get(rest if slash else head)
+        if found is None:
+            target = ""
+        elif slash:
+            named = schemas.canonical(head)
+            target = found.name if named and schemas.name_of(found.container) == named else ""
+        else:
+            target = found.name if found.container is draft.container else ""
         if bindings.setdefault(path, target) != target:
-            bindings[path] = ""  # two different targets: not guessed
+            bindings[path] = ""  # two different answers: not guessed
     return bindings
 
 
@@ -896,25 +985,21 @@ def _v4_navigations(
             name = _name(nav)
             type_ref = (nav.get("Type") or "").strip()
             target = bindings.get(name or "")
+            collection = type_ref.startswith("Collection(")
             if name is None:
                 reason = "invalid_name"
-            elif not type_ref:
-                reason = "invalid_type"  # without a Type the multiplicity would be a guess
+            elif not type_ref or collection != type_ref.endswith(")"):
+                # No Type, or half a `Collection(...)`: the multiplicity
+                # would be a guess.
+                reason = "invalid_type"
             elif not target:
                 reason = "unresolved_target"
             else:
-                reason = ""
-            if name is None or not target or reason:
-                skipped.append(SkippedElement("navigation", draft.name, position, reason))
+                navigations.setdefault(
+                    name, ParsedNavigation(name=name, target=target, collection=collection)
+                )
                 continue
-            navigations.setdefault(
-                name,
-                ParsedNavigation(
-                    name=name,
-                    target=target,
-                    collection=type_ref.startswith("Collection(") and type_ref.endswith(")"),
-                ),
-            )
+            skipped.append(SkippedElement("navigation", draft.name, position, reason))
     return tuple(navigations.values()), skipped
 
 
@@ -928,7 +1013,7 @@ def _v4_parameters(
     """
     parameters: dict[str, ParamDef] = {}
     for param in element.findall("Parameter")[1 if bound else 0 :]:
-        name, type_name = _name(param), _type_name(param)
+        name, type_name = _name(param), _type_name(param, default="")
         if name is None or type_name is None:
             return None
         if kind == "action":
@@ -937,7 +1022,7 @@ def _v4_parameters(
         else:
             # A function's parameters are part of the URL: all of them, unless
             # the service marks one as optional.
-            required = annotations.find(_TERM_OPTIONAL, param) is None
+            required = not annotations.find_all(_TERM_OPTIONAL, param)
         parameters.setdefault(name, ParamDef(name=name, type=type_name, required=required))
     return tuple(parameters.values())
 
@@ -957,6 +1042,11 @@ def _v4_operation(
     entity. An unbound one is callable only through an import in the
     container and is addressed by the import's name -- one operation per
     import, none without.
+
+    Overloads share one qualified name. The caller keeps the first operation
+    of a name (``duplicate_name`` for the rest), and a label given in an
+    ``Annotations`` block attaches to every overload of that name, because
+    the block's signature is not compared.
     """
     name = _name(element)
     qualified = f"{namespace}.{name}" if namespace else name or ""
@@ -1089,7 +1179,9 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
                 elif outcome.name in operations:
                     # `OperationDef` names are unique: of several overloads
                     # (or bound actions of one name on different entities)
-                    # only the first is offered.
+                    # only the first is offered. Its label may come from any
+                    # of them: an `Annotations` block targets an operation by
+                    # qualified name and the signature is not compared.
                     skipped.append(SkippedElement("operation", "", position, "duplicate_name"))
                 else:
                     operations[outcome.name] = outcome
@@ -1126,7 +1218,8 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     if root.tag != "Edmx":
         raise MetadataError(_NOT_EDMX)
     # EDMX 4.0 has its own (OASIS) namespace; every older one is Microsoft's.
-    is_v4 = namespace == _EDMX_V4_NAMESPACE or (root.get("Version") or "").strip().startswith("4")
+    # The Version attribute decides nothing: it is free text in the document.
+    is_v4 = namespace == _EDMX_V4_NAMESPACE
     if is_v4 and version == "v2":
         raise MetadataError("the document is OData V4, not V2")
     if not is_v4 and version == "v4":

@@ -341,7 +341,7 @@ def test_labels_are_one_line_bounded_and_without_invisible_characters():
         _doc(
             '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
             '<Property Name="Id" Type="Edm.Guid" Nullable="false">'
-            f'<Annotation Term="Common.Label"><String>{"x" * 5000}</String></Annotation>'
+            f'<Annotation Term="Common.Label"><String>{"x" * 500}</String></Annotation>'
             "</Property>"
             '<Property Name="Note" Type="Edm.String">'
             '<Annotation Term="Common.Label" String="a&#x202E;b&#10;c&#x200B;"/></Property>'
@@ -358,11 +358,15 @@ def test_character_data_is_kept_only_where_v4_needs_it_and_bounded():
     cap = odata_metadata._MAX_TEXT_CHARS
     root, _ = odata_metadata._parse_tree(
         f'<Edmx xmlns="{_EDMX}"><Documentation>free text</Documentation>'
-        f"<String>{'y' * (cap + 500)}</String><PropertyPath>A&amp;B</PropertyPath>"
-        f"<Bool>false<Nested/>tail</Bool></Edmx>".encode()
+        f"<String>{'y' * (cap + 1)}</String><PropertyPath>A&amp;B</PropertyPath>"
+        f"<Bool>false<Nested/>tail</Bool>"
+        f"<Record><String>{'z' * cap}</String></Record></Edmx>".encode()
     )
     assert root.find("Documentation").text is None
-    assert root.find("String").text == "y" * cap
+    # Longer than the cap is absent, not cut: a cut text would be a value the
+    # document never gave.
+    assert root.find("String").text is None
+    assert root.find("Record/String").text == "z" * cap
     assert root.find("PropertyPath").text == "A&B"
     # An expression element with child elements is not a plain value.
     assert root.find("Bool").text is None
@@ -647,6 +651,251 @@ def test_several_schemas():
     assert sets["Orders"].navigations[0].target == "Lines"
     assert (sets["Lines"].deletable, sets["Orders"].deletable) == (False, True)
     assert md.skipped == ()
+
+
+# ------------------------------------------------------------- review round 1
+
+_PAD = " " * 2000
+
+
+def test_a_value_longer_than_the_text_cap_is_no_value():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" Nullable="false">'
+            f'<Annotation Term="Common.Label"><String>{"x" * 5000}</String></Annotation>'
+            "</Property>"
+            '<Property Name="Note" Type="Edm.String"/></EntityType>'
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType">'
+                '<Annotation Term="Capabilities.InsertRestrictions"><Record>'
+                f'<PropertyValue Property="Insertable"><Bool>false{_PAD}</Bool></PropertyValue>'
+                "</Record></Annotation>"
+                '<Annotation Term="Capabilities.FilterRestrictions"><Record>'
+                '<PropertyValue Property="NonFilterableProperties"><Collection>'
+                f"<PropertyPath>Note{_PAD}</PropertyPath>"
+                "</Collection></PropertyValue></Record></Annotation>"
+                "</EntitySet>"
+            )
+        ),
+        "v4",
+    )
+    orders = md.entity_sets[0]
+    assert orders.creatable is True
+    assert {f.name: (f.label, f.filterable) for f in orders.fields} == {
+        "Id": ("", True),
+        "Note": ("", True),
+    }
+
+
+def test_a_binding_target_must_live_in_the_container_it_names():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" Nullable="false"/>'
+            '<NavigationProperty Name="_Other" Type="Collection(NS.LineType)"/>'
+            '<NavigationProperty Name="_Same" Type="Collection(NS.LineType)"/>'
+            '<NavigationProperty Name="_Bare" Type="Collection(NS.LineType)"/>'
+            "</EntityType>"
+            '<EntityType Name="LineType"><Key><PropertyRef Name="Pos"/></Key>'
+            '<Property Name="Pos" Type="Edm.Int32" Nullable="false"/></EntityType>'
+            '<EntityContainer Name="C">'
+            '<EntitySet Name="Orders" EntityType="NS.OrderType">'
+            # The kept "Lines" is C's; D's is a duplicate name and not in the result.
+            '<NavigationPropertyBinding Path="_Other" Target="NS.D/Lines"/>'
+            '<NavigationPropertyBinding Path="_Same" Target="Self.C/Lines"/>'
+            '<NavigationPropertyBinding Path="_Bare" Target="Lines"/>'
+            "</EntitySet>"
+            '<EntitySet Name="Lines" EntityType="NS.LineType"/>'
+            "</EntityContainer>"
+            '<EntityContainer Name="D">'
+            '<EntitySet Name="Lines" EntityType="NS.LineType"/>'
+            '<EntitySet Name="Archive" EntityType="NS.OrderType">'
+            # A bare name means a set of the binding's own container.
+            '<NavigationPropertyBinding Path="_Bare" Target="Lines"/>'
+            '<NavigationPropertyBinding Path="_Same" Target="NS.C/Lines"/>'
+            "</EntitySet>"
+            "</EntityContainer>"
+        ),
+        "v4",
+    )
+    sets = _sets(md)
+    assert [(n.name, n.target) for n in sets["Orders"].navigations] == [
+        ("_Same", "Lines"),
+        ("_Bare", "Lines"),
+    ]
+    assert [(n.name, n.target) for n in sets["Archive"].navigations] == [("_Same", "Lines")]
+    assert md.skipped == (
+        SkippedElement("entity_set", "Lines", 3, "duplicate_name"),
+        SkippedElement("navigation", "Orders", 1, "unresolved_target"),
+        SkippedElement("navigation", "Archive", 1, "unresolved_target"),
+        SkippedElement("navigation", "Archive", 3, "unresolved_target"),
+    )
+
+
+def test_a_property_or_parameter_without_a_type_is_not_given_one():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" Nullable="false"/>'
+            '<Property Name="Untyped"/><Property Name="Blank" Type="  "/></EntityType>'
+            '<EntityType Name="OddType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id"/></EntityType>'
+            '<Action Name="Post"><Parameter Name="What"/></Action>'
+            '<Action Name="Close" IsBound="true">'
+            # The binding parameter is not an argument; the rest are.
+            '<Parameter Name="_it" Type="NS.OrderType"/><Parameter Name="Why"/></Action>'
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType"/>'
+                '<EntitySet Name="Odd" EntityType="NS.OddType"/>'
+                '<ActionImport Name="Post" Action="NS.Post"/>'
+            )
+        ),
+        "v4",
+    )
+    assert [e.name for e in md.entity_sets] == ["Orders"]
+    assert [f.name for f in md.entity_sets[0].fields] == ["Id"]
+    assert md.operations == ()
+    assert md.skipped == (
+        SkippedElement("property", "Orders", 2, "invalid_type"),
+        SkippedElement("property", "Orders", 3, "invalid_type"),
+        SkippedElement("entity_set", "Odd", 2, "unrepresentable_key"),
+        SkippedElement("operation", "", 1, "invalid_parameter"),
+        SkippedElement("operation", "", 2, "invalid_parameter"),
+    )
+
+
+def test_among_duplicate_annotations_the_restriction_wins():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" Nullable="false"/>'
+            '<Property Name="A" Type="Edm.String"/><Property Name="B" Type="Edm.String"/>'
+            '<Property Name="C" Type="Edm.String"/></EntityType>'
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType">'
+                '<Annotation Term="Capabilities.InsertRestrictions"><Record>'
+                '<PropertyValue Property="Insertable" Bool="true"/></Record></Annotation>'
+                '<Annotation Term="Capabilities.DeleteRestrictions"><Record>'
+                '<PropertyValue Property="Deletable" Bool="true"/>'
+                '<PropertyValue Property="Deletable" Bool="false"/></Record></Annotation>'
+                '<Annotation Term="Capabilities.FilterRestrictions"><Record>'
+                '<PropertyValue Property="NonFilterableProperties"><Collection>'
+                "<PropertyPath>A</PropertyPath></Collection></PropertyValue></Record></Annotation>"
+                '<Annotation Term="Capabilities.FilterRestrictions"><Record>'
+                '<PropertyValue Property="NonFilterableProperties"><Collection>'
+                "<PropertyPath>B</PropertyPath></Collection></PropertyValue></Record></Annotation>"
+                "</EntitySet>"
+            )
+            + '<Annotations Target="NS.C/Orders">'
+            '<Annotation Term="Capabilities.InsertRestrictions"><Record>'
+            '<PropertyValue Property="Insertable" Bool="false"/></Record></Annotation>'
+            '<Annotation Term="Capabilities.UpdateRestrictions"><Record>'
+            '<PropertyValue Property="Updatable" Bool="true"/></Record></Annotation>'
+            "</Annotations>"
+            '<Annotations Target="NS.C/Orders">'
+            '<Annotation Term="Capabilities.UpdateRestrictions"><Record>'
+            '<PropertyValue Property="Updatable" Bool="false"/></Record></Annotation>'
+            "</Annotations>"
+        ),
+        "v4",
+    )
+    orders = md.entity_sets[0]
+    assert (orders.creatable, orders.updatable, orders.deletable) == (False, False, False)
+    assert {f.name for f in orders.fields if not f.filterable} == {"A", "B"}
+
+
+def test_v4_is_recognised_by_the_root_namespace_only():
+    old = (
+        '<edmx:Edmx Version="4.0" xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx">'
+        '<edmx:DataServices><Schema Namespace="NS" '
+        'xmlns="http://schemas.microsoft.com/ado/2008/09/edm">'
+        '<EntityContainer Name="C"/></Schema></edmx:DataServices></edmx:Edmx>'
+    ).encode()
+    with pytest.raises(MetadataError, match="^the document is OData V2, not V4$"):
+        parse_metadata(old, "v4")
+    assert parse_metadata(old, "v2").version == "v2"
+    # ... and the OASIS namespace is V4 whatever Version says.
+    new = _doc(_container("")).replace(b'Version="4.0"', b'Version="1.0"')
+    with pytest.raises(MetadataError, match="^the document is OData V4, not V2$"):
+        parse_metadata(new, "v2")
+    assert parse_metadata(new, "v4").version == "v4"
+
+
+def test_a_malformed_collection_type_is_not_read_as_a_single_entity():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" Nullable="false"/>'
+            '<NavigationProperty Name="_Lines" Type="Collection(NS.LineType"/>'
+            "</EntityType>" + _LINE + _container()
+        ),
+        "v4",
+    )
+    assert _sets(md)["Orders"].navigations == ()
+    assert SkippedElement("navigation", "Orders", 1, "invalid_type") in md.skipped
+
+
+def _flags(md: ParsedMetadata) -> dict:
+    return {f.name: (f.creatable, f.updatable) for f in md.entity_sets[0].fields}
+
+
+def test_field_level_capabilities_only_go_down():
+    md = parse_metadata(
+        _doc(
+            '<EntityType Name="OrderType"><Key><PropertyRef Name="Id"/></Key>'
+            '<Property Name="Id" Type="Edm.Guid" Nullable="false">'
+            '<Annotation Term="Core.Computed"/></Property>'
+            '<Property Name="Total" Type="Edm.Decimal">'
+            '<Annotation Term="Core.Computed" Bool="true"/></Property>'
+            '<Property Name="Kind" Type="Edm.String">'
+            '<Annotation Term="Core.Immutable"><Bool>true</Bool></Annotation></Property>'
+            '<Property Name="Free" Type="Edm.String">'
+            '<Annotation Term="Core.Computed" Bool="false"/>'
+            '<Annotation Term="Core.Immutable" Bool="false"/></Property>'
+            # Decided at runtime, or for another consumer: not a declared "no".
+            '<Property Name="Dynamic" Type="Edm.String">'
+            '<Annotation Term="Core.Computed" Path="IsLocked"/>'
+            '<Annotation Term="Core.Immutable" Qualifier="Other"/></Property>'
+            '<Property Name="ByBlock" Type="Edm.String">'
+            '<Annotation Term="Core.Computed" Bool="false"/></Property>'
+            '<Property Name="NoInsert" Type="Edm.String"/>'
+            '<Property Name="NoUpdate" Type="Edm.String"/>'
+            "</EntityType>"
+            + _container(
+                '<EntitySet Name="Orders" EntityType="NS.OrderType">'
+                '<Annotation Term="Capabilities.InsertRestrictions"><Record>'
+                '<PropertyValue Property="NonInsertableProperties"><Collection>'
+                "<PropertyPath>NoInsert</PropertyPath></Collection></PropertyValue>"
+                "</Record></Annotation></EntitySet>"
+                # The same type in a set without restrictions.
+                '<EntitySet Name="Drafts" EntityType="NS.OrderType"/>'
+            )
+            + '<Annotations Target="NS.OrderType/ByBlock">'
+            '<Annotation Term="Org.OData.Core.V1.Computed"/></Annotations>'
+            '<Annotations Target="Self.C/Orders">'
+            '<Annotation Term="Capabilities.UpdateRestrictions"><Record>'
+            '<PropertyValue Property="NonUpdatableProperties"><Collection>'
+            "<PropertyPath>NoUpdate</PropertyPath></Collection></PropertyValue>"
+            "</Record></Annotation></Annotations>",
+            references="",
+        ),
+        "v4",
+    )
+    assert _flags(md) == {
+        "Id": (False, False),  # computed: the server sets it
+        "Total": (False, False),
+        "Kind": (True, False),  # immutable: only at creation
+        "Free": (True, True),
+        "Dynamic": (True, True),
+        "ByBlock": (False, False),  # a "false" does not undo another "computed"
+        "NoInsert": (False, True),
+        "NoUpdate": (True, False),
+    }
+    drafts = _sets(md)["Drafts"]
+    assert {f.name: (f.creatable, f.updatable) for f in drafts.fields}["NoInsert"] == (True, True)
+    # Set-level flags are their own statement and stay as declared.
+    assert (md.entity_sets[0].creatable, md.entity_sets[0].updatable) == (True, True)
 
 
 def test_real_metadata_if_present():
