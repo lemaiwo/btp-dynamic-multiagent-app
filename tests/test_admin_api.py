@@ -20,10 +20,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 # Use a throwaway SQLite DB for the test run
-TEST_DB = ROOT / "tests" / "_test_registry.db"
-if TEST_DB.exists():
-    TEST_DB.unlink()
-os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 # A developer .env may set this. Set it EMPTY rather than popping it: app.py

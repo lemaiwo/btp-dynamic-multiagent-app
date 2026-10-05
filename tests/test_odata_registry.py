@@ -20,9 +20,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-TEST_DB = ROOT / "tests" / "_test_odata_registry.db"
-TEST_DB.unlink(missing_ok=True)
-os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 for _v in (
@@ -153,8 +153,8 @@ async def add_agent(name: str, *servers: dict, instructions: str = "You help buy
 async def _clean(monkeypatch):
     """Empty catalogue and no agents; a model that needs no AI Core.
 
-    Another suite may have imported ``agents.db`` first (then the engine is
-    its database, not ``TEST_DB``), so the tests never assume a fresh file.
+    The database is the session's, shared with every other suite in the
+    process, so the tests never assume a fresh file.
     """
     await init_db()
     async with SessionLocal() as s:

@@ -13,10 +13,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-TEST_DB = ROOT / "tests" / "_test_agent_model.db"
-if TEST_DB.exists():
-    TEST_DB.unlink()
-os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 # A developer .env may set this. Set it EMPTY rather than popping it: app.py
@@ -112,6 +111,20 @@ from agents.db import (  # noqa: E402
     list_agents,
 )
 import json  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _registry_resolves_the_fake_model(monkeypatch):
+    """``agents.registry`` binds ``get_model`` by name when it is imported, so
+    the stub on ``agents.shared`` above reaches it only if this module is the
+    first to import the registry. After a suite that imported ``app`` without
+    stubbing, the app's start-up asked the real AI Core for a model and
+    failed for want of credentials. (Run as a script, this module is first.)
+    """
+    monkeypatch.setattr(registry_module, "get_model", _module_fake_get_model)
+
 
 FAILED = 0
 PASSED = 0

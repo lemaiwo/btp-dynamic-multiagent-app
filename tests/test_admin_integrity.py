@@ -22,9 +22,9 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-os.environ.setdefault(
-    "DATABASE_URL", f"sqlite+aiosqlite:///{ROOT / 'tests' / '_test_admin_integrity.db'}"
-)
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 os.environ["MCP_URL_ALLOWLIST"] = ""

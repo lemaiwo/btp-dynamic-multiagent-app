@@ -27,11 +27,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-(ROOT / "tests" / "_test_ide_request_changes.db").unlink(missing_ok=True)
-os.environ.setdefault(
-    "DATABASE_URL",
-    f"sqlite+aiosqlite:///{ROOT / 'tests' / '_test_ide_request_changes.db'}",
-)
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 

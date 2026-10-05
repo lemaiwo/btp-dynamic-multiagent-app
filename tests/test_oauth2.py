@@ -21,10 +21,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-TEST_DB = ROOT / "tests" / "_test_oauth2.db"
-if TEST_DB.exists():
-    TEST_DB.unlink()
-os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{TEST_DB}"
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 # A developer .env may set this. Set it EMPTY rather than popping it: app.py
@@ -648,11 +647,10 @@ async def main() -> None:
     check("returns None when absent", find_oauth_required(ValueError("nope")) is None)
 
     print(f"\n==== {PASSED} passed, {FAILED} failed ====")
-    if TEST_DB.exists():
-        try:
-            await SessionLocal().bind.dispose()  # type: ignore[attr-defined]
-        except Exception:
-            pass
+    try:
+        await SessionLocal().bind.dispose()  # type: ignore[attr-defined]
+    except Exception:
+        pass
     sys.exit(1 if FAILED else 0)
 
 
