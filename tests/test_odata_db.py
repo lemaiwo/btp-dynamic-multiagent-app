@@ -416,7 +416,7 @@ async def test_audit_row_insert_and_purge():
         s.add(_audit_row(
             call_id="b" * 32, created_at=now - timedelta(days=400), run_id=None,
             sent_as="technical:S4_ODATA_TECH", run_principal=None, token_digest=None,
-            operation="create", key_json=None, phase="token", http_status=None, outcome="intent",
+            operation="create", key_json=None, phase=None, http_status=None, outcome="intent",
         ))
         await s.commit()
         query = select(ODataAuditLog).where(ODataAuditLog.run_id == "r1")
@@ -470,6 +470,7 @@ def test_column_widths_fit_what_validation_accepts():
     assert audit.run_principal.type.length >= 255
     assert audit.created_at.index is True
     assert "principal" not in audit  # two identities, never one ambiguous column
+    assert audit.phase.nullable is True  # an open intent has no phase
 
 
 async def test_losing_the_name_race_is_a_value_error_and_keeps_the_transaction(monkeypatch):

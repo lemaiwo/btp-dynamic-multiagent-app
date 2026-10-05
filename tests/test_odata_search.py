@@ -45,7 +45,8 @@ from agents.odata.search import (  # noqa: E402
     MAX_SUMMARY_MATCHES,
 )
 from agents.odata.search import search_catalogue as _search_as_shipped  # noqa: E402
-from agents.odata.tools import UnrecordedWritesForTests, odata_toolset  # noqa: E402
+from agents.odata.tools import odata_toolset  # noqa: E402
+from tests.odata_helpers import UnrecordedWritesForTests  # noqa: E402
 
 # The ranking and shape tests below describe the catalogue search with
 # operations listed (`allow_call`), as the tool will run it once operations

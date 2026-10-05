@@ -184,3 +184,23 @@ def v2_error(status: int, code: str, text: str) -> httpx.Response:
     return httpx.Response(
         status, json={"error": {"code": code, "message": {"lang": "en", "value": text}}}
     )
+
+
+
+class UnrecordedWritesForTests:
+    """TEST ONLY: lets ``builtin:odata`` writes through without recording any.
+
+    The explicit opt-in for a test that is about something else than the
+    audit. It carries the marker the toolset asks for (``records_writes``)
+    and records nothing. It lives here, not in ``agents/``, so that no
+    production code can pass it: the app passes
+    ``agents.odata.audit.stored_recorder()``.
+    """
+
+    records_writes = True
+
+    async def intent(self, record: Any) -> Any:
+        return None
+
+    async def result(self, token: Any, record: Any) -> None:
+        return None

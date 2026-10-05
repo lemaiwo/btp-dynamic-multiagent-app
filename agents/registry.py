@@ -1082,6 +1082,7 @@ class Registry:
 
         background = len(in_flight_runs) + len(in_flight_workflows)
         still_busy: list[BuildResult] = []
+        closed: list[BuildResult] = []
         for build in self._retired:
             busy = background + build.in_flight.value
             if busy:
@@ -1101,30 +1102,36 @@ class Registry:
                         await client.aclose()
                 except Exception:
                     logger.debug("Failed to close old MCP client", exc_info=True)
-            await _drain_audit_recorders(build)
+            closed.append(build)
         self._retired = still_busy
+        # Once for everything retired in this pass, not once per build: the
+        # recorder is process-wide, and a hanging database must cost a
+        # reload one drain timeout, not one per build.
+        await _drain_audit_recorders(closed)
 
 
-async def _drain_audit_recorders(build: BuildResult) -> None:
-    """Let the audit results of a retired build's ``builtin:odata`` toolsets
+async def _drain_audit_recorders(builds: list[BuildResult]) -> None:
+    """Let the audit results of retired builds' ``builtin:odata`` toolsets
     finish being stored, for at most the recorder's own timeout.
 
-    The build is idle, so its writes are over; what can still run is the
-    task that stores a result whose caller timed out or was cancelled.
-    ``drain`` cancels nothing and does not raise; a failure here must not
-    fail a reload either.
+    The builds are idle, so their writes are over; what can still run is
+    the task that stores a result whose caller timed out or was cancelled.
+    Each distinct recorder is drained once, however many builds and
+    toolsets share it. ``drain`` cancels nothing and does not raise; a
+    failure here must not fail a reload either.
     """
     seen: set[int] = set()
-    for server in build.mcp_clients:
-        recorder = getattr(server, "recorder", None)
-        drain = getattr(recorder, "drain", None)
-        if drain is None or id(recorder) in seen:
-            continue
-        seen.add(id(recorder))
-        try:
-            await drain()
-        except Exception:  # noqa: BLE001
-            logger.warning("Draining an OData audit recorder failed", exc_info=True)
+    for build in builds:
+        for server in build.mcp_clients:
+            recorder = getattr(server, "recorder", None)
+            drain = getattr(recorder, "drain", None)
+            if drain is None or id(recorder) in seen:
+                continue
+            seen.add(id(recorder))
+            try:
+                await drain()
+            except Exception:  # noqa: BLE001
+                logger.warning("Draining an OData audit recorder failed", exc_info=True)
 
 
 registry = Registry()

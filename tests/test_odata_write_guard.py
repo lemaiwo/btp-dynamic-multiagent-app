@@ -55,11 +55,15 @@ from agents.odata import urls as urls_module  # noqa: E402
 from agents.odata.models import validate_odata_service  # noqa: E402
 from agents.odata.tools import (  # noqa: E402
     NoWriteRecorder,
-    UnrecordedWritesForTests,
     WriteAudit,
     odata_toolset,
 )
-from tests.odata_helpers import FakeResolver, service_payload, v2_error  # noqa: E402
+from tests.odata_helpers import (  # noqa: E402
+    FakeResolver,
+    UnrecordedWritesForTests,
+    service_payload,
+    v2_error,
+)
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -219,6 +223,8 @@ class Sap:
 
 class Recorder:
     """A recorder that keeps what it is given, and what had happened by then."""
+
+    records_writes = True  # the marker the toolset asks for
 
     def __init__(self, world: "World") -> None:
         self.world = world
@@ -795,9 +801,10 @@ async def test_intent_before_anything_and_one_result_per_write(alice):
         ("delete", "sap_error", "write", 400),
     ]
     assert [(a.operation, a.outcome, a.phase, a.status) for a in w.recorder.intents] == [
-        ("update", "intent", "token", None),
-        ("create", "intent", "token", None),
-        ("delete", "intent", "token", None),
+        # No phase yet: an intent never says "nothing left".
+        ("update", "intent", None, None),
+        ("create", "intent", None, None),
+        ("delete", "intent", None, None),
     ]
     # One call id per call, the same in both records; the intent's token comes back.
     ids = [a.call_id for a in w.audits]
@@ -1073,9 +1080,27 @@ def test_bound_token_principal_needs_claims_that_are_the_tokens_own():
     assert bound(_token(**anonymous), anonymous) is None
 
 
-@pytest.mark.parametrize("recorder", [None, NoWriteRecorder()])
+class _LooksLikeARecorder:
+    """Has both methods, would even "work" -- and carries no marker."""
+
+    async def intent(self, record: WriteAudit) -> Any:
+        return 1
+
+    async def result(self, token: Any, record: WriteAudit) -> None:
+        return None
+
+
+class _MarkerNotExactlyTrue(_LooksLikeARecorder):
+    records_writes = "yes"
+
+
+@pytest.mark.parametrize(
+    "recorder", [None, NoWriteRecorder(), _LooksLikeARecorder(), _MarkerNotExactlyTrue(), object()]
+)
 async def test_without_a_recorder_no_write_is_sent_and_none_is_offered(alice, caplog, recorder):
-    """Fail closed: allow_write and the catalogue say yes, nothing records."""
+    """Fail closed: allow_write and the catalogue say yes, nothing records.
+    A recorder is recognised positively, by its marker -- not by being
+    "anything but the no-op"."""
     w = World(catalogue=snapshot(operations=ALL_OPS), recorder=recorder)
     with caplog.at_level(logging.DEBUG, logger="agents"):
         for call in (UPDATE, {"operation": "create", "body": {"Plant": "1"}},
@@ -1113,6 +1138,51 @@ async def test_unrecorded_writes_are_an_explicit_test_only_opt_in(alice):
     w = World(recorder=UnrecordedWritesForTests())
     assert (await w.run(**UPDATE)) == {"ok": True, "status": 204}
     assert "TEST ONLY" in (UnrecordedWritesForTests.__doc__ or "")
+    # It is a test helper, not something production code can reach.
+    assert not hasattr(tools_module, "UnrecordedWritesForTests")
+    assert "UnrecordedWritesForTests" not in tools_module.__all__
+    assert UnrecordedWritesForTests.__module__ == "tests.odata_helpers"
+
+
+async def test_an_unsent_intent_is_handed_back_to_the_recorder_to_close(alice, monkeypatch):
+    """Interrupted or not confirmed: the recorder gets `abandon` with the
+    same call id, shielded; one without `abandon` is simply not asked."""
+    monkeypatch.setattr(tools_module, "AUDIT_INTENT_TIMEOUT_SECONDS", 0.05)
+    started = asyncio.Event()
+
+    class Closing(Recorder):
+        def __init__(self, world: Any) -> None:
+            super().__init__(world)
+            self.abandoned: list[WriteAudit] = []
+            self.fail = False
+
+        async def intent(self, record: WriteAudit) -> Any:
+            self.intents.append(record)
+            started.set()
+            await asyncio.Event().wait()
+
+        async def abandon(self, record: WriteAudit) -> bool:
+            await asyncio.sleep(0)
+            self.abandoned.append(record)
+            if self.fail:
+                raise RuntimeError("store down")
+            return True
+
+    w = World(recorder_type=Closing)
+    assert (await w.run(**UPDATE))["error"]["code"] == "audit_unavailable"  # timed out
+    assert [a.call_id for a in w.recorder.abandoned] == [w.recorder.intents[0].call_id]
+    started.clear()
+    task = asyncio.create_task(w.run(**UPDATE))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [a.call_id for a in w.recorder.abandoned] == [a.call_id for a in w.recorder.intents]
+    # A close that fails changes nothing about the answer.
+    w.recorder.fail = True
+    assert (await w.run(**UPDATE))["error"]["code"] == "audit_unavailable"
+    await asyncio.sleep(0)
+    assert len(w.recorder.abandoned) == 3 and w.sap.requests == [] and not w.toolset.audit_tasks
 
 
 async def test_a_run_cancelled_while_the_token_is_renewed_is_recorded_as_sent(alice):

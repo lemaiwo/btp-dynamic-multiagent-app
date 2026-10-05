@@ -95,6 +95,8 @@ WRITE_OUTCOMES = ("ok", "refused", "sap_error", "unknown", "cancelled")
 # already happened from the model.
 AUDIT_INTENT_TIMEOUT_SECONDS = 10.0
 AUDIT_RESULT_TIMEOUT_SECONDS = 10.0
+# The attribute a recorder carries, exactly `True`, to count as one.
+RECORDS_WRITES_MARKER = "records_writes"
 
 OPERATIONS = (*ENTITY_OPS, "call")
 # One dialect object per protocol version this module can send. A version
@@ -154,7 +156,7 @@ __all__ = [
     "AUDIT_RESULT_TIMEOUT_SECONDS",
     "NoUsableServiceError",
     "NoWriteRecorder",
-    "UnrecordedWritesForTests",
+    "RECORDS_WRITES_MARKER",
     "WRITE_OUTCOMES",
     "WriteAudit",
     "WriteRecorder",
@@ -401,8 +403,11 @@ class WriteAudit:
       change may or may not have been applied); ``cancelled`` (the run was
       cancelled while the call was in flight, so the outcome is unknown
       too).
-    * ``phase``: whether a modifying request left this app. ``"token"``:
-      none did (the call ended while the connection was set up or the CSRF
+    * ``phase``: whether a modifying request left this app. ``None`` in
+      the intent record: nothing is known yet, and a store must never
+      keep an open intent as "nothing left" -- when the process dies
+      after the send, that row is all there is. In the result record,
+      ``"token"``: none did (the call ended while the connection was set up or the CSRF
       token was fetched) -- nothing was changed, whatever ``outcome`` says.
       ``"write"``: one was handed to an open connection at least once. For
       an error it is the client's own word (``ODataError.sent``); for a
@@ -432,7 +437,7 @@ class WriteAudit:
     key: dict[str, Any] | None
     fields: tuple[str, ...]
     outcome: str
-    phase: str
+    phase: str | None
     status: int | None
     sent_as: str
     run_principal: str | None
@@ -457,6 +462,16 @@ class WriteRecorder(Protocol):
     ``agents.odata.audit`` logger instead (without key values) and the
     write's own answer stands. It runs in its own task, shielded from the
     run's cancellation, with the request's context variables.
+
+    A recorder counts as one only when it says so: ``records_writes`` must
+    be exactly ``True`` on it (``RECORDS_WRITES_MARKER``). Without the
+    marker the toolset sends no write -- an object that merely has the two
+    methods, or the no-op default, is not a record.
+
+    Optional: ``abandon(record) -> bool`` closes the stored intent of a
+    call whose write was NOT sent (the intent was interrupted or not
+    confirmed), so that it is not read as "may have been sent"; and a
+    ``tasks`` set, which then owns the recorder tasks still running.
     """
 
     async def intent(self, record: WriteAudit) -> Any: ...
@@ -475,21 +490,6 @@ class NoWriteRecorder:
 
     async def intent(self, record: WriteAudit) -> Any:
         raise RuntimeError("this toolset has no audit recorder")
-
-    async def result(self, token: Any, record: WriteAudit) -> None:
-        return None
-
-
-class UnrecordedWritesForTests:
-    """TEST ONLY: lets writes through without recording any of them.
-
-    The explicit opt-in for a test that is about something else than the
-    audit. Never pass it outside a test: the app passes
-    ``agents.odata.audit.stored_recorder()``.
-    """
-
-    async def intent(self, record: WriteAudit) -> Any:
-        return None
 
     async def result(self, token: Any, record: WriteAudit) -> None:
         return None
@@ -663,12 +663,13 @@ def odata_toolset(
     (``WriteRecorder``): the intent after all checks and before anything is
     built or sent -- if that fails, the write is not sent -- and the result
     exactly once afterwards. A call refused by a check is not recorded
-    (nothing was going to be sent). Without a recorder that records
-    (``None`` or ``NoWriteRecorder``, the default) the toolset fails closed:
+    (nothing was going to be sent). Without a recorder that says it
+    records (``records_writes is True``; not ``None``, not the default
+    ``NoWriteRecorder``, not any other object) the toolset fails closed:
     it sends no write (``audit_not_configured``) and offers none, whatever
     ``allow_write`` says. The app passes
     ``agents.odata.audit.stored_recorder()``; a test that wants unrecorded
-    writes says so with ``UnrecordedWritesForTests``. A recorder with a
+    writes says so with ``tests.odata_helpers.UnrecordedWritesForTests``. A recorder with a
     ``tasks`` set owns the result tasks still running (so it can drain
     them); otherwise the toolset holds them.
     """
@@ -690,7 +691,8 @@ def odata_toolset(
     allow_write = oauth.get("allow_write") is True
     audit: Any = recorder if recorder is not None else NoWriteRecorder()
     # No record, no write: decided once, here, for search and execute alike.
-    recording = not isinstance(audit, NoWriteRecorder)
+    # Recognised positively: only a recorder that carries the marker.
+    recording = getattr(audit, RECORDS_WRITES_MARKER, None) is True
     if allow_write and not recording:
         logger.error(
             "odata: agent '%s' may write (allow_write) but its toolset has no audit "
@@ -974,6 +976,49 @@ def odata_toolset(
         except Exception:  # noqa: BLE001 - logged with the record by _result_settled
             pass
 
+    async def _abandon_intent(record: WriteAudit) -> None:
+        """Best effort: close the stored intent of a write that was NOT sent.
+
+        The intent was interrupted or not confirmed, so nothing left this
+        app -- but its row may have been committed, and an open intent
+        reads as "may have been sent". Where the recorder can
+        (``abandon``), the row is closed as never sent. In its own task,
+        held like a result task, shielded and bounded; whatever goes wrong
+        here, the caller's log line already says what happened, and the
+        write stays unsent.
+        """
+        abandon = getattr(audit, "abandon", None)
+        if abandon is None:
+            return
+
+        async def run() -> None:
+            await abandon(record)
+
+        task = asyncio.ensure_future(run())
+        audit_tasks.add(task)
+
+        def settled(done: asyncio.Task[None]) -> None:
+            audit_tasks.discard(done)
+            if done.cancelled() or done.exception() is not None:
+                audit_logger.warning(
+                    "odata audit: the unsent intent could not be closed; its row may "
+                    "stay 'intent': call_id=%s",
+                    record.call_id,
+                )
+
+        task.add_done_callback(settled)
+        # This can run inside a cancellation that is already being handled,
+        # so "cancelled (again) while closing" is a count that went up.
+        current = asyncio.current_task()
+        before = current.cancelling() if current is not None else 0
+        try:
+            await asyncio.wait_for(asyncio.shield(task), AUDIT_RESULT_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            if current is not None and current.cancelling() > before:
+                raise  # the close goes on behind the shield
+        except Exception:  # noqa: BLE001 - logged by `settled`, or still running
+            pass
+
     async def _send_write(
         entry: _Service,
         dialect: Any,
@@ -1007,7 +1052,7 @@ def odata_toolset(
             key=dict(key) if isinstance(key, dict) else None,
             fields=fields,
             outcome="intent",
-            phase="token",
+            phase=None,
             status=None,
             sent_as=sent_as,
             run_principal=current_principal.get(),
@@ -1019,11 +1064,13 @@ def odata_toolset(
             # The run was cancelled while the intent was being recorded. The
             # recorder may have stored it all the same, and no result will
             # follow: this line is what tells that row from a write that
-            # went out and lost its result.
+            # went out and lost its result. The row itself is closed too
+            # where the recorder can (logs are short-lived, the table is not).
             audit_logger.warning(
                 "odata audit: intent interrupted, the write was not sent: %s",
                 _audit_text(record),
             )
+            await _abandon_intent(record)
             raise
         except Exception as exc:  # noqa: BLE001 - no record, no write
             # "Not confirmed", not "not recorded": a recorder that failed or
@@ -1034,6 +1081,7 @@ def odata_toolset(
                 _origin(exc),
                 _audit_text(record),
             )
+            await _abandon_intent(record)
             raise ODataError(
                 "audit_unavailable",
                 "nothing was changed; the audit record could not be written",

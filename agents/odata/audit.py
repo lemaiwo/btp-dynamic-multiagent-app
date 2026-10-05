@@ -11,6 +11,8 @@ own database session (``agents.db.SessionLocal``), never the caller's:
 1. ``intent`` INSERTS one row with outcome ``intent`` and returns its id.
    It runs after every check of the write and BEFORE a client is built or
    anything is sent. If the row cannot be written, the write is not sent.
+   ``phase`` is NULL in that row: an open intent says nothing about
+   whether a modifying request left.
 2. ``result`` UPDATES exactly that row -- outcome, phase, HTTP status,
    created key, ``finished_at`` -- and only while its outcome is still
    ``intent``. A row is therefore finalised exactly once; a second result
@@ -24,16 +26,20 @@ How to read a row that is still ``intent``
 * Normally: **the write may have been sent; the process stopped, or the run
   was cancelled, before the outcome was recorded.** Nobody knows whether
   SAP applied it -- look at the entity (the row names it: service, target,
-  key). The same holds when the result could not be stored: then the
-  ``agents.odata.audit`` logger carries an ERROR line "result NOT recorded"
-  or "result not recorded within ..." with the row's ``call_id`` and the
-  outcome that was known.
-* Unless the ``agents.odata.audit`` logger has, for the row's ``call_id``,
-  the line **"intent interrupted, the write was not sent"** (the run was
-  cancelled while the intent was being stored) or "intent not confirmed
-  ...; the write was not sent" (storing it failed or took too long, and
-  the row was committed all the same). In both cases nothing left this
-  app: the row is an intent that was never acted on.
+  key). Its ``phase`` is NULL: the row does not claim that nothing left.
+  The same holds when the result could not be stored (after one retry):
+  then the ``agents.odata.audit`` logger carries an ERROR line "result NOT
+  recorded" or "result not recorded within ..." with the row's ``call_id``
+  and the outcome that was known.
+* An intent whose write was never sent -- the run was cancelled while the
+  intent was being stored, or storing it failed or took too long although
+  the row was committed -- is closed where possible (``abandon``): the row
+  then reads **``refused`` with phase ``token`` and no HTTP status, which
+  after an interrupted intent means "never sent"**. Only when that close
+  fails too does such a row stay ``intent``; the ``agents.odata.audit``
+  logger then has, for its ``call_id``, the line **"intent interrupted,
+  the write was not sent"** or "intent not confirmed ...; the write was not
+  sent" (logs are short-lived, which is why the row is closed first).
 
 What a row holds
 ----------------
@@ -60,6 +66,7 @@ empty the log. The purge runs with the IDE's retention pass in ``app.py``
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -94,6 +101,9 @@ RETENTION_MAX_DAYS = ODATA_AUDIT_MAX_RETENTION_DAYS
 # are still being stored. Each is one UPDATE; this only bounds a database
 # that hangs.
 DRAIN_TIMEOUT_SECONDS = 10.0
+# Storing a result is tried twice: a database that blinked must not turn a
+# known outcome into an open intent.
+RESULT_RETRY_DELAY_SECONDS = 0.5
 
 _PHASES = ("token", "write")
 
@@ -131,17 +141,48 @@ def retention_days() -> int:
 ODATA_AUDIT_RETENTION_DAYS = retention_days()
 
 
+_CUT_MARK = "~"
+_CUT_DIGEST_CHARS = 16
+_cut_warned: set[str] = set()
+
+
 def _fit(value: str | None, column: Any) -> str | None:
-    """``value`` cut to its column's width.
+    """``value`` as it fits its column; a longer one is cut, visibly.
 
     SQLite ignores a VARCHAR limit, Postgres refuses the row -- and a
     refused intent row refuses the write. A principal of any length must
-    not lock its user out, so it is cut instead (the token digest next to
-    it still tells two senders apart).
+    not lock its user out, so it is cut: prefix + ``~`` + the first 16 hex
+    digits of the SHA-256 of the whole value, together exactly the column
+    width. Two long values with a common prefix therefore stay distinct,
+    and a cut value is recognisable as one. Logged once per column (the
+    column's name, never the value).
     """
     if value is None:
         return None
-    return str(value)[: column.type.length]
+    text_value = str(value)
+    width = column.type.length
+    if len(text_value) <= width:
+        return text_value
+    if column.name not in _cut_warned:
+        _cut_warned.add(column.name)
+        audit_logger.warning(
+            "odata audit: a value for column '%s' is longer than %d characters; it is "
+            "stored cut, ending in '%s' and a digest of the whole value",
+            column.name,
+            width,
+            _CUT_MARK,
+        )
+    digest = hashlib.sha256(text_value.encode("utf-8", "surrogatepass")).hexdigest()
+    tail = _CUT_MARK + digest[:_CUT_DIGEST_CHARS]
+    return text_value[: width - len(tail)] + tail
+
+
+def _call_id(record: WriteAudit) -> str:
+    """The call id, never cut: it is what ties the result to its intent."""
+    width = ODataAuditLog.__table__.c.call_id.type.length
+    if not isinstance(record.call_id, str) or not 1 <= len(record.call_id) <= width:
+        raise ValueError("the call id does not fit the audit row")
+    return record.call_id
 
 
 def _json(value: Any) -> str | None:
@@ -163,6 +204,9 @@ class StoredWriteRecorder:
     registry build and the shutdown can wait for it (``drain``).
     """
 
+    # The marker `agents.odata.tools` asks for before it sends any write.
+    records_writes = True
+
     def __init__(self, session_factory: Callable[[], Any] | None = None) -> None:
         self._session_factory = session_factory
         self.tasks: set[asyncio.Task[None]] = set()
@@ -178,7 +222,7 @@ class StoredWriteRecorder:
         columns = ODataAuditLog.__table__.c
         row = ODataAuditLog(
             created_at=_utcnow(),
-            call_id=_fit(record.call_id, columns.call_id),
+            call_id=_call_id(record),
             agent=_fit(record.agent, columns.agent) or "",
             run_id=_fit(record.run_id, columns.run_id),
             sent_as=_fit(record.sent_as, columns.sent_as) or "",
@@ -189,7 +233,8 @@ class StoredWriteRecorder:
             operation=_fit(record.operation, columns.operation) or "",
             key_json=_json(record.key),
             body_fields_json=_json(list(record.fields)),
-            phase="token",
+            # Not "token": an open intent must not claim that nothing left.
+            phase=None,
             outcome="intent",
         )
         async with self._session() as session:
@@ -201,13 +246,28 @@ class StoredWriteRecorder:
             raise RuntimeError("the audit row got no id")
         return row_id
 
+    async def _close(self, statement: Any) -> int:
+        """Run one conditional UPDATE in its own session; the rows changed."""
+        async with self._session() as session:
+            done = await session.execute(statement)
+            await session.commit()
+        return int(done.rowcount or 0)
+
     async def result(self, token: Any, record: WriteAudit) -> None:
-        """Finalise the intent row ``token``: once, and only that row."""
+        """Finalise the intent row ``token``: once, and only that row.
+
+        A failure to store is retried once after
+        ``RESULT_RETRY_DELAY_SECONDS`` (the UPDATE is conditional, so a
+        first attempt that did land makes the second a no-op that is
+        recognised below); the second failure is raised, and the toolset
+        writes the record to the log.
+        """
         if not isinstance(token, int) or isinstance(token, bool):
             raise TypeError("the audit token is not a row id")
         if record.outcome not in WRITE_OUTCOMES or record.phase not in _PHASES:
             raise ValueError("not a result record")
-        status = record.status if isinstance(record.status, int) else None
+        # `type(...) is int`: True is an int too, and no HTTP status.
+        status = record.status if type(record.status) is int else None
         statement = (
             update(ODataAuditLog)
             .where(
@@ -224,10 +284,18 @@ class StoredWriteRecorder:
             )
             .execution_options(synchronize_session=False)
         )
-        async with self._session() as session:
-            done = await session.execute(statement)
-            await session.commit()
-        if (done.rowcount or 0) != 1:
+        retried = False
+        try:
+            changed = await self._close(statement)
+        except Exception:  # noqa: BLE001 - once more, then the caller logs the record
+            retried = True
+            await asyncio.sleep(RESULT_RETRY_DELAY_SECONDS)
+            changed = await self._close(statement)
+        if changed != 1:
+            if retried and await self._is_result_of(token, record):
+                # The first attempt was committed although it raised.
+                changed = 1
+        if changed != 1:
             # Already finalised (a row is finalised once), purged, or not
             # this call's row. Nothing was changed; the record is kept here.
             audit_logger.error(
@@ -237,6 +305,41 @@ class StoredWriteRecorder:
             )
             return
         audit_logger.info("odata audit: row %d: %s", token, audit_text(record))
+
+    async def _is_result_of(self, token: int, record: WriteAudit) -> bool:
+        async with self._session() as session:
+            row = await session.get(ODataAuditLog, token)
+            return (
+                row is not None
+                and row.call_id == record.call_id
+                and row.outcome == record.outcome
+                and row.phase == record.phase
+            )
+
+    async def abandon(self, record: WriteAudit) -> bool:
+        """Close the intent row of a call whose write was NOT sent.
+
+        For an intent that was interrupted or not confirmed: the toolset
+        sent nothing, but the row may have been committed. By ``call_id``
+        (there is no row id to go by) and only while the row is still an
+        intent: it becomes ``refused`` / ``token`` -- "never sent". True
+        when a row was closed; False when there was none to close.
+        """
+        statement = (
+            update(ODataAuditLog)
+            .where(
+                ODataAuditLog.call_id == _call_id(record),
+                ODataAuditLog.outcome == "intent",
+            )
+            .values(outcome="refused", phase="token", finished_at=_utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        closed = await self._close(statement) == 1
+        if closed:
+            audit_logger.info(
+                "odata audit: unsent intent closed as refused/token: call_id=%s", record.call_id
+            )
+        return closed
 
     async def drain(self, timeout: float = DRAIN_TIMEOUT_SECONDS) -> int:
         """Wait up to ``timeout`` seconds for the results still being stored.

@@ -142,6 +142,7 @@ class Sap:
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
         self.rows_seen: list[list[tuple[str, str, str | None]]] = []
+        self.phases_seen: list[list[str | None]] = []
         self.write_answer: Any = None
 
     @property
@@ -150,9 +151,9 @@ class Sap:
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        self.rows_seen.append(
-            [(r.operation, r.outcome, r.finished_at) for r in await all_rows()]
-        )
+        rows = await all_rows()
+        self.rows_seen.append([(r.operation, r.outcome, r.finished_at) for r in rows])
+        self.phases_seen.append([r.phase for r in rows])
         if request.headers.get("X-CSRF-Token") == "Fetch":
             return httpx.Response(
                 200,
@@ -264,7 +265,7 @@ def _record(**patch: Any) -> WriteAudit:
         "key": dict(KEY),
         "fields": ("RequestedQuantity",),
         "outcome": "intent",
-        "phase": "token",
+        "phase": None,
         "status": None,
         "sent_as": ALICE,
         "run_principal": ALICE,
@@ -293,6 +294,7 @@ async def test_an_update_writes_intent_before_the_request_and_the_result_after(a
     # open, before the CSRF fetch and before the write itself.
     assert [r.headers.get("X-CSRF-Token") == "Fetch" for r in w.sap.requests] == [True, False]
     assert w.sap.rows_seen == [[("update", "intent", None)], [("update", "intent", None)]]
+    assert w.sap.phases_seen == [[None], [None]]  # an open row never says "nothing left"
     (row,) = await all_rows()
     assert (row.agent, row.run_id, row.service, row.target, row.operation) == (
         "pr-release-job", "run-1", "pr", ITEM, "update",
@@ -466,16 +468,70 @@ async def test_a_slow_intent_means_no_request_even_if_its_row_lands(alice, monke
     with caplog.at_level(logging.DEBUG, logger="agents"):
         out = await w.run(**UPDATE)
     assert out["error"]["code"] == "audit_unavailable" and w.sap.requests == []
-    # The row is there and stays an intent; the log line with its call id is
-    # what says that it was never acted on.
+    # The row landed although the intent was not confirmed. Nothing was
+    # sent, and the row says so itself: closed as refused / token.
     (row,) = await all_rows()
-    assert (row.outcome, row.finished_at) == ("intent", None)
+    assert (row.outcome, row.phase, row.http_status) == ("refused", "token", None)
+    assert row.finished_at is not None
     (line,) = _audit_lines(caplog, logging.ERROR)
     assert "intent not confirmed" in line and "the write was not sent" in line
     assert f"call_id={row.call_id}" in line
 
 
-async def test_a_cancelled_intent_leaves_a_row_explained_by_the_log(alice, caplog):
+@pytest.mark.parametrize("how", ["raises", "hangs"])
+async def test_an_unsent_intent_that_cannot_be_closed_stays_open_and_logged(
+    alice, monkeypatch, caplog, how
+):
+    monkeypatch.setattr(tools_module, "AUDIT_INTENT_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(tools_module, "AUDIT_RESULT_TIMEOUT_SECONDS", 0.05)
+    release = asyncio.Event()
+
+    class CannotClose(StoredWriteRecorder):
+        async def intent(self, record: WriteAudit) -> int:
+            await super().intent(record)
+            await asyncio.Event().wait()
+            return 0
+
+        async def abandon(self, record: WriteAudit) -> bool:
+            if how == "hangs":
+                await release.wait()
+            raise RuntimeError("database is gone: secret-dsn")
+
+    recorder = CannotClose()
+    w = World(recorder=recorder)
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        out = await w.run(**UPDATE)
+        release.set()
+        await recorder.drain(5)
+        await asyncio.sleep(0)
+    assert out["error"]["code"] == "audit_unavailable" and w.sap.requests == []
+    (row,) = await all_rows()
+    assert (row.outcome, row.phase, row.finished_at) == ("intent", None, None)
+    text_ = "\n".join(_audit_lines(caplog))
+    assert "intent not confirmed" in text_ and f"call_id={row.call_id}" in text_
+    assert "could not be closed" in text_ and "secret-dsn" not in caplog.text
+    assert not recorder.tasks
+
+
+async def test_abandon_closes_only_an_open_intent_of_that_call():
+    recorder = StoredWriteRecorder()
+    done = await recorder.intent(_record(call_id="a" * 32))
+    await recorder.result(done, _record(call_id="a" * 32, outcome="ok", phase="write", status=204))
+    await recorder.intent(_record(call_id="b" * 32))
+    await recorder.intent(_record(call_id="c" * 32))
+    assert await recorder.abandon(_record(call_id="a" * 32)) is False  # finalised: untouched
+    assert await recorder.abandon(_record(call_id="e" * 32)) is False  # no such row
+    assert await recorder.abandon(_record(call_id="b" * 32)) is True
+    assert await recorder.abandon(_record(call_id="b" * 32)) is False  # once
+    rows = {r.call_id[0]: (r.outcome, r.phase, r.http_status) for r in await all_rows()}
+    assert rows == {
+        "a": ("ok", "write", 204), "b": ("refused", "token", None), "c": ("intent", None, None),
+    }
+    doc = " ".join((audit_module.__doc__ or "").split())
+    assert "``refused`` with phase ``token``" in doc and '"never sent"' in doc
+
+
+async def test_a_cancelled_intent_is_closed_as_never_sent_and_logged(alice, caplog):
     stored = asyncio.Event()
 
     class CommitsThenHangs(StoredWriteRecorder):
@@ -493,8 +549,9 @@ async def test_a_cancelled_intent_leaves_a_row_explained_by_the_log(alice, caplo
         with pytest.raises(asyncio.CancelledError):
             await task
     assert w.sap.requests == []
+    # Closed before the cancellation was passed on: never sent.
     (row,) = await all_rows()
-    assert row.outcome == "intent"
+    assert (row.outcome, row.phase) == ("refused", "token") and row.finished_at is not None
     (line,) = _audit_lines(caplog, logging.WARNING)
     assert "intent interrupted, the write was not sent" in line
     assert f"call_id={row.call_id}" in line and "10000001" not in caplog.text
@@ -550,8 +607,108 @@ async def test_the_intent_row_is_always_an_intent_whatever_the_record_says():
     await recorder.intent(_record(outcome="ok", phase="write", status=204, created_key=KEY))
     (row,) = await all_rows()
     assert (row.outcome, row.phase, row.http_status, row.created_key_json, row.finished_at) == (
-        "intent", "token", None, None, None,
+        "intent", None, None, None, None,
     )
+
+
+async def test_an_open_intent_never_claims_that_nothing_left(client):
+    """`token` means "no modifying request left the app". An open row cannot
+    know that, in the table and in the route alike."""
+    assert ODataAuditLog.__table__.c.phase.nullable is True
+    recorder = StoredWriteRecorder()
+    for phase in (None, "token", "write"):
+        await recorder.intent(_record(call_id=str(phase)[0] * 32, phase=phase))
+    assert [(r.outcome, r.phase) for r in await all_rows()] == [("intent", None)] * 3
+    items = (await client.get(AUDIT_URL, params={"outcome": "intent"})).json()["items"]
+    assert len(items) == 3 and all(item["phase"] is None for item in items)
+    # A result record must say which it was: an open phase cannot be stored as a result.
+    (row, *_rest) = await all_rows()
+    with pytest.raises(ValueError):
+        await recorder.result(row.id, _record(call_id=row.call_id, outcome="ok", phase=None))
+
+
+async def test_storing_a_result_is_retried_once(monkeypatch, caplog):
+    monkeypatch.setattr(audit_module, "RESULT_RETRY_DELAY_SECONDS", 0.01)
+    failures = {"left": 0}
+
+    class Flaky(StoredWriteRecorder):
+        async def _close(self, statement: Any) -> int:
+            if failures["left"] > 0:
+                failures["left"] -= 1
+                raise RuntimeError("connection reset: secret-dsn")
+            return await super()._close(statement)
+
+    recorder = Flaky()
+    done = _record(outcome="ok", phase="write", status=204)
+    # Once: the second attempt stores it, and nothing is an error.
+    row_id = await recorder.intent(_record())
+    failures["left"] = 1
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        await recorder.result(row_id, done)
+    assert [(r.outcome, r.phase) for r in await all_rows()] == [("ok", "write")]
+    assert _audit_lines(caplog, logging.ERROR) == []
+    # Twice: raised to the toolset, which logs the record; the row stays open.
+    other = await recorder.intent(_record(call_id="e" * 32))
+    failures["left"] = 2
+    with pytest.raises(RuntimeError):
+        await recorder.result(other, _record(call_id="e" * 32, outcome="ok", phase="write"))
+    assert failures["left"] == 0  # exactly two attempts
+    assert [(r.outcome, r.phase) for r in await all_rows()] == [("ok", "write"), ("intent", None)]
+
+
+async def test_a_first_attempt_that_landed_before_it_failed_is_not_an_error(monkeypatch, caplog):
+    monkeypatch.setattr(audit_module, "RESULT_RETRY_DELAY_SECONDS", 0.01)
+    calls = {"n": 0}
+
+    class CommitsThenRaises(StoredWriteRecorder):
+        async def _close(self, statement: Any) -> int:
+            calls["n"] += 1
+            changed = await super()._close(statement)
+            if calls["n"] == 1:
+                raise RuntimeError("the answer to the commit was lost")
+            return changed
+
+    recorder = CommitsThenRaises()
+    row_id = await recorder.intent(_record())
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        await recorder.result(row_id, _record(outcome="unknown", phase="write", status=None))
+    assert [(r.outcome, r.phase) for r in await all_rows()] == [("unknown", "write")]
+    assert _audit_lines(caplog, logging.ERROR) == []
+
+
+async def test_the_toolset_logs_the_record_when_both_attempts_fail(alice, monkeypatch, caplog):
+    monkeypatch.setattr(audit_module, "RESULT_RETRY_DELAY_SECONDS", 0.01)
+
+    class ResultStoreDown(StoredWriteRecorder):
+        async def result(self, token: Any, record: WriteAudit) -> None:
+            self._close = self._down  # type: ignore[method-assign]
+            await super().result(token, record)
+
+        async def _down(self, statement: Any) -> int:
+            raise RuntimeError("database is gone")
+
+    w = World(recorder=ResultStoreDown())
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        assert (await w.run(**UPDATE))["ok"] is True
+        await asyncio.sleep(0)
+    (row,) = await all_rows()
+    assert (row.outcome, row.phase) == ("intent", None)
+    (line,) = _audit_lines(caplog, logging.ERROR)
+    assert "result NOT recorded" in line and f"call_id={row.call_id}" in line
+
+
+async def test_a_bool_is_not_an_http_status():
+    recorder = StoredWriteRecorder()
+    row_id = await recorder.intent(_record())
+    await recorder.result(row_id, _record(outcome="ok", phase="write", status=True))
+    (row,) = await all_rows()
+    assert (row.outcome, row.http_status) == ("ok", None)
+
+
+def test_the_outcomes_of_the_table_are_those_of_the_toolset():
+    from agents.db import ODATA_AUDIT_OUTCOMES
+
+    assert ODATA_AUDIT_OUTCOMES == ("intent", *tools_module.WRITE_OUTCOMES)
 
 
 async def test_each_step_uses_a_session_of_its_own_and_closes_it():
@@ -571,16 +728,49 @@ async def test_each_step_uses_a_session_of_its_own_and_closes_it():
     assert not any(session.in_transaction() for session in opened)
 
 
-async def test_values_longer_than_their_column_are_cut_not_refused():
+async def test_values_longer_than_their_column_are_cut_visibly_and_stay_distinct(
+    caplog, monkeypatch
+):
+    monkeypatch.setattr(audit_module, "_cut_warned", set())
     columns = ODataAuditLog.__table__.c
+    width = columns.sent_as.type.length
+    assert width == columns.run_principal.type.length == 255
+    prefix = "p" * 300
+    exact = "e" * width
     recorder = StoredWriteRecorder()
-    await recorder.intent(
-        _record(sent_as="s" * 400, run_principal="p" * 400, agent="a" * 100, run_id="r" * 100)
-    )
-    (row,) = await all_rows()
-    assert len(row.sent_as) == columns.sent_as.type.length == 255
-    assert len(row.run_principal) == columns.run_principal.type.length == 255
-    assert len(row.agent) == columns.agent.type.length and len(row.run_id) == 64
+    with caplog.at_level(logging.DEBUG, logger="agents"):
+        await recorder.intent(_record(call_id="1" * 32, sent_as=prefix + "-alice@example.com",
+                                      run_principal=prefix + "-alice@example.com"))
+        await recorder.intent(_record(call_id="2" * 32, sent_as=prefix + "-bob@example.com",
+                                      run_principal=exact, agent="a" * 100, run_id="r" * 100))
+        await recorder.intent(_record(call_id="3" * 32, sent_as=exact))
+        await recorder.intent(_record(call_id="4" * 32, sent_as=prefix + "-alice@example.com"))
+    first, second, third, again = await all_rows()
+    # Two long principals with a 300-character common prefix stay two.
+    assert first.sent_as != second.sent_as and first.sent_as == again.sent_as
+    for cut in (first.sent_as, second.sent_as, first.run_principal):
+        assert len(cut) == width and cut[-17] == "~" and cut.startswith("p" * (width - 17))
+        int(cut[-16:], 16)  # the first 16 hex of the SHA-256 of the whole value
+    full = (prefix + "-alice@example.com").encode()
+    assert first.sent_as.endswith("~" + hashlib.sha256(full).hexdigest()[:16])
+    # Exactly the width: untouched.
+    assert third.sent_as == exact and second.run_principal == exact
+    assert len(second.agent) == columns.agent.type.length and len(second.run_id) == 64
+    # Said once per column, by name, never the value.
+    warnings = _audit_lines(caplog, logging.WARNING)
+    assert sorted(w.split("'")[1] for w in warnings) == [
+        "agent", "run_id", "run_principal", "sent_as",
+    ]
+    assert "ppp" not in caplog.text and "example.com" not in caplog.text
+
+
+async def test_the_call_id_is_never_cut(alice):
+    recorder = StoredWriteRecorder()
+    for bad in ("c" * 33, "", None, 7):
+        with pytest.raises(ValueError):
+            await recorder.intent(_record(call_id=bad))  # type: ignore[arg-type]
+    assert await all_rows() == []
+    assert len(tools_module.uuid.uuid4().hex) == ODataAuditLog.__table__.c.call_id.type.length
 
 
 def test_the_table_fits_what_a_record_carries_and_is_indexed_for_an_operator():
@@ -630,9 +820,12 @@ async def test_a_process_that_dies_after_the_send_leaves_a_distinguishable_row(a
         await asyncio.sleep(0)
     assert len(w.sap.writes) == 1
     (row,) = await all_rows()
+    # A modifying request DID leave. The row must not say "token" (nothing
+    # left): it says nothing about the phase at all.
     assert (row.outcome, row.phase, row.http_status, row.finished_at) == (
-        "intent", "token", None, None,
+        "intent", None, None, None,
     )
+    assert row.to_dict()["phase"] is None
     # Distinguishable from every finished row ...
     assert (await World().run(**UPDATE))["ok"] is True
     open_rows = [r for r in await all_rows() if r.outcome == "intent"]
@@ -772,26 +965,33 @@ async def test_a_retired_build_drains_its_recorders_once_and_survives_a_failure(
         SimpleNamespace(recorder=None),
     ]
     build = SimpleNamespace(mcp_clients=servers, in_flight=SimpleNamespace(value=0))
-    await registry_module._drain_audit_recorders(build)
+    other = SimpleNamespace(
+        mcp_clients=[SimpleNamespace(recorder=shared)], in_flight=SimpleNamespace(value=0)
+    )
+    # Once per recorder, however many builds and toolsets share it.
+    await registry_module._drain_audit_recorders([build, other])
     assert calls == ["shared", "broken"]
-    # ... and the retire path of the registry calls it for an idle build only.
-    seen: list[Any] = []
-
-    async def spy(retired: Any) -> None:
-        seen.append(retired)
-
-    monkeypatch.setattr(registry_module, "_drain_audit_recorders", spy)
-    busy = SimpleNamespace(mcp_clients=[], in_flight=SimpleNamespace(value=1))
-    idle = SimpleNamespace(mcp_clients=[], in_flight=SimpleNamespace(value=0))
+    # ... and the retire path drains ONCE per pass, for the idle builds only:
+    # the recorder is process-wide, so N retired builds must not cost N timeouts.
+    calls.clear()
+    busy = SimpleNamespace(
+        mcp_clients=[SimpleNamespace(recorder=Rec("busy"))], in_flight=SimpleNamespace(value=1)
+    )
+    idle = [
+        SimpleNamespace(
+            mcp_clients=[SimpleNamespace(recorder=shared)], in_flight=SimpleNamespace(value=0)
+        )
+        for _ in range(3)
+    ]
     reg = registry_module.Registry()
-    reg._retired = [busy, idle]
+    reg._retired = [busy, *idle]
     import agents.job_runner as job_runner
     import agents.workflow_runner as workflow_runner
 
     monkeypatch.setattr(job_runner, "_tasks", set())
     monkeypatch.setattr(workflow_runner, "_tasks", set())
     await reg._close_idle_retired()
-    assert seen == [idle] and reg._retired == [busy]
+    assert calls == ["shared"] and reg._retired == [busy]
 
 
 # -- retention ------------------------------------------------------------------------
@@ -987,6 +1187,44 @@ async def test_the_route_lists_newest_first_with_everything_an_audit_needs(clien
     assert (open_row["outcome"], open_row["finished_at"], open_row["status"]) == (
         "intent", None, None,
     )
+    assert open_row["phase"] is None  # not "token": it may have been sent
+
+
+async def test_until_and_before_id_reach_every_row_of_a_filter(client):
+    await _seed_rows()
+    now = datetime.now(timezone.utc)
+    until = (now - timedelta(hours=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert _calls(await client.get(AUDIT_URL, params={"until": until})) == ["2", "1"]
+    since = (now - timedelta(hours=60)).isoformat()
+    window = {"since": since, "until": (now - timedelta(hours=1, minutes=30)).isoformat()}
+    assert _calls(await client.get(AUDIT_URL, params=window)) == ["4", "3", "2"]
+    # Paging as the docstring says: the same filters, before_id = the last id.
+    seen: list[str] = []
+    params: dict[str, str] = {"sent_as": ALICE, "limit": "1"}
+    for _ in range(10):
+        r = await client.get(AUDIT_URL, params=params)
+        seen += _calls(r)
+        if not r.json()["more"]:
+            break
+        params["before_id"] = str(r.json()["items"][-1]["id"])
+    assert seen == ["5", "2", "1"]
+    ids = [item["id"] for item in (await client.get(AUDIT_URL)).json()["items"]]
+    assert ids == sorted(ids, reverse=True)
+    r = await client.get(AUDIT_URL, params={"before_id": str(ids[-1])})
+    assert _calls(r) == [] and r.json()["more"] is False
+    r = await client.get(AUDIT_URL, params={"before_id": str(ids[1]), "limit": "2"})
+    assert [item["id"] for item in r.json()["items"]] == ids[2:4] and r.json()["more"] is True
+    from agents.odata.admin_routes import api_list_odata_audit
+
+    doc = " ".join((api_list_odata_audit.__doc__ or "").split())
+    assert "before_id" in doc and "%2B" in doc and "arrives as a space" in doc
+
+
+async def test_an_unencoded_plus_in_a_date_is_refused_not_misread(client):
+    r = await client.get(AUDIT_URL + "?since=2026-01-31T00:00:00+02:00")
+    assert r.status_code == 422 and r.json()["detail"].startswith("since:")
+    r = await client.get(AUDIT_URL + "?since=2026-01-31T00:00:00%2B02:00")
+    assert r.status_code == 200
 
 
 async def test_the_route_filters_exactly_and_bounds_the_answer(client):
@@ -1024,6 +1262,17 @@ async def test_the_route_filters_exactly_and_bounds_the_answer(client):
         ({"outcome": "error-SECRET"}, "outcome"),
         ({"since": "yesterday-SECRET"}, "since"),
         ({"since": "2026-13-45"}, "since"),
+        # At the edge of the calendar the conversion to UTC overflows.
+        ({"since": "0001-01-01T00:00:00+14:00"}, "since"),
+        ({"since": "9999-12-31T23:59:59-14:00"}, "since"),
+        ({"until": "0001-01-01T00:00:00+14:00"}, "until"),
+        ({"until": "9999-12-31T23:59:59-14:00"}, "until"),
+        ({"until": "tomorrow-SECRET"}, "until"),
+        ({"before_id": "0"}, "before_id"),
+        ({"before_id": "-3"}, "before_id"),
+        ({"before_id": "abc-SECRET"}, "before_id"),
+        ({"before_id": "9" * 19}, "before_id"),
+        ({"before_id": "1.5"}, "before_id"),
         ({"sent_as": ""}, "sent_as"),
         ({"sent_as": "x" * 256}, "sent_as"),
         ({"sent_as": "a\nSECRET"}, "sent_as"),

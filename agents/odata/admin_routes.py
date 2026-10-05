@@ -71,7 +71,7 @@ _EXPECTED_RE = re.compile(
 # The audit route: how many rows one answer holds.
 AUDIT_DEFAULT_LIMIT = 100
 AUDIT_MAX_LIMIT = 500
-_AUDIT_PARAMS = ("service", "sent_as", "outcome", "since", "limit")
+_AUDIT_PARAMS = ("service", "sent_as", "outcome", "since", "until", "before_id", "limit")
 
 
 class DuplicateBody(BaseModel):
@@ -415,6 +415,24 @@ async def api_duplicate_odata_service(name: str, request: Request) -> dict[str, 
         return row.to_dict([])
 
 
+def _audit_moment(name: str, raw: str) -> datetime:
+    """An ISO 8601 query value as a UTC moment, or a 422 that names ``name``."""
+    try:
+        if len(raw) > 40 or not raw.isascii():
+            raise ValueError
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        # Without an offset it is UTC, like the stored timestamps.
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        # Inside the try: a date at the edge of the calendar with an offset
+        # (0001-01-01T00:00:00+14:00) overflows here, with OverflowError.
+        return moment.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        raise _refuse(
+            f"{name}: an ISO 8601 date or date-time, e.g. 2026-01-31T00:00:00Z"
+        ) from None
+
+
 def _audit_filters(request: Request) -> dict[str, Any]:
     """The query parameters of the audit route, checked one by one.
 
@@ -443,20 +461,18 @@ def _audit_filters(request: Request) -> dict[str, Any]:
         if outcome not in ODATA_AUDIT_OUTCOMES:
             raise _refuse("outcome: one of " + ", ".join(ODATA_AUDIT_OUTCOMES))
         filters["outcome"] = outcome
-    since = params.get("since")
-    if since is not None:
-        try:
-            if len(since) > 40 or not since.isascii():
-                raise ValueError
-            moment = datetime.fromisoformat(since.replace("Z", "+00:00"))
-        except ValueError:
-            raise _refuse(
-                "since: an ISO 8601 date or date-time, e.g. 2026-01-31T00:00:00Z"
-            ) from None
-        # Without an offset it is UTC, like the stored timestamps.
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=timezone.utc)
-        filters["since"] = moment.astimezone(timezone.utc)
+    for name in ("since", "until"):
+        raw = params.get(name)
+        if raw is not None:
+            filters[name] = _audit_moment(name, raw)
+    before_id = params.get("before_id")
+    if before_id is not None:
+        # At most 18 digits: within a 64-bit id, whatever the database.
+        if not (before_id.isascii() and before_id.isdigit() and len(before_id) <= 18) or (
+            int(before_id) < 1
+        ):
+            raise _refuse("before_id: the id of an audit row (a positive integer)")
+        filters["before_id"] = int(before_id)
     limit = params.get("limit")
     if limit is not None:
         if not (limit.isascii() and limit.isdigit() and len(limit) <= 4) or not (
@@ -472,20 +488,27 @@ async def api_list_odata_audit(request: Request) -> dict[str, Any]:
     """The write audit log of ``builtin:odata``, newest first. Read-only:
     there is no route that writes, changes or deletes an audit row.
 
-    Query parameters, all optional and each an exact match: ``service`` (a
-    service name), ``sent_as`` (whose credential SAP saw), ``outcome``
+    Query parameters, all optional: the exact matches ``service`` (a
+    service name), ``sent_as`` (whose credential SAP saw) and ``outcome``
     (``intent``, ``ok``, ``refused``, ``sap_error``, ``unknown``,
-    ``cancelled``), ``since`` (ISO 8601; rows recorded at or after it, UTC
-    when it has no offset) and ``limit`` (1 to ``AUDIT_MAX_LIMIT``, default
-    ``AUDIT_DEFAULT_LIMIT``). Any other parameter is a 422.
+    ``cancelled``); ``since`` / ``until`` (ISO 8601; rows recorded at or
+    after / at or before it, UTC when it has no offset); ``before_id``
+    (rows with a smaller id) and ``limit`` (1 to ``AUDIT_MAX_LIMIT``,
+    default ``AUDIT_DEFAULT_LIMIT``). Any other parameter is a 422.
+    An unencoded ``+`` in ``since`` / ``until`` arrives as a space and is
+    refused: write the offset as ``%2B02:00``, or use ``Z``.
 
-    Answer: ``{"items": [row], "limit": n, "more": bool}``; ``more`` says
-    that older matching rows exist beyond ``limit`` (narrow the filters).
+    Answer: ``{"items": [row], "limit": n, "more": bool}``, newest first by
+    id (the order in which the intents were recorded). Paging: while
+    ``more`` is true, ask again with the same filters and ``before_id`` =
+    the ``id`` of the last item; every row of a filter is reachable that
+    way, however many there are.
     A row is ``ODataAuditLog.to_dict()``: ids and timestamps, agent, run id,
     service, target, operation, ``key`` and ``created_key`` WITH their
     values, the body field NAMES, phase, outcome, HTTP status, ``sent_as``,
-    ``run_principal`` and the token digest. How to read a row whose outcome
-    is still ``intent``: the docstring of ``agents.odata.audit``.
+    ``run_principal`` and the token digest. A row whose outcome is still
+    ``intent`` has ``phase: null``: the write MAY have been sent (see the
+    docstring of ``agents.odata.audit``).
 
     The table can hold personal data -- key values name an entity (which
     can be a person's), principals name users -- so the route is for admins

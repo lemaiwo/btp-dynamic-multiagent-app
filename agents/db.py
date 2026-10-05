@@ -698,8 +698,10 @@ class ODataAuditLog(Base):
     key_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_key_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     body_fields_json: Mapped[str | None] = mapped_column(Text, nullable=True)
-    # "token": no modifying request left the app; "write": one did.
-    phase: Mapped[str] = mapped_column(String(8), nullable=False, default="token")
+    # NULL while the row is an intent (nothing is known yet -- it must not
+    # read as "nothing left"); then "token": no modifying request left the
+    # app, or "write": one did.
+    phase: Mapped[str | None] = mapped_column(String(8), nullable=True)
     # intent | ok | refused | sap_error | unknown | cancelled
     outcome: Mapped[str] = mapped_column(String(16), nullable=False)
     http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -2710,10 +2712,18 @@ async def list_odata_audit(
     sent_as: str | None = None,
     outcome: str | None = None,
     since: datetime | None = None,
+    until: datetime | None = None,
+    before_id: int | None = None,
     limit: int = 100,
 ) -> list[ODataAuditLog]:
-    """Audit rows, newest first, at most ``limit``; every filter is an exact
-    match (``since``: recorded at or after). Read-only."""
+    """Audit rows, newest first, at most ``limit``. Read-only.
+
+    ``service``, ``sent_as`` and ``outcome`` are exact matches; ``since`` /
+    ``until`` bound ``created_at`` (at or after / at or before);
+    ``before_id`` keeps rows with a smaller id. "Newest first" is by id,
+    the order in which the intents were recorded, so that ``before_id`` =
+    the last id of a page continues exactly where that page ended.
+    """
     query = select(ODataAuditLog)
     if service is not None:
         query = query.where(ODataAuditLog.service == service)
@@ -2723,7 +2733,11 @@ async def list_odata_audit(
         query = query.where(ODataAuditLog.outcome == outcome)
     if since is not None:
         query = query.where(ODataAuditLog.created_at >= since)
-    query = query.order_by(ODataAuditLog.created_at.desc(), ODataAuditLog.id.desc()).limit(limit)
+    if until is not None:
+        query = query.where(ODataAuditLog.created_at <= until)
+    if before_id is not None:
+        query = query.where(ODataAuditLog.id < before_id)
+    query = query.order_by(ODataAuditLog.id.desc()).limit(limit)
     return list((await session.execute(query)).scalars().all())
 
 
