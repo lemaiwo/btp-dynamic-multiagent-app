@@ -104,6 +104,19 @@ class FieldDef(_Model):
     values: list[ValueMeaning] = Field(default_factory=list)
     personal_data: bool = False
 
+    @model_validator(mode="after")
+    def _filterable_is_selectable(self) -> FieldDef:
+        # Agents see only selectable fields. A filter on a field they may not
+        # read would still answer "is the value X?" row by row, so a hidden
+        # field must not be filterable either. (No such rule for `writable`:
+        # a write-only field is legitimate.)
+        if self.filterable and not self.selectable:
+            raise ValueError(
+                f"field {self.name!r} is filterable but not selectable; "
+                "a filterable field must also be selectable"
+            )
+        return self
+
 
 class NavigationDef(_Model):
     name: EdmName

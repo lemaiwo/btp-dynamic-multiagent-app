@@ -443,3 +443,20 @@ def test_example_query_lengths():
     assert ODataServicePayload.model_validate(ok)
     refused(with_example(select=["x" * 129]), "select")
     refused(with_example(orderby="x" * 301), "orderby")
+
+
+def test_a_filterable_field_must_be_selectable():
+    # The search tool lists only selectable fields; filtering on a field the
+    # agent may not read would let it probe the hidden values.
+    def with_field(**flags: bool) -> dict[str, Any]:
+        data = good()
+        data["definition"]["entity_sets"][0]["fields"].append({"name": "CreatedByUser", **flags})
+        return data
+
+    refused(with_field(filterable=True, selectable=False), "field 'CreatedByUser' is filterable")
+    refused(with_field(filterable=True), "field 'CreatedByUser' is filterable")
+    assert ODataServicePayload.model_validate(with_field(filterable=True, selectable=True))
+    assert ODataServicePayload.model_validate(with_field(selectable=True, filterable=False))
+    assert ODataServicePayload.model_validate(with_field(writable=True))
+    with pytest.raises(ValueError, match="definition.entity_sets.0.fields.3: .*'CreatedByUser'"):
+        validate_odata_service(with_field(filterable=True))
