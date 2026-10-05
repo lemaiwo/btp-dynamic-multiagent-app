@@ -198,7 +198,8 @@ async def test_export_wipe_import_export_is_byte_stable(client):
     # ... and importing onto itself changes nothing either.
     r = await client.post(IMPORT, json=second)
     assert r.status_code == 200, r.text
-    assert (r.json()["created_odata_services"], r.json()["updated_odata_services"]) == (0, 3)
+    # "updated" counts the services whose stored form changed: none here.
+    assert (r.json()["created_odata_services"], r.json()["updated_odata_services"]) == (0, 0)
     assert r.json()["odata_identity_changes"] == []
     third = (await client.get(EXPORT)).json()
     assert json.dumps(third, sort_keys=True) == json.dumps(first, sort_keys=True)
@@ -290,6 +291,43 @@ async def test_import_creates_and_updates_by_name(client):
     assert sorted(stored) == ["new-one", "purchase-requisitions", "stock"]
     assert stored["purchase-requisitions"] == bundle["odata_services"][0]
     assert stored["stock"] == svc("stock"), "a service the bundle does not name is untouched"
+
+
+async def test_an_import_makes_only_the_services_it_changed_stale_for_an_open_tab(client):
+    """An open tab holds the ``updated_at`` it loaded. The import restamps
+    the service it really changed (that tab must reload, 409) and leaves an
+    identical one alone (that tab's save goes through)."""
+    await create(client, svc(), svc("stock"))
+    loaded = {s["name"]: s["updated_at"] for s in (await client.get(SERVICES)).json()}
+    bundle = {"odata_services": [svc(title="Changed by the import"), svc("stock")]}
+    r = await client.post(IMPORT, json=bundle)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["imported_odata_services"] == 2
+    assert (body["created_odata_services"], body["updated_odata_services"]) == (0, 1)
+    after = {s["name"]: s["updated_at"] for s in (await client.get(SERVICES)).json()}
+    assert after["stock"] == loaded["stock"]
+    assert after["purchase-requisitions"] != loaded["purchase-requisitions"]
+
+    changed = await client.put(
+        f"{SERVICES}/purchase-requisitions",
+        json={**svc(title="From the tab"), "expected_updated_at": loaded["purchase-requisitions"]},
+    )
+    assert changed.status_code == 409, changed.text
+    assert (await catalogue())["purchase-requisitions"]["title"] == "Changed by the import"
+    untouched = await client.put(
+        f"{SERVICES}/stock",
+        json={**svc("stock", title="From the tab"), "expected_updated_at": loaded["stock"]},
+    )
+    assert untouched.status_code == 200, untouched.text
+
+
+async def test_an_identity_change_alone_is_a_change(client):
+    await create(client, svc())
+    r = await client.post(IMPORT, json={"odata_services": [svc(user_context=True)]})
+    assert r.status_code == 200, r.text
+    assert r.json()["updated_odata_services"] == 1
+    assert (await catalogue())["purchase-requisitions"]["user_context"] is True
 
 
 async def test_import_takes_the_switches_exactly_as_the_bundle_says(client):

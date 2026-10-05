@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import AsyncSession
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -184,26 +186,18 @@ async def test_two_updates_in_a_row_with_the_answered_timestamp_both_succeed(cli
 
 
 async def test_the_same_instant_matches_however_it_is_written(client, created):
-    moment = instant(created["updated_at"])
-    naive = moment.replace(tzinfo=None).isoformat()
+    plus_two = timezone(timedelta(hours=2))
     spellings = [
-        naive,
-        naive + "Z",
-        moment.isoformat(),
-        moment.astimezone(timezone(timedelta(hours=2))).isoformat(),
+        lambda m: m.replace(tzinfo=None).isoformat(),
+        lambda m: m.replace(tzinfo=None).isoformat() + "Z",
+        lambda m: m.isoformat(),
+        lambda m: m.astimezone(plus_two).isoformat(),
     ]
     stamp = created["updated_at"]
-    for spelling in spellings:
-        assert instant(spelling) == instant(stamp)
-    for spelling in spellings:
+    for spell in spellings:
         # Each save moves the row on, so each spelling is of the latest answer.
-        shifted = instant(stamp)
-        text = {
-            spellings[0]: shifted.replace(tzinfo=None).isoformat(),
-            spellings[1]: shifted.replace(tzinfo=None).isoformat() + "Z",
-            spellings[2]: shifted.isoformat(),
-            spellings[3]: shifted.astimezone(timezone(timedelta(hours=2))).isoformat(),
-        }[spelling]
+        text = spell(instant(stamp))
+        assert instant(text) == instant(stamp)
         r = await client.put(ONE, json=good(**{FIELD: text}))
         assert r.status_code == 200, (text, r.text)
         stamp = r.json()["updated_at"]
@@ -404,16 +398,160 @@ def test_the_statement_the_update_reads_with_is_for_update_on_postgres():
     assert "FOR " not in str(query.compile(dialect=sqlite.dialect()))
 
 
-async def test_begin_exclusive_write_takes_the_sqlite_write_lock():
+_SQLITE_ONLY = pytest.mark.skipif(
+    db_module.engine.dialect.name != "sqlite", reason="about SQLite's write lock"
+)
+
+
+@_SQLITE_ONLY
+async def test_begin_exclusive_write_takes_the_sqlite_write_lock(caplog):
     """SQLite's stand-in for the row lock: the transaction is a writer from
     its first statement, so a second one waits instead of reading a row the
     first is about to replace. Nothing is sent on Postgres."""
+    caplog.set_level(logging.WARNING, logger="agents.db")
     async with SessionLocal() as s:
         await db_module.begin_exclusive_write(s)
         raw = await (await s.connection()).get_raw_connection()
         assert raw.driver_connection.in_transaction
-        await db_module.begin_exclusive_write(s)  # already open: nothing to do
         await s.rollback()
+    assert not caplog.records
+
+
+@_SQLITE_ONLY
+async def test_begin_exclusive_write_warns_when_the_transaction_is_already_open(caplog):
+    """Called too late it can take no lock: what was read before it is
+    already stale-prone. That must not pass silently."""
+    caplog.set_level(logging.WARNING, logger="agents.db")
+    async with SessionLocal() as s:
+        await s.execute(delete(ODataAuditLog))  # a write: the driver transaction is open
+        await db_module.begin_exclusive_write(s)
+        await s.rollback()
+    warnings = [r for r in caplog.records if r.name == "agents.db"]
+    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert "begin_exclusive_write" in warnings[0].getMessage()
+
+
+def test_the_column_has_no_default_of_its_own_for_an_update():
+    """`_next_odata_stamp` owns ``updated_at`` on update; a second source
+    (``onupdate=now()``) would be whole seconds on SQLite and the start of
+    the transaction on Postgres. Creation still stamps."""
+    column = ODataService.__table__.c.updated_at
+    assert column.onupdate is None and column.server_onupdate is None
+    assert column.server_default is not None
+
+
+async def test_creation_stamps_updated_at(created):
+    assert created["updated_at"] and instant(created["updated_at"]) <= datetime.now(timezone.utc)
+
+
+# --- the answer is what THIS save wrote ----------------------------------------------
+
+
+def _right_after_the_next_commit(monkeypatch, interloper) -> None:
+    """Run ``interloper`` once, directly after the next commit: another
+    writer landing between a save's commit and its answer."""
+    real = AsyncSession.commit
+    armed = [True]
+
+    async def commit(self):
+        await real(self)
+        if armed[0]:
+            armed[0] = False
+            await interloper()
+
+    monkeypatch.setattr(AsyncSession, "commit", commit)
+
+
+async def test_the_answer_is_this_saves_state_not_a_later_writers(client, created, monkeypatch):
+    """Otherwise the client holds a valid stamp for a state it never wrote
+    and its next save replaces that state without a 409."""
+
+    async def unconditional_writer():
+        async with SessionLocal() as s:
+            row = await get_odata_service(s, "stock-levels")
+            data = validate_odata_service(other_identity(title="Other"))
+            await update_odata_service(s, row, data)
+
+    _right_after_the_next_commit(monkeypatch, unconditional_writer)
+    r = await client.put(ONE, json=good(title="Mine", **{FIELD: created["updated_at"]}))
+    assert r.status_code == 200, r.text
+    mine = r.json()
+    assert mine["title"] == "Mine" and mine["destination"] == "S4_ODATA_USER"
+    stored = (await client.get(ONE)).json()
+    assert stored["title"] == "Other" and stored["destination"] == "S4_ODATA_TECH"
+    assert instant(mine["updated_at"]) < instant(stored["updated_at"])
+    again = await client.put(ONE, json=good(title="Mine again", **{FIELD: mine["updated_at"]}))
+    assert again.status_code == 409
+    assert (await client.get(ONE)).json() == stored
+
+
+async def test_a_delete_right_after_the_commit_does_not_fail_the_save(
+    client, created, monkeypatch
+):
+    async def deleter():
+        async with SessionLocal() as s:
+            await s.execute(delete(ODataService))
+            await s.commit()
+
+    _right_after_the_next_commit(monkeypatch, deleter)
+    r = await client.put(ONE, json=good(title="Mine", **{FIELD: created["updated_at"]}))
+    assert r.status_code == 200, r.text
+    assert r.json()["title"] == "Mine"
+    assert (await client.get(ONE)).status_code == 404
+
+
+async def test_a_failing_referrer_read_fails_the_save_before_anything_is_stored(
+    client, created, monkeypatch
+):
+    """The answer is read before the commit: an error there is an error
+    answer for a write that did not happen, never for one that did."""
+    from agents.odata import admin_routes
+
+    async def broken(*args: Any, **kwargs: Any):
+        raise RuntimeError("agents unreadable")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(admin_routes, "odata_service_referrers", broken)
+        with pytest.raises(RuntimeError):
+            await client.put(ONE, json=other_identity(**{FIELD: created["updated_at"]}))
+    assert (await client.get(ONE)).json() == created
+
+
+# --- a save without the check is visible in the log ----------------------------------
+
+
+def _unchecked(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "agents.odata.admin_routes" and r.levelno == logging.INFO
+    ]
+
+
+@pytest.mark.parametrize("patch", [{}, {FIELD: None}], ids=["absent", "null"])
+async def test_a_save_without_the_check_is_logged_with_service_and_principal(
+    client, created, caplog, patch
+):
+    caplog.set_level(logging.INFO, logger="agents.odata.admin_routes")
+    r = await client.put(ONE, json=other_identity(title=SECRET, **patch))
+    assert r.status_code == 200
+    lines = _unchecked(caplog)
+    assert len(lines) == 1
+    # Without an XSUAA binding the middleware binds this principal.
+    assert "stock-levels" in lines[0] and lines[0].endswith(" by local-dev")
+    assert FIELD in lines[0]
+    # No body: neither a field value nor the identity it sets.
+    assert SECRET not in lines[0] and "S4_ODATA_TECH" not in lines[0]
+
+
+async def test_a_checked_save_and_a_refused_one_log_no_such_line(client, created, caplog):
+    caplog.set_level(logging.INFO, logger="agents.odata.admin_routes")
+    assert (
+        await client.put(ONE, json=good(title="T", **{FIELD: created["updated_at"]}))
+    ).status_code == 200
+    assert (await client.put(ONE, json=good(name="renamed"))).status_code == 422
+    assert (await client.put(f"{BASE}/nope", json=good(name="nope"))).status_code == 404
+    assert _unchecked(caplog) == []
 
 
 async def test_two_saves_from_the_same_loaded_state_cannot_both_win(client, created):

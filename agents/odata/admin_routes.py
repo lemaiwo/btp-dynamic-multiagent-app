@@ -19,6 +19,7 @@ This module imports ``agents.auth`` and ``agents.db`` only, never
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any
@@ -28,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints, Valid
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agents.auth import require_admin
+from agents.auth import current_principal, require_admin
 from agents.db import (
     ODATA_AUDIT_OUTCOMES,
     ODataAuditLog,
@@ -45,6 +46,8 @@ from agents.db import (
     validate_odata_service,
 )
 from agents.odata.models import DESTINATION_NAME_RE, MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/odata", tags=["odata"])
 
@@ -286,15 +289,23 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
     replace what a newer one stored, nor put an identity change on top of a
     state the admin never saw. Without the field, or with ``null``, the
     route replaces unconditionally, as it always did (API clients,
-    scripts). A value that is no string, or no such timestamp, is a 422
-    naming the field.
+    scripts); each such save is one INFO line with the service and the
+    caller's principal (never the body), so a check that is silently off
+    shows in the log. A value that is no string, or no such timestamp, is a
+    422 naming the field.
 
     Order of the answers: payload refusals (422), then the field's own 422,
     unknown service (404), another name in the body (422), stale (409).
 
-    The answer is the stored service with its NEW ``updated_at`` (always
-    later than the previous one, also for a save that changed no field), to
-    be sent as ``expected_updated_at`` of the next save.
+    The answer is the service as THIS save wrote it, with its NEW
+    ``updated_at`` (always later than the previous one, also for a save
+    that changed no field), to be sent as ``expected_updated_at`` of the
+    next save. It is read back -- the row and its referrers -- inside the
+    transaction, under the lock, and only then committed. Read after the
+    commit it could be another writer's state: the client would hold a
+    valid stamp for content it never saw and overwrite it without a 409
+    (and a delete in between would turn a stored save into a 500). An error
+    while reading it is an error answer for a write that was rolled back.
 
     Lock, compare, write, in one transaction, like the delete route below:
     the row is read ``FOR UPDATE`` and the comparison is made on that read.
@@ -327,12 +338,22 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
             raise _refuse("name cannot be changed; duplicate the service instead")
         if _is_stale(row, expected):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_stale_write(name))
+        if expected is None:
+            logger.info(
+                "odata service '%s' replaced without %s (no stale-write check) by %s",
+                name,
+                EXPECTED_FIELD,
+                current_principal.get() or "unknown principal",
+            )
         try:
-            row = await update_odata_service(session, row, data)
+            # Flushed and re-read from the database, not committed yet.
+            row = await update_odata_service(session, row, data, commit=False)
         except ValueError as e:  # a different name in the body
             raise _refuse(str(e)) from None
         used_by = await odata_service_referrers(session, name)
-        return row.to_dict(used_by.get(name))
+        answer = row.to_dict(used_by.get(name))
+        await session.commit()
+        return answer
 
 
 @router.delete(

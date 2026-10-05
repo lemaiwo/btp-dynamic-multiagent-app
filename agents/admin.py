@@ -104,6 +104,7 @@ from agents.db import (
     normalize_skills_json,
     odata_entries,
     odata_service_columns,
+    odata_service_unchanged,
     odata_service_referrers,
     prepare_servers,
     prepared_server_list,
@@ -2081,6 +2082,11 @@ async def _import_odata_services(
                 continue
             result.created += 1
             continue
+        if odata_service_unchanged(row, columns):
+            # Not written, so not restamped: `updated_at` is what an open
+            # admin tab hands back, and a service this import left as it was
+            # must not answer that tab's save with 409.
+            continue
         # From the columns: `to_export` would parse the stored definition.
         before = {"destination": row.destination, "user_context": bool(row.user_context)}
         changed = [f for f in _ODATA_SERVICE_IDENTITY_FIELDS if before[f] != data[f]]
@@ -2113,6 +2119,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     The registry is not rebuilt here (it never was: the admin UIs call
     reload after an import), so an imported catalogue change takes effect at
     the same reload as the agents of its bundle.
+
+    ``updated_odata_services`` counts the existing catalogue services whose
+    stored form this import changed. One the bundle carries unchanged is
+    not written and keeps its ``updated_at`` (`odata_service_unchanged`): it
+    is in ``imported_odata_services`` but in neither ``created_`` nor
+    ``updated_odata_services``.
     """
     errors: list[str] = []
     warnings: list[str] = []
@@ -2312,7 +2324,9 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         "imported": len(payload.agents),
         "imported_skills": len(payload.skills),
         "imported_workflows": len(payload.workflows),
-        "imported_odata_services": odata.created + odata.updated,
+        # Every service the bundle carried and the import accepted, also
+        # one it found unchanged (which is in neither count below).
+        "imported_odata_services": len(odata.names),
         "created_odata_services": odata.created,
         "updated_odata_services": odata.updated,
         "removed": removed,

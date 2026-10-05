@@ -562,8 +562,12 @@ class ODataService(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # The version the admin API compares with ``expected_updated_at``. The
+    # default stamps a new row; no ``onupdate``: `_next_odata_stamp` owns the
+    # column on update (`update_odata_service`), and a second source would
+    # be whole seconds on SQLite and the transaction's start on Postgres.
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        DateTime(timezone=True), server_default=func.now()
     )
 
     def _stored_definition(self) -> dict[str, Any] | None:
@@ -2501,18 +2505,27 @@ async def begin_exclusive_write(session: AsyncSession) -> None:
     does nothing. SQLite has no row locks and takes its write lock only at
     the first INSERT, UPDATE or DELETE, so two such requests would both read
     the old row and both write. ``BEGIN IMMEDIATE`` takes the write lock up
-    front: the second request waits here (the driver's busy timeout) and
-    then reads what the first one committed.
+    front: the second request waits here and then reads what the first one
+    committed. That wait is the sqlite3 driver's busy timeout (5 s by
+    default), after which the request fails with "database is locked";
+    SQLite is the local and test database only, so nothing here tunes it.
 
-    Call it before the first statement of the session; in a transaction
-    that is already open at the driver it does nothing.
+    Call it before the first statement of the session. In a transaction
+    that is already open at the driver it can take no lock, and whatever
+    that transaction read before is not protected: it logs a WARNING and
+    does nothing, because that is a mistake in the caller.
     """
     if session.get_bind().dialect.name != "sqlite":
         return
     connection = await session.connection()
     raw = await connection.get_raw_connection()
-    if not raw.driver_connection.in_transaction:
-        await connection.exec_driver_sql("BEGIN IMMEDIATE")
+    if raw.driver_connection.in_transaction:
+        logger.warning(
+            "begin_exclusive_write: the transaction is already open, no write lock "
+            "taken; call it before the session's first statement"
+        )
+        return
+    await connection.exec_driver_sql("BEGIN IMMEDIATE")
 
 
 def _odata_now() -> datetime:
@@ -2573,6 +2586,26 @@ async def create_odata_service(
         await session.commit()
     await session.refresh(row)
     return row
+
+
+def odata_service_unchanged(row: ODataService, columns: dict[str, Any]) -> bool:
+    """Whether writing ``columns`` (`odata_service_columns` output) to ``row``
+    would change nothing.
+
+    Stored form against stored form: the definition as the text the models
+    serialise (what the row holds), the flags as 0/1, the metadata stamp as
+    an instant (SQLite hands it back naive). For a bulk writer (the bundle
+    import) that must not restamp, and so make stale for every open admin
+    tab, a service it does not change. A row whose definition is unreadable
+    never equals a validated one, so it is rewritten.
+    """
+    for column, value in columns.items():
+        stored = getattr(row, column)
+        if column == "metadata_fetched_at":
+            stored, value = _odata_utc(stored), _odata_utc(value)
+        if stored != value:
+            return False
+    return True
 
 
 async def update_odata_service(
