@@ -413,7 +413,7 @@ async def test_tokens_expire_with_the_skew():
     await tokens.app_token()
     await tokens.user_token("jwt-a", "alice@example.com")
     tokens._app = (tokens._app[0], 0.0)
-    key = "alice@example.com"
+    (key,) = tokens._per_user
     tokens._per_user[key] = (tokens._per_user[key][0], 0.0)
     await tokens.app_token()
     await tokens.user_token("jwt-a", "alice@example.com")
@@ -485,3 +485,163 @@ async def test_token_error_is_a_destination_error_without_the_secret():
     with pytest.raises(DestinationError, match="could not reach") as net_err:
         await down.app_token()
     assert SECRET not in str(net_err.value)
+
+
+# --- a cached credential belongs to principal AND token ----------------------
+#
+# A job run started with "Run now" carries the trigger's JWT while `run_as`
+# sets the principal to the agent's run-as user, so the two can name different
+# people. A cache keyed by principal alone would then hand the trigger's
+# credential to the run-as user's own later request.
+
+
+class PerUserService:
+    """A destination service that answers with a token naming the X-user-token."""
+
+    def __init__(self):
+        self.user_tokens: list[str | None] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(200, json={"access_token": "svc-token", "expires_in": 3600})
+        user = request.headers.get("X-user-token")
+        self.user_tokens.append(user)
+        return httpx.Response(
+            200,
+            json={
+                "destinationConfiguration": {
+                    "URL": "https://api.example",
+                    "Authentication": "OAuth2UserTokenExchange",
+                },
+                "authTokens": [
+                    {
+                        "type": "Bearer",
+                        "value": f"cred-of-{user}",
+                        "expires_in": "3600",
+                        "http_header": {"key": "Authorization", "value": f"Bearer cred-of-{user}"},
+                    }
+                ],
+            },
+        )
+
+    def resolver(self) -> DestinationResolver:
+        return DestinationResolver(
+            "S4_ODATA_USER", CONFIG, transport=httpx.MockTransport(self.handler)
+        )
+
+
+def _cred(d: Destination) -> str:
+    return d.headers["Authorization"]
+
+
+async def test_resolver_never_serves_a_credential_obtained_with_another_users_token():
+    svc = PerUserService()
+    resolver = svc.resolver()
+    # Alice's token travels with Bob's principal (a run-as job she triggered).
+    mixed = await resolver.resolve(user_token="jwt-alice", principal="bob@example.com")
+    assert _cred(mixed) == "Bearer cred-of-jwt-alice"
+    # Bob's own request must not get Alice's credential ...
+    bob = await resolver.resolve(user_token="jwt-bob", principal="bob@example.com")
+    assert _cred(bob) == "Bearer cred-of-jwt-bob"
+    # ... and neither is Alice's own request served the entry filed under Bob.
+    alice = await resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    assert alice is not mixed
+    assert svc.user_tokens == ["jwt-alice", "jwt-bob", "jwt-alice"]
+    # Each of the three is a cache hit for exactly its own pair.
+    assert await resolver.resolve(user_token="jwt-alice", principal="bob@example.com") is mixed
+    assert await resolver.resolve(user_token="jwt-bob", principal="bob@example.com") is bob
+    assert await resolver.resolve(user_token="jwt-alice", principal="alice@example.com") is alice
+    assert len(svc.user_tokens) == 3
+    assert sorted(resolver.cached_principals) == ["alice@example.com", "bob@example.com"]
+
+
+async def test_resolver_invalidate_drops_every_entry_of_the_principal():
+    svc = PerUserService()
+    resolver = svc.resolver()
+    await resolver.resolve(user_token="jwt-alice", principal="bob@example.com")
+    await resolver.resolve(user_token="jwt-bob", principal="bob@example.com")
+    alice = await resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    resolver.invalidate("bob@example.com")
+    assert resolver.cached_principals == ["alice@example.com"]
+    assert await resolver.resolve(user_token="jwt-alice", principal="alice@example.com") is alice
+    await resolver.resolve(user_token="jwt-bob", principal="bob@example.com")
+    await resolver.resolve(user_token="jwt-alice", principal="bob@example.com")
+    assert len(svc.user_tokens) == 5
+    resolver.invalidate_all()
+    assert resolver.cached_principals == []
+
+
+async def test_resolver_keys_never_hold_the_raw_token():
+    resolver = PerUserService().resolver()
+    await resolver.resolve(user_token="jwt-alice", principal="bob@example.com")
+    await resolver.resolve(user_token="jwt-carol")
+    assert "jwt-" not in repr(list(resolver._per_user)) + repr(resolver.cached_principals)
+
+
+async def test_resolver_lru_bound_holds_with_several_tokens_per_principal(monkeypatch):
+    monkeypatch.setattr(dest_mod, "PER_USER_CACHE_MAX", 2)
+    svc = PerUserService()
+    resolver = svc.resolver()
+    for n in range(4):
+        await resolver.resolve(user_token=f"jwt-{n}", principal="bob@example.com")
+    assert len(resolver._per_user) == 2 and resolver.cached_principals == ["bob@example.com"]
+    # The two newest survived; the oldest was evicted and is fetched again.
+    await resolver.resolve(user_token="jwt-3", principal="bob@example.com")
+    await resolver.resolve(user_token="jwt-2", principal="bob@example.com")
+    assert len(svc.user_tokens) == 4
+    await resolver.resolve(user_token="jwt-0", principal="bob@example.com")
+    assert len(svc.user_tokens) == 5 and len(resolver._per_user) == 2
+
+
+async def test_connectivity_never_serves_a_token_obtained_with_another_users_jwt():
+    uaa = Uaa()
+    tokens = _tokens(uaa)
+    mixed = await tokens.user_token("jwt-alice", "bob@example.com")
+    assert "jwt-alice" in mixed
+    bob = await tokens.user_token("jwt-bob", "bob@example.com")
+    assert "jwt-bob" in bob and bob != mixed
+    assert uaa.last(JWT_BEARER)["assertion"] == "jwt-bob"
+    alice = await tokens.user_token("jwt-alice", "alice@example.com")
+    assert alice != mixed and uaa.count(JWT_BEARER) == 3
+    assert await tokens.user_token("jwt-alice", "bob@example.com") == mixed
+    assert await tokens.user_token("jwt-bob", "bob@example.com") == bob
+    assert await tokens.user_token("jwt-alice", "alice@example.com") == alice
+    assert uaa.count(JWT_BEARER) == 3
+    assert sorted(tokens.cached_principals) == ["alice@example.com", "bob@example.com"]
+    assert "jwt-" not in repr(list(tokens._per_user))
+
+
+async def test_connectivity_invalidate_drops_every_entry_of_the_principal():
+    uaa = Uaa()
+    tokens = _tokens(uaa)
+    await tokens.user_token("jwt-alice", "bob@example.com")
+    await tokens.user_token("jwt-bob", "bob@example.com")
+    alice = await tokens.user_token("jwt-alice", "alice@example.com")
+    # What the proxy's 407 rule calls.
+    tokens.invalidate(ConnectivityTokens.user_key("bob@example.com", "jwt-bob"))
+    assert tokens.cached_principals == ["alice@example.com"]
+    assert await tokens.user_token("jwt-alice", "alice@example.com") == alice
+    await tokens.user_token("jwt-bob", "bob@example.com")
+    await tokens.user_token("jwt-alice", "bob@example.com")
+    assert uaa.count(JWT_BEARER) == 5
+    # Without a principal, user_key names that one token's entry.
+    await tokens.user_token("jwt-carol", None)
+    await tokens.user_token("jwt-dave", None)
+    tokens.invalidate(ConnectivityTokens.user_key(None, "jwt-carol"))
+    assert [k for k in tokens.cached_principals if k.startswith("token:")] == [
+        ConnectivityTokens.user_key(None, "jwt-dave")
+    ]
+
+
+async def test_connectivity_lru_bound_holds_with_several_tokens_per_principal(monkeypatch):
+    monkeypatch.setattr(dest_mod, "PER_USER_CACHE_MAX", 2)
+    uaa = Uaa()
+    tokens = _tokens(uaa)
+    for n in range(4):
+        await tokens.user_token(f"jwt-{n}", "bob@example.com")
+    assert len(tokens._per_user) == 2 and tokens.cached_principals == ["bob@example.com"]
+    await tokens.user_token("jwt-3", "bob@example.com")
+    await tokens.user_token("jwt-2", "bob@example.com")
+    assert uaa.count(JWT_BEARER) == 4
+    await tokens.user_token("jwt-0", "bob@example.com")
+    assert uaa.count(JWT_BEARER) == 5 and len(tokens._per_user) == 2

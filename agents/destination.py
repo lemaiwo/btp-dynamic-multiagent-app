@@ -184,6 +184,42 @@ def config_from_environment(
     return None
 
 
+def _token_digest(user_token: str) -> str:
+    return hashlib.sha256(user_token.encode("utf-8")).hexdigest()
+
+
+def _cache_owner(principal: str | None, user_token: str) -> str:
+    """Whose cache entries these are: the principal, else ``token:<digest>``."""
+    if principal:
+        return principal
+    return "token:" + _token_digest(user_token)
+
+
+def _cache_key(principal: str | None, user_token: str) -> tuple[str, str]:
+    """The key of one per-user cache entry: ``(owner, sha256 of the token)``.
+
+    A principal alone is not enough. The principal and the token reach this
+    module separately, and they can name different people: a job run started
+    by an admin carries the admin's JWT while ``run_as`` sets the principal to
+    the agent's run-as user. Keyed by principal only, the admin's credential
+    would be filed under that user and served to the user's own next request.
+    With the digest in the key an entry is served only to a caller presenting
+    the very token it was obtained with. The price is one extra fetch when a
+    user's JWT is refreshed. The raw token is never part of a key.
+    """
+    return _cache_owner(principal, user_token), _token_digest(user_token)
+
+
+def _drop_owner(cache: "OrderedDict[tuple[str, str], Any]", owner: str) -> None:
+    for key in [k for k in cache if k[0] == owner]:
+        del cache[key]
+
+
+def _owners(cache: "OrderedDict[tuple[str, str], Any]") -> list[str]:
+    # De-duplicated, in the order of each owner's most recently used entry.
+    return list(dict.fromkeys(reversed([k[0] for k in cache])))[::-1]
+
+
 @dataclass(frozen=True)
 class Destination:
     """A resolved destination: where to send requests, and what to send with them.
@@ -294,24 +330,25 @@ class DestinationResolver:
         # than by a URL (MAIL). App-level only: no built-in resolves those
         # per user. Same lifetime rules as `_cached`.
         self._cached_properties: DestinationProperties | None = None
-        # Per-principal results, least recently used first. Kept apart from
-        # the app-level entry: the two are different credentials, and a
-        # user's token must never be handed to a request made as the app.
-        self._per_user: OrderedDict[str, Destination] = OrderedDict()
+        # Per-user results, least recently used first, keyed by principal
+        # AND token digest (see _cache_key). Kept apart from the app-level
+        # entry: the two are different credentials, and a user's token must
+        # never be handed to a request made as the app.
+        self._per_user: OrderedDict[tuple[str, str], Destination] = OrderedDict()
         self._lock = asyncio.Lock()
 
     def invalidate(self, principal: str | None = None) -> None:
         """Drop a cached destination, so the next resolve re-fetches.
 
-        Without ``principal`` the app-level entry goes; with one, only that
-        principal's entry. A 401 from the target under one user says nothing
-        about anyone else's token.
+        Without ``principal`` the app-level entry goes; with one, every
+        entry of that principal, whatever token it was resolved with. A 401
+        from the target under one user says nothing about anyone else's token.
         """
         if principal is None:
             self._cached = None
             self._cached_properties = None
         else:
-            self._per_user.pop(principal, None)
+            _drop_owner(self._per_user, principal)
 
     def invalidate_all(self) -> None:
         self._cached = None
@@ -320,17 +357,19 @@ class DestinationResolver:
 
     @property
     def cached_principals(self) -> list[str]:
-        """The principals with a live per-user entry. For tests and diagnostics."""
-        return list(self._per_user)
+        """The principals with a per-user entry, each once. For tests and diagnostics.
+
+        A token resolved without a principal shows as ``token:<digest>``.
+        """
+        return _owners(self._per_user)
 
     @staticmethod
     def _user_key(principal: str | None, user_token: str) -> str:
-        # Keyed by principal when the caller knows it. A token without a
-        # principal is keyed by its digest, so two users are never mixed up
-        # and the raw token is never a dictionary key that a debugger prints.
-        if principal:
-            return principal
-        return "token:" + hashlib.sha256(user_token.encode("utf-8")).hexdigest()
+        # The name entries are filed and invalidated under: the principal when
+        # the caller knows it, else a digest of the token, so the raw token is
+        # never a dictionary key that a debugger prints. The cache itself is
+        # keyed by this name AND the token's digest (_cache_key).
+        return _cache_owner(principal, user_token)
 
     async def resolve(
         self,
@@ -345,8 +384,12 @@ class DestinationResolver:
         service is asked to resolve *for that user*: the token goes along as
         ``X-user-token``, which is what makes a user-propagating
         authentication type return that person's token. The result is cached
-        under ``principal`` (or a digest of the token), never in the
-        app-level slot. Without ``user_token`` the behaviour is unchanged.
+        under ``principal`` together with a digest of the token, never in the
+        app-level slot, and is served again only when both match: a
+        credential obtained with one user's token is never handed to a call
+        that presents another token, whatever principal it names. A refreshed
+        JWT for the same user therefore resolves once more. Without
+        ``user_token`` the behaviour is unchanged.
         """
         if user_token:
             return await self._resolve_for_user(user_token, principal, force=force)
@@ -369,7 +412,7 @@ class DestinationResolver:
     async def _resolve_for_user(
         self, user_token: str, principal: str | None, *, force: bool
     ) -> Destination:
-        key = self._user_key(principal, user_token)
+        key = _cache_key(principal, user_token)
         hit = self._per_user.get(key)
         if not force and hit is not None and time.monotonic() < hit.expires_at:
             self._per_user.move_to_end(key)
@@ -738,20 +781,22 @@ class ConnectivityTokens:
         self._transport = transport
         # (token, monotonic deadline with the skew already subtracted)
         self._app: tuple[str, float] | None = None
-        self._per_user: OrderedDict[str, tuple[str, float]] = OrderedDict()
+        # Keyed by principal AND digest of the JWT exchanged (_cache_key).
+        self._per_user: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
         self._lock = asyncio.Lock()
 
     def invalidate(self, principal: str | None = None) -> None:
-        """Drop the app token, or with ``principal`` only that user's.
+        """Drop the app token, or with ``principal`` every token of that user.
 
         A 407 from the proxy under one user says nothing about anyone else's
-        token. ``principal`` is the cache key: the principal the token was
-        requested with, or :meth:`user_key` of the JWT when there was none.
+        token. ``principal`` is what :meth:`user_key` returns: the principal
+        the token was requested with, or ``token:<digest>`` when there was
+        none. Every entry filed under it goes, whichever JWT it came from.
         """
         if principal is None:
             self._app = None
         else:
-            self._per_user.pop(principal, None)
+            _drop_owner(self._per_user, principal)
 
     def invalidate_all(self) -> None:
         self._app = None
@@ -759,15 +804,20 @@ class ConnectivityTokens:
 
     @property
     def cached_principals(self) -> list[str]:
-        """The cache keys with a per-user token. For tests and diagnostics."""
-        return list(self._per_user)
+        """The principals with a per-user token, each once. For tests and diagnostics."""
+        return _owners(self._per_user)
 
     @staticmethod
     def user_key(principal: str | None, user_jwt: str) -> str:
-        """The cache key of a user token; see ``DestinationResolver._user_key``."""
-        if principal:
-            return principal
-        return "token:" + hashlib.sha256(user_jwt.encode("utf-8")).hexdigest()
+        """The name a user's tokens are filed under, for :meth:`invalidate`.
+
+        ``principal`` when there is one, else ``"token:" + sha256(user_jwt)``.
+        It is *not* the whole cache key: an entry is additionally bound to the
+        digest of the JWT it was exchanged from, so ``invalidate(user_key(p,
+        jwt))`` drops every token of ``p`` while a lookup only ever returns
+        the one obtained with the JWT presented. Never contains the raw JWT.
+        """
+        return _cache_owner(principal, user_jwt)
 
     async def app_token(self, *, force: bool = False) -> str:
         """The application's token (client_credentials), fetched or cached."""
@@ -787,16 +837,20 @@ class ConnectivityTokens:
     ) -> str:
         """A token for the signed-in user, exchanged from their XSUAA JWT.
 
-        Cached under ``principal`` (or a digest of the JWT), never in the app
-        slot. Without a JWT this raises: answering with the application's
-        token would make the proxy call run under the wrong identity.
+        Cached under ``principal`` together with a digest of the JWT, never
+        in the app slot, and served again only when both match: the token
+        decides who the SAP system sees, so one exchanged from another JWT is
+        never returned, whatever principal the call names. A refreshed JWT for
+        the same user is exchanged once more. Without a JWT this raises:
+        answering with the application's token would make the proxy call run
+        under the wrong identity.
         """
         if not user_jwt or not isinstance(user_jwt, str):
             raise DestinationError(
                 "the connectivity service needs the signed-in user's token for "
                 "principal propagation, and none was given"
             )
-        key = self.user_key(principal, user_jwt)
+        key = _cache_key(principal, user_jwt)
         hit = self._per_user.get(key)
         if not force and hit is not None and time.monotonic() < hit[1]:
             self._per_user.move_to_end(key)
