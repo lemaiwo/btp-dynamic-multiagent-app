@@ -527,8 +527,12 @@ async def test_to_dict_lists_enabled_operations_that_can_never_be_called():
     ]
     v4 = good(name="uncallable-v4", odata_version="v4", service_path="/sap/opu/odata4/x")
     v4["definition"]["operations"] = [
+        # Callable: V4 actions and functions are.
         {"name": "Release", "qualified_name": "NS.Release", "kind": "action",
          "http_method": "POST", "enabled": True},
+        {"name": "NeedsComplex", "qualified_name": "NS.NeedsComplex", "kind": "action",
+         "http_method": "POST", "enabled": True,
+         "parameters": [{"name": "Address", "type": "NS.Address"}]},
     ]
     async with SessionLocal() as s:
         row = await create_odata_service(s, validate_odata_service(data))  # saved all the same
@@ -539,7 +543,7 @@ async def test_to_dict_lists_enabled_operations_that_can_never_be_called():
         assert "uncallable_operations" not in row.to_summary()
         row = await create_odata_service(s, validate_odata_service(v4))
         assert row.to_dict()["uncallable_operations"] == [
-            {"name": "Release", "reason": "calls_not_available"},
+            {"name": "NeedsComplex", "reason": "parameter_type"},
         ]
     broken = ODataService(name="x", odata_version="v2", definition_json="not json")
     assert broken.to_dict()["uncallable_operations"] == []

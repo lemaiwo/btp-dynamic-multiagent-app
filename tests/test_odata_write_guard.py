@@ -58,6 +58,7 @@ from agents.odata.tools import (  # noqa: E402
     WriteAudit,
     odata_toolset,
 )
+from agents.odata.v4 import V4Dialect  # noqa: E402
 from tests.odata_helpers import (  # noqa: E402
     FakeResolver,
     UnrecordedWritesForTests,
@@ -335,18 +336,20 @@ async def run_update(catalogue: dict[str, dict], oauth: dict[str, Any]) -> tuple
 # -- the two switches ---------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "catalogue_op, allow_write, expected",
-    [
-        (False, False, "operation_disabled"),
-        (False, True, "operation_disabled"),
-        (True, False, "write_not_allowed"),
-        (True, "true", "write_not_allowed"),
-        (True, 1, "write_not_allowed"),
-        (True, None, "write_not_allowed"),
-        (True, True, None),
-    ],
-)
+# (the catalogue's switch, the agent entry's `allow_write`, the refusal).
+# Said once: `tests/test_odata_v4_write.py` runs the same table on a V4 service.
+SWITCH_CASES = [
+    (False, False, "operation_disabled"),
+    (False, True, "operation_disabled"),
+    (True, False, "write_not_allowed"),
+    (True, "true", "write_not_allowed"),
+    (True, 1, "write_not_allowed"),
+    (True, None, "write_not_allowed"),
+    (True, True, None),
+]
+
+
+@pytest.mark.parametrize("catalogue_op, allow_write, expected", SWITCH_CASES)
 async def test_both_switches_are_needed(alice, catalogue_op, allow_write, expected):
     out, w = await run_update(
         snapshot(update_enabled=catalogue_op), {"services": ["pr"], "allow_write": allow_write}
@@ -1286,7 +1289,15 @@ async def test_a_failed_intent_is_not_confirmed_rather_than_not_recorded(
     assert w.sap.requests == []
 
 
-async def test_refused_write_attempts_are_logged_without_values(alice, caplog):
+class _ReadsOnly(V4Dialect):
+    """A version this app can read, but neither write nor call."""
+
+    supports_write = False
+    supports_call = False
+
+
+async def test_refused_write_attempts_are_logged_without_values(alice, caplog, monkeypatch):
+    monkeypatch.setitem(tools_module._DIALECTS, "v4", _ReadsOnly())
     def lines() -> list[str]:
         return [
             r.getMessage() for r in caplog.records
@@ -1548,15 +1559,21 @@ async def test_whatever_search_returns_execute_does_not_refuse_by_a_switch(alice
     # ... and it is the whole of what this agent can do: nothing is held back.
     kinds = {operation for _, _, operation in offered}
     called = {(service, target) for service, target, operation in offered if operation == "call"}
-    reading = {("pr", "CountOpen")}
-    changing = {("pr", "Release"), ("pr-jobs", "Release")}
+    reading = {("pr", "CountOpen"), ("pr-v4", "CountOpen")}
+    changing = {("pr", "Release"), ("pr-jobs", "Release"), ("pr-v4", "Release")}
     assert called == (reading | changing if allow_write else reading)
     assert ({"create", "update", "delete"} <= kinds) is allow_write
+    # A V4 service is offered like a V2 one: its writes behind the same switch.
     v4_ops = {operation for service, _, operation in offered if service == "pr-v4"}
-    assert v4_ops == {"list", "get"}  # a V4 service is read-only for now
+    assert v4_ops == (
+        {"list", "get", "create", "update", "delete", "call"}
+        if allow_write
+        else {"list", "get", "call"}
+    )
 
 
-async def test_a_v4_service_is_read_only_and_says_so_with_its_own_code(alice):
+async def test_a_version_that_is_only_read_says_so_with_its_own_code(alice, monkeypatch):
+    monkeypatch.setitem(tools_module._DIALECTS, "v4", _ReadsOnly())
     w = World({"services": ["pr-v4"], "allow_write": True}, _v4_catalogue())
     for call in (UPDATE, {"operation": "create", "body": {"Plant": "1"}},
                  {"operation": "delete", "key": KEY}):

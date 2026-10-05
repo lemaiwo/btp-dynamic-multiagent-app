@@ -704,8 +704,9 @@ def test_the_dialect_builds_the_request_and_refuses_what_is_not_declared():
         with pytest.raises(ODataError) as refused:
             dialect.call_request(SERVICE_PATH, op, key, params)
         assert refused.value.code == "invalid_argument"
-    assert getattr(V4Dialect(), "supports_call", False) is not True
-    assert not hasattr(V4Dialect(), "call_request")
+    # V4 has a request form of its own, for its own kinds (test_odata_v4_write.py).
+    assert V4Dialect().call_kinds == ("action", "function")
+    assert not hasattr(dialect, "call_kinds")  # V2: function imports, the default
 
 
 def test_a_call_plan_shows_names_only():
@@ -1141,8 +1142,10 @@ async def test_whatever_search_returns_execute_does_not_refuse_by_a_switch(
             if match["kind"] == "operation":
                 assert match["operations"] == ["call"]
                 operations.setdefault(service, set()).add(match["target"])
-    # Exactly the callable ones, per service; a V4 operation is never offered.
-    assert operations == {"pr": expected, "pr-jobs": expected}
+    # Exactly the callable ones, per service -- of the V4 service too: its
+    # function reads, its action changes data.
+    v4 = {"CountOpen"} | ({"Release"} if expected >= CHANGING else set())
+    assert operations == {"pr": expected, "pr-jobs": expected, "pr-v4": v4}
     for service, target, operation in offered:
         out = await w.run(service=service, target=target, operation=operation)
         # `not_available` is in there: also the code of a catalogue reason.
@@ -1180,8 +1183,10 @@ async def test_whatever_search_returns_execute_does_not_refuse_by_a_switch(
     assert not await all_rows() or allow_write is True
     for target in ("Release", "CountOpen"):
         out = await w.call(target, service="pr-v4")
+        # The V4 service goes by the same switches: its function reads, its
+        # action is a write.
         expected_code = (
-            "not_available"
+            None
             if target == "CountOpen" or (allow_write is True and recorded)
             else "write_not_allowed"
             if allow_write is not True
@@ -1550,10 +1555,26 @@ async def test_the_record_names_only_the_parameters_that_were_sent(alice):
     assert json.loads(row.body_fields_json) == list(RELEASE)
 
 
-async def test_one_text_says_that_calls_of_a_version_are_not_available(alice):
+async def test_one_text_says_that_calls_of_a_version_are_not_available(alice, monkeypatch):
+    from agents.odata import calls
+
+    class ReadsOnly(V4Dialect):
+        supports_call = False
+
+    monkeypatch.setitem(calls.DIALECTS, "v4", ReadsOnly())
     w = World({"services": ["pr-v4"], "allow_write": True})
-    out = await w.call("CountOpen", service="pr-v4")
-    assert (code(out), out["error"]["message"]) == ("not_available", CALL_NOT_AVAILABLE)
+    for target in ("CountOpen", "Release"):
+        out = await w.call(target, service="pr-v4")
+        assert (code(out), out["error"]["message"]) == ("not_available", CALL_NOT_AVAILABLE)
+    assert await w.untouched()
+    # The same text for an operation of a kind the version does not have.
+    stray = OperationDef.model_validate(_op("X"))
+    assert call_refusal(stray, None, V4Dialect()) == "calls_not_available"
+    # V4 itself calls its functions and actions.
+    monkeypatch.undo()
+    w = World({"services": ["pr-v4"]})
+    assert (await w.call("CountOpen", service="pr-v4"))["ok"] is True
+    assert w.sap.calls[-1].url.path == f"{V4_PATH}/CountOpen()"
 
 
 def test_key_segment_names_what_it_is_told_to_and_never_the_set_then():

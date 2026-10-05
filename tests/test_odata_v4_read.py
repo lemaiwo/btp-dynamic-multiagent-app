@@ -940,7 +940,14 @@ async def test_the_version_comes_from_the_catalogue_never_from_an_answer():
     assert sap.requests[0].url.params["$format"] == "json"
 
 
-# -- writes are the next task -------------------------------------------------
+# -- a dialect that only reads (the seam; V4 itself writes, see test_odata_v4_write.py) --
+
+
+class _ReadsOnly(V4Dialect):
+    """A version this app can read but not write."""
+
+    supports_write = False
+    write_refusal = "writing to a service of this OData version is not supported"
 
 
 @pytest.mark.parametrize(
@@ -951,13 +958,15 @@ async def test_the_version_comes_from_the_catalogue_never_from_an_answer():
         ("delete", {"key": {"PurchaseRequisition": "1"}}),
     ],
 )
-async def test_a_v4_write_is_refused_before_anything_is_sent(operation, kwargs):
+async def test_a_write_a_dialect_does_not_support_is_refused_before_anything_is_sent(
+    operation, kwargs
+):
     sap = Sap(page([]))
-    c = client(sap, sessions=CsrfSessionStore())
+    c = ODataClient(sap_v2(sap), SERVICE, _ReadsOnly(), sessions=CsrfSessionStore())
     with pytest.raises(ODataError) as excinfo:
         c.check_write(ES_HEADER, operation, **kwargs)
     assert excinfo.value.code == "operation_disabled"
-    assert "V4" in excinfo.value.message
+    assert excinfo.value.message == _ReadsOnly.write_refusal
     call = {
         "create": lambda: c.create(ES_HEADER, kwargs["body"]),
         "update": lambda: c.update(ES_HEADER, kwargs.get("key"), kwargs.get("body")),
@@ -966,14 +975,9 @@ async def test_a_v4_write_is_refused_before_anything_is_sent(operation, kwargs):
     error = await refused(call())
     assert error.code == "operation_disabled"
     assert sap.requests == []  # not even a CSRF token request
-    d = V4Dialect()
-    for refuse in (
-        lambda: d.encode_body(ES_HEADER, {"Description": "x"}),
-        lambda: d.update_request("/x", {}),
-    ):
-        with pytest.raises(ODataError) as excinfo:
-            refuse()
-        assert excinfo.value.code == "operation_disabled"
+    # The same check passes for V4 itself: it writes.
+    plan = client(sap, sessions=CsrfSessionStore()).check_write(ES_HEADER, operation, **kwargs)
+    assert plan.operation == operation and V4Dialect().update_request("/x", {}) == ("PATCH", {})
 
 
 # -- review follow-up ---------------------------------------------------------
@@ -1070,13 +1074,20 @@ async def test_v4_requests_say_which_version_they_speak():
 
 
 def test_the_write_refusal_has_one_source_and_was_not_sent():
-    c = client(Sap(page([])), sessions=CsrfSessionStore())
+    c = ODataClient(sap_v2(Sap(page([]))), SERVICE, _ReadsOnly(), sessions=CsrfSessionStore())
     with pytest.raises(ODataError) as excinfo:
         c.check_write(ES_HEADER, "delete", key={"PurchaseRequisition": "1"})
-    assert excinfo.value.message == V4Dialect.write_refusal and excinfo.value.sent is False
+    assert excinfo.value.message == _ReadsOnly.write_refusal and excinfo.value.sent is False
+    # A dialect that says nothing of its own gets the client's text.
+
+    class Silent(_ReadsOnly):
+        write_refusal = None
+
+    c = ODataClient(sap_v2(Sap(page([]))), SERVICE, Silent(), sessions=CsrfSessionStore())
     with pytest.raises(ODataError) as excinfo:
-        V4Dialect().encode_body(ES_HEADER, {"Description": "x"})
-    assert excinfo.value.message == V4Dialect.write_refusal
+        c.check_write(ES_HEADER, "delete", key={"PurchaseRequisition": "1"})
+    assert "not supported for the OData version" in excinfo.value.message
+    assert not hasattr(V4Dialect, "write_refusal")
 
 
 async def test_a_read_error_never_says_sent():

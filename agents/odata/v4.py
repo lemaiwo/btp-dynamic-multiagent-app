@@ -1,4 +1,4 @@
-"""What is specific to OData V4: literals, options, payloads. Reads only.
+"""What is specific to OData V4: literals, options, bodies, calls, payloads.
 
 The same seams as ``v2.V2Dialect``, so ``ODataClient`` and its one gate
 (``check_read``) stay the same code for both versions. Which dialect a
@@ -29,8 +29,25 @@ What differs from V2:
   answer in a later format does not. That is a request header, not a way of
   finding out the version.
 
-Writes and actions are not part of this module yet: ``supports_write`` is
-``False`` and ``ODataClient.check_write`` refuses before anything is sent.
+Writes and calls:
+
+* An update is a plain ``PATCH`` (no ``X-HTTP-Method`` tunnel); the ETag of
+  an entity is ``@odata.etag``.
+* A request body carries JSON values of the declared type: numbers stay
+  numbers (``Edm.Decimal`` and ``Edm.Int64`` too -- this client does not ask
+  for ``IEEE754Compatible``), given as a number or as its text. A decimal
+  with more digits than a JSON number carries exactly is refused, never
+  rounded.
+* An action is a ``POST`` with its parameters as a JSON object; a function
+  a ``GET`` with its parameters as literals behind its name,
+  ``Name(P1='x',P2=5)``. An operation bound to an entity follows the key
+  predicate of that entity under its namespace-qualified name
+  (``Set('1')/NS.Name``); an unbound one is addressed by its import name.
+  Every piece of the path is one confined segment built from catalogue
+  names and typed literals.
+* What a call answers is recognised positively (``parse_call``), and an
+  entity is tied to a catalogue entity set by the ``@odata.context`` of the
+  answer (``returned_rows_are_of``); anything else is not shown.
 
 No refusal repeats a value. The payload shapes follow the OData 4.0 JSON
 format and are not verified against a live system.
@@ -39,17 +56,26 @@ format and are not verified against a live system.
 from __future__ import annotations
 
 import datetime
+import decimal
 import math
 import re
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from . import common
 from .client import ODataError, ReadQuery
 from .common import refuse as _refuse
-from .models import EntitySetDef
-from .urls import V4_COMPARABLE_TYPES
+from .models import EDM_NAME_RE, EntitySetDef, OperationDef
+from .urls import V4_COMPARABLE_TYPES, join_path
+
+# What one parameter value of a function may weigh: it travels in the path.
+MAX_PARAM_VALUE_CHARS = common.MAX_KEY_VALUE_CHARS
+# What a call answered, as `V4Dialect.parse_call` names it (as in V2).
+CALL_SHAPES = ("none", "value", "entity", "collection", "other")
+# The longest `@odata.context` that is looked at.
+MAX_CONTEXT_CHARS = 2000
 
 # Used with `fullmatch` only, and with `[0-9]`: `$` also matches before a
 # trailing newline, and `\d` matches every Unicode decimal digit.
@@ -69,7 +95,28 @@ _INTEGER_RANGES = {
     "Edm.Int32": (-(2**31), 2**31 - 1),
     "Edm.Int64": (-(2**63), 2**63 - 1),
 }
-_NOT_YET = "writing to an OData V4 service is not supported yet; only reads are"
+_FLOAT_TYPES = ("Edm.Double", "Edm.Single")
+_STRING_FORMS = ("Edm.Guid", "Edm.Date", "Edm.DateTimeOffset", "Edm.TimeOfDay", "Edm.Duration")
+# What a text in a path segment may not hold, as for a key (`common.key_segment`).
+_PATH_BREAKERS = ("/", "\\", "%", "?", "#")
+# `Set(A,B)`: the select list a context may carry behind the entity set.
+_SELECT_LIST = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*(?:,[A-Za-z_][A-Za-z0-9_.]*)*")
+_METADATA = "$metadata#"
+_ENTITY = "/$entity"
+_VALUE_HINTS = {
+    "Edm.Date": "write it as 2026-10-05",
+    "Edm.DateTimeOffset": "write it with its offset, for example 2026-10-05T12:00:00Z",
+    "Edm.TimeOfDay": "write it as 12:30:00",
+    "Edm.Duration": "write it as an ISO 8601 duration, for example P1DT2H",
+    "Edm.Guid": "write it as 8-4-4-4-12 hexadecimal digits",
+    "Edm.Decimal": "write it as a number with at most 15 significant digits; "
+    "more cannot be sent exactly and is not rounded",
+}
+
+
+def _type_shown(edm_type: str) -> str:
+    """A type for a refusal: repeated only when it has the form of a name."""
+    return edm_type if re.fullmatch(r"[A-Za-z0-9_.]{1,64}", edm_type) else "its type"
 
 
 def _is_date(text: str) -> bool:
@@ -108,13 +155,16 @@ def _is_timestamp(text: str) -> bool:
 
 
 class V4Dialect:
-    """OData V4 as SAP's RAP and Gateway V4 services speak it (reads)."""
+    """OData V4 as SAP's RAP and Gateway V4 services speak it."""
 
     version = "v4"
-    # `ODataClient.check_write` refuses a write while this is False, with
-    # this text (its one source).
-    supports_write = False
-    write_refusal = _NOT_YET
+    supports_write = True
+    # Actions and functions can be called (`call_request`, `parse_call`).
+    supports_call = True
+    call_kinds = ("action", "function")
+    # The key of a bound operation is the key predicate of its entity, in
+    # the path; `call_request` therefore takes the entity set as `bound=`.
+    key_in_path = True
     # Sent with every request of this version.
     request_headers: dict[str, str] = {"OData-MaxVersion": "4.0"}
 
@@ -204,12 +254,377 @@ class V4Dialect:
         """
         return edm_type in V4_COMPARABLE_TYPES
 
-    # -- request bodies (the next task) -------------------------------------
+    # -- request bodies -----------------------------------------------------
     def update_request(self, path: str, body: dict | None) -> tuple[str, dict[str, str]]:
-        raise ODataError("operation_disabled", _NOT_YET)
+        """``(HTTP method, extra headers)`` of a partial update: a plain ``PATCH``.
+
+        It changes the fields in the body and leaves the others alone; V4
+        needs no ``X-HTTP-Method`` tunnel.
+        """
+        return "PATCH", {}
+
+    def _json_value(self, edm_type: str, value: Any) -> Any:
+        """``value`` in the form V4 JSON carries ``edm_type`` in a request.
+
+        By positive recognition, like ``literal``: an unknown type or a value
+        without the form of its type is refused. ``None`` (clear the field)
+        passes for every known type. Numbers stay numbers, whether they were
+        given as a number or as its text; a boolean is never a number.
+
+        ``Edm.Int64`` and ``Edm.Decimal`` are sent as JSON numbers, which is
+        the V4 default (strings need ``IEEE754Compatible=true``, which this
+        client does not ask for). An integer is exact at any size. A decimal
+        with a fraction goes through a float, so it is sent only when the
+        float reads back as exactly the digits that were given; otherwise it
+        is refused -- a silently rounded amount is worse than a refusal.
+        """
+        if isinstance(value, (dict, list, tuple, set)) or edm_type not in V4_COMPARABLE_TYPES:
+            raise _refuse(edm_type)
+        if value is None:
+            return None
+        if edm_type == "Edm.String":
+            if isinstance(value, int) and not isinstance(value, bool):
+                if value.bit_length() > 4 * 1000:  # Python refuses to print a longer one
+                    raise _refuse(edm_type)
+                return str(value)
+            if not isinstance(value, str) or not all(
+                ch.isprintable() or ch in "\n\r\t" for ch in value
+            ):
+                raise _refuse(edm_type)
+            return value
+        if edm_type == "Edm.Boolean":
+            if value is True or value == "true":
+                return True
+            if value is False or value == "false":
+                return False
+            raise _refuse(edm_type)
+        if isinstance(value, bool):
+            raise _refuse(edm_type)
+        if isinstance(value, int) and value.bit_length() > 140:  # beyond 40 digits
+            raise _refuse(edm_type)
+        if edm_type in _INTEGER_RANGES:
+            text = str(value) if isinstance(value, int) else value
+            if not isinstance(text, str) or not _INTEGER.fullmatch(text):
+                raise _refuse(edm_type)
+            low, high = _INTEGER_RANGES[edm_type]
+            number = int(text)
+            if not low <= number <= high:
+                raise _refuse(edm_type)
+            return number
+        if edm_type == "Edm.Decimal":
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                if not math.isfinite(value):
+                    raise _refuse(edm_type)
+                return value
+            if not isinstance(value, str) or not _DECIMAL.fullmatch(value):
+                raise _refuse(edm_type)
+            if "." not in value:
+                return int(value)
+            number = float(value)
+            if not math.isfinite(number) or decimal.Decimal(repr(number)) != decimal.Decimal(
+                value
+            ):
+                raise _refuse(edm_type)
+            return number
+        if edm_type in _FLOAT_TYPES:
+            if isinstance(value, str) and not _DECIMAL.fullmatch(value):
+                raise _refuse(edm_type)
+            try:
+                number = float(value) if isinstance(value, (int, float, str)) else math.nan
+            except OverflowError:  # an integer no float can hold
+                raise _refuse(edm_type) from None
+            if not math.isfinite(number):
+                raise _refuse(edm_type)
+            return number
+        # The types whose JSON form is their text: checked as a literal is.
+        # (A duration is the bare ISO text in JSON; only its URI literal is
+        # wrapped in `duration'..'`.)
+        if not isinstance(value, str) or edm_type not in _STRING_FORMS:
+            raise _refuse(edm_type)
+        self.literal(edm_type, value)
+        return value
 
     def encode_body(self, entity_set: EntitySetDef, body: dict) -> dict:
-        raise ODataError("operation_disabled", _NOT_YET)
+        """``body`` as the JSON object of a V4 create or update request.
+
+        Every name must be a field of the entity set and every value a
+        scalar (or ``None``) with the form of that field's EDM type; an
+        object or a list -- a deep insert -- is refused. Whether a field may
+        be written is the client's check (``ODataClient.check_write``), which
+        runs first. A refusal names the field and the type, never the value.
+        """
+        if not isinstance(body, dict):
+            raise ODataError("invalid_argument", "the body must be an object of field values")
+        out: dict[str, Any] = {}
+        for name, value in body.items():
+            definition = entity_set.field(name) if isinstance(name, str) else None
+            if definition is None:
+                raise ODataError(
+                    "unknown_field", f"entity set {entity_set.name!r} has no such field"
+                )
+            if isinstance(value, (dict, list, tuple, set)):
+                raise ODataError(
+                    "invalid_argument",
+                    f"the value of field {definition.name!r} must be a single value; "
+                    f"nested entities and lists cannot be written",
+                )
+            try:
+                out[definition.name] = self._json_value(definition.type, value)
+            except ODataError:
+                raise ODataError(
+                    "invalid_argument",
+                    f"the value of field {definition.name!r} is not a valid "
+                    f"{_type_shown(definition.type)} value",
+                    hint=_VALUE_HINTS.get(definition.type),
+                ) from None
+        return out
+
+    # -- actions and functions ----------------------------------------------
+    def sends_type(self, edm_type: str) -> bool:
+        """Whether a parameter of ``edm_type`` can be given a value at all.
+
+        The types of ``literal`` and ``_json_value``, said once for
+        ``client.call_refusal``: a parameter of any other type (a complex
+        type, an enumeration, a collection, ``Edm.Binary``, a V2-only type,
+        an unknown name) is never sent.
+        """
+        return edm_type in V4_COMPARABLE_TYPES
+
+    def call_literal(self, edm_type: str, value: Any) -> str:
+        """``value`` as the percent-encoded URI literal of a function parameter.
+
+        ``literal`` with what a place in the path adds, the rules of a key
+        value (``common.key_segment``): an object or a list is never a
+        parameter value, and a text is short and holds no slash, backslash,
+        ``%``, ``?``, ``#`` or ``..`` -- it could not become a second segment (a quote is
+        doubled, the rest is percent-encoded and ``urls.join_path`` checks
+        the segment again), but SAP does not read such a value reliably
+        from a path either.
+        """
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            raise _refuse(edm_type)
+        if isinstance(value, int) and not isinstance(value, bool):
+            if value.bit_length() > 4 * MAX_PARAM_VALUE_CHARS:
+                raise _refuse(edm_type)
+        if isinstance(value, str) and (
+            len(value) > MAX_PARAM_VALUE_CHARS
+            or ".." in value
+            or any(ch in value for ch in _PATH_BREAKERS)
+        ):
+            raise _refuse(edm_type)
+        text = self.literal(edm_type, value)
+        if len(text) > MAX_PARAM_VALUE_CHARS + 2:
+            raise _refuse(edm_type)
+        return quote(text, safe="'")
+
+    def call_request(
+        self,
+        service_path: str,
+        operation: OperationDef,
+        key: dict | None,
+        params: dict | None,
+        *,
+        bound: EntitySetDef | None = None,
+    ) -> tuple[str, str, dict[str, str], Any]:
+        """``(HTTP method, path, query, JSON body)`` of an action or function call.
+
+        * action: ``POST``, the parameters as a JSON object (``{}`` without
+          any), each in the JSON form of its declared type;
+        * function: ``GET``, the parameters as typed literals behind the
+          name, ``Name(P1='x',P2=5)`` (``Name()`` without any);
+        * bound (``bound`` is the entity set ``operation.bound_to`` names,
+          ``key`` the key of the entity): ``Set(<key>)/<qualified_name>``;
+          not bound: the operation's import name directly below the service.
+
+        The query is always empty. Only names the catalogue declares are
+        sent: the entity set's path, the operation's name (re-checked here
+        to be an EDM name; a bound one must be namespace-qualified) and its
+        declared parameters. An optional parameter that is not given, or
+        given as null, is left out. Every segment goes through
+        ``urls.join_path``.
+
+        The caller (``ODataClient.check_call``) has checked the arguments
+        against the catalogue; what does not fit is refused here again, by
+        name and never with a value.
+        """
+        name = operation.name
+        method = {"action": "POST", "function": "GET"}.get(operation.kind)
+        if method is None or operation.http_method != method:
+            raise ODataError(
+                "invalid_argument",
+                f"operation {name!r} is not an action (POST) or a function (GET) "
+                f"of an OData V4 service",
+            )
+        if params is None:
+            params = {}
+        declared = {p.name: p for p in operation.parameters}
+        if not isinstance(params, dict) or any(
+            not isinstance(given, str) or given not in declared for given in params
+        ):
+            raise ODataError(
+                "invalid_argument",
+                f"operation {name!r} takes each of its declared parameters once and no other",
+            )
+        segments: list[str] = []
+        if operation.bound_to is not None:
+            if bound is None or bound.name != operation.bound_to:
+                raise ODataError(
+                    "invalid_argument",
+                    f"operation {name!r} is bound to an entity set that was not given",
+                )
+            segments.append(
+                (bound.path or bound.name)
+                + common.key_segment(self.literal, bound, key, subject="this operation")
+            )
+            address = operation.qualified_name
+            qualified = "." in address.strip(".")
+        else:
+            if key is not None:
+                raise ODataError(
+                    "invalid_argument",
+                    f"operation {name!r} is not bound to an entity; it takes no key",
+                )
+            address, qualified = name, True
+        if not qualified or not re.fullmatch(EDM_NAME_RE, address):
+            raise ODataError(
+                "invalid_argument",
+                f"operation {name!r} cannot be addressed: the catalogue does not hold "
+                f"its namespace-qualified name",
+            )
+        sent: dict[str, Any] = {}
+        for parameter, definition in declared.items():
+            if params.get(parameter) is None:
+                if definition.required:
+                    raise ODataError(
+                        "invalid_argument", f"operation {name!r} needs parameter {parameter!r}"
+                    )
+                continue  # optional and not given: left out, never sent as null
+            value = params[parameter]
+            try:
+                if isinstance(value, (dict, list, tuple, set)):
+                    raise _refuse(definition.type)
+                sent[parameter] = (
+                    self._json_value(definition.type, value)
+                    if method == "POST"
+                    else self.call_literal(definition.type, value)
+                )
+            except ODataError:
+                raise ODataError(
+                    "invalid_argument",
+                    f"the value of parameter {parameter!r} is not a single valid "
+                    f"{_type_shown(definition.type)} value (objects, lists and types this "
+                    f"tool does not know are not sent)",
+                    hint=_VALUE_HINTS.get(definition.type),
+                ) from None
+        body: dict[str, Any] | None = None
+        if method == "POST":
+            body = sent
+        else:
+            if not all(re.fullmatch(EDM_NAME_RE, parameter) for parameter in sent):
+                raise ODataError(
+                    "invalid_argument",
+                    f"a parameter of operation {name!r} has a name a URL cannot carry",
+                )
+            address += "(" + ",".join(f"{p}={text}" for p, text in sent.items()) + ")"
+        segments.append(address)
+        try:
+            path = join_path(service_path, *segments)
+        except ValueError:
+            raise ODataError(
+                "invalid_argument", "the request path could not be built for this operation"
+            ) from None
+        return method, path, {}, body
+
+    def parse_call(self, payload: Any, name: str) -> tuple[str, Any]:
+        """``(shape, value)`` of what an action or function answered.
+
+        One of ``CALL_SHAPES``, recognised positively:
+
+        * ``none``: no content, ``@odata.null``, or a ``value`` of ``null``;
+        * ``value``: one JSON scalar, as ``{"@odata.context": .., "value":
+          scalar}``;
+        * ``collection``: a list under ``value``;
+        * ``entity``: an object with properties of its own -- an entity or a
+          complex value; the two look alike here, and
+          ``returned_rows_are_of`` tells them apart;
+        * ``other``: anything else (an object without a property, an object
+          under ``value``). The value is ``None``.
+
+        A ``value`` that is the only property is the wrapper, unless the
+        context says the answer is one entity (``.../$entity``): an entity
+        type may have a single property of that name, and it must not pass
+        as a scalar. Whether an entity or a collection may be shown is not
+        decided here. An answer that is not a JSON object, or has a
+        top-level ``error``, is not the answer of a call (``sap_error``).
+        """
+        if payload is None:
+            return "none", None
+        if not isinstance(payload, dict) or "error" in payload:
+            raise ODataError("sap_error", "the OData service answered in an unexpected shape")
+        if self._control(payload, "null") is True:
+            return "none", None
+        properties = self._properties(payload)
+        context = self._control(payload, "context")
+        one_entity = isinstance(context, str) and context.endswith(_ENTITY)
+        if properties == ["value"] and not one_entity:
+            value = payload["value"]
+            if value is None:
+                return "none", None
+            if isinstance(value, (str, int, float)):  # bool is an int
+                return "value", value
+            if isinstance(value, list):
+                return "collection", value
+            return "other", None
+        if properties:
+            return "entity", payload
+        return "other", None
+
+    def returned_rows_are_of(
+        self, payload: Any, rows: list, target: EntitySetDef, many: bool
+    ) -> bool:
+        """Whether a call's answer says its rows are entities of ``target``.
+
+        V4 says what an answer holds once, in its ``@odata.context``:
+        ``<..>$metadata#<fragment>``. The rows are taken as entities of
+        ``target`` only for a fragment that names it and the right number:
+
+        * the entity set: ``Set/$entity`` (one) or ``Set`` (many), each with
+          an optional select list ``Set(A,B)``;
+        * the entity type: ``NS.Type`` (one) or ``Collection(NS.Type)``.
+
+        A row that names a type of its own (``@odata.type``, which SAP sends
+        for a derived type) must name the set's type. No context, a context
+        that names another set, a key or a navigation path, a complex type,
+        or a list of values: no -- the caller then shows nothing.
+        """
+        context = self._control(payload, "context") if isinstance(payload, dict) else None
+        if not isinstance(context, str) or len(context) > MAX_CONTEXT_CHARS:
+            return False
+        _, found, fragment = context.rpartition(_METADATA)
+        if not found or not target.name or not target.entity_type:
+            return False
+        if fragment in (target.entity_type, f"Collection({target.entity_type})"):
+            named_many = fragment.startswith("Collection(")
+        else:
+            named_many = not fragment.endswith(_ENTITY)
+            if not named_many:
+                fragment = fragment[: -len(_ENTITY)]
+            set_name, paren, rest = fragment.partition("(")
+            if paren and not (rest.endswith(")") and _SELECT_LIST.fullmatch(rest[:-1])):
+                return False
+            if set_name != target.name:
+                return False
+        if named_many is not many:
+            return False
+        for row in rows:
+            if not isinstance(row, dict):
+                return False
+            own = self._control(row, "type")
+            if own is not None and own != "#" + target.entity_type:
+                return False
+        return True
 
     # -- query options ------------------------------------------------------
     def projection(

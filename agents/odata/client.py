@@ -68,14 +68,19 @@ their own gate, ``check_write``, and three rules of their own:
 * No token, cookie, body value or host appears in an error, a log line or a
   ``repr`` of this module.
 
-Function imports (``call``, V2 only) have their own gate, ``check_call``.
-In SAP the real business steps -- release, approve, post, cancel -- are
-function imports, so a call is a WRITE unless the catalogue says otherwise
-in so many words: only an operation marked ``changes_data: false`` that is
-also a ``GET`` is sent as a read (``call_changes_data``). Every other call,
-a ``GET`` included, goes out exactly like an entity write: the caller's own
-CSRF session, one repeat after a 403 ``Required``, never a repeat after a
-failure, success recognised positively. What comes back is shown only when
+Operations (``call``: V2 function imports, V4 actions and functions) have
+their own gate, ``check_call``. In SAP the real business steps -- release,
+approve, post, cancel -- are function imports and actions, so a call is a
+WRITE unless the catalogue says otherwise in so many words: only an
+operation marked ``changes_data: false`` that is also a ``GET`` is sent as a
+read (``call_changes_data``); a V4 action is a ``POST`` and therefore always
+a write. Every other call, a ``GET`` included, goes out exactly like an
+entity write: the caller's own CSRF session, one repeat after a 403
+``Required``, never a repeat after a failure, success recognised
+positively. How a call is addressed is the dialect's (``call_request``): V2
+sends the parameters and the key of a bound entity in the query string, V4
+puts the key in the path, a function's parameters behind its name and an
+action's parameters in a JSON body. What comes back is shown only when
 it can be tied to a catalogue entity set -- the one the operation's
 ``returns`` names, else the one it is ``bound_to`` -- so that the field
 allowlist applies; otherwise the answer is a confirmation and nothing else
@@ -166,8 +171,12 @@ def _outcome_hint(operation: str) -> str:
     return _LIST_FIRST_HINT if operation == "create" else _READ_FIRST_HINT
 
 
-# The one text for "this app cannot call operations of this OData version".
+# The one text for "this app cannot call this operation on a service of this
+# OData version": a version without a dialect that calls, or an operation of
+# a kind that version does not have.
 CALL_NOT_AVAILABLE = "operations of a service of this OData version cannot be called yet"
+# The kinds a dialect calls when it does not say (`call_kinds`): V2's one.
+_DEFAULT_CALL_KINDS = ("function_import",)
 # Why an operation cannot be called (`call_refusal`).
 CALL_REFUSALS = (
     "operation_disabled",  # not enabled in the catalogue
@@ -203,16 +212,31 @@ def call_refusal(
     service's OData version (``None``: none). First match of
     ``CALL_REFUSALS``, in that order.
 
-    A bound call sends the key of its entity as parameters of the same
-    names, so every key field must be a declared parameter. A parameter that
-    is always sent -- a ``required`` one, or a key field -- must have a type
-    the dialect writes (``sends_type``): a complex type, a collection,
-    ``Edm.Binary`` or an unknown name can never be given a value. An
-    optional parameter of such a type is merely never sent.
+    The dialect says what it can call: ``supports_call`` exactly ``True``,
+    and the operation kinds it sends (``call_kinds``; function imports when
+    it does not say). An operation of another kind is never sent with this
+    version's rules -- a stored V4 action on a V2 service, say.
+
+    Where the key of a bound call travels is the dialect's too. V2 sends it
+    as parameters of the same names, so every key field must be a declared
+    parameter (``key_not_declared``). A dialect with ``key_in_path`` (V4)
+    puts it in the path as the key predicate of the bound entity; nothing
+    has to be declared for it.
+
+    A parameter that is always sent -- a ``required`` one, or a key field
+    that travels as a parameter -- must have a type the dialect writes
+    (``sends_type``): a complex type, a collection, ``Edm.Binary`` or an
+    unknown name can never be given a value. An optional parameter of such
+    a type is merely never sent.
     """
     if operation.enabled is not True:
         return "operation_disabled"
-    if getattr(dialect, "supports_call", False) is not True or operation.kind != "function_import":
+    kinds = getattr(dialect, "call_kinds", _DEFAULT_CALL_KINDS)
+    if (
+        getattr(dialect, "supports_call", False) is not True
+        or not isinstance(kinds, (tuple, frozenset))
+        or operation.kind not in kinds
+    ):
         return "calls_not_available"
     if not allow_write and operation.is_write():
         return "write_not_allowed"
@@ -222,10 +246,11 @@ def call_refusal(
             return "bound_set_missing"
         if not bound_keys:
             return "bound_set_without_key"
-        declared = {p.name for p in operation.parameters}
-        if any(name not in declared for name in bound_keys):
-            return "key_not_declared"
-        always = set(bound_keys)
+        if getattr(dialect, "key_in_path", False) is not True:
+            declared = {p.name for p in operation.parameters}
+            if any(name not in declared for name in bound_keys):
+                return "key_not_declared"
+            always = set(bound_keys)
     sends = getattr(dialect, "sends_type", None)
     for parameter in operation.parameters:
         if not (parameter.required or parameter.name in always):
@@ -353,14 +378,16 @@ class WritePlan:
 
 @dataclass(frozen=True)
 class CallPlan:
-    """A function import call that passed every check (``ODataClient.check_call``).
+    """An operation call that passed every check (``ODataClient.check_call``).
 
     ``name`` is the operation's catalogue name; ``method``, ``path`` (the
-    confined, relative request path) and ``query`` (for ``params=``) are the
-    request; ``fields`` the NAMES of the parameters of ``params`` that are
-    SENT, in the caller's order (an optional parameter passed as null is
-    left out of the request, and so of this) -- names only, which is all an
-    audit record may hold; ``key`` the validated key of the bound entity or ``None``;
+    confined, relative request path), ``query`` (for ``params=``; empty in
+    V4) and ``body`` (the JSON object of a V4 action's parameters, else
+    ``None``) are the request; ``fields`` the NAMES of the parameters of
+    ``params`` that are SENT, in the caller's order (an optional parameter
+    passed as null is left out of the request, and so of this) -- names
+    only, which is all an audit record may hold; ``key`` the validated key
+    of the bound entity or ``None``;
     ``changes`` whether the call is a write (``call_changes_data``);
     ``bound`` the entity set it is bound to, if any (whose KEY the call
     takes); ``result_set`` the entity set returned entities are checked
@@ -369,8 +396,8 @@ class CallPlan:
     collection, ``False`` one entity, ``None`` when the catalogue does not
     say); ``etag`` the validated ``If-Match`` value or ``None``.
     ``operation`` and ``body`` make it the plan of a modifying request for
-    ``_write``. The ``repr`` shows names only: the query carries the
-    parameter and key values.
+    ``_write``. The ``repr`` shows names only: the path, the query and the
+    body carry the parameter and key values.
     """
 
     name: str
@@ -385,7 +412,7 @@ class CallPlan:
     many: bool | None = field(default=None, repr=False)
     etag: str | None = field(default=None, repr=False)
     operation: str = "call"
-    body: None = None
+    body: dict[str, Any] | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return (
@@ -788,7 +815,7 @@ class ODataClient:
         1. ``operation`` is ``"create"``, ``"update"`` or ``"delete"``
            (``invalid_argument``);
         2. the operation is enabled on ``entity_set``, and the service's
-           OData version is one this client can write (V2 today)
+           OData version is one whose dialect writes (V2 and V4)
            (``operation_disabled``);
         3. the key: exactly the key fields with valid values for an update
            and a delete (``invalid_key``); none for a create
@@ -918,7 +945,7 @@ class ODataClient:
         params: Any = None,
         etag: Any = None,
     ) -> CallPlan:
-        """Every catalogue check of a function import call; nothing is sent.
+        """Every catalogue check of an operation call; nothing is sent.
 
         ``call`` runs exactly this before it asks for a CSRF token or sends,
         and a caller that wants the refusal first (the execute tool) calls
@@ -929,28 +956,32 @@ class ODataClient:
            (``unknown_target``);
         2. it can be called at all (``call_refusal``, the rule the search
            tool offers by): it is ``enabled`` (``operation_disabled``); the
-           service's OData version is one whose operations this client can
-           call, V2 function imports today (``not_available``, the code and
-           text the execute tool answers); and the catalogue declares it
-           callable -- a bound operation's entity set exists and every key
+           service's OData version is one whose operations of this kind
+           the client can call -- V2 function imports, V4 actions and
+           functions (``not_available``, the code and text the execute tool
+           answers); and the catalogue declares it callable -- a bound
+           operation's entity set exists and has a key; in V2 every key
            field is a declared parameter (SAP V2 takes the key of a bound
            function import as parameters, and nothing is sent under a name
-           the catalogue does not declare), and every parameter that is
-           always sent has a type the dialect writes (``not_available``,
-           with a hint that it is a catalogue setting);
+           the catalogue does not declare; V4 puts the key in the path);
+           and every parameter that is always sent has a type the dialect
+           writes (``not_available``, with a hint that it is a catalogue
+           setting);
         3. ``params``: absent or an object of at most ``MAX_CALL_PARAMS``
            entries, every name a parameter the catalogue declares for the
            operation (``invalid_argument``);
         4. the key: an operation bound to an entity set needs exactly that
            set's key, with valid values (``invalid_key``; the refusal says
            "this operation", never the set's name, which the agent may not
-           be able to see), and no key field in ``params`` as well
+           be able to see), and -- where the key travels as parameters
+           (V2) -- no key field in ``params`` as well
            (``invalid_argument``). An operation that is not bound takes no
            key (``invalid_argument``);
         5. every ``required`` parameter is there, and every value is one
            JSON scalar with the form of the parameter's EDM type; an
            object, a list and a type the dialect does not know are refused
-           (``invalid_argument``, naming the parameter and the type);
+           (``invalid_argument``, naming the parameter and the type). A
+           JSON body (a V4 action) is at most ``MAX_REQUEST_BYTES``;
         6. ``etag``: only for a call that changes data and is bound, then
            absent or one entity tag as a get of that entity returned it;
            ``*`` and a list of tags are refused (``invalid_argument``).
@@ -984,16 +1015,19 @@ class ODataClient:
                     f"operation {operation.name!r} has no parameter {_shown(name)}; "
                     f"its parameters are: {expected}",
                 )
+        in_path = getattr(self._dialect, "key_in_path", False) is True
         if bound is not None:
-            # The rules of a key in a path, although this one travels in the
-            # query: the same key names the same entity everywhere.
+            # The rules of a key in a path, also where it travels in the
+            # query (V2): the same key names the same entity everywhere.
             # The agent may not be able to see the entity set (search then
             # hides `bound_to`): a refusal says the key is the operation's.
             from . import common  # imports this module
 
             common.key_segment(self._dialect.literal, bound, key, subject="this operation")
             for definition in bound.keys:
-                if definition.name in params:
+                # In the path (V4) a key field is no parameter: one of the
+                # same name would be the operation's own.
+                if not in_path and definition.name in params:
                     raise ODataError(
                         "invalid_argument",
                         f"key field {definition.name!r} goes in 'key' only, not in 'params'",
@@ -1018,16 +1052,38 @@ class ODataClient:
                     "'*' is never accepted",
                 )
         returns = operation.returns
-        method, path, query, _ = self._dialect.call_request(
-            self._service_path, operation, key if bound is not None else None, params
-        )
+        bound_key = key if bound is not None else None
+        if in_path:
+            # The key predicate needs the entity set itself (its path, the
+            # types of its key fields), not only the key's names.
+            method, path, query, body = self._dialect.call_request(
+                self._service_path, operation, bound_key, params, bound=bound
+            )
+        else:
+            method, path, query, body = self._dialect.call_request(
+                self._service_path, operation, bound_key, params
+            )
+        if body is not None:
+            try:
+                size = len(json.dumps(body).encode("utf-8"))
+            except (TypeError, ValueError):
+                raise ODataError(
+                    "invalid_argument", "the parameters cannot be sent as JSON"
+                ) from None
+            if size > MAX_REQUEST_BYTES:
+                raise ODataError(
+                    "invalid_argument",
+                    f"the parameters are larger than {MAX_REQUEST_BYTES} bytes",
+                )
         return CallPlan(
             name=operation.name,
             method=method,
             path=path,
             query=query,
-            # What was sent: an optional parameter passed as null is not.
-            fields=tuple(name for name in params if name in query),
+            body=body,
+            # What was sent, wherever it travels (query, path or body): an
+            # optional parameter passed as null is not.
+            fields=tuple(name for name in params if params[name] is not None),
             key=dict(key) if bound is not None else None,
             changes=changes,
             bound=bound,
@@ -1447,6 +1503,14 @@ class ODataClient:
             return False
         return True
 
+    def _is_call_answer(self, decoded: Any, name: str) -> bool:
+        """Whether a decoded answer is one the dialect reads as a call's."""
+        try:
+            self._dialect.parse_call(decoded, name)
+        except ODataError:
+            return False
+        return True
+
     def _confirmed(self, plan: WritePlan | CallPlan, status: int, body: bytes | None) -> Any:
         """The decoded answer of a write that SAP confirmed, else an error.
 
@@ -1460,7 +1524,9 @@ class ODataClient:
           the entity. Any other body -- text, markup, JSON that is not an
           entity, JSON with a top-level ``error`` -- is not a confirmation.
         * call: 204 without a body, or 200/201 with no body or with a JSON
-          object that has the ``d`` member of a V2 answer and no ``error``.
+          object without a top-level ``error`` that the dialect reads as
+          the answer of a call (``parse_call``: the ``d`` member in V2, an
+          object in V4).
 
         Everything else below 300 was answered by something, but not
         recognisably by the write: ``write_outcome_unknown``.
@@ -1480,8 +1546,8 @@ class ODataClient:
                 ok = (
                     status in (200, 201)
                     and isinstance(decoded, dict)
-                    and "d" in decoded
                     and "error" not in decoded
+                    and self._is_call_answer(decoded, plan.name)
                 )
             else:
                 ok = status == 204 or (status in (200, 201) and body is not None)
@@ -1691,13 +1757,18 @@ class ODataClient:
         ``etag`` is the value a read of the entity returned; it is sent as
         ``If-Match`` so a change made by somebody else in between is not
         overwritten. Returns ``{"ok", "status"}`` plus the entity's new raw
-        ETag when SAP sends one.
+        ETag when SAP sends one: in the ``ETag`` header, else in the entity
+        an update can be answered with (a V4 ``PATCH`` answered ``200``).
+        Nothing else of that entity is returned.
         """
         plan = self.check_write(entity_set, "update", key=key, body=body, etag=etag)
         method, extra = self._dialect.update_request(plan.path, plan.body)
-        status, headers, _ = await self._write(plan, method, dict(extra))
+        status, headers, payload = await self._write(plan, method, dict(extra))
         result: dict[str, Any] = {"ok": True, "status": status}
-        new_etag = _etag_of(headers.get("etag"))
+        inner: str | None = None
+        if payload is not None:
+            _, inner = self._dialect.parse_entity(payload)  # accepted by _confirmed
+        new_etag = _etag_of(headers.get("etag"), inner)
         if new_etag:
             result[RAW_ETAG_FIELD] = new_etag
         return result
@@ -1708,8 +1779,27 @@ class ODataClient:
         status, _, _ = await self._write(plan, "DELETE", {})
         return {"ok": True, "status": status}
 
-    # -- function imports ---------------------------------------------------
-    def _returned(self, plan: CallPlan, shape: str, value: Any) -> tuple[str, Any]:
+    # -- operations: function imports, actions, functions ----------------------
+    def _rows_are_of(self, payload: Any, rows: list, target: EntitySetDef, many: bool) -> bool:
+        """Whether every returned row is positively an entity of ``target``.
+
+        How an answer says what it holds is the dialect's
+        (``returned_rows_are_of``: in V4 the context of the answer). Without
+        that seam it is the V2 rule: every row names the set's entity type
+        in ``__metadata.type``.
+        """
+        check = getattr(self._dialect, "returned_rows_are_of", None)
+        if callable(check):
+            return check(payload, rows, target, many) is True
+        for row in rows:
+            metadata = row.get("__metadata") if isinstance(row, dict) else None
+            if not isinstance(metadata, dict) or metadata.get("type") != target.entity_type:
+                return False
+        return True
+
+    def _returned(
+        self, plan: CallPlan, shape: str, value: Any, payload: Any = None
+    ) -> tuple[str, Any]:
         """``(returned, result)``: what of a call's answer may be shown.
 
         The catalogue's field allowlist is per entity set, so entity data is
@@ -1719,10 +1809,11 @@ class ODataClient:
         bound to. That set must have the read enabled that matches what
         came back -- ``get`` for one entity, ``list`` for a collection;
         with ``returns`` the answer must also have the declared shape,
-        without it either read will do -- and EVERY returned entity must
-        say in ``__metadata.type`` that it is of that set's entity type. It
-        is then cut to the set's selectable fields exactly like a read
-        (``_row``: no ``__metadata``, no ETag). Anything else that looks
+        without it either read will do -- and the answer must say that
+        EVERY returned entity is of that set (``_rows_are_of``: in
+        ``__metadata.type`` in V2, in the answer's ``@odata.context`` in
+        V4). It is then cut to the set's selectable fields exactly like a
+        read (``_row``: no ``__metadata``, no annotation, no ETag). Anything else that looks
         like data -- an entity of another or of no stated type, a set
         nobody may read, a complex type, a list of values -- is
         ``withheld``: the caller learns that the call worked, not what it
@@ -1766,10 +1857,8 @@ class ODataClient:
         if not reads & set(target.operations) or not names:
             return "withheld", None
         rows = value if many else [value]
-        for row in rows:
-            metadata = row.get("__metadata") if isinstance(row, dict) else None
-            if not isinstance(metadata, dict) or metadata.get("type") != target.entity_type:
-                return "withheld", None
+        if not self._rows_are_of(payload, rows, target, many):
+            return "withheld", None
         cut = [self._row(row, target, names, []) for row in rows]
         return ("entities", cut) if many else ("entity", cut[0])
 
@@ -1781,7 +1870,7 @@ class ODataClient:
         params: dict | None = None,
         etag: str | None = None,
     ) -> dict:
-        """Call one function import. ``{"ok", "status", "returned", "result"}``.
+        """Call one operation. ``{"ok", "status", "returned", "result"}``.
 
         ``returned`` says what ``result`` is: ``entity`` / ``entities`` (cut
         to the selectable fields of the entity set the operation returns,
@@ -1799,17 +1888,19 @@ class ODataClient:
         """
         plan = self.check_call(operation, key=key, params=params, etag=etag)
         if not plan.changes:
-            payload, _, status = await self._fetch_status(plan.path, plan.query)
+            payload, _, status = await self._fetch_status(plan.path, plan.query or None)
             shape, value = self._dialect.parse_call(payload, plan.name)
         else:
-            status, _, payload = await self._write(plan, plan.method, {}, params=plan.query)
+            status, _, payload = await self._write(
+                plan, plan.method, {}, params=plan.query or None
+            )
             try:
                 shape, value = self._dialect.parse_call(payload, plan.name)
             except ODataError:
                 # Confirmed by `_confirmed`: SAP applied it. An answer that
                 # cannot be read then is merely not shown.
                 shape, value = "other", None
-        returned, result = self._returned(plan, shape, value)
+        returned, result = self._returned(plan, shape, value, payload)
         return {"ok": True, "status": status, "returned": returned, "result": result}
 
 

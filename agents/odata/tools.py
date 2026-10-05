@@ -30,13 +30,15 @@ app) sends no write at all, whatever its entry allows
 (``audit_not_configured``). A write refused by a switch is not a record but
 one WARNING line on the ``agents.odata.audit`` logger.
 
-Calling an operation (``operation="call"``, V2 function imports) is a write
-too, unless the catalogue marks it ``changes_data: false`` and it is a
-``GET`` (``client.call_changes_data``): in SAP, release, approve, post and
-cancel are function imports. A call that changes data therefore passes the
-same two switches, needs the same recorder and is recorded the same way
-(operation ``call``, the operation's name as the target, parameter NAMES,
-the key of a bound entity), and leaves from the same place (``_send_write``).
+Calling an operation (``operation="call"``: V2 function imports, V4 actions
+and functions) is a write too, unless the catalogue marks it
+``changes_data: false`` and it is a ``GET`` (``client.call_changes_data``):
+in SAP, release, approve, post and cancel are function imports and actions,
+and a V4 action -- a ``POST`` -- is therefore always a write. A call that
+changes data therefore passes the same two switches, needs the same
+recorder and is recorded the same way (operation ``call``, the operation's
+name as the target, parameter NAMES, the key of a bound entity), and leaves
+from the same place (``_send_write``).
 What a call returns is shown only as far as the catalogue's field allowlist
 can be applied to it (``ODataClient.call``).
 """
@@ -124,7 +126,8 @@ _DIALECTS: dict[str, Any] = DIALECTS
 # What `execute_operation` can do beyond reading, said once so that
 # `search_operations` offers exactly that: the versions whose dialect can
 # write, and whether operations (function imports, actions, functions) can
-# be called (V2 function imports; V4 actions and functions not yet).
+# be called. Both V2 and V4 do both; which single operation is callable is
+# `client.call_refusal`.
 _WRITE_VERSIONS = frozenset(
     version
     for version, dialect in _DIALECTS.items()
@@ -442,8 +445,8 @@ class WriteAudit:
       error to ask, it is what ``_PhasedSessions`` saw.
     * ``status``: the HTTP status of the answer, when there was one.
     * ``operation``: ``create``, ``update``, ``delete``, or ``call`` for an
-      operation (function import) that changes data; ``target`` is then
-      the operation's name instead of an entity set's.
+      operation (function import, action, function) that changes data;
+      ``target`` is then the operation's name instead of an entity set's.
     * ``key``: the key the call named (``None`` for a create, and for a
       ``call`` of an operation that is not bound to an entity);
       ``created_key``: for a create that succeeded, the key of the created
@@ -1646,7 +1649,9 @@ def odata_toolset(
                 objects or lists.
             params: For 'call' only: {parameter name: value}, every required
                 parameter, names exactly as listed; one plain value each
-                (no objects or lists). Dates as 2026-10-05T00:00:00. Key
+                (no objects or lists), in the form of the listed type:
+                Edm.DateTime as 2026-10-05T00:00:00, Edm.Date as
+                2026-10-05, Edm.DateTimeOffset as 2026-10-05T12:00:00Z. Key
                 fields of a 'bound_to' operation go in 'key', not here.
             etag: For 'update' and 'delete' (and a 'call' with a 'key', when
                 SAP asks for one): the 'etag' value that a 'get'
