@@ -636,8 +636,7 @@ async def test_toolset_exposes_exactly_the_two_tools_once_O4_lands():
         services=SNAPSHOT,
         resolver_factory=fake,
     )
-    assert set(ts.tools) >= {"search_operations"}
-    assert set(ts.tools) <= {"search_operations", "execute_operation"}
+    assert set(ts.tools) == {"search_operations", "execute_operation"}
     search = ts.tools["search_operations"].function
     out = await search("requisition")
     assert out["matches"][0]["target"] == ITEM
