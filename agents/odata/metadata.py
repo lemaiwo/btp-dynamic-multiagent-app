@@ -95,6 +95,25 @@ a scan whose size the document chooses. The rules the code keeps to:
   or compared again: ``_Work.spend_text``, nothing for the first
   ``_TEXT_UNIT`` characters, so a real document pays nothing here.
 
+Those rules bound the loops. The INPUT of every loop is bounded once, where
+the document is read (``_parse_tree``), so that no later code can be handed
+a string or a tree whose size the document chose:
+
+* An attribute value longer than its cap is not kept: the attribute is
+  absent, as over-long element text is, and counted
+  (``ParsedMetadata.attributes_dropped``). The cap is ``_MAX_TEXT_CHARS``
+  in general (a label is cut to ``MAX_LABEL_CHARS`` anyway) and tighter for
+  the attributes that carry NAMES (``_ATTRIBUTE_CAPS``): a name the
+  definition models cannot hold makes its element unrepresentable, which
+  the skip-and-record paths report. So a megabyte of ``Bool="..."`` is not
+  stripped and lowered per lookup, and a megabyte of namespace is not copied
+  into the qualified name of every element of its schema.
+* Where "absent" has a meaning of its own -- a V2 ``Type`` is
+  ``Edm.String``, ``m:HttpMethod`` is ``GET``, no ``Qualifier`` is the plain
+  annotation, no ``EntitySet`` lets the type decide -- a dropped attribute
+  is told apart (``_dropped``) and never gets that default.
+* A document of more than ``MAX_ELEMENTS`` elements is refused.
+
 ``parse_metadata`` is synchronous CPU work (up to ``MAX_METADATA_BYTES`` of
 XML): a route or tool must call it through ``asyncio.to_thread`` and not on
 the event loop.
@@ -125,6 +144,16 @@ MAX_PARSED_OPERATIONS = 2 * MAX_OPERATIONS
 # cap is what keeps "sets x properties" from being chosen by the document.
 # Read at call time.
 MAX_PARSE_WORK = 200_000
+# How many elements a document may have. The largest SAP `$metadata`
+# documents have a few hundred thousand; an element of a real service
+# (`<Property Name=".." Type=".."/>`, `<PropertyRef Name=".."/>`) is tens of
+# bytes at the very least, so a real document under `MAX_METADATA_BYTES`
+# stays well below this. Without it the same 20 MB can be five million
+# four-byte elements, each a tree node and, for a schema's own children, up
+# to three qualified names kept in the lookup tables. With the attribute
+# caps this is what bounds what one document can make a parse retain:
+# elements x a few hundred bytes. Read at call time.
+MAX_ELEMENTS = 500_000
 # EDMX is shallow (Edmx > DataServices > Schema > EntityType > Key >
 # PropertyRef; V4 annotations nest a little deeper). A cap keeps a hostile
 # document from building a tree that is expensive to walk or free.
@@ -142,6 +171,36 @@ _TEXT_ELEMENTS = frozenset({"String", "Bool", "PropertyPath"})
 # would be a value the document never gave ("false" followed by padding
 # would read as false).
 _MAX_TEXT_CHARS = 1024
+# An attribute value longer than its cap is dropped where the document is
+# read. The general cap is the text cap; attributes that carry names are held
+# to what the models can store, with a little room so that a name or type
+# just over ITS limit still reaches the check that names the reason: an EDM
+# name is at most 128 characters (`EDM_NAME_RE`), a type 200
+# (`_MAX_TYPE_CHARS`) or `Collection(` + 200 + `)`. A namespace or alias is
+# part of every qualified name of its schema, and a qualified name is itself
+# held to those limits. An annotation target is two names, or an operation
+# with its signature.
+_MAX_ATTRIBUTE_CHARS = _MAX_TEXT_CHARS
+_MAX_NAME_ATTRIBUTE_CHARS = 256
+_MAX_NAMESPACE_CHARS = 128
+_MAX_TARGET_CHARS = 512
+_ATTRIBUTE_CAPS = {
+    **dict.fromkeys(
+        (
+            "Name", "Type", "EntityType", "EntitySet", "BaseType", "ReturnType",
+            "Association", "Relationship", "Role", "FromRole", "ToRole", "Partner",
+            "Action", "Function", "EntitySetPath", "action-for", "Term", "Qualifier",
+            "Property", "Path", "PropertyPath", "HttpMethod", "Mode",
+        ),  # fmt: skip
+        _MAX_NAME_ATTRIBUTE_CHARS,
+    ),
+    "Namespace": _MAX_NAMESPACE_CHARS,
+    "Alias": _MAX_NAMESPACE_CHARS,
+    "Target": _MAX_TARGET_CHARS,
+}
+# The key under which the tree builder notes a dropped attribute `X` on its
+# element: " X". No XML attribute has a space in its name.
+_DROPPED_PREFIX = " "
 # `_Work.spend_text`: one unit of the budget per this many characters of a
 # shared string that is copied or compared once more.
 _TEXT_UNIT = 4096
@@ -331,6 +390,10 @@ class ParsedMetadata:
     operations_declared: int = 0
     # The work the parse spent, in the units of `MAX_PARSE_WORK`.
     work: int = 0
+    # How many attribute values were longer than their cap and therefore not
+    # kept (`_ATTRIBUTE_CAPS`); more than 0 means the result may lack what
+    # those attributes said (a label, a skipped element, a namespace).
+    attributes_dropped: int = 0
 
 
 class _Work:
@@ -339,6 +402,7 @@ class _Work:
     def __init__(self) -> None:
         self.spent = 0
         self.truncated = False
+        self.attributes_dropped = 0
         # id(element) -> its children by tag. The elements live as long as
         # the tree, which outlives every use of this object.
         self._kids: dict[int, dict[str, list[ET.Element]]] = {}
@@ -420,16 +484,26 @@ def _local(name: str) -> str:
     return name.rpartition(" ")[2]
 
 
-def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
+def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.Element, str]:
     """The document as a tree of local names, plus the root's namespace.
 
     expat is driven directly instead of through ``ET.XMLParser`` so that the
     DTD handlers are ours: the C ``XMLParser`` does not expose its expat
     parser, and its default is to accept an internal DTD.
+
+    This is where the input is bounded, once: at most ``MAX_ELEMENTS``
+    elements, and no attribute value longer than its cap (``_ATTRIBUTE_CAPS``,
+    else ``_MAX_ATTRIBUTE_CHARS``). A longer value is not kept -- never cut:
+    cut, it would be a value the document never gave -- and its name is
+    noted on the element (``_dropped``). ``counts["attributes_dropped"]`` is
+    how many there were.
     """
     builder = ET.TreeBuilder()
     parser = expat.ParserCreate(namespace_separator=" ")
     depth = 0
+    elements = 0
+    dropped = 0
+    limit = MAX_ELEMENTS
     root_namespace: list[str] = []
     # Per open element: the text collected for it, or None when its text is
     # not kept (any more). `room` is what the innermost element may still take.
@@ -437,10 +511,16 @@ def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
     room = 0
 
     def start(name: str, attrs: dict[str, str]) -> None:
-        nonlocal depth, room
+        nonlocal depth, room, elements, dropped
         depth += 1
         if depth > MAX_DEPTH:
             raise MetadataError(f"the document is nested deeper than {MAX_DEPTH} levels")
+        elements += 1
+        if elements > limit:
+            raise MetadataError(
+                f"the $metadata document is too large to read: it has more than "
+                f"{limit} elements"
+            )
         if depth == 1:
             root_namespace.append(name.rpartition(" ")[0])
         if texts and texts[-1] is not None:
@@ -453,6 +533,14 @@ def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
         # the same local name.
         flat = {_local(k): v for k, v in attrs.items() if " " in k}
         flat.update((k, v) for k, v in attrs.items() if " " not in k)
+        for key in [
+            k for k, v in flat.items() if len(v) > _ATTRIBUTE_CAPS.get(k, _MAX_ATTRIBUTE_CHARS)
+        ]:
+            # Absent, and noted: an annotation of the same local name that
+            # was overwritten above is gone either way.
+            del flat[key]
+            flat[_DROPPED_PREFIX + key] = ""
+            dropped += 1
         builder.start(_local(name), flat)
 
     def end(name: str) -> None:
@@ -495,10 +583,18 @@ def _parse_tree(xml: bytes) -> tuple[ET.Element, str]:
         # expat's message carries a line/column and, chained, the context;
         # neither is needed and the input may be a page with a session in it.
         raise MetadataError(_NOT_EDMX) from None
+    if counts is not None:
+        counts["attributes_dropped"] = dropped
     return root, (root_namespace[0] if root_namespace else "")
 
 
 # -------------------------------------------------------------------- helpers
+
+
+def _dropped(element: ET.Element, name: str) -> bool:
+    """Whether the element HAD attribute ``name`` with a value too long to
+    keep. Asked only where a missing attribute has a meaning of its own."""
+    return element.get(_DROPPED_PREFIX + name) is not None
 
 
 def _flag(element: ET.Element, name: str) -> bool:
@@ -566,7 +662,10 @@ def _type_name(element: ET.Element, *, default: str = "Edm.String") -> str | Non
     the attribute and passes ``default=""``: a guessed type would decide how
     a value is quoted in a URL.
     """
-    value = (element.get("Type") or "").strip() or default
+    raw = element.get("Type")
+    if raw is None and _dropped(element, "Type"):
+        return None  # there was a type, too long to keep: never the default
+    value = (raw or "").strip() or default
     return value if value and len(value) <= _MAX_TYPE_CHARS else None
 
 
@@ -792,7 +891,9 @@ def _entity_set_drafts(
                     )
                 )
                 continue
-            if len(entity_type) > _MAX_TYPE_CHARS:
+            if len(entity_type) > _MAX_TYPE_CHARS or (
+                not entity_type and _dropped(element, "EntityType")
+            ):
                 skipped.append(SkippedElement("entity_set", name, position, "invalid_type"))
                 continue
             safe_type = _safe_type(entity_type)
@@ -1053,7 +1154,7 @@ def _v2_operation(
     if name is None:
         return "invalid_name"
     http_method = (element.get("HttpMethod") or "").strip().upper() or "GET"
-    if http_method not in _HTTP_METHODS:
+    if http_method not in _HTTP_METHODS or _dropped(element, "HttpMethod"):
         # PUT / DELETE / MERGE exist in V2, but the tools call an operation
         # with GET or POST only, and `OperationDef` stores nothing else.
         return "unsupported_http_method"
@@ -1089,6 +1190,8 @@ def _v2_operation(
     if named is not None:
         found = sets.drafts.get(named.strip())
         named = found.name if found is not None and found.container is container else ""
+    elif _dropped(element, "EntitySet"):
+        named = ""  # a set was named: the type alone does not decide
     return ParsedOperation(
         name=name,
         qualified_name="",  # a V2 function import is addressed by its plain name
@@ -1193,6 +1296,7 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
         entity_sets_declared=sets_declared,
         operations_declared=operations_declared,
         work=work.spent,
+        attributes_dropped=work.attributes_dropped,
     )
 
 
@@ -1232,7 +1336,7 @@ class _Annotations:
         self._values: dict[int, dict[str | None, list[ET.Element]]] = {}
         for schema in schemas.elements:
             for block in work.kids(schema, "Annotations"):
-                if not block.get("Qualifier"):
+                if not block.get("Qualifier") and not _dropped(block, "Qualifier"):
                     target = self._target(block.get("Target"))
                     self._sort(block, self._blocks.setdefault(target, {}))
 
@@ -1257,7 +1361,7 @@ class _Annotations:
 
     def _sort(self, source: ET.Element, into: dict[str, list[ET.Element]]) -> None:
         for annotation in self._work.kids(source, "Annotation"):
-            if annotation.get("Qualifier"):
+            if annotation.get("Qualifier") or _dropped(annotation, "Qualifier"):
                 continue
             term = self._term(annotation.get("Term"))
             if term is not None:
@@ -1671,7 +1775,9 @@ def _v4_operation(
         # navigation) is not followed; without one the type decides.
         path = (element.get("EntitySetPath") or "").strip()
         own = binding is not None and path and path == (binding.get("Name") or "").strip()
-        named = candidates[0] if own else "" if path else None
+        named = candidates[0] if own else None
+        if not own and (path or _dropped(element, "EntitySetPath")):
+            named = ""
         return [
             ParsedOperation(
                 name=name,
@@ -1710,6 +1816,8 @@ def _v4_operation(
                 named = found.name if place and schemas.name_of(found.container) == place else ""
             else:
                 named = found.name if found.container is container else ""
+        elif _dropped(imported, "EntitySet"):
+            named = ""
         outcomes.append(
             ParsedOperation(
                 name=import_name,
@@ -1848,6 +1956,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
         entity_sets_declared=sets_declared,
         operations_declared=operations_declared,
         work=work.spent,
+        attributes_dropped=work.attributes_dropped,
     )
 
 
@@ -1874,7 +1983,8 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     if _DTD_RE.search(xml):
         _refuse_dtd()
 
-    root, namespace = _parse_tree(xml)
+    counts: dict[str, int] = {}
+    root, namespace = _parse_tree(xml, counts)
     if root.tag != "Edmx":
         raise MetadataError(_NOT_EDMX)
     # EDMX 4.0 has its own (OASIS) namespace; every older one is Microsoft's.
@@ -1888,6 +1998,7 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     if not schemas:
         raise MetadataError(_NOT_EDMX)
     work = _Work()
+    work.attributes_dropped = counts.get("attributes_dropped", 0)
     if is_v4:
         return _parse_v4(root, _Schemas(schemas, work))
     return _parse_v2(_Schemas(schemas, work))

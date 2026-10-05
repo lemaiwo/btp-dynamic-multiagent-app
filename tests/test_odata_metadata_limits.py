@@ -431,7 +431,7 @@ def test_a_shared_base_types_labels_are_cleaned_once(version, monkeypatch):
         return real(ch)
 
     monkeypatch.setattr(metadata.unicodedata, "category", category)
-    long_label = "​" * 4_000 + "Amount"  # zero-width, then the label
+    long_label = "​" * 1_000 + "Amount"  # zero-width, then the label (under the cap)
     if version == "v2":
         sap = 'xmlns:sap="http://www.sap.com/Protocols/SAPData"'
         head = V2_HEAD.replace("<Schema ", f"<Schema {sap} ")
@@ -459,9 +459,10 @@ def test_a_shared_base_types_labels_are_cleaned_once(version, monkeypatch):
     assert calls[0] < 4 * len(long_label)
 
 
-def test_a_long_shared_name_is_charged_where_it_is_copied(monkeypatch):
-    """A name that many elements share (container, namespace) is copied into
-    a target or a qualified name per element: charged by its length."""
+def test_a_long_shared_name_is_dropped_where_the_document_is_read():
+    """A name that many elements share (container, namespace) was copied into
+    a target or a qualified name per element, and charged by its length. It
+    no longer gets that far: a name no model can hold is not kept at all."""
     name = "C" * 50_000
     types = "".join(
         f'<EntityType Name="T{i}"><Key><PropertyRef Name="Ghost"/></Key></EntityType>'
@@ -471,13 +472,16 @@ def test_a_long_shared_name_is_charged_where_it_is_copied(monkeypatch):
     document = (
         V4_HEAD + types + f'<EntityContainer Name="{name}">{sets}</EntityContainer>' + V4_TAIL
     ).encode()
-    refused(document, "v4", 2_000, monkeypatch)
+    parsed = parse_metadata(document, "v4")
+    assert parsed.attributes_dropped == 1 and parsed.work < 2_000
     namespace = "N" * 50_000
     actions = '<Action Name="A"/>' * 300
     document = (
         V4_HEAD.replace('Namespace="NS"', f'Namespace="{namespace}"') + actions + V4_TAIL
     ).encode()
-    refused(document, "v4", 2_000, monkeypatch)
+    parsed = parse_metadata(document, "v4")
+    assert parsed.attributes_dropped == 1 and parsed.work < 2_000
+    assert parsed.operations == () and parsed.operations_declared == 300
 
 
 def test_a_qualified_name_resolves_as_before():
@@ -518,3 +522,166 @@ def test_a_qualified_name_resolves_as_before():
     refs += [".".join(rng.choice(parts) for _ in range(rng.randint(1, 6))) for _ in range(3_000)]
     for ref in refs:
         assert resolver.canonical(ref) == before(ref), ref
+
+
+# -- input caps where the document is read (task M1, section D) ----------------------
+#
+# The tree builder is the one place every attribute and element passes. What
+# it does not keep, no later loop can copy, strip, lower or compare.
+
+SAP_NS = 'xmlns:sap="http://www.sap.com/Protocols/SAPData"'
+
+
+def _longest_attribute(root) -> int:
+    return max((len(v) for e in root.iter() for v in e.attrib.values()), default=0)
+
+
+def test_an_attribute_value_of_megabytes_is_not_kept_and_not_looked_at_again():
+    """(a) `Bool="..."` was stripped and lowered, megabytes at a time, for
+    every lookup of the restriction."""
+    huge = "false" + " " * 3_000_000
+    restricted = (
+        '<Annotation Term="Capabilities.InsertRestrictions"><Record>'
+        f'<PropertyValue Property="Insertable" Bool="{huge}"/></Record></Annotation>'
+    )
+    document = v4(1, 3, set_body=restricted)
+    root, _ = metadata._parse_tree(document)
+    assert _longest_attribute(root) <= 1024
+    parsed = parse_metadata(document, "v4")
+    assert parsed.attributes_dropped == 1
+    # Absent, not cut: "false" followed by padding is not a value the document gave.
+    assert parsed.entity_sets[0].creatable is True
+    # At the cap it is still a value.
+    at_cap = restricted.replace(huge, "false" + " " * (1024 - 5))
+    parsed = parse_metadata(v4(1, 3, set_body=at_cap), "v4")
+    assert parsed.attributes_dropped == 0 and parsed.entity_sets[0].creatable is False
+
+
+@pytest.mark.parametrize("attribute", ["Namespace", "Alias"])
+def test_a_long_namespace_is_not_copied_into_every_name_of_its_schema(attribute):
+    """(b) a megabyte of namespace, repeated in the qualified name of every
+    small element of the schema: hundreds of megabytes from a small document."""
+    long = "N" * 200_000
+    types = "".join(f'<EntityType Name="T{i}"/>' for i in range(2_000))
+    head = V4_HEAD.replace('Namespace="NS"', f'Namespace="NS" {attribute}="{long}"').replace(
+        f'Namespace="NS" Namespace="{long}"', f'Namespace="{long}"'
+    )
+    document = (head + types + '<EntityContainer Name="C"/>' + V4_TAIL).encode()
+    root, _ = metadata._parse_tree(document)
+    assert _longest_attribute(root) <= 1024
+    schemas = metadata._Schemas(list(root.iter("Schema")))
+    retained = sum(len(key) + len(value[0]) for key, value in schemas.entity_types.items())
+    assert len(schemas.entity_types) >= 2_000 and retained < 2_000 * 100
+    parsed = parse_metadata(document, "v4")
+    assert parsed.attributes_dropped == 1 and parsed.work < 100
+
+
+def test_a_long_name_repeated_on_many_elements_is_skipped_and_recorded():
+    """(b) the other way round: many elements, each with its own long name."""
+    sets = "".join(f'<EntitySet Name="{"S" * 5_000}{i}" EntityType="NS.T"/>' for i in range(500))
+    document = v2(1, 2).replace(b"</EntityContainer>", sets.encode() + b"</EntityContainer>")
+    root, _ = metadata._parse_tree(document)
+    assert _longest_attribute(root) <= 1024
+    parsed = parse_metadata(document, "v2")
+    assert parsed.attributes_dropped == 500 and [e.name for e in parsed.entity_sets] == ["S0"]
+    assert [s.reason for s in parsed.skipped] == ["invalid_name"] * 500
+    assert parsed.entity_sets_declared == 501
+
+
+def test_a_name_at_the_models_limit_is_kept_and_one_just_past_the_cap_is_not():
+    for length, kept in ((128, True), (129, False), (256, False), (257, False), (5_000, False)):
+        name = "S" * length
+        document = v2(0, 2).replace(
+            b"</EntityContainer>",
+            f'<EntitySet Name="{name}" EntityType="NS.T"/></EntityContainer>'.encode(),
+        )
+        parsed = parse_metadata(document, "v2")
+        assert [e.name for e in parsed.entity_sets] == ([name] if kept else []), length
+        assert [s.reason for s in parsed.skipped] == ([] if kept else ["invalid_name"]), length
+        assert parsed.attributes_dropped == (1 if length > 256 else 0), length
+
+
+def test_a_dropped_attribute_never_falls_back_to_a_default():
+    """Absent has a meaning for some attributes (a V2 `Type` is `Edm.String`,
+    `m:HttpMethod` is GET, no `Qualifier` is the plain annotation). An
+    attribute that was there and too long is none of those."""
+    long = "X" * 5_000
+    document = (
+        V2_HEAD.replace("<Schema ", f"<Schema {SAP_NS} ")
+        + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+        '<Property Name="Id" Type="Edm.String"/>'
+        f'<Property Name="Odd" Type="{long}"/></EntityType>'
+        '<EntityContainer Name="C" m:IsDefaultEntityContainer="true">'
+        '<EntitySet Name="S" EntityType="NS.T"/>'
+        f'<EntitySet Name="Typeless" EntityType="{long}"/>'
+        f'<FunctionImport Name="Method" m:HttpMethod="{long}"/>'
+        f'<FunctionImport Name="Param"><Parameter Name="P" Type="{long}" Mode="In"/>'
+        "</FunctionImport>"
+        f'<FunctionImport Name="Returns" ReturnType="NS.T" EntitySet="{long}"/>'
+        f'<FunctionImport Name="ReturnType" ReturnType="{long}" EntitySet="S"/>'
+        f"</EntityContainer>{V2_TAIL}"
+    ).encode()
+    parsed = parse_metadata(document, "v2")
+    assert parsed.attributes_dropped == 6
+    assert [(e.name, [f.name for f in e.fields]) for e in parsed.entity_sets] == [("S", ["Id"])]
+    assert sorted((s.kind, s.reason) for s in parsed.skipped) == [
+        ("entity_set", "invalid_type"),
+        ("operation", "invalid_parameter"),
+        ("operation", "unsupported_http_method"),
+        ("property", "invalid_type"),
+    ]
+    by_name = {o.name: o.returns for o in parsed.operations}
+    # A set was named and could not be read: not replaced by "the only set of the type".
+    assert by_name["Returns"].entity_set is None and by_name["ReturnType"] is None
+    # V4: an annotation with a qualifier is not the plain one, however long the qualifier.
+    qualified = f'<Annotation Term="Common.Label" Qualifier="{long}" String="Qualified"/>'
+    parsed = parse_metadata(v4(1, 2, set_body=qualified), "v4")
+    assert parsed.attributes_dropped == 1 and parsed.entity_sets[0].label == ""
+
+
+def test_the_number_of_elements_is_capped(monkeypatch):
+    # Generous for a real service: the largest have a few hundred thousand.
+    assert metadata.MAX_ELEMENTS >= 300_000
+    document = v2(1, 500)
+    elements = document.count(b"<") - document.count(b"</") - 1  # minus the declaration
+    monkeypatch.setattr(metadata, "MAX_ELEMENTS", elements)
+    assert len(parse_metadata(document, "v2").entity_sets[0].fields) == 500
+    monkeypatch.setattr(metadata, "MAX_ELEMENTS", elements - 1)
+    with pytest.raises(MetadataError, match="too large to read") as error:
+        parse_metadata(document, "v2")
+    assert "F0" not in str(error.value) and str(elements - 1) in str(error.value)
+
+
+@pytest.mark.parametrize("version", ["v2", "v4"])
+def test_a_long_but_legitimate_label_or_description_still_parses(version):
+    label = "Purchase requisition item " * 23  # 598 characters
+    essay = "A very thorough description. " * 400  # 11,600 characters
+    if version == "v2":
+        document = (
+            V2_HEAD.replace("<Schema ", f"<Schema {SAP_NS} ")
+            + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+            f'<Property Name="Id" Type="Edm.String" sap:label="{label}" sap:quickinfo="{essay}"/>'
+            "</EntityType>"
+            '<EntityContainer Name="C" m:IsDefaultEntityContainer="true">'
+            f'<EntitySet Name="S" EntityType="NS.T" sap:label="{label}"/>'
+            f"</EntityContainer>{V2_TAIL}"
+        ).encode()
+    else:
+        note = (
+            f'<Annotation Term="Common.Label" String="{label}"/>'
+            f'<Annotation Term="Core.LongDescription" String="{essay}"/>'
+        )
+        document = (
+            V4_HEAD
+            + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+            f'<Property Name="Id" Type="Edm.String">{note}</Property></EntityType>'
+            f'<EntityContainer Name="C"><EntitySet Name="S" EntityType="NS.T">{note}</EntitySet>'
+            f"</EntityContainer>{V4_TAIL}"
+        ).encode()
+    parsed = parse_metadata(document, version)
+    (entity_set,) = parsed.entity_sets
+    expected = label.strip()[: metadata.MAX_LABEL_CHARS]
+    assert entity_set.label == expected and entity_set.fields[0].label == expected
+    assert parsed.skipped == ()
+    # Only the texts nobody reads were too long to keep.
+    assert parsed.attributes_dropped == (1 if version == "v2" else 2)
