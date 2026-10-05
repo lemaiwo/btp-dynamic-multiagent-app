@@ -149,7 +149,8 @@ def _split_endpoint_url(
     try:
         parts = urlsplit(v)
     except ValueError as e:
-        raise ValueError(f"{field}: invalid URL: {e}") from e
+        # Not the parser's text: it quotes the host it choked on.
+        raise ValueError(f"{field}: invalid URL") from e
     schemes = ("https", "http") if allow_http else ("https",)
     if parts.scheme not in schemes:
         if allow_http:
@@ -374,7 +375,15 @@ class OAuthClientPayload(BaseModel):
         # field, not a 403 from a proxy that saw a doubled prefix mid-run.
         from agents.jira_tools import normalize_api_base
 
-        normalize_api_base(v)
+        try:
+            normalize_api_base(v)
+        except ValueError:
+            # The helper's own text quotes the value (fine for a run log,
+            # not for the answer to a refused save).
+            raise ValueError(
+                "api_base must be a path starting with '/', without a host, "
+                "query, fragment or '..': the host comes from the destination"
+            ) from None
         return (v or "").strip()
 
     @field_validator("lookback")
@@ -384,7 +393,14 @@ class OAuthClientPayload(BaseModel):
         # 400 surfacing mid-run with no hint where it came from.
         from agents.lookback import parse_lookback
 
-        parse_lookback(v)
+        try:
+            parse_lookback(v)
+        except ValueError:
+            # As for `api_base`: name the rule, not the value.
+            raise ValueError(
+                "lookback must be a positive number of hours or a value with a "
+                "unit such as '90m', '5h', '2d', '1w' (at most 100 years)"
+            ) from None
         return (v or "").strip()
 
     def to_config(self) -> dict[str, Any]:
@@ -654,7 +670,7 @@ class McpServerPayload(BaseModel):
                 and not cfg.get("mailbox")
             ):
                 raise ValueError(
-                    f"{self.url} with auth_mode=client_credentials requires "
+                    f"{_server_key(self.url)} with auth_mode=client_credentials requires "
                     "oauth.mailbox: an app-only token identifies no user, so the "
                     "target mailbox has to be named"
                 )
@@ -717,7 +733,8 @@ class McpServerPayload(BaseModel):
         if v.lower().startswith("builtin"):
             if not is_builtin_url(v):
                 raise ValueError(
-                    f"unknown built-in toolset {v!r}; known: {', '.join(sorted(BUILTIN_URLS))}"
+                    "url names an unknown built-in toolset; known: "
+                    f"{', '.join(sorted(BUILTIN_URLS))}"
                 )
             self.url = v.lower()
             return self
@@ -735,7 +752,8 @@ class McpServerPayload(BaseModel):
         try:
             HttpUrl(v)
         except Exception as e:
-            raise ValueError(f"invalid URL: {e}") from e
+            # Not pydantic's text: it carries `input_value=<the url>`.
+            raise ValueError("url is not a valid URL") from e
         # Host allow-list applies to authenticated (JWT-forwarding) servers
         # only. Public servers are unrestricted by design. The decision is
         # made on the parsed hostname by DNS label, never on the raw string:
@@ -2605,7 +2623,7 @@ def _validate_mail_theme(url: str, theme: Any) -> None:
     if key not in _MAIL_THEME_URLS:
         raise ValueError(
             f"oauth.theme is only supported for {', '.join(sorted(_MAIL_THEME_URLS))}; "
-            f"{key} sends no report mail"
+            f"{key if is_builtin_url(key) else 'this server'} sends no report mail"
         )
     MailTheme.from_config(theme)
 
@@ -2618,7 +2636,8 @@ def _validate_smtp_config(cfg: dict[str, Any]) -> None:
     bad = [r for r in recipients if not is_address(r)]
     if bad:
         raise ValueError(
-            f"oauth.recipients: not a valid recipient address: {', '.join(bad)}"
+            f"oauth.recipients: {len(bad)} of {len(recipients)} entries are not a "
+            "valid recipient address"
         )
     if cfg.get("allow_send") is True and not recipients:
         raise ValueError(

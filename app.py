@@ -522,8 +522,10 @@ app.include_router(runs_router)
 # The two routers share no path, so their order does not matter.
 app.include_router(ide_review_router)
 app.include_router(ide_router)
-# A refused IDE request is a 422 that never echoes the input (a lone
-# surrogate in it made FastAPI's own 422 a 500).
+# A refused request is a 422 that never echoes the input, on every route
+# (agents/validation_errors.py): a credential pasted into a refused field
+# must not come back, and a lone surrogate in it made FastAPI's own 422
+# a 500.
 install_validation_handler(app)
 
 

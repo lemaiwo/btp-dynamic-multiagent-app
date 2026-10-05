@@ -108,7 +108,7 @@ class MailTheme:
         unknown = sorted(str(k) for k in cfg if k not in known)
         if unknown:
             raise ValueError(
-                f"theme has unknown key(s): {', '.join(unknown)} "
+                f"theme has {len(unknown)} unknown key(s) "
                 f"(allowed: {', '.join(sorted(known))})"
             )
         values: dict[str, str] = {}

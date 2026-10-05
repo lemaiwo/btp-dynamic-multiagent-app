@@ -1525,7 +1525,7 @@ def validate_api_slug(slug: str | None) -> str | None:
         return None
     if not API_SLUG_RE.match(text_):
         raise ValueError(
-            f"api_slug {text_!r} is invalid: use lower-case letters, digits and "
+            "api_slug is invalid: use lower-case letters, digits and "
             "hyphens, starting with a letter or digit (max 64 characters)"
         )
     return text_

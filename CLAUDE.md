@@ -44,6 +44,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin`/`require_developer` FastAPI dependencies
   (`require_developer` = the `$XSAPPNAME.developer` scope, for the ABAP Assistant)
+- `agents/validation_errors.py` — the app-wide answer to a refused request
+  (`RequestValidationError`): 422 with `detail[]` of `loc`/`msg`/`type` only,
+  never `input`/`ctx`/`url`, on every route (`install_validation_handler`,
+  re-exported by `agents.ide.routes`, called by `app.py`). Save-time
+  validators name the field instead of quoting the value; routes that
+  validate in the handler keep their string `detail`
+  (`tests/test_admin_validation_errors.py`)
 - `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
   on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`.
   `create_mcp_server` returns a `PerRunMCPServer`: the registry shares one
@@ -429,7 +436,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     changing or clearing the `destination` of a flagged target
     (`conventions_destination`), in the write's own transaction. A refused
     request body is a 422 `detail[]` of `loc`/`msg`/`type` only, never the
-    input (`install_validation_handler`, installed by `app.py`; a lone
+    input (`agents/validation_errors.py`; a lone
     surrogate echoed back made it a 500); session titles are stored as
     one-line plain text.
     `POST .../open` and `GET /objects/search` stay but the UI no longer
