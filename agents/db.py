@@ -25,9 +25,13 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     delete,
+    exists,
     func,
+    insert,
+    literal,
     select,
     text,
+    update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -937,6 +941,8 @@ DEFAULT_RUN_PROMPT = (
 # ---------------------------------------------------------------------------
 async def init_db() -> None:
     """Create tables and ensure an orchestrator config row exists."""
+    import agents.ide.models  # noqa: F401  (registers the IDE tables on Base)
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Lightweight migrations: SQLAlchemy create_all doesn't add columns
@@ -991,10 +997,45 @@ async def init_db() -> None:
         # --- deep agents ---
         await _ensure_column(conn, "agent_configs", "deep_json", "TEXT")
         await _ensure_column(conn, "job_runs", "activity_json", "TEXT")
+        # --- IDE phase 1c: diagnose sessions ---
+        await _ensure_column(
+            conn, "ide_sessions", "session_type", "VARCHAR(16) NOT NULL DEFAULT 'change'"
+        )
+        await _ensure_column(
+            conn, "ide_conventions", "non_production", "BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        await _ensure_column(conn, "ide_findings", "detail", "TEXT")
+        # --- IDE redesign: file revisions, comments, pins, base check ---
+        # Additive only. ide_file_revisions / ide_comments (and the
+        # ix_ide_comments_session_state index) are new tables, so create_all
+        # above creates them; existing rows get revision 0 and NULLs.
+        tstz = (
+            "TIMESTAMP WITH TIME ZONE"
+            if conn.dialect.name == "postgresql"
+            else "TIMESTAMP"
+        )
+        await _ensure_column(conn, "ide_sessions", "pins_json", "TEXT")
+        await _ensure_column(conn, "ide_artifacts", "based_on_json", "TEXT")
+        await _ensure_column(
+            conn, "ide_workspace_files", "revision", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(
+            conn, "ide_workspace_files", "origin_version", "VARCHAR(255)"
+        )
+        await _ensure_column(conn, "ide_workspace_files", "base_status", "VARCHAR(8)")
+        await _ensure_column(conn, "ide_workspace_files", "base_checked_at", tstz)
+        # ide_comments already exists where the redesign ran before quotes.
+        await _ensure_column(conn, "ide_comments", "quote", "VARCHAR(200)")
+        await _backfill_ide_revisions(conn)
+        await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
         # existing deployment needs them added here.
         await _ensure_index(conn, "uq_agent_configs_api_slug", "agent_configs", "api_slug")
         await _ensure_index(conn, "uq_workflows_api_slug", "workflows", "api_slug")
+        await _ensure_unique_index(
+            conn, "uq_ide_artifacts_version", "ide_artifacts",
+            ("session_id", "kind", "version"),
+        )
 
     async with SessionLocal() as session:
         existing = await session.get(OrchestratorConfig, 1)
@@ -1003,6 +1044,160 @@ async def init_db() -> None:
                 OrchestratorConfig(id=1, instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
             )
             await session.commit()
+
+
+async def _backfill_ide_revisions(conn) -> None:
+    """Give every pre-redesign proposal its revision 1, once.
+
+    A workspace file saved before revisions existed holds a proposal with
+    ``revision = 0``: nothing could comment on, pin or approve it. Each such
+    row gets ``IdeFileRevision(1, its proposal, run_id NULL)``. The claim is
+    a conditional UPDATE (``revision = 0`` -> 1) and the revision is
+    inserted only by the transaction whose UPDATE matched, so two instances
+    starting together cannot both insert; an already existing revision row
+    is kept. A second start finds no ``revision = 0`` proposal: a no-op.
+    """
+    from agents.ide.models import IdeFileRevision, IdeWorkspaceFile
+
+    files = IdeWorkspaceFile.__table__
+    revisions = IdeFileRevision.__table__
+    pending = (
+        await conn.execute(
+            select(files.c.id, files.c.session_id, files.c.path).where(
+                files.c.proposed_source.is_not(None), files.c.revision == 0
+            )
+            # One order for every instance: two starting together then lock
+            # the rows they both claim in the same sequence (no deadlock).
+            .order_by(files.c.id)
+        )
+    ).all()
+    for fid, sid, path in pending:
+        claimed = await conn.execute(
+            update(files)
+            .where(files.c.id == fid, files.c.revision == 0)
+            .values(revision=1)
+        )
+        if claimed.rowcount != 1:
+            continue  # another instance did it
+        exists = (
+            await conn.execute(
+                select(revisions.c.id).where(
+                    revisions.c.session_id == sid,
+                    revisions.c.path == path,
+                    revisions.c.revision == 1,
+                )
+            )
+        ).first()
+        if exists is not None:
+            continue
+        await conn.execute(
+            insert(revisions).from_select(
+                ["id", "session_id", "path", "revision", "proposed_source",
+                 "created_at"],
+                select(
+                    literal(str(uuid.uuid4())),
+                    files.c.session_id,
+                    files.c.path,
+                    literal(1),
+                    files.c.proposed_source,
+                    literal(datetime.now(timezone.utc), DateTime(timezone=True)),
+                ).where(files.c.id == fid),
+            )
+        )
+
+
+async def _resync_ide_revisions(conn) -> None:
+    """Re-align proposals that 2.18.0 code edited after a rollback.
+
+    2.18.0 rewrites ``proposed_source`` (and creates or deletes file rows)
+    without knowing ``revision`` or ``ide_file_revisions``. After rolling
+    forward, a file's ``revision`` can then name a revision whose text is
+    not the proposal, or lie below revisions that exist for its path (a file
+    deleted and written again). Comments, pins and approve would point at
+    the wrong text, and the next save (``revision + 1``) would collide.
+
+    Runs after :func:`_backfill_ide_revisions` (no proposal is at revision 0
+    any more). For every proposal whose revision row is missing, holds other
+    text, or is not the path's latest:
+
+    * the path's latest revision holds the proposal -> the file points at it;
+    * otherwise a NEW revision ``max(latest, revision) + 1`` with the
+      proposal's text is added (``run_id`` NULL, like the backfill).
+
+    Additive: no revision row is changed or removed. The file update is
+    conditional on the revision that was read, and the insert copies the
+    text from the row inside the same transaction, so two instances starting
+    together cannot both add one. A consistent database is a no-op.
+    """
+    from agents.ide.models import IdeFileRevision, IdeWorkspaceFile
+
+    files = IdeWorkspaceFile.__table__
+    revisions = IdeFileRevision.__table__
+    same_path = (revisions.c.session_id == files.c.session_id) & (
+        revisions.c.path == files.c.path
+    )
+    matching = exists().where(
+        same_path,
+        revisions.c.revision == files.c.revision,
+        revisions.c.proposed_source == files.c.proposed_source,
+    )
+    newer = exists().where(same_path, revisions.c.revision > files.c.revision)
+    pending = (
+        await conn.execute(
+            select(files.c.id, files.c.session_id, files.c.path, files.c.revision)
+            .where(files.c.proposed_source.is_not(None), ~matching | newer)
+            .order_by(files.c.id)
+        )
+    ).all()
+    for fid, sid, path, seen in pending:
+        latest = (
+            await conn.execute(
+                select(revisions.c.revision, revisions.c.proposed_source)
+                .where(revisions.c.session_id == sid, revisions.c.path == path)
+                .order_by(revisions.c.revision.desc())
+                .limit(1)
+            )
+        ).first()
+        proposal = (
+            await conn.execute(
+                select(files.c.proposed_source).where(files.c.id == fid)
+            )
+        ).scalar_one_or_none()
+        if proposal is None:
+            continue
+        if latest is not None and latest[1] == proposal:
+            await conn.execute(
+                update(files)
+                .where(files.c.id == fid, files.c.revision == seen)
+                .values(revision=latest[0])
+            )
+            continue
+        number = max(latest[0] if latest is not None else 0, seen or 0) + 1
+        claimed = await conn.execute(
+            update(files)
+            .where(files.c.id == fid, files.c.revision == seen)
+            .values(revision=number)
+        )
+        if claimed.rowcount != 1:
+            continue  # another instance did it
+        await conn.execute(
+            insert(revisions).from_select(
+                ["id", "session_id", "path", "revision", "proposed_source",
+                 "created_at"],
+                select(
+                    literal(str(uuid.uuid4())),
+                    files.c.session_id,
+                    files.c.path,
+                    literal(number),
+                    files.c.proposed_source,
+                    literal(datetime.now(timezone.utc), DateTime(timezone=True)),
+                ).where(files.c.id == fid),
+            )
+        )
+        logger.warning(
+            "IDE file %s: proposal changed outside revisions; added revision %d",
+            fid, number,
+        )
 
 
 async def _ensure_column(conn, table: str, column: str, ddl_type: str) -> None:
@@ -1035,18 +1230,55 @@ async def _ensure_index(conn, name: str, table: str, column: str) -> None:
     same statement on SQLite and Postgres. A pre-existing duplicate makes the
     statement fail; that is logged rather than raised, because refusing to
     start would take the whole app down over two rows an operator can fix in
-    the admin UI (get_agent_by_slug tolerates the duplicate meanwhile).
+    the admin UI (get_agent_by_slug tolerates the duplicate meanwhile). On
+    Postgres the attempt runs in a SAVEPOINT, as in
+    :func:`_ensure_unique_index`: a failed statement would otherwise abort
+    the whole migration transaction.
     """
+    ddl = text(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({column}) "
+        f"WHERE {column} IS NOT NULL"
+    )
     try:
-        await conn.execute(text(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({column}) "
-            f"WHERE {column} IS NOT NULL"
-        ))
+        if conn.dialect.name == "postgresql":
+            async with conn.begin_nested():
+                await conn.execute(ddl)
+        else:
+            await conn.execute(ddl)
     except Exception:
         logger.warning(
             "Could not create index %s on %s(%s); duplicate slugs may exist. "
             "Fix them in the admin UI and restart.",
             name, table, column, exc_info=True,
+        )
+
+
+async def _ensure_unique_index(
+    conn, name: str, table: str, columns: tuple[str, ...]
+) -> None:
+    """Idempotently add a unique index over ``columns``.
+
+    A database written by an older version may hold duplicates; then the
+    index cannot be built. That is logged as a WARNING, never raised: the
+    app still starts, and the writer's retry keeps new rows unique. On
+    Postgres the attempt runs in a SAVEPOINT, because a failed statement
+    would otherwise abort the whole migration transaction.
+    """
+    ddl = text(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table} ({', '.join(columns)})"
+    )
+    try:
+        if conn.dialect.name == "postgresql":
+            async with conn.begin_nested():
+                await conn.execute(ddl)
+        else:
+            await conn.execute(ddl)
+    except Exception:
+        logger.warning(
+            "Could not create unique index %s on %s(%s); duplicate rows may "
+            "exist. New rows stay unique; remove the duplicates and restart "
+            "to add the index.",
+            name, table, ", ".join(columns), exc_info=True,
         )
 
 
@@ -1252,6 +1484,18 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
         # The built-ins that gained destination mode later keep their own
         # pinned keys plus the user-context switch; see `# --- destinations ---`.
         return _clean_builtin_destination(src, builtin)
+    if builtin and not builtin.startswith("builtin:"):
+        # A remote MCP server through a destination: the destination holds
+        # URL and credential, so only its name and the user-context switch
+        # are stored. ``is True``: the string "false" must not decide whose
+        # token a request carries.
+        name = str(src.get("destination") or "").strip()
+        if not name:
+            raise ValueError("destination server requires a destination name")
+        remote: dict[str, Any] = {"destination": name}
+        if src.get("user_context") is True:
+            remote["user_context"] = True
+        return remote
     slack = builtin == "builtin:slack"
     for k in _SLACK_DEST_KEYS if slack else _DEST_KEYS:
         v = src.get(k)

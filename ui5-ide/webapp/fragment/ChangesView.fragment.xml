@@ -1,0 +1,162 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!--
+        The changes view (Task U10): the proposed objects, each with its base,
+        syntax and lint state, revision, counts, actions and its stacked diff.
+        Diffs reach the page only as diffModel.renderUnifiedHtml output
+        (escaped); syntax messages and comments are Text controls bound to
+        model values: never HTML, never parsed as binding syntax. The only
+        href is the validated adtUri of an object.
+        Cards are a VBox, not a sap.m.List: a list's item navigation would
+        take the arrow keys the diffs use to move between lines.
+    -->
+    <VBox id="changesView" class="ideChangesView" visible="{= ${s>/artifact/view} === 'changes' }">
+        <core:InvisibleText id="changesHint" text="{i18n>changesKeyboardHint}" />
+        <core:InvisibleText id="changesRowHint" text="{i18n>changesRowHint}" />
+        <FlexBox id="changesBar" class="ideChangesBar" alignItems="Center" justifyContent="SpaceBetween" wrap="Wrap">
+            <Text id="changesSummary" text="{s>/artifact/changes/summary}" />
+            <HBox id="changesNav" alignItems="Center">
+                <Button
+                    id="changesPrevious"
+                    text="{i18n>changesPrevious}"
+                    icon="sap-icon://navigation-up-arrow"
+                    type="Transparent"
+                    enabled="{= ${s>/artifact/changes/stops} > 0 }"
+                    ariaDescribedBy="changesHint"
+                    press=".onPreviousChange" />
+                <Button
+                    id="changesNext"
+                    text="{i18n>changesNext}"
+                    icon="sap-icon://navigation-down-arrow"
+                    type="Transparent"
+                    enabled="{= ${s>/artifact/changes/stops} > 0 }"
+                    ariaDescribedBy="changesHint"
+                    press=".onNextChange" />
+            </HBox>
+        </FlexBox>
+        <MessageStrip
+            id="changesNone"
+            text="{i18n>changesNone}"
+            type="Information"
+            showIcon="true"
+            visible="{= ${s>/artifact/changes/loaded} &amp;&amp; ${s>/artifact/changes/objects}.length === 0 }"
+            class="sapUiSmallMargin" />
+        <VBox
+            id="changesObjects"
+            items="{path: 's>/artifact/changes/objects', templateShareable: false}">
+            <VBox id="changesObject" class="ideChangesObject" busy="{s>busy}" busyIndicatorDelay="300">
+                <FlexBox id="changesObjectHead" class="ideChangesObjectHead" alignItems="Center" justifyContent="SpaceBetween" wrap="Wrap">
+                    <HBox id="changesObjectStates" alignItems="Center" wrap="Wrap">
+                        <Title id="changesObjectName" text="{s>name}" level="H4" class="sapUiSmallMarginEnd" />
+                        <Text id="changesObjectType" text="{s>typeText}" class="sapUiSmallMarginEnd" />
+                        <ObjectStatus id="changesBase" text="{s>base/text}" state="{s>base/state}" stateAnnouncementText="" icon="{s>base/icon}"
+                            class="sapUiSmallMarginEnd" />
+                        <ObjectStatus id="changesSyntax" text="{s>syntax/text}" state="{s>syntax/state}" stateAnnouncementText="" icon="{s>syntax/icon}"
+                            visible="{s>isObject}" class="sapUiSmallMarginEnd" />
+                        <ObjectStatus id="changesLint" text="{s>lint/text}" state="{s>lint/state}" stateAnnouncementText="" icon="{s>lint/icon}"
+                            visible="{s>isObject}" class="sapUiSmallMarginEnd" />
+                    </HBox>
+                    <HBox id="changesObjectActions" alignItems="Center" wrap="Wrap">
+                        <Text id="changesCounts" text="{s>countsText}" tooltip="{s>countsLabel}" class="sapUiSmallMarginEnd" />
+                        <core:InvisibleText id="changesRevisionLabel" text="{s>revisionLabel}" />
+                        <Select
+                            id="changesRevision"
+                            selectedKey="{s>revisionKey}"
+                            ariaLabelledBy="changesRevisionLabel"
+                            items="{path: 's>revisions', templateShareable: false}"
+                            change=".onChangesRevisionChange"
+                            visible="{= !${s>failed} }"
+                            class="sapUiSmallMarginEnd">
+                            <core:Item key="{s>key}" text="{s>text}" />
+                        </Select>
+                        <Button
+                            id="changesCommentButton"
+                            text="{s>selectionText}"
+                            icon="sap-icon://comment"
+                            visible="{= !!${s>selectionText} }"
+                            press=".onChangesCommentPress" />
+                        <Button
+                            id="changesCheckSyntax"
+                            text="{i18n>changesCheckSyntax}"
+                            type="Transparent"
+                            visible="{= ${s>isObject} &amp;&amp; !${s>failed} }"
+                            enabled="{= !${s>syntaxBusy} &amp;&amp; !${s>/running} }"
+                            press=".onCheckSyntax" />
+                        <Button
+                            id="changesRunLint"
+                            text="{i18n>changesRunLint}"
+                            type="Transparent"
+                            visible="{= ${s>isObject} &amp;&amp; !${s>failed} }"
+                            enabled="{= !${s>lintBusy} &amp;&amp; !${s>/running} &amp;&amp; !${s>lintOlder} }"
+                            tooltip="{s>lintTooltip}"
+                            press=".onRunLint" />
+                        <Link
+                            id="changesAdt"
+                            text="{i18n>changesOpenInAdt}"
+                            href="{s>adtHref}"
+                            target="_blank"
+                            tooltip="{s>adtTooltip}"
+                            visible="{= !!${s>adtHref} }"
+                            class="sapUiSmallMarginBegin" />
+                    </HBox>
+                </FlexBox>
+                <FlexBox id="changesFailed" alignItems="Center" wrap="Wrap" visible="{= !!${s>failed} }">
+                    <MessageStrip id="changesFailedText" text="{s>failedText}" type="Error" showIcon="true"
+                        class="sapUiSmallMarginEnd" />
+                    <Button id="changesRetry" text="{i18n>changesRetry}" icon="sap-icon://refresh" press=".onChangesRetry" />
+                </FlexBox>
+                <VBox
+                    id="changesSyntaxMessages"
+                    class="ideChangesSyntaxMessages"
+                    visible="{= ${s>syntaxMessages}.length > 0 }"
+                    items="{path: 's>syntaxMessages', templateShareable: false}">
+                    <Text id="changesSyntaxMessage" text="{s>text}" renderWhitespace="true" />
+                </VBox>
+                <Text
+                    id="changesHunksNote"
+                    class="ideChangesHunksNote"
+                    text="{s>hunksNote}"
+                    visible="{s>hunksOnly}" />
+                <core:HTML id="changesDiff" content="{s>html}" preferDOM="false" afterRendering=".onChangesDiffRendered" />
+                <Link
+                    id="changesShowSource"
+                    text="{i18n>changesOpenSource}"
+                    visible="{= !!${s>tooLarge} || !!${s>hunksOnly} }"
+                    press=".onChangesShowSource"
+                    class="sapUiSmallMarginBegin" />
+                <VBox
+                    id="changesComments"
+                    class="ideDocComments"
+                    visible="{= ${s>comments}.length > 0 }"
+                    items="{path: 's>comments', templateShareable: false}">
+                    <VBox id="changesComment" class="ideDocComment">
+                        <HBox id="changesCommentHead" alignItems="Center" wrap="Wrap">
+                            <Link id="changesCommentAnchor" text="{s>anchorText}" press=".onChangesCommentAnchorPress"
+                                class="sapUiSmallMarginEnd" />
+                            <ObjectStatus id="changesCommentState" text="{s>stateText}" state="{s>stateValue}" stateAnnouncementText="" icon="{s>icon}" />
+                        </HBox>
+                        <Text id="changesCommentBody" text="{s>body}" renderWhitespace="true" />
+                        <Text id="changesCommentAnswer" class="ideDocCommentAnswer" text="{s>answerText}" visible="{s>hasAnswer}" />
+                    </VBox>
+                </VBox>
+                <VBox
+                    id="changesOthers"
+                    class="ideDocOther"
+                    visible="{= ${s>others}.length > 0 }">
+                    <Title id="changesOthersTitle" text="{i18n>changesOtherComments}" level="H5" class="sapUiTinyMarginBottom" />
+                    <VBox id="changesOtherList" items="{path: 's>others', templateShareable: false}">
+                        <VBox id="changesOther" class="ideDocComment">
+                            <HBox id="changesOtherHead" alignItems="Center" wrap="Wrap">
+                                <Link id="changesOtherLink" text="{s>anchorText}" press=".onChangesOtherPress" class="sapUiSmallMarginEnd" />
+                                <ObjectStatus id="changesOtherState" text="{s>stateText}" state="{s>stateValue}" stateAnnouncementText="" icon="{s>icon}" />
+                            </HBox>
+                            <Text id="changesOtherBody" text="{s>body}" renderWhitespace="true" />
+                            <Text id="changesOtherAnswer" class="ideDocCommentAnswer" text="{s>answerText}" visible="{s>hasAnswer}" />
+                        </VBox>
+                    </VBox>
+                </VBox>
+            </VBox>
+        </VBox>
+    </VBox>
+</core:FragmentDefinition>

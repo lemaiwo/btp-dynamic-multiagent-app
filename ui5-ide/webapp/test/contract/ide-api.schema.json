@@ -1,0 +1,2874 @@
+{
+  "$defs": {
+    "ActivityOut": {
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/ToolEventOut"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "plan": {
+          "items": {
+            "$ref": "#/$defs/TodoOut"
+          },
+          "title": "Plan",
+          "type": "array"
+        },
+        "dropped": {
+          "title": "Dropped",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "events",
+        "plan",
+        "dropped"
+      ],
+      "title": "ActivityOut",
+      "type": "object"
+    },
+    "AdminSessionRowOut": {
+      "description": "The admin overview row: metadata only, never content, pins or counts\nof what is inside a session.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "owner": {
+          "title": "Owner",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "change",
+            "diagnose"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "chat",
+            "design",
+            "plan",
+            "propose",
+            "review",
+            "done",
+            "investigate"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "running"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Updated At"
+        }
+      },
+      "required": [
+        "id",
+        "owner",
+        "title",
+        "target",
+        "type",
+        "stage",
+        "status",
+        "created_at",
+        "updated_at"
+      ],
+      "title": "AdminSessionRowOut",
+      "type": "object"
+    },
+    "ApprovalDecision": {
+      "additionalProperties": false,
+      "description": "The whole body: a decision. Parameters are never taken from the\nclient; what is armed is what the stored proposal says.",
+      "properties": {
+        "decision": {
+          "enum": [
+            "approve",
+            "deny"
+          ],
+          "title": "Decision",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision"
+      ],
+      "title": "ApprovalDecision",
+      "type": "object"
+    },
+    "ApprovalOut": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "action": {
+          "enum": [
+            "trace_start",
+            "trace_cancel"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "params": {
+          "additionalProperties": true,
+          "title": "Params",
+          "type": "object"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "approved",
+            "denied",
+            "failed",
+            "expired"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "ttl_min": {
+          "title": "Ttl Min",
+          "type": "integer"
+        },
+        "decided_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Decided At"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Result"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Error Code"
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "params",
+        "status",
+        "created_at",
+        "ttl_min",
+        "decided_at",
+        "result",
+        "error_code"
+      ],
+      "title": "ApprovalOut",
+      "type": "object"
+    },
+    "ApproveBody": {
+      "additionalProperties": false,
+      "description": "``POST /sessions/{sid}/approve``: what the developer saw.\n\n``version``: the document version (decision D3). Omitted means \"the\nlatest\", as before pins; a version that is no longer the latest is\nrefused (409 ``version_changed``).\n\n``revisions``: in the propose stage, ``path -> revision`` of every\nproposal the developer saw. It must equal the current revision of every\nproposed file (same paths, same numbers), checked in the same locked,\nconditional step that pins them, or the approve is refused (409\n``version_changed``), so a stale tab never pins revisions it did not\nshow. Sent in another stage it is refused as 409 ``stage_changed``: the\ncaller still shows the propose stage. Omitted means today's behaviour.",
+      "properties": {
+        "version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Version"
+        },
+        "revisions": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "maxProperties": 200,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revisions"
+        }
+      },
+      "title": "ApproveBody",
+      "type": "object"
+    },
+    "ArtifactOut": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "chat",
+            "design",
+            "plan",
+            "propose",
+            "review",
+            "done",
+            "investigate"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "design",
+            "plan",
+            "review",
+            "note",
+            "report"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "based_on": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Based On"
+        },
+        "content": {
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "stage",
+        "kind",
+        "version",
+        "created_at",
+        "based_on",
+        "content"
+      ],
+      "title": "ArtifactOut",
+      "type": "object"
+    },
+    "ArtifactSummaryOut": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "chat",
+            "design",
+            "plan",
+            "propose",
+            "review",
+            "done",
+            "investigate"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "design",
+            "plan",
+            "review",
+            "note",
+            "report"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "based_on": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Based On"
+        }
+      },
+      "required": [
+        "id",
+        "stage",
+        "kind",
+        "version",
+        "created_at",
+        "based_on"
+      ],
+      "title": "ArtifactSummaryOut",
+      "type": "object"
+    },
+    "CommentCreate": {
+      "description": "A new comment on a file range or a document paragraph.",
+      "discriminator": {
+        "mapping": {
+          "document": "#/$defs/DocumentCommentCreate",
+          "file": "#/$defs/FileCommentCreate"
+        },
+        "propertyName": "anchor"
+      },
+      "oneOf": [
+        {
+          "$ref": "#/$defs/FileCommentCreate"
+        },
+        {
+          "$ref": "#/$defs/DocumentCommentCreate"
+        }
+      ],
+      "title": "CommentCreate"
+    },
+    "CommentOut": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "anchor": {
+          "enum": [
+            "file",
+            "document"
+          ],
+          "title": "Anchor",
+          "type": "string"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Path"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Revision"
+        },
+        "line_start": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line Start"
+        },
+        "line_end": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line End"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "enum": [
+                "design",
+                "plan",
+                "review",
+                "note",
+                "report"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Kind"
+        },
+        "version": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Version"
+        },
+        "paragraph": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Paragraph"
+        },
+        "body": {
+          "title": "Body",
+          "type": "string"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Quote"
+        },
+        "state": {
+          "enum": [
+            "open",
+            "sent",
+            "addressed",
+            "dismissed"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "answer": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Answer"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Updated At"
+        }
+      },
+      "required": [
+        "id",
+        "anchor",
+        "path",
+        "revision",
+        "line_start",
+        "line_end",
+        "kind",
+        "version",
+        "paragraph",
+        "body",
+        "quote",
+        "state",
+        "answer",
+        "created_at",
+        "updated_at"
+      ],
+      "title": "CommentOut",
+      "type": "object"
+    },
+    "CommentPatch": {
+      "additionalProperties": false,
+      "description": "Either an edit (only while open: a new ``body`` and/or ``quote``) or a\nuser transition (``state``). A ``quote`` left out keeps the stored one;\n``quote: null`` clears it.",
+      "properties": {
+        "body": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Body"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quote"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "enum": [
+                "open",
+                "dismissed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        }
+      },
+      "title": "CommentPatch",
+      "type": "object"
+    },
+    "ConventionsBody": {
+      "additionalProperties": false,
+      "description": "Update body; omitted fields keep their stored value.",
+      "properties": {
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "destination": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Destination"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Namespace"
+        },
+        "package": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Package"
+        },
+        "atc_variant": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Atc Variant"
+        },
+        "clean_core_level": {
+          "anyOf": [
+            {
+              "pattern": "^[A-D]$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Clean Core Level"
+        },
+        "free_text": {
+          "anyOf": [
+            {
+              "maxLength": 20000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Free Text"
+        },
+        "non_production": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Non Production"
+        }
+      },
+      "title": "ConventionsBody",
+      "type": "object"
+    },
+    "ConventionsCreate": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "destination": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Destination"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Namespace"
+        },
+        "package": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Package"
+        },
+        "atc_variant": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Atc Variant"
+        },
+        "clean_core_level": {
+          "anyOf": [
+            {
+              "pattern": "^[A-D]$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Clean Core Level"
+        },
+        "free_text": {
+          "anyOf": [
+            {
+              "maxLength": 20000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Free Text"
+        },
+        "non_production": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Non Production"
+        },
+        "target": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]{0,63}$",
+          "title": "Target",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "title": "ConventionsCreate",
+      "type": "object"
+    },
+    "ConventionsOut": {
+      "properties": {
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Label"
+        },
+        "destination": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Destination"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Namespace"
+        },
+        "package": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Package"
+        },
+        "atc_variant": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Atc Variant"
+        },
+        "clean_core_level": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Clean Core Level"
+        },
+        "free_text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Free Text"
+        },
+        "non_production": {
+          "title": "Non Production",
+          "type": "boolean"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Updated At"
+        }
+      },
+      "required": [
+        "target",
+        "label",
+        "destination",
+        "namespace",
+        "package",
+        "atc_variant",
+        "clean_core_level",
+        "free_text",
+        "non_production",
+        "updated_at"
+      ],
+      "title": "ConventionsOut",
+      "type": "object"
+    },
+    "ConventionsUpdate": {
+      "additionalProperties": false,
+      "description": "``PUT /conventions/{target}``: omitted fields keep their value, the\nfields in ``clear`` are emptied. A subclass rather than\n``ConventionsBody.clear`` so ``ConventionsCreate`` (which extends\n``ConventionsBody``) does not accept ``clear``. ``non_production`` and\n``clean_core_level`` are not clearable: they always hold a value.",
+      "properties": {
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 120,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "destination": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Destination"
+        },
+        "namespace": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Namespace"
+        },
+        "package": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Package"
+        },
+        "atc_variant": {
+          "anyOf": [
+            {
+              "maxLength": 30,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Atc Variant"
+        },
+        "clean_core_level": {
+          "anyOf": [
+            {
+              "pattern": "^[A-D]$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Clean Core Level"
+        },
+        "free_text": {
+          "anyOf": [
+            {
+              "maxLength": 20000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Free Text"
+        },
+        "non_production": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Non Production"
+        },
+        "clear": {
+          "items": {
+            "enum": [
+              "label",
+              "destination",
+              "namespace",
+              "package",
+              "atc_variant",
+              "free_text"
+            ],
+            "type": "string"
+          },
+          "maxItems": 6,
+          "title": "Clear",
+          "type": "array"
+        }
+      },
+      "title": "ConventionsUpdate",
+      "type": "object"
+    },
+    "DocumentCommentCreate": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quote"
+        },
+        "anchor": {
+          "const": "document",
+          "title": "Anchor",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "design",
+            "plan",
+            "review",
+            "note",
+            "report"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "paragraph": {
+          "minimum": 0,
+          "title": "Paragraph",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "body",
+        "anchor",
+        "kind",
+        "version",
+        "paragraph"
+      ],
+      "title": "DocumentCommentCreate",
+      "type": "object"
+    },
+    "ErrorOut": {
+      "description": "A refusal with a stable ``code``; ``detail`` is for people, the UI\nbranches on ``code``.",
+      "properties": {
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        },
+        "code": {
+          "title": "Code",
+          "type": "string"
+        }
+      },
+      "required": [
+        "detail",
+        "code"
+      ],
+      "title": "ErrorOut",
+      "type": "object"
+    },
+    "FileCommentCreate": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 4000,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quote"
+        },
+        "anchor": {
+          "const": "file",
+          "title": "Anchor",
+          "type": "string"
+        },
+        "path": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "line_start": {
+          "minimum": 1,
+          "title": "Line Start",
+          "type": "integer"
+        },
+        "line_end": {
+          "minimum": 1,
+          "title": "Line End",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "body",
+        "anchor",
+        "path",
+        "revision",
+        "line_start",
+        "line_end"
+      ],
+      "title": "FileCommentCreate",
+      "type": "object"
+    },
+    "FileDetailOut": {
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "read",
+            "modified",
+            "new"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "object_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Object Type"
+        },
+        "object_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Object Name"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "base_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "sap",
+                "absent",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Base Status"
+        },
+        "syntax_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "errors",
+                "unavailable"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Syntax Status"
+        },
+        "origin_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Origin Source"
+        },
+        "proposed_source": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Proposed Source"
+        },
+        "origin_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Origin Version"
+        },
+        "lint": {
+          "items": {
+            "$ref": "#/$defs/LintFindingOut"
+          },
+          "title": "Lint",
+          "type": "array"
+        },
+        "syntax": {
+          "items": {
+            "$ref": "#/$defs/SyntaxItemOut"
+          },
+          "title": "Syntax",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "state",
+        "object_type",
+        "object_name",
+        "revision",
+        "base_status",
+        "syntax_status",
+        "origin_source",
+        "proposed_source",
+        "origin_version",
+        "lint",
+        "syntax"
+      ],
+      "title": "FileDetailOut",
+      "type": "object"
+    },
+    "FileRevisionOut": {
+      "properties": {
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "run_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Run Id"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "chars": {
+          "title": "Chars",
+          "type": "integer"
+        },
+        "syntax_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "errors",
+                "unavailable"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Syntax Status"
+        }
+      },
+      "required": [
+        "revision",
+        "run_id",
+        "created_at",
+        "chars",
+        "syntax_status"
+      ],
+      "title": "FileRevisionOut",
+      "type": "object"
+    },
+    "FileSummaryOut": {
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "read",
+            "modified",
+            "new"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "object_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Object Type"
+        },
+        "object_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Object Name"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "base_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "sap",
+                "absent",
+                "unknown"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Base Status"
+        },
+        "syntax_status": {
+          "anyOf": [
+            {
+              "enum": [
+                "ok",
+                "errors",
+                "unavailable"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Syntax Status"
+        }
+      },
+      "required": [
+        "path",
+        "state",
+        "object_type",
+        "object_name",
+        "revision",
+        "base_status",
+        "syntax_status"
+      ],
+      "title": "FileSummaryOut",
+      "type": "object"
+    },
+    "FindingDetailOut": {
+      "properties": {
+        "finding": {
+          "$ref": "#/$defs/FindingOut"
+        },
+        "detail": {
+          "title": "Detail",
+          "type": "string"
+        }
+      },
+      "required": [
+        "finding",
+        "detail"
+      ],
+      "title": "FindingDetailOut",
+      "type": "object"
+    },
+    "FindingOpenOut": {
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/FileSummaryOut"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line"
+        },
+        "hint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Hint"
+        }
+      },
+      "required": [
+        "file",
+        "line",
+        "hint"
+      ],
+      "title": "FindingOpenOut",
+      "type": "object"
+    },
+    "FindingOut": {
+      "description": "Metadata only: the detail text is served by the detail route alone.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "dump",
+            "trace",
+            "gateway_error",
+            "auth_check",
+            "odata_call"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "ref_id": {
+          "title": "Ref Id",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "program": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Program"
+        },
+        "include": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Include"
+        },
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line"
+        },
+        "occurred_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Occurred At"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "ref_id",
+        "title",
+        "program",
+        "include",
+        "line",
+        "occurred_at",
+        "created_at"
+      ],
+      "title": "FindingOut",
+      "type": "object"
+    },
+    "LintFindingOut": {
+      "properties": {
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line"
+        },
+        "column": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Column"
+        },
+        "severity": {
+          "title": "Severity",
+          "type": "string"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "rule": {
+          "title": "Rule",
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "column",
+        "severity",
+        "message",
+        "rule"
+      ],
+      "title": "LintFindingOut",
+      "type": "object"
+    },
+    "MeOut": {
+      "properties": {
+        "principal": {
+          "title": "Principal",
+          "type": "string"
+        },
+        "is_admin": {
+          "title": "Is Admin",
+          "type": "boolean"
+        },
+        "targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Targets",
+          "type": "array"
+        },
+        "diagnose_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Diagnose Targets",
+          "type": "array"
+        },
+        "diagnose_retention_days": {
+          "title": "Diagnose Retention Days",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "principal",
+        "is_admin",
+        "targets",
+        "diagnose_targets",
+        "diagnose_retention_days"
+      ],
+      "title": "MeOut",
+      "type": "object"
+    },
+    "MessageBody": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "maxLength": 20000,
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "title": "MessageBody",
+      "type": "object"
+    },
+    "MessageOut": {
+      "description": "A message in the list. The run activity is not in the list (it can be\nlarge); ``has_activity`` says whether ``.../activity`` has one.",
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "chat",
+            "design",
+            "plan",
+            "propose",
+            "review",
+            "done",
+            "investigate"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "user",
+            "assistant",
+            "system"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "content": {
+          "title": "Content",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "has_activity": {
+          "title": "Has Activity",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "stage",
+        "role",
+        "content",
+        "created_at",
+        "has_activity"
+      ],
+      "title": "MessageOut",
+      "type": "object"
+    },
+    "ObjectHitOut": {
+      "properties": {
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "package": {
+          "title": "Package",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name",
+        "package",
+        "description"
+      ],
+      "title": "ObjectHitOut",
+      "type": "object"
+    },
+    "OpenBody": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "pattern": "^[A-Za-z]{4}$",
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^\\s*[A-Za-z0-9_/$]{1,40}\\s*$",
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "OpenBody",
+      "type": "object"
+    },
+    "PinsOut": {
+      "description": "What the developer approved: a version per document kind, a revision\nper file. A kind nothing was pinned for is absent, not ``null``\n(``design?: number`` in the UI's types).",
+      "properties": {
+        "design": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Design"
+        },
+        "plan": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Plan"
+        },
+        "review": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Review"
+        },
+        "report": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Report"
+        },
+        "files": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Files"
+        }
+      },
+      "title": "PinsOut",
+      "type": "object"
+    },
+    "RequestChangesBody": {
+      "additionalProperties": false,
+      "description": "``POST /sessions/{sid}/request-changes``: an optional note sent with\nthe open review comments. A blank note counts as none; with no open\ncomment and no note the run is refused (409 ``nothing_to_send``).",
+      "properties": {
+        "note": {
+          "anyOf": [
+            {
+              "maxLength": 4000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        }
+      },
+      "title": "RequestChangesBody",
+      "type": "object"
+    },
+    "SeedRefreshOut": {
+      "properties": {
+        "updated": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Updated",
+          "type": "array"
+        },
+        "skipped_edited": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Skipped Edited",
+          "type": "array"
+        },
+        "added": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Added",
+          "type": "array"
+        },
+        "reload_failed": {
+          "default": false,
+          "title": "Reload Failed",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "updated",
+        "skipped_edited",
+        "added"
+      ],
+      "title": "SeedRefreshOut",
+      "type": "object"
+    },
+    "SessionCreate": {
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "target": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.\\-]{0,63}$",
+          "title": "Target",
+          "type": "string"
+        },
+        "type": {
+          "default": "change",
+          "enum": [
+            "change",
+            "diagnose"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "target"
+      ],
+      "title": "SessionCreate",
+      "type": "object"
+    },
+    "SessionDetailOut": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "owner": {
+          "title": "Owner",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "change",
+            "diagnose"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "chat",
+            "design",
+            "plan",
+            "propose",
+            "review",
+            "done",
+            "investigate"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "running"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Updated At"
+        },
+        "requests_used": {
+          "title": "Requests Used",
+          "type": "integer"
+        },
+        "request_cap": {
+          "title": "Request Cap",
+          "type": "integer"
+        },
+        "target_non_production": {
+          "title": "Target Non Production",
+          "type": "boolean"
+        },
+        "pins": {
+          "$ref": "#/$defs/PinsOut"
+        },
+        "waiting": {
+          "anyOf": [
+            {
+              "enum": [
+                "approval",
+                "comments",
+                "changes",
+                "document"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Waiting"
+        },
+        "open_comments": {
+          "title": "Open Comments",
+          "type": "integer"
+        },
+        "unresolved_comments": {
+          "title": "Unresolved Comments",
+          "type": "integer"
+        },
+        "objects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Objects",
+          "type": "array"
+        },
+        "objects_total": {
+          "title": "Objects Total",
+          "type": "integer"
+        },
+        "changed_objects": {
+          "title": "Changed Objects",
+          "type": "integer"
+        },
+        "findings_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Findings Count"
+        },
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/ArtifactSummaryOut"
+          },
+          "title": "Artifacts",
+          "type": "array"
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/FileSummaryOut"
+          },
+          "title": "Files",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "owner",
+        "title",
+        "target",
+        "type",
+        "stage",
+        "status",
+        "created_at",
+        "updated_at",
+        "requests_used",
+        "request_cap",
+        "target_non_production",
+        "pins",
+        "waiting",
+        "open_comments",
+        "unresolved_comments",
+        "objects",
+        "objects_total",
+        "changed_objects",
+        "findings_count",
+        "artifacts",
+        "files"
+      ],
+      "title": "SessionDetailOut",
+      "type": "object"
+    },
+    "SessionOut": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "owner": {
+          "title": "Owner",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "target": {
+          "title": "Target",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "change",
+            "diagnose"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "stage": {
+          "enum": [
+            "chat",
+            "design",
+            "plan",
+            "propose",
+            "review",
+            "done",
+            "investigate"
+          ],
+          "title": "Stage",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "idle",
+            "running"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "created_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Created At"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Updated At"
+        },
+        "requests_used": {
+          "title": "Requests Used",
+          "type": "integer"
+        },
+        "request_cap": {
+          "title": "Request Cap",
+          "type": "integer"
+        },
+        "target_non_production": {
+          "title": "Target Non Production",
+          "type": "boolean"
+        },
+        "pins": {
+          "$ref": "#/$defs/PinsOut"
+        },
+        "waiting": {
+          "anyOf": [
+            {
+              "enum": [
+                "approval",
+                "comments",
+                "changes",
+                "document"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Waiting"
+        },
+        "open_comments": {
+          "title": "Open Comments",
+          "type": "integer"
+        },
+        "unresolved_comments": {
+          "title": "Unresolved Comments",
+          "type": "integer"
+        },
+        "objects": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Objects",
+          "type": "array"
+        },
+        "objects_total": {
+          "title": "Objects Total",
+          "type": "integer"
+        },
+        "changed_objects": {
+          "title": "Changed Objects",
+          "type": "integer"
+        },
+        "findings_count": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Findings Count"
+        }
+      },
+      "required": [
+        "id",
+        "owner",
+        "title",
+        "target",
+        "type",
+        "stage",
+        "status",
+        "created_at",
+        "updated_at",
+        "requests_used",
+        "request_cap",
+        "target_non_production",
+        "pins",
+        "waiting",
+        "open_comments",
+        "unresolved_comments",
+        "objects",
+        "objects_total",
+        "changed_objects",
+        "findings_count"
+      ],
+      "title": "SessionOut",
+      "type": "object"
+    },
+    "SessionPatch": {
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "title": "SessionPatch",
+      "type": "object"
+    },
+    "SyntaxItemOut": {
+      "properties": {
+        "line": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Line"
+        },
+        "message": {
+          "title": "Message",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "warning"
+          ],
+          "title": "Severity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "line",
+        "message",
+        "severity"
+      ],
+      "title": "SyntaxItemOut",
+      "type": "object"
+    },
+    "SyntaxResultOut": {
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "errors",
+            "unavailable"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/SyntaxItemOut"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "checked_at": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Checked At"
+        }
+      },
+      "required": [
+        "path",
+        "revision",
+        "status",
+        "items",
+        "checked_at"
+      ],
+      "title": "SyntaxResultOut",
+      "type": "object"
+    },
+    "TodoOut": {
+      "properties": {
+        "content": {
+          "title": "Content",
+          "type": "string"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "status"
+      ],
+      "title": "TodoOut",
+      "type": "object"
+    },
+    "ToolEventOut": {
+      "description": "One event of ``agents.run_activity.RunActivity``: a tool call (with\n``id``/``tool``/``status``/``output``) or a note/message/delegation.",
+      "properties": {
+        "ts": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ts"
+        },
+        "agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Tool"
+        },
+        "detail": {
+          "default": "",
+          "title": "Detail",
+          "type": "string"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Status"
+        },
+        "output": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output"
+        },
+        "ended": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ended"
+        },
+        "code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Code"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ToolEventOut",
+      "type": "object"
+    }
+  },
+  "x-routes": {
+    "DELETE /sessions/{sid}": {
+      "response": null,
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "DELETE /sessions/{sid}/comments/{cid}": {
+      "response": null,
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /admin/sessions": {
+      "response": "AdminSessionRowOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /conventions": {
+      "response": "ConventionsOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /conventions/{target}": {
+      "response": "ConventionsOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /me": {
+      "response": "MeOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /objects/search": {
+      "response": "ObjectHitOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions": {
+      "response": "SessionOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}": {
+      "response": "SessionDetailOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /sessions/{sid}/approvals": {
+      "response": "ApprovalOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/artifacts": {
+      "response": "ArtifactOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/artifacts/{aid}": {
+      "response": "ArtifactOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /sessions/{sid}/comments": {
+      "response": "CommentOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/file": {
+      "response": "FileDetailOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /sessions/{sid}/file/revisions": {
+      "response": "FileRevisionOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/files": {
+      "response": "FileSummaryOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/findings": {
+      "response": "FindingOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/findings/{fid}": {
+      "response": "FindingDetailOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "GET /sessions/{sid}/messages": {
+      "response": "MessageOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "GET /sessions/{sid}/messages/{mid}/activity": {
+      "response": "ActivityOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "PATCH /sessions/{sid}": {
+      "response": "SessionOut",
+      "request": "SessionPatch",
+      "list": false,
+      "stream": false
+    },
+    "PATCH /sessions/{sid}/comments/{cid}": {
+      "response": "CommentOut",
+      "request": "CommentPatch",
+      "list": false,
+      "stream": false
+    },
+    "POST /admin/seed/refresh": {
+      "response": "SeedRefreshOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "POST /conventions": {
+      "response": "ConventionsOut",
+      "request": "ConventionsCreate",
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions": {
+      "response": "SessionOut",
+      "request": "SessionCreate",
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/approvals/{aid}": {
+      "response": "ApprovalOut",
+      "request": "ApprovalDecision",
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/approve": {
+      "response": "SessionOut",
+      "request": "ApproveBody",
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/cancel": {
+      "response": "SessionOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/comments": {
+      "response": "CommentOut",
+      "request": "CommentCreate",
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/file/lint": {
+      "response": "LintFindingOut",
+      "request": null,
+      "list": true,
+      "stream": false
+    },
+    "POST /sessions/{sid}/file/refresh": {
+      "response": "FileDetailOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/file/syntax": {
+      "response": "SyntaxResultOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/findings/{fid}/open": {
+      "response": "FindingOpenOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/handover": {
+      "response": "SessionOut",
+      "request": null,
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/messages": {
+      "response": null,
+      "request": "MessageBody",
+      "list": false,
+      "stream": true
+    },
+    "POST /sessions/{sid}/open": {
+      "response": "FileSummaryOut",
+      "request": "OpenBody",
+      "list": false,
+      "stream": false
+    },
+    "POST /sessions/{sid}/report": {
+      "response": null,
+      "request": null,
+      "list": false,
+      "stream": true
+    },
+    "POST /sessions/{sid}/request-changes": {
+      "response": null,
+      "request": "RequestChangesBody",
+      "list": false,
+      "stream": true
+    },
+    "PUT /conventions/{target}": {
+      "response": "ConventionsOut",
+      "request": "ConventionsUpdate",
+      "list": false,
+      "stream": false
+    }
+  }
+}

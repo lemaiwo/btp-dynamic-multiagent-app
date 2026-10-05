@@ -1,0 +1,22 @@
+{
+  "errors": [
+    {
+      "id": "0A1B2C3D4E5F",
+      "errorType": "Frontend Error",
+      "service": "ZDEMO_SRV",
+      "user": "DEVUSER01",
+      "timestamp": "2026-10-03T10:20:00Z",
+      "message": "Partner 123456789012 not found for jane.doe@example.com",
+      "detailUrl": "/sap/bc/adt/gw/errorlog/0A1B2C3D4E5F?user=DEVUSER01"
+    },
+    {
+      "id": "0A1B2C3D4E60",
+      "errorType": "Backend Error",
+      "service": "ZDEMO_SRV",
+      "user": "DEVUSER01",
+      "timestamp": "2026-10-03T10:21:00Z",
+      "message": "Invalid IBAN BE71 0961 2345 6769 (RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789)",
+      "detailUrl": "/sap/bc/adt/gw/errorlog/0A1B2C3D4E60"
+    }
+  ]
+}

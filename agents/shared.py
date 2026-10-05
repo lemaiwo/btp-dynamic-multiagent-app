@@ -177,10 +177,23 @@ AGENT_REQUEST_LIMIT = int(os.environ.get("AGENT_REQUEST_LIMIT", "200"))
 
 
 def run_usage_limits():
-    """The UsageLimits every agent run in this app is started with."""
+    """The UsageLimits every agent run in this app is started with.
+
+    Inside an IDE session (``agents.deep.current_workspace`` bound) the limit
+    is also capped by what the session may still spend. Delegations and deep
+    sub-agents pass ``usage=ctx.usage`` and call this too, so the check runs
+    against the whole run tree's cumulative requests.
+    """
     from pydantic_ai.usage import UsageLimits
 
-    return UsageLimits(request_limit=AGENT_REQUEST_LIMIT)
+    # Deferred: agents.deep imports this module.
+    from agents.deep import current_workspace
+
+    limit = AGENT_REQUEST_LIMIT
+    scope = current_workspace.get()
+    if scope is not None and scope.request_limit is not None:
+        limit = min(limit, max(0, scope.request_limit))
+    return UsageLimits(request_limit=limit)
 
 
 async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
@@ -270,6 +283,78 @@ def mcp_endpoint_url(base_url: str) -> str:
     return base_url if urlparse(base_url).path else f"{base_url}/mcp"
 
 
+def safe_server_key(url: str) -> str:
+    """``url`` as ``scheme://host[:port]/path`` for log and error texts.
+
+    The configured URL of a destination-mode server is not host-checked and
+    may carry userinfo, a query (``?token=``) or a fragment; error messages
+    (``DestinationUserRequired`` names its server) must never echo them."""
+    parts = urlparse(url or "")
+    if not parts.scheme or not parts.hostname:
+        return (url or "").split("?", 1)[0].split("#", 1)[0]
+    host = parts.hostname
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    netloc = f"{host}:{port}" if port else host
+    return f"{parts.scheme}://{netloc}{parts.path}"
+
+
+def _destination_mcp_server(
+    mcp_url: str,
+    oauth: dict,
+    *,
+    tool_prefix: str | None,
+    max_retries: int,
+) -> "PerRunMCPServer":
+    """An MCP server reached through a BTP destination.
+
+    The destination names the host and supplies the credential; the
+    configured URL contributes only its path. Every request is built against
+    ``PLACEHOLDER_BASE`` and ``DestinationAuth`` rewrites it onto the
+    destination per request -- as the signed-in user when
+    ``user_context`` is true (their JWT goes to the destination service as
+    ``X-user-token``; no JWT bound raises ``DestinationUserRequired`` rather
+    than falling back to an app credential).
+
+    ``expected_hosts`` stays empty on purpose: the credential may go only to
+    the host the destination names, not to the configured URL's host (which
+    the admin validator does not host-check in this mode). Redirects are not
+    followed, so a 3xx cannot carry the credential elsewhere either. The
+    client holds nobody's identity -- the auth reads the caller per request --
+    so ``PerRunMCPServer`` keeps runs of different users apart as before.
+    """
+    from agents.destination_auth import (
+        PLACEHOLDER_BASE,
+        DestinationAuth,
+        resolver_for,
+        user_context_of,
+    )
+
+    server_key = safe_server_key(mcp_url)
+    resolver = resolver_for(oauth, server_key)
+    path = urlparse(mcp_url).path or "/mcp"
+    return PerRunMCPServer(
+        url=f"{PLACEHOLDER_BASE}{path}",
+        tool_prefix=tool_prefix,
+        max_retries=max_retries,
+        process_tool_call=_resilient_tool_call,
+        http_client=httpx.AsyncClient(
+            auth=DestinationAuth(
+                resolver,
+                user_context=user_context_of(oauth),
+                expected_hosts=(),
+                server_key=server_key,
+            ),
+            follow_redirects=False,
+            timeout=httpx.Timeout(30.0),
+        ),
+    )
+
+
 def create_mcp_server(
     name: str,
     base_url: str,
@@ -293,6 +378,9 @@ def create_mcp_server(
         which is what makes unattended, scheduled runs work. The access it
         gets is whatever was granted to the registration, not to a person.
       - "none": no authentication. Use for public MCP servers.
+      - "destination": a BTP destination holds the server's URL and
+        credential (`oauth` = `{destination, user_context?}`); see
+        `_destination_mcp_server`.
 
     tool_prefix: when set, all tools from this server are exposed as
     `{tool_prefix}_{tool_name}`. Use to disambiguate when a single agent
@@ -318,6 +406,10 @@ def create_mcp_server(
             )
         auth = ClientCredentialsAuth(
             server_key=mcp_url, config=config_from_oauth(oauth)
+        )
+    elif auth_mode == "destination":
+        return _destination_mcp_server(
+            mcp_url, oauth or {}, tool_prefix=tool_prefix, max_retries=max_retries
         )
     elif ON_CF:
         auth = JWTForwardAuth()

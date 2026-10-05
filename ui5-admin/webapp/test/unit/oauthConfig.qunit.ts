@@ -1,4 +1,6 @@
 import oauthConfig from "com/agent/admin/model/oauthConfig";
+import formatter from "com/agent/admin/model/formatter";
+import { isRemoteUrl } from "com/agent/admin/model/remoteUrl";
 import validators from "com/agent/admin/model/validators";
 import type { AuthMode } from "com/agent/admin/service/types";
 
@@ -197,8 +199,9 @@ QUnit.test("supportsUserContext names the built-ins that act as a user", functio
     ["builtin:gmail", "builtin:outlook", "builtin:teams"].forEach((url) => {
         assert.ok(oauthConfig.supportsUserContext(url), url);
     });
-    ["builtin:jira", "builtin:slack", "builtin:smtp", "builtin:sapnotes", "builtin:sapnotedetail",
-        "https://mcp.example.hana.ondemand.com/mcp"].forEach((url) => {
+    // A remote MCP server may too (Task 5b): see the remote-server module below.
+    ["builtin:jira", "builtin:slack", "builtin:smtp", "builtin:sapnotes", "builtin:sapnotedetail"
+    ].forEach((url) => {
         assert.notOk(oauthConfig.supportsUserContext(url), url);
     });
 });
@@ -243,4 +246,82 @@ QUnit.test("formatMailTheme round-trips what parseMailTheme reads", function (as
     assert.strictEqual(oauthConfig.formatMailTheme({}), "");
     const text = oauthConfig.formatMailTheme(THEME);
     assert.deepEqual(oauthConfig.parseMailTheme(text).theme, THEME);
+});
+
+// --- destinations: a remote MCP server ---
+// The destination holds URL and credential; the server stores only its name
+// and whose credential it hands back (`_clean_destination` in agents/db.py).
+// Dropping user_context on a re-save would silently switch every caller to
+// the destination's technical credential.
+QUnit.module("oauthConfig.cleanOAuth on a destination, remote MCP server");
+
+const REMOTE = "https://arc1.example.com/mcp";
+
+QUnit.test("posts exactly {destination, user_context}", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", REMOTE);
+    assert.deepEqual(out, { destination: "DEST", user_context: true },
+        "no Jira filters, no client fields, no allow_send");
+});
+
+QUnit.test("an app-level destination posts the name alone", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ user_context: false }), "destination", REMOTE);
+    assert.deepEqual(out, { destination: "DEST" });
+});
+
+QUnit.test("only a boolean true acts as the user", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ user_context: "true" }), "destination", REMOTE);
+    assert.deepEqual(out, { destination: "DEST" });
+});
+
+QUnit.test("a stored user-context server round-trips unchanged", function (assert) {
+    // What the server returns for the server, loaded into the dialog model
+    // as-is and sent back on OK.
+    const stored = { destination: "arc1-abap-readonly", user_context: true };
+    const out = oauthConfig.cleanOAuth(Object.assign({}, stored), "destination", REMOTE);
+    assert.deepEqual(out, stored);
+});
+
+QUnit.test("the name is trimmed", function (assert) {
+    const out = oauthConfig.cleanOAuth({ destination: "  arc1-abap-readonly " }, "destination", REMOTE);
+    assert.deepEqual(out, { destination: "arc1-abap-readonly" });
+});
+
+QUnit.test("a remote server may act as the signed-in user; Jira still may not", function (assert) {
+    assert.ok(oauthConfig.supportsUserContext(REMOTE), "https url");
+    assert.ok(oauthConfig.isRemote(REMOTE), "isRemote for https");
+    assert.notOk(oauthConfig.isRemote("builtin:jira"), "a built-in is not remote");
+    assert.notOk(oauthConfig.isRemote(""), "no url is not remote");
+    assert.notOk(oauthConfig.supportsUserContext("builtin:jira"));
+    const jira = oauthConfig.cleanOAuth(fullForm({ user_context: true }), "destination", "builtin:jira") as Record<string, unknown>;
+    assert.notOk("user_context" in jira, "Jira keeps its own shape");
+});
+
+// FIX-14: the dialog's user_context switch, cleanOAuth and the validators
+// decide "remote" through one http(s) helper, so the switch is never shown
+// for a url whose user_context cleanOAuth would then drop.
+QUnit.test("isRemote is the shared http(s) helper", function (assert) {
+    for (const url of [REMOTE, "http://x/mcp", "  HTTPS://X/mcp ", "", "builtin:gmail", "ftp://x", "mcp", "https:/x"]) {
+        assert.strictEqual(oauthConfig.isRemote(url), isRemoteUrl(url), JSON.stringify(url));
+    }
+    assert.ok(isRemoteUrl("  HTTPS://X/mcp "), "case and whitespace are tolerated");
+});
+
+QUnit.test("the user_context switch shows exactly where cleanOAuth keeps user_context", function (assert) {
+    for (const url of [REMOTE, "  HTTPS://X/mcp ", "", "ftp://x", "mcp.example.com", "builtin:gmail",
+        "builtin:outlook", "builtin:teams", "builtin:jira", "builtin:slack", "builtin:sapnotes"]) {
+        const kept = "user_context" in (oauthConfig.cleanOAuth(
+            fullForm({ user_context: true }), "destination", url) as Record<string, unknown>);
+        assert.strictEqual(formatter.userContextVisible("destination", url), kept, `destination ${JSON.stringify(url)}`);
+        assert.strictEqual(formatter.userContextVisible("jwt", url), false, `jwt ${JSON.stringify(url)}`);
+    }
+});
+
+QUnit.module("oauthConfig.defaultUserContext");
+
+QUnit.test("on only for a remote url behind a destination", function (assert) {
+    assert.strictEqual(oauthConfig.defaultUserContext("destination", "https://arc1.example.com/mcp"), true);
+    assert.strictEqual(oauthConfig.defaultUserContext("destination", " HTTP://x.example.com "), true);
+    assert.strictEqual(oauthConfig.defaultUserContext("destination", "builtin:outlook"), false, "built-ins unchanged");
+    assert.strictEqual(oauthConfig.defaultUserContext("destination", ""), false);
+    assert.strictEqual(oauthConfig.defaultUserContext("jwt", "https://arc1.example.com/mcp"), false);
 });

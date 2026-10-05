@@ -1,0 +1,68 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:form="sap.ui.layout.form">
+    <Dialog
+        id="newSessionDialog"
+        title="{i18n>newSessionDialogTitle}"
+        contentWidth="28rem"
+        afterClose=".onNewSessionAfterClose">
+        <!--
+            The layout module is required up front: otherwise the form renders
+            once without a layout while SimpleForm loads it ("Layout missing!").
+            The diagnose hint sits below the form (a MessageStrip is no form
+            content); the type field names it as its description.
+        -->
+        <form:SimpleForm id="newSessionForm" editable="true" layout="ResponsiveGridLayout"
+            core:require="{ ResponsiveGridLayout: 'sap/ui/layout/form/ResponsiveGridLayout' }">
+            <Label id="newSessionTitleLabel" text="{i18n>newSessionTitleLabel}" labelFor="newSessionTitle" required="true" />
+            <Input
+                id="newSessionTitle"
+                value="{ide>/newSession/title}"
+                placeholder="{i18n>newSessionTitlePlaceholder}"
+                valueState="{ide>/newSession/titleState}"
+                valueStateText="{i18n>titleRequired}"
+                maxLength="200"
+                submit=".onNewSessionCreate" />
+            <Label id="newSessionTypeLabel" text="{i18n>newSessionTypeLabel}" labelFor="newSessionType" />
+            <SegmentedButton
+                id="newSessionType"
+                ariaDescribedBy="newSessionDiagnoseHint"
+                selectedKey="{ide>/newSession/type}"
+                selectionChange=".onNewSessionTypeChange">
+                <items>
+                    <SegmentedButtonItem id="newSessionTypeChange" key="change" text="{i18n>sessionTypeChange}" />
+                    <SegmentedButtonItem
+                        id="newSessionTypeDiagnose"
+                        key="diagnose"
+                        text="{i18n>sessionTypeDiagnose}"
+                        enabled="{= ${ide>/diagnoseTargets}.length > 0 }"
+                        tooltip="{= ${ide>/diagnoseTargets}.length > 0 ? '' : ${i18n>noDiagnoseTargets} }" />
+                </items>
+            </SegmentedButton>
+            <Label id="newSessionTargetLabel" text="{i18n>newSessionTargetLabel}" labelFor="newSessionTarget" required="true" />
+            <Select
+                id="newSessionTarget"
+                forceSelection="false"
+                width="100%"
+                selectedKey="{ide>/newSession/target}"
+                valueState="{ide>/newSession/targetState}"
+                valueStateText="{i18n>targetRequired}"
+                items="{ide>/newSession/targets}">
+                <core:Item key="{ide>}" text="{ide>}" />
+            </Select>
+        </form:SimpleForm>
+        <MessageStrip
+            id="newSessionDiagnoseHint"
+            class="sapUiSmallMarginBeginEnd sapUiSmallMarginBottom"
+            visible="{= ${ide>/newSession/type} === 'diagnose' }"
+            text="{i18n>newSessionDiagnoseHint}"
+            showIcon="true" />
+        <beginButton>
+            <Button id="newSessionCreate" text="{i18n>create}" type="Emphasized" press=".onNewSessionCreate" />
+        </beginButton>
+        <endButton>
+            <Button id="newSessionCancel" text="{i18n>cancel}" press=".onNewSessionCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

@@ -382,6 +382,11 @@ def require_admin(request: Request) -> dict[str, Any]:
     return _require_scope(request, "admin", "Admin scope required")
 
 
+def require_developer(request: Request) -> dict[str, Any]:
+    """Ensure the caller holds `<xsappname>.developer` (the ABAP IDE)."""
+    return _require_scope(request, "developer", "Developer scope required")
+
+
 def require_a2a(request: Request) -> dict[str, Any]:
     """Ensure the caller holds the `<xsappname>.a2a` scope.
 

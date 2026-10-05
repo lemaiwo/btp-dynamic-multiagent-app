@@ -1,0 +1,83 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!--
+        The findings of a diagnose session (Task U11, `?view=findings`), in the
+        artifact column in place of the changes. Every value of a row is data
+        from SAP or the model (model/findings `findingRow`): bound to Text and
+        ObjectStatus properties, never rendered as markup or parsed as binding
+        syntax. The kind is text and icon. A row opens the finding's SAP source
+        at its line; Details opens its stored text; "Open in ADT" exists only
+        for an href that model/adtLink built.
+        One tab stop for the list (sap.m.List item navigation: arrow keys move
+        between rows, Enter opens); F2 moves into a row's Details and Open in ADT
+        (the UI5 list pattern), said in visible text under the list, which also
+        names it. A finding without a program has no source: its row is not an
+        action and says so. When the target lost its flag, opening and Details read from
+        SAP and are off: the reason is visible above the list, rows are not an
+        action and Details is described by that reason.
+        A row's own name is UI5's: kind (text), title, where and when.
+    -->
+    <VBox id="findingsView" class="ideFindingsView" visible="{= ${s>/artifact/view} === 'findings' }">
+        <Text
+            id="findingsLostReason"
+            class="ideGateReason sapUiTinyMarginBottom"
+            text="{i18n>targetNotNonProd}"
+            visible="{= !!${s>/lostFlag} }" />
+        <List
+            id="findingsList"
+            class="ideFindings"
+            noDataText="{i18n>findingsEmpty}"
+            ariaLabelledBy="artifactTitle findingsLostReason findingsKeyHint"
+            items="{path: 's>/artifact/findings/items', key: 'id', templateShareable: false}">
+            <CustomListItem
+                id="findingItem"
+                type="{= ${s>/lostFlag} || !${s>hasSource} ? 'Inactive' : 'Active' }"
+                press=".onFindingPress">
+                <HBox id="findingRow" class="ideFinding" alignItems="Center" wrap="Wrap">
+                    <ObjectStatus
+                        id="findingKind"
+                        class="ideFindingKindStatus sapUiSmallMarginEnd"
+                        text="{s>kindText}"
+                        icon="{s>kindIcon}"
+                        state="{s>kindState}"
+                        stateAnnouncementText=""
+                        inverted="true" />
+                    <VBox id="findingTexts" class="ideFindingTexts">
+                        <layoutData>
+                            <FlexItemData growFactor="1" shrinkFactor="1" minWidth="0" />
+                        </layoutData>
+                        <Text id="findingTitle" class="ideFindingTitle" text="{s>title}" wrapping="true" />
+                        <Text id="findingWhere" class="ideFindingWhere" text="{s>meta}" />
+                        <!-- No program: the row is no action, and says why (visible, also in the row's name). -->
+                        <Text id="findingNoSource" class="ideFindingWhere" text="{i18n>findingNoSourceRow}" visible="{= !${s>hasSource} }" />
+                    </VBox>
+                    <HBox id="findingActions" alignItems="Center">
+                        <Button
+                            id="findingDetails"
+                            text="{i18n>findingDetailsButton}"
+                            tooltip="{i18n>findingDetailsTooltip}"
+                            type="Transparent"
+                            visible="{s>hasDetail}"
+                            enabled="{= !${s>/lostFlag} }"
+                            ariaDescribedBy="findingsLostReason"
+                            press=".onFindingDetails" />
+                        <Link
+                            id="findingAdt"
+                            class="sapUiSmallMarginBegin"
+                            text="{i18n>changesOpenInAdt}"
+                            tooltip="{i18n>findingAdtTooltip}"
+                            href="{s>adtHref}"
+                            target="_blank"
+                            visible="{= !!${s>adtHref} }" />
+                    </HBox>
+                </HBox>
+            </CustomListItem>
+        </List>
+        <Text
+            id="findingsKeyHint"
+            class="ideFindingsHint sapUiTinyMarginTop"
+            text="{i18n>findingsKeyHint}"
+            visible="{= !!${s>/artifact/findings/any} }" />
+    </VBox>
+</core:FragmentDefinition>

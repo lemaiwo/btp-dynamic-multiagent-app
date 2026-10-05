@@ -1,0 +1,36 @@
+{
+  "id": "ATRA_20261003_101500_0001",
+  "statements": [
+    {
+      "level": 0,
+      "statement": "Program ZDEMO_REPORT",
+      "grossTime": 15000,
+      "netTime": 100,
+      "children": [
+        {
+          "level": 1,
+          "statement": "Call M ZCL_DEMO_CALC=>DIVIDE",
+          "grossTime": 9000,
+          "netTime": 50,
+          "children": [
+            {
+              "level": 2,
+              "statement": "SELECT ZDEMO_T WHERE partner = '123456789012' AND mail = 'jane.doe@example.com'",
+              "grossTime": 8900,
+              "netTime": 8900,
+              "children": []
+            },
+            {
+              "level": 2,
+              "statement": "MESSAGE e001 WITH 'BE71 0961 2345 6769' 'RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789' sy-uname DEVUSER01",
+              "grossTime": 50,
+              "netTime": 50,
+              "children": []
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "uname": "DEVUSER01"
+}

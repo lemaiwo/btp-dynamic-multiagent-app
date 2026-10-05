@@ -1,0 +1,51 @@
+specVersion: "3.0"
+metadata:
+  name: com.agent.ide
+type: application
+framework:
+  name: SAPUI5
+  version: "1.120.50"
+  libraries:
+    - name: sap.m
+    - name: sap.ui.core
+    - name: sap.f
+    - name: sap.tnt
+    - name: sap.ui.layout
+    - name: themelib_sap_horizon
+builder:
+  resources:
+    excludes:
+      - "/test/**"
+      - "/localService/**"
+  customTasks:
+    - name: ui5-tooling-transpile-task
+      afterTask: replaceVersion
+    # Produces dist/ui5-ide-content.zip for the HTML5 repo deployer module;
+    # `ui5 build` alone emits loose files and no archive. xs-app.json must be
+    # inside the archive because the repository reads each app's routes from
+    # there. See ui5-admin/ui5.yaml for the full story.
+    - name: ui5-task-zipper
+      afterTask: generateVersionInfo
+      configuration:
+        archiveName: ui5-ide-content
+        additionalFiles:
+          - xs-app.json
+  # `resolve: false` is load-bearing (see ui5-admin/ui5.yaml): it keeps the
+  # SAPUI5 framework out of the bundle so framework JS and CSS always come
+  # from the same version-pinned /resources/ route in xs-app.json. Keep the
+  # framework `version` above equal to that route's version.
+  # vendor/ is excluded: those scripts are loaded on demand with a <script>
+  # tag, not through the UI5 loader.
+  bundles:
+    - bundleDefinition:
+        name: com/agent/ide/Component-preload.js
+        defaultFileTypes: [".js", ".fragment.xml", ".view.xml", ".properties", ".json"]
+        sections:
+          - mode: preload
+            filters:
+              - "com/agent/ide/"
+              - "!com/agent/ide/vendor/"
+              - "!com/agent/ide/test/"
+            resolve: false
+          - mode: require
+            filters: ["ui5loader-autoconfig.js"]

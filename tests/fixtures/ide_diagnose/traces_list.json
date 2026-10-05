@@ -1,0 +1,13 @@
+{
+  "traces": [
+    {
+      "id": "ATRA_20261003_101500_0001",
+      "title": "ZDEMO_REPORT run for 123456789012",
+      "user": "DEVUSER01",
+      "objectName": "ZDEMO_REPORT",
+      "timestamp": "2026-10-03T10:15:00Z",
+      "size": 20480,
+      "description": "Measured by jane.doe@example.com for BE71 0961 2345 6769 / RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789"
+    }
+  ]
+}

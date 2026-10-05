@@ -104,17 +104,16 @@ export function findBuiltin(url: string): BuiltinToolset | undefined {
 /**
  * The auth modes the server accepts for a url.
  *
- * A remote MCP server cannot use `destination` or `session`: the server
- * refuses both for anything that is not a built-in. `session` is also
- * refused for every built-in but the one that reads a session cookie, which
- * the catalog already says through its `authModes`.
+ * A remote MCP server cannot use `session`: the server refuses it for
+ * anything but the one built-in that reads a session cookie, which the
+ * catalog already says through its `authModes`. A remote server may use
+ * `destination`: the BTP destination then names the host and holds the
+ * credential (see `create_mcp_server` in agents/shared.py).
  */
 export function authModesFor(url: string): AuthMode[] {
     const builtin = findBuiltin(url);
     if (builtin?.authModes) {
         return builtin.authModes.slice();
     }
-    return builtin
-        ? ALL_AUTH_MODES.filter((m) => m !== "session")
-        : ALL_AUTH_MODES.filter((m) => m !== "destination" && m !== "session");
+    return ALL_AUTH_MODES.filter((m) => m !== "session");
 }

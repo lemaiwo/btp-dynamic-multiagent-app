@@ -66,3 +66,22 @@ jobs:
       # karma.conf.js already uses ChromeHeadless; the runner image ships a
       # Chrome that karma-chrome-launcher finds on its own.
       - run: npx karma start karma.conf.js --single-run
+
+  ui5-ide:
+    name: UI5 IDE (tsc + karma)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui5-ide
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: ui5-ide/package-lock.json
+      - run: npm ci
+      - run: npm run ts:check
+      # karma.conf.js already uses ChromeHeadless; the runner image ships a
+      # Chrome that karma-chrome-launcher finds on its own.
+      - run: npx karma start karma.conf.js --single-run

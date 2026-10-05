@@ -1,0 +1,33 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!--
+        The read-only source view (Task U10, `?view=source&path=&line=`). The
+        source reaches the page only as sourceView.renderSource output
+        (escaped); the line of the query is highlighted and scrolled into view.
+    -->
+    <VBox id="sourceView" class="ideSourceView" visible="{= ${s>/artifact/view} === 'source' }">
+        <HBox id="sourceMetaBar" alignItems="Center" wrap="Wrap" class="ideChangesBar"
+            visible="{= !!${s>/artifact/source/meta} }">
+            <Text id="sourceMeta" text="{s>/artifact/source/meta}" class="sapUiSmallMarginEnd" />
+            <Link
+                id="sourceAdt"
+                text="{i18n>changesOpenInAdt}"
+                href="{s>/artifact/source/adtHref}"
+                target="_blank"
+                visible="{= !!${s>/artifact/source/adtHref} }"
+                class="sapUiSmallMarginEnd" />
+            <Link
+                id="sourceBackToFindings"
+                text="{i18n>sourceBackToFindings}"
+                visible="{= !!${s>/artifact/source/fromFinding} }"
+                press=".onShowFindings" />
+        </HBox>
+        <!-- A finding's line: which finding it is (title as text), or why no line is highlighted. -->
+        <Text id="sourceFindingNote" class="ideSourceFindingNote" text="{s>/artifact/source/findingNote}"
+            visible="{= !!${s>/artifact/source/findingNote} }" />
+        <MessageStrip id="sourceHint" type="Information" showIcon="true" class="sapUiTinyMarginBottom"
+            text="{s>/artifact/source/hint}" visible="{= !!${s>/artifact/source/hint} }" />
+        <core:HTML id="sourceHtml" content="{s>/artifact/source/html}" preferDOM="false" afterRendering=".onSourceRendered" />
+    </VBox>
+</core:FragmentDefinition>

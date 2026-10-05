@@ -1,6 +1,7 @@
 import type { AuthMode, McpServer } from "../service/types";
 import validators from "./validators";
 import { findBuiltin } from "./builtins";
+import { isRemoteUrl } from "./remoteUrl";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -100,9 +101,26 @@ export default {
         return keys ? keys.slice() : undefined;
     },
 
+    /**
+     * True for a remote MCP server (an http(s) url), as opposed to a
+     * `builtin:` toolset. The shared {@link isRemoteUrl} helper.
+     */
+    isRemote(url: string): boolean {
+        return isRemoteUrl(url);
+    },
+
+    /**
+     * The starting value of "Act as signed-in user" for a NEW server: on for a
+     * remote MCP url behind a destination, off everywhere else (built-ins keep
+     * their own defaults). Never applied to a stored server.
+     */
+    defaultUserContext(authMode: AuthMode | string, url: string): boolean {
+        return authMode === "destination" && this.isRemote(url);
+    },
+
     /** True when this url's destination may act as the signed-in user. */
     supportsUserContext(url: string): boolean {
-        return DESTINATION_USER_CONTEXT_URLS.indexOf(builtinKey(url)) > -1;
+        return this.isRemote(url) || DESTINATION_USER_CONTEXT_URLS.indexOf(builtinKey(url)) > -1;
     },
 
     /**
@@ -219,6 +237,21 @@ export default {
                 out.allow_send = true;
             }
             return out as McpServer["oauth"];
+        }
+        if (authMode === "destination" && this.isRemote(url)) {
+            // --- destinations: a remote MCP server ---
+            // The destination holds the URL and the credential, so its name
+            // and whose credential it hands back are all there is. Exactly
+            // what `_clean_destination` in agents/db.py stores: losing
+            // `user_context` on a re-save would quietly swap every caller's
+            // identity for the destination's technical user.
+            const remote: Record<string, unknown> = {
+                destination: String(raw.destination ?? "").trim()
+            };
+            if (raw.user_context === true) {
+                remote.user_context = true;
+            }
+            return remote as McpServer["oauth"];
         }
         if (authMode === "destination") {
             return {

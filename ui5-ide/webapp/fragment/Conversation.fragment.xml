@@ -1,0 +1,206 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1">
+    <!-- The conversation column of the session page (Task U8). One list holds the messages and a
+         diagnose session's trace approvals in time order (model/conversation `interleave`): a row is
+         either a message (`kind: "message"`) or an approval (`kind: "approval"`, a card while pending,
+         one read-only line once decided; model/approvals). User text is plain text; assistant text is
+         HTML only from the sanitising renderer (model/markdown `renderMarkdown`). The list is not a live
+         region: the controller announces once that an answer is complete (InvisibleMessage, polite). -->
+    <VBox id="conversationHost" height="100%" width="100%" renderType="Bare" class="ideConversation">
+        <core:InvisibleText id="conversationLabel" text="{i18n>conversationLabel}" />
+        <ScrollContainer id="conversationScroll" vertical="true" horizontal="false" class="ideConversationScroll">
+            <List
+                id="messageList"
+                items="{path: 's>/messages', templateShareable: false}"
+                showSeparators="None"
+                showNoData="true"
+                noDataText="{= ${s>/isDiagnose} ? ${i18n>chatEmptyDiagnose} : ${i18n>chatEmpty} }"
+                ariaLabelledBy="conversationLabel">
+                <CustomListItem id="messageItem" class="ideMessage">
+                    <VBox id="messageBox" class="ideMessageBox">
+                        <!-- A message -->
+                        <Text id="messageAuthor" text="{s>author}" class="ideMessageAuthor" visible="{= ${s>kind} === 'message' }">
+                            <customData>
+                                <core:CustomData key="role" value="{= ${s>isUser} ? 'user' : 'assistant' }" writeToDom="true" />
+                            </customData>
+                        </Text>
+                        <Text
+                            id="messageText"
+                            text="{s>content}"
+                            renderWhitespace="true"
+                            visible="{= ${s>kind} === 'message' &amp;&amp; (${s>isUser} || (!${s>html} &amp;&amp; !!${s>content})) }" />
+                        <core:HTML
+                            id="messageHtml"
+                            content="{s>html}"
+                            visible="{= ${s>kind} === 'message' &amp;&amp; !${s>isUser} &amp;&amp; !!${s>html} }"
+                            preferDOM="false" />
+                        <Text
+                            id="messageStatus"
+                            text="{s>statusText}"
+                            visible="{= !!${s>statusText} }"
+                            class="ideMessageStatus" />
+                        <!-- The run's tool calls and plan: read on the first expand (GET .../activity), or live
+                             while the answer streams. A Panel, so the toggle has aria-expanded and keyboard. -->
+                        <Panel
+                            id="activityPanel"
+                            headerText="{s>activityTitle}"
+                            expandable="true"
+                            expanded="{s>activityOpen}"
+                            expand=".onActivityExpand"
+                            visible="{= ${s>kind} === 'message' &amp;&amp; !!${s>hasActivity} }"
+                            backgroundDesign="Transparent"
+                            class="ideMessageActivity">
+                            <VBox id="activityBody" busy="{s>activityBusy}" busyIndicatorDelay="0">
+                                <MessageStrip
+                                    id="activityError"
+                                    text="{s>activityError}"
+                                    type="Warning"
+                                    showIcon="true"
+                                    visible="{= !!${s>activityError} }" />
+                                <Title id="activityPlanTitle" text="{i18n>activityTodos}" level="H4" visible="{= ${s>todos}.length > 0 }" />
+                                <VBox id="activityPlan" items="{path: 's>todos', templateShareable: false}">
+                                    <ObjectStatus id="activityTodo" text="{s>mark} {s>content}" icon="{s>icon}" state="{s>state}" stateAnnouncementText="" />
+                                </VBox>
+                                <Title id="activityToolsTitle" text="{i18n>activityTools}" level="H4" visible="{= ${s>events}.length > 0 }"
+                                    class="sapUiTinyMarginTop" />
+                                <VBox id="activityTools" items="{path: 's>events', templateShareable: false}">
+                                    <VBox id="activityTool" class="ideActivityTool">
+                                        <HBox id="activityToolHead" alignItems="Center" wrap="Wrap">
+                                            <ObjectStatus id="activityToolTitle" text="{s>title}" icon="{s>icon}" state="{s>state}" stateAnnouncementText=""
+                                                tooltip="{s>statusText}" class="sapUiTinyMarginEnd" />
+                                            <!-- The state as words for screen readers (the icon and colour say it visually). -->
+                                            <Text id="activityToolStatus" text="{s>statusText}" visible="{= !!${s>statusText} }"
+                                                class="sapUiInvisibleText" />
+                                            <ObjectStatus id="activityToolRefused" text="{s>refusedText}" state="Warning" stateAnnouncementText="" visible="{s>refused}"
+                                                class="sapUiTinyMarginEnd" />
+                                            <Text id="activityToolAgent" text="{s>agent}" class="ideActivityAgent" />
+                                        </HBox>
+                                        <Text id="activityToolDetail" text="{s>detail}" maxLines="2" visible="{= !!${s>detail} }" />
+                                        <Text id="activityToolOutput" text="{s>output}" maxLines="{= ${s>outputOpen} ? 0 : 3 }"
+                                            visible="{s>hasOutput}" class="ideActivityOutput" />
+                                        <Link id="activityToolMore" text="{= ${s>outputOpen} ? ${i18n>activityShowLess} : ${i18n>activityShowMore} }"
+                                            visible="{= !!${s>longOutput} }" press=".onActivityOutputToggle" />
+                                    </VBox>
+                                </VBox>
+                                <Button id="activityShowAll" text="{s>showAllText}" type="Transparent" visible="{= ${s>hiddenEvents} > 0 }"
+                                    press=".onActivityShowAll" />
+                            </VBox>
+                        </Panel>
+                        <!-- A trace approval (diagnose): the card is the user's consent; no default action. -->
+                        <Panel
+                            id="approvalCard"
+                            class="ideApprovalCard"
+                            visible="{= ${s>kind} === 'approval' &amp;&amp; !!${s>approval/pending} }"
+                            headerText="{s>approval/title}"
+                            expandable="false"
+                            backgroundDesign="Solid"
+                            busy="{s>approval/busy}"
+                            busyIndicatorDelay="0">
+                            <VBox id="approvalFields" items="{path: 's>approval/fields', templateShareable: false}" class="sapUiTinyMarginBottom">
+                                <ObjectAttribute id="approvalField" title="{s>label}" text="{s>value}" />
+                            </VBox>
+                            <MessageStrip
+                                id="approvalInvalid"
+                                text="{s>approval/invalidText}"
+                                type="Warning"
+                                showIcon="true"
+                                visible="{= !!${s>approval/invalidText} }"
+                                class="sapUiTinyMarginBottom" />
+                            <VBox id="approvalTexts">
+                                <Text id="approvalWho" text="{s>approval/who}" visible="{= !!${s>approval/canApprove} }" class="sapUiTinyMarginBottom" />
+                                <Text id="approvalConsent" text="{i18n>approvalConsent}" visible="{= !!${s>approval/canApprove} }" class="sapUiTinyMarginBottom" />
+                                <Text id="approvalDecideBy" text="{s>approval/decideBy}" visible="{= !!${s>approval/decideBy} }" class="sapUiTinyMarginBottom" />
+                                <!-- The conversation is a list: Tab leaves it, F2 reaches a row's buttons (U17). -->
+                                <Text id="approvalKeyHint" text="{i18n>approvalKeyHint}" class="ideGateReason sapUiTinyMarginBottom" />
+                            </VBox>
+                            <HBox id="approvalButtons">
+                                <Button
+                                    id="approveTraceButton"
+                                    text="{s>approval/approveText}"
+                                    type="Accept"
+                                    icon="sap-icon://accept"
+                                    enabled="{= !${s>approval/busy} }"
+                                    visible="{= !!${s>approval/canApprove} }"
+                                    app:decision="approve"
+                                    press=".onApprovalDecide"
+                                    class="sapUiTinyMarginEnd" />
+                                <Button
+                                    id="denyTraceButton"
+                                    text="{i18n>denyTrace}"
+                                    type="Reject"
+                                    icon="sap-icon://decline"
+                                    enabled="{= !${s>approval/busy} }"
+                                    app:decision="deny"
+                                    press=".onApprovalDecide" />
+                            </HBox>
+                        </Panel>
+                        <ObjectStatus
+                            id="approvalDecided"
+                            class="ideApprovalDecided"
+                            visible="{= ${s>kind} === 'approval' &amp;&amp; !${s>approval/pending} }"
+                            text="{s>approval/statusText}"
+                            state="{s>approval/statusState}"
+                            stateAnnouncementText=""
+                            icon="{s>approval/statusIcon}" />
+                    </VBox>
+                </CustomListItem>
+            </List>
+        </ScrollContainer>
+        <HBox id="jumpBar" justifyContent="Center" visible="{s>/showJump}" class="ideJumpBar">
+            <Button
+                id="jumpToLatest"
+                text="{i18n>jumpToLatest}"
+                icon="sap-icon://navigation-down-arrow"
+                visible="{s>/showJump}"
+                press=".onJumpToLatest" />
+        </HBox>
+        <MessageStrip
+            id="runErrorStrip"
+            text="{s>/runError/text}"
+            type="{s>/runError/type}"
+            showIcon="true"
+            showCloseButton="true"
+            close=".onRunErrorClose"
+            visible="{= !!${s>/runError/text} }"
+            class="sapUiSmallMarginBeginEnd sapUiTinyMarginTop" />
+        <HBox id="composer" class="ideComposer" alignItems="End">
+            <TextArea
+                id="chatInput"
+                value="{s>/draft}"
+                valueLiveUpdate="true"
+                rows="3"
+                width="100%"
+                maxLength="20000"
+                showExceededText="true"
+                placeholder="{i18n>chatPlaceholder}"
+                ariaLabelledBy="chatInputLabel"
+                ariaDescribedBy="sendReason draftTooLong"
+                enabled="{= !!${s>/session} &amp;&amp; ${s>/canType} }">
+                <layoutData>
+                    <FlexItemData growFactor="1" />
+                </layoutData>
+            </TextArea>
+            <Button
+                id="sendButton"
+                text="{i18n>chatSend}"
+                type="Emphasized"
+                enabled="{= ${s>/canSend} &amp;&amp; !!${s>/draft} &amp;&amp; ${s>/draft}.length &lt;= 20000 }"
+                press=".onSend"
+                ariaDescribedBy="sendReason draftTooLong"
+                class="sapUiSmallMarginBegin" />
+            <core:InvisibleText id="chatInputLabel" text="{i18n>chatInputLabel}" />
+        </HBox>
+        <Text
+            id="draftTooLong"
+            text="{i18n>draftTooLong}"
+            visible="{= ${s>/draft}.length &gt; 20000 }"
+            class="ideGateReason ideSendReason" />
+        <Text
+            id="sendReason"
+            text="{s>/sendReason}"
+            visible="{= !!${s>/sendReason} }"
+            class="ideGateReason ideSendReason" />
+    </VBox>
+</core:FragmentDefinition>

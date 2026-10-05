@@ -1,0 +1,6 @@
+# Playwright output (node_modules/ and dist/ are covered by the root .gitignore)
+test-results/
+playwright-report/
+.ui5/
+coverage/
+_e2e_registry.db

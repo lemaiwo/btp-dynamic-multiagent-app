@@ -1,0 +1,8 @@
+{
+  "error": "SAP_AUTHENTICATION_FAILED",
+  "message": "SAP authentication failed for target DEMO/100 after principal propagation.",
+  "target": "DEMO/100",
+  "identity": "per-user",
+  "requestId": "REQ-0001",
+  "retryable": true
+}

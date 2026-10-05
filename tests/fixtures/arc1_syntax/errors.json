@@ -1,0 +1,17 @@
+{
+  "_note": "synthetic, replace with the real payload from L1",
+  "payload": {
+    "messages": [
+      {
+        "line": 12,
+        "message": "Field \"LV_TOTAL\" is unknown.",
+        "severity": "E"
+      },
+      {
+        "line": 20,
+        "text": "The variable \"LV_TMP\" is not used.",
+        "type": "W"
+      }
+    ]
+  }
+}

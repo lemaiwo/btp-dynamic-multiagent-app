@@ -1,0 +1,9 @@
+{
+  "_note": "synthetic, replace with the real payload from L1",
+  "payload": {
+    "status": "done",
+    "result": {
+      "checked": true
+    }
+  }
+}

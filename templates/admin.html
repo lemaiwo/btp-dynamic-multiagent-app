@@ -769,11 +769,15 @@ function renderMcpServers(servers) {
 }
 
 function addMcpServerRow(server) {
+    const isNewServer = !server;
     server = server || {url: '', auth_mode: 'jwt'};
     const oauth = server.oauth || {};
     const container = document.getElementById('agent-mcp-servers');
     const row = document.createElement('div');
     row.className = 'mcp-server-row';
+    // A new row's act-as-user switch follows the default (on for a remote
+    // destination server) until the user touches it; a stored one never does.
+    if (isNewServer) row.dataset.newServer = '1';
     row.style.cssText = 'border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:8px';
     row.innerHTML = `
         <div style="display:grid;grid-template-columns:1fr 180px 32px;gap:6px;align-items:center">
@@ -2431,9 +2435,9 @@ function openFromHash() {
 // A server on auth mode "BTP destination" stores no credential here: the
 // destination holds the target's URL and credential. The config block is the
 // destination's name, whether to resolve it as the signed-in user
-// (`user_context`, mail and Teams only), and the built-in's own pinned keys.
-// Mirrors `_DEST_KEYS`, `_SLACK_DEST_KEYS` and `_DEST_KEYS_BY_URL` in
-// agents/db.py: a field shown here and not listed there is dropped on save.
+// (`user_context`, mail, Teams and remote MCP servers), and the built-in's own
+// pinned keys. Mirrors `_DEST_KEYS`, `_SLACK_DEST_KEYS` and `_DEST_KEYS_BY_URL`
+// in agents/db.py: a field shown here and not listed there is dropped on save.
 const DESTINATION_FIELDS = {
     'builtin:jira':          ['project', 'status', 'labels', 'api_base', 'lookback', 'allow_comment'],
     'builtin:slack':         ['channels', 'lookback', 'allow_send'],
@@ -2444,6 +2448,22 @@ const DESTINATION_FIELDS = {
     'builtin:sapnotedetail': [],
     'builtin:smtp':          ['recipients', 'from', 'allow_send', 'theme'],
 };
+// A remote MCP server (an http(s) url) through a destination: the destination
+// names the host and holds the credential, so its name and `user_context` are
+// all that is stored (the remote branch of `_clean_destination`). Dropping
+// user_context on a re-save would swap every caller for the technical user.
+const REMOTE_DESTINATION_FIELDS = ['user_context'];
+
+function isRemoteMcpUrl(url) {
+    return /^https?:\/\//i.test(url);
+}
+
+/** The destination fields this url stores, or null for an unknown built-in. */
+function destinationFieldsFor(builtin) {
+    if (Object.prototype.hasOwnProperty.call(DESTINATION_FIELDS, builtin)) return DESTINATION_FIELDS[builtin];
+    return isRemoteMcpUrl(builtin) ? REMOTE_DESTINATION_FIELDS : null;
+}
+
 // Text fields, in the order they appear; the two switches are checkboxes.
 const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
     'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
@@ -2456,7 +2476,7 @@ function destinationFieldsHtml() {
                     <input type="text" class="dest-destination" placeholder="MY_DESTINATION">
                 </label>
                 <label class="full dest-field-user_context" style="font-weight:600">
-                    <input type="checkbox" class="dest-user_context" onchange="syncDestinationFields(this.closest('.mcp-server-row'))">
+                    <input type="checkbox" class="dest-user_context" onchange="userContextToggled(this.closest('.mcp-server-row'))">
                     Act as signed-in user
                     <span style="display:block;color:var(--muted);font-size:12px;font-weight:normal">
                         Resolve the destination with the user's token (OAuth2UserTokenExchange,
@@ -2530,13 +2550,24 @@ function fillDestinationFields(row, oauth) {
         theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
 }
 
+/** The user flipped the act-as-user switch: stop following the new-server default. */
+function userContextToggled(row) {
+    row.dataset.userContextTouched = '1';
+    syncDestinationFields(row);
+}
+
 /** Shows the fields the current built-in stores on a destination. */
 function syncDestinationFields(row) {
     const box = row.querySelector('.mcp-destination');
     if (!box) return;
     const builtin = destinationBuiltinOf(row);
-    const known = Object.prototype.hasOwnProperty.call(DESTINATION_FIELDS, builtin);
-    const wanted = known ? DESTINATION_FIELDS[builtin] : [];
+    const fields = destinationFieldsFor(builtin);
+    const known = fields !== null;
+    const wanted = fields || [];
+    if (row.dataset.newServer === '1' && row.dataset.userContextTouched !== '1') {
+        row.querySelector('.dest-user_context').checked =
+            row.querySelector('.mcp-auth-mode').value === 'destination' && isRemoteMcpUrl(builtin);
+    }
     const userContext = row.querySelector('.dest-user_context').checked;
     box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
         const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
@@ -2549,8 +2580,13 @@ function syncDestinationFields(row) {
     });
     let hint = '';
     if (!known) {
-        hint = 'A destination works with built-in toolsets only (builtin:gmail, builtin:outlook, '
+        hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
             + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sapnotes, builtin:sapnotedetail).';
+    } else if (isRemoteMcpUrl(builtin)) {
+        hint = 'The destination names the MCP server\'s host and holds its credential; the URL above contributes only its path. '
+            + (userContext
+                ? 'Acting as the signed-in user is on by default for a new server. Its Authentication must be a user-propagating type (OAuth2UserTokenExchange, OAuth2JWTBearer, OAuth2SAMLBearerAssertion); scheduled runs cannot use it, so untick it for those.'
+                : 'It holds an app-level credential: every caller reaches the server as the destination\'s technical user.');
     } else if (builtin === 'builtin:smtp') {
         hint = 'A destination of Type MAIL: mail.smtp.host/port, mail.user, mail.password, mail.smtp.from. The server certificate is always verified.';
     } else if (builtin === 'builtin:sapnotedetail') {
@@ -2568,7 +2604,7 @@ function syncDestinationFields(row) {
 /** The config block for a destination server, shaped as the API stores it. */
 function collectDestinationConfig(row) {
     const builtin = destinationBuiltinOf(row);
-    const wanted = DESTINATION_FIELDS[builtin] || [];
+    const wanted = destinationFieldsFor(builtin) || [];
     const oauth = {destination: row.querySelector('.dest-destination').value.trim()};
     DESTINATION_TEXT_KEYS.forEach(k => {
         if (k === 'destination' || !wanted.includes(k)) return;

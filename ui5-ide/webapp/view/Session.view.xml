@@ -1,0 +1,93 @@
+<mvc:View
+    controllerName="com.agent.ide.controller.Session"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.f"
+    height="100%">
+    <f:DynamicPage
+        id="sessionPage"
+        toggleHeaderOnTitleClick="false"
+        fitContent="true"
+        headerExpanded="true">
+        <f:title>
+            <f:DynamicPageTitle id="sessionPageTitle">
+                <f:breadcrumbs>
+                    <Breadcrumbs id="sessionBreadcrumbs">
+                        <Link id="backToWorklist" text="{i18n>sessionBackToWorklist}" press=".onNavBack" />
+                    </Breadcrumbs>
+                </f:breadcrumbs>
+                <f:heading>
+                    <HBox id="sessionHeading" alignItems="Center" wrap="Wrap">
+                        <Title id="sessionTitle" text="{s>/session/title}" level="H2" wrapping="true" class="sapUiSmallMarginEnd" />
+                        <ObjectStatus
+                            id="sessionType"
+                            text="{s>/typeText}"
+                            state="{= ${s>/isDiagnose} ? 'Indication03' : 'Indication05' }"
+                            stateAnnouncementText=""
+                            inverted="true"
+                            class="sapUiSmallMarginEnd" />
+                        <Text id="sessionTarget" text="{s>/session/target}" />
+                    </HBox>
+                </f:heading>
+            </f:DynamicPageTitle>
+        </f:title>
+        <f:header>
+            <f:DynamicPageHeader id="sessionPageHeader" pinnable="false" visible="{= !${s>/loadFailed} }">
+                <core:Fragment fragmentName="com.agent.ide.fragment.SessionHeader" type="XML" />
+            </f:DynamicPageHeader>
+        </f:header>
+        <f:content>
+            <VBox id="sessionContent" height="100%" renderType="Bare" class="ideSessionContent">
+            <VBox id="loadFailedBox" visible="{s>/loadFailed}" class="sapUiMediumMargin">
+                <MessageStrip
+                    id="loadFailedStrip"
+                    text="{s>/loadFailedText}"
+                    type="Error"
+                    showIcon="true"
+                    class="sapUiSmallMarginBottom" />
+                <Link id="loadFailedBack" text="{i18n>loadFailedBack}" press=".onNavBack" />
+            </VBox>
+            <f:FlexibleColumnLayout
+                id="fcl"
+                visible="{= !${s>/loadFailed} }"
+                layout="{path: 's>/layout', mode: 'OneWay'}"
+                busy="{s>/busy}"
+                busyIndicatorDelay="0"
+                backgroundDesign="Solid">
+                <f:beginColumnPages>
+                    <core:Fragment fragmentName="com.agent.ide.fragment.Conversation" type="XML" />
+                </f:beginColumnPages>
+                <f:midColumnPages>
+                    <VBox id="artifactHost" height="100%" width="100%" class="ideArtifactHost">
+                        <Toolbar id="artifactToolbar" style="Clear">
+                            <Title id="artifactTitle" text="{s>/artifact/title}" level="H3" />
+                            <ToolbarSpacer />
+                            <Button
+                                id="closeArtifact"
+                                icon="sap-icon://decline"
+                                type="Transparent"
+                                tooltip="{i18n>artifactClose}"
+                                press=".onCloseArtifact" />
+                        </Toolbar>
+                        <ScrollContainer id="artifactScroll" vertical="true" height="100%" class="ideArtifactScroll"
+                            busy="{s>/artifact/busy}" busyIndicatorDelay="300">
+                            <MessageStrip
+                                id="artifactMissing"
+                                text="{s>/artifact/missing}"
+                                type="Warning"
+                                showIcon="true"
+                                visible="{= !!${s>/artifact/missing} }"
+                                class="sapUiSmallMargin" />
+                            <core:Fragment fragmentName="com.agent.ide.fragment.DocumentView" type="XML" />
+                            <core:Fragment fragmentName="com.agent.ide.fragment.ChangesView" type="XML" />
+                            <core:Fragment fragmentName="com.agent.ide.fragment.SourceView" type="XML" />
+                            <core:Fragment fragmentName="com.agent.ide.fragment.Findings" type="XML" />
+                        </ScrollContainer>
+                    </VBox>
+                </f:midColumnPages>
+            </f:FlexibleColumnLayout>
+            </VBox>
+        </f:content>
+    </f:DynamicPage>
+</mvc:View>

@@ -14,6 +14,7 @@ import re
 import reprlib
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from typing import Callable
 from urllib.parse import urlparse
 
 from pydantic_ai import Agent, ModelRetry, RunContext
@@ -35,7 +36,8 @@ from agents.shared import (
     run_usage_limits,
 )
 # --- deep agents ---
-from agents.deep import deep_instructions, deep_toolset
+from agents.deep import deep_toolset, scoped_deep_instructions
+from agents.ide.readonly import ReadOnlyGuard
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +368,18 @@ async def _authorization_prompt(agent_name: str, exc: BaseException) -> str | No
 # ---------------------------------------------------------------------------
 # Skills
 # ---------------------------------------------------------------------------
+def _deep_section(config) -> Callable[[], str]:
+    """A zero-argument instructions callable for the deep section.
+
+    pydantic-ai passes ``RunContext`` to an instructions function that has
+    *any* parameter, so this must take none (no ``cfg=`` default trick)."""
+
+    def deep_section() -> str:
+        return scoped_deep_instructions(config)
+
+    return deep_section
+
+
 def _skills_instructions(attached: list[dict]) -> str:
     """Prompt block advertising an agent's attached skills.
 
@@ -595,7 +609,11 @@ async def build_orchestrator() -> BuildResult:
             logger.warning("Agent %s has no usable MCP servers; skipping", row.name)
             continue
 
+        # Cleanup needs the raw servers (their httpx clients); the agent and
+        # its deep sub-agents get them behind the IDE read-only guard, which
+        # is a pass-through unless an IDE session is bound.
         mcp_clients.extend(servers)
+        servers = [ReadOnlyGuard(server) for server in servers]
 
         attached_skills = []
         for skill_name in row.skills:
@@ -616,12 +634,24 @@ async def build_orchestrator() -> BuildResult:
             row, default_model=model, default_name=model_name, cache=model_cache
         )
         toolsets = list(servers)
+        # The IDE session tools (submit_document): the app's own toolset, not
+        # an MCP server, so not behind ReadOnlyGuard. Every specialist has
+        # it, so delegates of an IDE run can submit too; it lists no tool
+        # unless an IDE session run is bound (chat, A2A, jobs, workflows).
+        # Deep sub-agents get `servers` only, never this toolset.
+        from agents.ide.session_tools import ide_session_toolset
+
+        toolsets.append(ide_session_toolset())
         # --- deep agents --- opt-in planning / scratchpad / sub-agent tools.
         # Sub-agents get `servers` (this agent's MCP servers and built-ins)
         # and are never registered: not a specialist, not a peer.
         deep_config = row.deep
+        instructions: list = [specialist_instructions]
         if deep_config.enabled:
-            specialist_instructions += deep_instructions(deep_config)
+            # Resolved per run: inside an IDE session the scratchpad is the
+            # shared session workspace the user sees, and `task` is described
+            # only when this agent has it and the stage allows it.
+            instructions.append(_deep_section(deep_config))
             toolsets.append(
                 deep_toolset(
                     deep_config,
@@ -635,7 +665,7 @@ async def build_orchestrator() -> BuildResult:
 
         specialist = Agent(
             specialist_model,
-            instructions=specialist_instructions,
+            instructions=instructions,
             toolsets=toolsets,
             retries=_TOOL_RETRIES,
         )

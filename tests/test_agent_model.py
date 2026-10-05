@@ -54,9 +54,12 @@ class _FakeMCP:
         self.kwargs = kwargs
 
 
+_real_create_mcp_server = shared.create_mcp_server
 shared.create_mcp_server = lambda name, base_url, *a, **k: _FakeMCP(  # type: ignore[assignment]
     name, base_url, **k
 )
+# Kept so tests/conftest.py can undo this stub for suites that need the real one.
+shared.create_mcp_server._unpatched = _real_create_mcp_server  # type: ignore[attr-defined]
 
 # Patch pydantic_ai.Agent so it accepts our fake model + fake toolsets
 import pydantic_ai  # noqa: E402
@@ -74,6 +77,7 @@ def _patched_init(self, model=None, **kwargs):  # type: ignore[no-untyped-def]
     _orig_agent_init(self, model=(model if model is not None else "test"), **kwargs)
 
 
+_patched_init._unpatched = _orig_agent_init  # type: ignore[attr-defined]  # see tests/conftest.py
 pydantic_ai.Agent.__init__ = _patched_init  # type: ignore[method-assign]
 
 

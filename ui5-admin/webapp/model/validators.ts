@@ -1,5 +1,6 @@
 import type { AuthMode, DeepConfig, McpServer, OAuthClient, WorkflowStep } from "../service/types";
 import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } from "./builtins";
+import { isRemoteUrl } from "./remoteUrl";
 
 // --- destinations ---
 /** What a BTP destination may be called. Mirrors `_DESTINATION_NAME_RE` in
@@ -81,6 +82,12 @@ export default {
         if (!DESTINATION_NAME_RE.test((cfg.destination || "").trim())) {
             return "The destination name may only contain letters, digits, '_', '.' "
                 + "and '-' (up to 200 characters).";
+        }
+        if (isRemoteUrl(key)) {
+            // A remote MCP server: name and user context are all it has, and
+            // either setting of the switch is valid (`_validate_destination_config`
+            // returns early for a non-builtin url the same way).
+            return "";
         }
         const userContext = cfg.user_context === true;
         if (userContext && DESTINATION_USER_CONTEXT_URLS.indexOf(key) === -1) {

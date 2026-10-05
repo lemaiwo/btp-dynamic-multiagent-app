@@ -228,6 +228,8 @@ export default class AgentDetail extends BaseController {
     // --- MCP server dialog -----------------------------------------------
     public onAddServer(): void {
         this.editingServerIndex = -1;
+        this.newServer = true;
+        this.userContextTouched = false;
         void this.openServerDialog({ url: "", auth_mode: "jwt" });
     }
 
@@ -235,8 +237,28 @@ export default class AgentDetail extends BaseController {
         const context = (event.getSource() as Control).getBindingContext("agent");
         const path = context?.getPath() ?? "";
         this.editingServerIndex = Number(path.substring(path.lastIndexOf("/") + 1));
+        this.newServer = false;
         const server = context?.getObject() as McpServer;
         void this.openServerDialog(JSON.parse(JSON.stringify(server)) as McpServer);
+    }
+
+    /** A server being added (not edited): its user_context starts from the default. */
+    private newServer = false;
+    /** Set once the user flips the switch, so the default stops following url/mode. */
+    private userContextTouched = false;
+
+    public onUserContextToggle(): void {
+        this.userContextTouched = true;
+    }
+
+    /** New remote destination servers start with "Act as signed-in user" on. */
+    private applyUserContextDefault(): void {
+        if (!this.newServer || this.userContextTouched) {
+            return;
+        }
+        const serverModel = this.getModel("server") as JSONModel;
+        serverModel.setProperty("/oauth/user_context", oauthConfig.defaultUserContext(
+            serverModel.getProperty("/auth_mode") as string, serverModel.getProperty("/url") as string));
     }
 
     private async openServerDialog(server: McpServer): Promise<void> {
@@ -320,11 +342,13 @@ export default class AgentDetail extends BaseController {
         }
         // Picking a built-in may have changed the mode above or in
         // onServerKindChange; the placeholder has to follow either way.
+        this.applyUserContextDefault();
         this.syncScopeHint();
     }
 
     public onAuthModeChange(): void {
         (this.getModel("server") as JSONModel).setProperty("/errors", {});
+        this.applyUserContextDefault();
         this.syncScopeHint();
     }
 
@@ -397,7 +421,10 @@ export default class AgentDetail extends BaseController {
             // openServerDialog reads has_client_secret to decide whether to
             // show the "stored" placeholder. Carry it forward or that hint
             // silently disappears the second time round.
-            if (oauth.dcr !== true && !publicBuiltin) {
+            // A destination stores no credential of its own, so there is no
+            // secret to remember; leaving the flag out keeps the posted block
+            // exactly what the server stores.
+            if (oauth.dcr !== true && !publicBuiltin && authMode !== "destination") {
                 oauth.has_client_secret = !!oauth.client_secret
                     || !!(oauthRaw as { has_client_secret?: boolean }).has_client_secret;
             }

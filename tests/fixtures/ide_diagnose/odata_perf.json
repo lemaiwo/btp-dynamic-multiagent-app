@@ -1,0 +1,15 @@
+{
+  "url": "/sap/opu/odata/sap/ZDEMO_SRV/Partners('123456789012')",
+  "requests": [
+    {
+      "requestId": "20261003102200000001",
+      "url": "/sap/opu/odata/sap/ZDEMO_SRV/Partners('123456789012')?$filter=Mail eq 'jane.doe@example.com'",
+      "method": "GET",
+      "status": 200,
+      "user": "DEVUSER01",
+      "duration": 340,
+      "timestamp": "2026-10-03T10:22:00Z",
+      "responseSample": "{\"Iban\":\"BE71 0961 2345 6769\",\"Raw\":\"RAWSENTINEL-0123456789-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789\"}"
+    }
+  ]
+}

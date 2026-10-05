@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.16.1
+version: 2.19.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -45,8 +45,40 @@ modules:
         - "package-lock.json"
         - "mta_archives/"
         - "*.mtar"
+        - "Makefile_*.mta"
         - "approuter/"
         - "ui5-admin/"
+        - "ui5-ide/"
+        # Local-only material: landscape/customer specific or dev tooling.
+        # Nothing here is read by app.py, agents/ or the before-start hook.
+        - ".sdd/"
+        - "docs/"
+        - "memory/"
+        - "tests/"
+        - "e2e/"
+        - "test-results/"
+        - "tmp/"
+        - "resources/"
+        - ".claude/"
+        - ".mcp.json"
+        - ".github/"
+        - ".pytest_cache/"
+        - ".ruff_cache/"
+        - "CLAUDE.md"
+        - "CLAUDE.local.md"
+        - "README.md"
+        - "JOULE_A2A.md"
+        - "SLACK_SETUP.md"
+        - "*.mtaext"
+        - "ruff.toml"
+        - "pytest.ini"
+        - "*.db"
+        - ".env.*"
+        - "client_secret_*.json"
+        - "*.pfx"
+        - "*.p12"
+        - "*.pem"
+        - "*.key"
     parameters:
       memory: 1G
       disk-quota: 2G
@@ -77,6 +109,22 @@ modules:
       PUBLIC_BASE_URL: ~{pydantic-agent-approuter-api/url}
       A2A_AGENT_NAME: "SAP BTP Multi-Agent Orchestrator"
       A2A_AGENT_DESCRIPTION: "Dynamic multi-agent orchestrator for SAP BTP. Delegates to specialist agents backed by BTP-hosted MCP servers."
+      # ABAP Assistant (agents/ide). Landscape-specific values (ARC-1
+      # destination, targets) are set in conventions / an .mtaext, not here.
+      IDE_SESSION_RETENTION_DAYS: "90"
+      IDE_SESSION_REQUEST_CAP: "1000"
+      IDE_ORCHESTRATOR_AGENT: abap-orchestrator
+      # Diagnose sessions: values are the code defaults; a landscape
+      # overrides them in its .mtaext.
+      IDE_DIAGNOSE_AGENT: abap-diagnostics
+      IDE_DIAGNOSE_RETENTION_DAYS: "14"
+      IDE_AUDIT_RETENTION_DAYS: "365"
+      IDE_APPROVAL_TTL_MIN: "15"
+      IDE_TRACE_MAX_EXECUTIONS: "3"
+      IDE_TRACE_MAX_HOURS: "8"
+      IDE_TRACE_ARM_TIMEOUT_S: "60"
+      # A landscape turns the IDE seed on in its .mtaext.
+      IDE_SEED: "false"
     requires:
       - name: aicore-service
       - name: uaa-service
@@ -159,6 +207,17 @@ modules:
       supported-platforms: []
       build-result: dist
 
+  - name: ui5-ide
+    type: html5
+    path: ui5-ide
+    build-parameters:
+      builder: custom
+      commands:
+        - npm ci
+        - npm run build:ui5
+      supported-platforms: []
+      build-result: dist
+
   - name: ui5-admin-deployer
     type: com.sap.application.content
     path: .
@@ -172,6 +231,10 @@ modules:
         - name: ui5-admin
           artifacts:
             - ui5-admin-content.zip
+          target-path: resources/
+        - name: ui5-ide
+          artifacts:
+            - ui5-ide-content.zip
           target-path: resources/
 
 resources:

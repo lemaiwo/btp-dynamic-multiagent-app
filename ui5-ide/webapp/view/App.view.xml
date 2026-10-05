@@ -1,0 +1,26 @@
+<mvc:View
+    controllerName="com.agent.ide.controller.App"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:tnt="sap.tnt"
+    displayBlock="true"
+    height="100%">
+    <tnt:ToolPage id="toolPage">
+        <tnt:header>
+            <tnt:ToolHeader id="toolHeader" visible="{appView>/showHeader}">
+                <Title id="appTitle" text="{i18n>appTitle}" level="H1" />
+                <ToolbarSpacer />
+                <Button
+                    id="conventionsButton"
+                    text="{i18n>conventionsButton}"
+                    icon="sap-icon://settings"
+                    type="Transparent"
+                    tooltip="{i18n>conventionsTooltip}"
+                    press=".onConventions" />
+            </tnt:ToolHeader>
+        </tnt:header>
+        <tnt:mainContents>
+            <App id="pageContainer" />
+        </tnt:mainContents>
+    </tnt:ToolPage>
+</mvc:View>

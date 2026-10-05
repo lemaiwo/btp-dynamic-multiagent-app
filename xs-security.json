@@ -25,6 +25,10 @@
       "description": "Administer dynamic agent configuration"
     },
     {
+      "name": "$XSAPPNAME.developer",
+      "description": "Use the ABAP Assistant (sessions, read-only SAP access)"
+    },
+    {
       "name": "$XSAPPNAME.a2a",
       "description": "Invoke the orchestrator over the A2A protocol (Joule Agent Hub)",
       "grant-as-authority-to-apps": ["$XSAPPNAME(application,sap-provisioning,tenant-onboarding)"]
@@ -47,6 +51,11 @@
       "scope-references": ["$XSAPPNAME.user", "$XSAPPNAME.admin"]
     },
     {
+      "name": "AbapIdeDeveloper",
+      "description": "Use the ABAP Assistant",
+      "scope-references": ["$XSAPPNAME.user", "$XSAPPNAME.developer"]
+    },
+    {
       "name": "AgentA2AClient",
       "description": "Remote A2A client (e.g. SAP Joule) allowed to invoke the orchestrator",
       "scope-references": ["$XSAPPNAME.a2a"]
@@ -62,6 +71,11 @@
       "name": "Agent Administrator",
       "description": "Administrators who can configure agents dynamically",
       "role-template-references": ["$XSAPPNAME.AgentAdmin"]
+    },
+    {
+      "name": "ABAP IDE Developer",
+      "description": "Developers who use the ABAP Assistant",
+      "role-template-references": ["$XSAPPNAME.AbapIdeDeveloper"]
     },
     {
       "name": "Agent A2A Client",

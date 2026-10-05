@@ -1,0 +1,52 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!-- Request changes (Task U9): the open comments that will be sent, and an optional note. Plain text only. -->
+    <Dialog
+        id="requestChangesDialog"
+        title="{i18n>requestChangesTitle}"
+        contentWidth="32rem"
+        initialFocus="requestChangesNote"
+        ariaDescribedBy="requestChangesIntro"
+        afterClose=".onRequestChangesClosed">
+        <content>
+            <VBox id="requestChangesBox" class="sapUiSmallMargin">
+                <Text id="requestChangesIntro" text="{s>/rc/intro}" class="sapUiTinyMarginBottom" />
+                <List
+                    id="requestChangesList"
+                    visible="{= ${s>/rc/comments}.length > 0 }"
+                    showSeparators="Inner"
+                    ariaLabelledBy="requestChangesIntro"
+                    items="{path: 's>/rc/comments', templateShareable: false}"
+                    class="sapUiSmallMarginBottom">
+                    <CustomListItem id="requestChangesItem">
+                        <VBox id="requestChangesRow" class="sapUiTinyMargin">
+                            <Text id="requestChangesAnchor" text="{s>anchorText}" class="ideRcAnchor" />
+                            <Text id="requestChangesBody" text="{s>body}" renderWhitespace="true" maxLines="4" />
+                        </VBox>
+                    </CustomListItem>
+                </List>
+                <Label id="requestChangesNoteLabel" text="{i18n>requestChangesNote}" labelFor="requestChangesNote" />
+                <TextArea
+                    id="requestChangesNote"
+                    value="{s>/rc/note}"
+                    maxLength="4000"
+                    rows="3"
+                    width="100%"
+                    valueLiveUpdate="true"
+                    liveChange=".onRequestChangesNoteChange" />
+            </VBox>
+        </content>
+        <beginButton>
+            <Button
+                id="requestChangesSend"
+                type="Emphasized"
+                text="{i18n>requestChangesSend}"
+                enabled="{= ${s>/rc/canSend} &amp;&amp; !${s>/rc/busy} }"
+                press=".onRequestChangesSend" />
+        </beginButton>
+        <endButton>
+            <Button id="requestChangesCancel" text="{i18n>requestChangesCancel}" press=".onRequestChangesCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

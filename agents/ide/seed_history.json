@@ -1,0 +1,51 @@
+{
+  "agents": {
+    "abap-developer": [
+      "ca16fa5a681c808204eef58509c6ee60ccbcb1ab0d28c01496c568a5edf0e18c",
+      "f25dd1208374dc11ea4739a3962e7ac8a566d6c3c6b2167b9c466b2525bff86b"
+    ],
+    "abap-diagnostics": [
+      "d5c0d86aa2f99faadb56f7373e70b6bd49f2ddace142f5feafe1038a1bf89106",
+      "e1e2c8ba18a103250f5760b45bad4423a317de00d71d383e20d5db909fcad07a"
+    ],
+    "abap-orchestrator": [
+      "60a7b54f99f1669a7e8b971df4ce2c68a705d5bed43b1fb79f4cf6b9b82914ff",
+      "17f0bdca709d440a10580feeaebcc90d0218cf2c319008fb4686b73e6f2aef2d"
+    ],
+    "abap-researcher": [
+      "1d8233c196dbcd6634dcd914d8650be143c1223b7da48d46e39b5b0b902b803f"
+    ],
+    "abap-reviewer": [
+      "2e8df728bfe4b0173bbee4962646e0facfc4e1f1460d9d821e1bea640a2630b2",
+      "f37fb45c40aead2c99f7e481f912f8070b1b81fab418f10561a67920a6968887"
+    ]
+  },
+  "skills": {
+    "abap-authorization-analysis": [
+      "cacbc304f0d563dd5a32104c714f38eb65e927497e34c7aa1bca197d4cfc0de6"
+    ],
+    "abap-cds-rap": [
+      "d9b78241c857bc914e14369c482810b98c0fb56c1ee378841ef0bc1f21f2202d"
+    ],
+    "abap-design": [
+      "788c9ea93dbcdb11369b79c34ac0ef09e121c9f18e6d1f281b1d553d62032325"
+    ],
+    "abap-dump-analysis": [
+      "bdbfa44d07649a3613125d71bed59ac604a918e87384bb41ee415a95abfe2b89"
+    ],
+    "abap-performance-trace": [
+      "ac6f037285a8830a1e94c7a2f094a99fd63f5f01a50409035e8bf17f25776a24"
+    ],
+    "abap-plan": [
+      "01b3f54dd3e08d53f83958a97b116c631f3f41e02a3fe3ea7ce85fc3a9f862c6",
+      "7db18645f087b0c7927af8d84c0460a44592b08885470f5559eca5c84a4e5124"
+    ],
+    "abap-tdd": [
+      "133bc9107596e40bb9b7c93a0565eb19eff6d3549787bd2c7b2859c253665813",
+      "1395f57c752ebbd9ee64efc3238f25d7de69d8b77fdb0f01ae0232b74207f526"
+    ],
+    "clean-core-abap": [
+      "79905eacbd809c34a50e8c91fc30dff275390d6048f1af1645587de51371bcf1"
+    ]
+  }
+}

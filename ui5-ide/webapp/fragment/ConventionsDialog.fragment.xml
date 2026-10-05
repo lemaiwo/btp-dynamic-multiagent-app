@@ -1,0 +1,173 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:form="sap.ui.layout.form"
+    xmlns:l="sap.ui.layout">
+    <!--
+        Conventions are admin-written free text that later goes into agent
+        prompts: every value is bound as a plain value (Input/TextArea/Text),
+        never used as binding info, so "{...}" in it stays text.
+        A field with a button is two fields of one form element (a box is no
+        form content); the button has its span, the field takes the rest. The
+        layout module is required up front, so the form never renders without
+        it ("Layout missing!").
+        The non_production switch changes nothing by itself: its change asks
+        for a confirmation (focus on Cancel, no emphasized action) and only the
+        confirmed answer sends the flag, alone; until the answer the switch
+        shows the stored state, then the server's answer. Save never sends
+        the flag, and is off in edit mode while no target is selected.
+    -->
+    <Dialog
+        id="conventionsDialog"
+        title="{i18n>conventionsTitle}"
+        contentWidth="38rem"
+        busy="{conv>/busy}"
+        busyIndicatorDelay="0">
+        <MessageStrip
+            id="conventionsReadOnly"
+            class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+            type="Information"
+            showIcon="true"
+            text="{i18n>conventionsReadOnly}"
+            visible="{= !${conv>/isAdmin} }" />
+        <form:SimpleForm id="conventionsForm" editable="true" layout="ResponsiveGridLayout"
+            labelSpanXL="4" labelSpanL="4" labelSpanM="4" labelSpanS="12" adjustLabelSpan="false"
+            columnsXL="1" columnsL="1" columnsM="1"
+            core:require="{ ResponsiveGridLayout: 'sap/ui/layout/form/ResponsiveGridLayout' }">
+            <Label id="convTargetLabel" text="{i18n>conventionsTarget}" labelFor="convTarget"
+                visible="{= ${conv>/mode} !== 'create' }" />
+            <Select
+                id="convTarget"
+                width="100%"
+                visible="{= ${conv>/mode} !== 'create' }"
+                selectedKey="{conv>/target}"
+                change=".onConventionsTarget"
+                items="{conv>/targets}">
+                <core:Item key="{conv>}" text="{conv>}" />
+            </Select>
+            <Button
+                id="convNewTargetButton"
+                text="{i18n>conventionsNewTarget}"
+                icon="sap-icon://add"
+                visible="{= ${conv>/isAdmin} &amp;&amp; ${conv>/mode} !== 'create' }"
+                press=".onConventionsNewTarget">
+                <layoutData><l:GridData span="XL3 L3 M3 S5" /></layoutData>
+            </Button>
+            <Label id="convNewTargetLabel" text="{i18n>conventionsNewTargetLabel}" labelFor="convNewTarget" required="true"
+                visible="{= ${conv>/mode} === 'create' }" />
+            <Input
+                id="convNewTarget"
+                value="{conv>/newTarget}"
+                required="true"
+                maxLength="64"
+                visible="{= ${conv>/mode} === 'create' }"
+                placeholder="{i18n>conventionsNewTargetPlaceholder}"
+                valueState="{conv>/newTargetState}"
+                valueStateText="{conv>/newTargetStateText}"
+                liveChange=".onConventionsNewTargetLive" />
+            <Button
+                id="convCancelNewButton"
+                text="{i18n>cancel}"
+                visible="{= ${conv>/mode} === 'create' }"
+                press=".onConventionsCancelNew">
+                <layoutData><l:GridData span="XL2 L2 M2 S4" /></layoutData>
+            </Button>
+            <Label id="convLabelLabel" text="{i18n>conventionsLabel}" labelFor="convLabel" />
+            <Input id="convLabel" value="{conv>/form/label}" editable="{conv>/isAdmin}" maxLength="120" />
+            <Button id="convLabelClear" icon="sap-icon://decline" type="Transparent"
+                tooltip="{i18n>conventionsClearLabel}" visible="{conv>/isAdmin}" enabled="{= !!${conv>/form/label} }"
+                press=".onConventionsClear('label')">
+                <layoutData><l:GridData span="XL1 L1 M1 S2" /></layoutData>
+            </Button>
+            <Label id="convNamespaceLabel" text="{i18n>conventionsNamespace}" labelFor="convNamespace" />
+            <Input id="convNamespace" value="{conv>/form/namespace}" editable="{conv>/isAdmin}" maxLength="30" />
+            <Button id="convNamespaceClear" icon="sap-icon://decline" type="Transparent"
+                tooltip="{i18n>conventionsClearNamespace}" visible="{conv>/isAdmin}" enabled="{= !!${conv>/form/namespace} }"
+                press=".onConventionsClear('namespace')">
+                <layoutData><l:GridData span="XL1 L1 M1 S2" /></layoutData>
+            </Button>
+            <Label id="convPackageLabel" text="{i18n>conventionsPackage}" labelFor="convPackage" />
+            <Input id="convPackage" value="{conv>/form/package}" editable="{conv>/isAdmin}" maxLength="30" />
+            <Button id="convPackageClear" icon="sap-icon://decline" type="Transparent"
+                tooltip="{i18n>conventionsClearPackage}" visible="{conv>/isAdmin}" enabled="{= !!${conv>/form/package} }"
+                press=".onConventionsClear('package')">
+                <layoutData><l:GridData span="XL1 L1 M1 S2" /></layoutData>
+            </Button>
+            <Label id="convAtcLabel" text="{i18n>conventionsAtc}" labelFor="convAtc" />
+            <Input id="convAtc" value="{conv>/form/atc_variant}" editable="{conv>/isAdmin}" maxLength="30" />
+            <Button id="convAtcClear" icon="sap-icon://decline" type="Transparent"
+                tooltip="{i18n>conventionsClearAtc}" visible="{conv>/isAdmin}" enabled="{= !!${conv>/form/atc_variant} }"
+                press=".onConventionsClear('atc_variant')">
+                <layoutData><l:GridData span="XL1 L1 M1 S2" /></layoutData>
+            </Button>
+            <Label id="convCleanCoreLabel" text="{i18n>conventionsCleanCore}" labelFor="convCleanCore" />
+            <Select
+                id="convCleanCore"
+                width="100%"
+                forceSelection="false"
+                editable="{conv>/isAdmin}"
+                selectedKey="{conv>/form/clean_core_level}">
+                <!-- Not clearable on the server: "not set" only while nothing is stored. -->
+                <core:Item key="" text="{i18n>conventionsNotSet}" enabled="{= !${conv>/storedCleanCore} }" />
+                <core:Item key="A" text="{i18n>cleanCoreA}" />
+                <core:Item key="B" text="{i18n>cleanCoreB}" />
+                <core:Item key="C" text="{i18n>cleanCoreC}" />
+                <core:Item key="D" text="{i18n>cleanCoreD}" />
+            </Select>
+            <Label id="convDestinationLabel" text="{i18n>conventionsDestination}" labelFor="convDestination" />
+            <Input id="convDestination" value="{conv>/form/destination}" editable="{conv>/isAdmin}" maxLength="200" />
+            <Button id="convDestinationClear" icon="sap-icon://decline" type="Transparent"
+                tooltip="{i18n>conventionsClearDestination}" visible="{conv>/isAdmin}" enabled="{= !!${conv>/form/destination} }"
+                press=".onConventionsClear('destination')">
+                <layoutData><l:GridData span="XL1 L1 M1 S2" /></layoutData>
+            </Button>
+            <Label id="convFreeTextLabel" text="{i18n>conventionsFreeText}" labelFor="convFreeText" />
+            <TextArea
+                id="convFreeText"
+                value="{conv>/form/free_text}"
+                editable="{conv>/isAdmin}"
+                rows="6"
+                maxLength="20000"
+                showExceededText="false"
+                width="100%" />
+            <Button id="convFreeTextClear" icon="sap-icon://decline" type="Transparent"
+                tooltip="{i18n>conventionsClearFreeText}" visible="{conv>/isAdmin}" enabled="{= !!${conv>/form/free_text} }"
+                press=".onConventionsClear('free_text')">
+                <layoutData><l:GridData span="XL1 L1 M1 S2" /></layoutData>
+            </Button>
+            <Label id="convNonProductionLabel" text="{i18n>conventionsNonProduction}" labelFor="convNonProduction" />
+            <Switch
+                id="convNonProduction"
+                state="{conv>/nonProduction}"
+                customTextOn="{i18n>yes}"
+                customTextOff="{i18n>no}"
+                enabled="{= ${conv>/isAdmin} &amp;&amp; ${conv>/mode} === 'edit' &amp;&amp; !!${conv>/target} }"
+                ariaLabelledBy="convNonProductionLabel convNonProductionHint"
+                change=".onConventionsFlag" />
+            <Text
+                id="convNonProductionHint"
+                text="{= ${conv>/mode} === 'create' ? ${i18n>conventionsNonProductionAfterCreate} : ${i18n>conventionsNonProductionHint} }">
+                <layoutData><l:GridData span="XL8 L8 M8 S12" indent="XL4 L4 M4 S0" linebreak="true" /></layoutData>
+            </Text>
+        </form:SimpleForm>
+        <MessageStrip
+            id="convNonProductionStrip"
+            class="sapUiSmallMarginBeginEnd sapUiSmallMarginBottom"
+            type="Warning"
+            showIcon="true"
+            text="{conv>/flagStripText}"
+            visible="{= ${conv>/mode} === 'edit' &amp;&amp; ${conv>/storedNonProduction} === true }" />
+        <beginButton>
+            <Button
+                id="convSaveButton"
+                text="{= ${conv>/mode} === 'create' ? ${i18n>create} : ${i18n>save} }"
+                type="Emphasized"
+                visible="{conv>/isAdmin}"
+                enabled="{= ${conv>/mode} === 'create' || !!${conv>/target} }"
+                press=".onConventionsSave" />
+        </beginButton>
+        <endButton>
+            <Button id="convCloseButton" text="{i18n>close}" press=".onConventionsClose" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>
