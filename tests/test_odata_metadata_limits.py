@@ -27,6 +27,7 @@ from agents.odata.metadata import (  # noqa: E402
     parse_metadata,
 )
 from agents.odata.models import MAX_ENTITY_SETS, MAX_OPERATIONS  # noqa: E402
+from agents.odata.preview import build_preview  # noqa: E402
 
 V2_HEAD = (
     '<?xml version="1.0" encoding="utf-8"?>'
@@ -479,9 +480,11 @@ def test_a_long_shared_name_is_dropped_where_the_document_is_read():
     document = (
         V4_HEAD.replace('Namespace="NS"', f'Namespace="{namespace}"') + actions + V4_TAIL
     ).encode()
-    parsed = parse_metadata(document, "v4")
-    assert parsed.attributes_dropped == 1 and parsed.work < 2_000
-    assert parsed.operations == () and parsed.operations_declared == 300
+    # A schema without its namespace would be sets without fields and
+    # operations without names, with nothing to say why: refused instead.
+    with pytest.raises(MetadataError) as error:
+        parse_metadata(document, "v4")
+    assert str(error.value) == NAMESPACE_TOO_LONG
 
 
 def test_a_qualified_name_resolves_as_before():
@@ -530,6 +533,10 @@ def test_a_qualified_name_resolves_as_before():
 # it does not keep, no later loop can copy, strip, lower or compare.
 
 SAP_NS = 'xmlns:sap="http://www.sap.com/Protocols/SAPData"'
+NAMESPACE_TOO_LONG = (
+    "the $metadata document cannot be read: the namespace or alias of a schema is "
+    "longer than 128 characters"
+)
 
 
 def _longest_attribute(root) -> int:
@@ -549,8 +556,9 @@ def test_an_attribute_value_of_megabytes_is_not_kept_and_not_looked_at_again():
     assert _longest_attribute(root) <= 1024
     parsed = parse_metadata(document, "v4")
     assert parsed.attributes_dropped == 1
-    # Absent, not cut: "false" followed by padding is not a value the document gave.
-    assert parsed.entity_sets[0].creatable is True
+    # Not cut ("false" followed by padding is not a value the document gave)
+    # and not forgotten: a restriction was stated, so the flag goes down.
+    assert parsed.entity_sets[0].creatable is False and parsed.unread_attributes == 1
     # At the cap it is still a value.
     at_cap = restricted.replace(huge, "false" + " " * (1024 - 5))
     parsed = parse_metadata(v4(1, 3, set_body=at_cap), "v4")
@@ -572,8 +580,12 @@ def test_a_long_namespace_is_not_copied_into_every_name_of_its_schema(attribute)
     schemas = metadata._Schemas(list(root.iter("Schema")))
     retained = sum(len(key) + len(value[0]) for key, value in schemas.entity_types.items())
     assert len(schemas.entity_types) >= 2_000 and retained < 2_000 * 100
-    parsed = parse_metadata(document, "v4")
-    assert parsed.attributes_dropped == 1 and parsed.work < 100
+    with pytest.raises(MetadataError) as error:
+        parse_metadata(document, "v4")
+    assert str(error.value) == NAMESPACE_TOO_LONG
+    # Just inside the cap it is an ordinary namespace.
+    fits = document.replace(long.encode(), b"N" * 128)
+    assert parse_metadata(fits, "v4").attributes_dropped == 0
 
 
 def test_a_long_name_repeated_on_many_elements_is_skipped_and_recorded():
@@ -641,7 +653,8 @@ def test_a_dropped_attribute_never_falls_back_to_a_default():
 
 def test_the_number_of_elements_is_capped(monkeypatch):
     # Generous for a real service: the largest have a few hundred thousand.
-    assert metadata.MAX_ELEMENTS >= 300_000
+    # the work budget could not get through more than that anyway.
+    assert 100_000 <= metadata.MAX_ELEMENTS <= metadata.MAX_PARSE_WORK
     document = v2(1, 500)
     elements = document.count(b"<") - document.count(b"</") - 1  # minus the declaration
     monkeypatch.setattr(metadata, "MAX_ELEMENTS", elements)
@@ -683,5 +696,105 @@ def test_a_long_but_legitimate_label_or_description_still_parses(version):
     expected = label.strip()[: metadata.MAX_LABEL_CHARS]
     assert entity_set.label == expected and entity_set.fields[0].label == expected
     assert parsed.skipped == ()
-    # Only the texts nobody reads were too long to keep.
+    # Only the texts nobody reads were too long to keep: nothing to warn about.
     assert parsed.attributes_dropped == (1 if version == "v2" else 2)
+    assert parsed.unread_attributes == 0
+    assert build_preview(parsed)["warnings"] == []
+
+
+def test_the_preview_warns_when_something_the_parser_reads_was_left_out():
+    long = "X" * 5_000
+    sets = f'<EntitySet Name="{long}" EntityType="NS.T"/>'
+    document = v2(1, 2).replace(b"</EntityContainer>", sets.encode() + b"</EntityContainer>")
+    parsed = parse_metadata(document, "v2")
+    assert (parsed.attributes_dropped, parsed.unread_attributes) == (1, 1)
+    assert build_preview(parsed)["warnings"] == [
+        {
+            "code": "metadata_incomplete",
+            "message": "parts of the $metadata document were too long to read and were "
+            "left out, so this preview may be incomplete",
+        }
+    ]
+    assert long[:50] not in str(build_preview(parsed)["warnings"])
+
+
+def test_a_dropped_attribute_is_read_as_the_conservative_answer():
+    """`Nullable`, `IsBound`, `sap:action-for`, `Mode`, `Bool` and the `sap:`
+    flags: absent is the permissive reading, so a dropped one is the other."""
+    long = "f" * 5_000
+    document = (
+        V2_HEAD.replace("<Schema ", f"<Schema {SAP_NS} ")
+        + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+        f'<Property Name="Id" Type="Edm.String" sap:updatable="{long}"/></EntityType>'
+        '<EntityContainer Name="C" m:IsDefaultEntityContainer="true">'
+        f'<EntitySet Name="S" EntityType="NS.T" sap:deletable="{long}"/>'
+        f'<FunctionImport Name="Needs"><Parameter Name="P" Type="Edm.String" Nullable="{long}"/>'
+        "</FunctionImport>"
+        '<FunctionImport Name="Optional"><Parameter Name="P" Type="Edm.String"/></FunctionImport>'
+        f'<FunctionImport Name="Bound" sap:action-for="{long}"/>'
+        f'<FunctionImport Name="Out"><Parameter Name="P" Type="Edm.String" Mode="{long}"/>'
+        "</FunctionImport>"
+        f"</EntityContainer>{V2_TAIL}"
+    ).encode()
+    parsed = parse_metadata(document, "v2")
+    (entity_set,) = parsed.entity_sets
+    assert entity_set.deletable is False and entity_set.creatable is True
+    assert entity_set.fields[0].updatable is False and entity_set.fields[0].creatable is True
+    by_name = {o.name: o for o in parsed.operations}
+    assert sorted(by_name) == ["Needs", "Optional"]
+    assert by_name["Needs"].parameters[0].required is True  # not "may be left out"
+    assert by_name["Optional"].parameters[0].required is False
+    # Bound to something that could not be read, or a parameter of unknown
+    # direction: not an operation that is offered as something else.
+    assert sorted(s.reason for s in parsed.skipped if s.kind == "operation") == [
+        "invalid_parameter", "unsupported_binding",
+    ]
+    assert parsed.unread_attributes == 5
+
+    operations = (
+        f'<Action Name="Bound" IsBound="{long}"><Parameter Name="_it" Type="NS.T"/></Action>'
+        f'<Action Name="Needs"><Parameter Name="P" Type="Edm.String" Nullable="{long}"/></Action>'
+    )
+    computed = f'<Annotation Term="Core.Computed" Bool="{long}"/>'
+    document = (
+        V4_HEAD
+        + '<EntityType Name="T"><Key><PropertyRef Name="F0"/></Key>'
+        f'<Property Name="F0" Type="Edm.String">{computed}</Property></EntityType>{operations}'
+        '<EntityContainer Name="C"><EntitySet Name="S0" EntityType="NS.T"/>'
+        '<ActionImport Name="Bound" Action="NS.Bound"/>'
+        '<ActionImport Name="Needs" Action="NS.Needs"/></EntityContainer>' + V4_TAIL
+    ).encode()
+    parsed = parse_metadata(document, "v4")
+    # An action that may be bound is not imported as an unbound one.
+    assert [o.name for o in parsed.operations] == ["Needs"]
+    assert parsed.operations[0].parameters[0].required is True
+    assert [s.reason for s in parsed.skipped if s.kind == "operation"] == ["unsupported_binding"]
+    field = parsed.entity_sets[0].fields[0]
+    assert field.creatable is False and field.updatable is False
+    assert parsed.unread_attributes == 3
+
+
+def test_what_one_element_makes_a_parse_retain_is_measured():
+    """The worst case the caps leave: a schema's own children, each with a
+    long distinct name, under a namespace and an alias at their cap. Scaled
+    to `MAX_ELEMENTS`, two parses at once must fit beside the app."""
+    import tracemalloc
+
+    count = 4_000
+    types = "".join(f'<EntityType Name="{"T" * 175}{i:06d}"/>' for i in range(count))
+    document = (
+        V4_HEAD.replace('Namespace="NS"', f'Namespace="{"N" * 128}" Alias="{"A" * 128}"')
+        + types + '<EntityContainer Name="C"/>' + V4_TAIL
+    ).encode()
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        root, _ = metadata._parse_tree(document)
+        schemas = metadata._Schemas(list(root.iter("Schema")))
+        peak = tracemalloc.get_traced_memory()[1] - before
+    finally:
+        tracemalloc.stop()
+    assert len(schemas.entity_types) == 2 * count
+    per_element = peak / count
+    assert per_element < 2_000, per_element
+    assert 2 * per_element * metadata.MAX_ELEMENTS < 420_000_000

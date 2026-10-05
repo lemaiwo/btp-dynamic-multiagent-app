@@ -61,12 +61,11 @@ from pydantic import ValidationError
 from agents.destination import USER_PROPAGATING_AUTH_TYPES, Destination, DestinationError
 from agents.destination_auth import PLACEHOLDER_BASE, DestinationUserRequired, resolver_for
 from agents.odata import preview
+from agents.odata.calls import DIALECTS
 from agents.odata.client import ODataClient, ODataError, ReadQuery
 from agents.odata.models import EntitySetDef, ServiceDefinition
 from agents.odata.session import NoCookieJar
 from agents.odata.urls import confine_service_path, join_path
-from agents.odata.v2 import V2Dialect
-from agents.odata.v4 import V4Dialect
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +76,8 @@ PROBE_BYTES = 1024
 METADATA_TARGET = "$metadata"
 MAX_QUERY_NAMES = 10
 
-_DIALECTS: dict[str, Any] = {"v2": V2Dialect(), "v4": V4Dialect()}
+# The same objects the tools and the search go by (`calls.DIALECTS`).
+_DIALECTS: dict[str, Any] = DIALECTS
 _QUERY_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 _ROW_TEXT = "the read worked: one row came back"

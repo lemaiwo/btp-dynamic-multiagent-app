@@ -120,6 +120,10 @@ _FAILED_TEXT = (
     "the $metadata preview failed unexpectedly; the application log has the reason"
 )
 # The slots are shared with the catalogue test call (`take_slot`).
+INCOMPLETE_TEXT = (
+    "parts of the $metadata document were too long to read and were left out, "
+    "so this preview may be incomplete"
+)
 BUSY_TEXT = "other previews or test calls are running; try again in a moment"
 _TECHNICAL_WARNING = (
     "the preview was asked for as the signed-in user, but the destination's "
@@ -724,7 +728,13 @@ def build_preview(parsed: ParsedMetadata, stored: dict[str, Any] | None = None) 
             else len(parsed.operations),
             "skipped": len(parsed.skipped),
         },
-        "warnings": [],
+        # Something the parser reads was too long to keep. Not for the
+        # long texts nobody reads (`attributes_dropped` alone): noise.
+        "warnings": (
+            [{"code": "metadata_incomplete", "message": INCOMPLETE_TEXT}]
+            if parsed.unread_attributes
+            else []
+        ),
     }
 
 

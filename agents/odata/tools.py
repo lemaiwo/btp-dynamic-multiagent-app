@@ -1593,11 +1593,13 @@ def odata_toolset(
         when the result shows 'bound_to'). A call answers {"ok": true,
         "status", "returned", "result", "truncated"}: 'returned' is 'entity'
         or 'entities' (readable fields of the 'bound_to' entity set),
-        'value' (one value, only from an operation that does not change
-        data), 'nothing', or 'withheld' -- SAP answered with data this tool
-        may not show; the call still worked, read the record to see its
-        state. A call whose 'changes_data' is true is carried out in SAP for
-        real and CANNOT BE UNDONE: make it only when the user asked for
+        'value' (one number, boolean or short line of text, only from an
+        operation that does not change data; a long, multi-line or
+        structured text such as JSON or XML is withheld), 'nothing', or
+        'withheld' -- SAP answered with data this tool may not show; the
+        call still worked, read the record to see its state. A call whose
+        'changes_data' is true is carried out in SAP for real and CANNOT BE
+        UNDONE: make it only when the user asked for
         exactly that step, once. After 'write_outcome_unknown' never repeat
         a call without first reading the affected record.
 

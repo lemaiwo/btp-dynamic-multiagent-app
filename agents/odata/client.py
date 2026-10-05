@@ -155,6 +155,8 @@ MAX_CALL_PARAMS = 100
 # imports that return a serialised document (JSON, XML) in an `Edm.String`
 # exist; such a text would carry fields past the catalogue's allowlist.
 MAX_CALL_VALUE_CHARS = 1000
+# How a serialised JSON or XML document starts, whatever its length.
+_STRUCTURED_STARTS = ("{", "[", "<")
 
 
 def _outcome_hint(operation: str) -> str:
@@ -172,6 +174,7 @@ CALL_REFUSALS = (
     "calls_not_available",  # the service's OData version: not this app, not yet
     "write_not_allowed",  # it changes data and the agent may not
     "bound_set_missing",  # bound to an entity set the catalogue does not hold
+    "bound_set_without_key",  # ... or to one that has no key: no entity to name
     "key_not_declared",  # bound, and a key field is not one of its parameters
     "parameter_type",  # a parameter that is always sent has a type not written
 )
@@ -194,7 +197,9 @@ def call_refusal(
 
     ``bound_keys`` are the key field names of the entity set the operation
     is bound to (``None`` when that set is not in the catalogue; ignored for
-    an operation that is not bound). ``dialect`` is the dialect of the
+    an operation that is not bound; empty when the set has no key, which a
+    set with only list or create may -- a call bound to it could name no
+    entity). ``dialect`` is the dialect of the
     service's OData version (``None``: none). First match of
     ``CALL_REFUSALS``, in that order.
 
@@ -215,6 +220,8 @@ def call_refusal(
     if operation.bound_to is not None:
         if bound_keys is None:
             return "bound_set_missing"
+        if not bound_keys:
+            return "bound_set_without_key"
         declared = {p.name for p in operation.parameters}
         if any(name not in declared for name in bound_keys):
             return "key_not_declared"
@@ -980,16 +987,11 @@ class ODataClient:
         if bound is not None:
             # The rules of a key in a path, although this one travels in the
             # query: the same key names the same entity everywhere.
-            try:
-                self._dialect.key_segment(bound, key)
-            except ODataError as exc:
-                # The agent may not be able to see the entity set (search
-                # then hides `bound_to`): the key is the operation's.
-                raise ODataError(
-                    exc.code,
-                    exc.message.replace(f"entity set {bound.name!r}", "this operation"),
-                    hint=exc.hint,
-                ) from None
+            # The agent may not be able to see the entity set (search then
+            # hides `bound_to`): a refusal says the key is the operation's.
+            from . import common  # imports this module
+
+            common.key_segment(self._dialect.literal, bound, key, subject="this operation")
             for definition in bound.keys:
                 if definition.name in params:
                     raise ODataError(
@@ -1049,6 +1051,8 @@ class ODataClient:
             return ODataError("not_available", CALL_NOT_AVAILABLE)
         if reason == "bound_set_missing":
             why = "the entity set it is bound to is not in the catalogue"
+        elif reason == "bound_set_without_key":
+            why = "the entity set it is bound to has no key, so it cannot be called for one entity"
         elif reason == "key_not_declared":
             declared = {p.name for p in operation.parameters}
             missing = next((k for k in bound_keys if k not in declared), "")
@@ -1728,9 +1732,11 @@ class ODataClient:
         the whole point of such a function): a number or a boolean as it
         is, a text only when it is one printable line of at most
         ``MAX_CALL_VALUE_CHARS`` characters once the white space around it
-        is dropped -- a longer or multi-line text is a document, not a
-        value. Never for a call that changes data, whose answer is the
-        confirmation.
+        is dropped, and does not start like JSON or XML (``{``, ``[``,
+        ``<``) -- a longer, multi-line or structured text is a document, not
+        a value: ABAP serialisers write JSON on one line, and its members
+        would pass outside every field allowlist. Never for a call that
+        changes data, whose answer is the confirmation.
         """
         if shape == "none":
             return "nothing", None
@@ -1739,7 +1745,11 @@ class ODataClient:
                 return "withheld", None
             if isinstance(value, str):
                 value = value.strip()
-                if len(value) > MAX_CALL_VALUE_CHARS or not value.isprintable():
+                if (
+                    len(value) > MAX_CALL_VALUE_CHARS
+                    or not value.isprintable()
+                    or value.startswith(_STRUCTURED_STARTS)
+                ):
                     return "withheld", None
             return "value", value
         target = plan.result_set

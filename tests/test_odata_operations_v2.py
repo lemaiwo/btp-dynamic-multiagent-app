@@ -156,6 +156,7 @@ def _operations() -> list[dict[str, Any]]:
             {"name": "Blob", "type": "Edm.Binary", "required": False},
         ]),
         # Enabled, but never callable as the catalogue declares them (UNCALLABLE).
+        _op("BoundToKeyless", "GET", changes_data=False, bound_to="A_Keyless"),
         _op("BoundWithoutKeyParams", bound_to=ITEM, parameters=[{"name": "Comment"}]),
         _op("NeedsComplex", "GET", changes_data=False,
             parameters=[{"name": "Address", "type": "API_PR.Address"}]),
@@ -171,6 +172,7 @@ def _operations() -> list[dict[str, Any]]:
 
 # Enabled operations no agent can ever call, with the predicate's reason.
 UNCALLABLE = {
+    "BoundToKeyless": "bound_set_without_key",
     "BoundWithoutKeyParams": "key_not_declared",
     "NeedsComplex": "parameter_type",
     "NeedsBinary": "parameter_type",
@@ -188,6 +190,7 @@ def catalogue(
             _entity_set(ITEM, ["list", "get"]),
             _entity_set("A_Hidden", []),  # in the catalogue, readable by nobody
             _entity_set("A_Untyped", ["get"], entity_type=""),
+            {**_entity_set("A_Keyless", ["list"]), "keys": []},  # list only: no key
             *(entity_sets or []),
         ],
         "operations": _operations() if operations is None else operations,
@@ -1413,7 +1416,7 @@ async def test_returns_decides_the_result_and_bound_to_the_key(alice):
     [
         (7, 7), (1.5, 1.5), (True, True), (False, False), ("", ""), ("05", "05"),
         ("x" * 1000, "x" * 1000),
-        ('{"a": 1}', '{"a": 1}'),  # one short line is a value, whatever it spells
+        ("12 pieces (open)", "12 pieces (open)"),
         ("  padded \n", "padded"),
     ],
 )
@@ -1433,6 +1436,11 @@ async def test_a_scalar_of_a_reading_call_is_a_number_a_boolean_or_one_short_lin
         "x" * 1001,
         "line one\nline two",
         '{\n  "CreatedByUser": "' + SECRET_USER + '"\n}',  # serialised JSON
+        # ... also on one short line, as ABAP serialisers write it.
+        '{"CreatedByUser":"' + SECRET_USER + '"}',
+        '  [{"CreatedByUser":"' + SECRET_USER + '"}]',
+        "<Item><User>" + SECRET_USER + "</User></Item>",
+        "\n<?xml version='1.0'?><a/>",
         "<Item>\r\n<User>" + SECRET_USER + "</User></Item>",
         "tab\tseparated",
         "zero\u200bwidth",
@@ -1469,6 +1477,9 @@ def _operation(**kw: Any) -> OperationDef:
         (_operation(bound_to=ITEM, parameters=KEY_PARAMS), None, V2Dialect(), True,
          "bound_set_missing"),
         (_operation(bound_to=ITEM, parameters=KEY_PARAMS), list(KEY), V2Dialect(), True, None),
+        # Bound to a set without a key (list or create only): no entity to call it for.
+        (_operation(bound_to=ITEM, parameters=KEY_PARAMS), [], V2Dialect(), True,
+         "bound_set_without_key"),
         (_operation(bound_to=ITEM, parameters=KEY_PARAMS[:1]), list(KEY), V2Dialect(), True,
          "key_not_declared"),
         (_operation(bound_to=ITEM, parameters=[
@@ -1503,6 +1514,11 @@ async def test_a_wrong_key_of_a_hidden_set_does_not_name_the_set(alice):
             "the key of this operation is exactly: PurchaseRequisition, PurchaseRequisitionItem"
         )
         assert "A_Hidden" not in json.dumps(out)
+    # ... whatever is wrong with the key: every refusal of it is about the operation.
+    for key in ({**KEY, "PurchaseRequisition": ""}, {**KEY, "PurchaseRequisition": {"a": 1}},
+                {**KEY, "PurchaseRequisitionItem": "00010/x"}):
+        out = await w.call("HiddenItem", key=key)
+        assert code(out) == "invalid_key" and "A_Hidden" not in json.dumps(out), out
     # The same words for a set the agent can see: one wording, nothing to tell apart.
     out = await w.call("ItemStatus", key={})
     assert "the key of this operation is exactly" in out["error"]["message"]
@@ -1538,3 +1554,28 @@ async def test_one_text_says_that_calls_of_a_version_are_not_available(alice):
     w = World({"services": ["pr-v4"], "allow_write": True})
     out = await w.call("CountOpen", service="pr-v4")
     assert (code(out), out["error"]["message"]) == ("not_available", CALL_NOT_AVAILABLE)
+
+
+def test_key_segment_names_what_it_is_told_to_and_never_the_set_then():
+    from agents.odata import common
+
+    definition = ServiceDefinition.model_validate(catalogue()["pr"]["definition"])
+    literal = V2Dialect().literal
+    for name in ("A_Hidden", "A_Keyless"):
+        entity_set = definition.entity_set(name)
+        for key in (None, {}, KEY, {**KEY, "PurchaseRequisition": ""}, {**KEY, "X": 1},
+                    {**KEY, "PurchaseRequisition": ["a"]}):
+            try:
+                common.key_segment(literal, entity_set, key, subject="this operation")
+            except ODataError as refused:
+                assert name not in refused.message and refused.code == "invalid_key"
+            with pytest.raises(ODataError, match="this operation"):
+                common.key_segment(literal, entity_set, {}, subject="this operation")
+    with pytest.raises(ODataError, match="entity set 'A_Hidden'"):
+        common.key_segment(literal, definition.entity_set("A_Hidden"), {})
+
+
+def test_the_test_call_route_and_the_tools_share_one_set_of_dialects():
+    from agents.odata import calls, testcall, tools
+
+    assert testcall._DIALECTS is calls.DIALECTS and tools._DIALECTS is calls.DIALECTS

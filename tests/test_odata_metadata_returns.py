@@ -211,3 +211,31 @@ def test_the_preview_passes_the_return_on_as_a_suggestion_only():
     # A suggestion: the operation itself carries no `returns` and no switch.
     for operation in preview["operations"]:
         assert "returns" not in operation and "enabled" not in operation
+
+
+def test_a_skipped_set_of_the_type_means_the_type_does_not_decide():
+    """"The only set of this type" counts the sets the document DECLARES: one
+    that was skipped (a bad name, a duplicate) is still a second set."""
+    skipped = (
+        '<EntitySet Name="bad name" EntityType="NS.Supplier"/>'
+        '<EntitySet Name="Items" EntityType="NS.Item"/>'  # a duplicate name
+    )
+    imports = (
+        '<FunctionImport Name="Supplier" ReturnType="NS.Supplier"/>'
+        '<FunctionImport Name="Item" ReturnType="NS.Item"/>'
+        '<FunctionImport Name="Named" ReturnType="NS.Supplier" EntitySet="Suppliers"/>'
+    )
+    parsed = parse_metadata(v2(skipped + imports), "v2")
+    assert sorted(s.reason for s in parsed.skipped) == [
+        "duplicate_name", "invalid_name", "unrepresentable_key",
+    ]
+    by_name = {o.name: o.returns for o in parsed.operations}
+    assert by_name["Supplier"] == ParsedReturn(None, False, "")
+    assert by_name["Item"] == ParsedReturn(None, False, "")
+    assert by_name["Named"] == ParsedReturn("Suppliers", False, "")
+    # A skipped set whose type cannot be read could be of any type.
+    unreadable = f'<EntitySet Name="Odd" EntityType="{"X" * 300}"/>'
+    parsed = parse_metadata(v2(unreadable + imports), "v2")
+    assert {o.name: o.returns for o in parsed.operations}["Supplier"] == ParsedReturn(
+        None, False, ""
+    )

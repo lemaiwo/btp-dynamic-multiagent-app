@@ -110,8 +110,14 @@ a string or a tree whose size the document chose:
   into the qualified name of every element of its schema.
 * Where "absent" has a meaning of its own -- a V2 ``Type`` is
   ``Edm.String``, ``m:HttpMethod`` is ``GET``, no ``Qualifier`` is the plain
-  annotation, no ``EntitySet`` lets the type decide -- a dropped attribute
-  is told apart (``_dropped``) and never gets that default.
+  annotation, no ``EntitySet`` lets the type decide, no ``Nullable`` is
+  optional, no ``IsBound`` / ``sap:action-for`` is unbound, no ``Bool`` or
+  ``sap:`` flag is "no restriction" -- a dropped attribute is told apart
+  (``_dropped``) and gets the conservative reading instead: the element is
+  skipped, the parameter required, the restriction present. A schema whose
+  ``Namespace`` or ``Alias`` was dropped ends the parse with a fixed-text
+  error. ``ParsedMetadata.unread_attributes`` counts the dropped attributes
+  the parser reads, for the preview's warning.
 * A document of more than ``MAX_ELEMENTS`` elements is refused.
 
 ``parse_metadata`` is synchronous CPU work (up to ``MAX_METADATA_BYTES`` of
@@ -144,16 +150,26 @@ MAX_PARSED_OPERATIONS = 2 * MAX_OPERATIONS
 # cap is what keeps "sets x properties" from being chosen by the document.
 # Read at call time.
 MAX_PARSE_WORK = 200_000
-# How many elements a document may have. The largest SAP `$metadata`
-# documents have a few hundred thousand; an element of a real service
-# (`<Property Name=".." Type=".."/>`, `<PropertyRef Name=".."/>`) is tens of
-# bytes at the very least, so a real document under `MAX_METADATA_BYTES`
-# stays well below this. Without it the same 20 MB can be five million
-# four-byte elements, each a tree node and, for a schema's own children, up
-# to three qualified names kept in the lookup tables. With the attribute
-# caps this is what bounds what one document can make a parse retain:
-# elements x a few hundred bytes. Read at call time.
-MAX_ELEMENTS = 500_000
+# How many elements a document may have. Half the work budget
+# (`MAX_PARSE_WORK`), so a larger document could not be worked through
+# anyway; real SAP `$metadata` documents are far below. Without it 20 MB can
+# be five million four-byte elements. With the attribute caps it is what
+# bounds what one document can make a parse retain, and the number is set by
+# that: two previews may parse at once (`preview.MAX_CONCURRENT_PREVIEWS`)
+# beside the app.
+#
+# MEASURED (tracemalloc peak of `parse_metadata`, the document itself not
+# counted, CPython 3 on a 64-bit machine): the worst document found for the
+# caps -- one schema with `Namespace` and `Alias` at 128 characters and
+# 99,990 `<EntityType Name="..."/>` children with distinct 179-character
+# names, 20.0 MB, i.e. both the element cap and the byte cap -- peaks at
+# 197 MB, 1,968 bytes per element (the tree node with its name, and three
+# qualified names per type in the `_Schemas` tables). The same shape with
+# 106-character names (12.7 MB): 168 MB. So two concurrent worst-case
+# parses stay just under 400 MB. `tests/test_odata_metadata_limits.py`
+# re-measures a scaled-down copy and fails when the cap times the measured
+# bytes per element, twice, passes 420 MB. Read at call time.
+MAX_ELEMENTS = 100_000
 # EDMX is shallow (Edmx > DataServices > Schema > EntityType > Key >
 # PropertyRef; V4 annotations nest a little deeper). A cap keeps a hostile
 # document from building a tree that is expensive to walk or free.
@@ -201,6 +217,17 @@ _ATTRIBUTE_CAPS = {
 # The key under which the tree builder notes a dropped attribute `X` on its
 # element: " X". No XML attribute has a space in its name.
 _DROPPED_PREFIX = " "
+# Attributes the parser READS. One of these dropped means the result may
+# lack something the document said (`ParsedMetadata.unread_attributes`); any
+# other long value (`sap:quickinfo`, a `String` of a long description) is
+# text nobody looks at, and dropping it is no loss worth a warning.
+_READ_ATTRIBUTES = frozenset(_ATTRIBUTE_CAPS) | {
+    "Bool", "Nullable", "IsBound", "creatable", "updatable", "deletable", "filterable",
+}  # fmt: skip
+_NAMESPACE_TOO_LONG = (
+    f"the $metadata document cannot be read: the namespace or alias of a schema is "
+    f"longer than {_MAX_NAMESPACE_CHARS} characters"
+)
 # `_Work.spend_text`: one unit of the budget per this many characters of a
 # shared string that is copied or compared once more.
 _TEXT_UNIT = 4096
@@ -236,7 +263,8 @@ SKIP_REASONS = (
     "invalid_parameter",
     # operation (V4), bound: the binding parameter is not a single entity of
     # exactly one entity set of the result (missing, a collection, a type no
-    # set or several sets have).
+    # set or several sets have). Both versions: whether or to what the
+    # operation is bound was too long to read (`IsBound`, `sap:action-for`).
     "unsupported_binding",
     "not_imported",  # operation (V4), unbound: no action / function import, so no URL
 )
@@ -394,6 +422,10 @@ class ParsedMetadata:
     # kept (`_ATTRIBUTE_CAPS`); more than 0 means the result may lack what
     # those attributes said (a label, a skipped element, a namespace).
     attributes_dropped: int = 0
+    # How many of those were attributes the parser reads (`_READ_ATTRIBUTES`).
+    # Each was given its conservative reading or made its element a skipped
+    # one, but more than 0 is worth telling the admin: the preview warns.
+    unread_attributes: int = 0
 
 
 class _Work:
@@ -403,6 +435,12 @@ class _Work:
         self.spent = 0
         self.truncated = False
         self.attributes_dropped = 0
+        self.unread_attributes = 0
+        # Entity types that a SKIPPED entity set has, and whether a set was
+        # skipped whose type could not be read: "the only set of this type"
+        # is about the sets the document declares, not the ones kept.
+        self.skipped_set_types: set[str] = set()
+        self.skipped_set_of_unknown_type = False
         # id(element) -> its children by tag. The elements live as long as
         # the tree, which outlives every use of this object.
         self._kids: dict[int, dict[str, list[ET.Element]]] = {}
@@ -503,6 +541,7 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
     depth = 0
     elements = 0
     dropped = 0
+    unread = 0
     limit = MAX_ELEMENTS
     root_namespace: list[str] = []
     # Per open element: the text collected for it, or None when its text is
@@ -511,7 +550,7 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
     room = 0
 
     def start(name: str, attrs: dict[str, str]) -> None:
-        nonlocal depth, room, elements, dropped
+        nonlocal depth, room, elements, dropped, unread
         depth += 1
         if depth > MAX_DEPTH:
             raise MetadataError(f"the document is nested deeper than {MAX_DEPTH} levels")
@@ -541,6 +580,7 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
             del flat[key]
             flat[_DROPPED_PREFIX + key] = ""
             dropped += 1
+            unread += key in _READ_ATTRIBUTES
         builder.start(_local(name), flat)
 
     def end(name: str) -> None:
@@ -585,6 +625,7 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
         raise MetadataError(_NOT_EDMX) from None
     if counts is not None:
         counts["attributes_dropped"] = dropped
+        counts["unread_attributes"] = unread
     return root, (root_namespace[0] if root_namespace else "")
 
 
@@ -604,7 +645,10 @@ def _flag(element: ET.Element, name: str) -> bool:
     nothing from it.
     """
     value = element.get(name)
-    return True if value is None else value.strip().lower() != "false"
+    if value is None:
+        # Too long to keep is not "not said": a restriction may have stood there.
+        return not _dropped(element, name)
+    return value.strip().lower() != "false"
 
 
 def _clean_label(text: str | None) -> str:
@@ -879,11 +923,14 @@ def _entity_set_drafts(
                 return drafts, declared
             position += 1
             name = _name(element)
+            resolved = schemas.entity_type(element.get("EntityType"))
+            entity_type = schemas.canonical_type(element.get("EntityType"))
+            if name is None or name in drafts:
+                # Still a set of its type, for whoever asks "the only one?".
+                work.skipped_set_types.add(entity_type)
             if name is None:
                 skipped.append(SkippedElement("entity_set", "", position, "invalid_name"))
                 continue
-            resolved = schemas.entity_type(element.get("EntityType"))
-            entity_type = schemas.canonical_type(element.get("EntityType"))
             if name in drafts:
                 skipped.append(
                     SkippedElement(
@@ -894,6 +941,7 @@ def _entity_set_drafts(
             if len(entity_type) > _MAX_TYPE_CHARS or (
                 not entity_type and _dropped(element, "EntityType")
             ):
+                work.skipped_set_of_unknown_type = True
                 skipped.append(SkippedElement("entity_set", name, position, "invalid_type"))
                 continue
             safe_type = _safe_type(entity_type)
@@ -905,6 +953,7 @@ def _entity_set_drafts(
             chain = schemas.chain(resolved[1]) if resolved else []
             memo_key = id(chain[-1]) if chain else 0
             if key_memo.get(memo_key, _NO_KEY_MEMO) is None:
+                work.skipped_set_types.add(entity_type)
                 skipped.append(unusable)
                 continue
             fields, skipped_fields = fields_of(chain, name, container, element)
@@ -914,6 +963,7 @@ def _entity_set_drafts(
                 keys = key_memo[memo_key] = _keys(chain, fields, work)
             if keys is None:
                 # One entry for the whole set; its properties are not listed.
+                work.skipped_set_types.add(entity_type)
                 skipped.append(unusable)
                 continue
             skipped.extend(
@@ -949,11 +999,27 @@ _COLLECTION = "Collection("
 class _ReturnSets:
     """What a return type is resolved against: the kept entity sets, by name
     and by type. ``complete`` is false when entity sets of the document were
-    left unread (the cap), so "the only set of this type" is not known."""
+    left unread (the cap) or one was skipped whose type could not be read,
+    so "the only set of this type" is not known; ``skipped_types`` are the
+    entity types a skipped set has -- such a type has more sets than were
+    kept."""
 
     drafts: dict[str, _SetDraft]
     by_type: dict[str, list[str]]
     complete: bool
+    skipped_types: set[str] = field(default_factory=set)
+
+    @classmethod
+    def of(
+        cls, drafts: dict[str, _SetDraft], by_type: dict[str, list[str]], work: _Work
+    ) -> _ReturnSets:
+        # Asked after the entity sets were read and before any operation is.
+        return cls(
+            drafts,
+            by_type,
+            complete=not work.truncated and not work.skipped_set_of_unknown_type,
+            skipped_types=work.skipped_set_types,
+        )
 
 
 def _parsed_return(
@@ -964,9 +1030,10 @@ def _parsed_return(
     ``named`` is ``None`` when the document names no set, ``""`` when it
     names one that is not an entity set of the result, else that set's name.
     A named set counts only when it has exactly the declared entity type;
-    without one, the only kept set of the type is taken -- never one of
-    several, and never when sets were left unread. Dictionary lookups on one
-    attribute value: nothing here grows with the document.
+    without one, the only set of the type that the document DECLARES is
+    taken -- never one of several (a skipped set of the type counts), and
+    never when sets were left unread. Dictionary lookups on one attribute
+    value: nothing here grows with the document.
     """
     type_ref = (type_ref or "").strip()
     collection = type_ref.startswith(_COLLECTION)
@@ -980,7 +1047,8 @@ def _parsed_return(
     entity_type = schemas.canonical_type(inner)
     if named is None:
         candidates = sets.by_type.get(entity_type, [])
-        named = candidates[0] if sets.complete and len(candidates) == 1 else ""
+        only = sets.complete and len(candidates) == 1 and entity_type not in sets.skipped_types
+        named = candidates[0] if only else ""
     elif named and sets.drafts[named].entity_type != entity_type:
         named = ""
     return ParsedReturn(named or None, collection, "")
@@ -1164,6 +1232,8 @@ def _v2_operation(
         # Out parameters are part of the answer, not of the call.
         if (param.get("Mode") or "In").strip().lower() == "out":
             continue
+        if _dropped(param, "Mode"):
+            return "invalid_parameter"  # in or out: not known, not assumed
         param_name, type_name = _name(param), _type_name(param)
         if param_name is None or type_name is None:
             # Not callable as declared: a call without one of its parameters
@@ -1176,9 +1246,14 @@ def _v2_operation(
                 type=type_name,
                 # A parameter is optional only when the service says it may
                 # be null; SAP Gateway writes Nullable="false" on mandatory ones.
-                required=(param.get("Nullable") or "").strip().lower() == "false",
+                # (One that was too long to keep: not read as "may be null".)
+                required=(param.get("Nullable") or "").strip().lower() == "false"
+                or _dropped(param, "Nullable"),
             ),
         )
+    if _dropped(element, "action-for"):
+        # Bound to something that could not be read: not offered as unbound.
+        return "unsupported_binding"
 
     # sap:action-for names an entity TYPE. It is a binding only when exactly
     # one entity set has that type; the import's own EntitySet attribute is
@@ -1246,7 +1321,7 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
     # are resolved afterwards, against these only.
     drafts, sets_declared = _entity_set_drafts(schemas, skipped, _v2_fields_of(work))
     sets_by_type = _sets_by_type(drafts)
-    return_sets = _ReturnSets(drafts, sets_by_type, complete=not work.truncated)
+    return_sets = _ReturnSets.of(drafts, sets_by_type, work)
     targets = _v2_navigation_targets(schemas, drafts)
     own_navigations = _v2_own_navigations(schemas)
 
@@ -1297,6 +1372,7 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
         operations_declared=operations_declared,
         work=work.spent,
         attributes_dropped=work.attributes_dropped,
+        unread_attributes=work.unread_attributes,
     )
 
 
@@ -1442,6 +1518,8 @@ class _Annotations:
         """
         return any(
             (self._expression(value, "Bool") or "").strip().lower() == "false"
+            # A value too long to keep: a restriction was stated, it goes down.
+            or _dropped(value, "Bool")
             for value in self._record_values(term, prop, element, target)
         )
 
@@ -1468,6 +1546,8 @@ class _Annotations:
         """
         for annotation in self.find_all(term, element, target):
             value = self._expression(annotation, "Bool")
+            if value is None and _dropped(annotation, "Bool"):
+                return True  # the term is there; its value was too long to keep
             if value is None:
                 # Present without any value expression: the default, true.
                 # (The count first: the attributes are the document's.)
@@ -1712,7 +1792,9 @@ def _v4_parameters(
             return None
         if kind == "action":
             # An action's nullable parameter may be left out of the body.
-            required = (param.get("Nullable") or "").strip().lower() == "false"
+            required = (param.get("Nullable") or "").strip().lower() == "false" or _dropped(
+                param, "Nullable"
+            )
         else:
             # A function's parameters are part of the URL: all of them, unless
             # the service marks one as optional.
@@ -1752,6 +1834,8 @@ def _v4_operation(
     # models.OperationDef holds the qualified name to the same EDM rule.
     if name is None or not _NAME_RE.fullmatch(qualified):
         return ["invalid_name"]
+    if _dropped(element, "IsBound"):
+        return ["unsupported_binding"]  # bound or not: not known, not assumed
     bound = (element.get("IsBound") or "").strip().lower() == "true"
     parameters = _v4_parameters(element, kind, bound, annotations, work)
     if parameters is None:
@@ -1844,7 +1928,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
         schemas, skipped, _v4_fields_of(schemas, annotations)
     )
     sets_by_type = _sets_by_type(drafts)
-    return_sets = _ReturnSets(drafts, sets_by_type, complete=not work.truncated)
+    return_sets = _ReturnSets.of(drafts, sets_by_type, work)
     own_navigations = _v4_own_navigations(work)
     # id(EntityType) -> its label: the fallback of every set of the type.
     type_labels: dict[int, str] = {}
@@ -1957,6 +2041,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
         operations_declared=operations_declared,
         work=work.spent,
         attributes_dropped=work.attributes_dropped,
+        unread_attributes=work.unread_attributes,
     )
 
 
@@ -1997,8 +2082,14 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     schemas = list(root.iter("Schema"))
     if not schemas:
         raise MetadataError(_NOT_EDMX)
+    if any(_dropped(schema, "Namespace") or _dropped(schema, "Alias") for schema in schemas):
+        # Every name of such a schema would be unqualified and every
+        # reference to it unresolved: entity sets without fields, with
+        # nothing to say why. Refused as a whole instead.
+        raise MetadataError(_NAMESPACE_TOO_LONG)
     work = _Work()
     work.attributes_dropped = counts.get("attributes_dropped", 0)
+    work.unread_attributes = counts.get("unread_attributes", 0)
     if is_v4:
         return _parse_v4(root, _Schemas(schemas, work))
     return _parse_v2(_Schemas(schemas, work))

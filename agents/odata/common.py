@@ -49,20 +49,31 @@ def refuse(edm_type: object) -> ODataError:
     return ODataError("invalid_argument", f"the value is not a valid {shown} value")
 
 
-def key_segment(literal: Callable[[str, Any], str], entity_set: EntitySetDef, key: Any) -> str:
+def key_segment(
+    literal: Callable[[str, Any], str],
+    entity_set: EntitySetDef,
+    key: Any,
+    *,
+    subject: str | None = None,
+) -> str:
     """The key predicate, percent-encoded: ``('4500000001')`` or ``(A='x',B='00010')``.
 
     The key must name exactly the key fields of the entity set. ``literal``
     is the dialect's own (``V2Dialect.literal`` / ``V4Dialect.literal``).
+    ``subject`` is what a refusal calls the owner of the key instead of
+    ``entity set '<name>'``: the key of an operation bound to an entity set
+    the caller cannot see must not name that set. Key field names are
+    always said.
     """
     names = [k.name for k in entity_set.keys]
+    whose = subject or f"entity set {entity_set.name!r}"
     if not names:
-        raise ODataError("invalid_key", f"entity set {entity_set.name!r} has no key")
+        raise ODataError("invalid_key", f"{whose} has no key")
     expected = ", ".join(names)
     if not isinstance(key, dict) or set(key) != set(names):
         raise ODataError(
             "invalid_key",
-            f"the key of entity set {entity_set.name!r} is exactly: {expected}",
+            f"the key of {whose} is exactly: {expected}",
         )
     parts: list[str] = []
     for definition in entity_set.keys:

@@ -70,7 +70,8 @@ def uncallable_operations(definition: Any, version: Any) -> list[dict[str, str]]
 
     Whatever an agent's switches are (``allow_write`` is taken as on), so
     what is listed is a property of the catalogue: a bound operation whose
-    key fields are not all parameters, a parameter that is always sent and
+    key fields are not all parameters or whose entity set has no key, a
+    parameter that is always sent and
     has a type the dialect does not write, a service version whose
     operations cannot be called. A warning for the admin, not a refusal: a
     definition that holds one is saved all the same (imports would break).
