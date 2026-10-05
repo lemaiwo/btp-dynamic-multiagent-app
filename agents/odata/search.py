@@ -33,6 +33,8 @@ MAX_FULL_TARGETS = 5
 _MAX_QUERY_CHARS = 200
 _MAX_QUERY_TOKENS = 12
 _TOKEN_RE = re.compile(r"\w+")
+_MIN_TOKEN_CHARS = 2  # shorter query tokens are ignored
+_SUBSTRING_MIN_CHARS = 3  # shorter tokens match whole words only
 
 _W_TARGET = 5  # title and technical name of an entity set / operation
 _W_DESCRIPTION = 3
@@ -58,18 +60,38 @@ def _dicts(value: Any) -> list[dict[str, Any]]:
 
 
 def _tokens(query: Any) -> list[str]:
+    """The query's usable words, case-folded, in order, without repeats.
+
+    A one-character token is dropped: it is in nearly every name and would
+    turn any query that contains "a" into a listing of everything.
+    """
     text = _text(query)[:_MAX_QUERY_CHARS].casefold()
-    return list(dict.fromkeys(_TOKEN_RE.findall(text)))[:_MAX_QUERY_TOKENS]
+    words = [w for w in _TOKEN_RE.findall(text) if len(w) >= _MIN_TOKEN_CHARS]
+    return list(dict.fromkeys(words))[:_MAX_QUERY_TOKENS]
 
 
 def _hits(tokens: list[str], *texts: Any) -> int:
-    """How many (token, text) pairs match, case-insensitively, as substrings.
+    """How many (token, text) pairs match, case-insensitively.
 
-    Substring, not word, matching: technical names are CamelCase without
-    separators (``PurReqnReleaseStatus``), and "release" has to find them.
+    A token of three or more characters matches as a substring: technical
+    names are CamelCase without separators (``PurReqnReleaseStatus``), and
+    "release" has to find them. A two-character token matches a whole word
+    only, or "re" and "pu" would hit most names in an SAP service.
     """
-    folded = [_text(t).casefold() for t in texts]
-    return sum(1 for text in folded if text for token in tokens if token in text)
+    total = 0
+    for raw in texts:
+        text = _text(raw).casefold()
+        if not text:
+            continue
+        words: set[str] | None = None
+        for token in tokens:
+            if len(token) >= _SUBSTRING_MIN_CHARS:
+                total += token in text
+            else:
+                if words is None:
+                    words = set(_TOKEN_RE.findall(text))
+                total += token in words
+    return total
 
 
 def visible_operations(entity_set: dict[str, Any], allow_write: bool) -> list[str]:
@@ -114,17 +136,52 @@ def _field_out(field: dict[str, Any], allow_write: bool) -> dict[str, Any]:
     }
 
 
-def _example_out(example: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {"description": _text(example.get("description"))}
-    for key in ("filter", "orderby"):
-        if _text(example.get(key)):
-            out[key] = example[key]
-    select = example.get("select")
-    if isinstance(select, list) and select:
-        out["select"] = [s for s in select if isinstance(s, str)]
-    top = example.get("top")
-    if isinstance(top, int) and not isinstance(top, bool):
-        out["top"] = top
+def _examples_out(entity_set: dict[str, Any], allow_write: bool) -> list[dict[str, Any]]:
+    """The entity set's example queries, without any that names a hidden field.
+
+    An example is free text an admin wrote, and nothing at save time checks
+    it against the field flags: THIS is the enforcement point that keeps a
+    field the agent may not see (switched off, or switched off after the
+    example was written) out of a tool result. So it fails closed:
+
+    * an example whose ``description``, ``filter`` or ``orderby`` contains a
+      hidden field's name as a word (case-insensitive) is dropped whole --
+      rewriting an expression could change what it means;
+    * ``select`` keeps only names the agent may select; an example whose
+      ``select`` had entries and keeps none is dropped.
+
+    Key names are not hidden (see ``_entity_set_detail``).
+    """
+    visible = {_text(f.get("name")) for f in _visible_fields(entity_set, allow_write)}
+    keys = {_text(k.get("name")) for k in _dicts(entity_set.get("keys"))}
+    hidden = {
+        _text(f.get("name")).casefold() for f in _dicts(entity_set.get("fields"))
+    } - {n.casefold() for n in visible | keys}
+    selectable = {
+        _text(f.get("name"))
+        for f in _dicts(entity_set.get("fields"))
+        if f.get("selectable") is True
+    }
+    out: list[dict[str, Any]] = []
+    for example in _dicts(entity_set.get("examples")):
+        texts = [_text(example.get(k)) for k in ("description", "filter", "orderby")]
+        words = {w for text in texts for w in _TOKEN_RE.findall(text.casefold())}
+        if words & hidden:
+            continue
+        item: dict[str, Any] = {"description": texts[0]}
+        for key in ("filter", "orderby"):
+            if _text(example.get(key)):
+                item[key] = example[key]
+        select = example.get("select")
+        if isinstance(select, list) and select:
+            kept = [n for n in select if isinstance(n, str) and n in selectable]
+            if not kept:
+                continue
+            item["select"] = kept
+        top = example.get("top")
+        if isinstance(top, int) and not isinstance(top, bool):
+            item["top"] = top
+        out.append(item)
     return out
 
 
@@ -154,21 +211,37 @@ def _entity_set_detail(
                 }
             )
     return {
+        # Deliberately every key, whatever its field's `selectable` flag: a
+        # key NAME is always visible, because the agent needs it to address
+        # one entity and it is part of every URL anyway. A key VALUE comes
+        # back only when the key field is selectable, which
+        # `execute_operation` enforces. So a non-selectable key is listed
+        # here and not under `fields`.
         "keys": [
             {"name": _text(k.get("name")), "type": _text(k.get("type"))}
             for k in _dicts(entity_set.get("keys"))
         ],
         "fields": [_field_out(f, allow_write) for f in _visible_fields(entity_set, allow_write)],
         "navigations": navigations,
-        "examples": [_example_out(e) for e in _dicts(entity_set.get("examples"))],
+        "parameters": [],
+        "examples": _examples_out(entity_set, allow_write),
+        "bound_to": None,
+        "changes_data": None,
     }
 
 
-def _operation_detail(operation: dict[str, Any]) -> dict[str, Any]:
+def _operation_detail(
+    operation: dict[str, Any], readable: dict[str, list[str]]
+) -> dict[str, Any]:
     bound_to = operation.get("bound_to")
+    # Named only when this agent can see that entity set; otherwise the
+    # operation would reveal an entity set the catalogue keeps from it.
+    if not isinstance(bound_to, str) or not readable.get(bound_to):
+        bound_to = None
     return {
-        "bound_to": bound_to if isinstance(bound_to, str) else None,
-        "changes_data": operation.get("changes_data") is not False,
+        "keys": [],
+        "fields": [],
+        "navigations": [],
         "parameters": [
             {
                 "name": _text(p.get("name")),
@@ -177,24 +250,77 @@ def _operation_detail(operation: dict[str, Any]) -> dict[str, Any]:
             }
             for p in _dicts(operation.get("parameters"))
         ],
+        "examples": [],
+        "bound_to": bound_to,
+        "changes_data": operation.get("changes_data") is not False,
     }
 
 
+class _Candidate:
+    """One visible target with its score; the result dict is built later.
+
+    Scoring looks at every visible target of every attached service, while
+    at most ``MAX_SUMMARY_MATCHES`` are returned: the (larger) result dicts
+    are built for those only.
+    """
+
+    __slots__ = ("kind", "operations", "raw", "readable", "score", "service", "target")
+
+    def __init__(
+        self,
+        *,
+        score: int,
+        service: dict[str, Any],
+        kind: str,
+        target: str,
+        raw: dict[str, Any],
+        operations: list[str],
+        readable: dict[str, list[str]],
+    ) -> None:
+        self.score = score
+        self.service = service
+        self.kind = kind
+        self.target = target
+        self.raw = raw
+        self.operations = operations
+        self.readable = readable
+
+    def sort_key(self) -> tuple[int, str, str]:
+        return (-self.score, _text(self.service.get("name")), self.target)
+
+    def match(self, *, full: bool, allow_write: bool) -> dict[str, Any]:
+        name = _text(self.service.get("name"))
+        out: dict[str, Any] = {
+            "service": name,
+            "service_title": _text(self.service.get("title")) or name,
+            "target": self.target,
+            "kind": self.kind,
+            "title": _text(self.raw.get("title")) or self.target,
+            "description": _text(self.raw.get("description")),
+            "operations": self.operations,
+        }
+        if full:
+            if self.kind == "entity_set":
+                out.update(_entity_set_detail(self.raw, self.readable, allow_write))
+            else:
+                out.update(_operation_detail(self.raw, self.readable))
+            out.update(_service_out(self.service))
+        return out
+
+
 def _candidates(
-    service: dict[str, Any], tokens: list[str], allow_write: bool, full: bool
-) -> list[tuple[int, dict[str, Any]]]:
+    service: dict[str, Any], tokens: list[str], allow_write: bool
+) -> list[_Candidate]:
     """Every visible target of one service with its score."""
     definition = service.get("definition")
     if not isinstance(definition, dict):
         return []
-    name = _text(service.get("name"))
-    head = {"service": name, "service_title": _text(service.get("title")) or name}
     service_score = _W_SERVICE * _hits(tokens, service.get("title"), service.get("purpose"))
     entity_sets = _dicts(definition.get("entity_sets"))
     readable = {
         _text(e.get("name")): visible_operations(e, allow_write) for e in entity_sets
     }
-    out: list[tuple[int, dict[str, Any]]] = []
+    out: list[_Candidate] = []
 
     for entity_set in entity_sets:
         target = _text(entity_set.get("name"))
@@ -208,18 +334,17 @@ def _candidates(
             own += _W_FIELD * _hits(
                 tokens, field.get("label"), field.get("name"), field.get("hint"), *meanings
             )
-        match = {
-            **head,
-            "target": target,
-            "kind": "entity_set",
-            "title": _text(entity_set.get("title")) or target,
-            "description": _text(entity_set.get("description")),
-            "operations": operations,
-        }
-        if full:
-            match.update(_entity_set_detail(entity_set, readable, allow_write))
-            match.update(_service_out(service))
-        out.append((own + service_score, match))
+        out.append(
+            _Candidate(
+                score=own + service_score,
+                service=service,
+                kind="entity_set",
+                target=target,
+                raw=entity_set,
+                operations=operations,
+                readable=readable,
+            )
+        )
 
     for operation in _dicts(definition.get("operations")):
         target = _text(operation.get("name"))
@@ -227,18 +352,17 @@ def _candidates(
             continue
         own = _W_TARGET * _hits(tokens, operation.get("title"), target)
         own += _W_DESCRIPTION * _hits(tokens, operation.get("description"))
-        match = {
-            **head,
-            "target": target,
-            "kind": "operation",
-            "title": _text(operation.get("title")) or target,
-            "description": _text(operation.get("description")),
-            "operations": ["call"],
-        }
-        if full:
-            match.update(_operation_detail(operation))
-            match.update(_service_out(service))
-        out.append((own + service_score, match))
+        out.append(
+            _Candidate(
+                score=own + service_score,
+                service=service,
+                kind="operation",
+                target=target,
+                raw=operation,
+                operations=["call"],
+                readable=readable,
+            )
+        )
     return out
 
 
@@ -261,7 +385,8 @@ def search_catalogue(
     non-empty one keeps the targets with at least one hit, best first:
     5 per hit in the target's title or name, 3 in its description, 2 in a
     visible field's label, name, hint or value meaning, 1 in the service's
-    title or purpose; ties by service, then target name.
+    title or purpose; ties by service, then target name. One-character
+    words are ignored and two-character words match whole words only.
     """
     if detail not in _DETAILS:
         return _error("invalid_argument", "detail must be 'summary' or 'full'")
@@ -282,6 +407,8 @@ def search_catalogue(
             )
         enabled = [s for s in chosen if s in enabled]
         if not enabled:
+            # Defence in depth: `odata_toolset` already drops a disabled
+            # service, so through the tool this name is `unknown_service`.
             return _error(
                 "service_disabled",
                 "This service is disabled.",
@@ -289,16 +416,21 @@ def search_catalogue(
             )
 
     tokens = _tokens(query)
-    scored: list[tuple[int, dict[str, Any]]] = []
-    for entry in enabled:
-        scored.extend(_candidates(entry, tokens, allow_write, full))
-    if tokens:
-        scored = [pair for pair in scored if pair[0] > 0]
-    scored.sort(key=lambda pair: (-pair[0], pair[1]["service"], pair[1]["target"]))
+    # A query without any word ("", "*") lists everything. One that has
+    # words but none usable (all one character) matches nothing: listing
+    # everything for "a" would read as "all of this is about a".
+    listing = not _TOKEN_RE.search(_text(query)[:_MAX_QUERY_CHARS])
+    scored: list[_Candidate] = []
+    if tokens or listing:
+        for entry in enabled:
+            scored.extend(_candidates(entry, tokens, allow_write))
+    if not listing:
+        scored = [c for c in scored if c.score > 0]
+    scored.sort(key=_Candidate.sort_key)
 
     limit = MAX_FULL_TARGETS if full else MAX_SUMMARY_MATCHES
     result: dict[str, Any] = {
-        "matches": [match for _, match in scored[:limit]],
+        "matches": [c.match(full=full, allow_write=allow_write) for c in scored[:limit]],
         "total": len(scored),
     }
     if len(scored) > limit:
@@ -311,7 +443,7 @@ def search_catalogue(
         result["hint"] = (
             "Nothing matched. Try other words, or an empty query to list "
             "everything this agent can use."
-            if tokens
+            if not listing
             else "Nothing is available to this agent in the attached services."
         )
     return result

@@ -112,7 +112,6 @@ PURCHASE_REQUISITIONS = _service(
                     _field(
                         "CreatedByUser",
                         label="Created by",
-                        filterable=True,
                         personal_data=True,
                     ),
                 ],
@@ -122,7 +121,25 @@ PURCHASE_REQUISITIONS = _service(
                         "filter": "PurReqnReleaseStatus eq 'B'",
                         "select": ["PurchaseRequisition", "PurchaseRequisitionItem"],
                         "top": 20,
-                    }
+                    },
+                    # The next four name a field no agent may see.
+                    {
+                        "description": "Hidden field in select",
+                        "select": ["PurchaseRequisition", "CreatedByUser", "RequestedQuantity"],
+                    },
+                    {
+                        "description": "Hidden field in filter",
+                        "filter": "createdbyuser eq 'X' and PurReqnReleaseStatus eq 'B'",
+                    },
+                    {
+                        "description": "Hidden field in orderby",
+                        "orderby": "CreatedByUser desc",
+                    },
+                    {"description": "Sorted by CreatedByUser", "top": 5},
+                    {
+                        "description": "Quantity filter",
+                        "filter": "RequestedQuantity gt 10",
+                    },
                 ],
             },
             {
@@ -386,6 +403,177 @@ def test_full_detail_of_an_operation_lists_its_parameters():
         {"name": "PurchaseRequisition", "type": "Edm.String", "required": True},
         {"name": "ReleaseCode", "type": "Edm.String", "required": True},
     ]
+
+
+def test_an_example_never_names_a_hidden_field():
+    out = search_catalogue(SERVICES, ITEM, detail="full")
+    examples = out["matches"][0]["examples"]
+    assert "CreatedByUser".casefold() not in json.dumps(out).casefold()
+    assert "RequestedQuantity" not in json.dumps(out)  # writable only: hidden without writes
+    assert [e["description"] for e in examples] == [
+        "Items awaiting release",
+        "Hidden field in select",
+    ]
+    # A select keeps the names the agent may select; the example survives.
+    assert examples[1] == {
+        "description": "Hidden field in select",
+        "select": ["PurchaseRequisition"],
+    }
+
+    out = search_catalogue(SERVICES, ITEM, detail="full", allow_write=True)
+    examples = out["matches"][0]["examples"]
+    assert "CreatedByUser".casefold() not in json.dumps(out).casefold()
+    # With writes, the writable field is visible, so its example is too --
+    # but it is still not selectable, so it stays out of a `select`.
+    assert [e["description"] for e in examples] == [
+        "Items awaiting release",
+        "Hidden field in select",
+        "Quantity filter",
+    ]
+    assert examples[1]["select"] == ["PurchaseRequisition"]
+
+
+def test_a_non_selectable_key_is_named_in_keys_but_not_in_fields():
+    # Key names are always visible: the agent needs them to address one
+    # entity. Key *values* come back only for a selectable key field.
+    out = search_catalogue(SERVICES, "A_WriteOnly", detail="full", allow_write=True)
+    match = out["matches"][0]
+    assert match["target"] == "A_WriteOnly"
+    assert match["keys"] == [{"name": "Id", "type": "Edm.String"}]
+    assert [f["name"] for f in match["fields"]] == ["Note"]
+
+
+def _bound_service() -> dict[str, Any]:
+    def entity_set(name: str, operations: list[str]) -> dict[str, Any]:
+        return {
+            "name": name,
+            "keys": [{"name": "Id"}],
+            "operations": operations,
+            "fields": [_field("Id", selectable=True), _field("Note", writable=True)],
+        }
+
+    def operation(name: str, bound_to: str | None) -> dict[str, Any]:
+        return {
+            "name": name,
+            "kind": "function_import",
+            "http_method": "GET",
+            "bound_to": bound_to,
+            "enabled": True,
+            "changes_data": False,
+        }
+
+    return _service(
+        name="bound",
+        title="Bound",
+        purpose="Bound operations",
+        destination="S4_ODATA_TECH",
+        odata_version="v2",
+        service_path="/sap/opu/odata/sap/Z_BOUND_SRV",
+        definition={
+            "entity_sets": [
+                entity_set("Open", ["list"]),
+                entity_set("Closed", []),
+                entity_set("WriteOnly", ["update"]),
+            ],
+            "operations": [
+                operation("OnOpen", "Open"),
+                operation("OnClosed", "Closed"),
+                operation("OnWriteOnly", "WriteOnly"),
+                operation("Unbound", None),
+            ],
+        },
+    )
+
+
+def test_bound_to_names_only_an_entity_set_the_agent_can_see():
+    def bound(allow_write: bool) -> dict[str, Any]:
+        out = search_catalogue(
+            [_bound_service()], "", detail="summary", allow_write=allow_write
+        )
+        names = [m["target"] for m in out["matches"] if m["kind"] == "operation"]
+        found = {}
+        for name in names:
+            full = search_catalogue(
+                [_bound_service()], name, detail="full", allow_write=allow_write
+            )
+            found[name] = next(m for m in full["matches"] if m["target"] == name)["bound_to"]
+        return found
+
+    assert bound(False) == {
+        "OnOpen": "Open",
+        "OnClosed": None,
+        "OnWriteOnly": None,
+        "Unbound": None,
+    }
+    assert bound(True)["OnWriteOnly"] == "WriteOnly"
+    assert "Closed" not in json.dumps(
+        search_catalogue([_bound_service()], "OnClosed", detail="full", allow_write=True)
+    ).replace("OnClosed", "")
+
+
+FULL_KEYS = {
+    "service", "service_title", "target", "kind", "title", "description", "operations",
+    "keys", "fields", "navigations", "parameters", "examples", "bound_to", "changes_data",
+    "purpose", "not_for", "runs_as",
+}  # fmt: skip
+
+
+def test_every_full_match_has_the_same_shape():
+    out = search_catalogue(
+        SERVICES, "", detail="full", allow_write=True, service="purchase-requisitions"
+    )
+    kinds = {m["kind"] for m in out["matches"]}
+    assert kinds == {"entity_set", "operation"}
+    for match in out["matches"]:
+        assert set(match) == FULL_KEYS, match["target"]
+        for key in ("keys", "fields", "navigations", "parameters", "examples"):
+            assert isinstance(match[key], list), (match["target"], key)
+        if match["kind"] == "entity_set":
+            assert match["parameters"] == []
+            assert match["bound_to"] is None and match["changes_data"] is None
+        else:
+            assert match["keys"] == match["fields"] == match["navigations"] == []
+            assert match["examples"] == [] and isinstance(match["changes_data"], bool)
+    for match in search_catalogue(SERVICES, "", allow_write=True)["matches"]:
+        assert set(match) == FULL_KEYS - {
+            "keys", "fields", "navigations", "parameters", "examples", "bound_to",
+            "changes_data", "purpose", "not_for", "runs_as",
+        }  # fmt: skip
+
+
+def test_detail_is_built_only_for_the_matches_that_are_returned(monkeypatch):
+    from agents.odata import search
+
+    built: list[str] = []
+    real = search._entity_set_detail
+
+    def counting(entity_set, *args, **kwargs):
+        built.append(entity_set["name"])
+        return real(entity_set, *args, **kwargs)
+
+    monkeypatch.setattr(search, "_entity_set_detail", counting)
+    out = search_catalogue([_many(25)], "thing", detail="full")
+    assert out["total"] == 25
+    assert built == [m["target"] for m in out["matches"]] and len(built) == MAX_FULL_TARGETS
+    built.clear()
+    search_catalogue([_many(25)], "thing")
+    assert built == []
+
+
+def test_short_query_tokens():
+    # One character says nothing: ignored.
+    assert search_catalogue(SERVICES, "a")["matches"] == []
+    assert _targets(search_catalogue(SERVICES, "a count")) == ["CountOpen"]
+    # Two characters match a whole word only ("by" is in "Created by", which
+    # is hidden; "re" is inside many names but is no word anywhere).
+    assert search_catalogue(SERVICES, "re")["matches"] == []
+    assert search_catalogue(SERVICES, "pu")["matches"] == []
+    assert _targets(search_catalogue(SERVICES, "of")) == [ITEM]  # "Items of a requisition"
+    assert _targets(search_catalogue(SERVICES, "on")) == [ITEM]  # hint "Filter on B ..."
+    # Three and more: substrings, so CamelCase names are found.
+    assert search_catalogue(SERVICES, "req")["matches"][0]["target"] == ITEM
+    # No word at all is a listing, like the empty query.
+    assert search_catalogue(SERVICES, " * ")["total"] == 4
 
 
 # -- arguments ---------------------------------------------------------------
