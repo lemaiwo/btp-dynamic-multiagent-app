@@ -33,9 +33,20 @@ redirect a credential.
 ``user_context=True`` without a JWT in context raises
 :class:`DestinationUserRequired`. That is deliberately *not*
 ``OAuthAuthorizationRequired``: there is nothing to sign in to, and a sign-in
-link would loop. Scheduled and API-triggered runs never carry a user token, so
-an agent that must run unattended needs ``user_context`` off and an app-level
-credential in the destination.
+link would loop. An agent that must run unattended, with no user behind the
+run, needs ``user_context`` off and an app-level credential in the destination.
+
+"No JWT in context" is not the same as "a scheduled or API-triggered run",
+though. A run started from a request ("Run now", an API trigger) is a task
+created inside that request and inherits its ``current_jwt``, while
+``agents.auth.run_as`` sets ``current_principal`` to the agent's run-as user.
+In such a run the token and
+the principal read by ``DestinationAuth._user`` can name **different
+identities** -- the destination is resolved with the trigger's token under the
+run-as principal. That is why every per-user cache behind this auth
+(``DestinationResolver``, ``ConnectivityTokens``, the Outlook and Teams
+caches) keys on the principal AND a digest of the token: an entry is only
+served to a caller presenting the token it was obtained with.
 """
 
 from __future__ import annotations
@@ -57,7 +68,14 @@ PLACEHOLDER_BASE = f"https://{PLACEHOLDER_HOST}"
 
 
 class DestinationUserRequired(DestinationError):
-    """A per-user destination was asked for, but no user is signed in."""
+    """A per-user destination was asked for, but no user token is bound.
+
+    Raised only when ``current_jwt`` is empty. A run started from a request
+    that carried a bearer token inherits that token and does not get here,
+    whatever its principal (see the module docstring), so the message's
+    "scheduled and API-triggered runs carry no user token" describes the
+    token-less run only.
+    """
 
     def __init__(self, server_key: str, destination: str) -> None:
         self.server_key = server_key

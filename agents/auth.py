@@ -434,10 +434,28 @@ def public_base_url() -> str | None:
 async def run_as(principal: str) -> AsyncIterator[None]:
     """Bind a non-interactive identity for a scheduled or API-triggered run.
 
-    Mirrors what JWTBindingMiddleware does per request, minus the JWT: there
-    is no user token to forward, so the run can only reach MCP servers on
-    auth_mode "oauth2" (per-user token store, keyed by this principal) or
-    "none". auth_mode "jwt" servers will fail, by design.
+    Binds the principal and the base URL, and nothing else: ``current_jwt``
+    is neither set nor cleared here. What token the run carries therefore
+    depends on where it was started:
+
+    * a run started outside a request, or by a request without a bearer
+      token, has no JWT bound. It can reach servers on auth_mode "oauth2"
+      (per-user token store, keyed by this principal), "none", or an
+      app-level credential; "jwt" servers and destinations with
+      ``user_context`` refuse it;
+    * a run started from a request is a task created inside that request
+      (``job_runner.start_run``), so it inherits whatever bearer token the
+      request carried: the admin's own JWT for "Run now", the caller's token
+      for an API trigger. In such a run ``current_principal`` is the agent's
+      run-as user while ``current_jwt`` is the token of whoever triggered
+      it: **the two can name different identities**. That is intended (the
+      run keeps the trigger's token).
+
+    Anything that caches per user must therefore not key on the principal
+    alone when the cached thing was obtained with the bound token: key on the
+    principal AND a digest of that token (``agents.destination._cache_key``,
+    ``agents.outlook_tools.owner_cache_key``), or one user is served what
+    another user's token fetched.
 
     current_base_url must be set for PerUserOAuth2Auth to resolve its DCR
     client, and no request exists to derive it from — hence public_base_url().
