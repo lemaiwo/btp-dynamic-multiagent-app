@@ -12,6 +12,9 @@ export interface FailNext {
     body: unknown;
     /** Only a call with this method fails; without it, the next call to `path`. */
     method?: string;
+    /** No answer at all: the call fails the way `fetch` does when the
+     *  server cannot be reached (`status` and `body` are then not used). */
+    network?: boolean;
 }
 
 /**
@@ -1136,6 +1139,9 @@ export default class FakeBackend {
             && (!this.failNext.method || this.failNext.method === method)) {
             const failure = this.failNext;
             this.failNext = undefined;
+            if (failure.network) {
+                return Promise.reject(new TypeError("Failed to fetch"));
+            }
             return this.json(failure.body, failure.status);
         }
 

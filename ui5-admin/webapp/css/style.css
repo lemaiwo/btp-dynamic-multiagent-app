@@ -76,3 +76,37 @@
     line-height: 1.4;
     margin-top: 0.25rem;
 }
+/* The entity sets table of an OData service: the three write columns
+   (Create, Update, Delete) are tinted, header and cells, so a tick there
+   does not read like a tick under List or Get. The column header says
+   "Write" as well; the tint is not the only sign. UI5 1.120 does not put
+   the theme parameters on :root, so each var() carries the sap_horizon
+   value as its fallback. */
+.sapMListTbl th.odataWriteCol,
+.sapMListTbl td.odataWriteCol,
+.sapMListTblSubCntRow.odataWriteCol {
+    background-color: var(--sapWarningBackground, #fff8d6);
+}
+.odataWriteMarker.sapMText {
+    color: var(--sapCriticalTextColor, #a93e00);
+    font-size: 0.6875rem;
+    line-height: 1.2;
+}
+.odataMeta.sapMText {
+    color: var(--sapContent_LabelColor, #556b82);
+    font-size: 0.75rem;
+}
+/* A message on a row is a sentence and wraps under the description. */
+.odataRowMessage.sapMObjStatus {
+    margin-top: 0.25rem;
+}
+.odataRowMessage .sapMObjStatusText {
+    white-space: normal;
+}
+.odataRowMessage.sapMObjStatus {
+    display: flex;
+    align-items: flex-start;
+}
+.odataRowMessage .sapMObjStatusIcon {
+    flex: none;
+}

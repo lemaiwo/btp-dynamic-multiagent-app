@@ -7,6 +7,7 @@ import type Input from "sap/m/Input";
 import type Text from "sap/m/Text";
 import type Panel from "sap/m/Panel";
 import type MessageStrip from "sap/m/MessageStrip";
+import type ObjectStatus from "sap/m/ObjectStatus";
 import type SegmentedButton from "sap/m/SegmentedButton";
 import type SideNavigation from "sap/tnt/SideNavigation";
 import type NavigationList from "sap/tnt/NavigationList";
@@ -16,9 +17,9 @@ import Common, { backend } from "./pages/Common";
 import { iPressInDialog, iSeeADialog } from "./pages/Dialogs";
 import { TABLE, VIEW as LIST_VIEW, buttonsOf, itemOf, messageOf } from "./pages/ODataList";
 import {
-    PAGE, VIEW, actionsOf, counterState, formOf, pageTitle, pressSegment, stateOf, stripOf, tagsOf, toasts, viewOf,
-    withId,
-    type FormTexts
+    ENTITY_TABLE, PAGE, VIEW, accessibleName, actionsOf, counterState, entityHeader, entityItem, entityItems,
+    entityRow, entityTitles, formOf, opBox, pageTitle, pressSegment, stateOf, stripOf, tagsOf, toasts, viewOf, withId,
+    type FormTexts, type Op
 } from "./pages/ODataDetail";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
@@ -1245,6 +1246,775 @@ opaTest("a server error while loading is shown the same way and leaves nothing t
         );
         Opa5.assert.strictEqual(actionsOf(page).save, false, "Save is not offered");
         Opa5.assert.strictEqual(backend.countRequests(`PUT odata/services/${JOBS}`), 0, "and nothing was sent");
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- the entity sets table (U4) ----------------------------------------------
+
+const ITEM = "Requisition item";
+const HEADER = "Requisition header";
+const ACCOUNT = "Account assignment";
+const ITEM_TEXT = "Item text";
+const DELIVERY = "Delivery address";
+const NEEDS_SELECTABLE = "Tick at least one readable field before enabling List or Get.";
+const NEEDS_WRITABLE = "Tick at least one writable field before enabling Create or Update.";
+const NEEDS_KEY = "This entity set has no key; Get, Update and Delete are not available.";
+const AUDITED = "Every write call is audited.";
+
+function pending(writes: string): string {
+    return `Not saved yet: ${writes}. After Save, agents whose server entry has "Allow writes" can run this in SAP. `
+        + AUDITED;
+}
+
+/** The operations the form holds for the entity set at `index`: what Save
+ *  would send, not what the checkboxes show. */
+function formOps(page: UI5Element, index: number): string[] {
+    const model = viewOf(page).getModel("svc") as unknown as { getProperty(path: string): string[] };
+    return model.getProperty(`/data/definition/entity_sets/${index}/operations`);
+}
+
+/** What the last PUT sent as the operations of the entity set at `index`. */
+function sentOps(name: string, index: number): string[] {
+    const definition = backend.bodies[`PUT odata/services/${name}`]?.definition as {
+        entity_sets: { name: string; operations: string[] }[];
+    };
+    return definition.entity_sets[index].operations;
+}
+
+/** Clicks the checkbox of `op` in the row titled `title`. */
+function iTick(When: Common, title: string, op: Op): void {
+    When.waitFor({
+        id: ENTITY_TABLE,
+        viewName: VIEW,
+        check: function (table: UI5Element) { return !!entityItem(table, title); },
+        success: function (table: UI5Element) { new Press().executeOn(opBox(entityItem(table, title), op)); },
+        errorMessage: `No row "${title}" in the entity sets table`
+    });
+}
+
+/**
+ * Opens the service `name` after `prepare` changed what the backend holds:
+ * the app starts on the list, so the service is read once, as prepared.
+ */
+function iOpenPrepared(Given: Common, When: Common, name: string, prepare: () => void): void {
+    Given.iStartTheApp("odata-services");
+    When.waitFor({
+        id: TABLE,
+        viewName: LIST_VIEW,
+        success: function () {
+            prepare();
+            HashChanger.getInstance().setHash(`odata-services/${name}`);
+        },
+        errorMessage: "The list did not load"
+    });
+}
+
+opaTest("the table lists the entity sets with their five operation checkboxes and the field count", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityTitles(page), [ITEM, HEADER, ACCOUNT, ITEM_TEXT, DELIVERY], "one row per entity set");
+        const header = entityHeader(page);
+        Opa5.assert.strictEqual(header.title, "Entity sets (5)", "the section counts them");
+        Opa5.assert.ok(/^Metadata read .*2026/.test(header.metadata), `when the metadata was read: ${header.metadata}`);
+        Opa5.assert.strictEqual(header.canAdd, true, "Add is offered");
+
+        Opa5.assert.deepEqual(entityRow(page, ITEM), {
+            title: ITEM, technical: "A_PurchaseRequisitionItem",
+            description: "Central entity for approval decisions: release status, quantity, value, plant, supplier.",
+            noDescription: "", ticked: ["list", "get", "update"], fields: "24 of 89", hint: "", note: "", error: ""
+        }, "the item: List, Get and Update, 24 of 89 fields");
+        Opa5.assert.deepEqual(entityRow(page, ITEM_TEXT).ticked, ["list", "get", "create", "update"], "the item text");
+        Opa5.assert.deepEqual(entityRow(page, ACCOUNT).ticked, ["list"], "the account assignment");
+        Opa5.assert.deepEqual(entityRow(page, DELIVERY), {
+            title: DELIVERY, technical: "A_PurReqAddDelivery", description: "", noDescription: "None",
+            ticked: [], fields: "0 of 31", hint: "", note: "", error: ""
+        }, "nothing is on for an entity set nobody enabled; its missing description is no warning yet");
+
+        // Writes are told apart from reads, and not by colour alone.
+        const item = entityItem(page, ITEM);
+        Opa5.assert.strictEqual(opBox(item, "update").getValueState(), "Warning", "a ticked write stands out");
+        Opa5.assert.strictEqual(opBox(item, "delete").getValueState(), "None", "an unticked one does not");
+        Opa5.assert.strictEqual(opBox(item, "list").getValueState(), "None", "nor does a read");
+        Opa5.assert.strictEqual(accessibleName(opBox(item, "update")), "Update Requisition item", "a checkbox is named by operation and entity set");
+        Opa5.assert.strictEqual(accessibleName(opBox(entityItem(page, DELIVERY), "list")), "List Delivery address", "in every row");
+        Opa5.assert.strictEqual(
+            opBox(item, "update").getTooltip_AsString(), "Update Requisition item: write operation, changes data in SAP",
+            "the tooltip of a write says that it is one"
+        );
+        Opa5.assert.strictEqual(opBox(item, "get").getTooltip_AsString(), "Get Requisition item", "a read's does not");
+        const columns = Array.from(viewOf(page).byId(ENTITY_TABLE)!.getDomRef()!.querySelectorAll("th.odataWriteCol"));
+        Opa5.assert.deepEqual(
+            columns.map((th) => (th.textContent ?? "").replace(/\s+/g, "")),
+            ["CreateWrite", "UpdateWrite", "DeleteWrite"], "the three write columns are marked in words"
+        );
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "nothing is pending");
+    });
+
+    // Looking is not editing.
+    iPress(When, BACK);
+    iSeeTheHash(Then, "odata-services", "back on the list without a question");
+
+    Then.iStopTheApp();
+});
+
+opaTest("a new service has no entity sets and says so", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("odata-services/new");
+    iSeeTheService(Then, "", "the empty form", function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityTitles(page), [], "no rows");
+        Opa5.assert.strictEqual(entityHeader(page).title, "Entity sets (0)");
+        Opa5.assert.strictEqual(entityHeader(page).metadata, "Metadata never read");
+        Opa5.assert.strictEqual(
+            (viewOf(page).byId(ENTITY_TABLE) as unknown as { getNoDataText(): string }).getNoDataText(),
+            "No entity sets yet."
+        );
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("ticking a write says what it will allow; Save asks with the agents' names, and only Save sends it", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    const WRITES = "Delete on \"Requisition item\" (A_PurchaseRequisitionItem)";
+    let agent = "";
+    let shown: UI5Element;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) {
+        agent = stored(JOBS).used_by[0].agent;
+        shown = page;
+    });
+
+    iTick(When, ITEM, "delete");
+    iSee(Then, "the pending write", function (page: UI5Element) {
+        return stripOf(page, "odataPendingWrites").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataPendingWrites").text, pending(WRITES), "the section says what the tick will allow"
+        );
+        Opa5.assert.deepEqual(entityRow(page, ITEM).ticked, ["list", "get", "update", "delete"], "the box is ticked");
+        Opa5.assert.strictEqual(opBox(entityItem(page, ITEM), "delete").getValueState(), "Warning", "and stands out");
+        Opa5.assert.deepEqual(formOps(page, 0), ["list", "get", "update", "delete"], "the form holds it");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "ticking asks nothing");
+        Opa5.assert.strictEqual(backend.requests.filter((r) => /^(PUT|POST)/.test(r)).length, 0, "and sends nothing");
+        Opa5.assert.deepEqual(stored(JOBS).definition.entity_sets[0].operations, ["list", "get", "update"], "nothing is stored");
+    });
+
+    // It is an unsaved change like any other.
+    iPress(When, BACK);
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), DISCARD_QUESTION, "leaving asks");
+    }, "the unsaved-changes question");
+    iPressInDialog(When, "Cancel");
+
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            `The agent ${agent} uses this service.\n\n`
+            + `Saving enables these write operations in SAP: ${WRITES}.\n\n`
+            + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
+            "the question names the entity set, the operation and the agent that can then run it"
+        );
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Save", "Cancel"], "Save or Cancel");
+        Opa5.assert.strictEqual(
+            (dialog as unknown as { getTitle(): string }).getTitle(), "Enable write operations?", "under its own title"
+        );
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
+        Opa5.assert.strictEqual(actionsOf(shown).save, false, "Save cannot be pressed again while the question is open");
+    }, "the write confirmation");
+
+    iPressInDialog(When, "Cancel");
+    iSeeNoDialog(Then, "cancelled", function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "Cancel sends nothing");
+        Opa5.assert.deepEqual(stored(JOBS).definition.entity_sets[0].operations, ["list", "get", "update"], "nothing is stored");
+    });
+    iSee(Then, "the form after Cancel", function () { return true; }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityRow(page, ITEM).ticked, ["list", "get", "update", "delete"], "the tick stays");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, true, "and is still announced");
+        Opa5.assert.strictEqual(actionsOf(page).save, true, "Save is back");
+    });
+
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function () {
+        Opa5.assert.ok(true, "the next Save asks again");
+    }, "the write confirmation, again");
+    iPressInDialog(When, "Save");
+
+    iSee(Then, "the saved write", function (page: UI5Element) {
+        return backend.countRequests(PUT) === 1 && !stripOf(page, "odataPendingWrites").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(sentOps(JOBS, 0), ["list", "get", "update", "delete"], "the PUT carries the operations of the entity set");
+        Opa5.assert.strictEqual(
+            (backend.bodies[PUT]?.definition as { entity_sets: unknown[] }).entity_sets.length, 5, "within the whole definition"
+        );
+        Opa5.assert.strictEqual(typeof backend.bodies[PUT]?.expected_updated_at, "string", "on the version the form was loaded from");
+        Opa5.assert.deepEqual(
+            stored(JOBS).definition.entity_sets[0].operations, ["list", "get", "update", "delete"], "it is stored"
+        );
+        Opa5.assert.deepEqual(entityRow(page, ITEM).ticked, ["list", "get", "update", "delete"], "and shown as saved");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "nothing is pending any more");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("unticking needs no confirmation, and what Save sends is what the boxes show", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+
+    iTick(When, ITEM, "update");
+    iTick(When, ITEM, "get");
+    iTick(When, ITEM_TEXT, "create");
+    iSee(Then, "the unticked boxes", function (page: UI5Element) {
+        return entityRow(page, ITEM).ticked.length === 1;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityRow(page, ITEM).ticked, ["list"], "Update and Get are off");
+        Opa5.assert.strictEqual(opBox(entityItem(page, ITEM), "update").getValueState(), "None", "an unticked write is a plain box");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "switching a write off announces nothing");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "and asks nothing");
+        Opa5.assert.strictEqual(
+            entityRow(page, ITEM).hint, "Get is off: agents cannot follow the navigations of this entity set.",
+            "an entity set with navigations and no Get says what that means"
+        );
+        Opa5.assert.strictEqual(entityRow(page, ACCOUNT).hint, "", "one without navigations does not");
+    });
+
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function () {
+        return backend.countRequests(PUT) === 1;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "Save asks nothing either, although an agent uses the service");
+        Opa5.assert.deepEqual(sentOps(JOBS, 0), ["list"], "the item");
+        Opa5.assert.deepEqual(sentOps(JOBS, 3), ["list", "get", "update"], "the item text");
+        Opa5.assert.deepEqual(sentOps(JOBS, 1), ["list", "get"], "what was not touched is sent as it was");
+        Opa5.assert.deepEqual(stored(JOBS).definition.entity_sets[0].operations, ["list"], "and stored");
+        Opa5.assert.deepEqual(tagsOf(page), ["V2", "Technical user", "Write"], "the service still writes (item text, the operation)");
+    });
+
+    // Ticking the same write again is new again: it was saved as off.
+    iTick(When, ITEM, "update");
+    iSee(Then, "the pending write", function (page: UI5Element) {
+        return stripOf(page, "odataPendingWrites").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataPendingWrites").text,
+            pending("Update on \"Requisition item\" (A_PurchaseRequisitionItem)"), "against what is stored now"
+        );
+    });
+    // And off again: the form is as saved, nothing pending, nothing unsaved.
+    iTick(When, ITEM, "update");
+    iPress(When, BACK);
+    iSeeTheHash(Then, "odata-services", "ticked and unticked is no change");
+
+    Then.iStopTheApp();
+});
+
+opaTest("an agent without Allow writes is named as such, and identity and writes are one question", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${USER}`;
+    let agent = "";
+
+    Given.iStartTheApp(`odata-services/${USER}`);
+    iSeeTheService(Then, USER, "the service is loaded", function () {
+        agent = stored(USER).used_by[0].agent;
+        // A second agent whose server entry allows writes.
+        stored(USER).used_by.push({ ...stored(USER).used_by[0], agent_id: 999, agent: "writer-agent", allow_write: true });
+    });
+
+    iTick(When, HEADER, "delete");
+    iTick(When, ITEM, "delete");
+    iChoose(When, "odataRunsAs", "technical");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            `These agents use this service: ${agent}, writer-agent.\n\n`
+            + "Runs as changes from \"Signed-in user\" to \"Technical user\". The service then works in chat, "
+            + "jobs and workflows, and every user of the agent sees what that SAP user may see.\n\n"
+            + "Saving enables these write operations in SAP: Delete on \"Requisition item\" (A_PurchaseRequisitionItem); "
+            + "Delete on \"Requisition header\" (A_PurchaseRequisitionHeader).\n\n"
+            + "The agent writer-agent has \"Allow writes\" and will be able to run them.\n\n"
+            + `The agent ${agent} uses this service without "Allow writes". Nothing changes for it until that is `
+            + `switched on in its server entry.\n\n${AUDITED}`,
+            "one question: who they act as, what is enabled, who can run it and who cannot -- with the agent attached after the page loaded"
+        );
+        Opa5.assert.strictEqual(
+            (dialog as unknown as { getTitle(): string }).getTitle(), "Confirm these changes", "under a title for both"
+        );
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 1, "one dialog, not two");
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
+    }, "the combined confirmation");
+    iPressInDialog(When, "Save");
+
+    iSee(Then, "the save", function () {
+        return backend.countRequests(PUT) === 1;
+    }, function () {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no second question");
+        Opa5.assert.strictEqual(stored(USER).user_context, false, "the identity is stored");
+        Opa5.assert.deepEqual(stored(USER).definition.entity_sets[1].operations, ["list", "get", "delete"], "and the writes");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a service no agent uses is saved with its new writes without a question; the section still said what they mean", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${UNUSED}`;
+
+    Given.iStartTheApp(`odata-services/${UNUSED}`);
+    iSeeTheService(Then, UNUSED, "the service is loaded");
+    iTick(When, "Requisition", "delete");
+    iSee(Then, "the pending write", function (page: UI5Element) {
+        return stripOf(page, "odataPendingWrites").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataPendingWrites").text, pending("Delete on \"Requisition\" (PurchaseReqn)")
+        );
+    });
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function () {
+        return backend.countRequests(PUT) === 1;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "nobody to name, nothing to ask");
+        Opa5.assert.deepEqual(stored(UNUSED).definition.entity_sets[0].operations, ["list", "get", "delete"]);
+        Opa5.assert.ok(tagsOf(page).indexOf("Write") !== -1, "the header says Write once it is saved");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a tick the entity set cannot carry is refused with the reason, and a missing description becomes a warning once something is on", function (Given: Common, When: Common, Then: Common) {
+    iOpenPrepared(Given, When, JOBS, function () {
+        // The account assignment loses its key.
+        stored(JOBS).definition.entity_sets[2].keys = [];
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded");
+
+    iTick(When, DELIVERY, "list");
+    iSee(Then, "the refusal", function (page: UI5Element) {
+        return entityRow(page, DELIVERY).note !== "";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityRow(page, DELIVERY).note, NEEDS_SELECTABLE, "List without a readable field: the row says why");
+        Opa5.assert.deepEqual(entityRow(page, DELIVERY).ticked, [], "the box is not ticked");
+        Opa5.assert.deepEqual(formOps(page, 4), [], "and the form is unchanged");
+    });
+    iTick(When, DELIVERY, "create");
+    iSee(Then, "the other refusal", function (page: UI5Element) {
+        return entityRow(page, DELIVERY).note === NEEDS_WRITABLE;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityRow(page, DELIVERY).ticked, [], "Create without a writable field is refused as well");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "a refused write is not pending");
+    });
+    iTick(When, ACCOUNT, "get");
+    iSee(Then, "the key refusal", function (page: UI5Element) {
+        return entityRow(page, ACCOUNT).note === NEEDS_KEY;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityRow(page, ACCOUNT).ticked, ["list"], "Get without a key is refused; List stays");
+        Opa5.assert.strictEqual(entityRow(page, DELIVERY).note, NEEDS_WRITABLE, "each row keeps its own reason");
+    });
+
+    // Refused ticks changed nothing: leaving does not ask.
+    iPress(When, BACK);
+    iSeeTheHash(Then, "odata-services", "nothing is unsaved");
+
+    // Delete needs a key and nothing else, so it can be ticked on the
+    // delivery address -- and then its missing description matters.
+    When.waitFor({
+        id: TABLE,
+        viewName: LIST_VIEW,
+        success: function () { HashChanger.getInstance().setHash(`odata-services/${JOBS}`); }
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded again", function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityRow(page, DELIVERY).noDescription, "None", "no warning while nothing is on");
+    });
+    iTick(When, DELIVERY, "delete");
+    iSee(Then, "the warning tag", function (page: UI5Element) {
+        return entityRow(page, DELIVERY).noDescription === "Warning";
+    }, function (page: UI5Element) {
+        const row = entityRow(page, DELIVERY);
+        Opa5.assert.deepEqual(row.ticked, ["delete"], "Delete is ticked");
+        Opa5.assert.strictEqual(row.note, "", "no refusal");
+        const tag = (entityItem(page, DELIVERY).getCells()[1] as unknown as { getItems(): ObjectStatus[] }).getItems()[1];
+        Opa5.assert.strictEqual(tag.getText(), "No description yet", "the tag of an entity set without a description");
+        Opa5.assert.strictEqual(tag.getState(), "Warning", "is a warning once an operation is on");
+        Opa5.assert.strictEqual(entityRow(page, ITEM).noDescription, "", "a described entity set has no tag");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("an entity set the server would refuse is marked on its row and nothing is sent", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    const GET = `GET odata/services/${JOBS}`;
+
+    iOpenPrepared(Given, When, JOBS, function () {
+        // Stored with List on and no readable field (an import, an older version).
+        stored(JOBS).definition.entity_sets[2].fields.forEach((field) => {
+            field.selectable = false;
+            field.filterable = false;
+        });
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded");
+
+    iEnter(When, "odataPurpose", "");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the marked row", function (page: UI5Element) {
+        return entityRow(page, ACCOUNT).error !== "";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityRow(page, ACCOUNT).error, NEEDS_SELECTABLE, "the row says what is wrong, in the user's words");
+        Opa5.assert.strictEqual(entityRow(page, ITEM).error, "", "the other rows are not marked");
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataSaveError").text, "Not saved. Check the marked entity sets: Account assignment.",
+            "and the page names it above the form"
+        );
+        Opa5.assert.strictEqual(stateOf(page, "odataPurpose").state, "Error", "together with what is wrong in General");
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent");
+        Opa5.assert.strictEqual(backend.countRequests(GET), 1, "not even the read before a save");
+    });
+
+    // Switching the operation off repairs it.
+    iEnter(When, "odataPurpose", "Nightly checks");
+    iTick(When, ACCOUNT, "list");
+    iSee(Then, "the repaired row", function (page: UI5Element) {
+        return entityRow(page, ACCOUNT).error === "";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataSaveError").visible, false, "the edit clears what was said above the form");
+    });
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function () {
+        return backend.countRequests(PUT) === 1;
+    }, function () {
+        Opa5.assert.deepEqual(stored(JOBS).definition.entity_sets[2].operations, [], "saved without the operation");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a refused save marks the rows the server names, with its words as text", function (Given: Common, When: Common, Then: Common) {
+    const DETAIL = "definition.entity_sets.1: Value error, entity set 'A_PurchaseRequisitionHeader' has 'list' but no selectable field; "
+        + "definition.entity_sets.4.fields.2: Value error, field '<b>Field003</b>' is filterable but not selectable; "
+        + "a filterable field must also be selectable; "
+        + "definition.entity_sets.0.<unknown field>: Extra inputs are not permitted; "
+        + "definition.entity_sets.3: Value error, entity set 'A_SomethingElse' has 'get' but no key";
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        backend.failNext = { path: `odata/services/${JOBS}`, method: "PUT", status: 422, body: { detail: DETAIL } };
+    });
+
+    iEnter(When, "odataTitle", "Edited");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the marked rows", function (page: UI5Element) {
+        return entityRow(page, HEADER).error !== "";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            entityRow(page, HEADER).error, "entity set 'A_PurchaseRequisitionHeader' has 'list' but no selectable field",
+            "the message is on the row its position names"
+        );
+        Opa5.assert.strictEqual(
+            entityRow(page, DELIVERY).error,
+            "fields.2: field '<b>Field003</b>' is filterable but not selectable; a filterable field must also be selectable",
+            "a problem inside an entity set says where in it"
+        );
+        Opa5.assert.strictEqual(
+            entityRow(page, ITEM).error, "<unknown field>: Extra inputs are not permitted", "an unknown key is the row's as well"
+        );
+        Opa5.assert.strictEqual(
+            entityRow(page, ITEM_TEXT).error, "", "a message that names another entity set than the row at its position marks nothing"
+        );
+        Opa5.assert.strictEqual(entityRow(page, ACCOUNT).error, "", "nor is a row marked that was not named");
+        Opa5.assert.strictEqual(
+            entityItem(page, DELIVERY).getDomRef()?.querySelector("b"), null, "markup in the answer is not rendered"
+        );
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataSaveError").text, `The service was not saved. The server answered: ${DETAIL}`,
+            "the whole answer is still above the form"
+        );
+        Opa5.assert.strictEqual(formOf(page).title, "Edited", "the form keeps the edit");
+    });
+
+    // Editing a row takes its message away; the others stay until the next save.
+    iTick(When, HEADER, "list");
+    iSee(Then, "the edited row", function (page: UI5Element) {
+        return entityRow(page, HEADER).error === "";
+    }, function (page: UI5Element) {
+        Opa5.assert.notStrictEqual(entityRow(page, DELIVERY).error, "", "another row keeps its message");
+    });
+    iTick(When, HEADER, "list");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function (page: UI5Element) {
+        return pageTitle(page) === "Edited";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityRow(page, DELIVERY).error, "", "a save that goes through clears them all");
+        Opa5.assert.strictEqual(entityRow(page, ITEM).error, "");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the search finds an entity set by title, technical name or description, and a tick lands on the right one", function (Given: Common, When: Common, Then: Common) {
+    function iSearch(text: string): void {
+        iEnter(When, "odataEntitySearch", text);
+    }
+    function iSeeRows(expected: string[], what: string, assert?: (page: UI5Element) => void): void {
+        iSee(Then, what, function (page: UI5Element) {
+            return entityTitles(page).join("|") === expected.join("|");
+        }, function (page: UI5Element) {
+            Opa5.assert.deepEqual(entityTitles(page), expected, what);
+            if (assert) {
+                assert(page);
+            }
+        });
+    }
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+
+    iSearch("header");
+    iSeeRows([HEADER], "by title", function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityHeader(page).title, "Entity sets (5)", "the section still counts all of them");
+    });
+    iSearch("acctassgmt");
+    iSeeRows([ACCOUNT], "by technical name, whatever the case");
+    iSearch("justification");
+    iSeeRows([ITEM_TEXT], "by description");
+
+    // The row on screen is the fourth entity set, not the first.
+    iTick(When, ITEM_TEXT, "delete");
+    iSee(Then, "the tick", function (page: UI5Element) {
+        return entityRow(page, ITEM_TEXT).ticked.indexOf("delete") !== -1;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(formOps(page, 3), ["list", "get", "create", "update", "delete"], "the item text got the tick");
+        Opa5.assert.deepEqual(formOps(page, 0), ["list", "get", "update"], "the first entity set did not");
+    });
+
+    iSearch("no such thing");
+    iSeeRows([], "nothing matches", function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            (viewOf(page).byId(ENTITY_TABLE) as unknown as { getNoDataText(): string }).getNoDataText(),
+            "No entity set matches the search.", "and the table says so"
+        );
+    });
+    iSearch("");
+    iSeeRows([ITEM, HEADER, ACCOUNT, ITEM_TEXT, DELIVERY], "an empty search shows all", function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityRow(page, ITEM_TEXT).ticked, ["list", "get", "create", "update", "delete"], "with the tick");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a service with 200 entity sets renders twenty rows, is searched whole, and takes no more", function (Given: Common, When: Common, Then: Common) {
+    iOpenPrepared(Given, When, UNUSED, function () {
+        const sets = stored(UNUSED).definition.entity_sets;
+        const template = JSON.stringify(sets[0]);
+        for (let n = sets.length; n < 200; n++) {
+            const copy = JSON.parse(template) as typeof sets[0];
+            copy.name = `Generated${n}`;
+            copy.title = `Generated set ${n}`;
+            copy.operations = [];
+            sets.push(copy);
+        }
+    });
+    iSeeTheService(Then, UNUSED, "the service is loaded", function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityHeader(page).title, "Entity sets (200)", "all are counted");
+        Opa5.assert.strictEqual(entityItems(page).length, 20, "twenty rows are rendered");
+        Opa5.assert.strictEqual(entityHeader(page).canAdd, false, "Add is off at the server's limit");
+    });
+
+    iEnter(When, "odataEntitySearch", "Generated set 187");
+    iSee(Then, "the found row", function (page: UI5Element) {
+        return entityTitles(page).join() === "Generated set 187";
+    }, function () {
+        Opa5.assert.ok(true, "the search reaches a row that was not rendered");
+    });
+    iTick(When, "Generated set 187", "list");
+    iSee(Then, "the tick", function (page: UI5Element) {
+        return entityRow(page, "Generated set 187").ticked.length === 1;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(formOps(page, 187), ["list"], "the tick is on entity set 187");
+        Opa5.assert.deepEqual(formOps(page, 0), ["list", "get"], "and nowhere else");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("Add appends an entity set with nothing enabled, and it is saved with the rest", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+    iEnter(When, "odataEntitySearch", "header");
+    iPress(When, "odataAddEntitySetButton");
+    iSee(Then, "the new row", function (page: UI5Element) {
+        return entityTitles(page).length === 6;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(
+            entityTitles(page), [ITEM, HEADER, ACCOUNT, ITEM_TEXT, DELIVERY, "NewEntitySet"],
+            "the new entity set is the last row, and the search no longer hides it"
+        );
+        Opa5.assert.deepEqual(entityRow(page, "NewEntitySet"), {
+            title: "NewEntitySet", technical: "NewEntitySet", description: "", noDescription: "None",
+            ticked: [], fields: "0 of 0", hint: "", note: "", error: ""
+        }, "nothing is enabled by default");
+        Opa5.assert.strictEqual(entityHeader(page).title, "Entity sets (6)");
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent yet");
+    });
+    iPress(When, "odataAddEntitySetButton");
+    iSee(Then, "a second new row", function (page: UI5Element) {
+        return entityTitles(page).length === 7;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(entityTitles(page)[6], "NewEntitySet2", "a second one gets a name of its own");
+    });
+
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function () {
+        return backend.countRequests(PUT) === 1;
+    }, function () {
+        const sets = stored(JOBS).definition.entity_sets;
+        Opa5.assert.strictEqual(sets.length, 7, "both are stored");
+        Opa5.assert.deepEqual(
+            sets[5], {
+                name: "NewEntitySet", title: "", path: "", entity_type: "", description: "",
+                keys: [], operations: [], fields: [], navigations: [], examples: []
+            } as unknown as typeof sets[0], "with nothing enabled"
+        );
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "and without a question: no write was enabled");
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- leftovers of the detail page's review -------------------------------------
+
+opaTest("when the read before the save fails, nothing is sent and the page says so", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    const path = `odata/services/${JOBS}`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        backend.failNext = { path, method: "GET", status: 500, body: { detail: "database is down" } };
+    });
+
+    iEnter(When, "odataTitle", "Edited");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the failed read", function (page: UI5Element) {
+        return stripOf(page, "odataSaveError").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataSaveError").text,
+            "Not saved: the current version of the service could not be read (database is down). Nothing was sent.",
+            "a server error on the read is said on the page, with the server's reason"
+        );
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "no PUT was sent");
+        Opa5.assert.strictEqual(formOf(page).title, "Edited", "the form keeps the input");
+        Opa5.assert.strictEqual(actionsOf(page).save, true, "and can be saved again");
+        Opa5.assert.strictEqual(stripOf(page, "odataChangedElsewhere").visible, false, "it is not taken for a change elsewhere");
+        backend.failNext = { path, method: "GET", status: 0, body: null, network: true };
+    });
+
+    // No answer at all.
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the unanswered read", function (page: UI5Element) {
+        return /Failed to fetch/.test(stripOf(page, "odataSaveError").text);
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataSaveError").text,
+            "Not saved: the current version of the service could not be read (Failed to fetch). Nothing was sent.",
+            "a network error is said the same way"
+        );
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "still no PUT");
+        Opa5.assert.strictEqual(actionsOf(page).save, true, "the page is not left busy");
+    });
+
+    // Once the backend answers again, the same input is saved.
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the save", function (page: UI5Element) {
+        return pageTitle(page) === "Edited";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "one PUT");
+        Opa5.assert.strictEqual(stripOf(page, "odataSaveError").visible, false, "the message is gone");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a service that was loaded without its version is not saved blindly", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+
+    iOpenPrepared(Given, When, JOBS, function () {
+        // The real backend always sends updated_at; an answer without it
+        // must not switch the stale-write check off.
+        (stored(JOBS) as unknown as { updated_at: null }).updated_at = null;
+    });
+    iSeeTheService(Then, JOBS, "the service is loaded");
+
+    iEnter(When, "odataTitle", "Edited");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the refusal", function (page: UI5Element) {
+        return stripOf(page, "odataSaveError").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataSaveError").text,
+            "Not saved: this service was loaded without its version, so the page cannot tell whether it was changed "
+            + "elsewhere. Reload the page and try again.",
+            "the page says why it does not save"
+        );
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "no PUT without a version to save on");
+        Opa5.assert.strictEqual(formOf(page).title, "Edited", "the input stays");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("an answer without a version to the read before the save stops the save as well", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        (stored(JOBS) as unknown as { updated_at: null }).updated_at = null;
+    });
+    iEnter(When, "odataTitle", "Edited");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the strip", function (page: UI5Element) {
+        return stripOf(page, "odataChangedElsewhere").visible;
+    }, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "what cannot be compared is not saved over");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("two saves in a row both go through: the second is made on the version the first one answered", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+    let first = "";
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+
+    iEnter(When, "odataTitle", "First");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the first save", function (page: UI5Element) {
+        return pageTitle(page) === "First";
+    }, function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 1, "one PUT");
+        first = stored(JOBS).updated_at as string;
+        Opa5.assert.notStrictEqual(backend.bodies[PUT]?.expected_updated_at, first, "the save moved the version");
+    });
+
+    iTick(When, ITEM, "get");
+    iEnter(When, "odataTitle", "Second");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the second save", function (page: UI5Element) {
+        return pageTitle(page) === "Second";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 2, "a second PUT");
+        Opa5.assert.strictEqual(
+            backend.bodies[PUT]?.expected_updated_at, first, "made on the version the first save answered"
+        );
+        Opa5.assert.strictEqual(stripOf(page, "odataChangedElsewhere").visible, false, "no false \"changed elsewhere\"");
+        Opa5.assert.strictEqual(stripOf(page, "odataSaveError").visible, false, "and no refusal");
+        Opa5.assert.deepEqual(stored(JOBS).definition.entity_sets[0].operations, ["list", "update"], "with the second edit");
     });
 
     Then.iStopTheApp();

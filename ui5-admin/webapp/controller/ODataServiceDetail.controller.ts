@@ -1,21 +1,32 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
 import Fragment from "sap/ui/core/Fragment";
 import HashChanger from "sap/ui/core/routing/HashChanger";
+import InvisibleMessage from "sap/ui/core/InvisibleMessage";
+import Filter from "sap/ui/model/Filter";
+import FilterOperator from "sap/ui/model/FilterOperator";
 import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
-import { ValueState } from "sap/ui/core/library";
+import { InvisibleMessageMode, ValueState } from "sap/ui/core/library";
 import ODataController from "./odata/ODataController";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
-import odataCatalog, { type ODataErrorField, type ODataErrors } from "../model/odataCatalog";
+import formatter from "../model/formatter";
+import odataCatalog, {
+    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataNewWrite
+} from "../model/odataCatalog";
 import { canonical } from "../model/runsPanel";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type Dialog from "sap/m/Dialog";
+import type CheckBox from "sap/m/CheckBox";
+import type SearchField from "sap/m/SearchField";
 import type SegmentedButton from "sap/m/SegmentedButton";
+import type ListBinding from "sap/ui/model/ListBinding";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
-import type { ODataService, ODataServiceInput, ODataServiceUpdate, ODataUsedBy } from "../service/types";
+import type {
+    ODataDefinition, ODataEntityOp, ODataService, ODataServiceInput, ODataServiceUpdate, ODataUsedBy
+} from "../service/types";
 
 const ROUTE = "odataServiceDetail";
 
@@ -46,10 +57,22 @@ interface DuplicateState {
     unsaved: boolean;
 }
 
+/** The i18n key of each entity-set operation's name. */
+const OP_TEXT: Record<ODataEntityOp, string> = {
+    list: "odataOpList", get: "odataOpGet", create: "odataOpCreate", update: "odataOpUpdate", delete: "odataOpDelete"
+};
+
+/** A question to ask before a save. */
+interface SaveQuestion {
+    title: string;
+    text: string;
+}
+
 /**
- * One OData service of the catalogue: its header actions and the General
- * section. The definition (entity sets, operations) is loaded and sent back
- * whole with every save; its own sections come with later tasks.
+ * One OData service of the catalogue: its header actions, the General
+ * section and the entity sets with their operation switches. The definition
+ * is loaded and sent back whole with every save; the operations section
+ * comes with a later task.
  *
  * @namespace com.agent.admin.controller
  */
@@ -209,6 +232,11 @@ export default class ODataServiceDetail extends ODataController {
             loadFailed: false, loadError: "",
             data: odataCatalog.emptyService(), original: odataCatalog.emptyService(),
             errors: {}, saveError: "", used_by: [], has_write: false,
+            // `rows`: what the entity sets table shows, one flat row per
+            // entity set of `data.definition` (`odataCatalog.entitySetRow`).
+            // `pendingWrites`: what the ticked, unsaved writes will allow.
+            // `asking`: a question about the save is open.
+            rows: [], entitySearch: "", pendingWrites: "", asking: false,
             // `updated_at`: the version of the service the form was loaded
             // from; a save is only made on top of that one.
             // `changedElsewhere` / `deletedElsewhere`: it is not the stored
@@ -228,8 +256,10 @@ export default class ODataServiceDetail extends ODataController {
             loaded: true, exists: true,
             data: odataCatalog.payloadOf(service), original: odataCatalog.payloadOf(service),
             used_by: service.used_by ?? [], has_write: service.has_write === true,
-            updated_at: service.updated_at ?? null
+            updated_at: service.updated_at ?? null,
+            rows: odataCatalog.entitySetRows(service.definition)
         });
+        this.filterEntitySets("");
     }
 
     private data(): ODataServiceInput {
@@ -265,6 +295,7 @@ export default class ODataServiceDetail extends ODataController {
         if (name === NEW) {
             this.serviceName = undefined;
             model.setData({ ...this.blankState(this.text("odataNewService")), isNew: true, loaded: true });
+            this.filterEntitySets("");
             return;
         }
 
@@ -319,6 +350,7 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty("/updated_at", null);
         model.setProperty("/original", odataCatalog.emptyService());
         model.setProperty("/title", this.text("odataNewService"));
+        this.showPendingWrites();
     }
 
     // --- formatters ---------------------------------------------------------
@@ -350,6 +382,208 @@ export default class ODataServiceDetail extends ODataController {
     /** Under the name: how to form it, or why it can no longer be changed. */
     public formatNameHint(isNew: boolean | undefined): string {
         return this.text(isNew ? "odataNameHint" : "odataNameImmutable");
+    }
+
+    /** "Entity sets (5)". */
+    public formatEntitySetsTitle(count: number | undefined): string {
+        return this.text("odataEntitySets", [count ?? 0]);
+    }
+
+    /** When the metadata was last read from SAP, or that it never was. */
+    public formatMetadataInfo(fetchedAt: string | null | undefined): string {
+        return fetchedAt
+            ? this.text("odataMetadataRead", [formatter.timestamp(fetchedAt)])
+            : this.text("odataMetadataNever");
+    }
+
+    /** The technical name, with the URL segment when that is another one. */
+    public formatEntityTechnical(name: string | undefined, path: string | undefined): string {
+        return path ? this.text("odataEntityPath", [name ?? "", path]) : (name ?? "");
+    }
+
+    /** "Update Requisition item": what a checkbox switches. */
+    public formatOperationOf(operation: string | undefined, title: string | undefined): string {
+        return this.text("odataOperationOf", [operation ?? "", title ?? ""]);
+    }
+
+    /** The same for a write column, which says that it is one. */
+    public formatWriteOperationOf(operation: string | undefined, title: string | undefined): string {
+        return this.text("odataWriteOperationOf", [operation ?? "", title ?? ""]);
+    }
+
+    /** A ticked write stands out; an unticked one is a plain box. */
+    public formatWriteState(enabled: boolean | undefined): ValueState {
+        return enabled ? ValueState.Warning : ValueState.None;
+    }
+
+    /** No description is a warning once agents can find the entity set. */
+    public formatNoDescriptionState(anyOperation: boolean | undefined): ValueState {
+        return anyOperation ? ValueState.Warning : ValueState.None;
+    }
+
+    /** "24 of 89": readable fields of all. */
+    public formatFieldsCount(selectable: number | undefined, total: number | undefined): string {
+        return this.text("odataFieldsCount", [selectable ?? 0, total ?? 0]);
+    }
+
+    public formatFieldsCountTooltip(selectable: number | undefined, total: number | undefined): string {
+        return this.text("odataFieldsCountTooltip", [selectable ?? 0, total ?? 0]);
+    }
+
+    /** Why the table is empty: nothing there, or nothing that matches. */
+    public formatNoEntitySets(search: string | undefined): string {
+        return this.text((search ?? "").trim() ? "odataNoEntityMatches" : "odataNoEntitySets");
+    }
+
+    /** "Add" until the definition is as large as the server takes it. */
+    public formatCanAddEntitySet(busy: boolean | undefined, count: number | undefined): boolean {
+        return !busy && (count ?? 0) < odataCatalog.MAX_ENTITY_SETS;
+    }
+
+    // --- entity sets --------------------------------------------------------
+
+    private definition(): ODataDefinition {
+        return this.data().definition;
+    }
+
+    private rows(): ODataEntityRow[] {
+        return this.svc().getProperty("/rows") as ODataEntityRow[];
+    }
+
+    /** Works the table rows out again from the definition, all of them. */
+    private showEntitySets(): void {
+        this.svc().setProperty("/rows", odataCatalog.entitySetRows(this.definition()));
+        this.showPendingWrites();
+    }
+
+    /** "Update on "Requisition item" (A_PurchaseRequisitionItem); ..." */
+    private writeList(writes: ODataNewWrite[]): string {
+        return writes.map((write) => this.text("odataWriteItem", [
+            write.operations.map((op) => this.text(OP_TEXT[op])).join(", "), write.title, write.name
+        ])).join("; ");
+    }
+
+    /** The write operations a save would newly open, against what is stored. */
+    private newWrites(): ODataNewWrite[] {
+        return odataCatalog.newWrites(this.original().definition, this.definition());
+    }
+
+    /**
+     * Says in the section what the ticked, unsaved writes will allow, as
+     * long as there are any: an admin sees what a tick means when it is
+     * set, not only in a question at Save (which is asked only when agents
+     * already use the service).
+     */
+    private showPendingWrites(): void {
+        const writes = this.newWrites();
+        this.svc().setProperty(
+            "/pendingWrites", writes.length ? this.text("odataPendingWrites", [this.writeList(writes)]) : ""
+        );
+    }
+
+    /**
+     * A checkbox of the table was clicked: switches that operation of that
+     * entity set on or off in the form. Nothing is sent; Save does that.
+     *
+     * Switching ON is refused, with the reason on the row, when the entity
+     * set cannot carry the operation (no key, no readable or no writable
+     * field): the server would refuse the whole save for it. Switching off
+     * is always taken.
+     */
+    public onToggleOperation(event: Event): void {
+        const box = event.getSource() as CheckBox;
+        const op = box.data("op") as ODataEntityOp;
+        const row = box.getBindingContext("svc")?.getObject() as ODataEntityRow | undefined;
+        const entitySet = row ? this.definition().entity_sets[row.index] : undefined;
+        if (!row || !entitySet || odataCatalog.ENTITY_OPS.indexOf(op) === -1) {
+            return;
+        }
+        const model = this.svc();
+        const enable = box.getSelected();
+        const path = `/rows/${row.index}`;
+        if (this.working || model.getProperty("/asking") === true) {
+            // Not while a save is on its way or being asked about: what was
+            // checked and confirmed must be what is sent.
+            box.setSelected(row[op]);
+            return;
+        }
+        const refusal = enable ? odataCatalog.operationRefusal(entitySet, op) : "";
+        if (refusal) {
+            const reason = this.text(refusal);
+            box.setSelected(false);
+            model.setProperty(`${path}/note`, reason);
+            InvisibleMessage.getInstance().announce(reason, InvisibleMessageMode.Assertive);
+            return;
+        }
+        entitySet.operations = odataCatalog.toggleOperation(entitySet.operations ?? [], op, enable);
+        // The row anew: its note and what a refused save said are about
+        // the entity set as it was.
+        model.setProperty(path, odataCatalog.entitySetRow(entitySet, row.index));
+        model.setProperty("/saveError", "");
+        this.showPendingWrites();
+    }
+
+    /**
+     * Shows the entity sets whose title, technical name or description
+     * holds `query`. A filter on the binding: no row is worked out again,
+     * and only the rows on screen are rendered.
+     */
+    private filterEntitySets(query: string): void {
+        const binding = this.byId("odataEntityTable")?.getBinding("items") as ListBinding | undefined;
+        const text = query.trim();
+        binding?.filter(text ? new Filter({
+            filters: ["title", "name", "description"].map((path) => new Filter(path, FilterOperator.Contains, text)),
+            and: false
+        }) : []);
+    }
+
+    public onEntitySearch(event: Event): void {
+        this.filterEntitySets((event.getSource() as SearchField).getValue());
+    }
+
+    /**
+     * Adds an entity set by hand, with nothing enabled, and opens it.
+     * It gets a free technical name; the dialog is where that is changed.
+     */
+    public onAddEntitySet(): void {
+        const model = this.svc();
+        const entitySets = this.definition().entity_sets;
+        if (this.working || model.getProperty("/asking") === true
+            || entitySets.length >= odataCatalog.MAX_ENTITY_SETS) {
+            return;
+        }
+        entitySets.push(odataCatalog.emptyEntitySet(
+            odataCatalog.newEntitySetName(entitySets.map((entitySet) => entitySet.name))
+        ));
+        // Positions changed meaning for nobody, but what a refused save
+        // said was about another list: all rows anew, and none hidden.
+        model.setProperty("/entitySearch", "");
+        this.filterEntitySets("");
+        this.showEntitySets();
+        model.setProperty("/saveError", "");
+        this.openEntitySet(entitySets.length - 1);
+    }
+
+    /** A row of the table was pressed. */
+    public onOpenEntitySet(event: Event): void {
+        const row = (event.getSource() as Control).getBindingContext("svc")?.getObject() as ODataEntityRow | undefined;
+        if (row) {
+            this.openEntitySet(row.index);
+        }
+    }
+
+    /**
+     * U5 HOOK -- the entity set dialog (fields, keys, navigations, example
+     * queries, title and description) opens from here; it is not built yet,
+     * so pressing a row does nothing.
+     *
+     * `index` is the position in `data.definition.entity_sets`. The dialog
+     * edits a copy and, on Apply, writes it back there and calls
+     * `showEntitySets()`: the rows, the pending-writes strip and the
+     * unsaved-changes check all follow from the definition.
+     */
+    private openEntitySet(index: number): void {
+        void index;
     }
 
     // --- editing ------------------------------------------------------------
@@ -387,20 +621,32 @@ export default class ODataServiceDetail extends ODataController {
      * since the form loaded it, nothing is sent: a PUT replaces the whole
      * service, definition included, and would undo that. And the agents
      * that use it are taken from that fresh answer: a change of identity or
-     * destination changes who THEY act as in SAP, so it is confirmed with
-     * their names, including an agent that was attached a minute ago.
+     * destination changes who THEY act as in SAP, and a newly ticked write
+     * operation is one THEY can run from then on, so either is confirmed
+     * with their names, including an agent that was attached a minute ago.
      */
     public async onSave(): Promise<void> {
         const model = this.svc();
-        if (this.working || model.getProperty("/loaded") !== true) {
+        if (this.working || model.getProperty("/asking") === true || model.getProperty("/loaded") !== true) {
             return;
         }
         model.setProperty("/saveError", "");
-        if (!this.showProblems(odataCatalog.validate(this.data()))) {
+        // Both checks run, so that everything wrong is marked at once.
+        const general = this.showProblems(odataCatalog.validate(this.data()));
+        const entitySets = this.showEntityProblems();
+        if (!general || !entitySets) {
             return;
         }
         if (model.getProperty("/isNew") === true) {
+            // No agent can use a service that does not exist yet.
             void this.save();
+            return;
+        }
+        if (!model.getProperty("/updated_at")) {
+            // Without the version the form was loaded from, neither this
+            // page nor the server can tell that the service was changed
+            // elsewhere; saving would be a blind overwrite.
+            model.setProperty("/saveError", this.text("odataCannotVerify"));
             return;
         }
 
@@ -408,18 +654,21 @@ export default class ODataServiceDetail extends ODataController {
         if (!usedBy) {
             return;
         }
-        const question = usedBy.length ? this.identityQuestion(usedBy) : "";
+        const question = usedBy.length ? this.saveQuestion(usedBy) : undefined;
         if (!question) {
             void this.save();
             return;
         }
         const save = this.text("save");
-        MessageBox.warning(question, {
-            title: this.text("odataIdentityConfirmTitle"),
+        // Until it is answered there is nothing to save or to tick.
+        model.setProperty("/asking", true);
+        MessageBox.warning(question.text, {
+            title: question.title,
             actions: [save, MessageBox.Action.CANCEL],
             emphasizedAction: save,
             initialFocus: MessageBox.Action.CANCEL,
             onClose: (action: string | null) => {
+                model.setProperty("/asking", false);
                 if (action === save) {
                     void this.save();
                 }
@@ -440,7 +689,7 @@ export default class ODataServiceDetail extends ODataController {
         try {
             fresh = await this.withBusy(() => this.getAdminService().getODataService(name));
         } catch (error) {
-            this.showRefusal(error, false);
+            this.showNotRead(error);
             return undefined;
         } finally {
             this.setWorking(false);
@@ -448,13 +697,68 @@ export default class ODataServiceDetail extends ODataController {
         if (name !== this.serviceName) {
             return undefined;
         }
-        if ((fresh.updated_at ?? null) !== model.getProperty("/updated_at")) {
+        if (!fresh.updated_at || fresh.updated_at !== model.getProperty("/updated_at")) {
             model.setProperty("/changedElsewhere", true);
             return undefined;
         }
         model.setProperty("/changedElsewhere", false);
         model.setProperty("/used_by", fresh.used_by ?? []);
         return fresh.used_by ?? [];
+    }
+
+    /**
+     * The read before a save failed, so nothing was sent. A service that is
+     * gone gets its own strip; anything else (a server error, no answer) is
+     * said above the form with the reason, and a lapsed session or a
+     * missing scope additionally gets the central dialog.
+     */
+    private showNotRead(error: unknown): void {
+        if (error instanceof AdminError && error.status === 404) {
+            this.svc().setProperty("/deletedElsewhere", true);
+            return;
+        }
+        const reason = ErrorHandler.messageFor(error, "");
+        this.svc().setProperty("/saveError", reason
+            ? this.text("odataSaveNotReadReason", [reason]) : this.text("odataSaveNotRead"));
+        const kind = ErrorHandler.classify(error);
+        if (kind === "session" || kind === "forbidden") {
+            ErrorHandler.handle(error);
+        }
+    }
+
+    /**
+     * Marks the entity sets the server would refuse (`definitionProblems`),
+     * each on its row and in the user's language, and names them above the
+     * form; returns whether there are none. Call after `showProblems`,
+     * which sets what is said above the form.
+     */
+    private showEntityProblems(): boolean {
+        const model = this.svc();
+        const problems = odataCatalog.definitionProblems(this.definition());
+        const byIndex: Record<number, string> = {};
+        problems.forEach((problem) => {
+            byIndex[problem.index] = this.text(problem.key, problem.args);
+        });
+        this.showRowErrors(byIndex);
+        if (problems.length) {
+            const rows = this.rows();
+            const names = problems.map((problem) => rows[problem.index]?.title ?? "").join(", ");
+            const above = model.getProperty("/saveError") as string;
+            model.setProperty("/saveError", [above, this.text("odataEntityProblems", [names])].filter(Boolean).join(" "));
+        }
+        return problems.length === 0;
+    }
+
+    /** Puts `errors` (row position -> text) on the rows and takes every
+     *  other row's error away. Only rows that change are touched. */
+    private showRowErrors(errors: Record<number, string>): void {
+        const model = this.svc();
+        this.rows().forEach((row, index) => {
+            const error = errors[index] ?? "";
+            if (row.error !== error) {
+                model.setProperty(`/rows/${index}/error`, error);
+            }
+        });
     }
 
     /**
@@ -487,13 +791,17 @@ export default class ODataServiceDetail extends ODataController {
     }
 
     /**
-     * What saving changes about who the agents in `usedBy` act as, or ""
-     * when it changes nothing of the kind.
+     * What has to be confirmed before saving a service that the agents in
+     * `usedBy` use, or nothing when the save changes none of it: who they
+     * act as in SAP (identity, destination) and which write operations the
+     * catalogue newly lets them run. One question for both.
      */
-    private identityQuestion(usedBy: ODataUsedBy[]): string {
+    private saveQuestion(usedBy: ODataUsedBy[]): SaveQuestion | undefined {
         const change = odataCatalog.identityChange(this.original(), this.data());
-        if (!change.runsAs && !change.destination) {
-            return "";
+        const identity = !!change.runsAs || !!change.destination;
+        const writes = this.newWrites();
+        if (!identity && !writes.length) {
+            return undefined;
         }
         const names = usedBy.map((used) => used.agent);
         const parts = [names.length === 1
@@ -506,7 +814,26 @@ export default class ODataServiceDetail extends ODataController {
         if (change.destination) {
             parts.push(this.text("odataIdentityDestination", [change.destination.from, change.destination.to]));
         }
-        return parts.join("\n\n");
+        if (writes.length) {
+            // Only an agent whose server entry allows writes can run them;
+            // the others are named too, so nobody has to guess.
+            const { allowed, others } = odataCatalog.writers(usedBy);
+            parts.push(this.text("odataWriteSaveIntro", [this.writeList(writes)]));
+            if (allowed.length) {
+                parts.push(allowed.length === 1
+                    ? this.text("odataWriteAllowedOne", [allowed[0]])
+                    : this.text("odataWriteAllowedMany", [allowed.join(", ")]));
+            }
+            if (others.length) {
+                parts.push(others.length === 1
+                    ? this.text("odataWriteOthersOne", [others[0]])
+                    : this.text("odataWriteOthersMany", [others.join(", ")]));
+            }
+            parts.push(this.text("odataWriteAudited"));
+        }
+        const title = identity && writes.length ? "odataSaveConfirmTitle"
+            : identity ? "odataIdentityConfirmTitle" : "odataWriteConfirmTitle";
+        return { title: this.text(title), text: parts.join("\n\n") };
     }
 
     /**
@@ -521,12 +848,20 @@ export default class ODataServiceDetail extends ODataController {
         const isNew = this.svc().getProperty("/isNew") === true;
         const payload: ODataServiceUpdate = odataCatalog.payloadOf(this.data());
         const loadedAt = this.svc().getProperty("/updated_at") as string | null;
-        if (!isNew && loadedAt) {
+        if (!isNew) {
+            if (!loadedAt) {
+                // `onSave` refuses this already; never a PUT without it.
+                this.svc().setProperty("/saveError", this.text("odataCannotVerify"));
+                return;
+            }
             // The server refuses (409) when the service is no longer the
             // version this form was loaded from; the check before the
             // question cannot rule out a save in the moment between.
             payload.expected_updated_at = loadedAt;
         }
+        // The entity sets in the order they are sent: a refusal names them
+        // by position.
+        const sentNames = payload.definition.entity_sets.map((entitySet) => entitySet.name);
         this.setWorking(true);
         let saved: ODataService;
         try {
@@ -535,7 +870,7 @@ export default class ODataServiceDetail extends ODataController {
                 : this.getAdminService().updateODataService(this.serviceName as string, payload)));
         } catch (error) {
             this.setWorking(false);
-            this.showRefusal(error, isNew);
+            this.showRefusal(error, isNew, sentNames);
             return;
         }
         this.setWorking(false);
@@ -554,17 +889,24 @@ export default class ODataServiceDetail extends ODataController {
      * A 422 of the catalogue routes is one string, "<loc>: <msg>; ...": each
      * message goes to the field its `loc` names, and when a `loc` has no
      * field here (the definition, a flag) or the refusal names none at all,
-     * the whole text is shown above the form. The texts are the server's,
-     * in English, and are shown as text. A 409 on create is about the name.
+     * the whole text is shown above the form. A `loc` inside the entity
+     * sets -- "definition.entity_sets.1: ..." -- additionally marks the row
+     * it names (`sentNames`: the entity sets as they were sent). The texts
+     * are the server's, in English, and are shown as text. A 409 on create
+     * is about the name.
      *
      * On an existing service, a 404 means it was deleted elsewhere and a
      * 409 that it was changed elsewhere: both get a strip of their own that
      * says what can be done, and the input stays.
      */
-    private showRefusal(error: unknown, isNew: boolean): void {
+    private showRefusal(error: unknown, isNew: boolean, sentNames: string[] = []): void {
         const model = this.svc();
         if (error instanceof AdminError && error.status === 422) {
             const byLoc = odataCatalog.serverErrors(error.detail);
+            // Only while the table still lists what was sent, row for row.
+            const shown = this.rows().map((row) => row.name);
+            this.showRowErrors(canonical(shown) === canonical(sentNames)
+                ? odataCatalog.rowErrors(byLoc, sentNames) : {});
             const errors: Record<string, string> = {};
             let unplaced = Object.keys(byLoc).length === 0;
             Object.keys(byLoc).forEach((loc) => {
@@ -775,6 +1117,7 @@ export default class ODataServiceDetail extends ODataController {
                         this.svc().setProperty("/data", odataCatalog.payloadOf(this.original()));
                         this.svc().setProperty("/errors", {});
                         this.svc().setProperty("/saveError", "");
+                        this.showEntitySets();
                     }
                     resolve(action === discard);
                 }

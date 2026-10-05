@@ -295,3 +295,221 @@ QUnit.test("toggleOperation adds and removes an entity operation without duplica
     odataCatalog.toggleOperation(before, "get", true);
     assert.deepEqual(before, ["list"], "the input is not changed");
 });
+
+// --- the entity sets table (U4) ---------------------------------------------
+
+QUnit.test("entitySetRow holds what the table shows of an entity set", function (assert) {
+    const row = odataCatalog.entitySetRow(entitySet("A_Item", {
+        title: "Item", description: "The item.", operations: ["list", "update"],
+        fields: [field("Id", { selectable: true }), field("Text", { writable: true }), field("Hidden")]
+    }), 3);
+    assert.deepEqual(row, {
+        index: 3, name: "A_Item", title: "Item", path: "", description: "The item.", described: true,
+        list: true, get: false, create: false, update: true, delete: false, anyOperation: true,
+        selectable: 1, total: 3, navigationHint: false, note: "", error: ""
+    });
+
+    const bare = odataCatalog.entitySetRow(entitySet("A_Bare", { description: "  ", operations: [], path: "Bare" }), 0);
+    assert.strictEqual(bare.title, "A_Bare", "without a title the name is the title");
+    assert.strictEqual(bare.path, "Bare", "a path that is not the name is shown");
+    assert.strictEqual(bare.described, false, "a blank description is none");
+    assert.strictEqual(bare.anyOperation, false);
+    assert.strictEqual(odataCatalog.entitySetRow(entitySet("A", { path: "A" }), 0).path, "", "a path equal to the name is not repeated");
+    assert.deepEqual(odataCatalog.entitySetRows(undefined), []);
+    assert.deepEqual(odataCatalog.entitySetRows(WRITING).map((r) => r.index), [0, 1]);
+});
+
+QUnit.test("the navigation hint is for an entity set in use that has navigations and no Get", function (assert) {
+    const navigations = [{ name: "to_Text", target: "A_Text", collection: true, description: "" }];
+    const hint = (operations: ("list" | "get" | "create")[], navs = navigations) => (
+        odataCatalog.entitySetRow(entitySet("A", { operations, navigations: navs }), 0).navigationHint
+    );
+    assert.strictEqual(hint(["list"]), true, "List without Get: its navigations cannot be followed");
+    assert.strictEqual(hint(["list", "get"]), false);
+    assert.strictEqual(hint([]), false, "nothing enabled: agents do not see it at all");
+    assert.strictEqual(hint(["list"], []), false, "no navigations, no hint");
+});
+
+QUnit.test("operationRefusal mirrors the three per-operation rules of the server", function (assert) {
+    const noKey = entitySet("A", { keys: [] });
+    const noRead = entitySet("A", { fields: [field("Id"), field("Text", { writable: true })] });
+    const noWrite = entitySet("A", { fields: [field("Id", { selectable: true })] });
+    const full = entitySet("A");
+
+    assert.strictEqual(odataCatalog.operationRefusal(noKey, "list"), "", "List needs no key");
+    assert.strictEqual(odataCatalog.operationRefusal(noKey, "create"), "", "nor does Create");
+    ["get", "update", "delete"].forEach((op) => {
+        assert.strictEqual(odataCatalog.operationRefusal(noKey, op as "get"), "odataNeedsKey", `${op} needs a key`);
+    });
+    assert.strictEqual(odataCatalog.operationRefusal(noRead, "list"), "odataNeedsSelectable");
+    assert.strictEqual(odataCatalog.operationRefusal(noRead, "get"), "odataNeedsSelectable");
+    assert.strictEqual(odataCatalog.operationRefusal(noRead, "update"), "", "a write needs no readable field");
+    assert.strictEqual(odataCatalog.operationRefusal(noRead, "delete"), "");
+    assert.strictEqual(odataCatalog.operationRefusal(noWrite, "create"), "odataNeedsWritable");
+    assert.strictEqual(odataCatalog.operationRefusal(noWrite, "update"), "odataNeedsWritable");
+    assert.strictEqual(odataCatalog.operationRefusal(noWrite, "delete"), "", "Delete sends no field");
+    odataCatalog.ENTITY_OPS.forEach((op) => {
+        assert.strictEqual(odataCatalog.operationRefusal(full, op), "", `${op} is fine with key, readable and writable field`);
+    });
+});
+
+QUnit.test("newWrites lists only the writes a save newly enables", function (assert) {
+    const stored: ODataDefinition = {
+        entity_sets: [
+            entitySet("A_Item", { title: "Item", operations: ["list", "get", "update"] }),
+            entitySet("A_Text", { title: "Text", operations: ["list", "create", "delete"] })
+        ],
+        operations: []
+    };
+    const current: ODataDefinition = {
+        entity_sets: [
+            // Update was there, Delete is new, Get went away.
+            entitySet("A_Item", { title: "Item", operations: ["list", "update", "delete"] }),
+            // A write switched off is no question.
+            entitySet("A_Text", { title: "Text", operations: ["list", "create"] }),
+            // Not stored at all: every write of it is new.
+            entitySet("A_New", { operations: ["create", "update"] }),
+            entitySet("A_ReadOnly", { operations: ["list", "get"] })
+        ],
+        operations: []
+    };
+    assert.deepEqual(odataCatalog.newWrites(stored, current), [
+        { name: "A_Item", title: "Item", operations: ["delete"] },
+        { name: "A_New", title: "A_New", operations: ["create", "update"] }
+    ]);
+    assert.deepEqual(odataCatalog.newWrites(stored, stored), [], "nothing changed, nothing new");
+    assert.deepEqual(odataCatalog.newWrites(undefined, stored).map((w) => w.name), ["A_Item", "A_Text"], "a new service");
+    assert.deepEqual(odataCatalog.newWrites(stored, undefined), []);
+    assert.deepEqual(
+        odataCatalog.newWrites({ entity_sets: [], operations: [] }, {
+            entity_sets: [entitySet("constructor", { operations: ["delete"] })], operations: []
+        }),
+        [{ name: "constructor", title: "constructor", operations: ["delete"] }],
+        "a name that an object has anyway is still new"
+    );
+});
+
+QUnit.test("writers splits the agents by Allow writes", function (assert) {
+    const used = (agent: string, allow: boolean) => ({
+        agent_id: 1, agent, enabled: true, expose_api: false, api_slug: "", allow_write: allow
+    });
+    assert.deepEqual(
+        odataCatalog.writers([used("a", true), used("b", false), used("c", true)]),
+        { allowed: ["a", "c"], others: ["b"] }
+    );
+    assert.deepEqual(odataCatalog.writers(undefined), { allowed: [], others: [] });
+});
+
+QUnit.test("definitionProblems names one problem per entity set, by the server's rules", function (assert) {
+    const key = (set: ODataEntitySet) => {
+        const problems = odataCatalog.definitionProblems({ entity_sets: [set], operations: [] });
+        return problems.length ? `${problems[0].key}(${problems[0].args.join(",")})` : "";
+    };
+    assert.strictEqual(key(entitySet("A")), "", "a consistent entity set");
+    assert.strictEqual(key(entitySet("A", { operations: [], fields: [], keys: [] })), "", "nothing enabled, nothing required");
+    assert.strictEqual(key(entitySet("1A")), "odataErrEntityName()");
+    assert.strictEqual(key(entitySet("")), "odataErrEntityName()");
+    assert.strictEqual(
+        key(entitySet("A", { fields: [field("Id", { selectable: true }), field("X", { filterable: true })] })),
+        "odataErrFilterNotSelectable(X)", "a filterable field must be selectable"
+    );
+    assert.strictEqual(
+        key(entitySet("A", { fields: [field("Id", { selectable: true }), field("Id")] })), "odataErrDuplicateField(Id)"
+    );
+    assert.strictEqual(key(entitySet("A", {
+        navigations: [
+            { name: "to_B", target: "B", collection: true, description: "" },
+            { name: "to_B", target: "B", collection: false, description: "" }
+        ]
+    })), "odataErrDuplicateNavigation(to_B)");
+    assert.strictEqual(
+        key(entitySet("A", { keys: [{ name: "Id", type: "Edm.String" }, { name: "Id", type: "Edm.String" }] })),
+        "odataErrDuplicateKey(Id)"
+    );
+    assert.strictEqual(
+        key(entitySet("A", { keys: [{ name: "Gone", type: "Edm.String" }] })), "odataErrKeyNotField(Gone)",
+        "a key must be one of the fields"
+    );
+    assert.strictEqual(key(entitySet("A", { keys: [] })), "odataNeedsKey()", "Get without a key");
+    assert.strictEqual(key(entitySet("A", { keys: [], operations: ["list"] })), "", "List alone needs none");
+    assert.strictEqual(key(entitySet("A", { fields: [field("Id")] })), "odataNeedsSelectable()");
+    assert.strictEqual(
+        key(entitySet("A", { operations: ["create"], fields: [field("Id", { selectable: true })] })), "odataNeedsWritable()"
+    );
+    assert.strictEqual(
+        key(entitySet("A", { operations: ["delete"], fields: [field("Id")] })), "",
+        "Delete needs a key and nothing else"
+    );
+
+    assert.deepEqual(
+        odataCatalog.definitionProblems({
+            entity_sets: [entitySet("A"), entitySet("B"), entitySet("A"), entitySet("C", { keys: [] })], operations: []
+        }),
+        [
+            { index: 0, key: "odataErrDuplicateEntitySet", args: ["A"] },
+            { index: 2, key: "odataErrDuplicateEntitySet", args: ["A"] },
+            { index: 3, key: "odataNeedsKey", args: [] }
+        ],
+        "a name used twice marks both rows"
+    );
+    assert.deepEqual(odataCatalog.definitionProblems(undefined), []);
+});
+
+QUnit.test("rowErrors puts a refusal on the row it names", function (assert) {
+    const names = ["A_Item", "A_Text", "A_Item"];
+    const rows = (detail: string) => odataCatalog.rowErrors(odataCatalog.serverErrors(detail), names);
+
+    assert.deepEqual(
+        rows("definition.entity_sets.1: Value error, entity set 'A_Text' has 'list' but no selectable field"),
+        { 1: "entity set 'A_Text' has 'list' but no selectable field" }, "by its position"
+    );
+    assert.deepEqual(
+        rows("definition.entity_sets.0.fields.4: Value error, field 'B' is filterable but not selectable; "
+            + "a filterable field must also be selectable; title: Field required"),
+        { 0: "fields.4: field 'B' is filterable but not selectable; a filterable field must also be selectable" },
+        "a problem inside an entity set says where; what is no entity set is not a row's"
+    );
+    assert.deepEqual(
+        rows("definition.entity_sets.1.description: String should have at most 600 characters; "
+            + "definition.entity_sets.1.title: Value error, title must be one line of text without control characters"),
+        {
+            1: "description: String should have at most 600 characters "
+                + "title: title must be one line of text without control characters"
+        },
+        "two problems of one row are both shown"
+    );
+    assert.deepEqual(
+        rows("definition: Value error, duplicate entity set 'A_Item'"),
+        { 0: "duplicate entity set 'A_Item'", 2: "duplicate entity set 'A_Item'" },
+        "a problem of the definition goes to every row of the name it gives"
+    );
+    assert.deepEqual(
+        rows("definition.entity_sets.0: Value error, entity set 'A_Text' has 'get' but no key"),
+        { 1: "entity set 'A_Text' has 'get' but no key" },
+        "when position and name disagree, the name decides"
+    );
+    assert.deepEqual(
+        rows("definition.entity_sets.0: Value error, entity set 'Other' has 'get' but no key"), {},
+        "a name the page does not have marks no row"
+    );
+    assert.deepEqual(rows("definition.entity_sets.7: Value error, something"), {}, "nor does a position it does not have");
+    assert.deepEqual(
+        rows("definition.entity_sets.0.<unknown field>: Extra inputs are not permitted"),
+        { 0: "<unknown field>: Extra inputs are not permitted" },
+        "a key the server does not repeat is still a problem of that row"
+    );
+    assert.deepEqual(
+        odataCatalog.serverErrors("<unknown field>: Extra inputs are not permitted; title: Field required"),
+        { "<unknown field>": "Extra inputs are not permitted", title: "Field required" }
+    );
+    assert.deepEqual(rows("definition.operations.0: Value error, x; definition: Value error, the definition is larger than 2000000 bytes"), {});
+    assert.deepEqual(rows("Service not found"), {});
+});
+
+QUnit.test("newEntitySetName and emptyEntitySet start an entity set that enables nothing", function (assert) {
+    assert.strictEqual(odataCatalog.newEntitySetName([]), "NewEntitySet");
+    assert.strictEqual(odataCatalog.newEntitySetName(["NewEntitySet", "NewEntitySet2"]), "NewEntitySet3");
+    const added = odataCatalog.emptyEntitySet("NewEntitySet");
+    assert.deepEqual(added.operations, [], "nothing is enabled by default");
+    assert.deepEqual(odataCatalog.definitionProblems({ entity_sets: [added], operations: [] }), [], "and it can be saved");
+});

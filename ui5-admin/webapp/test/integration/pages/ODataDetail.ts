@@ -4,6 +4,12 @@ import type TextArea from "sap/m/TextArea";
 import type Text from "sap/m/Text";
 import type Page from "sap/m/Page";
 import type Button from "sap/m/Button";
+import type CheckBox from "sap/m/CheckBox";
+import type ColumnListItem from "sap/m/ColumnListItem";
+import type ObjectIdentifier from "sap/m/ObjectIdentifier";
+import type Table from "sap/m/Table";
+import type Title from "sap/m/Title";
+import type VBox from "sap/m/VBox";
 import type Switch from "sap/m/Switch";
 import type MessageStrip from "sap/m/MessageStrip";
 import type ObjectStatus from "sap/m/ObjectStatus";
@@ -128,4 +134,93 @@ export function pressSegment(segmented: UI5Element, key: string): void {
     // `buttons` is the aggregation of rendered buttons behind `items`.
     const buttons = (control as unknown as { getButtons(): Button[] }).getButtons();
     new Press().executeOn(buttons[index]);
+}
+
+// --- the entity sets table ---------------------------------------------------
+
+export const ENTITY_TABLE = "odataEntityTable";
+
+/** The operations in the order of their columns. */
+export const OPS = ["list", "get", "create", "update", "delete"] as const;
+export type Op = typeof OPS[number];
+
+/** What one row of the entity sets table shows. */
+export interface EntityRow {
+    title: string;
+    technical: string;
+    /** The description, or "" when the row shows the tag instead. */
+    description: string;
+    /** The state of the "No description yet" tag, or "" when it is not shown. */
+    noDescription: string;
+    /** The operations whose checkbox is ticked. */
+    ticked: Op[];
+    fields: string;
+    /** The messages on the row that are shown: navigation hint, refused tick, refused save. */
+    hint: string;
+    note: string;
+    error: string;
+}
+
+/** The rendered rows of the entity sets table. */
+export function entityItems(element: UI5Element): ColumnListItem[] {
+    return control<Table>(element, ENTITY_TABLE).getItems() as ColumnListItem[];
+}
+
+function identifierOf(item: ColumnListItem): ObjectIdentifier {
+    return (item.getCells()[0] as VBox).getItems()[0] as ObjectIdentifier;
+}
+
+/** The titles of the rendered rows, in order. */
+export function entityTitles(element: UI5Element): string[] {
+    return entityItems(element).map((item) => identifierOf(item).getTitle());
+}
+
+/** The row with the business title `title`. */
+export function entityItem(element: UI5Element, title: string): ColumnListItem {
+    return entityItems(element).filter((item) => identifierOf(item).getTitle() === title)[0];
+}
+
+/** The checkbox of `op` in a row. */
+export function opBox(item: ColumnListItem, op: Op): CheckBox {
+    return item.getCells()[2 + OPS.indexOf(op)] as CheckBox;
+}
+
+function shown(status: ObjectStatus): string {
+    return status.getVisible() ? status.getText() : "";
+}
+
+export function entityRow(element: UI5Element, title: string): EntityRow {
+    const item = entityItem(element, title);
+    const second = (item.getCells()[1] as VBox).getItems();
+    const description = second[0] as Text;
+    const tag = second[1] as ObjectStatus;
+    return {
+        title: identifierOf(item).getTitle(),
+        technical: identifierOf(item).getText(),
+        description: description.getVisible() ? description.getText(false) : "",
+        noDescription: tag.getVisible() ? tag.getState() : "",
+        ticked: OPS.filter((op) => opBox(item, op).getSelected()),
+        fields: (item.getCells()[7] as Text).getText(false),
+        hint: shown(second[2] as ObjectStatus),
+        note: shown(second[3] as ObjectStatus),
+        error: shown(second[4] as ObjectStatus)
+    };
+}
+
+/**
+ * The accessible name of a checkbox as a screen reader builds it: the texts
+ * of the elements its `aria-labelledby` names, in order.
+ */
+export function accessibleName(box: CheckBox): string {
+    const ids = (box.getDomRef()?.getAttribute("aria-labelledby") ?? "").split(" ").filter(Boolean);
+    return ids.map((id) => document.getElementById(id)?.textContent ?? "").filter(Boolean).join(" ");
+}
+
+/** The title of the entity sets section and the note about the metadata. */
+export function entityHeader(element: UI5Element): { title: string; metadata: string; canAdd: boolean } {
+    return {
+        title: control<Title>(element, "odataEntityTitle").getText(),
+        metadata: control<Text>(element, "odataMetadataInfo").getText(false),
+        canAdd: control<Button>(element, "odataAddEntitySetButton").getEnabled()
+    };
 }

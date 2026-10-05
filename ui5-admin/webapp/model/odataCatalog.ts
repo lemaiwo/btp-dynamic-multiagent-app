@@ -1,5 +1,5 @@
 import type {
-    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataServiceInput
+    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataServiceInput, ODataUsedBy
 } from "../service/types";
 
 /**
@@ -22,6 +22,12 @@ export const WRITE_OPS: readonly ODataEntityOp[] = ["create", "update", "delete"
 const SERVICE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
 const DESTINATION_NAME_RE = /^[A-Za-z0-9_.-]{1,200}$/;
 
+// Mirror of EDM_NAME_RE in agents/odata/models.py.
+const EDM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]{0,127}$/;
+
+/** The most entity sets a definition may hold (`MAX_ENTITY_SETS`). */
+const MAX_ENTITY_SETS = 200;
+
 const MAX_TITLE = 120;
 const MAX_PURPOSE = 200;
 const MAX_NOT_FOR = 200;
@@ -35,6 +41,60 @@ export interface ODataCounts {
 export interface ODataFieldCount {
     selected: number;
     total: number;
+}
+
+/**
+ * One row of the entity sets table: everything the table shows of an entity
+ * set, worked out once when the entity set changes and not while the table
+ * renders or the admin types. `index` is the entity set's position in the
+ * definition, which a filtered table no longer shows by its row number.
+ */
+export interface ODataEntityRow {
+    index: number;
+    name: string;
+    /** The business title, or the name when there is none. */
+    title: string;
+    /** The URL segment when it is not the name, else "". */
+    path: string;
+    description: string;
+    described: boolean;
+    list: boolean;
+    get: boolean;
+    create: boolean;
+    update: boolean;
+    delete: boolean;
+    /** At least one operation is on: agents can find this entity set. */
+    anyOperation: boolean;
+    /** Fields an agent can read, and all fields. */
+    selectable: number;
+    total: number;
+    /** It has navigations, is in use, and Get -- which following a
+     *  navigation from here needs -- is off. */
+    navigationHint: boolean;
+    /** Why the last tick in this row was refused (a text), or "". */
+    note: string;
+    /** What a refused save said about this row (a text), or "". */
+    error: string;
+}
+
+/** The write operations a save would newly open on one entity set. */
+export interface ODataNewWrite {
+    name: string;
+    title: string;
+    operations: ODataEntityOp[];
+}
+
+/** What is wrong with the entity set at `index`: an i18n key and its arguments. */
+export interface ODataEntityProblem {
+    index: number;
+    key: string;
+    args: string[];
+}
+
+/** The agents of a service, by whether their server entry allows writes. */
+export interface ODataWriters {
+    allowed: string[];
+    others: string[];
 }
 
 /** The payload fields `validate` can report on. The first six have a text
@@ -134,7 +194,9 @@ function isConfinedPath(path: string): boolean {
 
 // "<loc>: " at the start of one part of a refusal: a dotted path of field
 // names and list positions, e.g. "definition.entity_sets.0.fields.1: ".
-const SERVER_LOC_RE = /^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*): (.*)$/;
+// A key the server does not repeat (it did not look like a field name) is
+// "<unknown field>" there.
+const SERVER_LOC_RE = /^((?:[A-Za-z_][A-Za-z0-9_]*|<unknown field>)(?:\.(?:[A-Za-z0-9_]+|<unknown field>))*): (.*)$/;
 const VALUE_ERROR_PREFIX = "Value error, ";
 
 function writeOpsOf(entitySet: ODataEntitySet): ODataEntityOp[] {
@@ -145,6 +207,97 @@ function writeOpsOf(entitySet: ODataEntitySet): ODataEntityOp[] {
 function titleOf(entitySet: ODataEntitySet): string {
     return (entitySet.title ?? "").trim() || entitySet.name;
 }
+
+function firstDuplicate(names: string[]): string | undefined {
+    return names.filter((name, i) => names.indexOf(name) !== i)[0];
+}
+
+/**
+ * Why `op` cannot be on for `entitySet`, as an i18n key, or "". The three
+ * per-operation rules of `EntitySetDef._consistent` (agents/odata/models.py),
+ * in its order, and nothing more: Get, Update and Delete address one entity,
+ * so they need a key; a read returns only selectable fields, so List and Get
+ * need one; Create and Update send writable fields, so they need one.
+ */
+function operationRefusal(entitySet: ODataEntitySet, op: ODataEntityOp): string {
+    const fields = entitySet.fields ?? [];
+    if ((op === "get" || op === "update" || op === "delete") && !(entitySet.keys ?? []).length) {
+        return "odataNeedsKey";
+    }
+    if ((op === "list" || op === "get") && !fields.some((f) => f.selectable === true)) {
+        return "odataNeedsSelectable";
+    }
+    if ((op === "create" || op === "update") && !fields.some((f) => f.writable === true)) {
+        return "odataNeedsWritable";
+    }
+    return "";
+}
+
+/** The first rule of the server the entity set breaks on its own (not
+ *  counting its name being taken by another one), or undefined. */
+function entitySetProblem(entitySet: ODataEntitySet): { key: string; args: string[] } | undefined {
+    const fields = entitySet.fields ?? [];
+    const keys = entitySet.keys ?? [];
+    if (!EDM_NAME_RE.test(entitySet.name ?? "")) {
+        return { key: "odataErrEntityName", args: [] };
+    }
+    // The server checks each field before the entity set as a whole.
+    const hidden = fields.filter((f) => f.filterable === true && f.selectable !== true)[0];
+    if (hidden) {
+        return { key: "odataErrFilterNotSelectable", args: [hidden.name] };
+    }
+    const names = fields.map((f) => f.name);
+    const field = firstDuplicate(names);
+    if (field !== undefined) {
+        return { key: "odataErrDuplicateField", args: [field] };
+    }
+    const navigation = firstDuplicate((entitySet.navigations ?? []).map((n) => n.name));
+    if (navigation !== undefined) {
+        return { key: "odataErrDuplicateNavigation", args: [navigation] };
+    }
+    const key = firstDuplicate(keys.map((k) => k.name));
+    if (key !== undefined) {
+        return { key: "odataErrDuplicateKey", args: [key] };
+    }
+    const stray = keys.filter((k) => names.indexOf(k.name) === -1)[0];
+    if (stray) {
+        return { key: "odataErrKeyNotField", args: [stray.name] };
+    }
+    for (const op of entitySet.operations ?? []) {
+        const refusal = operationRefusal(entitySet, op);
+        if (refusal) {
+            return { key: refusal, args: [] };
+        }
+    }
+    return undefined;
+}
+
+function entitySetRow(entitySet: ODataEntitySet, index: number): ODataEntityRow {
+    const operations = entitySet.operations ?? [];
+    const fields = entitySet.fields ?? [];
+    const on = (op: ODataEntityOp): boolean => operations.indexOf(op) !== -1;
+    const description = entitySet.description ?? "";
+    return {
+        index,
+        name: entitySet.name,
+        title: titleOf(entitySet),
+        path: entitySet.path && entitySet.path !== entitySet.name ? entitySet.path : "",
+        description,
+        described: description.trim().length > 0,
+        list: on("list"), get: on("get"), create: on("create"), update: on("update"), delete: on("delete"),
+        anyOperation: ENTITY_OPS.some(on),
+        selectable: fields.filter((f) => f.selectable === true).length,
+        total: fields.length,
+        navigationHint: (entitySet.navigations ?? []).length > 0 && ENTITY_OPS.some(on) && !on("get"),
+        note: "",
+        error: ""
+    };
+}
+
+// "definition.entity_sets.<n>" and what follows it in a refusal's `loc`.
+const ENTITY_LOC_RE = /^definition\.entity_sets\.(\d+)(?:\.(.+))?$/;
+// The entity set a message of the server names (`who` in models.py).
+const NAMED_ENTITY_RE = /entity set '([^']*)'/;
 
 export default {
 
@@ -192,6 +345,130 @@ export default {
 
     /** The business title of an entity set, or its technical name. */
     titleOf,
+
+    /** The most entity sets a definition may hold. */
+    MAX_ENTITY_SETS,
+
+    operationRefusal,
+
+    /** The table row of the entity set at `index` of its definition. */
+    entitySetRow,
+
+    /** One table row per entity set, in the definition's order. */
+    entitySetRows(definition: ODataDefinition | undefined | null): ODataEntityRow[] {
+        return (definition?.entity_sets ?? []).map(entitySetRow);
+    },
+
+    /**
+     * The write operations that are on in `current` and were not in
+     * `stored`, per entity set (matched by name; an entity set `stored` does
+     * not have counts with all its writes). This is what a save newly lets
+     * agents with `allow_write` do; switching a write off is not in here.
+     */
+    newWrites(
+        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+    ): ODataNewWrite[] {
+        const before: Record<string, ODataEntityOp[]> = {};
+        (stored?.entity_sets ?? []).forEach((entitySet) => {
+            // Two of a name cannot be saved; if they are there, either's writes count as stored.
+            before[`=${entitySet.name}`] = (before[`=${entitySet.name}`] ?? []).concat(writeOpsOf(entitySet));
+        });
+        const added: ODataNewWrite[] = [];
+        (current?.entity_sets ?? []).forEach((entitySet) => {
+            const had = before[`=${entitySet.name}`] ?? [];
+            const operations = writeOpsOf(entitySet).filter((op) => had.indexOf(op) === -1);
+            if (operations.length) {
+                added.push({ name: entitySet.name, title: titleOf(entitySet), operations });
+            }
+        });
+        return added;
+    },
+
+    /** The agents using a service, split by `allow_write`: only the first
+     *  group can run a write the catalogue enables. */
+    writers(usedBy: readonly ODataUsedBy[] | undefined | null): ODataWriters {
+        const all = usedBy ?? [];
+        return {
+            allowed: all.filter((used) => used.allow_write === true).map((used) => used.agent),
+            others: all.filter((used) => used.allow_write !== true).map((used) => used.agent)
+        };
+    },
+
+    /**
+     * What the server would refuse about the entity sets, one problem per
+     * entity set at most: the rules of `EntitySetDef` and the unique names
+     * of `ServiceDefinition` (agents/odata/models.py). The per-value rules
+     * (text lengths, the size cap) stay the server's.
+     */
+    definitionProblems(definition: ODataDefinition | undefined | null): ODataEntityProblem[] {
+        const entitySets = definition?.entity_sets ?? [];
+        const names = entitySets.map((entitySet) => entitySet.name);
+        const problems: ODataEntityProblem[] = [];
+        entitySets.forEach((entitySet, index) => {
+            const own = entitySetProblem(entitySet);
+            if (own) {
+                problems.push({ index, key: own.key, args: own.args });
+            } else if (names.indexOf(entitySet.name) !== names.lastIndexOf(entitySet.name)) {
+                problems.push({ index, key: "odataErrDuplicateEntitySet", args: [entitySet.name] });
+            }
+        });
+        return problems;
+    },
+
+    /**
+     * The rows a refused save names, as row position -> the server's text.
+     *
+     * `byLoc` is what `serverErrors` made of the 422; `names` are the entity
+     * set names in the order they were sent. A `loc` inside
+     * `definition.entity_sets.<n>` belongs to row n -- unless the message
+     * names another entity set, then the name decides (the page may have
+     * sent something else than it shows). A message at `definition` itself
+     * ("duplicate entity set 'A'") goes to every row of that name. What
+     * names no row here is left to the caller, which shows the whole text.
+     */
+    rowErrors(byLoc: Record<string, string>, names: readonly string[]): Record<number, string> {
+        const rows: Record<number, string> = {};
+        const add = (index: number, message: string): void => {
+            rows[index] = rows[index] ? `${rows[index]} ${message}` : message;
+        };
+        Object.keys(byLoc).forEach((loc) => {
+            const message = byLoc[loc];
+            const match = ENTITY_LOC_RE.exec(loc);
+            if (!match && loc !== "definition") {
+                return;
+            }
+            const named = NAMED_ENTITY_RE.exec(message)?.[1];
+            const text = match?.[2] ? `${match[2]}: ${message}` : message;
+            const index = match ? Number(match[1]) : -1;
+            if (match && index < names.length && (named === undefined || names[index] === named)) {
+                add(index, text);
+            } else if (named !== undefined) {
+                names.forEach((name, i) => {
+                    if (name === named) {
+                        add(i, text);
+                    }
+                });
+            }
+        });
+        return rows;
+    },
+
+    /** A name for an entity set added by hand that no other one has. */
+    newEntitySetName(names: readonly string[]): string {
+        let name = "NewEntitySet";
+        for (let n = 2; names.indexOf(name) !== -1; n++) {
+            name = `NewEntitySet${n}`;
+        }
+        return name;
+    },
+
+    /** An entity set as "Add" starts it: nothing enabled, no fields. */
+    emptyEntitySet(name: string): ODataEntitySet {
+        return {
+            name, title: "", path: "", entity_type: "", description: "",
+            keys: [], operations: [], fields: [], navigations: [], examples: []
+        };
+    },
 
     /** A new service as the form starts with it: V2, enabled, technical
      * user, nothing in the definition. */
