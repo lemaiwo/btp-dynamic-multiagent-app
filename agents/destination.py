@@ -762,6 +762,25 @@ class DestinationResolver:
         )
 
 
+async def fetch_service_token(
+    config: DestinationServiceConfig, http: httpx.AsyncClient
+) -> str:
+    """A client-credentials token for the destination service itself.
+
+    For a caller that asks the service something other than "find
+    destination" (listing what exists). The very request a resolver makes,
+    so there is one place that knows the grant; nothing is cached and no
+    resolver's cache is touched. Raises :class:`DestinationError` whose text
+    has the client secret scrubbed.
+    """
+    return await DestinationResolver("", config)._service_token(http)
+
+
+def scrub(text: str, *secrets: str | None) -> str:
+    """Public name of the scrub every error text of this module goes through."""
+    return _scrub(text, *secrets)
+
+
 def resolver_from_environment(
     name: str, *, server_key: str = "", require_credential: bool = True
 ) -> DestinationResolver:

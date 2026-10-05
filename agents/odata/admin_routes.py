@@ -30,7 +30,7 @@ import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -59,7 +59,7 @@ from agents.db import (
     update_odata_service,
     validate_odata_service,
 )
-from agents.odata import preview, testcall
+from agents.odata import destinations, preview, testcall
 from agents.odata.models import (
     DESTINATION_NAME_RE,
     EDM_NAME_RE,
@@ -675,6 +675,42 @@ async def api_test_odata_service(name: str, request: Request) -> dict[str, Any]:
     except preview.PreviewError as exc:
         raise HTTPException(
             status_code=exc.status, detail=exc.detail, headers={ERROR_HEADER: exc.code}
+        ) from None
+
+
+@router.get("/destinations", dependencies=[Depends(require_admin)])
+async def api_list_odata_destinations(request: Request, response: Response) -> dict[str, Any]:
+    """The destinations a catalogue service can name, for the admin UI's
+    dropdown: those of the bound destination service instance and of the
+    subaccount, asked for on every call (nothing is cached). Read-only.
+
+    Answer (``agents.odata.destinations.list_destinations``)::
+
+        {"items": [...], "truncated": bool, "skipped": int, "warnings": [...]}
+
+    Each item is ``name``, ``description``, ``type``, ``proxy_type``,
+    ``authentication``, ``level``, ``user_propagating``, ``usable``,
+    ``reason``, ``notes`` and ``shadows_subaccount`` -- and nothing else of
+    the destination: no URL, no user, no credential, no other property.
+
+    A 200 always carries a list that can be offered, possibly with one
+    ``level_unavailable`` warning. When there is no list at all the answer
+    is an error with a fixed text and a stable code in ``X-OData-Error``,
+    and the UI falls back to typing the name: 503 ``no_destination_service``
+    (no binding), 502 ``token_failed``, 502 ``list_failed`` (neither level
+    answered), 504 ``timeout``. The route takes no query parameter (422,
+    never echoed).
+    """
+    if request.query_params.keys():
+        raise _refuse("query: this route takes no parameters")
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await destinations.list_destinations()
+    except destinations.ListError as exc:
+        raise HTTPException(
+            status_code=exc.status,
+            detail=exc.detail,
+            headers={ERROR_HEADER: exc.code, "Cache-Control": "no-store"},
         ) from None
 
 
