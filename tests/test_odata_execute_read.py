@@ -1018,13 +1018,13 @@ async def test_write_operations_are_refused_without_allow_write(alice, allow_wri
     assert w.requests == [] and w.built == []
 
 
-async def test_call_is_checked_against_the_catalogue_and_not_sent_yet(alice):
+async def test_call_is_checked_against_the_catalogue(alice):
+    """What a call does once it passes: tests/test_odata_operations_v2.py."""
     w = World()
     for target, code in (
         ("Nope", "unknown_target"),
         (ITEM, "unknown_target"),  # an entity set is not an operation
         ("Off", "operation_disabled"),
-        ("CountOpen", "not_available"),  # enabled, read-only: arrives with W4
     ):
         out = await w.run("execute_operation", **{**BASE, "target": target, "operation": "call"})
         assert out["error"]["code"] == code, (target, out)

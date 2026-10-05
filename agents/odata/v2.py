@@ -20,9 +20,15 @@ import httpx
 from . import common
 from .client import ODataError, ReadQuery
 from .common import refuse as _refuse
-from .models import EntitySetDef
+from .models import EntitySetDef, OperationDef
+from .urls import join_path
 
 MAX_KEY_VALUE_CHARS = common.MAX_KEY_VALUE_CHARS
+# What one parameter value of a function import may weigh: it travels in the
+# query string, and a URL is not the place for a document.
+MAX_PARAM_VALUE_CHARS = 1000
+# What a function import answered, as `V2Dialect.parse_call` names it.
+CALL_SHAPES = ("none", "value", "entity", "collection", "other")
 
 # Used with `fullmatch` only, and with `[0-9]`: `$` also matches before a
 # trailing newline, and `\d` matches every Unicode decimal digit.
@@ -65,6 +71,12 @@ _DATE_HINTS = {
     "Edm.DateTimeOffset": "write it in UTC as 2026-10-05T12:00:00Z (no other offset is "
     "accepted), or hand back the /Date(...)/ value a read returned",
 }
+_PARAM_HINTS = {
+    "Edm.DateTime": "write it as 2026-10-05T00:00:00 (date and time, no time zone)",
+    "Edm.DateTimeOffset": "write it as 2026-10-05T12:00:00Z",
+    "Edm.Time": "write it as an ISO 8601 duration, for example PT12H30M",
+    "Edm.Guid": "write it as 8-4-4-4-12 hexadecimal digits",
+}
 _ISO = re.compile(
     r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,7}))?)?"
     r"(Z|[+-][0-9]{2}:[0-9]{2})?"
@@ -75,6 +87,8 @@ class V2Dialect:
 
     version = "v2"
     supports_write = True
+    # Function imports can be called (`call_request`, `parse_call`).
+    supports_call = True
     # Sent with every request of this version; V2 needs none.
     request_headers: dict[str, str] = {}
 
@@ -136,6 +150,134 @@ class V2Dialect:
         (``common.key_segment``, with this dialect's literals).
         """
         return common.key_segment(self.literal, entity_set, key)
+
+    # -- function imports ---------------------------------------------------
+    def call_literal(self, edm_type: str, value: Any) -> str:
+        """``value`` as the URI literal of a function import parameter.
+
+        ``literal`` with what a parameter adds: an object or a list is never
+        a parameter value, an integer must fit its type, and a text has a
+        length a query string can carry. A type ``literal`` does not know
+        (a complex type, a collection, ``Edm.Binary``) is refused there.
+        """
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            raise _refuse(edm_type)
+        if isinstance(value, str) and len(value) > MAX_PARAM_VALUE_CHARS:
+            raise _refuse(edm_type)
+        text = self.literal(edm_type, value)
+        if edm_type in _INTEGER_RANGES:
+            low, high = _INTEGER_RANGES[edm_type]
+            if not low <= int(text.rstrip("L")) <= high:
+                raise _refuse(edm_type)
+        return text
+
+    def call_request(
+        self,
+        service_path: str,
+        operation: OperationDef,
+        key: dict | None,
+        params: dict | None,
+    ) -> tuple[str, str, dict[str, str], Any]:
+        """``(HTTP method, path, query, JSON body)`` of a function import call.
+
+        V2: the path is the service path plus the function import's own name
+        from the catalogue, and every parameter is a typed literal in the
+        query string -- also for a POST, which has no body (``None``). A
+        bound function import gets the key of its entity as parameters of
+        the same names, so ``key`` is merged into ``params``; only names the
+        catalogue's parameter list declares are ever sent, each written with
+        the declared type. The query is returned as a mapping for ``params=``
+        (never as URL text), so a value cannot add an option, a fragment or
+        a path segment. ``$format=json`` asks for the one answer format the
+        result handling recognises.
+
+        The caller (``ODataClient.check_call``) has checked the arguments
+        against the catalogue; what does not fit is refused here again, by
+        name and never with a value.
+        """
+        declared = {p.name: p for p in operation.parameters}
+        given: dict[str, Any] = {}
+        for source in (params or {}, key or {}):
+            if not isinstance(source, dict):
+                raise ODataError("invalid_argument", "parameters must be an object of values")
+            for name, value in source.items():
+                if not isinstance(name, str) or name not in declared or name in given:
+                    raise ODataError(
+                        "invalid_argument",
+                        f"operation {operation.name!r} takes each of its declared "
+                        f"parameters once and no other",
+                    )
+                given[name] = value
+        query: dict[str, str] = {}
+        for name, definition in declared.items():
+            if given.get(name) is None:
+                if definition.required:
+                    raise ODataError(
+                        "invalid_argument",
+                        f"operation {operation.name!r} needs parameter {name!r}",
+                    )
+                continue  # optional and not given: left out, never sent as null
+            try:
+                query[name] = self.call_literal(definition.type, given[name])
+            except ODataError:
+                shown = (
+                    definition.type
+                    if re.fullmatch(r"[A-Za-z0-9_.]{1,64}", definition.type)
+                    else "its type"
+                )
+                raise ODataError(
+                    "invalid_argument",
+                    f"the value of parameter {name!r} is not a single valid {shown} value "
+                    f"(objects, lists and types this tool does not know are not sent)",
+                    hint=_PARAM_HINTS.get(definition.type),
+                ) from None
+        query["$format"] = "json"
+        try:
+            path = join_path(service_path, operation.name)
+        except ValueError:
+            raise ODataError(
+                "invalid_argument", "the request path could not be built for this operation"
+            ) from None
+        return operation.http_method, path, query, None
+
+    def parse_call(self, payload: Any, name: str) -> tuple[str, Any]:
+        """``(shape, value)`` of what a function import answered.
+
+        One of ``CALL_SHAPES``, recognised positively:
+
+        * ``none``: no content, or ``{"d": null}``;
+        * ``value``: one JSON scalar, as ``{"d": {"<name>": scalar}}`` (how
+          Gateway returns a primitive) or ``{"d": scalar}``;
+        * ``entity``: one object with ``__metadata``, directly under ``d`` or
+          under ``d.<name>``;
+        * ``collection``: a list, as ``d.results``, ``d`` or ``d.<name>``
+          (with or without ``results``);
+        * ``other``: anything else under ``d`` (a complex type, say). The
+          value is ``None``: the caller has nothing it could check.
+
+        Whether an entity or a collection may be shown is not decided here.
+        An answer without ``d``, or with an ``error``, is not the answer of
+        a function import (``sap_error``).
+        """
+        if payload is None:
+            return "none", None
+        if not isinstance(payload, dict) or "d" not in payload or "error" in payload:
+            raise ODataError("sap_error", "the OData service answered in an unexpected shape")
+        d = payload["d"]
+        if isinstance(d, dict) and "__metadata" not in d and set(d) == {name}:
+            d = d[name]  # the wrapper Gateway puts around a function import's result
+        if d is None:
+            return "none", None
+        if isinstance(d, (str, int, float)):  # bool is an int
+            return "value", d
+        if isinstance(d, list):
+            return "collection", d
+        if isinstance(d, dict):
+            if "__metadata" in d:
+                return "entity", d
+            if isinstance(d.get("results"), list):
+                return "collection", d["results"]
+        return "other", None
 
     # -- request bodies -----------------------------------------------------
     def update_request(self, path: str, body: dict | None) -> tuple[str, dict[str, str]]:

@@ -506,18 +506,29 @@ async def test_write_through_a_signed_in_user_service_without_user_is_no_user():
     assert w.sap.writes[0].headers["Authorization"] == "Bearer dest-token"
 
 
-async def test_function_imports_stay_refused(alice):
-    """Allowed by both switches, but not built yet: its own code, and not offered."""
-    w = World()
-    out = await w.run(target="Release", operation="call")
-    assert out["error"]["code"] == "not_available" and w.nothing_sent
+async def test_a_function_import_that_changes_data_passes_the_same_switches(alice):
+    """The details are in tests/test_odata_operations_v2.py; here: the same
+    two switches and the same recorder as an entity write, and search agrees."""
     closed = World({"services": ["pr"]})
     out = await closed.run(target="Release", operation="call")
     assert out["error"]["code"] == "write_not_allowed" and closed.nothing_sent
-    for world in (w, closed):
+    unrecorded = World(recorder=None)
+    out = await unrecorded.run(target="Release", operation="call")
+    assert out["error"]["code"] == "audit_not_configured"
+    assert unrecorded.sap.requests == [] and unrecorded.resolved == []
+    for world in (closed, unrecorded):
         for query in ("", "Release", "release"):
             found = await world.search(query=query, detail="full")
             assert "Release" not in {m["target"] for m in found["matches"]}
+    w = World()
+    found = await w.search(query="Release", detail="full")
+    assert "Release" in {m["target"] for m in found["matches"]}
+    out = await w.run(target="Release", operation="call")
+    assert out["ok"] is True and out["result"] is None  # an entity it cannot tie to a set
+    (intent,), (result,) = w.recorder.intents, w.audits
+    assert (intent.operation, intent.target, intent.outcome) == ("call", "Release", "intent")
+    assert (result.outcome, result.phase, result.call_id) == ("ok", "write", intent.call_id)
+    assert w.recorder.seen_at_intent == [(0, 0, 0)]  # recorded before anything was built
 
 
 # -- the ETag handle ----------------------------------------------------------
@@ -1536,7 +1547,10 @@ async def test_whatever_search_returns_execute_does_not_refuse_by_a_switch(alice
         assert code not in _SWITCH_CODES, (service, target, operation, out)
     # ... and it is the whole of what this agent can do: nothing is held back.
     kinds = {operation for _, _, operation in offered}
-    assert "call" not in kinds  # no operation can be called yet, so none is offered
+    called = {(service, target) for service, target, operation in offered if operation == "call"}
+    reading = {("pr", "CountOpen")}
+    changing = {("pr", "Release"), ("pr-jobs", "Release")}
+    assert called == (reading | changing if allow_write else reading)
     assert ({"create", "update", "delete"} <= kinds) is allow_write
     v4_ops = {operation for service, _, operation in offered if service == "pr-v4"}
     assert v4_ops == {"list", "get"}  # a V4 service is read-only for now

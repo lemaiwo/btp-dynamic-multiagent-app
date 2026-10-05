@@ -693,9 +693,12 @@ async def test_toolset_exposes_exactly_the_two_tools_once_O4_lands():
     search = ts.tools["search_operations"].function
     out = await search("requisition")
     assert out["matches"][0]["target"] == ITEM
-    # Only the attached service is searched, whatever the snapshot holds
-    # (two entity sets; its operations are not offered while they cannot be called).
-    assert (await search(""))["total"] == 2
+    # Only the attached service is searched, whatever the snapshot holds:
+    # its two entity sets and the one function import that only reads (this
+    # entry may not write, so the ones that change data are not offered).
+    listed = await search("")
+    assert listed["total"] == 3
+    assert [m["target"] for m in listed["matches"] if m["kind"] == "operation"] == ["CountOpen"]
     assert (await search("", service="sales-orders"))["error"]["code"] == "unknown_service"
     full = await search(ITEM, detail="full")
     assert "fields" in full["matches"][0]
@@ -773,4 +776,4 @@ async def test_the_toolset_keeps_its_own_copy_of_the_snapshot():
     )
     snapshot["purchase-requisitions"]["definition"]["entity_sets"].clear()
     snapshot.clear()
-    assert (await ts.tools["search_operations"].function(""))["total"] == 2
+    assert (await ts.tools["search_operations"].function(""))["total"] == 3

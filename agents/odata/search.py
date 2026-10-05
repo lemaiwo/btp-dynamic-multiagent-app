@@ -13,8 +13,12 @@ this module decides what exists for it. Three rules hold for every result:
   is not listed at all. With ``write_versions``, the same holds for a
   service whose OData version the caller cannot write.
 * Operations (function imports, actions, functions) need ``allow_call``,
-  which is off unless the caller says it can run them: a search must never
-  offer what the execute tool would refuse.
+  which is off unless the caller says it can run them, and with
+  ``call_versions`` only for services of a version whose operations it can
+  run: a search must never offer what the execute tool would refuse. An
+  operation is a write unless it is marked ``changes_data: false`` AND is
+  a ``GET`` (``operation_changes_data``); a write is listed only with
+  ``allow_write``.
 * Results are built key by key from the definition, never by copying a
   catalogue dict, so a UI-only flag (``personal_data``) or a future key
   cannot leak into a tool result.
@@ -127,12 +131,21 @@ def _visible_fields(entity_set: dict[str, Any], allow_write: bool) -> list[dict[
     ]
 
 
+def operation_changes_data(operation: dict[str, Any]) -> bool:
+    """Whether calling this operation is a write.
+
+    The rule of ``client.call_changes_data``, on the stored dict: a read is
+    only what is marked ``changes_data: false`` (exactly) AND is sent with
+    ``GET``. A missing key must not read as "only reads", and a ``POST`` is
+    a write whatever the flag says.
+    """
+    return not (operation.get("changes_data") is False and operation.get("http_method") == "GET")
+
+
 def _operation_visible(operation: dict[str, Any], allow_write: bool) -> bool:
     if operation.get("enabled") is not True:
         return False
-    # Anything but an explicit `False` is a write: the model default is
-    # `changes_data=True`, and a missing key must not read as "only reads".
-    return allow_write or operation.get("changes_data") is False
+    return allow_write or not operation_changes_data(operation)
 
 
 def _field_out(field: dict[str, Any], allow_write: bool) -> dict[str, Any]:
@@ -275,7 +288,8 @@ def _operation_detail(
         ],
         "examples": [],
         "bound_to": bound_to,
-        "changes_data": operation.get("changes_data") is not False,
+        # What a call of it IS for this tool, not merely what is stored.
+        "changes_data": operation_changes_data(operation),
     }
 
 
@@ -339,12 +353,18 @@ class _Candidate:
 
 
 def _candidates(
-    service: dict[str, Any], tokens: list[str], allow_write: bool, allow_call: bool
+    service: dict[str, Any],
+    tokens: list[str],
+    allow_write: bool,
+    allow_call: bool,
+    call_write: bool,
 ) -> list[_Candidate]:
     """Every visible target of one service with its score.
 
     ``allow_write`` is already the answer for this service (the entry's
-    switch and the service's version).
+    switch and the service's version), and so are ``allow_call`` (its
+    operations can be called at all) and ``call_write`` (also those that
+    change data).
     """
     definition = service.get("definition")
     if not isinstance(definition, dict):
@@ -385,7 +405,7 @@ def _candidates(
         return out
     for operation in _dicts(definition.get("operations")):
         target = _text(operation.get("name"))
-        if not target or not _operation_visible(operation, allow_write):
+        if not target or not _operation_visible(operation, call_write):
             continue
         own = _W_TARGET * _hits(tokens, operation.get("title"), target)
         own += _W_DESCRIPTION * _hits(tokens, operation.get("description"))
@@ -413,6 +433,7 @@ def search_catalogue(
     allow_write: bool = False,
     allow_call: bool = False,
     write_versions: Collection[str] | None = None,
+    call_versions: Collection[str] | None = None,
 ) -> dict:
     """Rank the visible targets of ``services`` against ``query``.
 
@@ -421,6 +442,12 @@ def search_catalogue(
     for a service of another version nothing write-related is listed.
     ``allow_call`` says the caller can run operations (function imports,
     actions, functions); without it none is listed, whatever it changes.
+    ``call_versions`` narrows it to the OData versions whose operations the
+    caller can run (``None``: any). An operation is listed only when it is
+    enabled and either only reads (``operation_changes_data``) or
+    ``allow_write`` is on -- the entry's switch as it is, since what a call
+    needs is the switch and the version in ``call_versions``, not entity
+    writes of that version.
 
     ``services`` are ``ODataService.to_dict()`` dicts. Never raises: a
     refusal is ``{"error": {"code", "message", "hint"?}}``, because the
@@ -472,7 +499,12 @@ def search_catalogue(
             write = allow_write is True and (
                 write_versions is None or entry.get("odata_version") in write_versions
             )
-            scored.extend(_candidates(entry, tokens, write, allow_call is True))
+            call = allow_call is True and (
+                call_versions is None or entry.get("odata_version") in call_versions
+            )
+            scored.extend(
+                _candidates(entry, tokens, write, call, call and allow_write is True)
+            )
     if not listing:
         scored = [c for c in scored if c.score > 0]
     scored.sort(key=_Candidate.sort_key)
