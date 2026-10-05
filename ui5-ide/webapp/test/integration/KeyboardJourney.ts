@@ -238,12 +238,15 @@ opaTest("Keyboard only: worklist -> session -> document -> message -> block comm
     theFocusIsOn(Then, () => inner("chatInput", "textarea"), "the composer still (the switch did not move the focus)");
     Then.waitFor({
         id: "toolPage", viewName: "App", visible: false,
-        check: () => !!block(1),
+        // Waits for the state, then for where the focus is: never asserted at the moment the document appears.
+        check: () => !!block(1) && active() === inner("chatInput", "textarea"),
         success: () => {
-            Opa5.assert.notStrictEqual(active(), win().document.body, `the focus is not lost to the page body (${describe(active())})`);
+            Opa5.assert.ok(true, "the focus stays in the composer once the new version is rendered");
             const stops = Array.from(win().document.querySelectorAll(".ideDocBlock[tabindex='0']"));
             Opa5.assert.ok(stops.length === 1 && stops[0] === block(0), "the document is one tab stop: its first block");
-        }
+        },
+        error: () => Opa5.assert.ok(false, `the focus is not in the composer but on ${describe(active())}`),
+        errorMessage: "The new version did not render with the focus in the composer"
     });
     // A block comment: Down to block 2, Enter, type, Save with Enter; the focus returns to the block.
     iFocus(When, () => block(0), "block 1");
@@ -292,12 +295,11 @@ opaTest("Keyboard only: worklist -> session -> document -> message -> block comm
     Then.waitFor({
         id: "toolPage", viewName: "App", visible: false,
         check: () => backend.dataOf("s-1")!.comments.length === 1 && backend.dataOf("s-1")!.comments.every((c) => c.state === "addressed") && announced.filter((a) => a === "The assistant has answered.").length === 2,
-        success: () => {
-            Opa5.assert.strictEqual(count("POST sessions/s-1/request-changes"), 1, "one request was sent");
-            Opa5.assert.notStrictEqual(active(), win().document.body, `the focus is not lost after the dialog (${describe(active())})`);
-        },
+        success: () => Opa5.assert.strictEqual(count("POST sessions/s-1/request-changes"), 1, "one request was sent"),
         errorMessage: "The request-changes run did not finish"
     });
+    // The dialog gives the focus back to the button that opened it (waited for, not asserted at the moment the run ends).
+    theFocusIsOn(Then, () => byId("requestChangesButton"), "Request changes, which opened the dialog");
     Then.iStopTheApp();
 });
 
@@ -413,11 +415,19 @@ opaTest("Keyboard only: changes view -> next change -> line comment -> dismiss -
     Then.waitFor({
         id: "toolPage", viewName: "App", visible: false,
         check: () => backend.dataOf("s-1")!.session.stage === "review",
-        success: () => {
-            Opa5.assert.strictEqual(count("POST sessions/s-1/approve"), 1, "one approve, from the changes view");
-            Opa5.assert.notStrictEqual(active(), win().document.body, `the focus is not lost (${describe(active())})`);
-        },
+        success: () => Opa5.assert.strictEqual(count("POST sessions/s-1/approve"), 1, "one approve, from the changes view"),
         errorMessage: "Not approved"
+    });
+    // The next action (Finish) stays off until there is a review document: the focus that sat on Approve goes to the
+    // composer, never to the page body or a disabled button. Waited for: the approve settles after the stage changed.
+    theFocusIsOn(Then, () => inner("chatInput", "textarea"), "the composer after the approve (Finish is off)");
+    Then.waitFor({
+        id: "toolPage", viewName: "App", visible: false,
+        success: () => {
+            const primary = CoreElement.closestTo(byId("primaryAction")!) as unknown as Button;
+            Opa5.assert.notOk(primary.getEnabled() && !primary.getBusy(),
+                `the primary action is off (${primary.getText()}), so the focus did not stay on it`);
+        }
     });
     Then.iStopTheApp();
 });
@@ -551,7 +561,6 @@ opaTest("Keyboard only (diagnose): finding -> source -> details -> trace approva
         id: "toolPage", viewName: "App", visible: false,
         check: () => backend.dataOf(sid)!.approvals[0].status === "denied",
         success: () => {
-            Opa5.assert.notStrictEqual(active(), win().document.body, `the focus is not lost after the decision (${describe(active())})`);
             Opa5.assert.ok(announced.some((a) => a.startsWith("Request rejected")), "the decision is announced");
             const line = win().document.querySelector("[id*='--approvalDecided-']:not([style*='display: none'])");
             Opa5.assert.ok(!!line && !/Indication Color|Warning issued|Entry successfully|Invalid entry|Informative entry/.test(line.textContent!),
@@ -559,6 +568,8 @@ opaTest("Keyboard only (diagnose): finding -> source -> details -> trace approva
         },
         errorMessage: "The approval was not rejected"
     });
+    // The buttons that had the focus are gone: the decision puts it in the composer (waited for, the answer settles first).
+    theFocusIsOn(Then, () => inner("chatInput", "textarea"), "the composer after the decision");
     Then.iStopTheApp();
 });
 

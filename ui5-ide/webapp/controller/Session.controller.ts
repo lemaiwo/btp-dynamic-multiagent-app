@@ -1157,26 +1157,41 @@ export default class Session extends BaseController {
      * After an approve the next action may stay off (no document of the new
      * stage yet): the focus that sat on the button goes to the composer, where
      * the next request is typed, instead of the page body.
+     *
+     * Decided here, from the model, and not later from where the focus is:
+     * the button still holds the focus while it turns off, and when it falls
+     * to the page body depends on the browser and on whether the button is
+     * rendered again (a disabled button cannot take the focus back). A check
+     * that ran before that saw the focus "kept" and the keyboard user was
+     * left on the body (or on a disabled button).
      */
     private releasePrimaryFocus(): void {
         if (!this.primaryFocusParked) {
             return;
         }
         this.primaryFocusParked = false;
-        setTimeout(() => {
-            if (!Session.focusLost()) {
-                return;
-            }
-            const primary = this.byId("primaryAction") as Button | undefined;
-            const input = this.byId("chatInput") as TextArea | undefined;
-            if (primary?.getEnabled() && !primary.getBusy()) {
-                primary.focus();
-            } else if (input?.getEnabled()) {
-                input.focus();
-            } else {
-                (this.byId("artifactTitle") as Control | undefined)?.focus();
-            }
-        }, 0);
+        const primary = this.byId("primaryAction") as Button | undefined;
+        const state = this.s().getProperty("/primary") as { enabled?: boolean; busy?: boolean } | undefined;
+        if (state?.enabled && !state.busy) {
+            // It stays usable: it keeps the focus, or gets it back if a re-render dropped it.
+            setTimeout(() => {
+                if (Session.focusLost()) {
+                    primary?.focus();
+                }
+            }, 0);
+            return;
+        }
+        // The focus moved on meanwhile (Tab during the approve): it stays where the user put it.
+        const active = document.activeElement;
+        if (!Session.focusLost() && !primary?.getDomRef()?.contains(active)) {
+            return;
+        }
+        const input = this.byId("chatInput") as TextArea | undefined;
+        if (input?.getEnabled() && input.getDomRef()) {
+            input.focus();
+        } else {
+            (this.byId("artifactTitle") as Control | undefined)?.focus();
+        }
     }
 
     private nextStage(stage: Stage): Stage {
