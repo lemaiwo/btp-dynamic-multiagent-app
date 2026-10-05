@@ -29,8 +29,10 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, AsyncIterator, Callable, Hashable, Mapping
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -220,6 +222,83 @@ def _owners(cache: "OrderedDict[tuple[str, str], Any]") -> list[str]:
     return list(dict.fromkeys(reversed([k[0] for k in cache])))[::-1]
 
 
+def _store(
+    cache: "OrderedDict[tuple[str, str], Any]",
+    key: tuple[str, str],
+    value: Any,
+    deadline_of: Callable[[Any], float],
+) -> None:
+    """Put ``value`` at the fresh end of a per-user cache and keep it bounded.
+
+    The same owner's expired entries go first: with the token digest in the
+    key, every refreshed JWT leaves a dead entry behind, and those must not
+    take the slots (:data:`PER_USER_CACHE_MAX`) that live ones need. Other
+    owners' entries are left to the LRU.
+    """
+    now = time.monotonic()
+    for stale in [
+        k for k, v in cache.items() if k[0] == key[0] and deadline_of(v) <= now
+    ]:
+        del cache[stale]
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > PER_USER_CACHE_MAX:
+        cache.popitem(last=False)
+
+
+def _scrub(text: str, *secrets: str | None) -> str:
+    """``text`` with every given secret replaced by ``***``.
+
+    The remote side's own message is the useful part of an error, but a
+    service (or a proxy in front of it) that echoes the request must not get
+    a client secret or a user's token into a :class:`DestinationError`, which
+    other modules log and some hand to a model.
+    """
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "***")
+            # A form body echoed back carries the value percent-encoded.
+            encoded = quote_plus(secret)
+            if encoded != secret:
+                text = text.replace(encoded, "***")
+    return text
+
+
+class _KeyedLocks:
+    """One :class:`asyncio.Lock` per cache key, kept only while in use.
+
+    A single lock per resolver made every user wait for whichever fetch was
+    in flight (up to the 30 s timeout each), and keying the cache by token
+    digest made misses more frequent. Per key, overlapping calls for the same
+    user and token still fetch once, and different users do not queue behind
+    each other. A lock is dropped when its last holder or waiter leaves, so
+    the table is bounded by the calls in flight, not by the users ever seen.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[Hashable, list[Any]] = {}  # key -> [lock, users]
+
+    @property
+    def idle(self) -> bool:
+        return not self._locks
+
+    @asynccontextmanager
+    async def hold(self, key: Hashable) -> AsyncIterator[None]:
+        # No await between the lookup and the count, so two tasks cannot
+        # create two locks for one key.
+        entry = self._locks.get(key)
+        if entry is None:
+            entry = self._locks[key] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            async with entry[0]:
+                yield
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and self._locks.get(key) is entry:
+                del self._locks[key]
+
+
 @dataclass(frozen=True)
 class Destination:
     """A resolved destination: where to send requests, and what to send with them.
@@ -335,7 +414,10 @@ class DestinationResolver:
         # entry: the two are different credentials, and a user's token must
         # never be handed to a request made as the app.
         self._per_user: OrderedDict[tuple[str, str], Destination] = OrderedDict()
+        # The app-level slot and the raw properties share one lock; per-user
+        # fetches lock per cache key, so users do not wait for each other.
         self._lock = asyncio.Lock()
+        self._user_locks = _KeyedLocks()
 
     def invalidate(self, principal: str | None = None) -> None:
         """Drop a cached destination, so the next resolve re-fetches.
@@ -364,11 +446,14 @@ class DestinationResolver:
         return _owners(self._per_user)
 
     @staticmethod
-    def _user_key(principal: str | None, user_token: str) -> str:
-        # The name entries are filed and invalidated under: the principal when
-        # the caller knows it, else a digest of the token, so the raw token is
-        # never a dictionary key that a debugger prints. The cache itself is
-        # keyed by this name AND the token's digest (_cache_key).
+    def user_key(principal: str | None, user_token: str) -> str:
+        """The name a user's entries are filed under, for :meth:`invalidate`.
+
+        ``principal`` when there is one, else ``"token:" + sha256(user_token)``
+        (never the raw token). Same meaning as
+        :meth:`ConnectivityTokens.user_key`: it is not the whole cache key,
+        which also carries the token's digest (``_cache_key``).
+        """
         return _cache_owner(principal, user_token)
 
     async def resolve(
@@ -417,16 +502,15 @@ class DestinationResolver:
         if not force and hit is not None and time.monotonic() < hit.expires_at:
             self._per_user.move_to_end(key)
             return hit
-        async with self._lock:
+        async with self._user_locks.hold(key):
+            # Re-check: an overlapping call for this user and token may have
+            # fetched while we waited.
             hit = self._per_user.get(key)
             if not force and hit is not None and time.monotonic() < hit.expires_at:
                 self._per_user.move_to_end(key)
                 return hit
             resolved = await self._fetch(user_token=user_token)
-            self._per_user.pop(key, None)
-            self._per_user[key] = resolved
-            while len(self._per_user) > PER_USER_CACHE_MAX:
-                self._per_user.popitem(last=False)
+            _store(self._per_user, key, resolved, lambda d: d.expires_at)
             return resolved
 
     def _client(self) -> httpx.AsyncClient:
@@ -483,15 +567,23 @@ class DestinationResolver:
             headers = {"Authorization": f"Bearer {token}"}
             if user_token:
                 headers[USER_TOKEN_HEADER] = user_token
+            # What a remote message may echo back and must not carry on.
+            secrets = (user_token, token, self._config.client_secret)
+            failure = None
             try:
                 response = await http.get(
                     f"{self._config.api_url}{DESTINATION_PATH}{self.name}",
                     headers=headers,
                 )
             except httpx.HTTPError as exc:
+                failure = f"{type(exc).__name__}: {_scrub(str(exc), *secrets)}"
+            if failure is not None:
+                # Raised outside the except block on purpose: a chained httpx
+                # error would print its unscrubbed text in any traceback log.
                 raise DestinationError(
-                    f"could not reach the destination service for {self.name!r}: {exc}"
-                ) from exc
+                    f"could not reach the destination service for {self.name!r}: "
+                    f"{failure}"
+                )
             if response.status_code == 404:
                 raise DestinationError(
                     f"destination {self.name!r} does not exist in the subaccount "
@@ -500,11 +592,13 @@ class DestinationResolver:
             if response.status_code >= 400:
                 raise DestinationError(
                     f"destination service returned {response.status_code} for "
-                    f"{self.name!r}: {response.text[:400]}"
+                    f"{self.name!r}: {_scrub(response.text, *secrets)[:400]}"
                 )
             return response.json()
 
     async def _service_token(self, http: httpx.AsyncClient) -> str:
+        secret = self._config.client_secret
+        failure = None
         try:
             response = await http.post(
                 self._config.token_url,
@@ -516,13 +610,15 @@ class DestinationResolver:
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         except httpx.HTTPError as exc:
+            failure = f"{type(exc).__name__}: {_scrub(str(exc), secret)}"
+        if failure is not None:
             raise DestinationError(
-                f"could not reach the destination service token endpoint: {exc}"
-            ) from exc
+                f"could not reach the destination service token endpoint: {failure}"
+            )
         if response.status_code >= 400:
             raise DestinationError(
                 f"destination service token request returned "
-                f"{response.status_code}: {response.text[:400]}"
+                f"{response.status_code}: {_scrub(response.text, secret)[:400]}"
             )
         token = str((response.json() or {}).get("access_token") or "")
         if not token:
@@ -783,7 +879,9 @@ class ConnectivityTokens:
         self._app: tuple[str, float] | None = None
         # Keyed by principal AND digest of the JWT exchanged (_cache_key).
         self._per_user: OrderedDict[tuple[str, str], tuple[str, float]] = OrderedDict()
+        # The app token has its own lock; user tokens lock per cache key.
         self._lock = asyncio.Lock()
+        self._user_locks = _KeyedLocks()
 
     def invalidate(self, principal: str | None = None) -> None:
         """Drop the app token, or with ``principal`` every token of that user.
@@ -855,7 +953,7 @@ class ConnectivityTokens:
         if not force and hit is not None and time.monotonic() < hit[1]:
             self._per_user.move_to_end(key)
             return hit[0]
-        async with self._lock:
+        async with self._user_locks.hold(key):
             hit = self._per_user.get(key)
             if not force and hit is not None and time.monotonic() < hit[1]:
                 self._per_user.move_to_end(key)
@@ -870,20 +968,8 @@ class ConnectivityTokens:
                 secrets=(user_jwt,),
                 what="user token",
             )
-            self._per_user.pop(key, None)
-            self._per_user[key] = fetched
-            while len(self._per_user) > PER_USER_CACHE_MAX:
-                self._per_user.popitem(last=False)
+            _store(self._per_user, key, fetched, lambda entry: entry[1])
             return fetched[0]
-
-    def _scrub(self, text: str, secrets: tuple[str, ...]) -> str:
-        # The endpoint's own message is the useful part of an error, but an
-        # endpoint (or a proxy in front of it) that echoes the request must
-        # not get the client secret or a user's JWT into a log line.
-        for secret in (self.config.client_secret, *secrets):
-            if secret:
-                text = text.replace(secret, "***")
-        return text
 
     async def _request(
         self,
@@ -897,6 +983,8 @@ class ConnectivityTokens:
             "client_id": self.config.client_id,
             "client_secret": self.config.client_secret,
         }
+        secrets = (self.config.client_secret, *secrets)
+        failure = None
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30.0), transport=self._transport
         ) as http:
@@ -907,14 +995,16 @@ class ConnectivityTokens:
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
             except httpx.HTTPError as exc:
-                raise DestinationError(
-                    f"could not reach the connectivity service token endpoint: "
-                    f"{type(exc).__name__}: {self._scrub(str(exc), secrets)}"
-                ) from None
+                failure = f"{type(exc).__name__}: {_scrub(str(exc), *secrets)}"
+        if failure is not None:
+            # Outside the except block: no chained, unscrubbed httpx error.
+            raise DestinationError(
+                f"could not reach the connectivity service token endpoint: {failure}"
+            )
         if response.status_code >= 400:
             raise DestinationError(
                 f"connectivity service {what} request returned "
-                f"{response.status_code}: {self._scrub(response.text[:400], secrets)}"
+                f"{response.status_code}: {_scrub(response.text, *secrets)[:400]}"
             )
         try:
             body = response.json() or {}

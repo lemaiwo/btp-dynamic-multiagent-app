@@ -17,6 +17,7 @@ Run:  python -m pytest tests/test_odata_connectivity.py
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -645,3 +646,280 @@ async def test_connectivity_lru_bound_holds_with_several_tokens_per_principal(mo
     assert uaa.count(JWT_BEARER) == 4
     await tokens.user_token("jwt-0", "bob@example.com")
     assert uaa.count(JWT_BEARER) == 5 and len(tokens._per_user) == 2
+
+
+# --- review follow-up: pinned edge cases, scrubbed errors, per-key locks -----
+
+
+def _sha(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def test_a_principal_shaped_like_a_token_owner_does_not_reach_that_callers_entry():
+    svc = PerUserService()
+    resolver = svc.resolver()
+    spoof = "token:" + _sha("jwt-victim")
+    assert DestinationResolver.user_key(None, "jwt-victim") == spoof
+    # A caller whose principal is literally the owner name of a principal-less
+    # caller's entry, in both orders.
+    evil = await resolver.resolve(user_token="jwt-evil", principal=spoof)
+    victim = await resolver.resolve(user_token="jwt-victim")
+    assert (_cred(evil), _cred(victim)) == ("Bearer cred-of-jwt-evil", "Bearer cred-of-jwt-victim")
+    assert await resolver.resolve(user_token="jwt-evil", principal=spoof) is evil
+    assert await resolver.resolve(user_token="jwt-victim") is victim
+    assert svc.user_tokens == ["jwt-evil", "jwt-victim"]
+
+    uaa = Uaa()
+    tokens = _tokens(uaa)
+    t_victim = await tokens.user_token("jwt-victim", None)
+    t_evil = await tokens.user_token("jwt-evil", spoof)
+    assert "jwt-victim" in t_victim and "jwt-evil" in t_evil
+    assert await tokens.user_token("jwt-victim", None) == t_victim
+    assert await tokens.user_token("jwt-evil", spoof) == t_evil
+    assert uaa.count(JWT_BEARER) == 2
+
+
+async def test_destination_auth_never_sends_a_credential_resolved_with_another_users_token():
+    """The production path: ``DestinationAuth`` reads ``current_jwt`` and
+    ``current_principal`` separately, and a run-as job binds the trigger's
+    token with the run-as user's principal."""
+    from agents.auth import current_jwt, current_principal
+    from agents.destination_auth import destination_http_client
+
+    svc = PerUserService()
+    sent: list[str] = []
+
+    def target(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("Authorization", ""))
+        return httpx.Response(200, json={"ok": True})
+
+    client = destination_http_client(
+        svc.resolver(), user_context=True, transport=httpx.MockTransport(target)
+    )
+
+    async def call(jwt: str, principal: str) -> None:
+        j = current_jwt.set(jwt)
+        p = current_principal.set(principal)
+        try:
+            (await client.get("/v1/things")).raise_for_status()
+        finally:
+            current_principal.reset(p)
+            current_jwt.reset(j)
+
+    async with client:
+        await call("jwt-alice", "bob@example.com")  # Alice triggers a job that runs as Bob
+        await call("jwt-bob", "bob@example.com")  # Bob's own request
+        await call("jwt-alice", "alice@example.com")  # Alice's own request
+        await call("jwt-bob", "bob@example.com")  # Bob again: his own entry, from cache
+    assert sent == [
+        "Bearer cred-of-jwt-alice",
+        "Bearer cred-of-jwt-bob",
+        "Bearer cred-of-jwt-alice",
+        "Bearer cred-of-jwt-bob",
+    ]
+    assert svc.user_tokens == ["jwt-alice", "jwt-bob", "jwt-alice"]
+
+
+class GatedService(PerUserService):
+    """Holds the find-destination call of ``slow`` open until released."""
+
+    def __init__(self, slow: str):
+        super().__init__()
+        self.slow = slow
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
+        if request.headers.get("X-user-token") == self.slow:
+            self.entered.set()
+            await self.release.wait()
+        return PerUserService.handler(self, request)
+
+
+class GatedUaa(Uaa):
+    def __init__(self, slow: str):
+        super().__init__()
+        self.slow = slow
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
+        if f"assertion={self.slow}".encode() in request.content:
+            self.entered.set()
+            await self.release.wait()
+        return Uaa.handler(self, request)
+
+
+async def test_overlapping_resolves_for_the_same_user_and_token_fetch_once():
+    svc = GatedService(slow="jwt-alice")
+    resolver = svc.resolver()
+    first = asyncio.create_task(
+        resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    )
+    second = asyncio.create_task(
+        resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    )
+    await svc.entered.wait()
+    await asyncio.sleep(0)
+    svc.release.set()
+    a, b = await asyncio.gather(first, second)
+    assert a is b and svc.user_tokens == ["jwt-alice"]
+    assert resolver._user_locks.idle
+
+    uaa = GatedUaa(slow="jwt-alice")
+    tokens = _tokens(uaa)
+    t1 = asyncio.create_task(tokens.user_token("jwt-alice", "alice@example.com"))
+    t2 = asyncio.create_task(tokens.user_token("jwt-alice", "alice@example.com"))
+    await uaa.entered.wait()
+    await asyncio.sleep(0)
+    uaa.release.set()
+    assert await t1 == await t2 and uaa.count(JWT_BEARER) == 1
+    assert tokens._user_locks.idle
+
+
+async def test_one_users_slow_resolve_does_not_hold_up_another_user():
+    svc = GatedService(slow="jwt-alice")
+    resolver = svc.resolver()
+    slow = asyncio.create_task(
+        resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    )
+    await svc.entered.wait()
+    # Alice's fetch is open. Bob, the same principal with another token, and
+    # the app-level slot all complete meanwhile.
+    bob = await asyncio.wait_for(
+        resolver.resolve(user_token="jwt-bob", principal="bob@example.com"), 1
+    )
+    other = await asyncio.wait_for(
+        resolver.resolve(user_token="jwt-alice-2", principal="alice@example.com"), 1
+    )
+    app = await asyncio.wait_for(resolver.resolve(), 1)
+    assert _cred(bob) == "Bearer cred-of-jwt-bob" and _cred(other) == "Bearer cred-of-jwt-alice-2"
+    assert _cred(app) == "Bearer cred-of-None" and not slow.done()
+    svc.release.set()
+    assert _cred(await slow) == "Bearer cred-of-jwt-alice"
+    assert resolver._user_locks.idle
+
+
+async def test_one_users_slow_token_exchange_does_not_hold_up_another_user():
+    uaa = GatedUaa(slow="jwt-alice")
+    tokens = _tokens(uaa)
+    slow = asyncio.create_task(tokens.user_token("jwt-alice", "alice@example.com"))
+    await uaa.entered.wait()
+    bob = await asyncio.wait_for(tokens.user_token("jwt-bob", "bob@example.com"), 1)
+    app = await asyncio.wait_for(tokens.app_token(), 1)
+    assert "jwt-bob" in bob and app.startswith("app-token") and not slow.done()
+    uaa.release.set()
+    assert "jwt-alice" in await slow
+    assert tokens._user_locks.idle
+
+
+async def test_a_cancelled_fetch_leaves_no_lock_behind():
+    svc = GatedService(slow="jwt-alice")
+    resolver = svc.resolver()
+    task = asyncio.create_task(
+        resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    )
+    await svc.entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert resolver._user_locks.idle and resolver.cached_principals == []
+    svc.slow = ""
+    d = await asyncio.wait_for(
+        resolver.resolve(user_token="jwt-alice", principal="alice@example.com"), 1
+    )
+    assert _cred(d) == "Bearer cred-of-jwt-alice"
+
+
+async def test_insert_drops_the_same_owners_expired_entries():
+    import dataclasses
+
+    svc = PerUserService()
+    resolver = svc.resolver()
+    await resolver.resolve(user_token="jwt-old", principal="bob@example.com")
+    await resolver.resolve(user_token="jwt-alice", principal="alice@example.com")
+    for key in list(resolver._per_user):  # everything cached so far has expired
+        resolver._per_user[key] = dataclasses.replace(resolver._per_user[key], expires_at=0.0)
+    await resolver.resolve(user_token="jwt-new", principal="bob@example.com")
+    # Bob's expired entry went; Alice's is not Bob's to clean up.
+    assert [(o, d == _sha("jwt-new")) for o, d in resolver._per_user] == [
+        ("alice@example.com", False),
+        ("bob@example.com", True),
+    ]
+
+    uaa = Uaa()
+    tokens = _tokens(uaa)
+    await tokens.user_token("jwt-old", "bob@example.com")
+    await tokens.user_token("jwt-alice", "alice@example.com")
+    for key in list(tokens._per_user):
+        tokens._per_user[key] = (tokens._per_user[key][0], 0.0)
+    await tokens.user_token("jwt-new", "bob@example.com")
+    assert list(tokens._per_user) == [
+        ("alice@example.com", _sha("jwt-alice")),
+        ("bob@example.com", _sha("jwt-new")),
+    ]
+
+
+async def test_resolver_errors_carry_neither_the_user_token_nor_a_secret():
+    user_jwt = "eyJ.user-jwt-distinctive.sig"
+    svc_secret = CONFIG.client_secret  # "shh" is too short to be distinctive
+    config = DestinationServiceConfig(
+        client_id="sb-dest",
+        client_secret="dest-s3cr3t-distinctive",
+        token_url="https://uaa.example/oauth/token",
+        api_url="https://destination.example",
+    )
+    assert svc_secret != config.client_secret
+
+    def resolver_with(handler) -> DestinationResolver:
+        return DestinationResolver("S4_ODATA_USER", config, transport=httpx.MockTransport(handler))
+
+    def leaks(exc: BaseException) -> bool:
+        seen, texts = set(), []
+        while exc is not None and id(exc) not in seen:  # the chain is logged too
+            seen.add(id(exc))
+            texts.append(str(exc))
+            exc = exc.__cause__ or exc.__context__
+        text = " ".join(texts)
+        return any(s in text for s in (user_jwt, config.client_secret, "svc-token-distinctive"))
+
+    # A destination service (or a proxy in front of it) that echoes the request.
+    def echo_find(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(200, json={"access_token": "svc-token-distinctive"})
+        return httpx.Response(500, text=f"upstream failed; headers were {dict(request.headers)}")
+
+    with pytest.raises(DestinationError, match="returned 500") as find_err:
+        await resolver_with(echo_find).resolve(user_token=user_jwt, principal="alice@example.com")
+    assert "upstream failed" in str(find_err.value) and not leaks(find_err.value)
+
+    def echo_token(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, text=f"bad client: {request.content.decode()}")
+
+    with pytest.raises(DestinationError, match="token request returned 401") as token_err:
+        await resolver_with(echo_token).resolve(user_token=user_jwt, principal="alice@example.com")
+    assert not leaks(token_err.value)
+
+    def boom_find(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/oauth/token"):
+            return httpx.Response(200, json={"access_token": "svc-token-distinctive"})
+        raise httpx.ConnectError(f"refused {dict(request.headers)}", request=request)
+
+    with pytest.raises(
+        DestinationError, match="could not reach the destination service"
+    ) as net_err:
+        await resolver_with(boom_find).resolve(user_token=user_jwt, principal="alice@example.com")
+    assert not leaks(net_err.value)
+
+    def boom_token(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"refused {request.content.decode()}", request=request)
+
+    with pytest.raises(DestinationError, match="token endpoint") as net_token_err:
+        await resolver_with(boom_token).resolve()
+    assert not leaks(net_token_err.value)
+    # resolve_properties (MAIL destinations) goes through the same calls.
+    with pytest.raises(DestinationError, match="returned 500") as props_err:
+        await resolver_with(echo_find).resolve_properties()
+    assert not leaks(props_err.value)
