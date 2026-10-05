@@ -160,10 +160,12 @@ class _OnPremise(DestinationError):
     """The destination is reached through the Cloud Connector."""
 
 
-class _MetadataAuth(DestinationAuth):
-    """``DestinationAuth`` for one fetch: no on-premise target, and the two
-    headers the fetch relies on cannot be changed by the destination.
+class OneShotAuth(DestinationAuth):
+    """``DestinationAuth`` for one admin-triggered request: no on-premise
+    target, and it remembers the destination the request was shaped for.
 
+    Shared by the preview (``_MetadataAuth``) and the catalogue test call
+    (``agents.odata.testcall``), so that both refuse the same destinations.
     Built with ``retry_on_401=False``: the resolver is new for this call, so
     a second attempt could only repeat a refused logon -- against a system
     that counts those.
@@ -172,6 +174,9 @@ class _MetadataAuth(DestinationAuth):
     resolved: Destination | None = None
 
     def send_through(self, request: httpx.Request, destination: Destination) -> None:
+        # Also for a destination that is refused below: its type is what a
+        # caller reports.
+        self.resolved = destination
         if (destination.proxy_type or "").strip().lower() == PROXY_TYPE_ON_PREMISE.lower():
             # Checked on the destination this very request would use, before
             # anything is shaped: sent from here it would go straight to the
@@ -180,7 +185,14 @@ class _MetadataAuth(DestinationAuth):
             # `DestinationAuth(connectivity=...)` + `OnPremiseRouter`) adds
             # that route; this refusal goes when the fetch can take it.
             raise _OnPremise(_ON_PREMISE_TEXT)
-        self.resolved = destination
+        super().send_through(request, destination)
+
+
+class _MetadataAuth(OneShotAuth):
+    """``OneShotAuth`` for the ``$metadata`` fetch: the two headers the fetch
+    relies on cannot be changed by the destination."""
+
+    def send_through(self, request: httpx.Request, destination: Destination) -> None:
         super().send_through(request, destination)
         # After the destination's own headers (`URL.headers.*`), which are
         # applied last and would otherwise win: a compressed answer would
@@ -698,6 +710,23 @@ def _parse_and_build(
 
 
 _active = 0
+
+
+def take_slot() -> None:
+    """Take one of the ``MAX_CONCURRENT_PREVIEWS`` slots, or refuse with 429
+    ``busy``. For the other admin-triggered request to SAP, the catalogue
+    test call: it and the previews count together. No ``await`` lies between
+    the check and the increment. Give it back with :func:`free_slot`."""
+    global _active
+    if _active >= MAX_CONCURRENT_PREVIEWS:
+        raise PreviewError(429, "busy", _BUSY_TEXT)
+    _active += 1
+
+
+def free_slot() -> None:
+    """Give back a slot taken with :func:`take_slot`."""
+    global _active
+    _active -= 1
 
 
 def _release(job: asyncio.Future[Any]) -> None:

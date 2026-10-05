@@ -14,7 +14,8 @@ field and the rule, never the value; the same holds for every refusal below.
 
 The same holds for what a remote system said: the ``$metadata`` preview
 route answers with fixed texts or SAP's own short code and message
-(``agents.odata.preview``), never a host, a URL or a page.
+(``agents.odata.preview``), never a host, a URL or a page. The test-call
+route (``agents.odata.testcall``) answers the same way, and never with a row.
 
 This module imports ``agents.auth``, ``agents.db`` and the ``agents.odata``
 modules only, never ``agents.admin`` (which imports it at the end of the
@@ -58,9 +59,10 @@ from agents.db import (
     update_odata_service,
     validate_odata_service,
 )
-from agents.odata import preview
+from agents.odata import preview, testcall
 from agents.odata.models import (
     DESTINATION_NAME_RE,
+    EDM_NAME_RE,
     MAX_DEFINITION_BYTES,
     SERVICE_NAME_RE,
     loc_path,
@@ -84,6 +86,8 @@ MAX_BODY_BYTES = MAX_DEFINITION_BYTES + 64 * 1024
 _TOO_LARGE = "Request body too large"
 # The preview request is five short fields.
 METADATA_BODY_BYTES = 16 * 1024
+# The test request is at most one entity set name.
+TEST_BODY_BYTES = 4 * 1024
 # The id column of the audit table is a 32-bit integer on Postgres; a larger
 # bound parameter is a driver error there, i.e. a 500.
 AUDIT_MAX_ID = 2_147_483_647
@@ -148,6 +152,16 @@ class MetadataBody(BaseModel):
         return confine_service_path(value)
 
 
+class TestCallBody(BaseModel):
+    """The one thing a test call may choose: which entity set of the STORED
+    service to list. No destination, identity, path or query option: those
+    are the stored service's, and any other key is refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_set: Annotated[StrictStr, StringConstraints(pattern=EDM_NAME_RE)] | None = None
+
+
 def _refuse(detail: str) -> HTTPException:
     return HTTPException(status_code=422, detail=detail)
 
@@ -186,9 +200,14 @@ async def _bounded_body(request: Request, limit: int = MAX_BODY_BYTES) -> bytes:
     return b"".join(chunks)
 
 
-async def _json_object(request: Request, limit: int = MAX_BODY_BYTES) -> dict[str, Any]:
-    """The request body as a JSON object, or a 422 that says only that."""
+async def _json_object(
+    request: Request, limit: int = MAX_BODY_BYTES, *, empty_ok: bool = False
+) -> dict[str, Any]:
+    """The request body as a JSON object, or a 422 that says only that.
+    ``empty_ok``: no body at all is ``{}`` (a route whose body is optional)."""
     raw = await _bounded_body(request, limit)
+    if empty_ok and not raw.strip():
+        return {}
     try:
         data = json.loads(raw)
     except (ValueError, RecursionError):
@@ -582,6 +601,77 @@ async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
         return await preview.run_preview(
             body.destination, body.service_path, body.odata_version, body.user_context, stored
         )
+    except preview.PreviewError as exc:
+        raise HTTPException(
+            status_code=exc.status, detail=exc.detail, headers={ERROR_HEADER: exc.code}
+        ) from None
+
+
+@router.post("/services/{name}/test", dependencies=[Depends(require_admin)])
+async def api_test_odata_service(name: str, request: Request) -> dict[str, Any]:
+    """Test a STORED service with one read: do its destination, identity and
+    service path work? A read, and a TEST: nothing is stored or changed, no
+    audit row is written, and the answer never holds a row, a field value or
+    a key (``agents.odata.testcall``). A disabled service may be tested --
+    that is what an admin does before enabling it.
+
+    Body: optional. A JSON object (at most ``TEST_BODY_BYTES``) with at most
+    ``entity_set``: the name of an entity set OF THIS SERVICE to try. Any
+    other key is a 422; nothing in a request changes the destination, the
+    identity, the path or a query option.
+
+    What is sent, once (no retry, no redirect or paging link followed): the
+    agent tools' own ``list`` of the entity set -- the named one, else the
+    first that has ``list`` enabled -- with ``$top=1`` and every selectable
+    field in ``$select``. When no entity set has ``list`` enabled, only the
+    beginning of ``<service_path>/$metadata`` is fetched (``read:
+    "metadata"``, warning ``no_list_entity_set``): reachability and sign-on,
+    no data read. With the service's ``user_context`` on, the request runs
+    as the admin who calls this route (the request's bound JWT through the
+    destination); otherwise with the destination's own credential.
+
+    Answer, HTTP 200 whenever the test ran or could be judged, also when it
+    FAILED (a 401/403 of SAP is ``status`` in the answer, never this
+    route's): ``{ok, code, status, duration_ms, service, enabled, read,
+    target, rows, identity, per_user, destination, auth_type, proxy_type,
+    message, warnings}``. ``code`` is ``null`` when ``ok``, else one of
+    ``sap_error`` (``message`` = ``HTTP <n> from the OData service: <SAP's
+    code>: <SAP's text>``, one line, capped, URLs masked), ``redirect``,
+    ``unexpected_answer`` (a sign-in page at 200, another shape),
+    ``unreachable``, ``timeout`` (``preview.PREVIEW_BUDGET_SECONDS``),
+    ``destination_error``, ``on_premise_unavailable`` (nothing sent),
+    ``invalid_definition`` (the stored service cannot be read; nothing
+    sent), a catalogue code of ``ODataClient.check_read`` (nothing sent),
+    ``test_failed`` (a defect: fixed text). ``warnings`` is a list of
+    ``{code, message}``: ``service_disabled``, ``technical_credential``
+    (``user_context`` on, but the destination's type propagates no user),
+    ``no_list_entity_set``, ``paging_not_followed``,
+    ``destination_queries_not_applied`` (the destination has
+    ``URL.queries.*`` properties such as ``sap-client``, which are not sent
+    yet).
+
+    Refusals, in this order: 404 ``Service not found`` (before the body is
+    looked at); 413 / 422 body; then, each with a stable code in the
+    ``X-OData-Error`` header: 422 ``unknown_target`` (not an entity set of
+    this service) or ``operation_disabled`` (``list`` is not enabled for
+    it); 429 ``busy`` (the slots are shared with the ``$metadata``
+    preview); 424 ``user_token_required`` (``user_context`` on and no JWT
+    bound: nothing is resolved or sent). ``testcall.run_test_call`` writes
+    the one log line: the service, the caller's principal, how the
+    destination was resolved, the outcome -- no content, no SAP text.
+    """
+    name = _service_name(name)
+    async with SessionLocal() as session:
+        row = await get_odata_service(session, name)
+        if row is None:
+            raise HTTPException(status_code=404, detail=_NOT_FOUND)
+        service = row.to_export()
+    # The session is closed: nothing is held while SAP is asked.
+    body = _model_body(
+        TestCallBody, await _json_object(request, TEST_BODY_BYTES, empty_ok=True)
+    )
+    try:
+        return await testcall.run_test_call(service, body.entity_set)
     except preview.PreviewError as exc:
         raise HTTPException(
             status_code=exc.status, detail=exc.detail, headers={ERROR_HEADER: exc.code}
