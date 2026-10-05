@@ -44,13 +44,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin`/`require_developer` FastAPI dependencies
   (`require_developer` = the `$XSAPPNAME.developer` scope, for the ABAP Assistant)
-- `agents/validation_errors.py` — the app-wide answer to a refused request
-  (`RequestValidationError`): 422 with `detail[]` of `loc`/`msg`/`type` only,
-  never `input`/`ctx`/`url`, on every route (`install_validation_handler`,
-  re-exported by `agents.ide.routes`, called by `app.py`). Save-time
-  validators name the field instead of quoting the value; routes that
-  validate in the handler keep their string `detail`
-  (`tests/test_admin_validation_errors.py`)
+- `agents/validation_errors.py` — the answer to a refused request
+  (`RequestValidationError`) on every route of the FastAPI app: 422 with
+  `detail[]` of `loc`/`msg`/`type` only, never `input`/`ctx`/`url`
+  (`install_validation_handler`, re-exported by `agents.ide.routes`, called
+  by `app.py`). Not involved: the mounted chat sub-application (its own
+  handlers, never raises this error), routes that read the body themselves
+  (A2A; the session-cookie route answers 400) and routes that validate in
+  the handler and answer a string `detail` (OData catalogue, workflow
+  gate). `msg` is replaced by fixed text for pydantic types that embed the
+  input (`union_tag_invalid`); a `loc` part that does not look like a field
+  name becomes `<unknown field>`. Save-time validators name the field or
+  position, never the value (`tests/test_admin_validation_errors.py`)
 - `agents/shared.py` — `JWTForwardAuth`, `create_mcp_server` (JWT forward
   on CF / browser OAuth locally / per-user `oauth2`), `SAPAICoreModel`.
   `create_mcp_server` returns a `PerRunMCPServer`: the registry shares one

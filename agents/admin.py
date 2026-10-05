@@ -2633,11 +2633,18 @@ def _validate_smtp_config(cfg: dict[str, Any]) -> None:
     from agents.jira_tools import normalize_csv_list
 
     recipients = normalize_csv_list(cfg.get("recipients"))
-    bad = [r for r in recipients if not is_address(r)]
+    bad = [str(i) for i, r in enumerate(recipients, 1) if not is_address(r)]
     if bad:
+        # Which ones, by 1-based position in the list as stored (blanks and
+        # repeats dropped); never the text, which is whatever was pasted.
+        which = (
+            f"entry {bad[0]} is"
+            if len(bad) == 1
+            else f"entries {', '.join(bad[:-1])} and {bad[-1]} are"
+        )
         raise ValueError(
-            f"oauth.recipients: {len(bad)} of {len(recipients)} entries are not a "
-            "valid recipient address"
+            f"oauth.recipients: {which} not a valid recipient address "
+            f"({len(recipients)} listed)"
         )
     if cfg.get("allow_send") is True and not recipients:
         raise ValueError(

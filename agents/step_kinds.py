@@ -146,7 +146,9 @@ class RegexSpec(BaseModel):
     def _known_flags(cls, v: str) -> str:
         bad = [c for c in v if c not in "imsx"]
         if bad:
-            raise ValueError(f"unknown regex flag(s) {''.join(bad)!r}; use i, m, s or x")
+            # Not the characters themselves: this text is the answer to a
+            # refused save, and the field holds whatever was pasted into it.
+            raise ValueError(f"{len(bad)} unknown regex flag(s); use i, m, s or x")
         return v
 
     @field_validator("pattern")
@@ -155,7 +157,10 @@ class RegexSpec(BaseModel):
         try:
             re.compile(v)
         except re.error as e:
-            raise ValueError(f"invalid regex {v!r}: {e}") from None
+            # Neither the pattern nor `re`'s text, which quotes parts of it
+            # (a group name, an escape).
+            where = f" at position {e.pos}" if e.pos is not None else ""
+            raise ValueError(f"pattern is not a valid regular expression{where}") from None
         return v
 
 
@@ -202,7 +207,18 @@ class HttpConfig(BaseModel):
     def _confined_path(cls, v: str) -> str:
         # Templates are rendered before the request, so the rendered path is
         # confined again at run time; this catches the static shape early.
-        return confine_path(v, allow_placeholders=True)
+        try:
+            return confine_path(v, allow_placeholders=True)
+        except ValueError:
+            # Save time only: `confine_path` quotes the path, which is right
+            # for a run record and wrong for the answer to a refused save --
+            # `/v1/items?api_key=<token>` is exactly the mistake it catches.
+            raise ValueError(
+                "path must be a path starting with '/', without a host, a "
+                "query string (use `query`), a fragment, a backslash, '.' or "
+                "'..' segments or an empty segment ('//'): the host comes from "
+                "the destination"
+            ) from None
 
     @field_validator("query", "headers", mode="before")
     @classmethod
@@ -252,10 +268,23 @@ CONFIG_MODELS: dict[str, type[BaseModel]] = {
 }
 
 
+_LOC_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _loc_part(part: Any) -> str:
+    if isinstance(part, int) and not isinstance(part, bool):
+        return str(part)
+    if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part):
+        return part
+    return "<unknown field>"
+
+
 def _describe_validation_error(e: ValidationError) -> str:
     parts = []
     for err in e.errors():
-        loc = ".".join(str(p) for p in err.get("loc", ()) if p != "else_")
+        # A key of the config is the client's own text (an unknown key
+        # arrives here as a location): named only when it looks like a field.
+        loc = ".".join(_loc_part(p) for p in err.get("loc", ()) if p != "else_")
         msg = err.get("msg", "invalid")
         # pydantic prefixes its own ValueError messages with "Value error, ".
         msg = msg.removeprefix("Value error, ")

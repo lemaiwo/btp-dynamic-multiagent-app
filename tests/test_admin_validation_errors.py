@@ -22,7 +22,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -36,6 +36,7 @@ os.environ.pop("MCP_URL_ALLOWLIST", None)
 import app as app_module  # noqa: E402
 from agents.db import init_db  # noqa: E402
 from agents.ide.routes import install_validation_handler  # noqa: E402
+from agents.ide.schemas import CommentCreate  # noqa: E402
 
 # Never part of an answer: what a refused body carried. Upper case and
 # punctuation keep it from being a legal slug, service name or address.
@@ -306,3 +307,124 @@ def test_the_app_installs_the_shared_handler():
     assert handler is validation_errors.validation_error
     # Still importable from where app.py and the IDE tests take it.
     assert install_validation_handler is validation_errors.install_validation_handler
+
+
+# --- review round 1 -----------------------------------------------------------
+
+def http_workflow(name: str, **config: Any) -> dict[str, Any]:
+    cfg: dict[str, Any] = {"destination": "D", "path": "/v1/items"}
+    cfg.update(config)
+    return {"name": name, "steps": [{"position": 1, "kind": "http", "config": cfg}]}
+
+
+def transform_workflow(name: str, **regex: Any) -> dict[str, Any]:
+    return {"name": name, "steps": [
+        {"position": 1, "kind": "transform", "config": {"regex": regex}}]}
+
+
+def assert_refused_without(r, status: int, secret: str = SECRET) -> str:
+    assert r.status_code == status, r.text
+    assert secret not in r.text
+    for key, value in r.headers.items():
+        assert secret not in key and secret not in value
+    return r.text
+
+
+STEP_CONFIGS = [
+    pytest.param(http_workflow("x", path=f"/v1/items?api_key={SECRET}"), "query",
+                 id="path-query"),
+    pytest.param(http_workflow("x", path=f"https://{SECRET}.example/v1"), "path",
+                 id="path-url"),
+    pytest.param(http_workflow("x", path=f"v1/{SECRET}"), "path", id="path-relative"),
+    pytest.param(http_workflow("x", path=f"/v1/../{SECRET}"), "path", id="path-dots"),
+    pytest.param(http_workflow("x", path=f"/v1//{SECRET}"), "path", id="path-empty-segment"),
+    pytest.param(transform_workflow("x", pattern=f"({SECRET}"), "regex", id="regex"),
+    pytest.param(transform_workflow("x", pattern=f"(?P<{SECRET}>a)"), "regex",
+                 id="regex-group-name"),
+    pytest.param(http_workflow("x", **{SECRET + " key": 1}), "<unknown field>",
+                 id="unknown-config-key"),
+]
+
+
+@pytest.mark.parametrize("body, names", STEP_CONFIGS)
+async def test_refused_step_config_is_not_echoed(client, body, names):
+    """The workflow gate answers a string `detail` (400); the http path with
+    a query string is exactly where a token gets pasted."""
+    text = assert_refused_without(await client.post("/admin/api/workflows", json=body), 400)
+    assert names in text
+    # Update of an existing workflow, and the import bundle.
+    r = await client.post("/admin/api/workflows", json=http_workflow("val-wf-existing"))
+    assert r.status_code in (201, 400), r.text  # 400: created by an earlier case
+    rows = (await client.get("/admin/api/workflows")).json()
+    wf_id = next(w["id"] for w in rows if w["name"] == "val-wf-existing")
+    assert_refused_without(await client.put(f"/admin/api/workflows/{wf_id}", json=body), 400)
+    r = await client.post("/admin/api/import", json={"workflows": [body]})
+    assert r.status_code >= 400, r.text
+    assert_refused_without(r, r.status_code)
+
+
+async def test_regex_flags_are_counted_not_quoted(client):
+    r = await client.post("/admin/api/workflows",
+                          json=transform_workflow("x", pattern="a", flags="iQZQ"))
+    assert r.status_code == 400 and "3 unknown regex flag" in r.text, r.text
+    assert "QZQ" not in r.text
+
+
+async def test_a_known_misplaced_config_key_is_still_named(client):
+    r = await client.post("/admin/api/workflows", json=http_workflow("x", bogus_key=1))
+    assert r.status_code == 400 and "bogus_key" in r.text, r.text
+
+
+async def test_recipients_are_named_by_position(client):
+    body = with_server(**SMTP, oauth={
+        "destination": "D",
+        "recipients": f"a@example.com, {SECRET}, b@example.com, c@example.com, {SECRET}-2"})
+    detail = assert_clean_422(await client.post("/admin/api/agents", json=body))
+    assert "entries 2 and 5" in detail[0]["msg"], detail
+    body = with_server(**SMTP, oauth={"destination": "D", "recipients": SECRET})
+    detail = assert_clean_422(await client.post("/admin/api/agents", json=body))
+    assert "entry 1" in detail[0]["msg"], detail
+
+
+# pydantic's own text and locations (bare app with the IDE's contract models)
+
+class Strict(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = ""
+
+
+def _contract_app() -> FastAPI:
+    app = FastAPI()
+
+    @app.post("/comment")
+    async def comment(body: CommentCreate) -> dict:
+        return {}
+
+    @app.post("/strict")
+    async def strict(body: Strict) -> dict:
+        return {}
+
+    install_validation_handler(app)
+    return app
+
+
+async def test_union_tag_message_does_not_quote_the_tag():
+    async with AsyncClient(transport=ASGITransport(app=_contract_app()),
+                           base_url="http://test") as c:
+        r = await c.post("/comment", json={"anchor": SECRET, "body": "b"})
+        detail = assert_clean_422(r)
+        assert detail[0]["type"] == "union_tag_invalid"
+        assert "anchor" in detail[0]["msg"] or "tag" in detail[0]["msg"]
+
+
+async def test_unknown_key_is_named_only_when_it_looks_like_a_field():
+    async with AsyncClient(transport=ASGITransport(app=_contract_app()),
+                           base_url="http://test") as c:
+        r = await c.post("/strict", json={f"https://x.example/?t={SECRET}": 1})
+        detail = assert_clean_422(r)
+        assert detail[0]["type"] == "extra_forbidden"
+        assert detail[0]["loc"] == ["body", "<unknown field>"]
+        r = await c.post("/strict", json={"tittle": 1, "x" * 65: 2, "bad\n": 3})
+        locs = [d["loc"] for d in assert_clean_422(r)]
+        assert ["body", "tittle"] in locs
+        assert locs.count(["body", "<unknown field>"]) == 2
