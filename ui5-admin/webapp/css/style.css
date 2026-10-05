@@ -146,3 +146,21 @@ html.sapUiTheme-sap_horizon .odataHint.sapMText,
 html.sapUiTheme-sap_horizon .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
     color: #556b82;
 }
+/* The entity set dialog (ODataEntitySetDialog.fragment.xml). Technical
+   names are monospaced, as in the General section. */
+.odataFieldName.sapMText,
+.odataFieldName .sapMObjStatusText {
+    font-family: "72Mono", Consolas, "Courier New", monospace;
+    overflow-wrap: anywhere;
+}
+.odataEntityHeadField.sapMFlexBox {
+    flex: 1 1 16rem;
+    min-width: 0;
+}
+/* The question a row asks before personal data becomes readable. */
+.odataFieldConfirm.sapMFlexBox {
+    margin-top: 0.25rem;
+    padding: 0.5rem;
+    border: 1px solid #e76500;
+    border-radius: 0.5rem;
+}

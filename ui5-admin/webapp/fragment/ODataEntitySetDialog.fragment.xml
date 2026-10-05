@@ -1,0 +1,412 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1">
+    <!-- One entity set of an OData service: what agents are told about it
+         and, per field, what they may read, filter on and write. Nothing in
+         here is sent: Apply writes into the form of the page, and the
+         page's Save stores it. The dialog works on a copy (model `entity`,
+         `controller/odata/EntitySetDialog.ts`); every text that comes from
+         the backend is bound as text. -->
+    <Dialog
+        id="odataEntityDialog"
+        contentWidth="72rem"
+        contentHeight="85%"
+        resizable="true"
+        draggable="true"
+        verticalScrolling="true"
+        class="odataEntityDialog">
+        <content>
+            <VBox class="sapUiSmallMarginBeginEnd sapUiTinyMarginTop">
+                <!-- What keeps Apply from being taken: the server would
+                     refuse the service for it. -->
+                <MessageStrip
+                    id="entityIssues"
+                    visible="{= !!${entity>/issues} }"
+                    type="Error"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{entity>/issues}" />
+                <HBox wrap="Wrap">
+                    <VBox class="odataEntityHeadField sapUiSmallMarginEnd">
+                        <Label text="{i18n>odataEntityTitle}" labelFor="entityTitle" />
+                        <Input
+                            id="entityTitle"
+                            value="{entity>/title}"
+                            maxLength="120"
+                            valueState="{ path: 'entity>/errors/title', formatter: '.formatErrorState' }"
+                            valueStateText="{entity>/errors/title}"
+                            liveChange=".onHeadEdit" />
+                    </VBox>
+                    <VBox class="odataEntityHeadField">
+                        <Label text="{i18n>odataEntityName}" labelFor="entityName" />
+                        <Input
+                            id="entityName"
+                            value="{entity>/name}"
+                            editable="{entity>/canRename}"
+                            class="odataTechnical"
+                            valueState="{ path: 'entity>/errors/name', formatter: '.formatErrorState' }"
+                            valueStateText="{entity>/errors/name}"
+                            liveChange=".onHeadEdit" />
+                    </VBox>
+                </HBox>
+                <Label text="{i18n>odataColAgentDescription}" labelFor="entityDescription" class="sapUiTinyMarginTop" />
+                <TextArea
+                    id="entityDescription"
+                    value="{entity>/description}"
+                    rows="2"
+                    width="100%"
+                    maxLength="600"
+                    showExceededText="true"
+                    valueState="{ path: 'entity>/errors/description', formatter: '.formatErrorState' }"
+                    valueStateText="{entity>/errors/description}"
+                    liveChange=".onHeadEdit" />
+                <HBox wrap="Wrap" alignItems="Center">
+                    <Label text="{i18n>odataKeys}" class="sapUiTinyMarginEnd" />
+                    <HBox id="entityKeys" wrap="Wrap" items="{entity>/keys}">
+                        <ObjectStatus text="{entity>text}" inverted="true" class="odataFieldName sapUiTinyMarginEnd" />
+                    </HBox>
+                </HBox>
+                <!-- What agents see of a key, said where the keys are. -->
+                <Text id="entityKeysHint" text="{i18n>odataKeysHint}" class="odataHint" />
+                <MessageStrip
+                    id="entityKeyWarning"
+                    visible="{= !!${entity>/keyWarning} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiTinyMarginTop"
+                    text="{entity>/keyWarning}" />
+            </VBox>
+            <!-- What each checkbox and field of a row is named with. -->
+            <core:InvisibleText id="entityGrantRead" text="{i18n>odataColRead}" />
+            <core:InvisibleText id="entityGrantFilter" text="{i18n>odataColFilter}" />
+            <core:InvisibleText id="entityGrantWrite" text="{i18n>odataColWrite}" />
+            <core:InvisibleText id="entityGrantWriteNote" text="{i18n>odataGrantWrite}" />
+            <core:InvisibleText id="entityLabelOf" text="{i18n>odataFieldLabelOf}" />
+            <core:InvisibleText id="entityHintOf" text="{i18n>odataFieldHintOf}" />
+            <core:InvisibleText id="entityMeaningsOf" text="{i18n>odataFieldMeaningsOf}" />
+            <core:InvisibleText id="entityPersonalOf" text="{i18n>odataPersonalDataOf}" />
+            <IconTabBar id="entityTabs" expandable="false" selectedKey="{entity>/tab}">
+                <items>
+                    <IconTabFilter
+                        id="entityTabFields"
+                        key="fields"
+                        text="{ parts: ['entity>/readCount', 'entity>/total'], formatter: '.formatTabFields' }">
+                        <HBox wrap="Wrap" alignItems="Center" class="sapUiTinyMarginBottom">
+                            <SearchField
+                                id="entityFieldSearch"
+                                width="16rem"
+                                placeholder="{i18n>odataFieldSearch}"
+                                tooltip="{i18n>odataFieldSearch}"
+                                liveChange=".onFieldSearch"
+                                search=".onFieldSearch"
+                                class="sapUiSmallMarginEnd" />
+                            <SegmentedButton
+                                id="entityFieldFilter"
+                                selectedKey="{entity>/filter}"
+                                selectionChange=".onFieldFilter"
+                                class="sapUiSmallMarginEnd">
+                                <items>
+                                    <SegmentedButtonItem key="all" width="auto" text="{i18n>odataFieldFilterAll}" />
+                                    <SegmentedButtonItem key="ticked" width="auto" text="{i18n>odataFieldFilterTicked}" />
+                                    <SegmentedButtonItem key="unticked" width="auto" text="{i18n>odataFieldFilterUnticked}" />
+                                    <SegmentedButtonItem key="personal" width="auto" text="{i18n>odataFieldFilterPersonal}" />
+                                </items>
+                            </SegmentedButton>
+                            <!-- Read only, counted before it is pressed, and
+                                 never a field marked as personal data. -->
+                            <Button
+                                id="entityReadAll"
+                                text="{ path: 'entity>/readAllCount', formatter: '.formatReadAll' }"
+                                tooltip="{i18n>odataReadAllHint}"
+                                enabled="{= ${entity>/readAllCount} > 0 }"
+                                press=".onReadAll" />
+                        </HBox>
+                        <MessageStrip
+                            id="entityReadAllDone"
+                            visible="{= !!${entity>/readAllDone} }"
+                            type="Information"
+                            showIcon="true"
+                            class="sapUiTinyMarginBottom"
+                            text="{entity>/readAllDone}">
+                            <link>
+                                <Link id="entityReadAllUndo" text="{i18n>odataReadAllUndo}" press=".onReadAllUndo" />
+                            </link>
+                        </MessageStrip>
+                        <Text text="{i18n>odataPersonalDataHint}" class="odataHint sapUiTinyMarginBottom" />
+                        <!-- Growing: an entity set can hold 500 fields; fifty
+                             rows at a time keep ticking quick. Search and
+                             filter go over all of them, shown or not. -->
+                        <Table
+                            id="entityFieldsTable"
+                            items="{ path: 'entity>/rows', key: 'index' }"
+                            growing="true"
+                            growingThreshold="50"
+                            popinLayout="GridSmall"
+                            noDataText="{i18n>odataNoFields}"
+                            ariaLabelledBy="entityTabFields">
+                            <columns>
+                                <Column width="15rem">
+                                    <Label text="{i18n>odataColField}" />
+                                </Column>
+                                <Column minScreenWidth="Tablet" demandPopin="true">
+                                    <Label text="{i18n>odataColLabel}" />
+                                </Column>
+                                <Column hAlign="Center" width="4rem">
+                                    <Label text="{i18n>odataColRead}" />
+                                </Column>
+                                <Column hAlign="Center" width="4rem">
+                                    <Label text="{i18n>odataColFilter}" />
+                                </Column>
+                                <Column hAlign="Center" width="4rem" styleClass="odataWriteCol">
+                                    <VBox alignItems="Center" tooltip="{i18n>odataFieldWriteTooltip}">
+                                        <Label text="{i18n>odataColWrite}" />
+                                        <Text text="{i18n>odataFieldWriteMarker}" class="odataWriteMarker" />
+                                    </VBox>
+                                </Column>
+                                <Column minScreenWidth="Desktop" demandPopin="true">
+                                    <Label text="{i18n>odataColMeanings}" />
+                                </Column>
+                                <Column width="10rem" minScreenWidth="Desktop" demandPopin="true">
+                                    <Label text="{i18n>odataPersonalData}" />
+                                </Column>
+                            </columns>
+                            <items>
+                                <ColumnListItem>
+                                    <cells>
+                                        <VBox>
+                                            <Text id="entityFieldName" text="{entity>name}" class="odataFieldName" />
+                                            <Text text="{entity>type}" class="odataMeta" />
+                                            <ObjectStatus
+                                                text="{i18n>odataKeyTag}"
+                                                visible="{entity>isKey}"
+                                                icon="sap-icon://key"
+                                                state="Information" />
+                                            <!-- Why a tick was changed or not taken. -->
+                                            <ObjectStatus
+                                                text="{entity>note}"
+                                                visible="{= !!${entity>note} }"
+                                                state="Warning"
+                                                icon="sap-icon://alert"
+                                                class="odataRowMessage" />
+                                            <!-- Reading personal data is asked
+                                                 about here, in the row. -->
+                                            <VBox visible="{entity>confirm}" class="odataFieldConfirm">
+                                                <Text text="{ path: 'entity>name', formatter: '.formatPersonalQuestion' }" />
+                                                <HBox wrap="Wrap">
+                                                    <Button
+                                                        text="{i18n>odataPersonalConfirm}"
+                                                        press=".onPersonalConfirm"
+                                                        class="sapUiTinyMarginEnd" />
+                                                    <Button text="{i18n>odataPersonalKeep}" press=".onPersonalKeep" />
+                                                </HBox>
+                                            </VBox>
+                                        </VBox>
+                                        <Input
+                                            value="{entity>label}"
+                                            maxLength="120"
+                                            ariaLabelledBy="entityLabelOf entityFieldName" />
+                                        <CheckBox
+                                            selected="{ path: 'entity>selectable', mode: 'OneWay' }"
+                                            ariaLabelledBy="entityGrantRead entityFieldName"
+                                            app:grant="selectable"
+                                            select=".onGrant" />
+                                        <CheckBox
+                                            selected="{ path: 'entity>filterable', mode: 'OneWay' }"
+                                            ariaLabelledBy="entityGrantFilter entityFieldName"
+                                            app:grant="filterable"
+                                            select=".onGrant" />
+                                        <CheckBox
+                                            selected="{ path: 'entity>writable', mode: 'OneWay' }"
+                                            valueState="{ path: 'entity>writable', formatter: '.formatWriteState' }"
+                                            ariaLabelledBy="entityGrantWrite entityFieldName entityGrantWriteNote"
+                                            app:grant="writable"
+                                            select=".onGrant" />
+                                        <VBox>
+                                            <Input
+                                                value="{entity>hint}"
+                                                maxLength="300"
+                                                placeholder="{i18n>odataFieldHintPlaceholder}"
+                                                ariaLabelledBy="entityHintOf entityFieldName" />
+                                            <Input
+                                                value="{entity>meanings}"
+                                                placeholder="{i18n>odataMeaningsPlaceholder}"
+                                                valueState="{ path: 'entity>meaningsError', formatter: '.formatErrorState' }"
+                                                valueStateText="{entity>meaningsError}"
+                                                ariaLabelledBy="entityMeaningsOf entityFieldName"
+                                                change=".onMeanings" />
+                                            <ObjectStatus
+                                                text="{i18n>odataEnumHint}"
+                                                visible="{entity>enumHint}"
+                                                state="Information"
+                                                icon="sap-icon://hint"
+                                                class="odataRowMessage" />
+                                        </VBox>
+                                        <VBox>
+                                            <ToggleButton
+                                                text="{i18n>odataPersonalData}"
+                                                pressed="{ path: 'entity>personal_data', mode: 'OneWay' }"
+                                                ariaLabelledBy="entityPersonalOf entityFieldName"
+                                                press=".onPersonal" />
+                                            <ObjectStatus
+                                                text="{entity>tag}"
+                                                visible="{= !!${entity>tag} }"
+                                                state="{entity>tagState}"
+                                                icon="{ path: 'entity>tagState', formatter: '.formatTagIcon' }"
+                                                class="odataRowMessage" />
+                                        </VBox>
+                                    </cells>
+                                </ColumnListItem>
+                            </items>
+                        </Table>
+                    </IconTabFilter>
+                    <IconTabFilter
+                        id="entityTabNavigations"
+                        key="navigations"
+                        text="{ path: 'entity>/navigations/length', formatter: '.formatTabNavigations' }">
+                        <Text text="{i18n>odataNavHint}" class="odataHint sapUiTinyMarginBottom" />
+                        <Table
+                            id="entityNavTable"
+                            items="{entity>/navigations}"
+                            popinLayout="GridSmall"
+                            noDataText="{i18n>odataNoNavigations}"
+                            ariaLabelledBy="entityTabNavigations">
+                            <columns>
+                                <Column><Label text="{i18n>odataNavName}" /></Column>
+                                <Column minScreenWidth="Tablet" demandPopin="true"><Label text="{i18n>odataNavTarget}" /></Column>
+                                <Column width="7rem" minScreenWidth="Tablet" demandPopin="true">
+                                    <Label text="{i18n>odataNavKind}" />
+                                </Column>
+                                <Column minScreenWidth="Desktop" demandPopin="true">
+                                    <Label text="{i18n>odataColAgentDescription}" />
+                                </Column>
+                                <Column minScreenWidth="Tablet" demandPopin="true"><Label text="{i18n>odataNavFollow}" /></Column>
+                            </columns>
+                            <items>
+                                <ColumnListItem>
+                                    <cells>
+                                        <Text id="entityNavName" text="{entity>name}" class="odataFieldName" />
+                                        <Text text="{entity>target}" class="odataFieldName" />
+                                        <Text text="{entity>kind}" />
+                                        <Input
+                                            value="{entity>description}"
+                                            maxLength="300"
+                                            ariaLabelledBy="entityNavDescriptionOf entityNavName" />
+                                        <ObjectStatus
+                                            text="{entity>follow}"
+                                            state="{entity>followState}"
+                                            icon="{ path: 'entity>followState', formatter: '.formatFollowIcon' }"
+                                            class="odataRowMessage" />
+                                    </cells>
+                                </ColumnListItem>
+                            </items>
+                        </Table>
+                        <core:InvisibleText id="entityNavDescriptionOf" text="{i18n>odataNavDescriptionOf}" />
+                    </IconTabFilter>
+                    <IconTabFilter
+                        id="entityTabExamples"
+                        key="examples"
+                        text="{ path: 'entity>/examples/length', formatter: '.formatTabExamples' }">
+                        <HBox wrap="Wrap" alignItems="Center" justifyContent="SpaceBetween" class="sapUiTinyMarginBottom">
+                            <Text text="{i18n>odataExamplesHint}" class="odataHint" />
+                            <Button id="entityAddExample" text="{i18n>odataAddExample}" icon="sap-icon://add" press=".onAddExample" />
+                        </HBox>
+                        <Table
+                            id="entityExamples"
+                            items="{entity>/examples}"
+                            popinLayout="GridSmall"
+                            noDataText="{i18n>odataNoExamples}"
+                            ariaLabelledBy="entityTabExamples">
+                            <columns>
+                                <Column><Label text="{i18n>odataExampleDescription}" /></Column>
+                                <Column minScreenWidth="Tablet" demandPopin="true"><Label text="{i18n>odataExampleSelect}" /></Column>
+                                <Column minScreenWidth="Tablet" demandPopin="true"><Label text="{i18n>odataExampleFilter}" /></Column>
+                                <Column minScreenWidth="Desktop" demandPopin="true"><Label text="{i18n>odataExampleOrderby}" /></Column>
+                                <Column width="5rem" minScreenWidth="Desktop" demandPopin="true">
+                                    <Label text="{i18n>odataExampleTop}" />
+                                </Column>
+                                <Column width="3rem" hAlign="End" />
+                            </columns>
+                            <items>
+                                <ColumnListItem>
+                                    <cells>
+                                        <VBox>
+                                            <Input
+                                                value="{entity>description}"
+                                                maxLength="200"
+                                                ariaLabelledBy="entityExampleDescriptionOf"
+                                                change=".onExampleEdit" />
+                                            <!-- Which example agents will not
+                                                 see, and why: a warning. -->
+                                            <ObjectStatus
+                                                text="{entity>warning}"
+                                                visible="{= !!${entity>warning} }"
+                                                state="Warning"
+                                                icon="sap-icon://alert"
+                                                class="odataRowMessage" />
+                                        </VBox>
+                                        <Input
+                                            value="{entity>select}"
+                                            placeholder="{i18n>odataExampleSelectPlaceholder}"
+                                            ariaLabelledBy="entityExampleSelectOf"
+                                            class="odataTechnical"
+                                            change=".onExampleEdit" />
+                                        <Input
+                                            value="{entity>filter}"
+                                            maxLength="1000"
+                                            ariaLabelledBy="entityExampleFilterOf"
+                                            class="odataTechnical"
+                                            change=".onExampleEdit" />
+                                        <Input
+                                            value="{entity>orderby}"
+                                            maxLength="300"
+                                            ariaLabelledBy="entityExampleOrderbyOf"
+                                            class="odataTechnical"
+                                            change=".onExampleEdit" />
+                                        <Input
+                                            value="{entity>top}"
+                                            ariaLabelledBy="entityExampleTopOf"
+                                            change=".onExampleEdit" />
+                                        <Button
+                                            icon="sap-icon://delete"
+                                            type="Transparent"
+                                            tooltip="{ path: 'entity>number', formatter: '.formatRemoveExample' }"
+                                            press=".onRemoveExample" />
+                                    </cells>
+                                </ColumnListItem>
+                            </items>
+                        </Table>
+                        <core:InvisibleText id="entityExampleDescriptionOf" text="{i18n>odataExampleDescription}" />
+                        <core:InvisibleText id="entityExampleSelectOf" text="{i18n>odataExampleSelect}" />
+                        <core:InvisibleText id="entityExampleFilterOf" text="{i18n>odataExampleFilter}" />
+                        <core:InvisibleText id="entityExampleOrderbyOf" text="{i18n>odataExampleOrderby}" />
+                        <core:InvisibleText id="entityExampleTopOf" text="{i18n>odataExampleTop}" />
+                    </IconTabFilter>
+                </items>
+            </IconTabBar>
+        </content>
+        <footer>
+            <OverflowToolbar>
+                <Text
+                    id="entityFieldsShowing"
+                    text="{ parts: ['entity>/shown', 'entity>/total'], formatter: '.formatShowing' }" />
+                <ToolbarSpacer />
+                <Button
+                    id="entityRemoveButton"
+                    text="{i18n>odataRemoveEntitySet}"
+                    icon="sap-icon://delete"
+                    press=".onRemove" />
+                <Button id="entityCancelButton" text="{i18n>cancel}" press=".onCancel">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" />
+                    </layoutData>
+                </Button>
+                <Button id="entityApplyButton" text="{i18n>odataApply}" type="Emphasized" press=".onApply">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" />
+                    </layoutData>
+                </Button>
+            </OverflowToolbar>
+        </footer>
+    </Dialog>
+</core:FragmentDefinition>

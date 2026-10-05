@@ -1,7 +1,10 @@
 import AdminService, { AdminError } from "com/agent/admin/service/AdminService";
 import type { ODataServiceInput } from "com/agent/admin/service/types";
 import FakeBackend from "com/agent/admin/test/integration/FakeBackend";
-import { ONE_LINE_ACCEPTED, RULE_CASES, VALID_INPUT, withField } from "./odataRuleCases";
+import {
+    ENTITY_ACCEPTED, ENTITY_CASES, ONE_LINE_ACCEPTED, RULE_CASES, VALID_INPUT, changed, entityRefusal, withEntitySet,
+    withField
+} from "./odataRuleCases";
 
 QUnit.module("AdminService", {
     beforeEach: function (this: { originalFetch: typeof fetch }) {
@@ -520,6 +523,23 @@ QUnit.test("create answers 422 with the server's text for every rule of the shar
         assert.strictEqual(error.detail, testCase.server, `${testCase.rule}: detail`);
     }
     assert.strictEqual((await service.listODataServices()).length, 4, "nothing was stored");
+});
+
+QUnit.test("create answers 422 with the server's text for every entity-set rule of the shared table", async function (assert) {
+    const service = new AdminService();
+
+    for (const testCase of ENTITY_CASES) {
+        const error = await refusal(() => service.createODataService(withEntitySet(changed(testCase.change))));
+        assert.strictEqual(error.status, 422, `${testCase.rule}: 422`);
+        assert.strictEqual(error.detail, entityRefusal(testCase), `${testCase.rule}: detail`);
+    }
+    assert.strictEqual((await service.listODataServices()).length, 4, "nothing was stored");
+    for (const accepted of ENTITY_ACCEPTED) {
+        const created = await service.createODataService({
+            ...withEntitySet(changed(accepted.change)), name: `accepted-${ENTITY_ACCEPTED.indexOf(accepted)}`
+        });
+        assert.strictEqual(created.definition.entity_sets.length, 1, `${accepted.rule}: stored`);
+    }
 });
 
 QUnit.test("update is held to the same rules as create", async function (assert) {

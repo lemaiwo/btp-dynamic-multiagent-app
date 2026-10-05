@@ -1,6 +1,6 @@
 import type {
-    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataOperation, ODataServiceInput,
-    ODataUsedBy
+    ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataExampleQuery, ODataField,
+    ODataNavigation, ODataOperation, ODataServiceInput, ODataUsedBy, ODataValueMeaning
 } from "../service/types";
 
 /**
@@ -28,6 +28,20 @@ const EDM_NAME_RE = /^[A-Za-z_][A-Za-z0-9_.]{0,127}$/;
 
 /** The most entity sets a definition may hold (`MAX_ENTITY_SETS`). */
 const MAX_ENTITY_SETS = 200;
+
+/** The most fields an entity set may hold (`MAX_FIELDS`). */
+const MAX_FIELDS = 500;
+const MAX_LABEL = 120;
+const MAX_HINT = 300;
+const MAX_TYPE = 200;
+const MAX_VALUE = 64;
+const MAX_MEANING = 200;
+const MAX_ENTITY_DESCRIPTION = 600;
+const MAX_NAV_DESCRIPTION = 300;
+const MAX_EXAMPLE_DESCRIPTION = 200;
+const MAX_EXAMPLE_FILTER = 1000;
+const MAX_EXAMPLE_SELECT = 128;
+const MAX_EXAMPLE_ORDERBY = 300;
 
 const MAX_TITLE = 120;
 const MAX_PURPOSE = 200;
@@ -95,10 +109,47 @@ export interface ODataNewOperation {
     title: string;
 }
 
+/** The fields of one entity set a save would newly let agents write. */
+export interface ODataNewFieldWrite {
+    name: string;
+    title: string;
+    fields: string[];
+}
+
 /** Everything a save would newly let agents with `allow_write` do. */
 export interface ODataPending {
     entitySets: ODataNewWrite[];
     operations: ODataNewOperation[];
+    /** Fields that become writable for agents: marked Write on an entity
+     *  set that has (or gets) Create or Update. */
+    fields: ODataNewFieldWrite[];
+}
+
+/** Which fields the entity set dialog lists. */
+export type ODataFieldFilter = "all" | "ticked" | "unticked" | "personal";
+
+/** One thing the server would refuse about an entity set: where (the
+ *  server's `loc` inside the entity set, "" for the entity set as a whole),
+ *  and an i18n key with its arguments. */
+export interface ODataIssue {
+    loc: string;
+    key: string;
+    args: string[];
+}
+
+/** Whether an agent could follow a navigation today, and why not. */
+export interface ODataFollow {
+    ok: boolean;
+    key: string;
+    args: string[];
+}
+
+/** What agents will not see of an example query, and why. */
+export interface ODataExampleWarning {
+    /** No agent sees the example at all. */
+    dropped: boolean;
+    key: string;
+    args: string[];
 }
 
 /** A refused save, taken apart: see `serverRefusal`. */
@@ -412,6 +463,302 @@ const ENTITY_LOC_RE = /^definition\.entity_sets\.(\d+)(?:\.(.+))?$/;
 // The entity set a message of the server names (`who` in models.py).
 const NAMED_ENTITY_RE = /entity set '([^']*)'/;
 
+/** Whether agents can send fields of this entity set at all. */
+function takesWrites(entitySet: ODataEntitySet): boolean {
+    const operations = entitySet.operations ?? [];
+    return operations.indexOf("create") !== -1 || operations.indexOf("update") !== -1;
+}
+
+/**
+ * The fields that become writable for agents by saving `current` over
+ * `stored`: marked Write, on an entity set that has Create or Update, and
+ * not writable for agents before -- not marked, or marked on an entity set
+ * that had neither Create nor Update (only now can an agent send it).
+ * Matched by entity set and field name. Switching a disabled service on
+ * does not list its fields again: its write operations are all named then,
+ * and the fields were marked before.
+ */
+function newWritableFields(
+    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+): ODataNewFieldWrite[] {
+    const before: Record<string, boolean> = {};
+    (stored?.entity_sets ?? []).filter(takesWrites).forEach((entitySet) => {
+        (entitySet.fields ?? []).filter((f) => f.writable === true).forEach((f) => {
+            before[`${entitySet.name}\n${f.name}`] = true;
+        });
+    });
+    const added: ODataNewFieldWrite[] = [];
+    (current?.entity_sets ?? []).filter(takesWrites).forEach((entitySet) => {
+        const fields = (entitySet.fields ?? [])
+            .filter((f) => f.writable === true && !before[`${entitySet.name}\n${f.name}`])
+            .map((f) => f.name);
+        if (fields.length) {
+            added.push({ name: entitySet.name, title: titleOf(entitySet), fields });
+        }
+    });
+    return added;
+}
+
+/** "B = awaiting release; 05 = released" as value/meaning pairs. A part
+ *  without "=" or with an empty side is left out: see `valueMeaningsProblem`. */
+function parseValueMeanings(text: string | undefined | null): ODataValueMeaning[] {
+    const pairs: ODataValueMeaning[] = [];
+    String(text ?? "").split(";").forEach((part) => {
+        const at = part.indexOf("=");
+        const value = at === -1 ? "" : part.substring(0, at).trim();
+        const meaning = at === -1 ? "" : part.substring(at + 1).trim();
+        if (value && meaning) {
+            pairs.push({ value, meaning });
+        }
+    });
+    return pairs;
+}
+
+function formatValueMeanings(values: readonly ODataValueMeaning[] | undefined | null): string {
+    return (values ?? []).map((pair) => `${pair.value} = ${pair.meaning}`).join("; ");
+}
+
+/**
+ * Why `text` cannot be stored as value meanings, as an i18n key, or "":
+ * every part between ";" must read "value = meaning", with a value of at
+ * most 64 and a meaning of at most 200 characters (`ValueMeaning`).
+ */
+function valueMeaningsProblem(text: string | undefined | null): string {
+    const parts = String(text ?? "").split(";").filter((part) => part.trim());
+    if (parts.length !== parseValueMeanings(text).length) {
+        return "odataErrMeaningsFormat";
+    }
+    return parseValueMeanings(text).some((pair) => (
+        pair.value.length > MAX_VALUE || pair.meaning.length > MAX_MEANING || !isOneLine(pair.value) || !isOneLine(pair.meaning)
+    )) ? "odataErrMeaningsLength" : "";
+}
+
+/** Whether the dialog lists `field` for the search text and the filter. */
+function fieldMatches(
+    field: Pick<ODataField, "name" | "label" | "selectable" | "filterable" | "writable" | "personal_data">,
+    query: string | undefined | null, mode: ODataFieldFilter
+): boolean {
+    const ticked = field.selectable === true || field.filterable === true || field.writable === true;
+    if ((mode === "ticked" && !ticked) || (mode === "unticked" && ticked)
+        || (mode === "personal" && field.personal_data !== true)) {
+        return false;
+    }
+    const text = String(query ?? "").trim().toLowerCase();
+    return !text || field.name.toLowerCase().indexOf(text) !== -1
+        || (field.label ?? "").toLowerCase().indexOf(text) !== -1;
+}
+
+/**
+ * Whether an agent could follow `navigation` from `entitySet` today
+ * (agents/odata/tools.py): it needs Get on the entity set it starts from,
+ * the target in the catalogue, and on the target List (a collection) or Get
+ * (a single entity).
+ */
+function navigationFollow(
+    entitySet: ODataEntitySet, navigation: ODataNavigation, definition: ODataDefinition | undefined | null
+): ODataFollow {
+    const target = navigation.target === entitySet.name
+        ? entitySet : (definition?.entity_sets ?? []).filter((e) => e.name === navigation.target)[0];
+    if (!target) {
+        return { ok: false, key: "odataNavTargetMissing", args: [navigation.target] };
+    }
+    if ((entitySet.operations ?? []).indexOf("get") === -1) {
+        return { ok: false, key: "odataNavNeedsGet", args: [] };
+    }
+    const needed: ODataEntityOp = navigation.collection === true ? "list" : "get";
+    if ((target.operations ?? []).indexOf(needed) === -1) {
+        return {
+            ok: false, key: needed === "list" ? "odataNavTargetNeedsList" : "odataNavTargetNeedsGet",
+            args: [entityLabel({ name: target.name, title: titleOf(target) })]
+        };
+    }
+    return { ok: true, key: "odataNavFollowable", args: [] };
+}
+
+/**
+ * What agents will not see of `example`, by the rule that hides it at run
+ * time (`_examples_out` in agents/odata/search.py), or undefined when they
+ * see all of it:
+ *
+ * - its description, filter or orderby mentions, as a word and whatever the
+ *   case, a field that is neither readable nor a key: dropped for everyone;
+ * - its select lists fields and none of them is readable: dropped;
+ * - it mentions a field that is only writable: agents without "Allow
+ *   writes" do not see it;
+ * - its select lists a field that is not readable: that entry is left out.
+ */
+function exampleWarning(entitySet: ODataEntitySet, example: ODataExampleQuery): ODataExampleWarning | undefined {
+    const fields = entitySet.fields ?? [];
+    const keys = (entitySet.keys ?? []).map((k) => k.name.toLowerCase());
+    const words: Record<string, boolean> = {};
+    [example.description, example.filter, example.orderby].forEach((text) => {
+        String(text ?? "").toLowerCase().split(/[^\p{L}\p{N}_]+/u).forEach((word) => {
+            words[`=${word}`] = true;
+        });
+    });
+    const mentioned = (candidates: ODataField[]): string[] => candidates
+        .filter((f) => f.selectable !== true && keys.indexOf(f.name.toLowerCase()) === -1)
+        .filter((f) => words[`=${f.name.toLowerCase()}`])
+        .map((f) => f.name);
+    const writeOnly = (f: ODataField): boolean => f.writable === true && takesWrites(entitySet);
+    const hidden = mentioned(fields.filter((f) => !writeOnly(f)));
+    if (hidden.length) {
+        return { dropped: true, key: "odataExampleDropped", args: [hidden.join(", ")] };
+    }
+    const readable = fields.filter((f) => f.selectable === true).map((f) => f.name);
+    const select = example.select ?? [];
+    const unread = select.filter((name) => readable.indexOf(name) === -1);
+    if (select.length && unread.length === select.length) {
+        return { dropped: true, key: "odataExampleDroppedSelect", args: [unread.join(", ")] };
+    }
+    const partly = mentioned(fields.filter(writeOnly));
+    if (partly.length) {
+        return { dropped: false, key: "odataExampleWriteOnly", args: [partly.join(", ")] };
+    }
+    if (unread.length) {
+        return { dropped: false, key: "odataExampleSelectTrimmed", args: [unread.join(", ")] };
+    }
+    return undefined;
+}
+
+/** The key fields an agent can address but not see: not readable while Get
+ *  is on. Key NAMES are always shown to agents; key VALUES come back only
+ *  for a key field with Read. */
+function hiddenKeys(entitySet: ODataEntitySet): string[] {
+    if ((entitySet.operations ?? []).indexOf("get") === -1) {
+        return [];
+    }
+    const fields = entitySet.fields ?? [];
+    return (entitySet.keys ?? []).map((k) => k.name).filter((name) => (
+        !fields.some((f) => f.name === name && f.selectable === true)
+    ));
+}
+
+/**
+ * Everything the server would refuse about one entity set, in the order it
+ * checks (`EntitySetDef` and what it holds, agents/odata/models.py): first
+ * the values -- names, types, lengths, one-line texts, value meanings,
+ * example queries -- and a filterable field that is not readable; then,
+ * only when all of that is fine (the server does the same), the entity set
+ * as a whole (`entitySetProblem`: duplicates, keys, what its operations
+ * need). `otherNames`: the names of the other entity sets of the service.
+ */
+function entitySetIssues(entitySet: ODataEntitySet, otherNames: readonly string[] = []): ODataIssue[] {
+    const issues: ODataIssue[] = [];
+    const add = (loc: string, key: string, ...args: string[]): void => {
+        issues.push({ loc, key, args });
+    };
+    const fields = entitySet.fields ?? [];
+    if (!EDM_NAME_RE.test(entitySet.name ?? "")) {
+        add("name", "odataErrEntityName");
+    }
+    const title = entitySet.title ?? "";
+    if (title.length > MAX_TITLE) {
+        add("title", "odataErrTitleTooLong");
+    } else if (!isOneLine(title)) {
+        add("title", "odataErrTitleOneLine");
+    }
+    if ((entitySet.description ?? "").length > MAX_ENTITY_DESCRIPTION) {
+        add("description", "odataErrEntityDescriptionTooLong");
+    }
+    (entitySet.keys ?? []).forEach((key, i) => {
+        if (!EDM_NAME_RE.test(key.name ?? "")) {
+            add(`keys.${i}.name`, "odataErrKeyName", String(key.name));
+        }
+        if (!key.type || key.type.length > MAX_TYPE) {
+            add(`keys.${i}.type`, "odataErrFieldType", String(key.name));
+        }
+    });
+    if (fields.length > MAX_FIELDS) {
+        add("fields", "odataErrTooManyFields", String(MAX_FIELDS));
+    }
+    fields.forEach((field, i) => {
+        const loc = `fields.${i}`;
+        const before = issues.length;
+        if (!EDM_NAME_RE.test(field.name ?? "")) {
+            add(`${loc}.name`, "odataErrFieldName", String(field.name));
+        }
+        if (!field.type || field.type.length > MAX_TYPE) {
+            add(`${loc}.type`, "odataErrFieldType", field.name);
+        }
+        const label = field.label ?? "";
+        if (label.length > MAX_LABEL) {
+            add(`${loc}.label`, "odataErrFieldLabelTooLong", field.name);
+        } else if (!isOneLine(label)) {
+            add(`${loc}.label`, "odataErrFieldLabelOneLine", field.name);
+        }
+        if ((field.hint ?? "").length > MAX_HINT) {
+            add(`${loc}.hint`, "odataErrFieldHintTooLong", field.name);
+        }
+        (field.values ?? []).forEach((pair, v) => {
+            const bad = (text: string, max: number): boolean => !text || text.length > max || !isOneLine(text);
+            if (bad(pair.value ?? "", MAX_VALUE)) {
+                add(`${loc}.values.${v}.value`, "odataErrFieldValues", field.name);
+            }
+            if (bad(pair.meaning ?? "", MAX_MEANING)) {
+                add(`${loc}.values.${v}.meaning`, "odataErrFieldValues", field.name);
+            }
+        });
+        // Like the server: the field as a whole only when its values passed.
+        if (issues.length === before && field.filterable === true && field.selectable !== true) {
+            add(loc, "odataErrFilterNotSelectable", field.name);
+        }
+    });
+    (entitySet.navigations ?? []).forEach((navigation, i) => {
+        if (!EDM_NAME_RE.test(navigation.name ?? "")) {
+            add(`navigations.${i}.name`, "odataErrNavigationName", String(navigation.name));
+        }
+        if (!EDM_NAME_RE.test(navigation.target ?? "")) {
+            add(`navigations.${i}.target`, "odataErrNavigationName", String(navigation.name));
+        }
+        if ((navigation.description ?? "").length > MAX_NAV_DESCRIPTION) {
+            add(`navigations.${i}.description`, "odataErrNavigationDescription", navigation.name);
+        }
+    });
+    (entitySet.examples ?? []).forEach((example, i) => {
+        const loc = `examples.${i}`;
+        const number = String(i + 1);
+        const description = example.description ?? "";
+        if (!description) {
+            add(`${loc}.description`, "odataErrExampleDescriptionRequired", number);
+        } else if (description.length > MAX_EXAMPLE_DESCRIPTION) {
+            add(`${loc}.description`, "odataErrExampleDescriptionTooLong", number);
+        }
+        if ((example.filter ?? "").length > MAX_EXAMPLE_FILTER) {
+            add(`${loc}.filter`, "odataErrExampleFilterTooLong", number);
+        }
+        (example.select ?? []).forEach((name, n) => {
+            if (String(name).length > MAX_EXAMPLE_SELECT) {
+                add(`${loc}.select.${n}`, "odataErrExampleSelectTooLong", number);
+            }
+        });
+        if ((example.orderby ?? "").length > MAX_EXAMPLE_ORDERBY) {
+            add(`${loc}.orderby`, "odataErrExampleOrderbyTooLong", number);
+        }
+        const top: unknown = example.top;
+        if (top !== null && top !== undefined && !(typeof top === "number" && Number.isInteger(top) && top >= 1)) {
+            add(`${loc}.top`, "odataErrExampleTop", number);
+        }
+    });
+    if (!issues.length) {
+        const whole = entitySetProblem(entitySet);
+        if (whole) {
+            add("", whole.key, ...whole.args);
+        } else if (otherNames.indexOf(entitySet.name) !== -1) {
+            add("name", "odataErrDuplicateEntitySet", entitySet.name);
+        }
+    }
+    return issues;
+}
+
+/** The operations (function imports, actions) bound to the entity set
+ *  `name`: the server refuses a definition in which one of them names an
+ *  entity set that is not there. */
+function boundOperations(definition: ODataDefinition | undefined | null, name: string): string[] {
+    return (definition?.operations ?? []).filter((o) => o.bound_to === name).map(operationTitle);
+}
+
+
 export default {
 
     ENTITY_OPS,
@@ -495,8 +842,9 @@ export default {
      * `allow_write` do: the entity-set writes of `newWrites`, and the
      * enabled operations that are writes (`operationIsWrite`) and were not
      * such in `stored` (matched by name: absent, not enabled, or a read
-     * there). `switchedOn`: the save also switches the stored, disabled
-     * service on, which opens every write it has.
+     * there), and the fields that become writable for agents
+     * (`newWritableFields`). `switchedOn`: the save also switches the
+     * stored, disabled service on, which opens every write it has.
      */
     pendingWrites(
         stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
@@ -504,14 +852,17 @@ export default {
     ): ODataPending {
         return {
             entitySets: newEntityWrites(stored, current, switchedOn),
-            operations: newWriteOperations(stored, current, switchedOn)
+            operations: newWriteOperations(stored, current, switchedOn),
+            fields: newWritableFields(stored, current)
         };
     },
 
-    /** How many write operations `pending` holds: each ticked operation of
-     *  each entity set, and each function import or action. */
+    /** How many things `pending` holds: each ticked operation of each
+     *  entity set, each function import or action, and each field that
+     *  becomes writable. */
     pendingCount(pending: ODataPending): number {
-        return pending.entitySets.reduce((sum, write) => sum + write.operations.length, 0) + pending.operations.length;
+        return pending.entitySets.reduce((sum, write) => sum + write.operations.length, 0) + pending.operations.length
+            + (pending.fields ?? []).reduce((sum, write) => sum + write.fields.length, 0);
     },
 
     /** What is in `pending` and not in `other`, in the order of `pending`. */
@@ -527,8 +878,47 @@ export default {
             }
         });
         const names = other.operations.map((operation) => operation.name);
-        return { entitySets, operations: pending.operations.filter((operation) => names.indexOf(operation.name) === -1) };
+        const fields: ODataNewFieldWrite[] = [];
+        (pending.fields ?? []).forEach((write) => {
+            const had = (other.fields ?? [])
+                .filter((candidate) => candidate.name === write.name)
+                .reduce((all: string[], candidate) => all.concat(candidate.fields), []);
+            const left = write.fields.filter((field) => had.indexOf(field) === -1);
+            if (left.length) {
+                fields.push({ name: write.name, title: write.title, fields: left });
+            }
+        });
+        return {
+            entitySets, fields,
+            operations: pending.operations.filter((operation) => names.indexOf(operation.name) === -1)
+        };
     },
+
+    /** Nothing pending. */
+    noPending(): ODataPending {
+        return { entitySets: [], operations: [], fields: [] };
+    },
+
+    parseValueMeanings,
+    formatValueMeanings,
+    valueMeaningsProblem,
+    fieldMatches,
+
+    /** The fields the dialog lists for a search text and a filter. */
+    filterFields<T extends Pick<ODataField, "name" | "label" | "selectable" | "filterable" | "writable" | "personal_data">>(
+        fields: readonly T[], query: string | undefined | null, mode: ODataFieldFilter
+    ): T[] {
+        return fields.filter((field) => fieldMatches(field, query, mode));
+    },
+
+    navigationFollow,
+    exampleWarning,
+    hiddenKeys,
+    entitySetIssues,
+    boundOperations,
+
+    /** The most fields an entity set may hold. */
+    MAX_FIELDS,
 
     /** The agents using a service, split by `allow_write`: only the first
      *  group can run a write the catalogue enables. */

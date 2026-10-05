@@ -8,6 +8,7 @@ import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import { InvisibleMessageMode, ValueState } from "sap/ui/core/library";
 import ODataController from "./odata/ODataController";
+import EntitySetDialog from "./odata/EntitySetDialog";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
@@ -102,6 +103,10 @@ export default class ODataServiceDetail extends ODataController {
     private justCreated?: string;
 
     private duplicateDialog?: Dialog;
+
+    /** The dialog of one entity set; it is open while `entityOpen`. */
+    private entityDialog?: EntitySetDialog;
+    private entityOpen = false;
 
     /** Watches the height of what the slot of the pending-writes strip holds. */
     private slotObserver?: ResizeObserver;
@@ -331,7 +336,7 @@ export default class ODataServiceDetail extends ODataController {
             // this is the sentence that says so.
             // `asking`: a question about the save is open.
             rows: [], entitySearch: "", pendingWrites: "", asking: false, problemsOnly: "",
-            pending: { entitySets: [], operations: [] },
+            pending: odataCatalog.noPending(),
             // `updated_at`: the version of the service the form was loaded
             // from; a save is only made on top of that one.
             // `changedElsewhere` / `deletedElsewhere`: it is not the stored
@@ -582,34 +587,41 @@ export default class ODataServiceDetail extends ODataController {
         return this.svc().getProperty("/rows") as ODataEntityRow[];
     }
 
-    /** Works the table rows out again from the definition, all of them. */
-    private showEntitySets(): void {
+    /** Works the table rows out again from the definition, all of them.
+     *  `announce`: the admin just changed the definition, so a change of
+     *  what is pending is said to a screen reader too. */
+    private showEntitySets(announce = false): void {
         this.svc().setProperty("/rows", odataCatalog.entitySetRows(this.definition()));
-        this.showPendingWrites();
+        this.showPendingWrites(announce);
     }
 
     /**
      * "Update on "Requisition item" (A_PurchaseRequisitionItem); the
-     * operation "Release item" (ReleaseItem)": one entry per entity set and
-     * per operation. With `cap`, at most that many entries and the number
-     * of the others.
+     * operation "Release item" (ReleaseItem); the field Note writable on
+     * ...": one entry per entity set, per operation and per entity set with
+     * fields that become writable. With `cap`, at most that many entries
+     * and the number of the others; `more` words that tail.
      */
-    private writeList(pending: ODataPending, cap = Infinity): string {
+    private writeList(pending: ODataPending, cap = Infinity, more = "odataWriteMore"): string {
         const entries = pending.entitySets.map((write) => this.text("odataWriteItem", [
             write.operations.map((op) => this.text(OP_TEXT[op])).join(", "), write.title, write.name
         ])).concat(pending.operations.map((operation) => (
             this.text("odataWriteOperationItem", [operation.title, operation.name])
+        ))).concat((pending.fields ?? []).map((write) => (
+            this.text(write.fields.length === 1 ? "odataWriteFieldOne" : "odataWriteFieldMany", [
+                write.fields.join(", "), write.title, write.name
+            ])
         )));
         return entries.length <= cap
             ? entries.join("; ")
-            : this.text("odataWriteMore", [entries.slice(0, cap).join("; "), entries.length - cap]);
+            : this.text(more, [entries.slice(0, cap).join("; "), entries.length - cap]);
     }
 
     /**
      * The writes saving the form over `stored` would newly open: ticked
-     * entity-set operations, and enabled operations (function imports,
-     * actions) that are writes. Switching a stored, disabled service on
-     * opens all it has.
+     * entity-set operations, enabled operations (function imports, actions)
+     * that are writes, and fields that become writable where Create or
+     * Update is on. Switching a stored, disabled service on opens all it has.
      */
     private newWrites(stored: ODataServiceInput): ODataPending {
         return odataCatalog.pendingWrites(stored.definition, this.definition(), this.switchesOn(stored));
@@ -635,7 +647,7 @@ export default class ODataServiceDetail extends ODataController {
             this.keepPlace();
         }
         const pending = model.getProperty("/loaded") === true
-            ? this.newWrites(this.original()) : { entitySets: [], operations: [] };
+            ? this.newWrites(this.original()) : odataCatalog.noPending();
         const count = odataCatalog.pendingCount(pending);
         model.setProperty("/pending", pending);
         // The strip names a few and counts the rest: it stays over the page.
@@ -652,8 +664,10 @@ export default class ODataServiceDetail extends ODataController {
         if (odataCatalog.pendingCount(added)) {
             said = this.text("odataAnnounceAdded", [this.writeList(added, STRIP_CAP), count]);
         } else if (odataCatalog.pendingCount(removed)) {
+            // Without "(Save lists them all)": what is gone is not in
+            // the Save question.
             said = this.text(count ? "odataAnnounceRemoved" : "odataAnnounceNone", [
-                this.writeList(removed, STRIP_CAP), count
+                this.writeList(removed, STRIP_CAP, "odataWriteMoreShort"), count
             ]);
         }
         if (said) {
@@ -779,7 +793,9 @@ export default class ODataServiceDetail extends ODataController {
             }
         };
         const rendered = this.renderedRows();
-        if (marked.some((index) => rendered.indexOf(index) === -1)) {
+        // Already showing marked rows alone: that view follows the marks,
+        // so that its sentence and its rows are those of this save.
+        if (model.getProperty("/problemsOnly") || marked.some((index) => rendered.indexOf(index) === -1)) {
             model.setProperty("/entitySearch", "");
             model.setProperty("/problemsOnly", this.problemsOnlyText(marked.length));
             table?.attachEventOnce("updateFinished", toFirst);
@@ -837,29 +853,79 @@ export default class ODataServiceDetail extends ODataController {
         this.clearEntitySearch();
         this.showEntitySets();
         model.setProperty("/saveError", "");
-        this.openEntitySet(entitySets.length - 1);
+        void this.openEntitySet(entitySets.length - 1);
     }
 
     /** A row of the table was pressed. */
     public onOpenEntitySet(event: Event): void {
         const row = (event.getSource() as Control).getBindingContext("svc")?.getObject() as ODataEntityRow | undefined;
-        if (row) {
-            this.openEntitySet(row.index);
+        if (!row) {
+            return;
         }
+        if (this.definition().entity_sets[row.index]?.name !== row.name) {
+            // The row is not the entity set at its position: nothing opens.
+            this.showEntitySets();
+            this.sayListRefreshed(row.name);
+            return;
+        }
+        void this.openEntitySet(row.index);
     }
 
     /**
-     * U5 HOOK -- the entity set dialog (fields, keys, navigations, example
-     * queries, title and description) opens from here; it is not built yet,
-     * so pressing a row does nothing.
+     * Opens the dialog of the entity set at `index` of the definition:
+     * fields, keys, navigations, example queries, title and description.
      *
-     * `index` is the position in `data.definition.entity_sets`. The dialog
-     * edits a copy and, on Apply, writes it back there and calls
-     * `showEntitySets()`: the rows, the pending-writes strip and the
-     * unsaved-changes check all follow from the definition.
+     * The dialog edits a copy and sends nothing. On Apply the copy takes the
+     * entity set's place in the form, on Remove the entity set leaves it;
+     * either way the rows are worked out again (`showEntitySets`), so the
+     * table, the pending-writes strip and the unsaved-changes check follow
+     * from the definition, and the page's Save is what stores it. The
+     * entity set is found again by identity when the dialog closes: if the
+     * form was loaded anew meanwhile, nothing is written into it.
      */
-    private openEntitySet(index: number): void {
-        void index;
+    private async openEntitySet(index: number): Promise<void> {
+        const model = this.svc();
+        const entitySet = this.definition().entity_sets[index];
+        if (!entitySet || this.entityOpen || this.working || model.getProperty("/asking") === true) {
+            return;
+        }
+        if (!this.entityDialog) {
+            this.entityDialog = new EntitySetDialog();
+        }
+        const stored = this.original().definition?.entity_sets ?? [];
+        this.entityOpen = true;
+        let result;
+        try {
+            result = await this.entityDialog.open(this.getView()!, entitySet, {
+                definition: this.definition(),
+                version: this.data().odata_version,
+                // What SAP calls it stays once the service is saved with it.
+                canRename: !stored.some((candidate) => candidate.name === entitySet.name),
+                text: (key, args) => this.text(key, args)
+            });
+        } finally {
+            this.entityOpen = false;
+        }
+        if (!result) {
+            return;
+        }
+        const entitySets = this.definition().entity_sets;
+        const at = entitySets.indexOf(entitySet);
+        if (at === -1) {
+            this.showEntitySets();
+            this.sayListRefreshed(entitySet.name);
+            return;
+        }
+        if (result.action === "remove") {
+            entitySets.splice(at, 1);
+            // Every later row moved up: a view of marked rows, which goes
+            // by position, would show others. The search stays.
+            this.filterEntitySets(model.getProperty("/entitySearch") as string);
+        } else {
+            entitySets[at] = result.entitySet;
+        }
+        model.setProperty("/saveError", "");
+        this.showEntitySets(true);
     }
 
     // --- editing ------------------------------------------------------------
@@ -1277,7 +1343,9 @@ export default class ODataServiceDetail extends ODataController {
     /** Every write `definition` holds, as the duplicate dialog lists them:
      *  the server copies the definition whole, writes included. */
     private copiedWrites(definition: ODataDefinition): string {
-        return this.writeList(odataCatalog.pendingWrites(undefined, definition));
+        // The operations, as the dialog's sentence says; which fields
+        // they can send is part of the definition that is copied.
+        return this.writeList({ ...odataCatalog.pendingWrites(undefined, definition), fields: [] });
     }
 
     /**
@@ -1362,10 +1430,12 @@ export default class ODataServiceDetail extends ODataController {
             const writes = this.copiedWrites(fresh.definition);
             if (writes !== state.writes) {
                 this.setWorking(false);
+                // With no write left there is no list to point at.
+                const changed = this.text(writes ? "odataDuplicateChanged" : "odataDuplicateChangedNone");
                 model.setProperty("/duplicate/writes", writes);
-                model.setProperty("/duplicate/error", this.text("odataDuplicateChanged"));
+                model.setProperty("/duplicate/error", changed);
                 InvisibleMessage.getInstance().announce(
-                    [this.text("odataDuplicateChanged"), this.formatDuplicateWrites(writes)].filter(Boolean).join(" "),
+                    [changed, this.formatDuplicateWrites(writes)].filter(Boolean).join(" "),
                     InvisibleMessageMode.Polite
                 );
                 return;

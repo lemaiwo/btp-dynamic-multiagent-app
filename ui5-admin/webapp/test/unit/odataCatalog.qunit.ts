@@ -572,6 +572,10 @@ QUnit.test("an enabled operation is a write unless it is marked as reading AND s
         isWrite({ changes_data: undefined as unknown as boolean, http_method: "GET" }), true,
         "a missing flag does not read as 'only reads'"
     );
+    assert.strictEqual(
+        isWrite({ changes_data: false, http_method: undefined as unknown as "GET" }), true,
+        "nor does a missing method read as GET: an operation without one is a write"
+    );
 
     // The tag, the summary, the strip and the question all follow it.
     assert.strictEqual(odataCatalog.hasWrite(withOperation({ changes_data: false, http_method: "POST" })), true);
@@ -596,7 +600,7 @@ QUnit.test("pendingWrites adds the enabled write operations a save newly opens",
     const none: ODataDefinition = { entity_sets: WRITING.entity_sets, operations: [] };
     const release = [{ name: "ReleaseItem", title: "Release item" }];
 
-    assert.deepEqual(odataCatalog.pendingWrites(WRITING, WRITING), { entitySets: [], operations: [] }, "stored and enabled: not new");
+    assert.deepEqual(odataCatalog.pendingWrites(WRITING, WRITING), odataCatalog.noPending(), "stored and enabled: not new");
     assert.deepEqual(odataCatalog.pendingWrites(off, WRITING).operations, release, "stored but not enabled");
     assert.deepEqual(odataCatalog.pendingWrites(none, WRITING).operations, release, "not stored (matched by name)");
     assert.deepEqual(odataCatalog.pendingWrites(undefined, WRITING).operations, release, "a new service");
@@ -607,7 +611,8 @@ QUnit.test("pendingWrites adds the enabled write operations a save newly opens",
                 { name: "A_PurchaseRequisitionItem", title: "Requisition item", operations: ["update"] },
                 { name: "A_PurchaseReqnItemText", title: "Item text", operations: ["create", "update"] }
             ],
-            operations: release
+            operations: release,
+            fields: []
         },
         "a service that is switched on opens everything it has"
     );
@@ -627,23 +632,28 @@ QUnit.test("pendingCount and pendingMinus say what one tick changed", function (
     const item = { name: "A_PurchaseRequisitionItem", title: "Requisition item" };
     const after = {
         entitySets: [{ ...item, operations: ["update", "delete"] as const }].map((w) => ({ ...w, operations: [...w.operations] })),
-        operations: [] as { name: string; title: string }[]
+        operations: [] as { name: string; title: string }[],
+        fields: [{ ...item, fields: ["Text", "Other"] }]
     };
-    assert.strictEqual(odataCatalog.pendingCount(before), 4, "update + create, update + one operation");
-    assert.strictEqual(odataCatalog.pendingCount({ entitySets: [], operations: [] }), 0);
+    assert.strictEqual(
+        odataCatalog.pendingCount(before), 6, "update + create, update + one operation + one writable field on each"
+    );
+    assert.strictEqual(odataCatalog.pendingCount(odataCatalog.noPending()), 0);
     assert.deepEqual(
-        odataCatalog.pendingMinus(after, before), { entitySets: [{ ...item, operations: ["delete"] }], operations: [] },
+        odataCatalog.pendingMinus(after, before),
+        { entitySets: [{ ...item, operations: ["delete"] }], operations: [], fields: [{ ...item, fields: ["Other"] }] },
         "what is new in it"
     );
     assert.deepEqual(
         odataCatalog.pendingMinus(before, after),
         {
             entitySets: [{ name: "A_PurchaseReqnItemText", title: "Item text", operations: ["create", "update"] }],
-            operations: [{ name: "ReleaseItem", title: "Release item" }]
+            operations: [{ name: "ReleaseItem", title: "Release item" }],
+            fields: [{ name: "A_PurchaseReqnItemText", title: "Item text", fields: ["Text"] }]
         },
         "what is gone from it"
     );
-    assert.deepEqual(odataCatalog.pendingMinus(before, before), { entitySets: [], operations: [] });
+    assert.deepEqual(odataCatalog.pendingMinus(before, before), odataCatalog.noPending());
 });
 
 QUnit.test("serverRefusal keeps what a refusal says before its first field and its 'and n more' tail", function (assert) {

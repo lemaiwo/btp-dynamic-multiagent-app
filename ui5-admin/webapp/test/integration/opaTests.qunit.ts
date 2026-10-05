@@ -16,6 +16,7 @@ import "./AgentJourney";
 import "./SkillJourney";
 import "./ODataListJourney";
 import "./ODataDetailJourney";
+import "./ODataEntityJourney";
 import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
 import "./ReloadJourney";

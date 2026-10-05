@@ -1,4 +1,4 @@
-import type { ODataServiceInput } from "com/agent/admin/service/types";
+import type { ODataEntitySet, ODataServiceInput } from "com/agent/admin/service/types";
 
 /**
  * One table of refused input for the general fields of a catalogue service,
@@ -182,4 +182,205 @@ export const RULE_CASES: RuleCase[] = GENERAL_CASES.concat(PATH_CASES, ONE_LINE_
 
 export function withField(testCase: RuleCase): ODataServiceInput {
     return { ...VALID_INPUT, [testCase.field]: testCase.value } as ODataServiceInput;
+}
+
+// --- one entity set ----------------------------------------------------------
+
+/**
+ * One table of refused entity sets, used twice like `RULE_CASES`:
+ * `odataCatalog.entitySetIssues` must name `clientKey` at `loc` first, and
+ * the fake backend must answer the 422 the real one answers (`server`, as
+ * `validate_odata_service` in agents/odata/models.py words it -- the texts
+ * were taken from the real validator). What the entity set dialog checks
+ * before Apply and what the fake refuses can then not drift apart.
+ */
+export interface EntityRuleCase {
+    rule: string;
+    /** Makes the valid entity set break the rule. */
+    change: (entitySet: ODataEntitySet) => void;
+    /** Where inside the entity set, as the server's `loc` ("" = the whole). */
+    loc: string;
+    clientKey: string;
+    /** What follows "definition.entity_sets.0[.<loc>]: ". */
+    server: string;
+}
+
+/** An entity set the server accepts: List, Get and Update, a key that is
+ *  readable, one writable field, a navigation and an example query. */
+export function validEntitySet(): ODataEntitySet {
+    return {
+        name: "A_Item", title: "Item", path: "", entity_type: "ItemType", description: "One item.",
+        keys: [{ name: "Id", type: "Edm.String" }], operations: ["list", "get", "update"],
+        fields: [
+            {
+                name: "Id", type: "Edm.String", label: "Id", selectable: true, filterable: true, writable: false,
+                hint: "", values: [], personal_data: false
+            },
+            {
+                name: "Status", type: "Edm.String", label: "Status", selectable: true, filterable: false,
+                writable: true, hint: "", values: [{ value: "B", meaning: "open" }], personal_data: false
+            }
+        ],
+        navigations: [{ name: "to_Text", target: "A_Text", collection: true, description: "" }],
+        examples: [{ description: "Open items", filter: "Status eq 'B'", select: ["Id"], orderby: "", top: 5 }]
+    };
+}
+
+const EDM = "String should match pattern '^[A-Za-z_][A-Za-z0-9_.]{0,127}$'";
+const atMost = (n: number): string => `String should have at most ${n} characters`;
+const AT_LEAST_ONE = "String should have at least 1 character";
+const oneLineOf = (field: string): string => `Value error, ${field} must be one line of text without control characters`;
+
+function entityRule(
+    rule: string, loc: string, clientKey: string, server: string, change: (entitySet: ODataEntitySet) => void
+): EntityRuleCase {
+    return { rule, loc, clientKey, server, change };
+}
+
+export const ENTITY_CASES: EntityRuleCase[] = [
+    entityRule("name: not an EDM name", "name", "odataErrEntityName", EDM, (e) => { e.name = "1x"; }),
+    entityRule("title: 121 characters", "title", "odataErrTitleTooLong", atMost(120), (e) => { e.title = "x".repeat(121); }),
+    entityRule("title: a tab", "title", "odataErrTitleOneLine", oneLineOf("title"), (e) => { e.title = "a\tb"; }),
+    entityRule("description: 601 characters", "description", "odataErrEntityDescriptionTooLong", atMost(600), (e) => {
+        e.description = "x".repeat(601);
+    }),
+    entityRule("key: not an EDM name", "keys.0.name", "odataErrKeyName", EDM, (e) => { e.keys[0].name = "a-b"; }),
+    entityRule("fields: 501", "fields", "odataErrTooManyFields", "List should have at most 500 items after validation, not 501", (e) => {
+        for (let i = 0; i < 499; i++) {
+            e.fields.push({ ...e.fields[1], name: `F${i}`, values: [] });
+        }
+    }),
+    entityRule("field: not an EDM name", "fields.1.name", "odataErrFieldName", EDM, (e) => { e.fields[1].name = "a b"; }),
+    entityRule("field: no type", "fields.1.type", "odataErrFieldType", AT_LEAST_ONE, (e) => { e.fields[1].type = ""; }),
+    entityRule("field: a type of 201 characters", "fields.1.type", "odataErrFieldType", atMost(200), (e) => {
+        e.fields[1].type = "x".repeat(201);
+    }),
+    entityRule("label: 121 characters", "fields.1.label", "odataErrFieldLabelTooLong", atMost(120), (e) => {
+        e.fields[1].label = "x".repeat(121);
+    }),
+    entityRule("label: a line break", "fields.1.label", "odataErrFieldLabelOneLine", oneLineOf("label"), (e) => {
+        e.fields[1].label = "a\nb";
+    }),
+    entityRule("hint: 301 characters", "fields.1.hint", "odataErrFieldHintTooLong", atMost(300), (e) => {
+        e.fields[1].hint = "x".repeat(301);
+    }),
+    entityRule("value meaning: no value", "fields.1.values.0.value", "odataErrFieldValues", AT_LEAST_ONE, (e) => {
+        e.fields[1].values[0].value = "";
+    }),
+    entityRule("value meaning: a value of 65 characters", "fields.1.values.0.value", "odataErrFieldValues", atMost(64), (e) => {
+        e.fields[1].values[0].value = "x".repeat(65);
+    }),
+    entityRule("value meaning: no meaning", "fields.1.values.0.meaning", "odataErrFieldValues", AT_LEAST_ONE, (e) => {
+        e.fields[1].values[0].meaning = "";
+    }),
+    entityRule("value meaning: a meaning of 201 characters", "fields.1.values.0.meaning", "odataErrFieldValues", atMost(200), (e) => {
+        e.fields[1].values[0].meaning = "x".repeat(201);
+    }),
+    entityRule("value meaning: a tab in the meaning", "fields.1.values.0.meaning", "odataErrFieldValues", oneLineOf("meaning"), (e) => {
+        e.fields[1].values[0].meaning = "a\tb";
+    }),
+    entityRule(
+        "field: filterable but not readable", "fields.1", "odataErrFilterNotSelectable",
+        "Value error, field 'Status' is filterable but not selectable; a filterable field must also be selectable",
+        (e) => { e.fields[1].selectable = false; e.fields[1].filterable = true; }
+    ),
+    entityRule("a field with a wrong value is not also checked as a whole", "fields.1.label", "odataErrFieldLabelTooLong", atMost(120), (e) => {
+        e.fields[1].label = "x".repeat(121); e.fields[1].selectable = false; e.fields[1].filterable = true;
+    }),
+    entityRule("navigation: not an EDM name", "navigations.0.name", "odataErrNavigationName", EDM, (e) => {
+        e.navigations[0].name = "a b";
+    }),
+    entityRule("navigation: no target", "navigations.0.target", "odataErrNavigationName", EDM, (e) => {
+        e.navigations[0].target = "";
+    }),
+    entityRule("navigation: a description of 301 characters", "navigations.0.description", "odataErrNavigationDescription", atMost(300), (e) => {
+        e.navigations[0].description = "x".repeat(301);
+    }),
+    entityRule("example: no description", "examples.0.description", "odataErrExampleDescriptionRequired", AT_LEAST_ONE, (e) => {
+        e.examples[0].description = "";
+    }),
+    entityRule("example: a description of 201 characters", "examples.0.description", "odataErrExampleDescriptionTooLong", atMost(200), (e) => {
+        e.examples[0].description = "x".repeat(201);
+    }),
+    entityRule("example: a filter of 1001 characters", "examples.0.filter", "odataErrExampleFilterTooLong", atMost(1000), (e) => {
+        e.examples[0].filter = "x".repeat(1001);
+    }),
+    entityRule("example: a select entry of 129 characters", "examples.0.select.0", "odataErrExampleSelectTooLong", atMost(128), (e) => {
+        e.examples[0].select = ["x".repeat(129)];
+    }),
+    entityRule("example: an orderby of 301 characters", "examples.0.orderby", "odataErrExampleOrderbyTooLong", atMost(300), (e) => {
+        e.examples[0].orderby = "x".repeat(301);
+    }),
+    entityRule("example: top 0", "examples.0.top", "odataErrExampleTop", "Input should be greater than or equal to 1", (e) => {
+        e.examples[0].top = 0;
+    }),
+    entityRule(
+        "example: top 1.5", "examples.0.top", "odataErrExampleTop",
+        "Input should be a valid integer, got a number with a fractional part", (e) => { e.examples[0].top = 1.5; }
+    ),
+    entityRule("a field listed twice", "", "odataErrDuplicateField", "Value error, duplicate field 'Status' in entity set 'A_Item'", (e) => {
+        e.fields.push({ ...e.fields[1] });
+    }),
+    entityRule(
+        "a navigation listed twice", "", "odataErrDuplicateNavigation",
+        "Value error, duplicate navigation 'to_Text' in entity set 'A_Item'", (e) => { e.navigations.push({ ...e.navigations[0] }); }
+    ),
+    entityRule("a key listed twice", "", "odataErrDuplicateKey", "Value error, duplicate key 'Id' in entity set 'A_Item'", (e) => {
+        e.keys.push({ ...e.keys[0] });
+    }),
+    entityRule(
+        "a key that is no field", "", "odataErrKeyNotField",
+        "Value error, key 'Other' of entity set 'A_Item' is not one of its fields", (e) => { e.keys[0].name = "Other"; }
+    ),
+    entityRule("Get without a key", "", "odataNeedsKey", "Value error, entity set 'A_Item' has 'get' but no key", (e) => {
+        e.keys = [];
+    }),
+    entityRule(
+        "List without a readable field", "", "odataNeedsSelectable",
+        "Value error, entity set 'A_Item' has 'list' but no selectable field", (e) => {
+            e.fields.forEach((f) => { f.selectable = false; f.filterable = false; });
+        }
+    ),
+    entityRule(
+        "Update without a writable field", "", "odataNeedsWritable",
+        "Value error, entity set 'A_Item' has 'update' but no writable field", (e) => {
+            e.fields.forEach((f) => { f.writable = false; });
+        }
+    ),
+    entityRule(
+        "Create without a writable field", "", "odataNeedsWritable",
+        "Value error, entity set 'A_Item' has 'create' but no writable field", (e) => {
+            e.operations = ["create"];
+            e.fields.forEach((f) => { f.writable = false; });
+        }
+    )
+];
+
+/** Entity sets the server accepts although they look close to a rule. */
+export const ENTITY_ACCEPTED: { rule: string; change: (entitySet: ODataEntitySet) => void }[] = [
+    { rule: "a hint may have a line break", change: (e) => { e.fields[1].hint = "a\nb"; } },
+    {
+        rule: "Delete needs no writable field",
+        change: (e) => { e.operations = ["delete"]; e.fields.forEach((f) => { f.writable = false; }); }
+    },
+    {
+        rule: "a writable field need not be readable",
+        change: (e) => { e.fields[1].selectable = false; e.fields[1].filterable = false; }
+    },
+    { rule: "no example, no navigation", change: (e) => { e.examples = []; e.navigations = []; } }
+];
+
+export function changed(change: (entitySet: ODataEntitySet) => void): ODataEntitySet {
+    const entitySet = validEntitySet();
+    change(entitySet);
+    return entitySet;
+}
+
+export function withEntitySet(entitySet: ODataEntitySet): ODataServiceInput {
+    return { ...VALID_INPUT, definition: { entity_sets: [entitySet], operations: [] } };
+}
+
+/** The 422 detail the server answers for `testCase` on the first entity set. */
+export function entityRefusal(testCase: EntityRuleCase): string {
+    return `definition.entity_sets.0${testCase.loc ? `.${testCase.loc}` : ""}: ${testCase.server}`;
 }

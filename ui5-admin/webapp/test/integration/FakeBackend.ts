@@ -585,6 +585,32 @@ export default class FakeBackend {
         });
     }
 
+    // `EDM_NAME_RE` in agents/odata/models.py.
+    private static readonly ODATA_EDM_RE = /^[A-Za-z_][A-Za-z0-9_.]{0,127}$/;
+
+    /** An EDM name, in pydantic's words. */
+    private static odataEdm(value: unknown): string {
+        return typeof value === "string" && FakeBackend.ODATA_EDM_RE.test(value)
+            ? "" : "String should match pattern '^[A-Za-z_][A-Za-z0-9_.]{0,127}$'";
+    }
+
+    /** A string of `min`..`max` characters (not stripped), in pydantic's
+     * words. Left out, the server's default applies. */
+    private static odataMax(value: unknown, max: number, min = 0): string {
+        const text = typeof value === "string" ? value : "";
+        if (text.length < min) {
+            return "String should have at least 1 character";
+        }
+        return text.length > max ? `String should have at most ${max} characters` : "";
+    }
+
+    /** `EntitySetDef._confined_segment`: one URL segment, or empty. */
+    private static odataSegment(value: string): string {
+        return !value || (/^[A-Za-z0-9_.-]{1,128}$/.test(value) && value.indexOf("..") === -1 && value !== ".")
+            ? "" : "Value error, path must be one URL segment of letters, digits, '_', '.' and '-' "
+                + "(empty = the entity set name)";
+    }
+
     /** The first rule of `EntitySetDef._consistent` the entity set breaks. */
     private static odataEntitySetProblem(entitySet: ODataEntitySet): string {
         const who = `entity set '${entitySet.name}'`;
@@ -626,9 +652,11 @@ export default class FakeBackend {
      * The cross-field rules of a definition (agents/odata/models.py), with
      * the server's `loc` and text. Like pydantic, an entity set is checked as
      * a whole only when its fields passed, and the definition as a whole only
-     * when everything in it passed. Not mirrored: the per-value rules inside
-     * a definition (EDM names, text lengths, the size cap) and the operation
-     * rules -- the import and entity-set dialogs build those values.
+     * when everything in it passed. The per-value rules of an entity set
+     * (EDM names, text lengths, one-line texts, value meanings, example
+     * queries) are mirrored too: the entity set dialog builds those values
+     * (`ENTITY_CASES` in test/unit/odataRuleCases.ts holds both sides to
+     * them). Not mirrored: the size cap and the operation rules.
      */
     private static odataDefinitionProblems(definition: unknown): string[] {
         if (definition === undefined) {
@@ -652,10 +680,40 @@ export default class FakeBackend {
         const entitySets = (definition as Partial<ODataDefinition>).entity_sets ?? [];
         entitySets.forEach((entitySet, i) => {
             const before = problems.length;
+            const at = `definition.entity_sets.${i}`;
+            // The values first, in the order of the model's fields; pydantic
+            // checks a model as a whole only when its values passed.
+            const say = (loc: string, problem: string) => {
+                if (problem) {
+                    problems.push(`${at}.${loc}: ${problem}`);
+                }
+            };
+            say("name", FakeBackend.odataEdm(entitySet.name));
+            say("title", FakeBackend.odataMax(entitySet.title, 120) || FakeBackend.odataOneLine("title", entitySet.title ?? ""));
+            say("path", FakeBackend.odataSegment(entitySet.path ?? ""));
+            say("description", FakeBackend.odataMax(entitySet.description, 600));
+            (entitySet.keys ?? []).forEach((key, k) => {
+                say(`keys.${k}.name`, FakeBackend.odataEdm(key.name));
+                say(`keys.${k}.type`, FakeBackend.odataMax(key.type ?? "Edm.String", 200, 1));
+            });
+            if ((entitySet.fields ?? []).length > 500) {
+                say("fields", `List should have at most 500 items after validation, not ${(entitySet.fields ?? []).length}`);
+            }
             (entitySet.fields ?? []).forEach((field, j) => {
                 const loc = `definition.entity_sets.${i}.fields.${j}`;
                 const own = problems.length;
-                flags(loc, field, ["selectable", "filterable", "writable", "personal_data"]);
+                say(`fields.${j}.name`, FakeBackend.odataEdm(field.name));
+                say(`fields.${j}.type`, FakeBackend.odataMax(field.type ?? "Edm.String", 200, 1));
+                say(`fields.${j}.label`, FakeBackend.odataMax(field.label, 120) || FakeBackend.odataOneLine("label", field.label ?? ""));
+                flags(loc, field, ["selectable", "filterable", "writable"]);
+                say(`fields.${j}.hint`, FakeBackend.odataMax(field.hint, 300));
+                (field.values ?? []).forEach((pair, v) => {
+                    say(`fields.${j}.values.${v}.value`,
+                        FakeBackend.odataMax(pair.value, 64, 1) || FakeBackend.odataOneLine("value", pair.value));
+                    say(`fields.${j}.values.${v}.meaning`,
+                        FakeBackend.odataMax(pair.meaning, 200, 1) || FakeBackend.odataOneLine("meaning", pair.meaning));
+                });
+                flags(loc, field, ["personal_data"]);
                 if (problems.length === own && field.filterable && !field.selectable) {
                     problems.push(
                         `${loc}: Value error, field '${field.name}' is `
@@ -664,7 +722,24 @@ export default class FakeBackend {
                 }
             });
             (entitySet.navigations ?? []).forEach((navigation, k) => {
+                say(`navigations.${k}.name`, FakeBackend.odataEdm(navigation.name));
+                say(`navigations.${k}.target`, FakeBackend.odataEdm(navigation.target));
                 flags(`definition.entity_sets.${i}.navigations.${k}`, navigation, ["collection"]);
+                say(`navigations.${k}.description`, FakeBackend.odataMax(navigation.description, 300));
+            });
+            (entitySet.examples ?? []).forEach((example, k) => {
+                say(`examples.${k}.description`, FakeBackend.odataMax(example.description, 200, 1));
+                say(`examples.${k}.filter`, FakeBackend.odataMax(example.filter, 1000));
+                (example.select ?? []).forEach((name, n) => {
+                    say(`examples.${k}.select.${n}`, FakeBackend.odataMax(name, 128));
+                });
+                say(`examples.${k}.orderby`, FakeBackend.odataMax(example.orderby, 300));
+                const top: unknown = example.top;
+                if (typeof top === "number" && !Number.isInteger(top)) {
+                    say(`examples.${k}.top`, "Input should be a valid integer, got a number with a fractional part");
+                } else if (typeof top === "number" && top < 1) {
+                    say(`examples.${k}.top`, "Input should be greater than or equal to 1");
+                }
             });
             const problem = problems.length === before ? FakeBackend.odataEntitySetProblem(entitySet) : "";
             if (problem) {

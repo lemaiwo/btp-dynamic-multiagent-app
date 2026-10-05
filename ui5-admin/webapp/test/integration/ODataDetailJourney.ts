@@ -1266,6 +1266,10 @@ const AUDITED = "Every write call is audited.";
 const NO_AGENTS = "No agent uses this service yet. An agent attached later with \"Allow writes\" can run them.";
 const PROBLEM_ROW = "Showing only the entity set with a problem.";
 const RELEASE = "the operation \"Release item\" (ReleaseItem)";
+// The fields an agent can send once Update (or Create) is on for their
+// entity set: named with it when that becomes the case.
+const ITEM_FIELDS = "the fields RequestedQuantity, DeliveryDate writable on \"Requisition item\" (A_PurchaseRequisitionItem)";
+const TEXT_FIELD = "the field NoteDescription writable on \"Item text\" (A_PurchaseReqnItemText)";
 const LIST_REFRESHED = "The list of entity sets was refreshed; this click was not applied. Check the boxes and tick again.";
 const CANNOT_VERIFY = "Not saved: this service was loaded without its version, so the page cannot tell whether it was "
     + "changed elsewhere. Reload the page and try again.";
@@ -1518,7 +1522,8 @@ opaTest("unticking needs no confirmation, and what Save sends is what the boxes 
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(
             stripOf(page, "odataPendingWrites").text,
-            pending("Update on \"Requisition item\" (A_PurchaseRequisitionItem)"), "against what is stored now"
+            pending(`Update on "Requisition item" (A_PurchaseRequisitionItem); ${ITEM_FIELDS}`),
+            "against what is stored now: the operation, and the fields it lets agents send again"
         );
     });
     // And off again: the form is as saved, nothing pending, nothing unsaved.
@@ -1886,6 +1891,17 @@ opaTest("a service with 200 entity sets renders twenty rows, is searched whole, 
     Then.iStopTheApp();
 });
 
+/** Leaves the entity set dialog by its Cancel button. */
+function iCancelTheEntityDialog(When: Common): void {
+    When.waitFor({
+        controlType: "sap.m.Button",
+        searchOpenDialogs: true,
+        matchers: withId("entityCancelButton"),
+        actions: new Press(),
+        errorMessage: "No entity set dialog to cancel"
+    });
+}
+
 opaTest("Add appends an entity set with nothing enabled, and it is saved with the rest", function (Given: Common, When: Common, Then: Common) {
     const PUT = `PUT odata/services/${JOBS}`;
 
@@ -1893,6 +1909,8 @@ opaTest("Add appends an entity set with nothing enabled, and it is saved with th
     iSeeTheService(Then, JOBS, "the service is loaded");
     iEnter(When, "odataEntitySearch", "header");
     iPress(When, "odataAddEntitySetButton");
+    // Add opens the dialog of the new entity set; left as it is, it stays.
+    iCancelTheEntityDialog(When);
     iSee(Then, "the new row", function (page: UI5Element) {
         return entityTitles(page).length === 6;
     }, function (page: UI5Element) {
@@ -1908,6 +1926,8 @@ opaTest("Add appends an entity set with nothing enabled, and it is saved with th
         Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent yet");
     });
     iPress(When, "odataAddEntitySetButton");
+    // Add opens the dialog of the new entity set; left as it is, it stays.
+    iCancelTheEntityDialog(When);
     iSee(Then, "a second new row", function (page: UI5Element) {
         return entityTitles(page).length === 7;
     }, function (page: UI5Element) {
@@ -2225,9 +2245,10 @@ opaTest("what Save asks about is worked out against the service as it is stored 
         Opa5.assert.strictEqual(
             messageOf(dialog),
             `The agent ${agent} uses this service.\n\n`
-            + "Saving enables these write operations in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem).\n\n"
+            + "Saving enables these write operations in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem); "
+            + `${ITEM_FIELDS}.\n\n`
             + `The agent ${agent} has "Allow writes" and will be able to run them.\n\n${AUDITED}`,
-            "a write the stored service does not have is one this save enables"
+            "a write the stored service does not have is one this save enables, with the fields it can then send"
         );
         Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
     }, "the write confirmation");
@@ -2411,8 +2432,9 @@ opaTest("a service saved as new after it was deleted elsewhere asks about all it
         Opa5.assert.strictEqual(
             messageOf(dialog),
             "Saving enables these write operations in SAP: Update on \"Requisition item\" (A_PurchaseRequisitionItem); "
-            + `Create, Update on "Item text" (A_PurchaseReqnItemText); ${RELEASE}.\n\n${NO_AGENTS}\n\n${AUDITED}`,
-            "a new service is asked about too"
+            + `Create, Update on "Item text" (A_PurchaseReqnItemText); ${RELEASE}; ${ITEM_FIELDS}; ${TEXT_FIELD}.`
+            + `\n\n${NO_AGENTS}\n\n${AUDITED}`,
+            "a new service is asked about too: its operations and its writable fields"
         );
         Opa5.assert.strictEqual(backend.countRequests("POST odata/services"), 0, "nothing is sent before the answer");
     }, "the write confirmation of a new service");
@@ -2671,6 +2693,147 @@ opaTest("a refused save leaves a search alone that shows the marked row", functi
         Opa5.assert.strictEqual(stripOf(page, "odataProblemsOnly").visible, false, "and the table is not filtered otherwise");
         Opa5.assert.strictEqual(stripOf(page, "odataSaveError").text, REFUSED_FIELD_SHOWN, "the server's text, with its tail");
         Opa5.assert.strictEqual(announced(), REFUSED_FIELD_SHOWN, "announced");
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- leftovers of the table's review ------------------------------------------
+
+opaTest("in the view of marked rows a second refused save shows and counts the rows that are marked now", function (Given: Common, When: Common, Then: Common) {
+    iOpenPrepared(Given, When, UNUSED, function () {
+        twoHundred();
+        [150, 160].forEach((n) => {
+            const set = stored(UNUSED).definition.entity_sets[n];
+            set.keys = [];
+            set.operations = ["delete"];
+        });
+    });
+    iSeeTheService(Then, UNUSED, "the service is loaded");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "two marked rows", function (page: UI5Element) {
+        return entityTitles(page).length === 2;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityTitles(page), ["Generated set 150", "Generated set 160"], "the two marked rows alone");
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataProblemsOnly").text, "Showing only the 2 entity sets with a problem.", "and how many"
+        );
+    });
+
+    // One is repaired; the next save is refused for the other alone.
+    iTick(When, "Generated set 150", "delete");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "one marked row", function (page: UI5Element) {
+        return entityTitles(page).length === 1;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(entityTitles(page), ["Generated set 160"], "the row that is still marked");
+        Opa5.assert.deepEqual(
+            stripOf(page, "odataProblemsOnly"), { visible: true, text: PROBLEM_ROW }, "the sentence counts again"
+        );
+        Opa5.assert.strictEqual(backend.requests.filter((r) => /^(PUT|POST)/.test(r)).length, 0, "nothing was sent");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("many writes that are no longer pending are announced without pointing at a Save question", function (Given: Common, When: Common, Then: Common) {
+    const three = [2, 3, 4].map((n) => `Delete on "Generated set ${n}" (Generated${n})`).join("; ");
+
+    iOpenPrepared(Given, When, UNUSED, function () {
+        twoHundred();
+        stored(UNUSED).definition.entity_sets.slice(2, 14).forEach((set) => { set.operations = ["delete"]; });
+    });
+    iSeeTheService(Then, UNUSED, "the service is loaded");
+    iPress(When, "odataEnabledSwitch");
+    iSee(Then, "the pending writes", function (page: UI5Element) {
+        return stripOf(page, "odataPendingWrites").visible;
+    }, function () {
+        Opa5.assert.ok(true, "twelve writes are pending");
+    });
+    iPress(When, "odataEnabledSwitch");
+    iSee(Then, "nothing pending", function (page: UI5Element) {
+        return !stripOf(page, "odataPendingWrites").visible && announced().indexOf("no longer pending") !== -1;
+    }, function () {
+        Opa5.assert.strictEqual(
+            announced(), `${three}; and 9 more is no longer pending. No write operations are pending.`,
+            "three and a count, and no \"(Save lists them all)\": Save will not ask about them"
+        );
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("unticking one of two pending writes says which one went and how many remain", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded");
+    iTick(When, ITEM, "delete");
+    iTick(When, ITEM_TEXT, "delete");
+    iSee(Then, "two pending writes", function (page: UI5Element) {
+        return entityRow(page, ITEM_TEXT).ticked.indexOf("delete") !== -1;
+    }, function () {
+        Opa5.assert.ok(true, "two writes are pending");
+    });
+    iTick(When, ITEM, "delete");
+    iSee(Then, "one pending write", function (page: UI5Element) {
+        return entityRow(page, ITEM).ticked.indexOf("delete") === -1 && announced().indexOf("no longer pending") !== -1;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(
+            announced(),
+            "Delete on \"Requisition item\" (A_PurchaseRequisitionItem) is no longer pending. Write operations pending: 1.",
+            "removed while another remains"
+        );
+        Opa5.assert.strictEqual(
+            stripOf(page, "odataPendingWrites").text, pending("Delete on \"Item text\" (A_PurchaseReqnItemText)"),
+            "the strip keeps the other"
+        );
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("Duplicate says so when the service has no write operations any more, and points at no list", function (Given: Common, When: Common, Then: Common) {
+    const DUPLICATE = `POST odata/services/${JOBS}/duplicate`;
+    const child = (dialog: UI5Element, id: string) => (dialog as unknown as {
+        findAggregatedObjects(deep: boolean, filter: (c: UI5Element) => boolean): UI5Element[];
+    }).findAggregatedObjects(true, withId(id))[0];
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "a service with writes");
+    iPress(When, "odataDuplicateButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual((child(dialog, "odataDuplicateWrites") as MessageStrip).getVisible(), true, "writes are listed");
+        // Saved elsewhere while the dialog is open: no write is left.
+        const definition = stored(JOBS).definition;
+        definition.entity_sets.forEach((set) => {
+            set.operations = set.operations.filter((op) => op === "list" || op === "get");
+        });
+        definition.operations[0].enabled = false;
+    }, "the duplicate dialog of a service with writes");
+    iEnterInDialog(When, "odataDuplicateName", "purchase-requisitions-nightly");
+    iPressInDialog(When, "Duplicate with write operations");
+    Then.waitFor({
+        controlType: "sap.m.MessageStrip",
+        searchOpenDialogs: true,
+        matchers: withId("odataDuplicateError"),
+        check: function (strips: UI5Element[]) { return (strips[0] as MessageStrip).getVisible(); },
+        success: function (strips: UI5Element[]) {
+            Opa5.assert.strictEqual(
+                (strips[0] as MessageStrip).getText(),
+                "The service was changed elsewhere since this dialog opened: it has no write operations any more. "
+                + "Press the button again to copy it as it is now.",
+                "what changed, without a list that is not there"
+            );
+            Opa5.assert.strictEqual(backend.countRequests(DUPLICATE), 0, "nothing was sent");
+        },
+        errorMessage: "The dialog did not say that the service changed"
+    });
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual((child(dialog, "odataDuplicateWrites") as MessageStrip).getVisible(), false, "no list of writes");
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Duplicate", "Cancel"], "and a plain Duplicate button");
+    }, "the duplicate dialog, without writes");
+    iPressInDialog(When, "Duplicate");
+    iSeeTheHash(Then, "odata-services/purchase-requisitions-nightly", "the page moved to the copy", function () {
+        Opa5.assert.strictEqual(backend.countRequests(DUPLICATE), 1, "one copy");
     });
 
     Then.iStopTheApp();
