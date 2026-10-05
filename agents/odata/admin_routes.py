@@ -23,11 +23,9 @@ module).
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -61,8 +59,13 @@ from agents.db import (
     validate_odata_service,
 )
 from agents.odata import preview
-from agents.odata.metadata import MetadataError
-from agents.odata.models import DESTINATION_NAME_RE, MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+from agents.odata.models import (
+    _LOC_FIELD_RE,
+    _UNKNOWN_FIELD,
+    DESTINATION_NAME_RE,
+    MAX_DEFINITION_BYTES,
+    SERVICE_NAME_RE,
+)
 from agents.odata.urls import confine_service_path
 
 logger = logging.getLogger(__name__)
@@ -205,6 +208,22 @@ def _validated(data: dict[str, Any]) -> dict[str, Any]:
         raise _refuse(str(e)) from None
 
 
+def _body_loc(parts: tuple[Any, ...]) -> str:
+    """Where a refused body field is. A key is the client's own text -- an
+    unknown key arrives here like any other, and a URL pasted where a key
+    belongs would come back -- so it is named only when it has the form of
+    a field name; the rule of ``agents.odata.models._loc``."""
+    shown = [
+        str(part)
+        if isinstance(part, int) and not isinstance(part, bool)
+        else part
+        if isinstance(part, str) and _LOC_FIELD_RE.fullmatch(part)
+        else _UNKNOWN_FIELD
+        for part in parts
+    ]
+    return ".".join(shown) or "body"
+
+
 def _model_body(model: type[_Body], data: dict[str, Any]) -> _Body:
     """``data`` as ``model``, or a 422 naming each field and its rule, never
     a value."""
@@ -212,10 +231,7 @@ def _model_body(model: type[_Body], data: dict[str, Any]) -> _Body:
         return model.model_validate(data)
     except ValidationError as exc:
         errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        lines = [
-            f"{'.'.join(str(part) for part in err['loc']) or 'body'}: {err['msg']}"
-            for err in errors[:_MAX_REPORTED_ERRORS]
-        ]
+        lines = [f"{_body_loc(err['loc'])}: {err['msg']}" for err in errors[:_MAX_REPORTED_ERRORS]]
         # `from None`: the ValidationError carries the input in its repr.
         raise _refuse("; ".join(lines)) from None
 
@@ -513,32 +529,46 @@ async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
     ``user_context`` true it is sent as the admin who calls this route (the
     request's bound JWT through the destination); without a bound JWT the
     answer is 424 and nothing is sent. With ``user_context`` false the
-    destination's own credential is used.
+    destination's own credential is used. When ``user_context`` is true
+    but the destination's authentication type propagates no user, the
+    answer says so in ``warnings`` (code ``technical_credential``).
 
-    Answer: ``{fetched_at, entity_sets, operations, skipped, summary,
-    truncated, totals}`` (``preview.build_preview``): names, types, labels
-    and what the service DECLARES (capabilities, ``filterable`` /
-    ``creatable`` / ``updatable`` per field) as information. Nothing in it
-    is enabled: no ``selectable`` / ``writable`` / entity operations, no
-    operation ``enabled``. ``changes_data`` of an operation is a suggestion
-    (``changes_data_known`` false: nothing is known, treated as changing).
-    With ``service``, each entity set has a ``status`` (``new`` |
-    ``in_service`` | ``changed``) and the names of fields new in the
-    document (``new_fields``) or stored but gone from it
-    (``removed_fields``), compared with the STORED definition read here --
-    whose hints, examples and switches are never part of the answer.
+    Answer (``preview.build_preview``): ``{fetched_at, entity_sets,
+    operations, skipped, removed_entity_sets, removed_operations,
+    removed_complete, summary, truncated, totals, warnings}``: names,
+    types and labels. What the service DECLARES sits under ``declared``
+    (per field: ``filterable`` / ``creatable`` / ``updatable``; per entity
+    set: ``creatable`` / ``updatable`` / ``deletable``), and an operation's
+    ``suggested: {changes_data, known}`` is a suggestion (``known`` false:
+    nothing is known, treated as changing). No key of a field, entity set
+    or operation is called ``selectable``, ``filterable``, ``writable`` or
+    ``enabled``: nothing is enabled here. With ``service``, each entity set
+    has a ``status`` (``new`` | ``in_service`` | ``changed``) with
+    ``new_fields``, ``removed_fields``, ``changed_types`` (field names) and
+    ``changed_keys``, and the top level names stored entity sets and
+    operations that are gone from the document -- all compared with the
+    STORED definition read here, whose hints, examples and switches are
+    never part of the answer.
 
-    Refusals, in this order: 422 body; 404 ``Service not found`` (``service``
-    names none, or cannot be a name) -- before anything is fetched; then,
-    each with a stable code in the ``X-OData-Error`` header: 424
-    ``user_token_required``; 502 ``on_premise_unavailable``,
-    ``destination_error``, ``unreachable``, ``redirect``, ``sap_error``
-    (SAP's short code and message), ``not_xml`` (a sign-in page),
-    ``too_large``; 504 ``timeout``; 422 ``invalid_metadata`` (the parser's
-    fixed text, e.g. a version mismatch).
+    Refusals, in this order: 413 / 422 body (an unknown key is named only
+    when it looks like a field name); 404 ``Service not found``
+    (``service`` names none, or cannot be a name) -- before anything is
+    fetched; then, each with a stable code in the ``X-OData-Error`` header:
+    429 ``busy`` (``preview.MAX_CONCURRENT_PREVIEWS`` are running); 422
+    ``invalid_path``; 424 ``user_token_required``; 502
+    ``on_premise_unavailable``, ``destination_error``, ``unreachable``,
+    ``redirect``, ``sap_error`` (SAP's short code and message),
+    ``not_xml`` (a sign-in page, a compressed answer), ``too_large``; 504
+    ``timeout`` (fetch plus parse, ``preview.PREVIEW_BUDGET_SECONDS``); 422
+    ``invalid_metadata`` (the parser's fixed text, e.g. a version mismatch
+    or a document over its work budget).
 
-    The log line names the caller's choice (destination, path, version,
-    identity kind), the outcome, bytes and duration -- no content.
+    ``preview.run_preview`` writes the one log line: what was asked, the
+    caller's principal, how the destination was resolved, the outcome,
+    bytes and duration -- no content.
+
+    The body is parsed whatever its ``Content-Type``; the cross-site guard
+    of this route is the Origin check of ``JWTBindingMiddleware``.
     """
     body = _model_body(MetadataBody, await _json_object(request, METADATA_BODY_BYTES))
     stored: dict[str, Any] | None = None
@@ -549,53 +579,14 @@ async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
             if row is None:
                 raise HTTPException(status_code=404, detail=_NOT_FOUND)
             stored = row.definition
-    identity = "user" if body.user_context else "technical"
-    started = time.monotonic()
-    size = 0
     try:
-        document = await preview.fetch_metadata(
-            body.destination, body.service_path, body.user_context
+        return await preview.run_preview(
+            body.destination, body.service_path, body.odata_version, body.user_context, stored
         )
-        size = len(document)
-        # Up to 20 MB of XML: CPU work that must not run on the event loop.
-        answer = await asyncio.to_thread(
-            preview.parse_and_build, document, body.odata_version, stored
-        )
-    except (preview.PreviewError, MetadataError) as exc:
-        if isinstance(exc, preview.PreviewError):
-            status_code, code, detail = exc.status, exc.code, exc.detail
-        else:  # the parser's texts are fixed and never quote the document
-            status_code, code, detail = 422, "invalid_metadata", str(exc)
-        logger.info(
-            "odata metadata preview refused: destination=%s path=%s version=%s identity=%s "
-            "code=%s status=%d bytes=%d duration_ms=%d",
-            body.destination,
-            body.service_path,
-            body.odata_version,
-            identity,
-            code,
-            status_code,
-            size,
-            int((time.monotonic() - started) * 1000),
-        )
+    except preview.PreviewError as exc:
         raise HTTPException(
-            status_code=status_code, detail=detail, headers={ERROR_HEADER: code}
+            status_code=exc.status, detail=exc.detail, headers={ERROR_HEADER: exc.code}
         ) from None
-    logger.info(
-        "odata metadata preview: destination=%s path=%s version=%s identity=%s "
-        "entity_sets=%d operations=%d skipped=%d truncated=%s bytes=%d duration_ms=%d",
-        body.destination,
-        body.service_path,
-        body.odata_version,
-        identity,
-        answer["totals"]["entity_sets"],
-        answer["totals"]["operations"],
-        answer["totals"]["skipped"],
-        answer["truncated"],
-        size,
-        int((time.monotonic() - started) * 1000),
-    )
-    return answer
 
 
 def _audit_moment(name: str, raw: str) -> datetime:

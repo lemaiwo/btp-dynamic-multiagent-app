@@ -1,25 +1,40 @@
 """The ``$metadata`` import preview: fetch a service's document, show what it offers.
 
-Behind ``POST /admin/api/odata/metadata`` (``agents/odata/admin_routes.py``).
-Two halves, and nothing here stores or caches anything:
+Behind ``POST /admin/api/odata/metadata`` (``agents/odata/admin_routes.py``),
+which calls :func:`run_preview`. Nothing here stores or caches anything.
 
 * :func:`fetch_metadata` makes the app read ONE document from a remote
   system an admin names -- by destination and service path, never by URL.
   That is a server-side fetch on somebody's identity, so it is narrow on
   purpose: the path is ``join_path(service_path, "$metadata")`` and nothing
   else (no query, no fragment), one ``GET``, no redirect followed, no
-  second attempt, a body cap enforced while reading, one total timeout.
-  The host and the credential are the destination's; with ``user_context``
-  the destination is resolved as the admin who calls the route (the JWT
-  bound to the request), and without a bound JWT the fetch is refused --
-  never sent with the destination's own credential instead.
+  second attempt, a body cap enforced on the bytes as they arrive
+  (``Accept-Encoding: identity`` is pinned and any other
+  ``Content-Encoding`` refused, so nothing is inflated). The host and the
+  credential are the destination's; with ``user_context`` the destination
+  is resolved as the admin who calls the route (the JWT bound to the
+  request), and without a bound JWT the fetch is refused -- never sent
+  with the destination's own credential instead.
 * :func:`build_preview` turns the parsed document into the answer: names,
-  types, labels and what the service DECLARES. It enables nothing -- every
-  switch of the catalogue (``selectable``, ``filterable``, ``writable``,
-  entity operations, an operation's ``enabled``) stays the admin's choice
-  and is not part of the answer. When a stored service is given, each
-  entity set is compared with its stored field NAMES; none of the stored
+  types, labels and what the service DECLARES, the latter always under a
+  ``declared`` (or ``suggested``) key so that no key of the answer has the
+  name of a catalogue switch. It enables nothing -- ``selectable``,
+  ``filterable``, ``writable``, entity operations and an operation's
+  ``enabled`` stay the admin's choice. When a stored service is given, the
+  document is compared with its stored NAMES and types; none of the stored
   hints travels back.
+* :func:`run_preview` puts the two under one clock and one gate.
+  ``PREVIEW_BUDGET_SECONDS`` covers the fetch AND the parse and is kept
+  below the timeout of the approuter in front of this app (about 30 s by
+  default; ``mta.yaml`` sets none for the backend destination): a slower
+  preview would end as the approuter's own 504, without this route's
+  error code, while the app went on fetching as the admin. The parse runs
+  in a thread, which cannot be cancelled: when the clock runs out the
+  route answers 504 and the thread ends on its own, bounded by the
+  parser's work budget (``metadata.MAX_PARSE_WORK``) and the document
+  cap. At most ``MAX_CONCURRENT_PREVIEWS`` run at a time -- a document may
+  be 20 MB and its tree many times that -- and a slot is held until its
+  thread has really ended.
 
 The answer of the remote system is untrusted. A non-2xx answer is reduced to
 SAP's own short code and message (``common.read_error``); a sign-in page or
@@ -34,12 +49,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
-from agents.destination import PROXY_TYPE_ON_PREMISE, DestinationError
+from agents.destination import (
+    PROXY_TYPE_ON_PREMISE,
+    USER_PROPAGATING_AUTH_TYPES,
+    Destination,
+    DestinationError,
+)
 from agents.destination_auth import (
     PLACEHOLDER_BASE,
     DestinationAuth,
@@ -49,6 +71,7 @@ from agents.destination_auth import (
 from agents.odata import common
 from agents.odata.metadata import (
     MAX_METADATA_BYTES,
+    MetadataError,
     ParsedEntitySet,
     ParsedMetadata,
     ParsedOperation,
@@ -62,20 +85,25 @@ logger = logging.getLogger(__name__)
 
 SERVER_KEY = "builtin:odata/metadata"
 METADATA_SEGMENT = "$metadata"
-# The whole fetch -- resolving the destination, the request, reading the
-# body -- may take this long. Read at call time (tests shorten it).
-FETCH_TIMEOUT_SECONDS = 60.0
+# Fetch plus parse, in all (see the module docstring: below the approuter's
+# timeout). Read at call time (tests shorten it).
+PREVIEW_BUDGET_SECONDS = 25.0
+MAX_CONCURRENT_PREVIEWS = 2
 # The read stops with the chunk that crosses this: the parser's own limit,
 # so a body is never buffered that it would refuse anyway. The overshoot is
-# at most one chunk.
+# at most one chunk of the wire (nothing is decompressed).
 MAX_FETCH_BYTES = MAX_METADATA_BYTES
 MAX_MESSAGE_CHARS = 500
 # A stored definition is at most 2 MB (`MAX_DEFINITION_BYTES`), which is
 # about this many fields; 200 entity sets of 500 fields each would be a
-# preview five times that. Entity sets past the budget are listed without
-# (all of) their fields, and say so.
+# preview five times that. Entity sets past the budget are listed with
+# their key fields only, and say so.
 MAX_PREVIEW_FIELDS = 20_000
 MAX_PREVIEW_SKIPPED = 1_000
+# Per entity set / operation. A real key has a handful of parts.
+MAX_PREVIEW_KEYS = 64
+MAX_PREVIEW_NAVIGATIONS = 200
+MAX_PREVIEW_PARAMETERS = 100  # client.MAX_CALL_PARAMS
 
 _ON_PREMISE_TEXT = "on-premise destinations are not available yet in this version"
 _USER_REQUIRED_TEXT = (
@@ -88,6 +116,14 @@ _DESTINATION_TEXT = (
     "(the application log has the reason)"
 )
 _UNREACHABLE_TEXT = "the OData service could not be reached"
+_BUSY_TEXT = (
+    "other $metadata previews are running; wait for them to finish and try again"
+)
+_TECHNICAL_WARNING = (
+    "the preview was asked for as the signed-in user, but the destination's "
+    "authentication type does not propagate a user: it was fetched with the "
+    "destination's own credential"
+)
 _NOT_XML_TEXT = (
     "the OData service did not answer with an XML document; a sign-in page "
     "instead of the $metadata usually means the destination's credential was "
@@ -122,27 +158,43 @@ class _OnPremise(DestinationError):
 
 
 class _MetadataAuth(DestinationAuth):
-    """``DestinationAuth`` for one fetch: no retry, no on-premise target.
+    """``DestinationAuth`` for one fetch: no on-premise target, and the two
+    headers the fetch relies on cannot be changed by the destination.
 
-    The base class re-sends a request once after a 401, because its cached
-    destination may have aged. Here the resolver is new for this call, so a
-    second attempt could only repeat a refused logon -- against a system
+    Built with ``retry_on_401=False``: the resolver is new for this call, so
+    a second attempt could only repeat a refused logon -- against a system
     that counts those.
     """
 
-    async def async_auth_flow(self, request):  # type: ignore[override]
-        token, principal = self._user()
-        destination = await self._resolve(token, principal)
+    resolved: Destination | None = None
+
+    def send_through(self, request: httpx.Request, destination: Destination) -> None:
         if (destination.proxy_type or "").strip().lower() == PROXY_TYPE_ON_PREMISE.lower():
             # Checked on the destination this very request would use, before
-            # the URL is rewritten: sent from here it would go straight to
-            # the virtual host, past the connectivity proxy and the Cloud
+            # anything is shaped: sent from here it would go straight to the
+            # virtual host, past the connectivity proxy and the Cloud
             # Connector. The connectivity task (plan section 1.7, task C2:
             # `DestinationAuth(connectivity=...)` + `OnPremiseRouter`) adds
             # that route; this refusal goes when the fetch can take it.
             raise _OnPremise(_ON_PREMISE_TEXT)
-        self._apply(request, destination)
-        yield request
+        self.resolved = destination
+        super().send_through(request, destination)
+        # After the destination's own headers (`URL.headers.*`), which are
+        # applied last and would otherwise win: a compressed answer would
+        # make the size cap count the wrong bytes.
+        request.headers["Accept"] = "application/xml"
+        request.headers["Accept-Encoding"] = "identity"
+
+
+@dataclass
+class Fetched:
+    """A fetched document and how it was fetched (for the log and the
+    ``warnings`` of the answer; nothing of it identifies the target)."""
+
+    document: bytearray | None
+    size: int
+    auth_type: str
+    per_user: bool
 
 
 # --------------------------------------------------------------------- seams
@@ -189,7 +241,7 @@ def _sap_error(status: int, content_type: str, body: bytes) -> PreviewError:
     return PreviewError(502, "sap_error", detail[:MAX_MESSAGE_CHARS])
 
 
-def _looks_like_xml(body: bytes) -> bool:
+def _looks_like_xml(body: bytes) -> bool:  # the first bytes are enough
     """Whether ``body`` can be an XML document at all, and is no HTML page.
 
     The parser decides what the document is; this only keeps a page -- which
@@ -197,16 +249,21 @@ def _looks_like_xml(body: bytes) -> bool:
     """
     if body.startswith(_UTF16_MARKS):
         return True
-    head = body[:1024].removeprefix(b"\xef\xbb\xbf").lstrip().lower()
+    head = body.removeprefix(b"\xef\xbb\xbf").lstrip().lower()
     return head.startswith(b"<") and not head.startswith(_HTML_STARTS)
 
 
-async def _read(client: httpx.AsyncClient, path: str) -> bytes:
+def _identity_encoded(response: httpx.Response) -> bool:
+    encoding = response.headers.get("content-encoding", "").strip().lower()
+    return encoding in ("", "identity")
+
+
+async def _read(client: httpx.AsyncClient, path: str) -> bytearray:
     async with client.stream(
         "GET",
         path,
-        # `identity`: the cap below then counts what the remote sent, not
-        # what a compressed body unpacks to.
+        # Both are pinned again by `_MetadataAuth`, after the destination's
+        # static headers.
         headers={"Accept": "application/xml", "Accept-Encoding": "identity"},
         follow_redirects=False,
     ) as response:
@@ -222,33 +279,47 @@ async def _read(client: httpx.AsyncClient, path: str) -> bytes:
                 "destination's credential was not accepted",
             )
         failed = not 200 <= status < 300
-        if not failed and "html" in content_type.lower():
-            raise PreviewError(502, "not_xml", _NOT_XML_TEXT)
+        plain = _identity_encoded(response)
+        if not failed:
+            # `identity` was asked for. A compressed answer all the same is
+            # not read: inflating it is exactly what the cap must not allow.
+            if not plain or "html" in content_type.lower():
+                raise PreviewError(502, "not_xml", _NOT_XML_TEXT)
+            declared = response.headers.get("content-length", "")
+            if declared.isdigit() and int(declared) > MAX_FETCH_BYTES:
+                raise PreviewError(
+                    502,
+                    "too_large",
+                    f"the $metadata document is larger than {MAX_FETCH_BYTES} bytes",
+                )
         limit = common.MAX_ERROR_BODY if failed else MAX_FETCH_BYTES
         body = bytearray()
-        async for chunk in response.aiter_bytes():
-            body += chunk
-            if len(body) > limit:
-                if failed:
-                    break  # an error text needs no more than its beginning
-                raise PreviewError(
-                    502, "too_large", f"the $metadata document is larger than {limit} bytes"
-                )
+        if plain:
+            # Raw: the bytes of the wire, never a decoded form of them.
+            async for chunk in response.aiter_raw():
+                body += chunk
+                if len(body) > limit:
+                    if failed:
+                        break  # an error text needs no more than its beginning
+                    raise PreviewError(
+                        502, "too_large", f"the $metadata document is larger than {limit} bytes"
+                    )
     if failed:
         raise _sap_error(status, content_type, bytes(body[:limit]))
-    document = bytes(body)
-    if not _looks_like_xml(document):
+    if not _looks_like_xml(bytes(body[:1024])):
         raise PreviewError(502, "not_xml", _NOT_XML_TEXT)
-    return document
+    return body
 
 
-async def fetch_metadata(destination: str, service_path: str, user_context: bool) -> bytes:
+async def fetch_metadata(destination: str, service_path: str, user_context: bool) -> Fetched:
     """The ``$metadata`` document of the service; :class:`PreviewError` otherwise.
 
     ``destination`` and ``service_path`` are validated by the caller; the
     path is confined here once more, because this is where it becomes a
     request. ``user_context`` true sends the request as the user whose JWT
-    is bound to the calling request, exactly as the tools do.
+    is bound to the calling request, exactly as the tools do. The caller
+    sets the deadline (``run_preview``): a ``TimeoutError`` of its
+    ``asyncio.timeout`` passes through here.
     """
     from agents.auth import current_jwt
 
@@ -261,19 +332,29 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         # behalf of nobody, and never a fall-back to its own credential.
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
     try:
+        auth = _MetadataAuth(
+            _resolver(destination),
+            user_context=user_context is True,
+            server_key=SERVER_KEY,
+            retry_on_401=False,
+        )
         client = httpx.AsyncClient(
             base_url=PLACEHOLDER_BASE,
-            auth=_MetadataAuth(
-                _resolver(destination), user_context=user_context is True, server_key=SERVER_KEY
-            ),
-            timeout=httpx.Timeout(FETCH_TIMEOUT_SECONDS),
+            auth=auth,
+            timeout=httpx.Timeout(PREVIEW_BUDGET_SECONDS),
             transport=_transport(),
             cookies=NoCookieJar(),
             follow_redirects=False,
         )
         async with client:
-            async with asyncio.timeout(FETCH_TIMEOUT_SECONDS):
-                return await _read(client, path)
+            document = await _read(client, path)
+        resolved = auth.resolved
+        return Fetched(
+            document=document,
+            size=len(document),
+            auth_type=resolved.auth_type if resolved else "",
+            per_user=bool(resolved and resolved.per_user),
+        )
     except PreviewError:
         raise
     except DestinationUserRequired:
@@ -290,60 +371,101 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
             _plain(str(exc), 300),
         )
         raise PreviewError(502, "destination_error", _DESTINATION_TEXT) from None
-    except (TimeoutError, httpx.TimeoutException):
-        raise PreviewError(
-            504,
-            "timeout",
-            f"the OData service did not answer within {FETCH_TIMEOUT_SECONDS:g} seconds",
-        ) from None
+    except httpx.TimeoutException:
+        raise _timed_out() from None
     except (httpx.HTTPError, httpx.InvalidURL) as exc:
         # The exception text can carry the URL; only its type is logged.
         logger.warning("odata metadata: request failed (%s)", type(exc).__name__)
         raise PreviewError(502, "unreachable", _UNREACHABLE_TEXT) from None
 
 
+def _timed_out() -> PreviewError:
+    return PreviewError(
+        504,
+        "timeout",
+        f"the $metadata preview did not finish within {PREVIEW_BUDGET_SECONDS:g} seconds",
+    )
+
+
 # --------------------------------------------------------------- the preview
 
 
-def _stored_fields(stored: dict[str, Any] | None) -> dict[str, list[str]]:
-    """Entity set name -> its stored field names. Read defensively: a stored
-    definition is trusted for its names only, and may be an old or broken one."""
-    known: dict[str, list[str]] = {}
-    sets = (stored or {}).get("entity_sets")
-    for entity_set in sets if isinstance(sets, list) else []:
-        if not isinstance(entity_set, dict) or not isinstance(entity_set.get("name"), str):
-            continue
-        fields = entity_set.get("fields")
-        known[entity_set["name"]] = [
-            f["name"]
-            for f in (fields if isinstance(fields, list) else [])
-            if isinstance(f, dict) and isinstance(f.get("name"), str)
-        ]
+@dataclass
+class _StoredSet:
+    """What is read of a stored entity set: names and types, nothing else."""
+
+    fields: dict[str, str]  # name -> type, in stored order
+    keys: list[str]
+
+
+def _names(items: Any) -> list[dict[str, Any]]:
+    """The dict members of a stored list that carry a string ``name``."""
+    return [
+        item
+        for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    ]
+
+
+def _stored_sets(stored: dict[str, Any]) -> dict[str, _StoredSet]:
+    """Entity set name -> its stored field names/types and key names. Read
+    defensively: a stored definition may be an old or a broken one."""
+    known: dict[str, _StoredSet] = {}
+    for entity_set in _names(stored.get("entity_sets")):
+        known[entity_set["name"]] = _StoredSet(
+            fields={
+                f["name"]: f["type"] if isinstance(f.get("type"), str) else "Edm.String"
+                for f in _names(entity_set.get("fields"))
+            },
+            keys=[k["name"] for k in _names(entity_set.get("keys"))],
+        )
     return known
 
 
-def _stored_operations(stored: dict[str, Any] | None) -> set[str]:
-    operations = (stored or {}).get("operations")
-    return {
-        o["name"]
-        for o in (operations if isinstance(operations, list) else [])
-        if isinstance(o, dict) and isinstance(o.get("name"), str)
-    }
+def _shown_fields(parsed: ParsedEntitySet, key_names: set[str], room: int) -> list[Any]:
+    """The fields of the answer: all of them, or -- when the set has more
+    than it may show -- the key fields plus the first others, in document
+    order. A key field is never cut and costs no budget: a set listed
+    without its key could not be saved (the catalogue's key rule)."""
+    key_fields = sum(1 for f in parsed.fields if f.name in key_names)
+    others = len(parsed.fields) - key_fields
+    # `MAX_FIELDS` per set, keys included; `room` is for the other fields.
+    slots = max(min(MAX_FIELDS - key_fields, room), 0)
+    if others <= slots:
+        return list(parsed.fields)
+    shown = []
+    for field in parsed.fields:
+        if field.name in key_names:
+            shown.append(field)
+        elif slots > 0:
+            slots -= 1
+            shown.append(field)
+    return shown
 
 
-def _entity_set(
-    parsed: ParsedEntitySet, stored: list[str] | None, room: int
-) -> dict[str, Any]:
-    shown = parsed.fields[: min(MAX_FIELDS, max(room, 0))]
+def _entity_set(parsed: ParsedEntitySet, stored: _StoredSet | None, room: int) -> dict[str, Any]:
+    keys = parsed.keys[:MAX_PREVIEW_KEYS]
+    key_names = {k.name for k in keys}
+    shown = _shown_fields(parsed, key_names, room)
+    navigations = parsed.navigations[:MAX_PREVIEW_NAVIGATIONS]
     status, new_fields, removed_fields = "new", [], []
+    changed_keys, changed_types = False, []
     if stored is not None:
-        have = set(stored)
-        # New: what can be taken over from this answer. Removed: against the
-        # whole document, so a field past the cut is not reported as gone.
-        declared = {f.name for f in parsed.fields}
-        new_fields = [f.name for f in shown if f.name not in have]
-        removed_fields = [name for name in stored if name not in declared]
-        status = "changed" if new_fields or removed_fields else "in_service"
+        # Against ALL fields of the document, shown or not: a set that
+        # changed past the cut must not read `in_service`, and a field past
+        # the cut is not "removed".
+        declared = {f.name: f.type for f in parsed.fields}
+        new_fields = [name for name in declared if name not in stored.fields]
+        removed_fields = [name for name in stored.fields if name not in declared]
+        # The stored type decides how a literal is quoted in a key or filter.
+        changed_types = [
+            name
+            for name, stored_type in stored.fields.items()
+            if name in declared and declared[name] != stored_type
+        ]
+        changed_keys = stored.keys != [k.name for k in parsed.keys]
+        changed = new_fields or removed_fields or changed_types or changed_keys
+        status = "changed" if changed else "in_service"
     return {
         "name": parsed.name,
         # The URL segment: the parser reads entity sets by name, and a set's
@@ -351,32 +473,46 @@ def _entity_set(
         "path": parsed.name,
         "entity_type": parsed.entity_type,
         "label": parsed.label,
-        "keys": [{"name": k.name, "type": k.type} for k in parsed.keys],
+        "keys": [{"name": k.name, "type": k.type} for k in keys],
+        "keys_total": len(parsed.keys),
         "fields": [
             {
                 "name": f.name,
                 "type": f.type,
                 "label": f.label,
-                # What the service declares, as information.
-                "filterable": f.filterable,
-                "creatable": f.creatable,
-                "updatable": f.updatable,
+                # What the SERVICE declares. Nested on purpose: a preview
+                # field spread into a catalogue field must not switch
+                # `filterable` on.
+                "declared": {
+                    "filterable": f.filterable,
+                    "creatable": f.creatable,
+                    "updatable": f.updatable,
+                },
             }
             for f in shown
         ],
         "fields_total": len(parsed.fields),
         "navigations": [
-            {"name": n.name, "target": n.target, "collection": n.collection}
-            for n in parsed.navigations
+            {"name": n.name, "target": n.target, "collection": n.collection} for n in navigations
         ],
-        "capabilities": {
+        "navigations_total": len(parsed.navigations),
+        "declared": {
             "creatable": parsed.creatable,
             "updatable": parsed.updatable,
             "deletable": parsed.deletable,
         },
         "status": status,
-        "new_fields": new_fields,
+        "new_fields": new_fields[:MAX_FIELDS],
+        "new_fields_total": len(new_fields),
         "removed_fields": removed_fields,
+        "changed_keys": changed_keys,
+        "changed_types": changed_types,
+        "truncated": (
+            len(shown) < len(parsed.fields)
+            or len(keys) < len(parsed.keys)
+            or len(navigations) < len(parsed.navigations)
+            or len(new_fields) > MAX_FIELDS
+        ),
     }
 
 
@@ -398,6 +534,7 @@ def _changes_data(operation: ParsedOperation) -> tuple[bool, bool]:
 
 def _operation(parsed: ParsedOperation, stored: set[str] | None) -> dict[str, Any]:
     changes_data, known = _changes_data(parsed)
+    parameters = parsed.parameters[:MAX_PREVIEW_PARAMETERS]
     return {
         "name": parsed.name,
         "qualified_name": parsed.qualified_name,
@@ -405,12 +542,14 @@ def _operation(parsed: ParsedOperation, stored: set[str] | None) -> dict[str, An
         "http_method": parsed.http_method,
         "bound_to": parsed.bound_to,
         "parameters": [
-            {"name": p.name, "type": p.type, "required": p.required} for p in parsed.parameters
+            {"name": p.name, "type": p.type, "required": p.required} for p in parameters
         ],
+        "parameters_total": len(parsed.parameters),
         "label": parsed.label,
         "status": "in_service" if stored is not None and parsed.name in stored else "new",
-        "changes_data": changes_data,
-        "changes_data_known": known,
+        # Nested like `declared`: not a value to take over unseen.
+        "suggested": {"changes_data": changes_data, "known": known},
+        "truncated": len(parameters) < len(parsed.parameters),
     }
 
 
@@ -418,32 +557,58 @@ def build_preview(parsed: ParsedMetadata, stored: dict[str, Any] | None = None) 
     """The route's answer for ``parsed``, compared with ``stored`` when given.
 
     ``stored`` is the definition of a catalogue service as the database has
-    it (never anything a request carried); only its entity set, field and
-    operation NAMES are read. The answer holds at most what the catalogue
-    could store -- the first ``MAX_ENTITY_SETS`` entity sets and
-    ``MAX_OPERATIONS`` operations in document order, ``MAX_FIELDS`` fields
-    per set and ``MAX_PREVIEW_FIELDS`` in all -- and says so: ``truncated``
-    plus the counts of the whole document (``totals``, ``fields_total``).
+    it (never anything a request carried); only its entity set, field, key
+    and operation NAMES and its field types are read. The answer holds at
+    most what the catalogue could store -- the first ``MAX_ENTITY_SETS``
+    entity sets and ``MAX_OPERATIONS`` operations in document order,
+    ``MAX_FIELDS`` fields per set and ``MAX_PREVIEW_FIELDS`` in all (key
+    fields always) -- and says so: ``truncated`` at the top and per entity
+    set and operation, with the counts of the whole document (``totals``,
+    ``*_total``).
+
+    ``removed_entity_sets`` / ``removed_operations`` name what the stored
+    service has and the document no longer declares, compared with
+    everything the parser read, not with what is shown. When the parser
+    itself stopped early (``parsed.truncated``) that cannot be known:
+    both lists are then empty and ``removed_complete`` is false.
     """
-    stored_fields = _stored_fields(stored) if stored is not None else None
-    stored_operations = _stored_operations(stored) if stored is not None else None
+    stored_sets = _stored_sets(stored) if stored is not None else None
+    stored_operations = (
+        {o["name"] for o in _names(stored.get("operations"))} if stored is not None else None
+    )
     entity_sets: list[dict[str, Any]] = []
     room = MAX_PREVIEW_FIELDS
     truncated = (
-        len(parsed.entity_sets) > MAX_ENTITY_SETS
+        parsed.truncated
+        or len(parsed.entity_sets) > MAX_ENTITY_SETS
         or len(parsed.operations) > MAX_OPERATIONS
         or len(parsed.skipped) > MAX_PREVIEW_SKIPPED
     )
     for parsed_set in parsed.entity_sets[:MAX_ENTITY_SETS]:
-        known = None if stored_fields is None else stored_fields.get(parsed_set.name)
+        known = None if stored_sets is None else stored_sets.get(parsed_set.name)
         entry = _entity_set(parsed_set, known, room)
-        room -= len(entry["fields"])
-        truncated = truncated or len(entry["fields"]) < entry["fields_total"]
+        key_names = {k["name"] for k in entry["keys"]}
+        room -= sum(1 for f in entry["fields"] if f["name"] not in key_names)
+        truncated = truncated or entry["truncated"]
         entity_sets.append(entry)
     operations = [
         _operation(operation, stored_operations)
         for operation in parsed.operations[:MAX_OPERATIONS]
     ]
+    truncated = truncated or any(o["truncated"] for o in operations)
+
+    removed_sets: list[str] = []
+    removed_operations: list[str] = []
+    removed_complete = not parsed.truncated
+    if stored_sets is not None and stored_operations is not None and removed_complete:
+        in_document = {e.name for e in parsed.entity_sets}
+        removed_sets = [name for name in stored_sets if name not in in_document]
+        operations_in_document = {o.name for o in parsed.operations}
+        removed_operations = [
+            o["name"]
+            for o in _names((stored or {}).get("operations"))
+            if o["name"] not in operations_in_document
+        ]
     return {
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "entity_sets": entity_sets,
@@ -457,25 +622,134 @@ def build_preview(parsed: ParsedMetadata, stored: dict[str, Any] | None = None) 
             }
             for s in parsed.skipped[:MAX_PREVIEW_SKIPPED]
         ],
+        "removed_entity_sets": removed_sets,
+        "removed_operations": removed_operations,
+        "removed_complete": removed_complete,
         "summary": {
             "entity_sets": len(entity_sets),
             "operations": len(operations),
             "in_service": sum(1 for e in entity_sets if e["status"] == "in_service"),
             "changed": sum(1 for e in entity_sets if e["status"] == "changed"),
             "skipped": len(parsed.skipped),
+            "removed_entity_sets": len(removed_sets),
+            "removed_operations": len(removed_operations),
         },
         "truncated": truncated,
+        # Of the whole document. When the parser stopped early these count
+        # the declared ELEMENTS (also ones it would have skipped).
         "totals": {
-            "entity_sets": len(parsed.entity_sets),
-            "operations": len(parsed.operations),
+            "entity_sets": parsed.entity_sets_declared
+            if parsed.truncated
+            else len(parsed.entity_sets),
+            "operations": parsed.operations_declared
+            if parsed.truncated
+            else len(parsed.operations),
             "skipped": len(parsed.skipped),
         },
+        "warnings": [],
     }
 
 
-def parse_and_build(
-    document: bytes, version: str, stored: dict[str, Any] | None = None
+def _parse_and_build(
+    holder: list[bytearray], version: str, stored: dict[str, Any] | None
 ) -> dict[str, Any]:
-    """Parse ``document`` and build the preview. Synchronous CPU work: call
-    it through ``asyncio.to_thread``. Raises ``MetadataError``."""
-    return build_preview(parse_metadata(document, version), stored)  # type: ignore[arg-type]
+    """Parse the document in ``holder`` and build the preview. Synchronous
+    CPU work for a thread. The document is taken OUT of ``holder`` and let
+    go as soon as it is parsed, so that it does not live on next to the
+    tree and the answer."""
+    document = holder.pop()
+    parsed = parse_metadata(document, version)  # type: ignore[arg-type]
+    del document
+    return build_preview(parsed, stored)
+
+
+_active = 0
+
+
+def _release(job: asyncio.Future[Any]) -> None:
+    global _active
+    _active -= 1
+    if not job.cancelled():
+        job.exception()  # retrieved: an abandoned parse must not warn at exit
+
+
+async def run_preview(
+    destination: str,
+    service_path: str,
+    version: str,
+    user_context: bool,
+    stored: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fetch, parse and build one preview; :class:`PreviewError` otherwise.
+
+    One deadline (``PREVIEW_BUDGET_SECONDS``) for all of it and one of
+    ``MAX_CONCURRENT_PREVIEWS`` slots; see the module docstring. Writes the
+    one log line of a preview: what was asked, by whom, as whom it was
+    fetched (the destination's authentication type and whether it was
+    resolved for the user -- what happened, not what was asked), the
+    outcome, bytes and duration. No content, no host.
+    """
+    global _active
+    from agents.auth import current_principal
+
+    started = time.monotonic()
+    fetched: Fetched | None = None
+    job: asyncio.Future[Any] | None = None
+
+    def log(outcome: str, *args: Any) -> None:
+        logger.info(
+            "odata metadata preview " + outcome + ": destination=%s path=%s version=%s "
+            "by=%s user_context=%s auth_type=%s per_user=%s bytes=%d duration_ms=%d",
+            *args,
+            destination,
+            service_path,
+            version,
+            current_principal.get() or "unknown principal",
+            user_context is True,
+            (fetched.auth_type if fetched else "") or "-",
+            bool(fetched and fetched.per_user),
+            fetched.size if fetched else 0,
+            int((time.monotonic() - started) * 1000),
+        )
+
+    try:
+        if _active >= MAX_CONCURRENT_PREVIEWS:
+            raise PreviewError(429, "busy", _BUSY_TEXT)
+        _active += 1
+        try:
+            async with asyncio.timeout(PREVIEW_BUDGET_SECONDS):
+                fetched = await fetch_metadata(destination, service_path, user_context)
+                holder = [fetched.document] if fetched.document is not None else []
+                fetched.document = None
+                job = asyncio.ensure_future(
+                    asyncio.to_thread(_parse_and_build, holder, version, stored)
+                )
+                del holder
+                # The slot goes back when the THREAD ends, also when this
+                # request has long been answered or dropped.
+                job.add_done_callback(_release)
+                answer = await asyncio.shield(job)
+        except TimeoutError:
+            raise _timed_out() from None
+        except MetadataError as exc:  # fixed texts that never quote the document
+            raise PreviewError(422, "invalid_metadata", str(exc)) from None
+        finally:
+            if job is None:
+                _active -= 1
+    except PreviewError as exc:
+        log("refused (code=%s status=%d)", exc.code, exc.status)
+        raise
+    if (
+        user_context is True
+        and fetched is not None
+        and fetched.auth_type not in USER_PROPAGATING_AUTH_TYPES
+    ):
+        answer["warnings"].append({"code": "technical_credential", "message": _TECHNICAL_WARNING})
+    log(
+        "(entity_sets=%d operations=%d skipped=%d truncated=%s)",
+        answer["totals"]["entity_sets"],
+        answer["totals"]["operations"],
+        answer["totals"]["skipped"],
+        answer["truncated"],
+    )
+    return answer

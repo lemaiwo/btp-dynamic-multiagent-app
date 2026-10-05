@@ -114,9 +114,14 @@ class DestinationAuth(httpx.Auth):
         user_context: bool = False,
         expected_hosts: Iterable[str] = (),
         server_key: str = "",
+        retry_on_401: bool = True,
     ) -> None:
         self._resolver = resolver
         self.user_context = bool(user_context)
+        # False for a caller whose resolver is new for the one request it
+        # makes: there is no aged cache entry a second attempt could fix, so
+        # a retry would only repeat a refused logon.
+        self.retry_on_401 = bool(retry_on_401)
         self.expected_hosts = tuple(h.lower() for h in expected_hosts)
         self.server_key = server_key or "destination"
         self._proxy_noted = False
@@ -197,14 +202,26 @@ class DestinationAuth(httpx.Auth):
         for key, value in destination.headers.items():
             request.headers[key] = value
 
+    def send_through(self, request: httpx.Request, destination: Destination) -> None:
+        """Shape ``request`` for ``destination``, just before it is sent.
+
+        The extension point of this class: called once per attempt with the
+        destination that attempt resolved. A subclass may refuse the
+        destination first (raise a :class:`DestinationError`; nothing is
+        sent), must call ``super().send_through(...)`` to get the URL
+        rewrite, the https and host rules and the destination's headers,
+        and may pin headers of its own afterwards.
+        """
+        self._apply(request, destination)
+
     # -- the flow -----------------------------------------------------------
     async def async_auth_flow(self, request):  # type: ignore[override]
         token, principal = self._user()
         destination = await self._resolve(token, principal)
-        self._apply(request, destination)
+        self.send_through(request, destination)
         response = yield request
 
-        if response.status_code == 401:
+        if response.status_code == 401 and self.retry_on_401:
             # The cached entry aged out or was revoked. Drop it -- this user's
             # only, under user_context -- and retry exactly once. A second 401
             # is a real refusal and must not become a loop.
@@ -214,7 +231,7 @@ class DestinationAuth(httpx.Auth):
             else:
                 self._resolver.invalidate()
             destination = await self._resolve(token, principal, force=True)
-            self._apply(request, destination)
+            self.send_through(request, destination)
             yield request
 
     def sync_auth_flow(self, request):  # type: ignore[override]

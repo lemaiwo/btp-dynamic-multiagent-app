@@ -60,8 +60,19 @@ cannot be represented that way is left out and listed in
 ``ParsedMetadata.skipped`` (kind, owning entity set, position, a reason code
 from ``SKIP_REASONS`` -- never a name that failed the EDM rule or other
 document text); one odd element does not make the whole service unreadable.
-A property or navigation of a type that several entity sets share is
-recorded once per set, with a position relative to that set's type chain.
+A skipped PROPERTY of a type that several entity sets share is recorded once,
+under the first entity set of the result that has the type; a skipped
+navigation is recorded per set (its target depends on the set). Positions
+are relative to the set's type chain.
+
+A remote system chooses this document, so the work it can cause is bounded
+here and not by its size alone: fields and keys are built once per entity
+type and shared by the sets that have it, at most ``MAX_PARSED_ENTITY_SETS``
+entity sets and ``MAX_PARSED_OPERATIONS`` operations are built (the rest are
+only counted: ``ParsedMetadata.truncated``, ``entity_sets_declared``,
+``operations_declared``), and one budget (``MAX_PARSE_WORK``: properties,
+navigations, parameters and skipped entries examined) ends the parse with a
+fixed-text ``MetadataError`` instead of letting it run on.
 
 ``parse_metadata`` is synchronous CPU work (up to ``MAX_METADATA_BYTES`` of
 XML): a route or tool must call it through ``asyncio.to_thread`` and not on
@@ -78,9 +89,21 @@ from dataclasses import dataclass
 from typing import Literal
 from xml.parsers import expat
 
-from .models import EDM_NAME_RE, KeyDef, ParamDef
+from .models import EDM_NAME_RE, MAX_ENTITY_SETS, MAX_OPERATIONS, KeyDef, ParamDef
 
 MAX_METADATA_BYTES = 20_000_000
+# How many entity sets and operations are BUILT: twice what a catalogue
+# service can hold, so a consumer that shows the catalogue's limit can still
+# say "there are more". Elements past the cap are counted, not read.
+MAX_PARSED_ENTITY_SETS = 2 * MAX_ENTITY_SETS
+MAX_PARSED_OPERATIONS = 2 * MAX_OPERATIONS
+# The work budget of one parse, in elements examined after the tree is
+# built: properties (once per entity type and set-level variant),
+# navigations and bindings (per set), parameters, inheritance links, and
+# every skipped entry recorded. A large real service is a few thousand; the
+# cap is what keeps "sets x properties" from being chosen by the document.
+# Read at call time.
+MAX_PARSE_WORK = 200_000
 # EDMX is shallow (Edmx > DataServices > Schema > EntityType > Key >
 # PropertyRef; V4 annotations nest a little deeper). A cap keeps a hostile
 # document from building a tree that is expensive to walk or free.
@@ -209,9 +232,9 @@ class SkippedElement:
     on into a preview or a log. ``entity_set`` is a name that passed the
     rule (for kind ``entity_set`` the element's own, already valid, name).
     ``position`` is how the admin finds the element in the ``$metadata``. A
-    property or navigation of a type that several entity sets share is
-    recorded once per set, with a position relative to that set's type
-    chain.
+    property of a type that several entity sets share is recorded once
+    (under the first set of the result with that type), a navigation once
+    per set; the position is relative to the set's type chain.
     """
 
     kind: str  # "entity_set" | "property" | "navigation" | "operation"
@@ -226,6 +249,54 @@ class ParsedMetadata:
     entity_sets: tuple[ParsedEntitySet, ...]
     operations: tuple[ParsedOperation, ...]
     skipped: tuple[SkippedElement, ...] = ()
+    # True when the document declares more entity sets or operations than
+    # are built (`MAX_PARSED_ENTITY_SETS` / `MAX_PARSED_OPERATIONS`). What
+    # lies past the cap was not read: it is in none of the tuples above, a
+    # navigation to such a set is skipped as `unresolved_target`, and an
+    # operation bound to its type is not bound.
+    truncated: bool = False
+    # How many `EntitySet` elements, and how many operation elements
+    # (`FunctionImport` in V2, `Action` + `Function` in V4), the document
+    # declares -- including those skipped and those past the cap.
+    entity_sets_declared: int = 0
+    operations_declared: int = 0
+    # The work the parse spent, in the units of `MAX_PARSE_WORK`.
+    work: int = 0
+
+
+class _Work:
+    """The work budget of one parse (`MAX_PARSE_WORK`)."""
+
+    def __init__(self) -> None:
+        self.spent = 0
+        self.truncated = False
+
+    def spend(self, units: int = 1) -> None:
+        self.spent += units
+        if self.spent > MAX_PARSE_WORK:
+            raise MetadataError(
+                f"the $metadata document is too large to read: its entity sets and "
+                f"operations have more than {MAX_PARSE_WORK} properties, navigations "
+                f"and parameters in all"
+            )
+
+
+class _Skips(list):  # of SkippedElement
+    """A list of skipped elements that charges the work budget per entry:
+    a document of nothing but invalid or duplicate elements is bounded too."""
+
+    def __init__(self, work: _Work) -> None:
+        super().__init__()
+        self._work = work
+
+    def append(self, item: SkippedElement) -> None:
+        self._work.spend()
+        super().append(item)
+
+    def extend(self, items) -> None:  # type: ignore[no-untyped-def]
+        items = list(items)
+        self._work.spend(len(items))
+        super().extend(items)
 
 
 # --------------------------------------------------------------- safe parsing
@@ -379,8 +450,10 @@ class _Schemas:
     the canonical ``Namespace.Name``.
     """
 
-    def __init__(self, schemas: list[ET.Element]) -> None:
+    def __init__(self, schemas: list[ET.Element], work: _Work | None = None) -> None:
         self.elements = schemas
+        self.work = work or _Work()
+        self._chains: dict[int, list[ET.Element]] = {}
         self.entity_types: dict[str, tuple[str, ET.Element]] = {}
         self.associations: dict[str, tuple[str, ET.Element]] = {}
         self.containers: list[ET.Element] = []
@@ -444,15 +517,23 @@ class _Schemas:
         return found[0] if found else (ref or "").strip()
 
     def chain(self, element: ET.Element) -> list[ET.Element]:
-        """The type and its base types, base first."""
+        """The type and its base types, base first. Built once per type and
+        shared: callers only read it."""
+        known = self._chains.get(id(element))
+        if known is not None:
+            return known
         chain = [element]
         seen = {id(element)}
         while True:
-            base = self.entity_type(chain[0].get("BaseType"))
+            self.work.spend()
+            base = self.entity_type(chain[-1].get("BaseType"))
             if base is None or id(base[1]) in seen:
-                return chain
+                break
             seen.add(id(base[1]))
-            chain.insert(0, base[1])
+            chain.append(base[1])
+        chain.reverse()
+        self._chains[id(element)] = chain
+        return chain
 
 
 # ---------------------------------------------------- entity sets, both versions
@@ -499,13 +580,28 @@ def _keys(chain: list[ET.Element], fields: tuple[ParsedField, ...]) -> tuple[Key
     return ()
 
 
+_NO_KEY_MEMO = object()
+
+
 def _entity_set_drafts(
     schemas: _Schemas, skipped: list[SkippedElement], fields_of: _FieldsOf
-) -> dict[str, _SetDraft]:
+) -> tuple[dict[str, _SetDraft], int]:
+    """The entity sets of the result, and how many the document declares.
+
+    At most ``MAX_PARSED_ENTITY_SETS`` are built; the elements after that
+    are counted only (``schemas.work.truncated``). The key is worked out
+    once per entity type: every variant of a type's fields has the same
+    names and types.
+    """
     drafts: dict[str, _SetDraft] = {}
+    key_memo: dict[int, tuple[KeyDef, ...] | None] = {}
+    declared = sum(len(container.findall("EntitySet")) for container in schemas.containers)
     position = 0
     for container in schemas.containers:
         for element in container.findall("EntitySet"):
+            if len(drafts) >= MAX_PARSED_ENTITY_SETS:
+                schemas.work.truncated = True
+                return drafts, declared
             position += 1
             name = _name(element)
             if name is None:
@@ -523,7 +619,11 @@ def _entity_set_drafts(
             # so the admin sees it exists instead of wondering where it went.
             chain = schemas.chain(resolved[1]) if resolved else []
             fields, skipped_fields = fields_of(chain, name, container, element)
-            keys = _keys(chain, fields)
+            memo_key = id(chain[-1]) if chain else 0
+            keys = key_memo.get(memo_key, _NO_KEY_MEMO)  # type: ignore[assignment]
+            if keys is _NO_KEY_MEMO:
+                schemas.work.spend(len(fields))
+                keys = key_memo[memo_key] = _keys(chain, fields)
             if keys is None:
                 # One entry for the whole set; its properties are not listed.
                 skipped.append(SkippedElement("entity_set", name, position, "unrepresentable_key"))
@@ -539,7 +639,7 @@ def _entity_set_drafts(
                 fields=fields,
                 keys=keys,
             )
-    return drafts
+    return drafts, declared
 
 
 def _sets_by_type(drafts: dict[str, _SetDraft]) -> dict[str, list[str]]:
@@ -554,13 +654,14 @@ def _sets_by_type(drafts: dict[str, _SetDraft]) -> dict[str, list[str]]:
 
 
 def _v2_fields(
-    chain: list[ET.Element], set_name: str
+    chain: list[ET.Element], set_name: str, work: _Work
 ) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
     fields: dict[str, ParsedField] = {}
     skipped: list[SkippedElement] = []
     position = 0
     for entity_type in chain:
         for prop in entity_type.findall("Property"):
+            work.spend()
             position += 1
             name, type_name = _name(prop), _type_name(prop)
             if name is None or type_name is None:
@@ -582,6 +683,27 @@ def _v2_fields(
     return tuple(fields.values()), skipped
 
 
+def _v2_fields_of(work: _Work) -> _FieldsOf:
+    """``_v2_fields`` once per entity type. In V2 a field depends on its
+    type alone, so the sets of one type share one tuple; the type's skipped
+    properties are handed out with the first of them only."""
+    memo: dict[int, tuple[ParsedField, ...]] = {}
+
+    def fields_of(
+        chain: list[ET.Element], name: str, _container: ET.Element, _element: ET.Element
+    ) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
+        if not chain:
+            return (), []
+        known = memo.get(id(chain[-1]))
+        if known is not None:
+            return known, []
+        fields, skipped = _v2_fields(chain, name, work)
+        memo[id(chain[-1])] = fields
+        return fields, skipped
+
+    return fields_of
+
+
 def _v2_navigations(
     draft: _SetDraft,
     schemas: _Schemas,
@@ -592,6 +714,7 @@ def _v2_navigations(
     position = 0
     for entity_type in draft.chain:
         for nav in entity_type.findall("NavigationProperty"):
+            schemas.work.spend()
             position += 1
             name = _name(nav)
             if name is None:
@@ -642,6 +765,7 @@ def _v2_operation(
         return "unsupported_http_method"
     parameters: dict[str, ParamDef] = {}
     for param in element.findall("Parameter"):
+        schemas.work.spend()
         # Out parameters are part of the answer, not of the call.
         if (param.get("Mode") or "In").strip().lower() == "out":
             continue
@@ -699,6 +823,8 @@ def _v2_navigation_targets(
                 (end.get("Role") or "", end.get("EntitySet") or "")
                 for end in element.findall("End")
             ]
+            # Every pair of ends is looked at: two in a real association set.
+            schemas.work.spend(len(ends) * len(ends))
             for from_role, from_set in ends:
                 for to_role, to_set in ends:
                     if from_role == to_role or from_set not in drafts or to_set not in drafts:
@@ -710,12 +836,11 @@ def _v2_navigation_targets(
 
 
 def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
-    skipped: list[SkippedElement] = []
+    work = schemas.work
+    skipped: list[SkippedElement] = _Skips(work)
     # Pass 1: which entity sets exist in the result. Navigations and bindings
     # are resolved afterwards, against these only.
-    drafts = _entity_set_drafts(
-        schemas, skipped, lambda chain, name, _container, _element: _v2_fields(chain, name)
-    )
+    drafts, sets_declared = _entity_set_drafts(schemas, skipped, _v2_fields_of(work))
     sets_by_type = _sets_by_type(drafts)
     targets = _v2_navigation_targets(schemas, drafts)
 
@@ -738,9 +863,15 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
         )
 
     operations: dict[str, ParsedOperation] = {}
+    operations_declared = sum(
+        len(container.findall("FunctionImport")) for container in schemas.containers
+    )
     position = 0
     for container in schemas.containers:
         for element in container.findall("FunctionImport"):
+            if len(operations) >= MAX_PARSED_OPERATIONS:
+                work.truncated = True
+                break
             position += 1
             operation = _v2_operation(element, schemas, sets_by_type)
             if isinstance(operation, str):
@@ -755,6 +886,10 @@ def _parse_v2(schemas: _Schemas) -> ParsedMetadata:
         entity_sets=tuple(entity_sets),
         operations=tuple(operations.values()),
         skipped=tuple(skipped),
+        truncated=work.truncated,
+        entity_sets_declared=sets_declared,
+        operations_declared=operations_declared,
+        work=work.spent,
     )
 
 
@@ -888,57 +1023,115 @@ def _expression(element: ET.Element, kind: str) -> str | None:
     return None if child is None else child.text or ""
 
 
-def _v4_fields(
-    chain: list[ET.Element],
-    set_name: str,
-    set_target: str,
-    set_element: ET.Element,
-    schemas: _Schemas,
-    annotations: _Annotations,
-) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
-    # These restrictions belong to the entity SET, not to the type: the same
-    # property can be filterable in one set and not in another.
-    def listed(term: str, prop: str) -> set[str]:
-        return annotations.property_paths(term, prop, set_element, set_target)
+# One property of a type chain as every set of the type sees it: position,
+# then either a skip reason or (name, type, label, computed, immutable, nullable).
+_V4Prop = tuple[int, str | None, tuple[str, str, str, bool, bool, bool] | None]
 
-    nothing_filterable = annotations.declared_false(
-        _TERM_FILTER, "Filterable", set_element, set_target
-    )
-    non_filterable = listed(_TERM_FILTER, "NonFilterableProperties")
-    non_insertable = listed(_TERM_INSERT, "NonInsertableProperties")
-    non_updatable = listed(_TERM_UPDATE, "NonUpdatableProperties")
 
-    fields: dict[str, ParsedField] = {}
-    skipped: list[SkippedElement] = []
+def _v4_type_properties(
+    chain: list[ET.Element], schemas: _Schemas, annotations: _Annotations
+) -> list[_V4Prop]:
+    """What the TYPE says about each property; the same for every set of it."""
+    properties: list[_V4Prop] = []
     position = 0
     for entity_type in chain:
         declaring_type = schemas.name_of(entity_type)
         for prop in entity_type.findall("Property"):
+            schemas.work.spend()
             position += 1
             name, type_name = _name(prop), _type_name(prop, default="")
             if name is None or type_name is None:
                 reason = "invalid_name" if name is None else "invalid_type"
-                skipped.append(SkippedElement("property", set_name, position, reason))
+                properties.append((position, reason, None))
                 continue
             # A block annotates the property on the type that declares it.
             target = f"{declaring_type}/{name}"
-            # Computed: the server sets it, a client never does. Immutable:
-            # a client may set it when creating, not afterwards.
-            computed = annotations.declared_true(_TERM_COMPUTED, prop, target)
-            immutable = annotations.declared_true(_TERM_IMMUTABLE, prop, target)
+            properties.append(
+                (
+                    position,
+                    None,
+                    (
+                        name,
+                        type_name,
+                        annotations.label(prop, target),
+                        # Computed: the server sets it, a client never does.
+                        # Immutable: a client may set it when creating, not
+                        # afterwards.
+                        annotations.declared_true(_TERM_COMPUTED, prop, target),
+                        annotations.declared_true(_TERM_IMMUTABLE, prop, target),
+                        (prop.get("Nullable") or "").strip().lower() != "false",
+                    ),
+                )
+            )
+    return properties
+
+
+def _v4_fields_of(schemas: _Schemas, annotations: _Annotations) -> _FieldsOf:
+    """The fields of an entity set, built once per type and set-level variant.
+
+    The restrictions below belong to the entity SET, not to the type: the
+    same property can be filterable in one set and not in another. Sets of
+    one type that declare the same restrictions (most declare none) share
+    one tuple, and the type's skipped properties are handed out with the
+    first set only.
+    """
+    work = schemas.work
+    by_type: dict[int, list[_V4Prop]] = {}
+    variants: dict[tuple, tuple[ParsedField, ...]] = {}
+
+    def fields_of(
+        chain: list[ET.Element], set_name: str, container: ET.Element, set_element: ET.Element
+    ) -> tuple[tuple[ParsedField, ...], list[SkippedElement]]:
+        if not chain:
+            return (), []
+        set_target = f"{schemas.name_of(container)}/{set_name}"
+
+        def listed(term: str, prop: str) -> frozenset[str]:
+            return frozenset(annotations.property_paths(term, prop, set_element, set_target))
+
+        nothing_filterable = annotations.declared_false(
+            _TERM_FILTER, "Filterable", set_element, set_target
+        )
+        non_filterable = listed(_TERM_FILTER, "NonFilterableProperties")
+        non_insertable = listed(_TERM_INSERT, "NonInsertableProperties")
+        non_updatable = listed(_TERM_UPDATE, "NonUpdatableProperties")
+
+        type_id = id(chain[-1])
+        skipped: list[SkippedElement] = []
+        properties = by_type.get(type_id)
+        if properties is None:
+            properties = by_type[type_id] = _v4_type_properties(chain, schemas, annotations)
+            skipped = [
+                SkippedElement("property", set_name, position, reason)
+                for position, reason, _ in properties
+                if reason is not None
+            ]
+        variant = (type_id, nothing_filterable, non_filterable, non_insertable, non_updatable)
+        known = variants.get(variant)
+        if known is not None:
+            return known, skipped
+        work.spend(len(properties))
+        fields: dict[str, ParsedField] = {}
+        for _position, _reason, parsed in properties:
+            if parsed is None:
+                continue
+            name, type_name, label, computed, immutable, nullable = parsed
             fields.setdefault(
                 name,
                 ParsedField(
                     name=name,
                     type=type_name,
-                    label=annotations.label(prop, target),
+                    label=label,
                     filterable=not nothing_filterable and name not in non_filterable,
                     creatable=not computed and name not in non_insertable,
                     updatable=not computed and not immutable and name not in non_updatable,
-                    nullable=(prop.get("Nullable") or "").strip().lower() != "false",
+                    nullable=nullable,
                 ),
             )
-    return tuple(fields.values()), skipped
+        variants[variant] = tuple(fields.values())
+        return variants[variant], skipped
+
+    return fields_of
 
 
 def _v4_bindings(
@@ -956,6 +1149,7 @@ def _v4_bindings(
     """
     bindings: dict[str, str] = {}
     for binding in draft.element.findall("NavigationPropertyBinding"):
+        schemas.work.spend()
         path = (binding.get("Path") or "").strip()
         if not path:
             continue
@@ -974,13 +1168,14 @@ def _v4_bindings(
 
 
 def _v4_navigations(
-    draft: _SetDraft, bindings: dict[str, str]
+    draft: _SetDraft, bindings: dict[str, str], work: _Work
 ) -> tuple[tuple[ParsedNavigation, ...], list[SkippedElement]]:
     navigations: dict[str, ParsedNavigation] = {}
     skipped: list[SkippedElement] = []
     position = 0
     for entity_type in draft.chain:
         for nav in entity_type.findall("NavigationProperty"):
+            work.spend()
             position += 1
             name = _name(nav)
             type_ref = (nav.get("Type") or "").strip()
@@ -1004,7 +1199,7 @@ def _v4_navigations(
 
 
 def _v4_parameters(
-    element: ET.Element, kind: str, bound: bool, annotations: _Annotations
+    element: ET.Element, kind: str, bound: bool, annotations: _Annotations, work: _Work
 ) -> tuple[ParamDef, ...] | None:
     """The parameters of the call, ``None`` when one cannot be represented.
 
@@ -1013,6 +1208,7 @@ def _v4_parameters(
     """
     parameters: dict[str, ParamDef] = {}
     for param in element.findall("Parameter")[1 if bound else 0 :]:
+        work.spend()
         name, type_name = _name(param), _type_name(param, default="")
         if name is None or type_name is None:
             return None
@@ -1054,7 +1250,7 @@ def _v4_operation(
     if name is None or not _NAME_RE.fullmatch(qualified):
         return ["invalid_name"]
     bound = (element.get("IsBound") or "").strip().lower() == "true"
-    parameters = _v4_parameters(element, kind, bound, annotations)
+    parameters = _v4_parameters(element, kind, bound, annotations, schemas.work)
     if parameters is None:
         return ["invalid_parameter"]
     http_method = "POST" if kind == "action" else "GET"
@@ -1083,6 +1279,7 @@ def _v4_operation(
 
     outcomes: list[ParsedOperation | str] = []
     for container, imported in imports.get((kind, qualified), []):
+        schemas.work.spend()
         import_name = _name(imported)
         if import_name is None:
             outcomes.append("invalid_name")
@@ -1104,19 +1301,16 @@ def _v4_operation(
 
 def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
     annotations = _Annotations(root, schemas)
-    skipped: list[SkippedElement] = []
+    work = schemas.work
+    skipped: list[SkippedElement] = _Skips(work)
 
     def set_target(container: ET.Element, name: str) -> str:
         return f"{schemas.name_of(container)}/{name}"
 
     # Pass 1: which entity sets exist in the result. Navigations and bindings
     # are resolved afterwards, against these only.
-    drafts = _entity_set_drafts(
-        schemas,
-        skipped,
-        lambda chain, name, container, element: _v4_fields(
-            chain, name, set_target(container, name), element, schemas, annotations
-        ),
+    drafts, sets_declared = _entity_set_drafts(
+        schemas, skipped, _v4_fields_of(schemas, annotations)
     )
     sets_by_type = _sets_by_type(drafts)
 
@@ -1124,7 +1318,7 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
     for draft in drafts.values():
         target = set_target(draft.container, draft.name)
         navigations, skipped_navigations = _v4_navigations(
-            draft, _v4_bindings(draft, schemas, drafts)
+            draft, _v4_bindings(draft, schemas, drafts), work
         )
         skipped.extend(skipped_navigations)
         entity_sets.append(
@@ -1163,6 +1357,12 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
             imports.setdefault(key, []).append((container, child))
 
     operations: dict[str, ParsedOperation] = {}
+    operations_declared = sum(
+        1
+        for schema in schemas.elements
+        for element in schema
+        if element.tag in ("Action", "Function")
+    )
     position = 0
     for schema in schemas.elements:
         namespace = (schema.get("Namespace") or "").strip()
@@ -1170,6 +1370,9 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
             kind = {"Action": "action", "Function": "function"}.get(element.tag)
             if kind is None:
                 continue
+            if len(operations) >= MAX_PARSED_OPERATIONS:
+                work.truncated = True
+                break
             position += 1
             for outcome in _v4_operation(
                 element, kind, namespace, schemas, annotations, sets_by_type, imports
@@ -1191,6 +1394,10 @@ def _parse_v4(root: ET.Element, schemas: _Schemas) -> ParsedMetadata:
         entity_sets=tuple(entity_sets),
         operations=tuple(operations.values()),
         skipped=tuple(skipped),
+        truncated=work.truncated,
+        entity_sets_declared=sets_declared,
+        operations_declared=operations_declared,
+        work=work.spent,
     )
 
 
@@ -1208,7 +1415,10 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     if not isinstance(xml, (bytes, bytearray, memoryview)):
         # Text would have lost the document's own encoding declaration.
         raise MetadataError("the $metadata document must be passed as bytes")
-    xml = bytes(xml)
+    if isinstance(xml, memoryview):
+        xml = bytes(xml)
+    # bytes and bytearray are parsed as they are: no second copy of a
+    # document that may be `MAX_METADATA_BYTES` long.
     if len(xml) > MAX_METADATA_BYTES:
         raise MetadataError(f"the $metadata document is larger than {MAX_METADATA_BYTES} bytes")
     if _DTD_RE.search(xml):
@@ -1227,6 +1437,7 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     schemas = list(root.iter("Schema"))
     if not schemas:
         raise MetadataError(_NOT_EDMX)
+    work = _Work()
     if is_v4:
-        return _parse_v4(root, _Schemas(schemas))
-    return _parse_v2(_Schemas(schemas))
+        return _parse_v4(root, _Schemas(schemas, work))
+    return _parse_v2(_Schemas(schemas, work))

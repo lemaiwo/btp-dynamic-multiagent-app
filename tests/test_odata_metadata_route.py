@@ -85,15 +85,25 @@ ENTITY_SET_KEYS = {
     "entity_type",
     "label",
     "keys",
+    "keys_total",
     "fields",
     "fields_total",
     "navigations",
-    "capabilities",
+    "navigations_total",
+    "declared",
     "status",
     "new_fields",
+    "new_fields_total",
     "removed_fields",
+    "changed_keys",
+    "changed_types",
+    "truncated",
 }
-FIELD_KEYS = {"name", "type", "label", "filterable", "creatable", "updatable"}
+FIELD_KEYS = {"name", "type", "label", "declared"}
+# The names of the catalogue's switches: never a key of a preview field,
+# entity set or operation, so that spreading one into a definition cannot
+# switch anything on.
+SWITCHES = {"filterable", "selectable", "writable", "enabled", "operations", "changes_data"}
 OPERATION_KEYS = {
     "name",
     "qualified_name",
@@ -101,19 +111,24 @@ OPERATION_KEYS = {
     "http_method",
     "bound_to",
     "parameters",
+    "parameters_total",
     "label",
     "status",
-    "changes_data",
-    "changes_data_known",
+    "suggested",
+    "truncated",
 }
 TOP_KEYS = {
     "fetched_at",
     "entity_sets",
     "operations",
     "skipped",
+    "removed_entity_sets",
+    "removed_operations",
+    "removed_complete",
     "summary",
     "truncated",
     "totals",
+    "warnings",
 }
 
 
@@ -127,6 +142,24 @@ def request(**patch: Any) -> dict[str, Any]:
     data = copy.deepcopy(REQUEST)
     data.update(patch)
     return data
+
+
+def unread(handler):
+    """``handler`` with its answers as a real transport hands them over: a
+    body that is still to be read. (A response built with ``content=`` is
+    already read, and the fetch reads the raw stream.)"""
+
+    def respond(req: httpx.Request) -> httpx.Response:
+        response = handler(req)
+        if not response.is_stream_consumed and not response.is_closed:
+            return response
+        return httpx.Response(
+            response.status_code,
+            headers=response.headers,
+            stream=httpx.ByteStream(response.content),
+        )
+
+    return respond
 
 
 class Remote:
@@ -154,8 +187,18 @@ def remote(monkeypatch) -> Remote:
         return state.resolver
 
     monkeypatch.setattr(preview, "_resolver", resolver)
-    monkeypatch.setattr(preview, "_transport", lambda: state.sap.transport())
+    monkeypatch.setattr(
+        preview, "_transport", lambda: httpx.MockTransport(unread(state.sap.handler))
+    )
     return state
+
+
+@pytest.fixture(autouse=True)
+def _every_slot_is_given_back():
+    """Whatever a test did, no preview slot stays taken."""
+    assert preview._active == 0
+    yield
+    assert preview._active == 0
 
 
 @pytest.fixture(autouse=True)
@@ -213,8 +256,10 @@ async def test_v2_preview_lists_what_the_document_declares(client, remote, caplo
     assert header["entity_type"] == "PURCHASEREQ_SRV.A_PurchaseRequisitionHeaderType"
     assert header["label"] == "Purchase requisition"
     assert header["keys"] == [{"name": "PurchaseRequisition", "type": "Edm.String"}]
-    assert header["capabilities"] == {"creatable": True, "updatable": True, "deletable": False}
-    assert item["capabilities"] == {"creatable": False, "updatable": True, "deletable": False}
+    assert header["declared"] == {"creatable": True, "updatable": True, "deletable": False}
+    assert item["declared"] == {"creatable": False, "updatable": True, "deletable": False}
+    assert header["keys_total"] == 1 and header["navigations_total"] == 1
+    assert header["truncated"] is False and header["changed_keys"] is False
     assert header["navigations"] == [
         {"name": "to_PurchaseReqnItem", "target": "A_PurchaseRequisitionItem", "collection": True}
     ]
@@ -223,9 +268,7 @@ async def test_v2_preview_lists_what_the_document_declares(client, remote, caplo
         "name": "PurchaseRequisition",
         "type": "Edm.String",
         "label": header["fields"][0]["label"],
-        "filterable": True,
-        "creatable": False,
-        "updatable": False,
+        "declared": {"filterable": True, "creatable": False, "updatable": False},
     }
     assert header["fields_total"] == 3 and item["fields_total"] == 10
     # Without `service` everything is new.
@@ -242,13 +285,18 @@ async def test_v2_preview_lists_what_the_document_declares(client, remote, caplo
         "type": "Edm.String",
         "required": False,
     }
-    assert body["skipped"] == [] and body["truncated"] is False
+    assert operation["parameters_total"] == 3 and operation["truncated"] is False
+    assert body["skipped"] == [] and body["truncated"] is False and body["warnings"] == []
+    assert body["removed_entity_sets"] == [] and body["removed_operations"] == []
+    assert body["removed_complete"] is True
     assert body["summary"] == {
         "entity_sets": 2,
         "operations": 1,
         "in_service": 0,
         "changed": 0,
         "skipped": 0,
+        "removed_entity_sets": 0,
+        "removed_operations": 0,
     }
     assert body["totals"] == {"entity_sets": 2, "operations": 1, "skipped": 0}
 
@@ -282,7 +330,7 @@ async def test_v4_preview(client, remote):
         "PurchaseRequisitionItem",
     ]
     assert body["entity_sets"][1]["label"] == ""
-    assert body["entity_sets"][1]["capabilities"] == {
+    assert body["entity_sets"][1]["declared"] == {
         "creatable": False,
         "updatable": False,
         "deletable": True,
@@ -301,19 +349,19 @@ async def test_changes_data_is_suggested_per_kind(client, remote):
     remote.answer(xml(V4))
     r = await client.post(URL, json=request(odata_version="v4"))
     release, count = r.json()["operations"]
-    assert (release["changes_data"], release["changes_data_known"]) == (True, True)
-    assert (count["changes_data"], count["changes_data_known"]) == (False, True)
+    assert release["suggested"] == {"changes_data": True, "known": True}
+    assert count["suggested"] == {"changes_data": False, "known": True}
     # V2: a POST function import changes data ...
     remote.answer(xml(V2))
     (post,) = (await client.post(URL, json=REQUEST)).json()["operations"]
-    assert (post["changes_data"], post["changes_data_known"]) == (True, True)
+    assert post["suggested"] == {"changes_data": True, "known": True}
     # ... and of a GET one nothing is known: it is treated as changing.
     as_get = V2.replace(b'm:HttpMethod="POST"', b'm:HttpMethod="GET"')
     assert as_get != V2
     remote.answer(xml(as_get))
     (get,) = (await client.post(URL, json=REQUEST)).json()["operations"]
     assert get["http_method"] == "GET"
-    assert (get["changes_data"], get["changes_data_known"]) == (True, False)
+    assert get["suggested"] == {"changes_data": True, "known": False}
 
 
 async def test_nothing_in_the_preview_is_enabled(client, remote):
@@ -334,8 +382,12 @@ async def test_nothing_in_the_preview_is_enabled(client, remote):
             "personal_data",
             "title",
         }
-        # An entity set carries no list of enabled operations.
-        assert all("operations" not in e for e in body["entity_sets"])
+        # No field, entity set or operation has a key named like a switch
+        # of the catalogue: what the service declares is nested.
+        items = body["entity_sets"] + body["operations"]
+        items += [f for e in body["entity_sets"] for f in e["fields"]]
+        assert items and not any(set(item) & SWITCHES for item in items)
+        assert all(set(f) == FIELD_KEYS for e in body["entity_sets"] for f in e["fields"])
 
 
 async def test_what_the_parser_skipped_is_passed_through(client, remote):
@@ -424,8 +476,14 @@ async def test_the_preview_has_a_field_budget_over_all_entity_sets(client, remot
     remote.answer(xml(big_v2(3, 4, 0)))
     body = (await client.post(URL, json=REQUEST)).json()
     assert body["truncated"] is True
-    assert [len(e["fields"]) for e in body["entity_sets"]] == [4, 1, 0]
+    # The key field (F0) costs no budget and is never cut.
+    assert [[f["name"] for f in e["fields"]] for e in body["entity_sets"]] == [
+        ["F0", "F1", "F2", "F3"],
+        ["F0", "F1", "F2"],
+        ["F0"],
+    ]
     assert [e["fields_total"] for e in body["entity_sets"]] == [4, 4, 4]
+    assert [e["truncated"] for e in body["entity_sets"]] == [False, True, True]
 
 
 async def test_an_untruncated_document_at_the_limits_is_not_flagged(client, remote):
@@ -615,7 +673,7 @@ async def test_an_unreachable_service_names_no_host(client, remote, caplog):
 
 
 async def test_the_fetch_has_a_total_timeout(client, remote, monkeypatch):
-    monkeypatch.setattr(preview, "FETCH_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(preview, "PREVIEW_BUDGET_SECONDS", 0.05)
 
     async def slow(_request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(5)
@@ -642,7 +700,7 @@ async def test_a_destination_that_cannot_be_resolved(client, remote, caplog):
     remote.resolver = Broken()
     r = await client.post(URL, json=REQUEST)
     assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
-    assert "S4_ODATA_TECH" not in r.json()["detail"] or SECRET not in r.text
+    assert r.json() == {"detail": preview._DESTINATION_TEXT}
     assert SECRET not in r.text and SECRET not in caplog.text
     assert remote.requests == []
 
@@ -801,6 +859,8 @@ async def test_the_compare_uses_the_stored_definition(client, remote):
     # The stored hints and switches never travel in this answer ...
     assert "HINT-TEXT" not in r.text and "Stored title" not in r.text
     assert not {key for key, _ in walk(body)} & {"enabled", "selectable", "writable", "hint"}
+    assert item["changed_keys"] is False and item["changed_types"] == []
+    assert body["removed_entity_sets"] == [] and body["removed_operations"] == []
     # ... and the service is exactly as it was.
     assert (await client.get(f"{SERVICES}/purchase-requisitions")).json() == stored
 
@@ -991,16 +1051,395 @@ def test_fit_still_marks_a_cut_in_a_column_with_room():
     assert cut is not None and len(cut) == 18 and cut.startswith("x~")
 
 
-def test_the_audit_docstrings_name_both_updating_statements_and_the_limits():
-    from agents.odata import audit
-    from agents.odata.admin_routes import api_list_odata_audit
+# ---------------------------------------------------------- review round 1
 
-    for doc in (audit.__doc__, ODataAuditLog.__doc__):
-        text_ = " ".join((doc or "").split())
-        assert "``result``" in text_ and "``abandon``" in text_
-        assert "No other statement updates a row" not in text_
-        assert "Nothing else updates a row" not in text_
-    route = " ".join((api_list_odata_audit.__doc__ or "").split())
-    assert "``sent_as`` matches the STORED form" in route
-    assert "committed late" in route and "read again from the top" in route
-    assert "audit not confirmed" in route and "intent timeout" in route
+
+def test_fit_logs_a_plain_cut_once(caplog, monkeypatch):
+    from types import SimpleNamespace
+
+    from agents.odata import audit
+
+    monkeypatch.setattr(audit, "_cut_warned", set())
+    caplog.set_level(logging.WARNING, logger=audit.audit_logger.name)
+    column = SimpleNamespace(name="narrow", type=SimpleNamespace(length=4))
+    assert audit._fit("abcdefgh-SECRET", column) == "abcd"
+    assert audit._fit("abcdefgh-SECRET", column) == "abcd"
+    lines = [r.getMessage() for r in caplog.records if "narrow" in r.getMessage()]
+    assert len(lines) == 1 and "cut plainly" in lines[0] and SECRET not in caplog.text
+
+
+async def test_a_compressed_answer_is_refused_without_being_inflated(client, remote):
+    import gzip
+
+    stream = Chunks(count=50, size=1000)
+    packed = gzip.compress(V2)
+    for response in (
+        httpx.Response(
+            200,
+            headers={"content-type": "application/xml", "content-encoding": "gzip"},
+            stream=stream,
+        ),
+        httpx.Response(
+            200,
+            headers={
+                "content-type": "application/xml",
+                "content-encoding": "GZIP",
+                "content-length": str(len(packed)),
+            },
+            stream=httpx.ByteStream(packed),
+        ),
+        httpx.Response(
+            200, headers={"content-type": "application/xml", "content-encoding": "br"}, content=b"x"
+        ),
+    ):
+        remote.answer(lambda _request, response=response: response)
+        r = await client.post(URL, json=REQUEST)
+        assert r.status_code == 502, r.text
+        assert r.headers["x-odata-error"] == "not_xml"
+    # Not one chunk of the compressed body was read.
+    assert stream.served == 0 and stream.closed
+
+
+async def test_identity_encoding_is_read_raw(client, remote):
+    remote.answer(xml(V2, **{"content-encoding": "identity"}))
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 200 and r.json()["summary"]["entity_sets"] == 2
+
+
+async def test_a_destination_header_cannot_change_what_the_fetch_asks_for(client, remote):
+    remote.resolver = FakeResolver(
+        name="S4_ODATA_TECH",
+        headers={
+            "Authorization": "Bearer dest-token",
+            "Accept-Encoding": "gzip, br",
+            "Accept": "text/html",
+            "X-Custom": "kept",
+        },
+    )
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 200
+    (sent,) = remote.requests
+    assert sent.headers["accept-encoding"] == "identity"
+    assert sent.headers["accept"] == "application/xml"
+    assert sent.headers["x-custom"] == "kept"
+    assert sent.headers.get_list("accept-encoding") == ["identity"]
+
+
+async def test_a_declared_length_over_the_cap_is_refused_before_reading(
+    client, remote, monkeypatch
+):
+    monkeypatch.setattr(preview, "MAX_FETCH_BYTES", 1000)
+    stream = Chunks(count=10, size=400)
+    remote.answer(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-type": "application/xml", "content-length": "4000"},
+            stream=stream,
+        )
+    )
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "too_large"
+    assert stream.served == 0 and stream.closed
+
+
+async def test_a_deeply_nested_error_body_is_no_500(client, remote):
+    nested = b"[" * 100_000
+    remote.answer(
+        httpx.Response(500, content=nested, headers={"content-type": "application/json"})
+    )
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "sap_error"
+    assert r.json() == {"detail": "HTTP 500 from the OData service"}
+
+
+def keyed_v2(fields: int, key: str, sets: int = 1) -> bytes:
+    """One type of ``fields`` properties whose key is the property ``key``."""
+    return big_v2(sets, fields, 0).replace(
+        b'<PropertyRef Name="F0"/>', f'<PropertyRef Name="{key}"/>'.encode()
+    )
+
+
+async def test_a_key_field_past_the_cut_is_kept(client, remote):
+    last = f"F{MAX_FIELDS + 6}"
+    remote.answer(xml(keyed_v2(MAX_FIELDS + 7, last)))
+    (entity_set,) = (await client.post(URL, json=REQUEST)).json()["entity_sets"]
+    names = [f["name"] for f in entity_set["fields"]]
+    assert entity_set["keys"] == [{"name": last, "type": "Edm.String"}]
+    # MAX_FIELDS in all, in document order, the key among them.
+    assert names == [f"F{i}" for i in range(MAX_FIELDS - 1)] + [last]
+    assert entity_set["truncated"] is True and entity_set["fields_total"] == MAX_FIELDS + 7
+
+
+async def test_keys_survive_a_spent_field_budget(client, remote, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_PREVIEW_FIELDS", 0)
+    remote.answer(xml(keyed_v2(6, "F4", sets=2)))
+    body = (await client.post(URL, json=REQUEST)).json()
+    assert [[f["name"] for f in e["fields"]] for e in body["entity_sets"]] == [["F4"], ["F4"]]
+    assert body["truncated"] is True
+
+
+def stored_service(fields: list[dict[str, Any]], keys: list[str], **more: Any) -> dict[str, Any]:
+    data = copy.deepcopy(STORED)
+    data["definition"] = {
+        "entity_sets": [
+            {
+                "name": "S0",
+                "keys": [{"name": k} for k in keys],
+                "operations": [],
+                "fields": fields,
+            },
+            *more.get("entity_sets", []),
+        ],
+        "operations": more.get("operations", []),
+    }
+    return data
+
+
+async def test_a_change_past_the_cut_is_still_a_change(client, remote):
+    """Status and field lists are worked out against ALL fields of the
+    document, not against the fields the answer shows."""
+    total = MAX_FIELDS + 7
+    known = [{"name": f"F{i}"} for i in range(MAX_FIELDS)]  # everything shown is stored
+    assert (await client.post(SERVICES, json=stored_service(known, ["F0"]))).status_code == 201
+    remote.answer(xml(big_v2(1, total, 0)))
+    body = (await client.post(URL, json=request(service="purchase-requisitions"))).json()
+    (entity_set,) = body["entity_sets"]
+    assert entity_set["status"] == "changed"
+    assert entity_set["new_fields"] == [f"F{i}" for i in range(MAX_FIELDS, total)]
+    assert entity_set["new_fields_total"] == 7 and entity_set["removed_fields"] == []
+
+
+async def test_a_stored_field_past_the_cut_is_not_reported_as_removed(client, remote):
+    total = MAX_FIELDS + 7
+    known = [{"name": f"F{i}"} for i in range(total - 400, total)] + [{"name": "F0"}]
+    assert (await client.post(SERVICES, json=stored_service(known, ["F0"]))).status_code == 201
+    remote.answer(xml(big_v2(1, total, 0)))
+    (entity_set,) = (
+        await client.post(URL, json=request(service="purchase-requisitions"))
+    ).json()["entity_sets"]
+    assert entity_set["removed_fields"] == []
+
+
+async def test_what_disappeared_from_the_document_is_named(client, remote):
+    data = stored_service(
+        [{"name": "F0"}, {"name": "F1"}, {"name": "F2"}],
+        ["F0"],
+        entity_sets=[
+            {"name": "GoneSet", "keys": [{"name": "Id"}], "fields": [{"name": "Id"}]},
+            {"name": "S1", "keys": [{"name": "F0"}], "fields": [{"name": "F0"}]},
+        ],
+        operations=[
+            {"name": "Op0", "kind": "function_import", "http_method": "POST"},
+            {"name": "GoneOp", "kind": "function_import", "http_method": "POST"},
+        ],
+    )
+    assert (await client.post(SERVICES, json=data)).status_code == 201
+    remote.answer(xml(big_v2(2, 3, 1)))
+    body = (await client.post(URL, json=request(service="purchase-requisitions"))).json()
+    assert body["removed_entity_sets"] == ["GoneSet"]
+    assert body["removed_operations"] == ["GoneOp"]
+    assert body["removed_complete"] is True
+    assert body["summary"]["removed_entity_sets"] == 1
+    assert body["summary"]["removed_operations"] == 1
+    assert body["entity_sets"][0]["status"] == "in_service"
+
+
+async def test_a_stored_name_past_the_shown_cut_is_not_removed(client, remote):
+    last = f"S{MAX_ENTITY_SETS + 4}"
+    data = stored_service(
+        [{"name": "F0"}],
+        ["F0"],
+        entity_sets=[{"name": last, "keys": [{"name": "F0"}], "fields": [{"name": "F0"}]}],
+        operations=[
+            {"name": f"Op{MAX_OPERATIONS + 2}", "kind": "function_import", "http_method": "POST"}
+        ],
+    )
+    assert (await client.post(SERVICES, json=data)).status_code == 201
+    remote.answer(xml(big_v2(MAX_ENTITY_SETS + 5, 1, MAX_OPERATIONS + 3)))
+    body = (await client.post(URL, json=request(service="purchase-requisitions"))).json()
+    assert last not in [e["name"] for e in body["entity_sets"]]
+    assert body["removed_entity_sets"] == [] and body["removed_operations"] == []
+    assert body["removed_complete"] is True and body["truncated"] is True
+
+
+async def test_past_the_parsers_cap_nothing_is_called_removed(client, remote):
+    from agents.odata.metadata import MAX_PARSED_ENTITY_SETS
+
+    data = stored_service(
+        [{"name": "F0"}],
+        ["F0"],
+        entity_sets=[{"name": "Elsewhere", "keys": [{"name": "F0"}], "fields": [{"name": "F0"}]}],
+    )
+    assert (await client.post(SERVICES, json=data)).status_code == 201
+    remote.answer(xml(big_v2(MAX_PARSED_ENTITY_SETS + 30, 1, 0)))
+    body = (await client.post(URL, json=request(service="purchase-requisitions"))).json()
+    assert body["removed_complete"] is False and body["removed_entity_sets"] == []
+    assert body["truncated"] is True
+    assert body["totals"]["entity_sets"] == MAX_PARSED_ENTITY_SETS + 30
+    assert len(body["entity_sets"]) == MAX_ENTITY_SETS
+
+
+async def test_a_changed_key_or_field_type_is_reported_by_name(client, remote):
+    known = [
+        {"name": "F0", "type": "Edm.Guid"},  # the document says Edm.String
+        {"name": "F1"},
+        {"name": "F2"},
+    ]
+    created = await client.post(SERVICES, json=stored_service(known, ["F0", "F1"]))
+    assert created.status_code == 201
+    remote.answer(xml(big_v2(1, 3, 0)))
+    (entity_set,) = (
+        await client.post(URL, json=request(service="purchase-requisitions"))
+    ).json()["entity_sets"]
+    assert entity_set["new_fields"] == [] and entity_set["removed_fields"] == []
+    assert entity_set["changed_types"] == ["F0"]
+    assert entity_set["changed_keys"] is True
+    assert entity_set["status"] == "changed"
+
+
+async def test_keys_navigations_and_parameters_are_capped_with_totals(client, remote, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_PREVIEW_KEYS", 1)
+    monkeypatch.setattr(preview, "MAX_PREVIEW_NAVIGATIONS", 0)
+    monkeypatch.setattr(preview, "MAX_PREVIEW_PARAMETERS", 2)
+    body = (await client.post(URL, json=REQUEST)).json()
+    item = body["entity_sets"][1]
+    assert len(item["keys"]) == 1 and item["keys_total"] == 2
+    assert item["navigations"] == [] and item["navigations_total"] == 1
+    assert item["truncated"] is True
+    (operation,) = body["operations"]
+    assert len(operation["parameters"]) == 2 and operation["parameters_total"] == 3
+    assert operation["truncated"] is True and body["truncated"] is True
+
+
+async def test_an_unknown_key_is_named_only_when_it_looks_like_a_field(client, remote):
+    r = await client.post(URL, json=request(**{f"https://{SECRET}.example/$metadata?x=1": 1}))
+    assert r.status_code == 422
+    assert r.json()["detail"].startswith("<unknown field>:") and SECRET not in r.text
+    r = await client.post(URL, json=request(**{"x" * 65: 1, "a\n": 2}))
+    assert r.status_code == 422 and "xxx" not in r.text
+    assert r.json()["detail"].count("<unknown field>:") == 2
+    r = await client.post(
+        "/admin/api/odata/services/purchase-requisitions/duplicate",
+        json={"name": "copy", f"{SECRET} key": 1},
+    )
+    assert r.status_code == 422 and SECRET not in r.text
+
+
+async def test_an_http_internet_destination_is_refused_with_nothing_sent(client, remote):
+    remote.resolver = FakeResolver(url="http://s4.internal:44300", name="S4_ODATA_TECH")
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert remote.requests == [] and SAP_HOST not in r.text
+
+
+async def test_user_context_on_a_technical_destination_is_said_in_the_answer(
+    client, remote, caplog
+):
+    class Technical(FakeResolver):
+        async def resolve(self, **kwargs: Any) -> Destination:
+            resolved = await super().resolve(**kwargs)
+            return Destination(
+                url=self.url,
+                headers={"Authorization": "Basic dGVjaDp4"},
+                expires_at=resolved.expires_at,
+                auth_type="BasicAuthentication",
+                per_user=True,
+            )
+
+    caplog.set_level(logging.INFO, logger=preview.logger.name)
+    remote.resolver = Technical(name="S4_ODATA_TECH")
+    r = await client.post(URL, json=request(user_context=True), headers=bearer("alice-id"))
+    assert r.status_code == 200, r.text
+    (warning,) = r.json()["warnings"]
+    assert warning["code"] == "technical_credential"
+    assert "destination's own credential" in warning["message"]
+    # The log says how it WAS fetched, and by whom.
+    (line,) = [x.getMessage() for x in caplog.records if "odata metadata preview" in x.getMessage()]
+    assert "auth_type=BasicAuthentication" in line and "by=alice-id" in line
+    assert "user_context=True" in line and "dGVjaDp4" not in caplog.text
+
+
+async def test_a_user_propagating_destination_has_no_warning(client, remote, caplog):
+    caplog.set_level(logging.INFO, logger=preview.logger.name)
+    r = await client.post(URL, json=request(user_context=True), headers=bearer("alice-id"))
+    assert r.status_code == 200 and r.json()["warnings"] == []
+    (line,) = [x.getMessage() for x in caplog.records if "odata metadata preview" in x.getMessage()]
+    assert "auth_type=OAuth2UserTokenExchange" in line and "per_user=True" in line
+
+
+async def test_a_refusal_is_logged_with_its_code_and_the_caller(client, remote, caplog):
+    caplog.set_level(logging.INFO, logger=preview.logger.name)
+    remote.answer(httpx.Response(302, headers={"location": "https://idp.example/"}))
+    await client.post(URL, json=REQUEST, headers=bearer("bob-id"))
+    (line,) = [x.getMessage() for x in caplog.records if "odata metadata preview" in x.getMessage()]
+    assert "code=redirect" in line and "by=bob-id" in line and "idp.example" not in line
+
+
+async def test_at_most_two_previews_run_at_a_time(client, remote, monkeypatch):
+    gate = asyncio.Event()
+    arrived = 0
+
+    async def held(_request: httpx.Request) -> httpx.Response:
+        nonlocal arrived
+        arrived += 1
+        await gate.wait()
+        return unread(lambda _r: xml(V2))(_request)
+
+    monkeypatch.setattr(preview, "_transport", lambda: httpx.MockTransport(held))
+    first = asyncio.ensure_future(client.post(URL, json=REQUEST))
+    second = asyncio.ensure_future(client.post(URL, json=REQUEST))
+    for _ in range(200):
+        if arrived == 2:
+            break
+        await asyncio.sleep(0.01)
+    assert arrived == 2 and preview._active == 2
+    third = await client.post(URL, json=REQUEST)
+    assert third.status_code == 429 and third.headers["x-odata-error"] == "busy"
+    assert third.json() == {"detail": preview._BUSY_TEXT}
+    assert arrived == 2  # the third fetched nothing
+    gate.set()
+    assert (await first).status_code == 200 and (await second).status_code == 200
+    assert preview._active == 0
+    assert (await client.post(URL, json=REQUEST)).status_code == 200
+
+
+async def test_the_budget_covers_the_parse_and_the_slot_waits_for_the_thread(
+    client, remote, monkeypatch
+):
+    import threading
+
+    release = threading.Event()
+    real = preview.parse_metadata
+
+    def slow_parse(document, version):
+        release.wait(5)
+        return real(document, version)
+
+    monkeypatch.setattr(preview, "parse_metadata", slow_parse)
+    monkeypatch.setattr(preview, "PREVIEW_BUDGET_SECONDS", 0.2)
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 504 and r.headers["x-odata-error"] == "timeout"
+    # Answered, but the thread still runs: its slot is still taken.
+    assert preview._active == 1
+    release.set()
+    for _ in range(200):
+        if preview._active == 0:
+            break
+        await asyncio.sleep(0.01)
+    assert preview._active == 0
+
+
+async def test_a_document_over_the_parsers_work_budget_is_a_422(client, remote, monkeypatch):
+    from agents.odata import metadata
+
+    monkeypatch.setattr(metadata, "MAX_PARSE_WORK", 50)
+    remote.answer(xml(big_v2(3, 60, 0)))
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 422 and r.headers["x-odata-error"] == "invalid_metadata"
+    assert "too large to read" in r.json()["detail"]
+
+
+def test_the_document_is_let_go_once_parsed():
+    holder = [bytearray(V2)]
+    answer = preview._parse_and_build(holder, "v2", None)
+    assert holder == [] and answer["summary"]["entity_sets"] == 2

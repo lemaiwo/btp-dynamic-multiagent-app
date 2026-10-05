@@ -173,6 +173,14 @@ def _fit(value: str | None, column: Any) -> str | None:
     if len(text_value) <= width:
         return text_value
     if width <= len(_CUT_MARK) + _CUT_DIGEST_CHARS:
+        if column.name not in _cut_warned:
+            _cut_warned.add(column.name)
+            audit_logger.warning(
+                "odata audit: a value for column '%s' is longer than %d characters; it is "
+                "stored cut plainly (the column has no room for a digest)",
+                column.name,
+                width,
+            )
         return text_value[:width]
     if column.name not in _cut_warned:
         _cut_warned.add(column.name)

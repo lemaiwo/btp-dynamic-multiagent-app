@@ -117,7 +117,9 @@ def read_error(response: httpx.Response, message_of: Callable[[Any], Any]) -> tu
         )
     try:
         error = response.json().get("error")
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, RecursionError):
+        # RecursionError: a body nested deeper than the JSON parser goes
+        # (`[[[[...`) is no envelope either, and must not become a 500.
         return "", ""
     if not isinstance(error, dict):
         return "", ""
