@@ -54,10 +54,12 @@ from agents.db import (  # noqa: E402
     ODataService,
     SessionLocal,
     _clean_destination,
+    create_odata_service,
     init_db,
     list_agents,
     prepare_servers,
     upsert_agent,
+    validate_odata_service,
 )
 
 AGENTS = "/admin/api/agents"
@@ -200,12 +202,20 @@ def test_url_spelling_does_not_escape_the_rules():
         ({"services": [None]}, "services"),
         ({"services": ["a"], "allow_write": "true"}, "allow_write"),
         ({"services": ["a"], "allow_write": 1}, "allow_write"),
-        ({"services": ["a"], "allow_write": None}, "allow_write"),
         ({"services": ["a"], "allow_write": [True]}, "allow_write"),
     ],
 )
 def test_bad_entries_are_422(oauth, message):
     assert message in refusal(entry(oauth))
+
+
+def test_null_is_absent_and_never_opens_anything():
+    """A client that serialises an unset field as ``null``: read-only, and no
+    services is still no services."""
+    p = McpServerPayload.model_validate(entry({"services": ["a"], "allow_write": None}))
+    assert p.oauth.to_config() == {"services": ["a"]}
+    assert "services" in refusal(entry({"services": None}))
+    assert "services" in refusal(entry({"services": None, "allow_write": True}))
 
 
 def test_a_missing_or_non_object_block_is_refused():
@@ -280,6 +290,47 @@ def test_destination_and_identity_are_explained():
 )
 def test_services_and_allow_write_belong_to_builtin_odata_only(server):
     assert "builtin:odata" in refusal(server)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"services": []},
+        {"allow_write": False},
+        {"services": None},
+        {"allow_write": None},
+        {"services": [], "allow_write": False},
+        {"services": None, "allow_write": None},
+    ],
+)
+def test_empty_values_of_the_two_keys_do_not_refuse_another_server(extra):
+    """Only a non-empty ``services`` or a true ``allow_write`` is refused on
+    another server; a client sending every field with its empty value keeps
+    working, and nothing of it is stored."""
+    for server in (
+        {
+            "url": "builtin:jira",
+            "auth_mode": "destination",
+            "oauth": {"destination": "JIRA", **extra},
+        },
+        {"url": "builtin:sapnotes", "auth_mode": "none", "oauth": {"min_score": "9.0", **extra}},
+        {
+            "url": "https://x.hana.ondemand.com/mcp",
+            "auth_mode": "destination",
+            "oauth": {"destination": "MCP", **extra},
+        },
+    ):
+        cfg = McpServerPayload.model_validate(server).oauth.to_config()
+        assert "services" not in cfg and "allow_write" not in cfg
+    jwt = {"url": "https://x.hana.ondemand.com/mcp", "auth_mode": "jwt", "oauth": extra}
+    assert McpServerPayload.model_validate(jwt).oauth.to_config() == {}
+    assert "builtin:odata" in refusal(
+        {
+            "url": "builtin:jira",
+            "auth_mode": "destination",
+            "oauth": {"destination": "JIRA", **extra, "allow_write": True},
+        }
+    )
 
 
 def test_other_destination_servers_validate_as_before():
@@ -417,7 +468,93 @@ def test_a_url_that_only_starts_like_the_built_in_is_refused():
         refusal({"url": url, "auth_mode": "destination", "oauth": {"destination": "S4_ODATA_TECH"}})
 
 
+async def add_services(*names: str, enabled: bool = True) -> None:
+    async with SessionLocal() as s:
+        for name in names:
+            data = validate_odata_service(
+                {**copy.deepcopy(SERVICE), "name": name, "enabled": enabled}
+            )
+            await create_odata_service(s, data)
+
+
+async def test_upsert_refuses_a_service_the_catalogue_does_not_have():
+    """The shared write point, not only the admin routes: a script or a seed
+    that calls ``upsert_agent`` must not store a dangling name. With
+    ``allow_write`` it would be a standing grant on whatever service is later
+    created under that name."""
+    await add_services("purchase-requisitions")
+    for services, message in (
+        (["nope"], "unknown OData service 'nope'"),
+        (["nope", "purchase-requisitions", "gone", "nope"], "unknown OData service 'nope', 'gone'"),
+    ):
+        async with SessionLocal() as s:
+            with pytest.raises(ValueError) as exc:
+                await upsert_agent(
+                    s,
+                    name="pr-agent",
+                    description="d",
+                    instructions="i",
+                    mcp_servers=[entry({"services": services, "allow_write": True})],
+                )
+            assert str(exc.value) == message
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError) as exc:
+            await upsert_agent(
+                s,
+                name="pr-agent",
+                description="d",
+                instructions="i",
+                commit=False,
+                mcp_servers=[
+                    {"url": "https://x.hana.ondemand.com/mcp", "auth_mode": "jwt"},
+                    entry({"services": [f"bad {SECRET}"]}),
+                ],
+            )
+        assert "invalid service name" in str(exc.value) and SECRET not in str(exc.value)
+    async with SessionLocal() as s:
+        assert await list_agents(s) == []
+    # A disabled service exists.
+    await add_services("stock", enabled=False)
+    async with SessionLocal() as s:
+        row = await upsert_agent(
+            s,
+            name="pr-agent",
+            description="d",
+            instructions="i",
+            mcp_servers=[entry({"services": ["stock", "purchase-requisitions"]})],
+        )
+        assert json.loads(row.oauth_json) == {"services": ["stock", "purchase-requisitions"]}
+
+
+async def test_the_helper_refuses_a_name_that_is_no_service_name():
+    """For a caller that hands over a server list no cleaner has seen."""
+    from agents.db import check_odata_services
+
+    async with SessionLocal() as s:
+        for bad in (f"Bad {SECRET}", 7, None, ["a"]):
+            with pytest.raises(ValueError) as exc:
+                await check_odata_services(s, [entry({"services": [bad]})])
+            assert str(exc.value) == "invalid service name"
+        await check_odata_services(s, [{"url": "builtin:jira", "oauth": {"services": ["nope"]}}])
+        await check_odata_services(s, [])
+
+
+def test_the_existence_check_locks_the_rows_on_postgres_only():
+    """Compile-only: SQLite has no row locks, so nothing else in the suite
+    would notice the clause missing where it matters."""
+    from sqlalchemy.dialects import postgresql, sqlite
+
+    from agents.db import _existing_odata_names_query
+
+    locked = _existing_odata_names_query(["a", "b"], lock=True)
+    assert "FOR SHARE" in str(locked.compile(dialect=postgresql.dialect()))
+    assert "FOR" not in str(locked.compile(dialect=sqlite.dialect()))
+    plain = _existing_odata_names_query(["a", "b"], lock=False)
+    assert "FOR" not in str(plain.compile(dialect=postgresql.dialect()))
+
+
 async def test_upsert_stores_the_exact_shape():
+    await add_services("a", "b")
     async with SessionLocal() as s:
         row = await upsert_agent(
             s,
@@ -592,12 +729,14 @@ async def test_credential_health_lists_each_attached_services_destination(client
         "agent",
         "server_key",
         "service",
+        "service_enabled",
         "destination",
         "user_context",
         "state",
         "auth_type",
         "error",
     }
+    assert [e["service_enabled"] for e in d] == [True, True]
 
 
 class _Row:
@@ -703,7 +842,9 @@ async def test_health_resolves_as_the_app_and_reports_principal_propagation(clie
         by_service["gone"]["state"] == "error" and "does not exist" in by_service["gone"]["error"]
     )
     unknown = by_service["nope"]
-    assert unknown["state"] == "error" and unknown["error"] == "unknown OData service"
+    assert unknown["state"] == "missing" and unknown["error"] == "unknown OData service"
+    assert unknown["service_enabled"] is False and unknown["auth_type"] == ""
+    assert user["service_enabled"] is True
     assert unknown["destination"] == "" and unknown["user_context"] is False
     # What is no service name is reported without the value.
     invalid = [e for e in out if e.get("service") == ""]
@@ -717,3 +858,106 @@ async def test_health_resolves_as_the_app_and_reports_principal_propagation(clie
     text = json.dumps(out)
     assert "Authorization" not in text and "s4.internal" not in text
     assert text.count(SECRET) == 1, "only the destination service's own error text"
+
+
+USER_TYPES = [
+    "PrincipalPropagation",
+    "OAuth2UserTokenExchange",
+    "OAuth2JWTBearer",
+    "OAuth2SAMLBearerAssertion",
+]
+
+
+@pytest.mark.parametrize("auth_type", USER_TYPES + ["BasicAuthentication", ""])
+async def test_health_of_a_user_service_that_only_resolves_for_a_user(monkeypatch, auth_type):
+    """A destination of a user-propagating type hands the application no
+    token. For a service that runs as the signed-in user that is the correct
+    set-up, not an error; any other type keeps the resolve error."""
+    import agents.destination as dest_mod
+    from agents.destination import DestinationError, DestinationServiceConfig
+
+    await add_services("purchase-requisitions")
+    await add_services("stock", enabled=False)
+    rows = [_Row("pr-agent", [entry({"services": ["purchase-requisitions", "stock"]})])]
+
+    async def fake_list_agents(session):
+        return rows
+
+    monkeypatch.setattr(admin, "list_agents", fake_list_agents)
+    monkeypatch.setattr(
+        dest_mod,
+        "config_from_environment",
+        lambda env: DestinationServiceConfig(
+            "id", "secret", "https://uaa/oauth/token", "https://api"
+        ),
+    )
+
+    class FakeResolverCls:
+        def __init__(self, name, config, **kw):
+            pass
+
+        async def resolve(self, **kw):
+            assert not kw, "health resolves with the app token only"
+            raise DestinationError("no token for the application")
+
+        async def resolve_properties(self, **kw):
+            assert not kw
+
+            class Props:
+                pass
+
+            Props.auth_type = auth_type
+            return Props()
+
+    monkeypatch.setattr(dest_mod, "DestinationResolver", FakeResolverCls)
+    on, off = await admin._destination_health()
+    assert (on["service"], on["service_enabled"]) == ("purchase-requisitions", True)
+    assert (off["service"], off["service_enabled"]) == ("stock", False)
+    for item in (on, off):
+        if auth_type in USER_TYPES:
+            assert item["state"] == "resolvable" and item["auth_type"] == auth_type
+            assert item["error"] is None and "warning" not in item
+        else:
+            assert item["state"] == "error" and item["auth_type"] == ""
+            assert item["error"] == "no token for the application"
+
+
+# --- end to end: saved through the API, built by the registry -----------------
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp")
+async def test_an_agent_saved_through_the_api_is_built_with_both_odata_tools(
+    client, service, monkeypatch
+):
+    from pydantic_ai.messages import ModelResponse, TextPart
+    from pydantic_ai.models.function import FunctionModel
+    from pydantic_ai.models.test import TestModel
+
+    import agents.registry as registry_module
+
+    monkeypatch.setattr(registry_module, "get_model", lambda *a, **k: TestModel())
+    r = await client.post(AGENTS, json=agent(servers=[entry(url="builtin:odata/")]))
+    assert r.status_code == 201, r.text
+    plain = {"url": "builtin:sapnotes", "auth_mode": "none"}
+    assert (await client.post(AGENTS, json=agent("notes", servers=[plain]))).status_code == 201
+
+    build = await registry_module.Registry().reload()
+
+    async def seen_by_model(built) -> tuple[set[str], str]:
+        seen: dict[str, Any] = {}
+
+        def answer(messages, info):
+            seen["tools"] = {t.name for t in info.function_tools}
+            seen["instructions"] = info.instructions or ""
+            return ModelResponse(parts=[TextPart("ok")])
+
+        await built.run("hello", model=FunctionModel(answer))
+        return seen["tools"], seen["instructions"]
+
+    tools, instructions = await seen_by_model(build.specialists["pr-agent"])
+    assert {"search_operations", "execute_operation"} <= tools
+    assert "- **purchase-requisitions**" in instructions
+    assert "Write operations are enabled" in instructions
+    tools, instructions = await seen_by_model(build.specialists["notes"])
+    assert not ({"search_operations", "execute_operation"} & tools)
+    assert "OData" not in instructions

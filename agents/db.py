@@ -1947,6 +1947,10 @@ async def upsert_agent(
     name = name.strip()
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
+    # Here rather than in the admin routes: scripts and seeds write agents
+    # through this function too, and none of them may store a service name
+    # the catalogue does not have.
+    await check_odata_services(session, mcp_servers)
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
     # Order-preserving de-duplication: the same peer listed twice would
@@ -2295,13 +2299,55 @@ async def existing_odata_service_names(
     by the delete's own referrer check. Postgres only; SQLite has no row
     locks, ignores the clause and serialises writers anyway.
     """
-    wanted = sorted(set(names))
-    if not wanted:
+    if not names:
         return set()
-    query = select(ODataService.name).where(ODataService.name.in_(wanted))
+    query = _existing_odata_names_query(names, lock=lock)
+    return set((await session.execute(query)).scalars().all())
+
+
+def _existing_odata_names_query(names: list[str], *, lock: bool) -> Any:
+    """The statement of `existing_odata_service_names`; a function of its own
+    so a test can compile it for Postgres (``FOR SHARE``), which no
+    SQLite-backed suite would otherwise see."""
+    query = select(ODataService.name).where(ODataService.name.in_(sorted(set(names))))
     if lock:
         query = query.with_for_update(read=True)
-    return set((await session.execute(query)).scalars().all())
+    return query
+
+
+async def check_odata_services(session: AsyncSession, servers: list[dict[str, Any]]) -> None:
+    """Refuse a server list that attaches a service the catalogue lacks.
+
+    ``ValueError("unknown OData service 'x'")``, every missing name in the
+    order listed. Called by every write of an agent's servers
+    (`upsert_agent`, and the admin update route beside its own
+    `prepare_servers`), in the session that then writes the row and with the
+    found rows locked, so the answer holds until that write commits.
+
+    A dangling name is not harmless: the agent would be attached, with
+    whatever ``allow_write`` its entry holds, to the next service somebody
+    creates under that name, without anyone saving the agent again. A
+    disabled service exists and may be attached: an admin prepares the agent
+    first and switches the service on later; the run time leaves it out
+    until then.
+
+    A name is repeated in the message only when it has the form of a service
+    name; anything else is "invalid service name", without the value.
+    """
+    names: list[str] = []
+    for block in odata_entries(servers):
+        services = block.get("services")
+        for name in services if isinstance(services, list) else []:
+            if not isinstance(name, str) or not re.fullmatch(_ODATA_SERVICE_NAME_RE, name):
+                raise ValueError("invalid service name")
+            if name not in names:
+                names.append(name)
+    if not names:
+        return
+    found = await existing_odata_service_names(session, names, lock=True)
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise ValueError("unknown OData service " + ", ".join(f"'{n}'" for n in missing))
 
 
 async def create_odata_service(
@@ -3415,8 +3461,9 @@ def _clean_odata_entry(src: dict[str, Any]) -> dict[str, Any]:
       "true" or the number 1 must not open writes; stored without the key,
       the entry is read-only.
 
-    Whether the names exist in the catalogue is the save route's question
-    (it needs the session). The message never repeats a refused value.
+    Whether the names exist in the catalogue is `check_odata_services`'
+    question (it needs the session). The message never repeats a refused
+    value.
     """
     raw = src.get("services")
     if not isinstance(raw, list) or not raw:

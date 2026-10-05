@@ -79,8 +79,8 @@ from agents.db import (
     delete_agent,
     delete_skill,
     delete_workflow,
+    check_odata_services,
     describe_referrers,
-    existing_odata_service_names,
     get_active_model_name,
     get_agent,
     get_agent_by_slug,
@@ -299,6 +299,15 @@ class OAuthClientPayload(BaseModel):
     allow_write: StrictBool = False
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("services", "allow_write", mode="before")
+    @classmethod
+    def _null_is_absent(cls, v: Any, info: Any) -> Any:
+        """A client that serialises an unset field as ``null`` means "not
+        set": no services, no writes. It can only ever close, never open."""
+        if v is None:
+            return [] if info.field_name == "services" else False
+        return v
 
     @field_validator("theme")
     @classmethod
@@ -1067,7 +1076,6 @@ async def api_list_agents() -> list[dict[str, Any]]:
 )
 async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
     async with SessionLocal() as session:
-        await _check_odata_services(session, payload.to_servers_list())
         try:
             row = await upsert_agent(
                 session,
@@ -1119,11 +1127,13 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 raise HTTPException(
                     status_code=409, detail=f"Agent name '{payload.name}' already exists"
                 )
-        await _check_odata_services(session, payload.to_servers_list())
         try:
             primary, extras, primary_oauth_json = prepare_servers(
                 payload.to_servers_list(), row
             )
+            # `upsert_agent` does this for every other writer; this route
+            # writes the row itself. Same session as the commit below.
+            await check_odata_services(session, payload.to_servers_list())
             skills_json = await normalize_skills_json(session, payload.skills)
 
             slug = validate_api_slug(payload.api_slug)
@@ -1954,13 +1964,6 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 if secret_errors:
                     errors.extend(secret_errors)
                     continue
-                # Against the catalogue as this transaction sees it. A bundle
-                # does not carry catalogue services yet; once it does they are
-                # written before the agents and found here.
-                unknown = await _unknown_odata_services(session, agent.to_servers_list())
-                if unknown:
-                    errors.append(f"Agent '{agent.name}': {unknown}")
-                    continue
                 try:
                     # run_as_principal is deliberately not carried by exports
                     # (it is a landscape-specific service identity), and is
@@ -2136,10 +2139,6 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                 payload = AgentPayload.model_validate(entry)
             except Exception as e:
                 logger.warning("Skipping invalid seed entry %r: %s", entry, e)
-                continue
-            unknown = await _unknown_odata_services(session, payload.to_servers_list())
-            if unknown:
-                logger.warning("Skipping seed agent %r: %s", payload.name, unknown)
                 continue
             try:
                 await upsert_agent(
@@ -2340,7 +2339,7 @@ def _validate_odata_entry(cfg: dict[str, Any]) -> None:
             f"a {BUILTIN_ODATA_URL} entry holds only oauth.services and "
             f"oauth.allow_write; remove {named}"
         )
-    if "allow_write" in cfg and not isinstance(cfg["allow_write"], bool):
+    if cfg.get("allow_write") is not None and not isinstance(cfg["allow_write"], bool):
         raise ValueError(
             "oauth.allow_write must be the JSON boolean true or false; a string "
             "or a number does not open writes"
@@ -2367,42 +2366,6 @@ def _validate_odata_entry(cfg: dict[str, Any]) -> None:
         if name in seen:
             raise ValueError(f"oauth.services: duplicate service '{name}'")
         seen.add(name)
-
-
-async def _unknown_odata_services(session: Any, servers: list[dict[str, Any]]) -> str | None:
-    """``unknown OData service 'x'`` for the services a server list attaches
-    that are not in the catalogue, or None.
-
-    Run in the session that then writes the agent, with the found rows
-    locked, so the answer holds until that write commits (see
-    `agents.db.existing_odata_service_names`). A disabled service exists: an
-    admin may prepare an agent before switching its service on, and the run
-    time leaves a disabled service out. A missing one is refused, because the
-    agent would be saved in a state that silently does less than configured.
-    """
-    names: list[str] = []
-    for block in odata_entries(servers):
-        services = block.get("services")
-        for name in services if isinstance(services, list) else []:
-            if not isinstance(name, str) or not re.fullmatch(SERVICE_NAME_RE, name):
-                # Not reachable past the payload model; never echoed anyway.
-                return "invalid service name"
-            if name not in names:
-                names.append(name)
-    if not names:
-        return None
-    found = await existing_odata_service_names(session, names, lock=True)
-    missing = [n for n in names if n not in found]
-    if not missing:
-        return None
-    return "unknown OData service " + ", ".join(f"'{n}'" for n in missing)
-
-
-async def _check_odata_services(session: Any, servers: list[dict[str, Any]]) -> None:
-    """422 when ``servers`` attaches a service the catalogue does not have."""
-    unknown = await _unknown_odata_services(session, servers)
-    if unknown:
-        raise HTTPException(status_code=422, detail=unknown)
 
 
 # Built-ins that originate mail through agents/mail_render and so read a
@@ -2546,14 +2509,25 @@ async def _odata_destination_health(
     resolvers: dict[str, Any],
 ) -> list[dict[str, Any]]:
     """The `_destination_health` entries of one ``builtin:odata`` entry: one
-    per service it lists, disabled services included.
+    per service it lists.
+
+    ``{agent, server_key, service, service_enabled, destination,
+    user_context, state, auth_type, error}`` plus ``warning`` on an identity
+    mismatch. ``state`` is ``resolvable``, ``error``, ``unbound`` or
+    ``missing``: a listed name the catalogue no longer has (the save gate
+    refuses it, but a row can predate a delete), reported rather than left
+    out because the agent silently works without that service.
+    ``service_enabled`` is false for a disabled catalogue service -- its
+    destination is still checked, but the agent cannot use it until it is
+    switched on -- and for one that is missing.
 
     Resolved as the application, like every other entry -- never with a
-    user's token. A ``PrincipalPropagation`` destination cannot be resolved
-    that way at all (it has no credential without a user), so for a service
-    that runs as the signed-in user its properties are read instead, and it
-    counts as resolvable when they say so. The answer carries the service and
-    destination names, the identity and the auth type: no host, no header.
+    user's token. A destination of a user-propagating type hands the
+    application no token (``PrincipalPropagation`` has no credential at all
+    without a user), so for a service that runs as the signed-in user its
+    properties are read instead, and it counts as resolvable when they name
+    such a type. The answer carries the service and destination names, the
+    identity and the auth type: no host, no header.
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
@@ -2569,6 +2543,7 @@ async def _odata_destination_health(
             "agent": agent,
             "server_key": BUILTIN_ODATA_URL,
             "service": "",
+            "service_enabled": False,
             "destination": "",
             "user_context": False,
             "state": "error",
@@ -2583,8 +2558,10 @@ async def _odata_destination_health(
         entry["service"] = name
         service = catalogue.get(name)
         if service is None:
+            entry["state"] = "missing"
             entry["error"] = "unknown OData service"
             continue
+        entry["service_enabled"] = bool(service.enabled)
         destination = str(service.destination or "").strip()
         user_context = bool(service.user_context)
         entry["destination"] = destination
@@ -2610,7 +2587,7 @@ async def _odata_destination_health(
                     fallback = (await resolver.resolve_properties()).auth_type
                 except Exception:  # noqa: BLE001 - the first error is the answer
                     fallback = ""
-                if fallback != "PrincipalPropagation":
+                if fallback not in USER_PROPAGATING_AUTH_TYPES:
                     raise
                 entry["auth_type"] = fallback
             entry["state"] = "resolvable"

@@ -383,6 +383,8 @@ async def test_referrers_lists_enabled_and_disabled_agents_with_allow_write():
     """Through ``upsert_agent``, i.e. the storage cleaner's own shape of the
     ``builtin:odata`` block (it names no destination)."""
     async with SessionLocal() as s:
+        # `upsert_agent` refuses a service the catalogue does not have.
+        await create_odata_service(s, validate_odata_service(copy.deepcopy(GOOD)))
         for name, enabled in (("buyer", True), ("reader", False)):
             await upsert_agent(
                 s, name=name, description="d", instructions="i",
