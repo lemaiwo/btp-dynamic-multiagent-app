@@ -239,3 +239,24 @@ def test_a_skipped_set_of_the_type_means_the_type_does_not_decide():
     assert {o.name: o.returns for o in parsed.operations}["Supplier"] == ParsedReturn(
         None, False, ""
     )
+
+
+def test_a_skipped_set_with_a_bad_name_and_an_unreadable_type_could_be_of_any_type():
+    """A set skipped for its NAME (invalid, or a duplicate) whose type cannot
+    be read either is not "a set of type ''": no type has an only set then."""
+    returning = '<FunctionImport Name="Supplier" ReturnType="NS.Supplier"/>'
+    for skipped, reason in (
+        (f'<EntitySet Name="bad name" EntityType="{"X" * 300}"/>', "invalid_name"),
+        (f'<EntitySet Name="bad name" EntityType="{"X" * 5_000}"/>', "invalid_name"),
+        ('<EntitySet Name="bad name" EntityType="NS.Suppliér"/>', "invalid_name"),
+        ('<EntitySet Name="bad name"/>', "invalid_name"),
+        (f'<EntitySet Name="Items" EntityType="{"X" * 300}"/>', "duplicate_name"),
+        (f'<EntitySet Name="Items" EntityType="{"X" * 5_000}"/>', "duplicate_name"),
+    ):
+        parsed = parse_metadata(v2(skipped + returning), "v2")
+        assert reason in [s.reason for s in parsed.skipped], skipped[:60]
+        assert parsed.operations[0].returns == ParsedReturn(None, False, ""), skipped[:60]
+    # A skipped set of ANOTHER type that can be read leaves this type its only set.
+    other = '<EntitySet Name="bad name" EntityType="NS.Item"/>'
+    parsed = parse_metadata(v2(other + returning), "v2")
+    assert parsed.operations[0].returns == ParsedReturn("Suppliers", False, "")

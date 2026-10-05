@@ -652,9 +652,10 @@ def test_a_dropped_attribute_never_falls_back_to_a_default():
 
 
 def test_the_number_of_elements_is_capped(monkeypatch):
-    # Generous for a real service: the largest have a few hundred thousand.
-    # the work budget could not get through more than that anyway.
-    assert 100_000 <= metadata.MAX_ELEMENTS <= metadata.MAX_PARSE_WORK
+    # Generous for a real service, and no more than the work budget could
+    # get through anyway. The upper end is set by memory: see
+    # `test_what_one_element_makes_a_parse_retain_is_measured`.
+    assert 50_000 <= metadata.MAX_ELEMENTS <= metadata.MAX_PARSE_WORK
     document = v2(1, 500)
     elements = document.count(b"<") - document.count(b"</") - 1  # minus the declaration
     monkeypatch.setattr(metadata, "MAX_ELEMENTS", elements)
@@ -774,27 +775,167 @@ def test_a_dropped_attribute_is_read_as_the_conservative_answer():
     assert parsed.unread_attributes == 3
 
 
-def test_what_one_element_makes_a_parse_retain_is_measured():
-    """The worst case the caps leave: a schema's own children, each with a
-    long distinct name, under a namespace and an alias at their cap. Scaled
-    to `MAX_ELEMENTS`, two parses at once must fit beside the app."""
+NAMESPACE_NOT_ASCII = (
+    "the $metadata document cannot be read: the namespace or alias of a schema has "
+    "characters outside ASCII"
+)
+# One character wider than ASCII makes CPython store the WHOLE string wider:
+# two bytes per character for U+0100..U+FFFF, four above.
+WIDE = {"bmp": "Ā", "astral": "\U00010000"}
+
+
+@pytest.mark.parametrize("wide", sorted(WIDE))
+def test_a_name_that_is_not_ascii_is_dropped_where_the_document_is_read(wide):
+    """No EDM name has such a character (`EDM_NAME_RE`), so the element could
+    not be represented anyway -- but kept, the name and the three qualified
+    names made from it would each be 2 or 4 bytes per character."""
+    char = WIDE[wide]
+    odd = f"Odd{char}"
+    document = (
+        V2_HEAD.replace("<Schema ", f"<Schema {SAP_NS} ")
+        + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+        '<Property Name="Id" Type="Edm.String"/>'
+        f'<Property Name="Typed" Type="{odd}"/></EntityType>'
+        f'<EntityType Name="{odd}"/>'
+        '<EntityContainer Name="C" m:IsDefaultEntityContainer="true">'
+        '<EntitySet Name="S" EntityType="NS.T"/>'
+        f'<EntitySet Name="{odd}" EntityType="NS.T"/>'
+        f'<EntitySet Name="Typeless" EntityType="NS.{odd}"/>'
+        f'<FunctionImport Name="Method" m:HttpMethod="{odd}"/>'
+        f'<FunctionImport Name="Returns" ReturnType="NS.T" EntitySet="{odd}"/>'
+        f"</EntityContainer>{V2_TAIL}"
+    ).encode()
+    root, _ = metadata._parse_tree(document)
+    kept = [v for e in root.iter() for v in e.attrib.values()]
+    assert all(v.isascii() for v in kept), [v for v in kept if not v.isascii()]
+    schemas = metadata._Schemas(list(root.iter("Schema")))
+    assert sorted(schemas.entity_types) == ["NS.T"]
+    parsed = parse_metadata(document, "v2")
+    assert (parsed.attributes_dropped, parsed.unread_attributes) == (6, 6)
+    assert [(e.name, [f.name for f in e.fields]) for e in parsed.entity_sets] == [("S", ["Id"])]
+    # The same paths as a value that is too long: never a default.
+    assert sorted((s.kind, s.entity_set, s.reason) for s in parsed.skipped) == [
+        ("entity_set", "", "invalid_name"),
+        ("entity_set", "Typeless", "invalid_type"),
+        ("operation", "", "unsupported_http_method"),
+        ("property", "S", "invalid_type"),
+    ]
+    assert {o.name: o.returns for o in parsed.operations}["Returns"].entity_set is None
+    assert build_preview(parsed)["warnings"][0]["code"] == "metadata_incomplete"
+    for attribute in ("Namespace", "Alias"):
+        head = V4_HEAD.replace('Namespace="NS"', f'Namespace="NS" {attribute}="N{char}"').replace(
+            f'Namespace="NS" Namespace="N{char}"', f'Namespace="N{char}"'
+        )
+        with pytest.raises(MetadataError) as error:
+            parse_metadata((head + '<EntityContainer Name="C"/>' + V4_TAIL).encode(), "v4")
+        assert str(error.value) == NAMESPACE_NOT_ASCII
+    # A character reference is the same character.
+    referenced = v2(1, 2).replace(b'Name="S0"', b'Name="S&#x1F600;"')
+    parsed = parse_metadata(referenced, "v2")
+    assert parsed.attributes_dropped == 1 and parsed.entity_sets == ()
+
+
+@pytest.mark.parametrize("version", ["v2", "v4"])
+def test_a_label_with_accents_or_another_script_is_kept_as_it_is(version):
+    """Only NAMES are held to ASCII. A label is text for people."""
+    labels = ["Numéro de commande", "Bestellübersicht für Käufer", "注文番号", "Order \U0001f4e6"]
+    for label in labels:
+        if version == "v2":
+            document = (
+                V2_HEAD.replace("<Schema ", f"<Schema {SAP_NS} ")
+                + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+                f'<Property Name="Id" Type="Edm.String" sap:label="{label}" '
+                f'sap:quickinfo="{label}"/></EntityType>'
+                '<EntityContainer Name="C" m:IsDefaultEntityContainer="true">'
+                f'<EntitySet Name="S" EntityType="NS.T" sap:label="{label}"/>'
+                f"</EntityContainer>{V2_TAIL}"
+            ).encode()
+        else:
+            note = f'<Annotation Term="Common.Label" String="{label}"/>'
+            document = (
+                V4_HEAD
+                + '<EntityType Name="T"><Key><PropertyRef Name="Id"/></Key>'
+                f'<Property Name="Id" Type="Edm.String">{note}</Property></EntityType>'
+                f'<EntityContainer Name="C"><EntitySet Name="S" EntityType="NS.T">{note}'
+                f"</EntitySet></EntityContainer>{V4_TAIL}"
+            ).encode()
+        parsed = parse_metadata(document, version)
+        (entity_set,) = parsed.entity_sets
+        assert entity_set.label == label and entity_set.fields[0].label == label
+        assert parsed.skipped == () and parsed.attributes_dropped == 0
+        assert build_preview(parsed)["warnings"] == []
+
+
+def test_the_number_of_attributes_is_capped(monkeypatch):
+    """Elements alone do not bound what a document makes a parse keep: a
+    two-character value costs seven bytes of document and some ninety of
+    memory, and an element may have hundreds."""
+    assert 5 * metadata.MAX_ELEMENTS <= metadata.MAX_ATTRIBUTES
+    document = v2(1, 500)
+    attributes = sum(len(e.attrib) for e in ET.fromstring(document).iter())
+    assert attributes > 1_000
+    monkeypatch.setattr(metadata, "MAX_ATTRIBUTES", attributes)
+    assert len(parse_metadata(document, "v2").entity_sets[0].fields) == 500
+    monkeypatch.setattr(metadata, "MAX_ATTRIBUTES", attributes - 1)
+    with pytest.raises(MetadataError, match="too large to read") as error:
+        parse_metadata(document, "v2")
+    assert "F0" not in str(error.value) and f"{attributes - 1} attributes" in str(error.value)
+    # A dropped attribute still takes its place on the element, and counts.
+    long = v2(1, 500).replace(b'Name="S0"', b'Name="' + b"S" * 5_000 + b'"')
+    with pytest.raises(MetadataError, match="too large to read"):
+        parse_metadata(long, "v2")
+
+
+def _worst_document(shape: str, count: int, per_element: int) -> bytes:
+    """`count` schema children of `per_element` bytes each, under a namespace
+    and an alias at their cap -- the shapes the full-size measurement at
+    `metadata.MAX_ELEMENTS` was made with, scaled down.
+
+    `ascii`: every byte in a distinct name (kept four times: the tree and
+    three qualified names). `bmp` / `astral`: the same with one wide
+    character in the name. `label`: a short name and the bytes in a text
+    attribute with one astral character, which is kept (a label may be in
+    any script) at four bytes per character. `attributes`: as `label`, with
+    as many two-character attributes as `MAX_ATTRIBUTES` allows per element
+    first -- the most memory per byte of document."""
+    head = V4_HEAD.replace('Namespace="NS"', f'Namespace="{"N" * 128}" Alias="{"A" * 128}"')
+    if shape in ("ascii", "bmp", "astral"):
+        char = {"ascii": "T", **WIDE}[shape]
+        pad = "T" * (per_element - len('<EntityType Name=""/>') - 6 - len(char.encode()))
+        body = "".join(f'<EntityType Name="{char}{pad}{i:06d}"/>' for i in range(count))
+    else:
+        small = ""
+        if shape == "attributes":
+            names = [a + b for a in "abcdefghijklmnopqrstuvwxyz" for b in "abcdefghij"]
+            each = metadata.MAX_ATTRIBUTES // metadata.MAX_ELEMENTS - 2
+            small = "".join(f' {name}="xy"' for name in names[:each])
+        used = len('<EntityType Name="T000000" zz="\U00010000"/>'.encode()) + len(small)
+        pad = "x" * min(1_023, per_element - used)
+        body = "".join(
+            f'<EntityType Name="T{i:06d}"{small} zz="\U00010000{pad}"/>' for i in range(count)
+        )
+    return (head + body + '<EntityContainer Name="C"/>' + V4_TAIL).encode()
+
+
+@pytest.mark.parametrize("shape", ["ascii", "bmp", "astral", "label", "attributes"])
+def test_what_one_element_makes_a_parse_retain_is_measured(shape):
+    """The worst cases the caps leave, scaled down: what `parse_metadata`
+    itself holds at its peak per element, the document not counted. At
+    `MAX_ELEMENTS` elements, two parses at once must fit beside the app
+    (`preview.MAX_CONCURRENT_PREVIEWS`). The bound is the budget, nothing
+    else: the numbers are in the comment at `metadata.MAX_ELEMENTS`."""
     import tracemalloc
 
     count = 4_000
-    types = "".join(f'<EntityType Name="{"T" * 175}{i:06d}"/>' for i in range(count))
-    document = (
-        V4_HEAD.replace('Namespace="NS"', f'Namespace="{"N" * 128}" Alias="{"A" * 128}"')
-        + types + '<EntityContainer Name="C"/>' + V4_TAIL
-    ).encode()
+    per_element = metadata.MAX_METADATA_BYTES // metadata.MAX_ELEMENTS
+    document = _worst_document(shape, count, per_element)
+    assert len(document) < count * per_element + 1_000
     tracemalloc.start()
     try:
         before = tracemalloc.get_traced_memory()[0]
-        root, _ = metadata._parse_tree(document)
-        schemas = metadata._Schemas(list(root.iter("Schema")))
+        parsed = parse_metadata(document, "v4")
         peak = tracemalloc.get_traced_memory()[1] - before
     finally:
         tracemalloc.stop()
-    assert len(schemas.entity_types) == 2 * count
-    per_element = peak / count
-    assert per_element < 2_000, per_element
-    assert 2 * per_element * metadata.MAX_ELEMENTS < 420_000_000
+    assert parsed.attributes_dropped == (count if shape in WIDE else 0)
+    assert 2 * (peak / count) * metadata.MAX_ELEMENTS < 420_000_000, peak / count

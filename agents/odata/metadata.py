@@ -108,6 +108,10 @@ a string or a tree whose size the document chose:
   the skip-and-record paths report. So a megabyte of ``Bool="..."`` is not
   stripped and lowered per lookup, and a megabyte of namespace is not copied
   into the qualified name of every element of its schema.
+* A NAME attribute with a character outside ASCII is dropped the same way,
+  however short: no EDM name has one (``EDM_NAME_RE``), and CPython would
+  store that name, and every qualified name made from it, at two or four
+  bytes per character. Labels and other text are kept in any script.
 * Where "absent" has a meaning of its own -- a V2 ``Type`` is
   ``Edm.String``, ``m:HttpMethod`` is ``GET``, no ``Qualifier`` is the plain
   annotation, no ``EntitySet`` lets the type decide, no ``Nullable`` is
@@ -118,7 +122,8 @@ a string or a tree whose size the document chose:
   ``Namespace`` or ``Alias`` was dropped ends the parse with a fixed-text
   error. ``ParsedMetadata.unread_attributes`` counts the dropped attributes
   the parser reads, for the preview's warning.
-* A document of more than ``MAX_ELEMENTS`` elements is refused.
+* A document of more than ``MAX_ELEMENTS`` elements, or with more than
+  ``MAX_ATTRIBUTES`` attributes on all its elements together, is refused.
 
 ``parse_metadata`` is synchronous CPU work (up to ``MAX_METADATA_BYTES`` of
 XML): a route or tool must call it through ``asyncio.to_thread`` and not on
@@ -150,26 +155,53 @@ MAX_PARSED_OPERATIONS = 2 * MAX_OPERATIONS
 # cap is what keeps "sets x properties" from being chosen by the document.
 # Read at call time.
 MAX_PARSE_WORK = 200_000
-# How many elements a document may have. Half the work budget
-# (`MAX_PARSE_WORK`), so a larger document could not be worked through
-# anyway; real SAP `$metadata` documents are far below. Without it 20 MB can
-# be five million four-byte elements. With the attribute caps it is what
-# bounds what one document can make a parse retain, and the number is set by
-# that: two previews may parse at once (`preview.MAX_CONCURRENT_PREVIEWS`)
-# beside the app.
+# How many elements a document may have, and how many attributes its
+# elements may have in all. Real SAP `$metadata` documents are far below
+# both; without them 20 MB can be five million four-byte elements, or three
+# million `a="xy"` attributes at some ninety bytes of memory each. Together
+# with the attribute caps (length, and ASCII for names) they bound what one
+# document can make a parse retain, and the numbers are set by that: two
+# previews may parse at once (`preview.MAX_CONCURRENT_PREVIEWS`) beside the
+# app, and the two together are to stay under about 400 MB.
 #
-# MEASURED (tracemalloc peak of `parse_metadata`, the document itself not
-# counted, CPython 3 on a 64-bit machine): the worst document found for the
-# caps -- one schema with `Namespace` and `Alias` at 128 characters and
-# 99,990 `<EntityType Name="..."/>` children with distinct 179-character
-# names, 20.0 MB, i.e. both the element cap and the byte cap -- peaks at
-# 197 MB, 1,968 bytes per element (the tree node with its name, and three
-# qualified names per type in the `_Schemas` tables). The same shape with
-# 106-character names (12.7 MB): 168 MB. So two concurrent worst-case
-# parses stay just under 400 MB. `tests/test_odata_metadata_limits.py`
-# re-measures a scaled-down copy and fails when the cap times the measured
-# bytes per element, twice, passes 420 MB. Read at call time.
-MAX_ELEMENTS = 100_000
+# MEASURED, not estimated: the `tracemalloc` peak of `parse_metadata` over a
+# full-size document (the document's own 20 MB not counted), one document
+# per fresh process, CPython 3.11 on a 64-bit machine. Each document is one
+# schema with `Namespace` and `Alias` at 128 characters and
+# `MAX_ELEMENTS - 10` `<EntityType .../>` children that together fill
+# `MAX_METADATA_BYTES` (266 bytes each); they differ in where the bytes go:
+#
+#   ascii       a distinct 238-character ASCII name      164 MB  2,189 B/element
+#   bmp         the same name with one U+0100 in it       35 MB    470 B/element
+#   astral      the same name with one U+10000 in it      35 MB    470 B/element
+#   label       a 7-character name, the bytes in a text
+#               attribute with one U+10000 (kept: a
+#               label may be in any script)              167 MB  2,229 B/element
+#   attributes  as `label`, after 8 two-character
+#               attributes per element (all that
+#               `MAX_ATTRIBUTES` leaves)                 185 MB  2,469 B/element
+#
+# So the worst document found peaks at 185 MB, two at once at 370 MB. The
+# process's peak RSS grew by 177 MB over the `ascii` parse (164 MB traced),
+# so the allocator adds some 8% on top.
+#
+# What the numbers were before these caps were what they are, same method,
+# at 100,000 elements: `ascii` 197 MB; `bmp` 316 MB and `astral` 534 MB
+# while a name was capped in characters only (CPython stores a string at
+# the width of its widest character, and a type's name is kept four times:
+# on the tree and in three qualified names of `_Schemas`), which is why a
+# non-ASCII name is dropped where the document is read; `label` 201 MB; and
+# 237 MB for 27 two-character attributes per element with no cap on
+# attributes -- still 201 MB with 20,000 elements of 127 attributes, so the
+# element cap alone does not bound that shape. With both caps at 100,000 /
+# 1,000,000 `attributes` was 225 MB (449 MB for two), at 80,000 / 800,000
+# 192 MB, hence 75,000.
+#
+# `tests/test_odata_metadata_limits.py` re-measures a scaled-down copy of
+# each shape and fails when the measured bytes per element, times the cap,
+# twice, passes 420 MB. Both are read at call time.
+MAX_ELEMENTS = 75_000
+MAX_ATTRIBUTES = 10 * MAX_ELEMENTS
 # EDMX is shallow (Edmx > DataServices > Schema > EntityType > Key >
 # PropertyRef; V4 annotations nest a little deeper). A cap keeps a hostile
 # document from building a tree that is expensive to walk or free.
@@ -215,8 +247,10 @@ _ATTRIBUTE_CAPS = {
     "Target": _MAX_TARGET_CHARS,
 }
 # The key under which the tree builder notes a dropped attribute `X` on its
-# element: " X". No XML attribute has a space in its name.
+# element: " X". No XML attribute has a space in its name. The value says why.
 _DROPPED_PREFIX = " "
+_TOO_LONG = ""
+_NOT_ASCII = "not_ascii"
 # Attributes the parser READS. One of these dropped means the result may
 # lack something the document said (`ParsedMetadata.unread_attributes`); any
 # other long value (`sap:quickinfo`, a `String` of a long description) is
@@ -227,6 +261,10 @@ _READ_ATTRIBUTES = frozenset(_ATTRIBUTE_CAPS) | {
 _NAMESPACE_TOO_LONG = (
     f"the $metadata document cannot be read: the namespace or alias of a schema is "
     f"longer than {_MAX_NAMESPACE_CHARS} characters"
+)
+_NAMESPACE_NOT_ASCII = (
+    "the $metadata document cannot be read: the namespace or alias of a schema has "
+    "characters outside ASCII"
 )
 # `_Work.spend_text`: one unit of the budget per this many characters of a
 # shared string that is copied or compared once more.
@@ -418,8 +456,8 @@ class ParsedMetadata:
     operations_declared: int = 0
     # The work the parse spent, in the units of `MAX_PARSE_WORK`.
     work: int = 0
-    # How many attribute values were longer than their cap and therefore not
-    # kept (`_ATTRIBUTE_CAPS`); more than 0 means the result may lack what
+    # How many attribute values were not kept: longer than their cap, or a
+    # name that is not ASCII (`_ATTRIBUTE_CAPS`); more than 0 means the result may lack what
     # those attributes said (a label, a skipped element, a namespace).
     attributes_dropped: int = 0
     # How many of those were attributes the parser reads (`_READ_ATTRIBUTES`).
@@ -530,19 +568,22 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
     parser, and its default is to accept an internal DTD.
 
     This is where the input is bounded, once: at most ``MAX_ELEMENTS``
-    elements, and no attribute value longer than its cap (``_ATTRIBUTE_CAPS``,
-    else ``_MAX_ATTRIBUTE_CHARS``). A longer value is not kept -- never cut:
-    cut, it would be a value the document never gave -- and its name is
-    noted on the element (``_dropped``). ``counts["attributes_dropped"]`` is
-    how many there were.
+    elements and ``MAX_ATTRIBUTES`` attributes, no attribute value longer
+    than its cap (``_ATTRIBUTE_CAPS``, else ``_MAX_ATTRIBUTE_CHARS``), and no
+    name (an attribute in ``_ATTRIBUTE_CAPS``) with a character outside
+    ASCII. Such a value is not kept -- never cut: cut, it would be a value
+    the document never gave -- and its name is noted on the element
+    (``_dropped``). ``counts["attributes_dropped"]`` is how many there were.
     """
     builder = ET.TreeBuilder()
     parser = expat.ParserCreate(namespace_separator=" ")
     depth = 0
     elements = 0
+    attributes = 0
     dropped = 0
     unread = 0
     limit = MAX_ELEMENTS
+    attribute_limit = MAX_ATTRIBUTES
     root_namespace: list[str] = []
     # Per open element: the text collected for it, or None when its text is
     # not kept (any more). `room` is what the innermost element may still take.
@@ -550,7 +591,7 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
     room = 0
 
     def start(name: str, attrs: dict[str, str]) -> None:
-        nonlocal depth, room, elements, dropped, unread
+        nonlocal depth, room, elements, attributes, dropped, unread
         depth += 1
         if depth > MAX_DEPTH:
             raise MetadataError(f"the document is nested deeper than {MAX_DEPTH} levels")
@@ -572,13 +613,28 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
         # the same local name.
         flat = {_local(k): v for k, v in attrs.items() if " " in k}
         flat.update((k, v) for k, v in attrs.items() if " " not in k)
-        for key in [
-            k for k, v in flat.items() if len(v) > _ATTRIBUTE_CAPS.get(k, _MAX_ATTRIBUTE_CHARS)
-        ]:
+        # A dropped attribute still has its place on the element (the note).
+        attributes += len(flat)
+        if attributes > attribute_limit:
+            raise MetadataError(
+                f"the $metadata document is too large to read: its elements have more "
+                f"than {attribute_limit} attributes in all"
+            )
+        for key, value in list(flat.items()):
+            cap = _ATTRIBUTE_CAPS.get(key)
+            if len(value) > (_MAX_ATTRIBUTE_CHARS if cap is None else cap):
+                why = _TOO_LONG
+            elif cap is not None and not value.isascii():
+                # A name: one character outside ASCII and CPython stores the
+                # whole string, and every qualified name made from it, at two
+                # or four bytes per character. No EDM name has one.
+                why = _NOT_ASCII
+            else:
+                continue
             # Absent, and noted: an annotation of the same local name that
             # was overwritten above is gone either way.
             del flat[key]
-            flat[_DROPPED_PREFIX + key] = ""
+            flat[_DROPPED_PREFIX + key] = why
             dropped += 1
             unread += key in _READ_ATTRIBUTES
         builder.start(_local(name), flat)
@@ -633,8 +689,9 @@ def _parse_tree(xml: bytes, counts: dict[str, int] | None = None) -> tuple[ET.El
 
 
 def _dropped(element: ET.Element, name: str) -> bool:
-    """Whether the element HAD attribute ``name`` with a value too long to
-    keep. Asked only where a missing attribute has a meaning of its own."""
+    """Whether the element HAD attribute ``name`` with a value that was not
+    kept (too long, or a name that is not ASCII). Asked only where a missing
+    attribute has a meaning of its own."""
     return element.get(_DROPPED_PREFIX + name) is not None
 
 
@@ -926,8 +983,12 @@ def _entity_set_drafts(
             resolved = schemas.entity_type(element.get("EntityType"))
             entity_type = schemas.canonical_type(element.get("EntityType"))
             if name is None or name in drafts:
-                # Still a set of its type, for whoever asks "the only one?".
-                work.skipped_set_types.add(entity_type)
+                # Still a set of its type, for whoever asks "the only one?" --
+                # and of ANY type when its type cannot be read either.
+                if not entity_type or len(entity_type) > _MAX_TYPE_CHARS:
+                    work.skipped_set_of_unknown_type = True
+                else:
+                    work.skipped_set_types.add(entity_type)
             if name is None:
                 skipped.append(SkippedElement("entity_set", "", position, "invalid_name"))
                 continue
@@ -2082,11 +2143,16 @@ def parse_metadata(xml: bytes, version: Literal["v2", "v4"]) -> ParsedMetadata:
     schemas = list(root.iter("Schema"))
     if not schemas:
         raise MetadataError(_NOT_EDMX)
-    if any(_dropped(schema, "Namespace") or _dropped(schema, "Alias") for schema in schemas):
+    unkept = {
+        schema.get(_DROPPED_PREFIX + attribute)
+        for schema in schemas
+        for attribute in ("Namespace", "Alias")
+    } - {None}
+    if unkept:
         # Every name of such a schema would be unqualified and every
         # reference to it unresolved: entity sets without fields, with
         # nothing to say why. Refused as a whole instead.
-        raise MetadataError(_NAMESPACE_TOO_LONG)
+        raise MetadataError(_NAMESPACE_TOO_LONG if _TOO_LONG in unkept else _NAMESPACE_NOT_ASCII)
     work = _Work()
     work.attributes_dropped = counts.get("attributes_dropped", 0)
     work.unread_attributes = counts.get("unread_attributes", 0)
