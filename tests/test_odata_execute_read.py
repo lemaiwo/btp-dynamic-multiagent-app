@@ -7,6 +7,7 @@ received, and `sap.requests == []` proves a refusal came before any request.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -95,6 +96,22 @@ _DEFINITION: dict[str, Any] = {
             "navigations": [
                 {"name": "to_PurchaseReqn", "target": HEADER, "collection": False},
             ],
+        },
+        {
+            # Only 'get': its navigations can be followed.
+            "name": "A_GetOnly",
+            "keys": [{"name": "Id"}],
+            "operations": ["get"],
+            "fields": [_field("Id", selectable=True)],
+            "navigations": [{"name": "to_Items", "target": ITEM, "collection": True}],
+        },
+        {
+            # Only 'list': rows can be read, but nothing is read *through* one row.
+            "name": "A_ListOnly",
+            "keys": [{"name": "Id"}],
+            "operations": ["list"],
+            "fields": [_field("Id", selectable=True)],
+            "navigations": [{"name": "to_Items", "target": ITEM, "collection": True}],
         },
         {
             # In the catalogue, no operation ticked.
@@ -203,6 +220,7 @@ class World:
         class Recording(FakeResolver):
             async def resolve(self, *, force=False, user_token=None, principal=None):
                 world.resolved.append((self.name, user_token, principal))
+                await asyncio.sleep(0)  # let a concurrent call run in between
                 return await super().resolve(
                     force=force, user_token=user_token, principal=principal
                 )
@@ -368,10 +386,10 @@ async def test_a_non_selectable_value_never_reaches_the_result(alice):
         ({"filter": "RequestedQuantity gt 1"}, "field_not_filterable"),
         ({"filter": "Nope eq 'X'"}, "unknown_field"),
         ({"filter": "to_PurchaseReqn/CreatedByUser eq 'X'"}, "invalid_argument"),
-        ({"filter": "PurchaseRequisition eq '1'" + " " * 1000}, "invalid_argument"),
+        ({"filter": "PurchaseRequisition eq '" + "1" * 1000 + "'"}, "invalid_argument"),
         ({"filter": ["PurchaseRequisition eq '1'"]}, "invalid_argument"),
-        ({"expand": ["to_Nope"]}, "unknown_field"),
-        ({"expand": ["CreatedByUser"]}, "unknown_field"),
+        ({"expand": ["to_Nope"]}, "unknown_target"),
+        ({"expand": ["CreatedByUser"]}, "unknown_target"),
         ({"expand": "to_PurchaseReqn"}, "invalid_argument"),
         ({"operation": "get"}, "invalid_key"),
         ({"operation": "get", "key": {"PurchaseRequisition": "10"}}, "invalid_key"),
@@ -422,8 +440,9 @@ async def test_a_refusal_never_repeats_a_value(alice):
 
 
 async def test_the_fixed_order_of_checks(alice):
-    """service -> target -> operation -> key -> navigation -> select / expand /
-    orderby -> filter -> top/skip -> body/params: the first one wins."""
+    """service -> target -> operation enabled -> key -> navigation -> select ->
+    expand -> orderby -> filter -> top/skip -> body/params: the first one wins.
+    From 'operation enabled' to 'top/skip' it is `ODataClient.check_read`'s order."""
     w = World()
     everything_wrong = {
         "service": "other",
@@ -446,7 +465,7 @@ async def test_the_fixed_order_of_checks(alice):
         ("invalid_key", {"key": {"PurchaseRequisition": "10"}}),
         ("unknown_target", {"navigation": "to_PurchaseReqnItem", "operation": "list"}),
         ("unknown_field", {"select": ["PurchaseRequisition"]}),
-        ("unknown_field", {"expand": []}),
+        ("unknown_target", {"expand": []}),
         ("invalid_argument", {"orderby": ["PurchaseRequisition"]}),
         ("unknown_field", {"filter": "PurchaseRequisition eq '1'"}),
         ("invalid_argument", {"top": 5}),
@@ -495,7 +514,7 @@ async def test_get_and_navigation_read(alice):
     key = {"PurchaseRequisition": "10", "PurchaseRequisitionItem": "00010"}
 
     got = await w.run("execute_operation", **{**BASE, "operation": "get"}, key=key)
-    assert set(got) == {"item", "etag", "truncated"}
+    assert set(got) == {"item", "truncated"}
     assert got["item"] == {
         "PurchaseRequisition": "10",
         "PurchaseRequisitionItem": "00010",
@@ -515,7 +534,7 @@ async def test_get_and_navigation_read(alice):
         navigation="to_PurchaseReqn",
         select=["PurReqnDescription"],
     )
-    assert parent["item"] == {"PurReqnDescription": "Pens"} and parent["etag"] == 'W/"7"'
+    assert parent == {"item": {"PurReqnDescription": "Pens"}, "truncated": False}
     assert w.requests[1].url.path.endswith("/to_PurchaseReqn")
     assert w.requests[1].url.params["$select"] == "PurReqnDescription"
 
@@ -578,6 +597,9 @@ async def test_expand_needs_the_target_enabled_and_is_capped_at_three(alice):
     assert MAX_EXPAND == 3
     many = await w.run("execute_operation", **base, expand=four)
     assert many["error"]["code"] == "invalid_argument" and "3" in many["error"]["message"]
+    # The cap is the tool's own rule and comes after the client's checks.
+    first = await w.run("execute_operation", **base, expand=four, top=-1)
+    assert "top" in first["error"]["message"]
     assert w.requests == []
     ok = await w.run("execute_operation", **base, expand=four[:3])
     assert "items" in ok
@@ -594,6 +616,178 @@ async def test_result_is_clipped_and_marked_truncated(alice, monkeypatch):
     assert 0 < len(out["items"]) < 20
     # The next page starts at the first row that was dropped.
     assert out["next_skip"] == 40 + len(out["items"])
+
+
+async def test_a_read_returns_no_etag(alice):
+    """An ETag is often the last-changed timestamp or a hash of fields, so it
+    can carry the value of a field the catalogue does not release."""
+    stamp = "2026-01-02T03:04:05"
+    etag = f"W/\"datetime'{stamp}'\""
+    row = {**_item("10", "00010"), "__metadata": {"uri": "x", "etag": etag}}
+    header = {
+        "__metadata": {"uri": "x", "etag": etag},
+        "PurchaseRequisition": "10",
+        "PurReqnDescription": "Pens",
+        "to_PurchaseReqnItem": {"results": [row]},
+    }
+
+    def answer(payload: Any):
+        return lambda _request: httpx.Response(200, json=payload, headers={"ETag": etag})
+
+    w = World(answer({"d": row}), answer({"d": header}), answer(_page([row], count=1)))
+    key = {"PurchaseRequisition": "10", "PurchaseRequisitionItem": "00010"}
+    got = await w.run("execute_operation", **{**BASE, "operation": "get"}, key=key)
+    parent = await w.run(
+        "execute_operation",
+        **{**BASE, "operation": "get"},
+        key=key,
+        navigation="to_PurchaseReqn",
+        expand=["to_PurchaseReqnItem"],
+    )
+    listed = await w.run("execute_operation", **BASE)
+    assert len(w.requests) == 3
+    assert set(got) == {"item", "truncated"} and set(parent) == {"item", "truncated"}
+    assert parent["item"]["to_PurchaseReqnItem"][0]["PurchaseRequisitionItem"] == "00010"
+    text = json.dumps([got, parent, listed])
+    assert "etag" not in text.lower() and stamp not in text and "datetime" not in text
+
+
+async def test_following_a_navigation_needs_get_on_the_parent_only(alice):
+    w = World(_page([_item("10", "00010")], count=1))
+    # 'get' on the parent, 'list' on the target: the parent needs no 'list'.
+    ok = await w.run(
+        "execute_operation",
+        service="purchase-requisitions",
+        target="A_GetOnly",
+        operation="list",
+        key={"Id": "1"},
+        navigation="to_Items",
+    )
+    assert [i["PurchaseRequisitionItem"] for i in ok["items"]] == ["00010"]
+    assert w.requests[0].url.path == f"{SERVICE_PATH}/A_GetOnly('1')/to_Items"
+    # No 'get' on the parent: nothing is read through one of its rows.
+    refused = await w.run(
+        "execute_operation",
+        service="purchase-requisitions",
+        target="A_ListOnly",
+        operation="list",
+        key={"Id": "1"},
+        navigation="to_Items",
+    )
+    assert refused["error"]["code"] == "operation_disabled"
+    assert len(w.requests) == 1
+
+
+async def test_search_offers_no_navigation_that_execute_refuses(alice):
+    w = World(_page([], count=0))
+    found = await w.run(
+        "search_operations", query="", detail="full", service="purchase-requisitions"
+    )
+    followed = 0
+    for match in found["matches"]:
+        if match["kind"] != "entity_set":
+            continue
+        for nav in match["navigations"]:
+            out = await w.run(
+                "execute_operation",
+                service=match["service"],
+                target=match["target"],
+                operation="list" if nav["collection"] else "get",
+                key={k["name"]: "1" for k in match["keys"]},
+                navigation=nav["name"],
+            )
+            assert "error" not in out, (match["target"], nav["name"], out)
+            followed += 1
+    assert followed >= 6
+    by_target = {m["target"]: m for m in found["matches"]}
+    assert by_target["A_ListOnly"]["navigations"] == []
+    assert [n["name"] for n in by_target["A_GetOnly"]["navigations"]] == ["to_Items"]
+
+
+async def test_two_users_at_the_same_time_on_one_toolset():
+    """The registry shares one toolset between every user of an agent."""
+    rows = {
+        "Bearer user-token-of-alice@example.com": "alice-row",
+        "Bearer user-token-of-bob@example.com": "bob-row",
+    }
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        owner = rows[request.headers["authorization"]]
+        item = {**_item(owner, "00010")}
+        return httpx.Response(
+            200,
+            json=_page([item], count=1),
+            headers={"set-cookie": f"SAP_SESSIONID_XXX_100={owner}; path=/"},
+        )
+
+    w = World(answer)
+
+    async def as_user(token: str, principal: str, expected: str) -> None:
+        jwt, who = current_jwt.set(token), current_principal.set(principal)
+        try:
+            for _ in range(10):
+                out = await w.run("execute_operation", **BASE)
+                assert [i["PurchaseRequisition"] for i in out["items"]] == [expected]
+        finally:
+            current_principal.reset(who)
+            current_jwt.reset(jwt)
+
+    await asyncio.gather(
+        as_user("jwt-a", "alice@example.com", "alice-row"),
+        as_user("jwt-b", "bob@example.com", "bob-row"),
+    )
+    assert len(w.requests) == 20 and len(w.toolset.http_clients) == 1
+    assert all("cookie" not in r.headers for r in w.requests)
+    sent = [r.headers["authorization"] for r in w.requests]
+    assert sent.count("Bearer user-token-of-alice@example.com") == 10
+    assert sent.count("Bearer user-token-of-bob@example.com") == 10
+    # The two users' calls really were interleaved.
+    assert sent != sorted(sent)
+    assert {(name, token) for name, token, _ in w.resolved} == {
+        ("S4_ODATA_USER", "jwt-a"),
+        ("S4_ODATA_USER", "jwt-b"),
+    }
+
+
+@pytest.mark.parametrize(
+    "text, gone, kept",
+    [
+        ("see https://s4.internal:44300/sap/x?sap-client=100 now", ["s4", "44300", "/sap"], "now"),
+        ("moved to //s4.internal/sap/bc now", ["s4.internal", "/sap"], "now"),
+        ("host s4.internal:44300 refused", ["s4.internal", "44300"], "refused"),
+        ("no handler for /sap/opu/odata/sap/SRV/A_Set('1') here", ["/sap", "A_Set"], "here"),
+        ("at 10.0.0.7:8443.", ["10.0.0.7", "8443"], "at"),
+        ("ldap://dc.corp.example:389/x", ["corp", "389"], ""),
+    ],
+)
+async def test_sap_error_text_loses_urls_hosts_and_paths(alice, text, gone, kept):
+    w = World(v2_error(400, "X/1", text))
+    message = (await w.run("execute_operation", **BASE))["error"]["message"]
+    for part in gone:
+        assert part not in message, message
+    assert kept in message and message.startswith("X/1: ")
+
+
+async def test_a_sap_message_code_is_not_taken_for_a_path(alice):
+    w = World(v2_error(404, "/IWBEP/CM_MGW_RT/022", "Resource not found for segment 'A_Set'"))
+    out = await w.run("execute_operation", **BASE)
+    assert out["error"]["message"] == (
+        "/IWBEP/CM_MGW_RT/022: Resource not found for segment 'A_Set'"
+    )
+
+
+async def test_an_unexpected_failure_is_logged_by_type_only(alice, caplog):
+    class Buggy(FakeResolver):
+        async def resolve(self, **_kw):
+            raise RuntimeError("detail https://s4.internal:44300/sap?token=abc")
+
+    w = World(resolver_factory=lambda name: Buggy(name=name))
+    with caplog.at_level(logging.DEBUG, logger="agents.odata.tools"):
+        out = await w.run("execute_operation", **BASE)
+    assert out["error"]["code"] == "destination_error"
+    assert "RuntimeError" in caplog.text and "purchase-requisitions" in caplog.text
+    assert "s4.internal" not in caplog.text and "token=abc" not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 # -- identity ----------------------------------------------------------------
@@ -818,7 +1012,7 @@ async def test_what_search_returns_is_what_execute_accepts(alice):
         )
         assert "items" in out, (match["target"], out)
         checked += 1
-    assert checked == 2
+    assert checked == 3
 
 
 async def test_closing_the_toolset_closes_every_client(alice):

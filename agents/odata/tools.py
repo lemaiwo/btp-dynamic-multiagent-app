@@ -41,7 +41,6 @@ from .models import (
     ServiceDefinition,
 )
 from .search import MAX_FULL_TARGETS, MAX_SUMMARY_MATCHES, search_catalogue
-from .urls import FilterError, check_filter
 from .v2 import V2Dialect
 
 logger = logging.getLogger(__name__)
@@ -60,7 +59,15 @@ _NO_USER_HINT = (
     "this service runs as the signed-in user and this run has none; "
     "use a service that runs as a technical user"
 )
-_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*")
+# What is cut out of a text before a model reads it, in this order: a URL,
+# a scheme-less `//host/...`, an absolute `/sap/...` path (the ICF tree; a
+# message code such as `/IWBEP/CM_MGW_RT/022` is not one) and `host:port`.
+_SCRUB: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*"), "[url]"),
+    (re.compile(r"(?<![:\w])//\S+"), "[url]"),
+    (re.compile(r"(?<![\w/])/sap/\S*", re.IGNORECASE), "[path]"),
+    (re.compile(r"(?<![\w.-])[A-Za-z0-9][A-Za-z0-9.-]*:\d{2,5}(?!\d)"), "[host]"),
+)
 
 __all__ = [
     "DEFAULT_TOP",
@@ -169,15 +176,22 @@ class _Service:
     client: ODataClient | None = None
 
 
+def _scrub(text: str) -> str:
+    for pattern, placeholder in _SCRUB:
+        text = pattern.sub(placeholder, text)
+    return text[:500]
+
+
 def _error(code: str, message: str, hint: str | None = None) -> dict[str, Any]:
     """The one shape a refusal or a failure has for the model.
 
-    A URL in the text is cut out: the message of a SAP error is SAP's own
-    wording, and it must not be the way a host name reaches a model.
+    URLs, hosts and ICF paths are cut out of the text: the message of a SAP
+    error is SAP's own wording, and it must not be the way the address of
+    the back end reaches a model.
     """
-    error = {"code": code, "message": _URL.sub("[url]", message)[:500]}
+    error = {"code": code, "message": _scrub(message)}
     if hint:
-        error["hint"] = _URL.sub("[url]", hint)[:500]
+        error["hint"] = _scrub(hint)
     return {"error": error}
 
 
@@ -188,15 +202,20 @@ def _shown(name: object) -> str:
     return "that name"
 
 
+def _without_etag(result: dict[str, Any]) -> dict[str, Any]:
+    """A read result without the entity's ETag.
+
+    An ETag is often the entity's last-changed timestamp or a hash of its
+    fields, so it can carry the value of a field the catalogue does not
+    release. A read therefore never returns one, at any level; rows are
+    already free of it (the client drops ``__metadata``).
+    """
+    return {k: v for k, v in result.items() if k != "etag"}
+
+
 def _absent(value: object) -> bool:
     """``None`` and the empty value a model sends for "not used"."""
     return value is None or (isinstance(value, (str, list, dict)) and not value)
-
-
-def _whole_number(label: str, value: object, low: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < low:
-        raise ODataError("invalid_argument", f"{label} must be an integer of at least {low}")
-    return value
 
 
 def odata_toolset(
@@ -365,83 +384,53 @@ def odata_toolset(
         return entry.client
 
     def _check_read(
-        rules: ODataClient,
-        dialect: Any,
-        entity_set: EntitySetDef,
-        operation: str,
-        args: dict[str, Any],
+        rules: ODataClient, entity_set: EntitySetDef, operation: str, args: dict[str, Any]
     ) -> ReadQuery:
-        """Refuse a read the catalogue does not allow, in one fixed order.
+        """Refuse a read the catalogue does not allow; the query to send.
 
-        key -> navigation -> select / expand / orderby -> filter -> top/skip
-        -> body/params. The client checks all of it again before it sends;
-        the order is kept here so that the model gets the same refusal for
-        the same call. Returns the query to send.
+        The rules and their order are ``ODataClient.check_read``'s, the same
+        gate the client runs again before it sends: operation enabled (for a
+        navigation: ``get`` on the parent) -> key -> navigation -> select ->
+        expand -> orderby -> filter -> top/skip. The tool adds only what is
+        its own: the page size, the expand cap, and that a read takes no
+        ``body``, ``params`` or ``etag``.
         """
-        key, navigation = args["key"], args["navigation"]
-        if navigation is not None or operation == "get":
-            dialect.key_segment(entity_set, key)
-        # Also refuses a key on a plain list, and resolves the navigation:
-        # the fields that follow are those of the entity set it leads to.
-        _, target = rules._resolve(entity_set, key, navigation, operation)
-
-        select = None if _absent(args["select"]) else args["select"]
-        expand = None if _absent(args["expand"]) else args["expand"]
-        orderby = None if _absent(args["orderby"]) else args["orderby"]
-        rules._projection(target, select, None)
-        if expand is not None:
-            if not isinstance(expand, list):
-                raise ODataError("invalid_argument", "expand must be a list of navigation names")
-            known = {nav.name for nav in target.navigations}
-            for name in expand:
-                if not isinstance(name, str) or name not in known:
-                    raise ODataError(
-                        "unknown_field",
-                        f"entity set {target.name!r} has no navigation {_shown(name)}",
-                    )
-            if len(set(expand)) > MAX_EXPAND:
-                raise ODataError(
-                    "invalid_argument", f"at most {MAX_EXPAND} navigations can be expanded"
-                )
-            rules._projection(target, select, expand)
-        if orderby is not None and operation != "list":
-            raise ODataError("invalid_argument", "orderby is only used with 'list'")
-        rules._orderby(target, orderby)
-
-        filter_ = None if _absent(args["filter"]) else args["filter"]
-        if filter_ is not None:
-            if operation != "list":
-                raise ODataError("invalid_argument", "filter is only used with 'list'")
-            if not isinstance(filter_, str) or len(filter_) > MAX_FILTER_CHARS:
-                raise ODataError(
-                    "invalid_argument",
-                    f"filter must be a string of at most {MAX_FILTER_CHARS} characters",
-                )
-            try:
-                check_filter(filter_, {f.name: f for f in target.fields})
-            except FilterError as exc:
-                raise ODataError(exc.code, exc.message) from None
-
-        top, skip = args["top"], args["skip"]
+        top = args["top"]
         if operation == "list":
-            top = DEFAULT_TOP if top is None else min(_whole_number("top", top, 1), MAX_TOP)
-            skip = 0 if skip is None else _whole_number("skip", skip, 0)
-        else:
-            if top is not None or skip not in (None, 0) or isinstance(skip, bool):
-                raise ODataError("invalid_argument", "top and skip are only used with 'list'")
-            top, skip = 0, 0
-
+            if top is None:
+                top = DEFAULT_TOP
+            elif isinstance(top, int) and not isinstance(top, bool) and top > MAX_TOP:
+                top = MAX_TOP  # capped, not refused: the model pages with next_skip
+        plan = rules.check_read(
+            entity_set,
+            operation,
+            key=args["key"],
+            navigation=args["navigation"],
+            select=args["select"],
+            expand=args["expand"],
+            orderby=args["orderby"],
+            filter=args["filter"],
+            top=top,
+            skip=args["skip"],
+        )
+        if len(plan.expands) > MAX_EXPAND:
+            raise ODataError(
+                "invalid_argument", f"at most {MAX_EXPAND} navigations can be expanded"
+            )
         if not (_absent(args["body"]) and _absent(args["params"]) and _absent(args["etag"])):
             raise ODataError(
                 "invalid_argument", "body, params and etag are not used when reading"
             )
+        # The caller's own arguments, not `plan.query`: the client builds its
+        # plan again from these, and `plan.query.select` already carries the
+        # expanded targets' fields.
         return ReadQuery(
-            select=select or [],
-            filter=filter_,
-            expand=expand or [],
-            orderby=orderby or [],
-            top=top,
-            skip=skip,
+            select=args["select"] or [],
+            filter=plan.query.filter,
+            expand=args["expand"] or [],
+            orderby=args["orderby"] or [],
+            top=plan.query.top,
+            skip=plan.query.skip,
         )
 
     async def _execute(service: Any, target: Any, operation: Any, args: dict[str, Any]) -> dict:
@@ -488,12 +477,12 @@ def odata_toolset(
                 f"service {entry.raw['name']!r} has no entity set {_shown(target)}",
                 hint="use a 'target' name returned by search_operations",
             )
-        if operation not in entity_set.operations:
-            raise ODataError(
-                "operation_disabled",
-                f"{operation!r} is not enabled for entity set {entity_set.name!r}",
-            )
         if operation in WRITE_OPS:
+            if operation not in entity_set.operations:
+                raise ODataError(
+                    "operation_disabled",
+                    f"{operation!r} is not enabled for entity set {entity_set.name!r}",
+                )
             raise ODataError(
                 "write_not_allowed",
                 "this agent may not change data in SAP"
@@ -501,14 +490,16 @@ def odata_toolset(
                 else "changing data is not available yet",
             )
 
-        # 5. everything else about the call, then -- and only then -- a request.
-        query = _check_read(rules, dialect, entity_set, operation, args)
+        # 5. a read: whether it is enabled (which, for a navigation, is 'get'
+        # on this entity set) and everything else about the call is one gate;
+        # then -- and only then -- a request.
+        query = _check_read(rules, entity_set, operation, args)
         client = _client(entry, dialect)
         if operation == "list":
             result = await client.list(
                 entity_set, query, key=args["key"], navigation=args["navigation"]
             )
-            return clip_result(result, MAX_RESULT_CHARS, skip=query.skip)
+            return clip_result(_without_etag(result), MAX_RESULT_CHARS, skip=query.skip)
         result = await client.get(
             entity_set,
             args["key"],
@@ -516,7 +507,7 @@ def odata_toolset(
             expand=query.expand,
             navigation=args["navigation"],
         )
-        return clip_result(result, MAX_RESULT_CHARS)
+        return clip_result(_without_etag(result), MAX_RESULT_CHARS)
 
     async def execute_operation(
         ctx: RunContext,
@@ -596,8 +587,14 @@ def odata_toolset(
             return _error(
                 "destination_error", "the destination of this service could not be used"
             )
-        except Exception:  # noqa: BLE001 - a tool error is data for the model, never a traceback
-            logger.exception("odata: execute_operation failed for service '%s'", label)
+        except Exception as exc:  # noqa: BLE001 - a tool error is data, never a traceback
+            # Only the type: the text and the traceback of an HTTP failure can
+            # carry the destination's URL.
+            logger.error(
+                "odata: execute_operation failed for service '%s' (%s)",
+                label,
+                type(exc).__name__,
+            )
             return _error("destination_error", "the call could not be completed")
 
     toolset.add_function(execute_operation)

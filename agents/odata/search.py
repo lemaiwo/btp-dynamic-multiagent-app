@@ -197,7 +197,11 @@ def _entity_set_detail(
     entity_set: dict[str, Any], readable: dict[str, list[str]], allow_write: bool
 ) -> dict[str, Any]:
     navigations = []
-    for nav in _dicts(entity_set.get("navigations")):
+    # Following a navigation reads through one entity of this set, which the
+    # execute tool allows only with 'get' enabled here (`ODataClient.check_read`).
+    operations = entity_set.get("operations")
+    through = isinstance(operations, list) and "get" in operations
+    for nav in _dicts(entity_set.get("navigations")) if through else []:
         # A navigation can be followed only into an entity set this agent
         # may read that way; any other one would be a name that always fails.
         needed = "list" if nav.get("collection") is True else "get"

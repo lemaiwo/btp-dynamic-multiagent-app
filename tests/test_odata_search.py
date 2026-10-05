@@ -386,6 +386,20 @@ def test_full_detail_shows_writable_fields_only_with_allow_write():
     assert "CreatedByUser" not in [f["name"] for f in out["matches"][0]["fields"]]
 
 
+def test_a_navigation_is_listed_only_when_the_parent_has_get():
+    """Following a navigation reads through one parent entity, so the execute
+    tool asks for 'get' on the parent; search must not offer what it refuses."""
+    definition = json.loads(json.dumps(PURCHASE_REQUISITIONS["definition"]))
+    header = definition["entity_sets"][0]
+    assert header["name"] == "A_PurchaseRequisitionHeader"
+    for operations, expected in ((["list"], []), (["get"], ["to_PurchaseReqnItem"])):
+        header["operations"] = operations
+        service = {**PURCHASE_REQUISITIONS, "definition": definition}
+        out = search_catalogue([service], "A_PurchaseRequisitionHeader", detail="full")
+        found = next(m for m in out["matches"] if m["target"] == "A_PurchaseRequisitionHeader")
+        assert [n["name"] for n in found["navigations"]] == expected, operations
+
+
 def test_full_detail_lists_only_navigations_the_model_can_follow():
     out = search_catalogue(SERVICES, "A_PurchaseRequisitionHeader", detail="full")
     header = out["matches"][0]
