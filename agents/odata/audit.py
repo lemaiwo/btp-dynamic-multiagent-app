@@ -18,8 +18,12 @@ own database session (``agents.db.SessionLocal``), never the caller's:
    ``intent``. A row is therefore finalised exactly once; a second result
    for the same row changes nothing and is logged.
 
-No other statement updates a row, and only the retention purge
-(``agents.db.purge_odata_audit``) deletes rows.
+Two statements update a row, and no other: ``result`` (above), and
+``abandon``, which closes the intent of a call whose write was never sent
+(see below) as ``refused`` / ``token``. Both are conditional on the outcome
+still being ``intent``, so whichever comes first is the only one that
+changes the row. Only the retention purge (``agents.db.purge_odata_audit``)
+deletes rows.
 
 How to read a row that is still ``intent``
 ------------------------------------------
@@ -156,6 +160,11 @@ def _fit(value: str | None, column: Any) -> str | None:
     width. Two long values with a common prefix therefore stay distinct,
     and a cut value is recognisable as one. Logged once per column (the
     column's name, never the value).
+
+    A column no wider than the mark and digest (17 characters) has no room
+    for a prefix: there the value is cut plainly to the width -- a negative
+    slice would otherwise return a text LONGER than the column, which
+    Postgres refuses.
     """
     if value is None:
         return None
@@ -163,6 +172,8 @@ def _fit(value: str | None, column: Any) -> str | None:
     width = column.type.length
     if len(text_value) <= width:
         return text_value
+    if width <= len(_CUT_MARK) + _CUT_DIGEST_CHARS:
+        return text_value[:width]
     if column.name not in _cut_warned:
         _cut_warned.add(column.name)
         audit_logger.warning(

@@ -654,8 +654,10 @@ class ODataAuditLog(Base):
     Written in two steps by ``agents.odata.audit.StoredWriteRecorder``: the
     row is inserted with outcome ``intent`` before anything is sent, and
     finalised exactly once afterwards (a conditional UPDATE on ``outcome =
-    'intent'``). Nothing else updates a row, and only ``purge_odata_audit``
-    deletes rows, by age. A row that stays ``intent`` is explained in the
+    'intent'``): by ``result``, or by ``abandon``, which closes the intent
+    of a write that was never sent as ``refused`` / ``token``. Those two
+    statements are the only ones that update a row, and only
+    ``purge_odata_audit`` deletes rows, by age. A row that stays ``intent`` is explained in the
     docstring of ``agents.odata.audit``.
 
     Two identities, on purpose: ``sent_as`` is whose credential SAP saw

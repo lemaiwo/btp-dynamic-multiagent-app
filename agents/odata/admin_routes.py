@@ -12,20 +12,35 @@ catalogue field (a path, a destination name) is exactly where a URL with a
 credential in it gets pasted by mistake. ``validate_odata_service`` names the
 field and the rule, never the value; the same holds for every refusal below.
 
-This module imports ``agents.auth`` and ``agents.db`` only, never
-``agents.admin`` (which imports it at the end of the module).
+The same holds for what a remote system said: the ``$metadata`` preview
+route answers with fixed texts or SAP's own short code and message
+(``agents.odata.preview``), never a host, a URL or a page.
+
+This module imports ``agents.auth``, ``agents.db`` and the ``agents.odata``
+modules only, never ``agents.admin`` (which imports it at the end of the
+module).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, StrictBool, StringConstraints, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictBool,
+    StrictStr,
+    StringConstraints,
+    ValidationError,
+    field_validator,
+)
 from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,9 +60,14 @@ from agents.db import (
     update_odata_service,
     validate_odata_service,
 )
+from agents.odata import preview
+from agents.odata.metadata import MetadataError
 from agents.odata.models import DESTINATION_NAME_RE, MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+from agents.odata.urls import confine_service_path
 
 logger = logging.getLogger(__name__)
+
+_Body = TypeVar("_Body", bound=BaseModel)
 
 router = APIRouter(prefix="/api/odata", tags=["odata"])
 
@@ -60,6 +80,13 @@ _MAX_REPORTED_ERRORS = 20
 # worker buffer and parse a body of any size.
 MAX_BODY_BYTES = MAX_DEFINITION_BYTES + 64 * 1024
 _TOO_LARGE = "Request body too large"
+# The preview request is five short fields.
+METADATA_BODY_BYTES = 16 * 1024
+# The id column of the audit table is a 32-bit integer on Postgres; a larger
+# bound parameter is a driver error there, i.e. a 500.
+AUDIT_MAX_ID = 2_147_483_647
+# The stable code of a refused preview, next to the text in `detail`.
+ERROR_HEADER = "X-OData-Error"
 # Optimistic concurrency of the update route: the `updated_at` the client
 # loaded. Not a stored field, so never part of the payload gate.
 EXPECTED_FIELD = "expected_updated_at"
@@ -95,6 +122,30 @@ class DuplicateBody(BaseModel):
     user_context: StrictBool | None = None
 
 
+class MetadataBody(BaseModel):
+    """What the ``$metadata`` preview is asked for: where to read, and as whom.
+
+    No URL, no query, no host: the host is the destination's, and the path
+    is held to the rule of a stored service path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    destination: Annotated[str, StringConstraints(pattern=DESTINATION_NAME_RE)]
+    service_path: StrictStr
+    odata_version: Literal["v2", "v4"]
+    # Strict, as in `DuplicateBody`: it decides whose identity reaches SAP.
+    user_context: StrictBool = False
+    # The stored service to compare with. Its pattern is checked in the
+    # handler, where a name that cannot be one is the 404 of an unknown one.
+    service: StrictStr | None = None
+
+    @field_validator("service_path")
+    @classmethod
+    def _confined(cls, value: str) -> str:
+        return confine_service_path(value)
+
+
 def _refuse(detail: str) -> HTTPException:
     return HTTPException(status_code=422, detail=detail)
 
@@ -112,8 +163,8 @@ def _service_name(name: str) -> str:
     return name
 
 
-async def _bounded_body(request: Request) -> bytes:
-    """The raw body, at most ``MAX_BODY_BYTES``; 413 beyond that.
+async def _bounded_body(request: Request, limit: int = MAX_BODY_BYTES) -> bytes:
+    """The raw body, at most ``limit`` bytes; 413 beyond that.
 
     The declared length is refused before a byte is read. The stream is
     counted as well, because a chunked body declares nothing and a declared
@@ -121,21 +172,21 @@ async def _bounded_body(request: Request) -> bytes:
     """
     too_large = HTTPException(status_code=413, detail=_TOO_LARGE)
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+    if declared.isdigit() and int(declared) > limit:
         raise too_large
     chunks: list[bytes] = []
     size = 0
     async for chunk in request.stream():
         size += len(chunk)
-        if size > MAX_BODY_BYTES:
+        if size > limit:
             raise too_large
         chunks.append(chunk)
     return b"".join(chunks)
 
 
-async def _json_object(request: Request) -> dict[str, Any]:
+async def _json_object(request: Request, limit: int = MAX_BODY_BYTES) -> dict[str, Any]:
     """The request body as a JSON object, or a 422 that says only that."""
-    raw = await _bounded_body(request)
+    raw = await _bounded_body(request, limit)
     try:
         data = json.loads(raw)
     except (ValueError, RecursionError):
@@ -154,9 +205,11 @@ def _validated(data: dict[str, Any]) -> dict[str, Any]:
         raise _refuse(str(e)) from None
 
 
-def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:
+def _model_body(model: type[_Body], data: dict[str, Any]) -> _Body:
+    """``data`` as ``model``, or a 422 naming each field and its rule, never
+    a value."""
     try:
-        return DuplicateBody.model_validate(data)
+        return model.model_validate(data)
     except ValidationError as exc:
         errors = exc.errors(include_url=False, include_context=False, include_input=False)
         lines = [
@@ -165,6 +218,10 @@ def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:
         ]
         # `from None`: the ValidationError carries the input in its repr.
         raise _refuse("; ".join(lines)) from None
+
+
+def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:
+    return _model_body(DuplicateBody, data)
 
 
 def _stale_write(name: str) -> str:
@@ -436,6 +493,111 @@ async def api_duplicate_odata_service(name: str, request: Request) -> dict[str, 
         return row.to_dict([])
 
 
+@router.post("/metadata", dependencies=[Depends(require_admin)])
+async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
+    """Read a service's ``$metadata`` and answer what it offers. A PREVIEW:
+    nothing is stored and no catalogue service changes; the admin picks from
+    the answer and saves through the create or update route.
+
+    Body (JSON object, at most ``METADATA_BODY_BYTES``; any other key is a
+    422, and a refusal names the field and the rule, never the value):
+    ``destination`` (a destination name), ``service_path`` (the rule of a
+    stored service path: absolute, no query, fragment, ``..`` or scheme),
+    ``odata_version`` (``v2`` | ``v4``), ``user_context`` (a JSON boolean,
+    default false) and optionally ``service``: the name of a stored
+    catalogue service to compare with (``null`` = none).
+
+    The app then sends ONE request, ``GET <destination><service_path>/
+    $metadata`` -- no URL, query or host from the client, no redirect
+    followed, no retry, nothing cached (``agents.odata.preview``). With
+    ``user_context`` true it is sent as the admin who calls this route (the
+    request's bound JWT through the destination); without a bound JWT the
+    answer is 424 and nothing is sent. With ``user_context`` false the
+    destination's own credential is used.
+
+    Answer: ``{fetched_at, entity_sets, operations, skipped, summary,
+    truncated, totals}`` (``preview.build_preview``): names, types, labels
+    and what the service DECLARES (capabilities, ``filterable`` /
+    ``creatable`` / ``updatable`` per field) as information. Nothing in it
+    is enabled: no ``selectable`` / ``writable`` / entity operations, no
+    operation ``enabled``. ``changes_data`` of an operation is a suggestion
+    (``changes_data_known`` false: nothing is known, treated as changing).
+    With ``service``, each entity set has a ``status`` (``new`` |
+    ``in_service`` | ``changed``) and the names of fields new in the
+    document (``new_fields``) or stored but gone from it
+    (``removed_fields``), compared with the STORED definition read here --
+    whose hints, examples and switches are never part of the answer.
+
+    Refusals, in this order: 422 body; 404 ``Service not found`` (``service``
+    names none, or cannot be a name) -- before anything is fetched; then,
+    each with a stable code in the ``X-OData-Error`` header: 424
+    ``user_token_required``; 502 ``on_premise_unavailable``,
+    ``destination_error``, ``unreachable``, ``redirect``, ``sap_error``
+    (SAP's short code and message), ``not_xml`` (a sign-in page),
+    ``too_large``; 504 ``timeout``; 422 ``invalid_metadata`` (the parser's
+    fixed text, e.g. a version mismatch).
+
+    The log line names the caller's choice (destination, path, version,
+    identity kind), the outcome, bytes and duration -- no content.
+    """
+    body = _model_body(MetadataBody, await _json_object(request, METADATA_BODY_BYTES))
+    stored: dict[str, Any] | None = None
+    if body.service is not None:
+        name = _service_name(body.service)
+        async with SessionLocal() as session:
+            row = await get_odata_service(session, name)
+            if row is None:
+                raise HTTPException(status_code=404, detail=_NOT_FOUND)
+            stored = row.definition
+    identity = "user" if body.user_context else "technical"
+    started = time.monotonic()
+    size = 0
+    try:
+        document = await preview.fetch_metadata(
+            body.destination, body.service_path, body.user_context
+        )
+        size = len(document)
+        # Up to 20 MB of XML: CPU work that must not run on the event loop.
+        answer = await asyncio.to_thread(
+            preview.parse_and_build, document, body.odata_version, stored
+        )
+    except (preview.PreviewError, MetadataError) as exc:
+        if isinstance(exc, preview.PreviewError):
+            status_code, code, detail = exc.status, exc.code, exc.detail
+        else:  # the parser's texts are fixed and never quote the document
+            status_code, code, detail = 422, "invalid_metadata", str(exc)
+        logger.info(
+            "odata metadata preview refused: destination=%s path=%s version=%s identity=%s "
+            "code=%s status=%d bytes=%d duration_ms=%d",
+            body.destination,
+            body.service_path,
+            body.odata_version,
+            identity,
+            code,
+            status_code,
+            size,
+            int((time.monotonic() - started) * 1000),
+        )
+        raise HTTPException(
+            status_code=status_code, detail=detail, headers={ERROR_HEADER: code}
+        ) from None
+    logger.info(
+        "odata metadata preview: destination=%s path=%s version=%s identity=%s "
+        "entity_sets=%d operations=%d skipped=%d truncated=%s bytes=%d duration_ms=%d",
+        body.destination,
+        body.service_path,
+        body.odata_version,
+        identity,
+        answer["totals"]["entity_sets"],
+        answer["totals"]["operations"],
+        answer["totals"]["skipped"],
+        answer["truncated"],
+        size,
+        int((time.monotonic() - started) * 1000),
+    )
+    return answer
+
+
 def _audit_moment(name: str, raw: str) -> datetime:
     """An ISO 8601 query value as a UTC moment, or a 422 that names ``name``."""
     try:
@@ -488,11 +650,14 @@ def _audit_filters(request: Request) -> dict[str, Any]:
             filters[name] = _audit_moment(name, raw)
     before_id = params.get("before_id")
     if before_id is not None:
-        # At most 18 digits: within a 64-bit id, whatever the database.
-        if not (before_id.isascii() and before_id.isdigit() and len(before_id) <= 18) or (
-            int(before_id) < 1
+        # At most 10 digits and no more than the id column holds on
+        # Postgres (`AUDIT_MAX_ID`): a larger value is a driver error there.
+        if not (before_id.isascii() and before_id.isdigit() and len(before_id) <= 10) or not (
+            1 <= int(before_id) <= AUDIT_MAX_ID
         ):
-            raise _refuse("before_id: the id of an audit row (a positive integer)")
+            raise _refuse(
+                f"before_id: the id of an audit row (an integer from 1 to {AUDIT_MAX_ID})"
+            )
         filters["before_id"] = int(before_id)
     limit = params.get("limit")
     if limit is not None:
@@ -514,8 +679,13 @@ async def api_list_odata_audit(request: Request) -> dict[str, Any]:
     (``intent``, ``ok``, ``refused``, ``sap_error``, ``unknown``,
     ``cancelled``); ``since`` / ``until`` (ISO 8601; rows recorded at or
     after / at or before it, UTC when it has no offset); ``before_id``
-    (rows with a smaller id) and ``limit`` (1 to ``AUDIT_MAX_LIMIT``,
-    default ``AUDIT_DEFAULT_LIMIT``). Any other parameter is a 422.
+    (rows with a smaller id; 1 to ``AUDIT_MAX_ID``, what the id column
+    holds) and ``limit`` (1 to ``AUDIT_MAX_LIMIT``, default
+    ``AUDIT_DEFAULT_LIMIT``). Any other parameter is a 422.
+    ``sent_as`` matches the STORED form: a value longer than its column is
+    stored cut (``agents.odata.audit._fit``: a prefix, ``~`` and a digest),
+    and such a row is found only by that stored, cut text -- not by the
+    full value and not by a prefix of it.
     An unencoded ``+`` in ``since`` / ``until`` arrives as a space and is
     refused: write the offset as ``%2B02:00``, or use ``Z``.
 
@@ -523,13 +693,23 @@ async def api_list_odata_audit(request: Request) -> dict[str, Any]:
     id (the order in which the intents were recorded). Paging: while
     ``more`` is true, ask again with the same filters and ``before_id`` =
     the ``id`` of the last item; every row of a filter is reachable that
-    way, however many there are.
+    way, however many there are. One exception, on Postgres: ids are handed
+    out when a row is inserted, not when it commits, so a row committed
+    late can have a smaller id than rows a page already showed, and
+    ``before_id`` paging that had passed its place does not come back to
+    it. To be sure of a complete picture, read again from the top (without
+    ``before_id``).
     A row is ``ODataAuditLog.to_dict()``: ids and timestamps, agent, run id,
     service, target, operation, ``key`` and ``created_key`` WITH their
     values, the body field NAMES, phase, outcome, HTTP status, ``sent_as``,
     ``run_principal`` and the token digest. A row whose outcome is still
     ``intent`` has ``phase: null``: the write MAY have been sent (see the
-    docstring of ``agents.odata.audit``).
+    docstring of ``agents.odata.audit``). A call that ends as "audit not
+    confirmed" (its intent could not be stored in time) can take up to the
+    intent timeout plus the bound of the close that follows
+    (``agents.odata.tools.AUDIT_INTENT_TIMEOUT_SECONDS`` +
+    ``AUDIT_RESULT_TIMEOUT_SECONDS``) before its row reads ``refused``;
+    until then it lists as ``intent``.
 
     The table can hold personal data -- key values name an entity (which
     can be a person's), principals name users -- so the route is for admins
