@@ -1706,44 +1706,47 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
             check(f"{fn}() builds no HTML from catalogue text",
                   m is not None and "innerHTML" not in m.group(0) and "textContent" in m.group(0))
 
-        # A stored entry, as GET /agents/{id} answers it, for the round trip
-        # below: load it into the row, collect it, PUT it back unchanged.
-        # Not in name order: the catalogue lists by name, so a round trip
-        # that kept this order did not take it from the catalogue.
+        odata_agent_id = None
         odata_names = ["purchase-requisitions", "business-partners"]
-        for svc_name, as_user in zip(odata_names, (True, False)):
-            r = await client.post("/admin/api/odata/services", json={
-                "name": svc_name, "title": svc_name.replace("-", " ").title(),
-                "purpose": "UI test service.",
-                "destination": "S4_ODATA_USER" if as_user else "S4_ODATA_TECH",
-                "user_context": as_user, "odata_version": "v2",
-                "service_path": "/sap/opu/odata/sap/ZUI_TEST_SRV",
-                "definition": {"entity_sets": [], "operations": []},
-            })
-            check(f"fixture OData service {svc_name} created", r.status_code == 201, r.text[:300])
-        odata_entry = {"url": "builtin:odata", "auth_mode": "destination",
-                       "oauth": {"services": list(odata_names), "allow_write": True}}
-        odata_agent = {
-            "name": "uiodata", "description": "UI test agent with OData services.",
-            "instructions": "You are a UI test agent.", "enabled": True,
-            "mcp_servers": [odata_entry],
-        }
-        r = await client.post("/admin/api/agents", json=odata_agent)
-        check("fixture agent with a builtin:odata entry created",
-              r.status_code == 201, r.text[:300])
-        odata_agent_id = r.json().get("id") if r.status_code == 201 else None
-        stored_odata = None
-        if odata_agent_id is not None:
-            r = await client.get(f"/admin/api/agents/{odata_agent_id}")
-            stored_odata = r.json()["mcp_servers"]
-            check("the stored entry holds the services in the saved order and the write switch",
-                  len(stored_odata) == 1
-                  and stored_odata[0]["oauth"].get("services") == odata_names
-                  and stored_odata[0]["oauth"].get("allow_write") is True,
-                  str(stored_odata))
+        try:
+            # A stored entry, as GET /agents/{id} answers it, for the round trip
+            # below: load it into the row, collect it, PUT it back unchanged.
+            # odata_names is not in name order: the catalogue lists by name, so a
+            # round trip that kept this order did not take it from the catalogue.
+            for svc_name, as_user in zip(odata_names, (True, False)):
+                r = await client.post("/admin/api/odata/services", json={
+                    "name": svc_name, "title": svc_name.replace("-", " ").title(),
+                    "purpose": "UI test service.",
+                    "destination": "S4_ODATA_USER" if as_user else "S4_ODATA_TECH",
+                    "user_context": as_user, "odata_version": "v2",
+                    "service_path": "/sap/opu/odata/sap/ZUI_TEST_SRV",
+                    "definition": {"entity_sets": [], "operations": []},
+                })
+                check(f"fixture OData service {svc_name} created",
+                      r.status_code == 201, r.text[:300])
+            odata_entry = {"url": "builtin:odata", "auth_mode": "destination",
+                           "oauth": {"services": list(odata_names), "allow_write": True}}
+            odata_agent = {
+                "name": "uiodata", "description": "UI test agent with OData services.",
+                "instructions": "You are a UI test agent.", "enabled": True,
+                "mcp_servers": [odata_entry],
+            }
+            r = await client.post("/admin/api/agents", json=odata_agent)
+            check("fixture agent with a builtin:odata entry created",
+                  r.status_code == 201, r.text[:300])
+            odata_agent_id = r.json().get("id") if r.status_code == 201 else None
+            stored_odata = None
+            if odata_agent_id is not None:
+                r = await client.get(f"/admin/api/agents/{odata_agent_id}")
+                stored_odata = r.json()["mcp_servers"]
+                check("the stored entry holds the services in the saved order and the write switch",
+                      len(stored_odata) == 1
+                      and stored_odata[0]["oauth"].get("services") == odata_names
+                      and stored_odata[0]["oauth"].get("allow_write") is True,
+                      str(stored_odata))
 
-        if shutil.which("node") is not None:
-            dest_harness = "const STORED_ODATA = " + json.dumps(stored_odata) + ";\n" + r"""
+            if shutil.which("node") is not None:
+                dest_harness = "const STORED_ODATA = " + json.dumps(stored_odata) + ";\n" + r"""
 'use strict';
 const assert = require('node:assert');
 const { JSDOM } = require('jsdom');
@@ -1954,6 +1957,7 @@ const typeUrl = (r, url) => {
     u.value = url;
     fire(u, 'input');
 };
+const commitUrl = (r, url) => { typeUrl(r, url); fire(r.querySelector('.mcp-url'), 'change'); };
 const setMode = (r, mode) => {
     r.querySelector('.mcp-auth-mode').value = mode;
     toggleOauthFields(r.querySelector('.mcp-auth-mode'));
@@ -1991,6 +1995,18 @@ assert.strictEqual(row.querySelector('.dest-field-services select'), null, 'no l
 assert.strictEqual(row.querySelector('.dest-field-services input:not([type=checkbox])'), null,
     'no free-text field for service names');
 assert.ok(boxesOf(row).every(b => b.type === 'checkbox' && !b.disabled));
+// A large catalogue scrolls inside the list; what is ticked is named above it.
+const listStyle = row.querySelector('.dest-services').style;
+assert.ok(listStyle.maxHeight && listStyle.overflowY === 'auto', 'the list scrolls on its own');
+const countOf = r => r.querySelector('.dest-services-count').textContent;
+assert.strictEqual(countOf(row), "1 selected: 'purchase-requisitions'");
+assert.strictEqual(row.querySelector('.dest-services-count').closest('label'), null);
+tick(row, 'business-partners', true);
+assert.strictEqual(countOf(row), "2 selected: 'business-partners', 'purchase-requisitions'");
+tick(row, 'business-partners', false);
+tick(row, 'purchase-requisitions', false);
+assert.strictEqual(countOf(row), 'None selected');
+tick(row, 'purchase-requisitions', true);
 
 // 10a. Accessibility: the note and the warning are outside every <label>
 //      (a click on that text must not move focus into the list or tick a
@@ -2073,13 +2089,38 @@ assert.strictEqual(shown(row, '.dest-field-allow_write'), 'none');
 assert.strictEqual(shown(row, '.dest-field-destination'), '',
     'every other type names a destination');
 ({ row } = addAndCollect(odata(['business-partners'], { allow_write: true })));
-typeUrl(row, 'builtin:jira');
-assert.strictEqual(row.querySelector('.dest-allow_write').checked, false,
-    'editing the url away from builtin:odata clears the switch');
-assert.ok(!('allow_write' in collectMcpServers()[0].oauth));
+const writesOn = r => r.querySelector('.dest-allow_write').checked;
+const clearedOf = r => r.querySelector('.dest-allow_write-cleared').textContent;
+// Retyping a character is not a decision: nothing is unticked while typing,
+// or the next save would silently post the entry without allow_write.
+typeUrl(row, 'builtin:odat');
 typeUrl(row, 'builtin:odata');
+assert.strictEqual(writesOn(row), true, 'retyping a character does not untick');
+assert.strictEqual(clearedOf(row), '');
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { services: ['business-partners'], allow_write: true });
+// Leaving the field with another url is: the switch is cleared, and says so.
+commitUrl(row, 'builtin:jira');
+assert.strictEqual(writesOn(row), false, 'leaving the field with another url clears the switch');
+assert.ok(!('allow_write' in collectMcpServers()[0].oauth));
+commitUrl(row, 'builtin:odata');
 assert.deepStrictEqual(collectMcpServers()[0].oauth, { services: ['business-partners'] },
     'coming back starts without writes');
+assert.ok(/Writes were switched off because the URL was edited; tick again/.test(clearedOf(row)),
+    clearedOf(row));
+assert.strictEqual(row.querySelector('.dest-allow_write-cleared').closest('label'), null);
+updateEndpointHint();
+typeUrl(row, 'builtin:odata');
+assert.ok(clearedOf(row) !== '', 'the line stays until the switch is touched');
+row.querySelector('.dest-allow_write').checked = true;
+fire(row.querySelector('.dest-allow_write'), 'change');
+assert.strictEqual(clearedOf(row), '', 'touching the switch removes the line');
+assert.strictEqual(collectMcpServers()[0].oauth.allow_write, true);
+// A switch that was off loses nothing, so there is nothing to say.
+({ row } = addAndCollect(odata(['business-partners'])));
+commitUrl(row, 'builtin:jira');
+commitUrl(row, 'builtin:odata');
+assert.strictEqual(clearedOf(row), '');
 
 // 13a. A brand-new row: the url typed afterwards, writes off, none posted.
 document.getElementById('agent-mcp-servers').innerHTML = '';
@@ -2161,6 +2202,33 @@ assert.strictEqual(shown(rows[1], '.dest-field-services'), '',
 tick(rows[1], 'business-partners', true);
 assert.throws(() => collectMcpServers(), /[Tt]wo builtin:odata rows/, 'still two rows: no save');
 
+// 16b. An empty url makes collectMcpServers skip a row. For the row that
+//      holds OData services that would save the agent without its entry and
+//      without a word, so it blocks the save and names the choice.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+renderMcpServers([{ url: 'https://arc1.example.com/mcp', auth_mode: 'destination',
+                    oauth: { destination: 'D' } },
+                  odata(['purchase-requisitions'])]);
+rows = [...document.querySelectorAll('.mcp-server-row')];
+commitUrl(rows[1], '  ');
+assert.throws(() => collectMcpServers(),
+    /empty URL.*builtin:odata.*remove the row/, 'the stored entry is not dropped silently');
+commitUrl(rows[1], 'builtin:odata');
+assert.deepStrictEqual(collectMcpServers()[1].oauth, { services: ['purchase-requisitions'] });
+// ... also for services ticked in a new row; any other empty row is skipped
+// as it always was.
+rows[1].remove();
+addMcpServerRow();
+rows = [...document.querySelectorAll('.mcp-server-row')];
+assert.strictEqual(collectMcpServers().length, 1, 'an empty new row is skipped');
+setMode(rows[1], 'destination');
+commitUrl(rows[1], 'builtin:odata');
+tick(rows[1], 'business-partners', true);
+commitUrl(rows[1], '');
+assert.throws(() => collectMcpServers(), /empty URL.*builtin:odata/);
+tick(rows[1], 'business-partners', false);
+assert.strictEqual(collectMcpServers().length, 1, 'nothing ticked: skipped like any empty row');
+
 // 17. Exposed for job runs + a service that runs as the signed-in user: warn.
 ({ row } = addAndCollect(odata(['business-partners', 'purchase-requisitions'])));
 assert.strictEqual(warningOf(row), '', 'no warning while the agent is not exposed for runs');
@@ -2169,6 +2237,14 @@ assert.ok(warningOf(row).startsWith('Warning:'), 'not told apart from the note b
 assert.ok(warningOf(row).includes('Purchase requisitions') && /signed-in user/.test(warningOf(row))
     && /refused/.test(warningOf(row)), warningOf(row));
 assert.ok(!warningOf(row).includes('Business partners'), 'a technical-user service is not named');
+// A status region is announced when it changes: it is not rebuilt with the
+// same text on every sync (every keystroke in any row's url runs one).
+const warnNode = row.querySelector('.dest-odata-warning').firstChild;
+updateEndpointHint();
+typeUrl(row, 'builtin:odata');
+tick(row, 'business-partners', true);
+assert.ok(row.querySelector('.dest-odata-warning').firstChild === warnNode,
+    'an unchanged warning is left alone');
 tick(row, 'purchase-requisitions', false);
 assert.strictEqual(warningOf(row), '', 'technical-user services only: nothing to warn about');
 setExpose(false);
@@ -2244,6 +2320,8 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         'nothing is called missing before the catalogue is known');
     assert.ok(boxesOf(row).length === 2 && boxesOf(row).every(b => b.disabled && b.checked),
         'not editable while loading');
+    assert.ok(/catalogue is not known/.test(writeNoteOf(row)),
+        'the switch is not offered blind: ' + writeNoteOf(row));
     await loadODataCatalogue();
     assert.deepStrictEqual(calls.map(c => c.slice(0, 2)), [['/admin/api/odata/services', 'GET']]);
     assert.strictEqual(boxesOf(row).length, 4);
@@ -2265,6 +2343,7 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
             noteOf(row));
         assert.deepStrictEqual(picked(row), ['purchase-requisitions', 'gone-service']);
         assert.ok(boxesOf(row).every(b => b.disabled), 'not editable without a catalogue');
+        assert.ok(/catalogue is not known/.test(writeNoteOf(row)), writeNoteOf(row));
         assert.strictEqual(textOf(row, 'gone-service'), 'gone-service');
         assert.strictEqual(
             row.querySelector('.dest-field-services input:not([type=checkbox])'), null);
@@ -2328,60 +2407,64 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
     console.log('destination server round-trip scenarios passed');
 })().catch(e => { console.error(e && e.stack || e); process.exit(1); });
 """
-            with tempfile.NamedTemporaryFile(
-                "w", suffix=".js", delete=False, dir=str(ROOT)
-            ) as f:
-                f.write(dest_harness)
-                dest_harness_path = f.name
-            try:
-                result = subprocess.run(
-                    ["node", dest_harness_path],
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                )
-                check(
-                    "destination servers round-trip through the row per built-in",
-                    result.returncode == 0
-                    and "destination server round-trip scenarios passed" in result.stdout,
-                    (result.stderr or result.stdout)[-1500:],
-                )
-                # The collected entry goes back to the API unchanged: the
-                # save is accepted and the stored entry is the same one.
-                collected = next((json.loads(line[len("ROUNDTRIP:"):])
-                                  for line in result.stdout.splitlines()
-                                  if line.startswith("ROUNDTRIP:")), None)
-                check("the form collected the stored builtin:odata entry",
-                      collected == [odata_entry], str(collected))
-                if collected is not None and odata_agent_id is not None:
-                    r = await client.put(f"/admin/api/agents/{odata_agent_id}",
-                                         json={**odata_agent, "mcp_servers": collected})
-                    check("saving the collected entry is accepted",
-                          r.status_code == 200, r.text[:300])
-                    r = await client.get(f"/admin/api/agents/{odata_agent_id}")
-                    check("load, save without changes: the same stored entry",
-                          r.json()["mcp_servers"] == stored_odata, str(r.json()["mcp_servers"]))
-                    # What the form can never send is what the API refuses.
-                    for label, block in (
-                        ("the string 'true'", {"services": odata_names, "allow_write": "true"}),
-                        ("an empty service list", {"services": []}),
-                        ("a destination name",
-                         {"services": odata_names, "destination": "S4_ODATA_TECH"}),
-                        ("a service the catalogue does not have", {"services": ["gone-service"]}),
-                    ):
-                        r = await client.put(
-                            f"/admin/api/agents/{odata_agent_id}",
-                            json={**odata_agent, "mcp_servers": [{**odata_entry, "oauth": block}]})
-                        check(f"the API refuses {label} with a 422", r.status_code == 422,
-                              f"{r.status_code} {r.text[:200]}")
-            finally:
-                os.unlink(dest_harness_path)
+                with tempfile.NamedTemporaryFile(
+                    "w", suffix=".js", delete=False, dir=str(ROOT)
+                ) as f:
+                    f.write(dest_harness)
+                    dest_harness_path = f.name
+                try:
+                    result = subprocess.run(
+                        ["node", dest_harness_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=20,
+                    )
+                    check(
+                        "destination servers round-trip through the row per built-in",
+                        result.returncode == 0
+                        and "destination server round-trip scenarios passed" in result.stdout,
+                        (result.stderr or result.stdout)[-1500:],
+                    )
+                    # The collected entry goes back to the API unchanged: the
+                    # save is accepted and the stored entry is the same one.
+                    collected = next((json.loads(line[len("ROUNDTRIP:"):])
+                                      for line in result.stdout.splitlines()
+                                      if line.startswith("ROUNDTRIP:")), None)
+                    check("the form collected the stored builtin:odata entry",
+                          collected == [odata_entry], str(collected))
+                    if collected is not None and odata_agent_id is not None:
+                        r = await client.put(f"/admin/api/agents/{odata_agent_id}",
+                                             json={**odata_agent, "mcp_servers": collected})
+                        check("saving the collected entry is accepted",
+                              r.status_code == 200, r.text[:300])
+                        r = await client.get(f"/admin/api/agents/{odata_agent_id}")
+                        check("load, save without changes: the same stored entry",
+                              r.json()["mcp_servers"] == stored_odata, str(r.json()["mcp_servers"]))
+                        # What the form can never send is what the API refuses.
+                        for label, block in (
+                            ("the string 'true'", {"services": odata_names, "allow_write": "true"}),
+                            ("an empty service list", {"services": []}),
+                            ("a destination name",
+                             {"services": odata_names, "destination": "S4_ODATA_TECH"}),
+                            ("a service the catalogue does not have",
+                             {"services": ["gone-service"]}),
+                        ):
+                            r = await client.put(
+                                f"/admin/api/agents/{odata_agent_id}",
+                                json={**odata_agent,
+                                      "mcp_servers": [{**odata_entry, "oauth": block}]})
+                            check(f"the API refuses {label} with a 422", r.status_code == 422,
+                                  f"{r.status_code} {r.text[:200]}")
+                finally:
+                    os.unlink(dest_harness_path)
+        finally:
+            # Whatever failed above, the fixtures do not outlive this section.
             if odata_agent_id is not None:
                 await client.delete(f"/admin/api/agents/{odata_agent_id}")
-        for svc_name in odata_names:
-            r = await client.delete(f"/admin/api/odata/services/{svc_name}")
-            check(f"fixture OData service {svc_name} removed", r.status_code == 204,
-                  f"{r.status_code} {r.text[:200]}")
+            for svc_name in odata_names:
+                r = await client.delete(f"/admin/api/odata/services/{svc_name}")
+                check(f"fixture OData service {svc_name} removed", r.status_code == 204,
+                      f"{r.status_code} {r.text[:200]}")
 
         # ------------------------------------------------------------------
         # saveAgent() must actually SEND all six exposure fields, not just

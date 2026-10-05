@@ -837,6 +837,7 @@ function addMcpServerRow(server) {
     `;
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-url').addEventListener('input', () => syncDestinationFields(row));
+    row.querySelector('.mcp-url').addEventListener('change', () => odataUrlCommitted(row));
     row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
     row.querySelector('.oauth-dcr').checked = !!oauth.dcr;
     row.querySelector('.oauth-uaa').value = oauth.uaa_url || '';
@@ -876,7 +877,16 @@ function collectMcpServers() {
     }
     rows.forEach(r => {
         const url = r.querySelector('.mcp-url').value.trim();
-        if (!url) return;
+        if (!url) {
+            // A row without a url is skipped. For the row that holds OData
+            // services that would save the agent without its entry, silently.
+            if (r.querySelector('.dest-services')
+                && (storedODataServices(r).length || pickedODataServices(r).length)) {
+                throw new Error('A row that holds OData services has an empty URL. '
+                    + 'Restore builtin:odata in it, or remove the row.');
+            }
+            return;
+        }
         const mode = r.querySelector('.mcp-auth-mode').value;
         const server = {url, auth_mode: mode};
         if (destinationBuiltinOf(r) === ODATA_BUILTIN && mode !== 'destination') {
@@ -2498,7 +2508,8 @@ function destinationFieldsHtml() {
                 </label>
                 <div class="dest-field-services" style="grid-column:1 / -1">
                     <div class="dest-services-title" style="font-weight:600">OData services</div>
-                    <div class="dest-services" role="group" style="margin:4px 0"></div>
+                    <div class="dest-services-count" style="color:var(--muted);font-size:12px"></div>
+                    <div class="dest-services" role="group" style="margin:4px 0;max-height:220px;overflow-y:auto"></div>
                     <div class="dest-services-note" style="color:var(--muted);font-size:12px"></div>
                     <div class="dest-odata-warning" role="status" style="color:var(--warn);font-size:12px"></div>
                 </div>
@@ -2510,6 +2521,7 @@ function destinationFieldsHtml() {
                         later in the catalogue for one of these services opens for this agent without
                         another edit here.</span>
                         <span class="dest-allow_write-detail" style="display:block"></span>
+                        <span class="dest-allow_write-cleared" role="status" style="display:block;color:var(--warn)"></span>
                     </div>
                 </div>
                 <label class="full dest-field-user_context" style="font-weight:600">
@@ -2634,9 +2646,6 @@ function syncDestinationFields(row) {
         if (key === 'allow_send' && builtin === 'builtin:teams' && !userContext) show = false;
         label.style.display = show ? '' : 'none';
     });
-    // The write switch belongs to builtin:odata alone. Once the url is
-    // something else it is cleared, so coming back starts without writes.
-    if (builtin !== ODATA_BUILTIN) row.querySelector('.dest-allow_write').checked = false;
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
@@ -2734,6 +2743,25 @@ function wireODataFields(row) {
     row.querySelector('.dest-allow_write').setAttribute('aria-describedby',
         set('.dest-allow_write-note', '-write-note'));
     list.addEventListener('change', () => odataSelectionChanged(row));
+    // The admin touched the switch: whatever it shows now is their choice.
+    row.querySelector('.dest-allow_write').addEventListener('change', () => {
+        row.querySelector('.dest-allow_write-cleared').textContent = '';
+    });
+}
+
+/**
+ * The url field was left. The write switch belongs to builtin:odata alone, so
+ * with another url it is cleared and coming back starts without writes. Not
+ * while typing: retyping one character must not untick it, or the next save
+ * would post the entry without allow_write and nobody would have decided that.
+ * A switch that was on says so, until it is touched or the agent is reloaded.
+ */
+function odataUrlCommitted(row) {
+    const box = row.querySelector('.dest-allow_write');
+    if (!box || destinationBuiltinOf(row) === ODATA_BUILTIN || !box.checked) return;
+    box.checked = false;
+    row.querySelector('.dest-allow_write-cleared').textContent =
+        'Writes were switched off because the URL was edited; tick again to keep them.';
 }
 
 function odataServiceChecks(row) {
@@ -2822,7 +2850,8 @@ function syncODataNotes(row) {
     const quoted = names => names.map(n => "'" + n + "'").join(', ');
     const titles = names => names.map(n => '"' + String(byName.get(n).title || n) + '"').join(', ');
     const lines = [];
-    let writes = '';
+    // Without a catalogue the switch must not look like it opens nothing.
+    let writes = 'The catalogue is not known, so which of these services have write operations cannot be shown.';
     if (odataCatalogue.state === 'loading') {
         lines.push('Loading the OData catalogue…');
     } else if (odataCatalogue.state === 'error') {
@@ -2845,6 +2874,7 @@ function syncODataNotes(row) {
                 + '. It stays attached, but the agent cannot use it until it is enabled.');
         }
         const writable = picked.filter(n => byName.has(n) && byName.get(n).has_write === true);
+        writes = '';
         if (writable.length) {
             writes = 'Of the selected services, write operations are enabled in the catalogue for: '
                 + titles(writable) + '.';
@@ -2860,21 +2890,31 @@ function syncODataNotes(row) {
         note.appendChild(line);
     });
     writeDetail.textContent = writes;
+    // The list scrolls on its own, so what is ticked is also named above it.
+    const count = row.querySelector('.dest-services-count');
+    count.textContent = !odataServiceChecks(row).length ? ''
+        : picked.length ? picked.length + ' selected: ' + quoted(picked) : 'None selected';
     // A run started through the API has no signed-in user, so a service that
     // runs as one is refused there (error code no_user). Say it at the place
     // where the service is picked.
     const exposeApi = document.getElementById('agent-expose-api');
     const asUser = picked.filter(n => byName.has(n) && byName.get(n).user_context === true);
+    const text = exposeApi && exposeApi.checked && asUser.length
+        ? ' ' + titles(asUser) + (asUser.length > 1 ? ' run' : ' runs') + ' as the signed-in user. '
+            + 'This agent is available via API (job runs), and such a run has no signed-in user, '
+            + 'so calls to ' + (asUser.length > 1 ? 'those services' : 'that service') + ' are refused there.'
+        : '';
+    // A status region is announced when it changes, and this runs on every
+    // keystroke in any row's url: leave an unchanged warning alone.
+    if ((warning.dataset.text || '') === text) return;
+    warning.dataset.text = text;
     warning.textContent = '';
-    if (exposeApi && exposeApi.checked && asUser.length) {
+    if (text) {
         // The word, not the colour alone, tells it apart from the note.
         const lead = document.createElement('strong');
         lead.textContent = 'Warning:';
         warning.appendChild(lead);
-        warning.appendChild(document.createTextNode(' ' + titles(asUser)
-            + (asUser.length > 1 ? ' run' : ' runs') + ' as the signed-in user. '
-            + 'This agent is available via API (job runs), and such a run has no signed-in user, '
-            + 'so calls to ' + (asUser.length > 1 ? 'those services' : 'that service') + ' are refused there.'));
+        warning.appendChild(document.createTextNode(text));
     }
 }
 
