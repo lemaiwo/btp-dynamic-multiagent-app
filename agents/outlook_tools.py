@@ -41,16 +41,18 @@ reaches the outside world under the mailbox owner's name.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
-from agents.auth import current_principal
+from agents.auth import current_jwt, current_principal
 from agents.lookback import parse_lookback
 from agents.mail_render import MailTheme, render_report_html, split_subject
 
@@ -69,6 +71,29 @@ BUILTIN_OUTLOOK_URL = "builtin:outlook"
 # How many mailbox owners' folder maps one client keeps. Bounded so a busy
 # multi-user agent cannot grow it without limit; the oldest owner is evicted.
 FOLDER_CACHE_MAX_OWNERS = 64
+
+# How long a folder map is trusted. A miss already refreshes, so this only
+# bounds how long a stale entry (a renamed folder, a user who left) lingers.
+FOLDER_CACHE_TTL_SECONDS = 900
+
+
+def owner_cache_key(owner: str | None, token_bound: bool) -> Any:
+    """The key of a per-owner cache of Graph data (folders, channels).
+
+    Plain ``owner`` when the data belongs to the owner whoever asks: a pinned
+    mailbox, an app-level credential, or ``oauth2``, where the token used is
+    the one stored *for that principal*. ``token_bound`` is for a destination
+    resolved as the signed-in user: there the data is fetched with the bound
+    JWT, and principal and JWT can name different people (a run started from
+    a request keeps that request's token while ``run_as`` sets the agent's
+    run-as principal). Keyed by principal alone, what one user's token
+    fetched would be served to another user. So the key then also carries a
+    digest of the bound token -- never the token itself.
+    """
+    if not token_bound:
+        return owner
+    token = current_jwt.get() or ""
+    return (owner, hashlib.sha256(token.encode("utf-8")).hexdigest())
 
 # Graph accepts these names wherever a folder id is expected, so they must not
 # be looked up among the Inbox's children -- "inbox" is not its own child.
@@ -174,15 +199,20 @@ class OutlookClient:
         lookback_minutes: int | None = None,
         recipients: list[str] | None = None,
         theme: MailTheme | None = None,
+        token_bound: bool = False,
     ) -> None:
         self._http = http
+        # True when requests are made with the bound user JWT through a
+        # destination (user_context): see owner_cache_key.
+        self.token_bound = bool(token_bound)
         # The look of originated mail only; replies stay plain.
         self.theme = theme
         # Folder ids per mailbox owner. One OutlookClient serves every user of
         # the agent, and under ``/me`` each signed-in user has a different
         # Inbox; a single shared map handed the first caller's ids to everyone
         # else, who then got 404s on list and move until the next reload.
-        self._folders: dict[str | None, dict[str, str]] = {}
+        # Values are (monotonic deadline, {display name: id}).
+        self._folders: dict[Any, tuple[float, dict[str, str]]] = {}
         self.mailbox = (mailbox or "").strip()
         self._root = f"/users/{self.mailbox}" if self.mailbox else "/me"
         self.lookback_minutes = lookback_minutes
@@ -205,14 +235,21 @@ class OutlookClient:
         r.raise_for_status()
         return r.json() if r.content else {}
 
-    def _cache_key(self) -> str | None:
-        """Whose folders: the pinned mailbox, else the signed-in principal."""
-        return self.mailbox or current_principal.get()
+    def _cache_key(self) -> Any:
+        """Whose folders: the pinned mailbox, else the signed-in principal.
+
+        Under ``/me`` through a per-user destination the principal alone does
+        not say whose Inbox was read; see :func:`owner_cache_key`.
+        """
+        if self.mailbox:
+            return self.mailbox
+        return owner_cache_key(current_principal.get(), self.token_bound)
 
     async def _inbox_children(self, *, refresh: bool = False) -> dict[str, str]:
         """``{display name: id}`` for the Inbox's subfolders, cached per owner."""
         key = self._cache_key()
-        folders = None if refresh else self._folders.get(key)
+        cached = None if refresh else self._folders.get(key)
+        folders = cached[1] if cached and time.monotonic() < cached[0] else None
         if folders is None:
             data = await self._req(
                 "GET", f"{self._root}/mailFolders/inbox/childFolders", params={"$top": 100}
@@ -224,7 +261,7 @@ class OutlookClient:
             }
             # Re-insert so the newest entry is last; evict from the front.
             self._folders.pop(key, None)
-            self._folders[key] = folders
+            self._folders[key] = (time.monotonic() + FOLDER_CACHE_TTL_SECONDS, folders)
             while len(self._folders) > FOLDER_CACHE_MAX_OWNERS:
                 self._folders.pop(next(iter(self._folders)))
         return folders
@@ -523,6 +560,7 @@ def outlook_toolset(
             "'mailbox' in the oauth config: an app-only token identifies no user, "
             "so there is no /me to fall back to"
         )
+    token_bound = False
     if auth_mode == AUTH_MODE_DESTINATION:
         from agents.destination_auth import user_context_of
 
@@ -531,6 +569,7 @@ def outlook_toolset(
         # the destination's token is that person's, and /me is right.
         if user_context_of(oauth):
             resolved_mailbox = ""
+            token_bound = True
         elif not resolved_mailbox:
             raise ValueError(
                 "builtin:outlook with auth_mode 'destination' and no user context "
@@ -562,6 +601,7 @@ def outlook_toolset(
         lookback_minutes=window,
         recipients=resolved_recipients,
         theme=theme,
+        token_bound=token_bound,
     )
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.

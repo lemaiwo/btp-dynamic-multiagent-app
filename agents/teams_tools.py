@@ -49,6 +49,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
@@ -58,7 +59,13 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from agents.auth import current_principal
 from agents.lookback import parse_lookback
-from agents.outlook_tools import GRAPH_API, GRAPH_V1, _text_to_html, _truncate
+from agents.outlook_tools import (
+    GRAPH_API,
+    GRAPH_V1,
+    _text_to_html,
+    _truncate,
+    owner_cache_key,
+)
 from agents.outlook_tools import build_http_client as graph_http_client
 
 __all__ = ["teams_toolset", "TeamsClient", "BUILTIN_TEAMS_URL"]
@@ -69,6 +76,9 @@ BUILTIN_TEAMS_URL = "builtin:teams"
 
 # How many principals' channel lists one client keeps; the oldest is evicted.
 CHANNEL_CACHE_MAX_PRINCIPALS = 64
+
+# How long a channel list is trusted; a miss already refreshes.
+CHANNEL_CACHE_TTL_SECONDS = 900
 
 AUTH_MODE_OAUTH2 = "oauth2"
 AUTH_MODE_APP_ONLY = "app_only"
@@ -145,8 +155,13 @@ class TeamsClient:
         team: str,
         channels: list[str] | None = None,
         lookback_minutes: int | None = None,
+        token_bound: bool = False,
     ) -> None:
         self._http = http
+        # True when requests are made with the bound user JWT through a
+        # destination (user_context): the cache key then also carries a
+        # digest of that token (outlook_tools.owner_cache_key).
+        self.token_bound = bool(token_bound)
         self.team = (team or "").strip()
         if not self.team:
             raise ValueError("builtin:teams requires a team id")
@@ -156,7 +171,12 @@ class TeamsClient:
         # Channels per signed-in principal: one TeamsClient serves every user
         # of the agent, and under oauth2 each user sees the channels they are
         # a member of. Bounded; the oldest principal is evicted.
-        self._channels: dict[str | None, list[dict[str, str]]] = {}
+        # Values are (monotonic deadline, channels).
+        self._channels: dict[Any, tuple[float, list[dict[str, str]]]] = {}
+
+    def _cache_key(self) -> Any:
+        """Whose channel list: the principal, plus the token when token-bound."""
+        return owner_cache_key(current_principal.get(), self.token_bound)
 
     def _window(self, requested: int | None) -> int | None:
         if requested is None:
@@ -180,8 +200,9 @@ class TeamsClient:
 
     async def list_channels(self, *, refresh: bool = False) -> list[dict[str, str]]:
         """The team's channels this toolset may use, cached per principal."""
-        key = current_principal.get()
-        channels = None if refresh else self._channels.get(key)
+        key = self._cache_key()
+        cached = None if refresh else self._channels.get(key)
+        channels = cached[1] if cached and time.monotonic() < cached[0] else None
         if channels is None:
             data = await self._req(
                 "GET",
@@ -199,7 +220,7 @@ class TeamsClient:
             ]
             channels = [c for c in every if self._permitted(c)]
             self._channels.pop(key, None)
-            self._channels[key] = channels
+            self._channels[key] = (time.monotonic() + CHANNEL_CACHE_TTL_SECONDS, channels)
             while len(self._channels) > CHANNEL_CACHE_MAX_PRINCIPALS:
                 self._channels.pop(next(iter(self._channels)))
         return channels
@@ -407,9 +428,19 @@ def teams_toolset(
         channels if channels is not None else oauth.get("channels")
     )
 
+    token_bound = False
+    if mode == AUTH_MODE_DESTINATION:
+        from agents.destination_auth import user_context_of
+
+        token_bound = user_context_of(oauth)
+
     session = http or graph_http_client(oauth, server_key, mode)
     client = TeamsClient(
-        session, resolved_team, channels=resolved_channels, lookback_minutes=window
+        session,
+        resolved_team,
+        channels=resolved_channels,
+        lookback_minutes=window,
+        token_bound=token_bound,
     )
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.
