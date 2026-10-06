@@ -2,9 +2,11 @@ import Controller from "sap/ui/core/mvc/Controller";
 import UIComponent from "sap/ui/core/UIComponent";
 import Router from "sap/m/routing/Router";
 import Model from "sap/ui/model/Model";
+import MessageBox from "sap/m/MessageBox";
 import type Component from "../Component";
 import type AdminService from "../service/AdminService";
 import ErrorHandler from "../service/ErrorHandler";
+import type { ReloadOutcome } from "../service/types";
 
 /**
  * Shared plumbing for every controller.
@@ -83,6 +85,31 @@ export default abstract class BaseController extends Controller {
             ErrorHandler.handle(error, fallback);
             return false;
         }
+    }
+
+    /**
+     * Says, in a box that stays until it is closed, that a change was stored
+     * but did not reach the running agents -- when `outcome` (the answer of
+     * a save, a delete or an import) reports a failed reload. Returns
+     * whether it did, so that the caller leaves out its "saved" toast: a
+     * toast would say the change is in, while the agents that are running
+     * keep the previous, possibly wider, configuration.
+     *
+     * `leadKey`: the i18n key of what was stored ("The service was saved").
+     * An answer without the keys (a route that reloads nothing, an older
+     * server) is no failure.
+     */
+    protected warnIfNotLive(outcome: ReloadOutcome | undefined | null | void, leadKey: string): boolean {
+        if (!outcome || outcome.reload_failed !== true) {
+            return false;
+        }
+        MessageBox.warning(this.text("reloadFailedText", [this.text(leadKey)]), {
+            title: this.text("reloadFailedTitle"),
+            // A save often navigates right after (to the list, to the new
+            // route): the box must outlive that, or it is never read.
+            closeOnNavigation: false
+        });
+        return true;
     }
 
     /**

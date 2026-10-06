@@ -4,6 +4,7 @@ import FilterOperator from "sap/ui/model/FilterOperator";
 import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import BaseController from "./BaseController";
+import ErrorHandler from "../service/ErrorHandler";
 import formatter from "../model/formatter";
 import type Event from "sap/ui/base/Event";
 import type { SearchField$LiveChangeEvent } from "sap/m/SearchField";
@@ -157,13 +158,17 @@ export default class Agents extends BaseController {
     }
 
     private async doDelete(agent: Agent): Promise<void> {
-        const ok = await this.runOk(
-            this.getAdminService().deleteAgent(agent.id),
-            `Could not delete the agent "${agent.name}".`
-        );
-        if (ok) {
-            MessageToast.show(this.text("agentDeleted"));
-            void this.load();
+        let answer;
+        try {
+            answer = await this.getAdminService().deleteAgent(agent.id);
+        } catch (error) {
+            ErrorHandler.handle(error, `Could not delete the agent "${agent.name}".`);
+            return;
         }
+        // Deleted, but still part of the running agents: a box that stays.
+        if (!this.warnIfNotLive(answer, "reloadFailedAgentDeleted")) {
+            MessageToast.show(this.text("agentDeleted"));
+        }
+        void this.load();
     }
 }

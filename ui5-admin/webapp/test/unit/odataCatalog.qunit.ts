@@ -209,28 +209,55 @@ QUnit.test("payloadOf keeps the payload fields of a stored service and nothing e
     );
 });
 
+QUnit.test("payloadOf leaves out what a PUT answered about the reload: the server refuses unknown keys", function (assert) {
+    const answered = { ...input({}), id: 3, used_by: [], reloaded: false, reload_failed: true };
+    const payload = odataCatalog.payloadOf(answered) as unknown as Record<string, unknown>;
+    assert.notOk("reloaded" in payload, "no reloaded");
+    assert.notOk("reload_failed" in payload, "no reload_failed");
+    assert.notOk("used_by" in payload, "like the other read-only keys");
+});
+
 QUnit.test("identityChange names what changes who the agents act as", function (assert) {
     const stored = input({ user_context: true, destination: "S4_ODATA_USER" });
+    const same = { runsAs: null, destination: null, servicePath: null, version: null };
 
     assert.deepEqual(
         odataCatalog.identityChange(stored, input({ title: "Other", purpose: "Other", enabled: false })),
-        { runsAs: null, destination: null }, "other fields change nobody's identity"
+        same, "other fields change nobody's identity"
     );
     assert.deepEqual(
         odataCatalog.identityChange(stored, input({ user_context: false })),
-        { runsAs: "technical", destination: null }
+        { ...same, runsAs: "technical" }
     );
     assert.deepEqual(
         odataCatalog.identityChange(input({ user_context: false }), input({ user_context: true })),
-        { runsAs: "user", destination: null }
+        { ...same, runsAs: "user" }
     );
     assert.deepEqual(
         odataCatalog.identityChange(stored, input({ destination: "S4_ODATA_TECH" })),
-        { runsAs: null, destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" } }
+        { ...same, destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" } }
     );
     assert.deepEqual(
         odataCatalog.identityChange(stored, input({ user_context: false, destination: "S4_ODATA_TECH" })),
-        { runsAs: "technical", destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" } }
+        { ...same, runsAs: "technical", destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" } }
+    );
+});
+
+QUnit.test("identityChange names a changed service path and OData version: the calls go elsewhere", function (assert) {
+    const stored = input({ service_path: "/sap/opu/odata/sap/API_A_SRV", odata_version: "v2" });
+    const same = { runsAs: null, destination: null, servicePath: null, version: null };
+
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ service_path: "/sap/opu/odata/sap/API_B_SRV", odata_version: "v2" })),
+        { ...same, servicePath: { from: "/sap/opu/odata/sap/API_A_SRV", to: "/sap/opu/odata/sap/API_B_SRV" } }
+    );
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ service_path: "/sap/opu/odata/sap/API_A_SRV", odata_version: "v4" })),
+        { ...same, version: { from: "v2", to: "v4" } }
+    );
+    assert.deepEqual(
+        odataCatalog.identityChange(stored, input({ service_path: "/sap/opu/odata/sap/API_A_SRV", odata_version: "v2" })),
+        same, "the same path and version change nothing"
     );
 });
 

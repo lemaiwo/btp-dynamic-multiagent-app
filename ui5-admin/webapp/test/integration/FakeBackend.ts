@@ -65,6 +65,17 @@ export default class FakeBackend {
     private heldCatalogue: (() => void)[] = [];
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
+    /**
+     * What the routes that reload the running agents report (the catalogue
+     * PUT and DELETE, the agent POST, PUT and DELETE, the import): `none`
+     * (no rebuild was due: both false), `reloaded`, or `failed` -- the
+     * change is stored, `reload_failed` is true. JSON keys on the answers
+     * with a body, the two `X-OData-...` headers on a 204.
+     */
+    public reloadOutcome: "none" | "reloaded" | "failed" = "none";
+    /** Merged into the answer of `POST import` (`warnings`,
+     *  `odata_identity_changes`, `removed_odata_service_names`, ...). */
+    public importAnswer: Record<string, unknown> = {};
     /** Every intercepted call as "METHOD path" (query string dropped), in
      * order, so a journey can assert that something was -- or was no
      * longer -- requested. */
@@ -267,6 +278,8 @@ export default class FakeBackend {
         this.seedOData();
         this.seedDestinations();
         this.failNext = undefined;
+        this.reloadOutcome = "none";
+        this.importAnswer = {};
     }
 
     /** Flips a job run to finished, the way the runner would between two
@@ -1435,7 +1448,7 @@ export default class FakeBackend {
             // attaches services to agents derives it from the agents' server
             // entries, as `odata_service_referrers` does.
             this.odataServices[index] = { ...stored, ...input, updated_at: this.nextODataStamp() };
-            return this.json(FakeBackend.odataDict(this.odataServices[index]));
+            return this.json({ ...FakeBackend.odataDict(this.odataServices[index]), ...this.reloadKeys() });
         }
         if (!stored) {
             return notFound();
@@ -1547,7 +1560,18 @@ export default class FakeBackend {
     /** Both delete endpoints really return 204; the fake must too, or the
      *  journeys would pass against behaviour the server does not have. */
     private noContent(): Promise<Response> {
-        return Promise.resolve(new Response(null, { status: 204 }));
+        const outcome = this.reloadKeys();
+        return Promise.resolve(new Response(null, {
+            status: 204,
+            headers: {
+                "X-OData-Reloaded": String(outcome.reloaded), "X-OData-Reload-Failed": String(outcome.reload_failed)
+            }
+        }));
+    }
+
+    /** `reloaded` / `reload_failed` as the reloading routes answer them. */
+    private reloadKeys(): { reloaded: boolean; reload_failed: boolean } {
+        return { reloaded: this.reloadOutcome === "reloaded", reload_failed: this.reloadOutcome === "failed" };
     }
 
     private handle(url: string, init?: RequestInit): Promise<Response> {
@@ -1588,7 +1612,7 @@ export default class FakeBackend {
         if (path === "agents" && method === "POST") {
             const created = { ...this.makeAgent(String(body?.name)), ...body, id: this.nextId++ } as Agent;
             this.agents.push(created);
-            return this.json(created, 201);
+            return this.json({ ...created, ...this.reloadKeys() }, 201);
         }
         if (/^agents\/\d+$/.test(path)) {
             const id = Number(path.split("/")[1]);
@@ -1598,7 +1622,7 @@ export default class FakeBackend {
             }
             if (method === "PUT") {
                 this.agents[index] = { ...this.agents[index], ...body } as Agent;
-                return this.json(this.agents[index]);
+                return this.json({ ...this.agents[index], ...this.reloadKeys() });
             }
             if (method === "DELETE") {
                 this.agents.splice(index, 1);
@@ -1735,7 +1759,12 @@ export default class FakeBackend {
             return this.json({ agents: [], skills: [], orchestrator_instructions: "", replace: false });
         }
         if (path === "import") {
-            return this.json({ status: "ok" });
+            // The keys of `api_import`; what a journey wants reported about
+            // the catalogue comes from `importAnswer`.
+            return this.json({
+                status: "imported", removed_odata_service_names: [], odata_identity_changes: [], warnings: [],
+                ...this.importAnswer, ...this.reloadKeys()
+            });
         }
         // --- odata ---
         if (path === "odata/destinations" && method === "GET") {

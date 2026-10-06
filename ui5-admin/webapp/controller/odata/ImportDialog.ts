@@ -67,7 +67,7 @@ const ERROR_WITH_DETAIL: Record<string, string> = {
     sap_error: "odataImportErrSap", invalid_metadata: "odataImportErrInvalid", invalid_path: "odataImportErrPath"
 };
 const WARNING_TEXT: Record<string, string> = {
-    metadata_incomplete: "odataImportWarnIncomplete", technical_credential: "odataImportWarnTechnical"
+    metadata_incomplete: "odataImportWarnIncomplete"
 };
 /** Why Apply is not taken, by the key `odataCatalog.importSummary` gives. */
 const BLOCK_TEXT: Record<string, string> = {

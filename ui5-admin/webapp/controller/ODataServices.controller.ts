@@ -274,9 +274,16 @@ export default class ODataServices extends ODataController {
             return false;
         }
 
-        const { input, invalid } = ODataServices.toInput(parsed as Record<string, unknown>);
+        const { input, invalid, switchedOff } = ODataServices.toInput(parsed as Record<string, unknown>);
         if (invalid.length) {
             MessageBox.error(this.text("odataConfigInvalid", [invalid.join(", ")]));
+            return false;
+        }
+
+        // The file is stored as it is, writes included: what it opens is
+        // asked about first, the way the Duplicate dialog says it.
+        const question = this.importQuestion(input, switchedOff);
+        if (question && !(await this.confirmImport(question))) {
             return false;
         }
 
@@ -292,16 +299,68 @@ export default class ODataServices extends ODataController {
             }
             return false;
         }
-        MessageToast.show(this.text("odataConfigImported", [created.title]));
+        MessageToast.show(this.text(switchedOff ? "odataConfigImportedOff" : "odataConfigImported", [created.title]));
         await this.load();
         return true;
     }
 
     /**
-     * The payload fields of a parsed file on top of an empty service, and
-     * the fields that cannot be right, in the order of the form.
+     * What has to be confirmed before the service of a file is created, or
+     * "" when it opens nothing: the writes its definition holds (every one:
+     * nothing is stored yet) and the enabled operations it marks as only
+     * reading, with the identity and the destination they would run with.
+     * A definition the rules cannot read is asked about in general words,
+     * never created unseen.
      */
-    private static toInput(source: Record<string, unknown>): { input: ODataServiceInput; invalid: string[] } {
+    private importQuestion(input: ODataServiceInput, switchedOff: boolean): string {
+        let writes: string;
+        let reads: string;
+        try {
+            const pending = odataCatalog.pendingWrites(undefined, input.definition);
+            writes = odataCatalog.hasWrite(input.definition) || odataCatalog.pendingCount(pending) > 0
+                ? this.writeList({ ...pending, fields: [] }) : "";
+            reads = this.operationList(odataCatalog.pendingReads(undefined, input.definition));
+        } catch {
+            return this.text("odataConfigAskUnknown");
+        }
+        if (!writes && !reads) {
+            return "";
+        }
+        return [
+            this.text("odataConfigAskIntro", [
+                odataCatalog.importLabel(input.title) || input.name, input.name,
+                this.formatRunsAs(input.user_context === true), input.destination
+            ]),
+            writes ? this.text("odataConfigAskWrites", [writes]) : "",
+            reads ? this.text("odataConfigAskReads", [reads]) : "",
+            this.text(switchedOff ? "odataConfigAskOff" : input.enabled === false
+                ? "odataConfigAskStoredOff" : "odataConfigAskOn")
+        ].filter(Boolean).join("\n\n");
+    }
+
+    /** Asks `question` with Cancel as the default; resolves whether the
+     *  admin chose to create the service. */
+    private confirmImport(question: string): Promise<boolean> {
+        const create = this.text("odataConfigCreate");
+        return new Promise((resolve) => {
+            MessageBox.warning(question, {
+                title: this.text("odataConfigAskTitle"),
+                actions: [create, MessageBox.Action.CANCEL],
+                emphasizedAction: create,
+                initialFocus: MessageBox.Action.CANCEL,
+                onClose: (action: string | null) => resolve(action === create)
+            });
+        });
+    }
+
+    /**
+     * The payload fields of a parsed file on top of an empty service, the
+     * fields that cannot be right, in the order of the form, and whether the
+     * service is switched off because the file does not say it is on.
+     */
+    private static toInput(
+        source: Record<string, unknown>
+    ): { input: ODataServiceInput; invalid: string[]; switchedOff: boolean } {
         const input = odataCatalog.emptyService() as unknown as Record<string, unknown>;
         const wrongType: string[] = [];
         CONFIG_FIELDS.forEach((field) => {
@@ -315,6 +374,13 @@ export default class ODataServices extends ODataController {
             }
             input[field] = value;
         });
+        // A file that does not say, as a boolean, whether the service is on
+        // gets no "on" from the defaults of a new service: it is created
+        // switched off, and the page says so.
+        const switchedOff = typeof source.enabled !== "boolean";
+        if (switchedOff) {
+            input.enabled = false;
+        }
         // No default for the version: a file that does not say V2 or V4 is
         // refused rather than guessed at.
         if (source.odata_version !== "v2" && source.odata_version !== "v4") {
@@ -323,6 +389,6 @@ export default class ODataServices extends ODataController {
         const failed = Object.keys(odataCatalog.validate(input as unknown as ODataServiceInput));
         const invalid = (CONFIG_FIELDS as readonly string[])
             .filter((field) => wrongType.indexOf(field) !== -1 || failed.indexOf(field) !== -1);
-        return { input: input as unknown as ODataServiceInput, invalid };
+        return { input: input as unknown as ODataServiceInput, invalid, switchedOff };
     }
 }

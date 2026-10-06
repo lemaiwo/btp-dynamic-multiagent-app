@@ -20,7 +20,7 @@ import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
 import type {
     Agent, AgentInput, AuthMode, CredentialStatus, DeepConfig, JobRun, McpServer,
-    ODataDefinition, ODataServiceSummary, WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
+    ODataDefinition, ODataServiceSummary, ReloadOutcome, WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
 } from "../service/types";
 import { DEEP_DEFAULTS } from "../service/types";
 
@@ -297,7 +297,11 @@ export default class AgentDetail extends BaseController {
             return;
         }
         (this.getModel("server") as JSONModel).setData({
-            url: server.url,
+            // The fragment shows the services box and "Allow writes" for
+            // exactly `builtin:odata`: an entry stored in another spelling
+            // (`Builtin:OData`) is held in that one, or OK would write back
+            // an `allow_write` the admin never saw.
+            url: isOData ? odataEntry.ODATA_URL : server.url,
             auth_mode: server.auth_mode,
             odata: {
                 services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
@@ -362,6 +366,8 @@ export default class AgentDetail extends BaseController {
         serverModel.setProperty("/kind", findBuiltin(url)?.url ?? "mcp");
         this.syncServerKind();
         if (odataEntry.isODataUrl(url)) {
+            // The spelling the fragment's bindings test for.
+            serverModel.setProperty("/url", odataEntry.ODATA_URL);
             void this.enterODataEntry();
         }
     }
@@ -865,9 +871,17 @@ export default class AgentDetail extends BaseController {
             // --- odata --- The entry is sent as exactly { services,
             // allow_write: <boolean> }, also when its dialog was never opened
             // and the form still holds the form the server answered with.
-            const sent = { ...data, mcp_servers: odataEntry.explicit(data.mcp_servers) };
+            const sent = { ...data, mcp_servers: odataEntry.explicit(data.mcp_servers) } as AgentInput & ReloadOutcome;
+            // What a save answers about the reload is no field of an agent;
+            // it never goes back in a body, whatever the form was filled from.
+            delete sent.reloaded;
+            delete sent.reload_failed;
             const saved = await this.getAdminService().upsertAgent(sent, this.agentId);
-            MessageToast.show(this.text("agentSaved"));
+            // Stored, but the running agent still has its services and its
+            // "Allow writes" as they were: said in a box that stays.
+            if (!this.warnIfNotLive(saved, "reloadFailedAgentSaved")) {
+                MessageToast.show(this.text("agentSaved"));
+            }
             this.agentId = saved.id;
             this.getRouter().navTo("agents");
         } catch (error) {

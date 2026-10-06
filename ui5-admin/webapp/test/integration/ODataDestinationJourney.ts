@@ -37,8 +37,8 @@ const CHOICES = [
 const UNUSABLE = "2 destinations cannot be used for OData and are not listed.";
 const UNAVAILABLE = "The list of destinations could not be loaded. Type the name of the destination.";
 const INCOMPLETE = "The list may be incomplete. A destination that is not shown can be typed.";
-const FIXED_ACCOUNT = "This destination does not sign in as the user: every user would act as one and the same "
-    + "account. Choose a destination that signs in as the user, or let the service run as a technical user.";
+const FIXED_ACCOUNT = "This destination signs in with one fixed account, so calls as the signed-in user will be refused. "
+    + "Choose a destination that signs in as the user, or let the service run as a technical user.";
 const NEEDS_USER = "This destination needs a signed-in user, so scheduled runs will be refused. Choose a "
     + "destination with a fixed account, or let the service run as the signed-in user.";
 const NOT_LISTED = "Not in the list of destinations. Check the spelling, or create the destination before agents "

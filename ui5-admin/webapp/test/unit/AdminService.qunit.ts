@@ -130,6 +130,23 @@ QUnit.test("a 204 resolves rather than failing to parse an empty body", async fu
     assert.ok(true, "deleteAgent resolves on a 204 instead of throwing");
 });
 
+QUnit.test("a delete resolves with what the 204 says about the reload, from its two headers", async function (assert) {
+    const answer = (headers: Record<string, string>) => {
+        window.fetch = (() => Promise.resolve(new Response(null, { status: 204, headers }))) as unknown as typeof fetch;
+    };
+    answer({ "X-OData-Reloaded": "false", "X-OData-Reload-Failed": "true" });
+    assert.deepEqual(await new AdminService().deleteODataService("purchase-requisitions"),
+        { reloaded: false, reload_failed: true }, "a service: stored, not live");
+    assert.deepEqual(await new AdminService().deleteAgent(5), { reloaded: false, reload_failed: true }, "an agent");
+
+    answer({ "X-OData-Reloaded": "true", "X-OData-Reload-Failed": "false" });
+    assert.deepEqual(await new AdminService().deleteAgent(5), { reloaded: true, reload_failed: false });
+
+    answer({});
+    assert.deepEqual(await new AdminService().deleteODataService("purchase-requisitions"),
+        { reloaded: false, reload_failed: false }, "an answer without the headers reports no failure");
+});
+
 QUnit.test("a failed delete still rejects", async function (assert) {
     stubFetch(404, { detail: "Agent not found" }, []);
 

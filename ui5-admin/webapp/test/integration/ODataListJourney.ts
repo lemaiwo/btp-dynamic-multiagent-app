@@ -3,6 +3,7 @@ import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
 import HashChanger from "sap/ui/core/routing/HashChanger";
+import Element from "sap/ui/core/Element";
 import type Table from "sap/m/Table";
 import type MessageStrip from "sap/m/MessageStrip";
 import type SideNavigation from "sap/tnt/SideNavigation";
@@ -516,5 +517,115 @@ opaTest("a list that cannot be loaded says so, offers a retry and does not look 
         }
     });
 
+    Then.iStopTheApp();
+});
+
+// --- final review -------------------------------------------------------------
+
+/** An exported service that carries writes and an operation marked as only reading. */
+const WRITING: ODataServiceInput = {
+    ...EXPORTED,
+    definition: {
+        entity_sets: [{
+            name: "A_SalesOrder", title: "Sales order", path: "", entity_type: "", description: "",
+            keys: [{ name: "SalesOrder", type: "Edm.String" }], operations: ["list", "get", "update"],
+            fields: [{
+                name: "SalesOrder", type: "Edm.String", label: "", selectable: true, filterable: true, writable: false,
+                hint: "", values: [], personal_data: false
+            }, {
+                name: "Note", type: "Edm.String", label: "", selectable: true, filterable: false, writable: true,
+                hint: "", values: [], personal_data: false
+            }],
+            navigations: [], examples: []
+        }],
+        operations: [
+            {
+                name: "ReleaseOrder", qualified_name: "", title: "Release order", kind: "function_import", http_method: "POST",
+                bound_to: null, parameters: [], description: "", enabled: true, changes_data: true
+            },
+            {
+                name: "GetStatus", qualified_name: "", title: "Order status", kind: "function_import", http_method: "GET",
+                bound_to: null, parameters: [], description: "", enabled: true, changes_data: false
+            }
+        ]
+    } as unknown as ODataServiceInput["definition"]
+};
+
+opaTest("Import configuration asks before it creates a service that carries writes; Cancel is the default and creates nothing", function (Given: Common, When: Common, Then: Common) {
+    let outcome: boolean | undefined;
+    const pick = function (table: UI5Element) {
+        outcome = undefined;
+        void controllerOf(table).importFile(fileOf(JSON.stringify(WRITING))).then((result) => { outcome = result; });
+    };
+
+    Given.iStartTheApp("odata-services");
+    When.waitFor({ id: TABLE, viewName: VIEW, success: pick });
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            "The file creates the service \"Sales orders\" (sales-orders). It runs as Signed-in user, through the destination S4_ODATA_USER.\n\n"
+            + "It carries these writes in SAP: Update on \"Sales order\" (A_SalesOrder); the operation \"Release order\" (ReleaseOrder). "
+            + "No agent uses the service yet; an agent attached later with \"Allow writes\" can run them.\n\n"
+            + "It marks these operations as only reading: the operation \"Order status\" (GetStatus). Every agent that uses the "
+            + "service can call them, also without \"Allow writes\", and their calls are not recorded in the audit.\n\n"
+            + "The service is created switched on.",
+            "the writes, the reads, the identity and the destination"
+        );
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Create service", "Cancel"]);
+        const focus = (dialog as unknown as { getInitialFocus(): string }).getInitialFocus();
+        Opa5.assert.strictEqual((Element.getElementById(focus) as unknown as { getText(): string }).getText(), "Cancel", "Cancel is the default");
+        Opa5.assert.strictEqual(backend.countRequests(CREATE), 0, "nothing is created before the answer");
+    }, "the question about the file");
+    iPressInDialog(When, "Cancel");
+    iSeeTheRows(Then, ALL, "nothing was created", function () {
+        Opa5.assert.strictEqual(outcome, false, "the import reports that nothing was created");
+        Opa5.assert.strictEqual(backend.countRequests(CREATE), 0, "Cancel sends nothing");
+    });
+
+    When.waitFor({ id: TABLE, viewName: VIEW, success: pick });
+    iPressInDialog(When, "Create service");
+    iSeeTheRows(Then, ALL.concat(["sales-orders"]).sort(), "created on the admin's answer", function () {
+        Opa5.assert.strictEqual(backend.countRequests(CREATE), 1, "one create");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Import configuration creates a file that does not say it is on switched off, and says so", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("odata-services");
+    When.waitFor({
+        id: TABLE,
+        viewName: VIEW,
+        success: function (table: UI5Element) {
+            const { enabled, ...unsaid } = EXPORTED;
+            void enabled;
+            void controllerOf(table).importFile(fileOf(JSON.stringify({ ...unsaid, name: "unsaid" })));
+        }
+    });
+    iSeeTheRows(Then, ALL.concat(["unsaid"]).sort(), "the service is listed", function (table: UI5Element) {
+        Opa5.assert.strictEqual(backend.bodies[CREATE]?.enabled, false, "sent as switched off, not as the default of a new service");
+        Opa5.assert.strictEqual(serviceOf(table, "unsaid").enabled, false, "and stored switched off");
+        Opa5.assert.ok(
+            (document.querySelector(".sapMMessageToast")?.textContent ?? "").indexOf("switched off: the file does not say whether it is on") !== -1,
+            "the toast says that it is off and why"
+        );
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a delete the running agents did not get says so in a box that stays", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("odata-services");
+    iSeeTheRows(Then, ALL, "the list", function () { backend.reloadOutcome = "failed"; });
+    iPressDeleteOf(When, "purchase-requisitions-v4");
+    iPressInDialog(When, "Delete");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            "The service was deleted, but the running agents could not be reloaded: they still use the previous configuration. "
+            + "Go to Settings and press Reload to make the change active."
+        );
+        Opa5.assert.strictEqual(backend.odataServices.length, 3, "the service is deleted");
+    }, "the failed reload");
+    iPressInDialog(When, "OK");
+    iSeeTheRows(Then, ALL.slice(0, 3), "the list without the service");
     Then.iStopTheApp();
 });

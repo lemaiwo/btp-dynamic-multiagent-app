@@ -1,7 +1,7 @@
 import type {
     ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataExampleQuery, ODataField,
     ODataMetadataPreview, ODataNavigation, ODataOperation, ODataPreviewEntitySet, ODataPreviewField,
-    ODataPreviewOperation, ODataServiceInput, ODataUsedBy, ODataValueMeaning
+    ODataPreviewOperation, ODataServiceInput, ODataUsedBy, ODataValueMeaning, ODataVersion
 } from "../service/types";
 
 /**
@@ -231,6 +231,10 @@ export interface ODataIdentityChange {
     /** The identity the service switches TO, or null when it stays. */
     runsAs: "user" | "technical" | null;
     destination: { from: string; to: string } | null;
+    /** Another service path: the same calls then go to another SAP service. */
+    servicePath: { from: string; to: string } | null;
+    /** Another OData version: the calls are sent in another protocol. */
+    version: { from: ODataVersion; to: ODataVersion } | null;
 }
 
 /** The payload fields, in the order of `ODataServicePayload`. */
@@ -1928,7 +1932,10 @@ export default {
      * What saving `current` over `stored` changes about who the agents
      * using the service act as in SAP: the identity (signed-in or technical
      * user) and the destination, which holds the technical user's
-     * credential and names the system.
+     * credential and names the system -- and where their calls go: the
+     * service path and the OData version. A changed path or version sends
+     * the reads and writes of every agent that uses the service to another
+     * SAP service, so it is asked about like a changed destination.
      */
     identityChange(stored: ODataServiceInput, current: ODataServiceInput): ODataIdentityChange {
         const before = stored.user_context === true;
@@ -1936,7 +1943,11 @@ export default {
         return {
             runsAs: before === after ? null : (after ? "user" : "technical"),
             destination: stored.destination === current.destination
-                ? null : { from: stored.destination, to: current.destination }
+                ? null : { from: stored.destination, to: current.destination },
+            servicePath: stored.service_path === current.service_path
+                ? null : { from: stored.service_path, to: current.service_path },
+            version: stored.odata_version === current.odata_version
+                ? null : { from: stored.odata_version, to: current.odata_version }
         };
     },
 

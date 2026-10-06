@@ -184,6 +184,23 @@ export interface AgentInput {
     deep?: DeepConfig;
 }
 
+/**
+ * Whether a change reached the running agents (`reload_after_catalogue_change`
+ * and `_reload_for_odata_entry` on the server). `reloaded`: they were rebuilt,
+ * the change is live. `reload_failed`: the change IS stored, the rebuild
+ * failed, and the running agents keep the previous configuration until a
+ * reload works. Never both; both false (or absent, on an older server and on
+ * the routes that report none): no rebuild was due.
+ *
+ * JSON keys on `PUT odata/services/{name}`, `POST agents`, `PUT agents/{id}`
+ * and `POST import`; the headers `X-OData-Reloaded` / `X-OData-Reload-Failed`
+ * on the 204 of `DELETE odata/services/{name}` and `DELETE agents/{id}`.
+ */
+export interface ReloadOutcome {
+    reloaded?: boolean;
+    reload_failed?: boolean;
+}
+
 /** What GET /admin/api/agents returns. Servers are redacted. */
 export interface Agent extends AgentInput {
     id: number;
@@ -194,6 +211,9 @@ export interface Agent extends AgentInput {
     created_at: string | null;
     updated_at: string | null;
 }
+
+/** What POST /admin/api/agents and PUT /admin/api/agents/{id} answer. */
+export type AgentSaved = Agent & ReloadOutcome;
 
 export interface SkillInput {
     name: string;
@@ -369,7 +389,7 @@ export interface ODataIdentityChangeReport {
 
 /** POST /admin/api/import. The OData keys are optional: a backend from
  * before the catalogue does not send them. */
-export interface ImportResult {
+export interface ImportResult extends ReloadOutcome {
     status: string;
     imported?: number;
     imported_skills?: number;
@@ -807,8 +827,9 @@ export interface ODataUncallableOperation {
     reason: string;
 }
 
-/** GET /admin/api/odata/services/{name}. */
-export interface ODataService extends ODataServiceSummary {
+/** GET /admin/api/odata/services/{name}. The answer of a PUT also carries
+ *  the `ReloadOutcome` keys; a GET, a create and a duplicate do not. */
+export interface ODataService extends ODataServiceSummary, ReloadOutcome {
     definition: ODataDefinition;
     /** Read-only, about the STORED service: the enabled operations no agent
      *  can ever call. Never part of a payload. Absent on an older server. */
@@ -905,7 +926,7 @@ export interface ODataSkippedElement {
     entity_type: string;
 }
 
-/** `code` is stable (`metadata_incomplete`, `technical_credential`);
+/** `code` is stable (`metadata_incomplete`);
  *  `message` is the server's text. */
 export interface ODataPreviewWarning {
     code: string;

@@ -1018,3 +1018,78 @@ opaTest("coming from an agent that has writes, a new agent with Allow writes is 
     });
     Then.iStopTheApp();
 });
+
+// --- final review -------------------------------------------------------------
+
+const NOT_LIVE = ", but the running agents could not be reloaded: they still use the previous configuration. Go to Settings and press Reload to make the change active.";
+
+opaTest("an entry stored in another spelling of the url opens with its services and Allow writes on screen", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, function () {
+        storeEntry(101, [JOBS], true);
+        const servers = backend.agents.filter((a) => a.id === 101)[0].mcp_servers;
+        servers[servers.length - 1].url = "Builtin:OData";
+    });
+    iEditServer(When, 2, 3);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 1, function (entry) {
+        Opa5.assert.strictEqual(entry.visible("odataEntryServices"), true, "the services box is shown");
+        Opa5.assert.strictEqual(entry.visible("odataEntryAllowWrite"), true, "and so is Allow writes");
+        Opa5.assert.strictEqual(entry.ticked, true, "with the stored tick: nothing is written back unseen");
+        Opa5.assert.deepEqual(entry.keys, [JOBS]);
+    });
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry after OK", function (data) {
+        Opa5.assert.strictEqual(data.mcp_servers[2].url, ODATA, "held in the spelling the server stores");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("an agent save the running agents did not get says so in a box that stays, and no outcome key is ever sent back", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, function () {
+        storeEntry(101, [PARTNERS], true);
+        // As if an answer of a save had been kept as the form's data.
+        Object.assign(backend.agents.filter((a) => a.id === 101)[0], { reloaded: false, reload_failed: true });
+        backend.reloadOutcome = "failed";
+    });
+    iSeeTheForm(Then, "the agent as stored", function () { /* loaded */ }, (data) => data.mcp_servers.length === 3);
+    // Unticking Allow writes is a narrowing: no question, but it must be live.
+    iEditServer(When, 2, 3);
+    When.waitFor({ id: "odataEntryAllowWrite", viewName: VIEW, searchOpenDialogs: true, actions: new Press() });
+    iPressInTheDialog(When, "serverConfirm");
+    iPressSave(When);
+    iSeeAMessage(Then, "the failed reload", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), `The agent was saved${NOT_LIVE}`);
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["OK"], "it stays until it is closed");
+        const body = backend.bodies[PUT_101] ?? {};
+        Opa5.assert.strictEqual((sentServers()[2].oauth as { allow_write: unknown }).allow_write, false, "the narrowing was sent");
+        Opa5.assert.notOk("reloaded" in body, "the body carries no reloaded");
+        Opa5.assert.notOk("reload_failed" in body, "and no reload_failed");
+    });
+    iAnswer(When, "OK");
+    Then.iStopTheApp();
+});
+
+opaTest("an agent delete the running agents did not get says so in a box that stays", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+    When.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) { return (element as Table).getItems().length > 0; },
+        actions: function (element: UI5Element | null) {
+            backend.reloadOutcome = "failed";
+            const item = (element as Table).getItems()
+                .filter((row) => (row.getBindingContext("agents")?.getObject() as { id: number }).id === 101)[0] as ColumnListItem;
+            const button = item.findAggregatedObjects(true, (child) => (
+                child.isA("sap.m.Button") && (child as Button).getIcon() === "sap-icon://delete"
+            ))[0] as Button;
+            button.firePress();
+        }
+    });
+    iAnswer(When, "OK");
+    iSeeAMessage(Then, "the failed reload", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), `The agent was deleted${NOT_LIVE}`);
+        Opa5.assert.strictEqual(backend.agents.filter((a) => a.id === 101).length, 0, "the agent is deleted");
+        Opa5.assert.strictEqual(backend.countRequests("DELETE agents/101"), 1);
+    });
+    iAnswer(When, "OK");
+    Then.iStopTheApp();
+});

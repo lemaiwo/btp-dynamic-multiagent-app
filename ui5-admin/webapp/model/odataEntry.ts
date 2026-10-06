@@ -57,6 +57,12 @@ export interface ODataEntryGiven {
     services: string[];
 }
 
+/**
+ * Whether a server url names the OData built-in, the way the server's save
+ * gate reads it (`_validate_url` and `_server_key` in agents/admin.py):
+ * trimmed, without trailing slashes, in any case. The server stores it as
+ * `builtin:odata`; the dialog holds it in that spelling too (`ODATA_URL`).
+ */
 function isODataUrl(url: string | undefined | null): boolean {
     return String(url ?? "").trim().replace(/\/+$/, "").toLowerCase() === ODATA_URL;
 }

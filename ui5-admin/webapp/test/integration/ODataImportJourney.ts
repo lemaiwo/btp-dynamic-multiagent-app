@@ -560,6 +560,12 @@ opaTest("a refusal of the read is said inside the dialog by its code, in plain w
         // What an on-premise destination that cannot be used answers: the server's own text, as text.
         ["destination_error", 504, "the destination <b>x</b> {y} has no CloudConnectorLocationId",
             "Metadata not read: the destination <b>x</b> {y} has no CloudConnectorLocationId"],
+        // A service that runs as the signed-in user on a destination that does not sign in as the user: refused, in the server's fixed words.
+        ["destination_error", 502,
+            "destination 'S4_<b>x</b>' does not sign in as the user: a service that runs as the signed-in user needs a "
+            + "user-propagating destination (OAuth2JWTBearer, OAuth2UserTokenExchange, OAuth2SAMLBearerAssertion) or, on-premise, PrincipalPropagation",
+            "Metadata not read: destination 'S4_<b>x</b>' does not sign in as the user: a service that runs as the signed-in user needs a "
+            + "user-propagating destination (OAuth2JWTBearer, OAuth2UserTokenExchange, OAuth2SAMLBearerAssertion) or, on-premise, PrincipalPropagation"],
         ["proxy_refused", 502,
             "HTTP 407 from the connectivity proxy: the connectivity proxy refused the request before it reached SAP",
             "Metadata not read: the connectivity proxy refused the request before it reached SAP. Check this app's connectivity "
@@ -625,8 +631,8 @@ opaTest("a cut document, an incomplete one and what could not be compared are sa
             "The document was not read to its end, so it is not known whether something was removed from it. Nothing is offered for removal.");
         Opa5.assert.deepEqual(texts(shown, "importWarnings"), [
             "Parts of the $metadata document could not be read and were left out, so this preview may be incomplete.",
-            "The read was asked for as you, but this destination does not pass on the signed-in user: the metadata was read "
-            + "with the destination's own credential.",
+            // No longer a warning of the preview (the server refuses such a read): not in this page's words.
+            "server words",
             "<i>a warning this page does not know</i>",
             "<b>x</b> {y}"
         ], "a known warning in this page's words, an unknown one in the server's, as text");

@@ -3924,3 +3924,116 @@ opaTest("the operation dialog goes when another service is shown, keeps a title 
     });
     Then.iStopTheApp();
 });
+
+// --- final review: a failed reload is shown ----------------------------------
+
+const NOT_LIVE = ", but the running agents could not be reloaded: they still use the previous configuration. Go to Settings and press Reload to make the change active.";
+
+opaTest("a save the running agents did not get says so in a box that stays, and the next save sends no outcome key", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${JOBS}`;
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () { backend.reloadOutcome = "failed"; });
+
+    iEnter(When, "odataTitle", "First title");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), `The service was saved${NOT_LIVE}`, "stored, not live, and where to reload");
+        Opa5.assert.strictEqual((dialog as unknown as { getTitle(): string }).getTitle(), "Saved, but not active yet");
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["OK"], "it stays until it is closed");
+        Opa5.assert.strictEqual(stored(JOBS).title, "First title", "the change is stored");
+        Opa5.assert.strictEqual(toasts().indexOf("Service saved"), -1, "no toast that reads as: it is in");
+    }, "the failed reload");
+    iPressInDialog(When, "OK");
+
+    // The answer carried `reloaded` and `reload_failed`; the fake refuses
+    // an unknown key like the server does (`extra="forbid"`).
+    iEnter(When, "odataTitle", "Second title");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function () {
+        const body = backend.bodies[PUT] ?? {};
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 2, "a second PUT");
+        Opa5.assert.notOk("reloaded" in body, "without reloaded");
+        Opa5.assert.notOk("reload_failed" in body, "without reload_failed");
+        Opa5.assert.strictEqual(stored(JOBS).title, "Second title", "and it was accepted");
+    }, "the second save");
+    iPressInDialog(When, "OK");
+
+    // A reload that worked: the toast, no box.
+    When.waitFor({ success: function () { backend.reloadOutcome = "reloaded"; } });
+    iEnter(When, "odataTitle", "Third title");
+    iPress(When, "odataSaveButton");
+    iSee(Then, "the third save", function () { return backend.countRequests(PUT) === 3; }, function () {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no box when the reload worked");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a delete the running agents did not get says so before the list is shown", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${UNUSED}`);
+    iSeeTheService(Then, UNUSED, "the service is loaded", function () { backend.reloadOutcome = "failed"; });
+
+    iPress(When, "odataDeleteButton");
+    iPressInDialog(When, "Delete");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), `The service was deleted${NOT_LIVE}`);
+        Opa5.assert.strictEqual(backend.odataServices.length, 3, "the service is gone from the catalogue");
+    }, "the failed reload after a delete");
+    iPressInDialog(When, "OK");
+    iSeeTheHash(Then, "odata-services", "back on the list");
+    Then.iStopTheApp();
+});
+
+opaTest("another service path or OData version on a service agents use is asked about", function (Given: Common, When: Common, Then: Common) {
+    const PUT = `PUT odata/services/${USER}`;
+    let agent = "";
+
+    Given.iStartTheApp(`odata-services/${USER}`);
+    iSeeTheService(Then, USER, "the service is loaded", function () { agent = stored(USER).used_by[0].agent; });
+
+    iEnter(When, "odataServicePath", "/sap/opu/odata/sap/API_OTHER_SRV");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            `The agent ${agent} uses this service.\n\n`
+            + `The service path changes from ${PATH} to /sap/opu/odata/sap/API_OTHER_SRV: the calls of these agents, `
+            + "writes included, will go to another service path.",
+            "the question says where the calls will go"
+        );
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Save", "Cancel"]);
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
+    }, "the question about the service path");
+    iPressInDialog(When, "Cancel");
+
+    iChoose(When, "odataVersion", "v4");
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.ok(messageOf(dialog).indexOf(
+            "The OData version changes from V2 to V4: the calls of these agents, writes included, will be sent as another OData version."
+        ) !== -1, `the version is named too: ${messageOf(dialog)}`);
+        Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "still nothing sent");
+    }, "the question about the version");
+    iPressInDialog(When, "Cancel");
+    Then.iStopTheApp();
+});
+
+opaTest("a test call that is refused because the destination does not sign in as the user shows the server's words as text", function (Given: Common, When: Common, Then: Common) {
+    const REFUSED = "destination '<b>S4</b>' does not sign in as the user: a service that runs as the signed-in user needs a "
+        + "user-propagating destination (OAuth2JWTBearer, OAuth2UserTokenExchange, OAuth2SAMLBearerAssertion) or, on-premise, PrincipalPropagation";
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        backend.testResult = {
+            ...backend.testResult, ok: false, code: "destination_error", status: null, rows: 0, identity: "unknown", message: REFUSED
+        };
+    });
+    iPressTestCall(When);
+    iSee(Then, "the refused test", function (page: UI5Element) { return testStripOf(page).visible; }, function (page: UI5Element) {
+        const strip = testStripOf(page);
+        Opa5.assert.strictEqual(strip.type, "Error", "a failure");
+        Opa5.assert.strictEqual(strip.markup, false, "as text");
+        Opa5.assert.ok(strip.text.indexOf(REFUSED) !== -1, `the server's fixed text is shown: ${strip.text}`);
+    });
+    Then.iStopTheApp();
+});

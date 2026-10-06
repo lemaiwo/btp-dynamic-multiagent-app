@@ -1,9 +1,9 @@
 import type {
     ImportResult,
-    Agent, AgentInput, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
+    Agent, AgentInput, AgentSaved, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
     JobRun, JobRunDetail, ModelInfo, ODataDestinationList, ODataDuplicateRequest, ODataMetadataPreview,
     ODataMetadataRequest, ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
-    OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
+    OrchestratorInfo, ReloadOutcome, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
 
@@ -44,7 +44,8 @@ export default class AdminService {
 
     private static readonly PREFIX = "backend/";
 
-    private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    /** The answer of a call that worked; a non-2xx one rejects. */
+    private async send(path: string, init?: RequestInit): Promise<Response> {
         const response = await fetch(AdminService.PREFIX + path, {
             ...init,
             headers: {
@@ -57,6 +58,11 @@ export default class AdminService {
         if (!response.ok) {
             throw await AdminService.toError(response);
         }
+        return response;
+    }
+
+    private async request<T>(path: string, init?: RequestInit): Promise<T> {
+        const response = await this.send(path, init);
         if (response.status === 204) {
             return undefined as T;
         }
@@ -88,6 +94,16 @@ export default class AdminService {
         return new AdminError(response.status, detail, fieldErrors, response.headers?.get("X-OData-Error") ?? "");
     }
 
+    /**
+     * A DELETE whose 204 says in two headers whether the running agents were
+     * reloaded. A header that is missing (an older server) reads as false.
+     */
+    private async remove(path: string): Promise<ReloadOutcome> {
+        const response = await this.send(path, { method: "DELETE" });
+        const flag = (name: string) => (response.headers?.get(name) ?? "").trim().toLowerCase() === "true";
+        return { reloaded: flag("X-OData-Reloaded"), reload_failed: flag("X-OData-Reload-Failed") };
+    }
+
     private static json(body: unknown): RequestInit {
         return { body: JSON.stringify(body) };
     }
@@ -102,14 +118,15 @@ export default class AdminService {
     }
 
     /** POSTs when `id` is omitted, PUTs when it is supplied. */
-    public upsertAgent(agent: AgentInput, id?: number): Promise<Agent> {
+    public upsertAgent(agent: AgentInput, id?: number): Promise<AgentSaved> {
         return id === undefined
-            ? this.request<Agent>("agents", { method: "POST", ...AdminService.json(agent) })
-            : this.request<Agent>(`agents/${id}`, { method: "PUT", ...AdminService.json(agent) });
+            ? this.request<AgentSaved>("agents", { method: "POST", ...AdminService.json(agent) })
+            : this.request<AgentSaved>(`agents/${id}`, { method: "PUT", ...AdminService.json(agent) });
     }
 
-    public deleteAgent(id: number): Promise<void> {
-        return this.request<void>(`agents/${id}`, { method: "DELETE" });
+    /** Resolves with what the 204 says about the reload of the running agents. */
+    public deleteAgent(id: number): Promise<ReloadOutcome> {
+        return this.remove(`agents/${id}`);
     }
 
     public agentCredentials(id: number, principal = ""): Promise<CredentialStatus[]> {
@@ -287,9 +304,10 @@ export default class AdminService {
         });
     }
 
-    /** Rejects with a 409 while an agent, enabled or not, uses the service. */
-    public deleteODataService(name: string): Promise<void> {
-        return this.request<void>(AdminService.odataServicePath(name), { method: "DELETE" });
+    /** Rejects with a 409 while an agent, enabled or not, uses the service.
+     *  Resolves with what the 204 says about the reload of the running agents. */
+    public deleteODataService(name: string): Promise<ReloadOutcome> {
+        return this.remove(AdminService.odataServicePath(name));
     }
 
     /** A copy with the same definition under another name, e.g. the same

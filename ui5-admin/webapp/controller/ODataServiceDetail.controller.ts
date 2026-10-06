@@ -76,17 +76,10 @@ interface DuplicateState {
 /** How many entity sets and operations the strip next to Save names; the
  *  Save question lists them all. */
 const STRIP_CAP = 3;
-/** How many field names one entry of that strip spells out. */
-const FIELD_CAP = 3;
 /** What the entity set dialog edits of an entity set: Apply writes these
  *  back and leaves the rest (keys, path, entity type, operations) as the
  *  form holds it. */
 const DIALOG_EDITS = ["name", "title", "description", "fields", "navigations", "examples"] as const;
-
-/** The i18n key of each entity-set operation's name. */
-const OP_TEXT: Record<ODataEntityOp, string> = {
-    list: "odataOpList", get: "odataOpGet", create: "odataOpCreate", update: "odataOpUpdate", delete: "odataOpDelete"
-};
 
 /** A question to ask before a save. */
 interface SaveQuestion {
@@ -1063,37 +1056,6 @@ export default class ODataServiceDetail extends ODataController {
     }
 
     /**
-     * "Update on "Requisition item" (A_PurchaseRequisitionItem); the
-     * operation "Release item" (ReleaseItem); the field Note writable on
-     * ...": one entry per entity set, per operation and per entity set with
-     * fields that become writable. With `cap`, at most that many entries
-     * and the number of the others (`more` words that tail), and per entry
-     * at most `FIELD_CAP` field names and the number of the others: an
-     * entity set can make hundreds of fields writable at once. Without
-     * `cap` (the Save question) every name is there.
-     */
-    private writeList(pending: ODataPending, cap = Infinity, more = "odataWriteMore"): string {
-        const entries = pending.entitySets.map((write) => this.text("odataWriteItem", [
-            write.operations.map((op) => this.text(OP_TEXT[op])).join(", "), write.title, write.name
-        ])).concat(pending.operations.map((operation) => (
-            this.text("odataWriteOperationItem", [operation.title, operation.name])
-        ))).concat((pending.fields ?? []).map((write) => {
-            const short = cap !== Infinity && write.fields.length > FIELD_CAP;
-            const names = short
-                ? this.text("odataWriteFieldsMore", [
-                    write.fields.slice(0, FIELD_CAP).join(", "), write.fields.length - FIELD_CAP
-                ])
-                : write.fields.join(", ");
-            return this.text(write.fields.length === 1 ? "odataWriteFieldOne" : "odataWriteFieldMany", [
-                names, write.title, write.name
-            ]);
-        }));
-        return entries.length <= cap
-            ? entries.join("; ")
-            : this.text(more, [entries.slice(0, cap).join("; "), entries.length - cap]);
-    }
-
-    /**
      * The writes saving the form over `stored` would newly open: ticked
      * entity-set operations, enabled operations (function imports, actions)
      * that are writes, and fields that become writable where Create or
@@ -1183,15 +1145,6 @@ export default class ODataServiceDetail extends ODataController {
      */
     private newReads(stored: ODataServiceInput): ODataNewOperation[] {
         return odataCatalog.pendingReads(stored.definition, this.definition());
-    }
-
-    /** "the operation "Release strategy" (GetReleaseStrategy); ...": with
-     *  `cap`, at most that many and the number of the others. */
-    private operationList(list: readonly ODataNewOperation[], cap = Infinity, more = "odataWriteMore"): string {
-        const entries = list.map((operation) => this.text("odataWriteOperationItem", [operation.title, operation.name]));
-        return entries.length <= cap
-            ? entries.join("; ")
-            : this.text(more, [entries.slice(0, cap).join("; "), entries.length - cap]);
     }
 
     /**
@@ -2264,8 +2217,9 @@ export default class ODataServiceDetail extends ODataController {
      * service as it is stored now; an empty one for a new service), or
      * nothing when the save changes none of it:
      *
-     * - who the agents in `usedBy` act as in SAP (identity, destination) --
-     *   only when there are such agents;
+     * - who the agents in `usedBy` act as in SAP (identity, destination) and
+     *   where their calls go (service path, OData version) -- only when
+     *   there are such agents;
      * - which write operations the catalogue newly lets agents run -- always,
      *   also when no agent uses the service yet: the next agent attached
      *   with "Allow writes" gets them without this page being opened again;
@@ -2277,7 +2231,8 @@ export default class ODataServiceDetail extends ODataController {
      */
     private saveQuestion(stored: ODataServiceInput, usedBy: ODataUsedBy[]): SaveQuestion | undefined {
         const change = odataCatalog.identityChange(stored, this.data());
-        const identity = usedBy.length > 0 && (!!change.runsAs || !!change.destination);
+        const identity = usedBy.length > 0
+            && (!!change.runsAs || !!change.destination || !!change.servicePath || !!change.version);
         const writes = this.newWrites(stored);
         const anyWrite = odataCatalog.pendingCount(writes) > 0;
         const reads = this.newReads(stored);
@@ -2298,6 +2253,15 @@ export default class ODataServiceDetail extends ODataController {
         }
         if (identity && change.destination) {
             parts.push(this.text("odataIdentityDestination", [change.destination.from, change.destination.to]));
+        }
+        // The agents' calls, writes included, would go somewhere else.
+        if (identity && change.servicePath) {
+            parts.push(this.text("odataIdentityServicePath", [change.servicePath.from, change.servicePath.to]));
+        }
+        if (identity && change.version) {
+            parts.push(this.text("odataIdentityVersion", [
+                this.formatVersion(change.version.from), this.formatVersion(change.version.to)
+            ]));
         }
         if (anyWrite) {
             if (this.switchesOn(stored)) {
@@ -2378,7 +2342,12 @@ export default class ODataServiceDetail extends ODataController {
             this.keepPlace();
         }
         this.show(saved, !isNew);
-        MessageToast.show(this.text("odataSaved"));
+        // Stored, but the running agents still have the service as it was
+        // (an unticked Update, a service switched off): a box that stays
+        // says so, in place of the toast that would read as "it is in".
+        if (!this.warnIfNotLive(saved, "reloadFailedServiceSaved")) {
+            MessageToast.show(this.text("odataSaved"));
+        }
         if (isNew) {
             // Its own route, in place of "new" in the history.
             this.justCreated = saved.name;
@@ -2576,7 +2545,9 @@ export default class ODataServiceDetail extends ODataController {
         }
         this.setWorking(false);
         this.duplicateDialog?.close();
-        MessageToast.show(this.text("odataDuplicated"));
+        if (!this.warnIfNotLive(copy, "reloadFailedServiceSaved")) {
+            MessageToast.show(this.text("odataDuplicated"));
+        }
         // The copy is what the page shows next; unsaved changes to the
         // source were announced as lost in the dialog.
         this.show(copy);
