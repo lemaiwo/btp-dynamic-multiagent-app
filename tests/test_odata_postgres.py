@@ -109,6 +109,10 @@ async def test_two_concurrent_saves_from_the_same_loaded_state_one_wins(client, 
         loser = next(a for a in answers if a.status_code == 409)
         assert loser.json() == {"detail": STALE}
         winner = next(a for a in answers if a.status_code == 200).json()
+        # A PUT answer is the service plus the reload outcome (always
+        # present, booleans); a GET answer is the service alone.
+        outcome = {key: winner.pop(key, None) for key in ("reloaded", "reload_failed")}
+        assert all(type(value) is bool for value in outcome.values()), outcome
         stored = (await client.get(ONE)).json()
         assert stored == winner
 
