@@ -428,7 +428,9 @@ class WriteAudit:
     * ``outcome``: ``"intent"`` in the intent record (written before
       anything is built or sent); in the result record one of
       ``WRITE_OUTCOMES``: ``ok``; ``refused`` (nothing was changed: the
-      destination or the connection failed first); ``sap_error`` (SAP
+      destination or the connection failed first, or the connectivity
+      proxy refused the request -- ``proxy_refused``, status 407 -- before
+      it reached SAP); ``sap_error`` (SAP
       answered with an error, ``status`` says which); ``unknown`` (the
       change may or may not have been applied); ``cancelled`` (the run was
       cancelled while the call was in flight, so the outcome is unknown

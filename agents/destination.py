@@ -27,6 +27,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -825,6 +826,9 @@ def resolver_from_environment(
 # the tokens.
 
 JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+# The form of an OAuth error code (RFC 6749 section 5.2): the only part of a
+# token endpoint's error answer that is repeated.
+_OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,40}")
 
 
 @dataclass(frozen=True)
@@ -1044,12 +1048,16 @@ class ConnectivityTokens:
         secrets: tuple[str, ...] = (),
         what: str = "token",
     ) -> tuple[str, float]:
+        # Nothing the endpoint (or httpx) says is repeated: an error text of
+        # this class is logged as it is and shown on admin screens, and both
+        # an httpx error and a UAA answer can name the client, the zone or
+        # what was sent. `secrets` is therefore not needed for a scrub.
+        del secrets
         data = {
             **form,
             "client_id": self.config.client_id,
             "client_secret": self.config.client_secret,
         }
-        secrets = (self.config.client_secret, *secrets)
         failure = None
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30.0), transport=self._transport
@@ -1060,17 +1068,27 @@ class ConnectivityTokens:
                     data=data,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
-            except httpx.HTTPError as exc:
-                failure = f"{type(exc).__name__}: {_scrub(str(exc), *secrets)}"
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                failure = type(exc).__name__  # the class only, never its text
         if failure is not None:
-            # Outside the except block: no chained, unscrubbed httpx error.
+            # Outside the except block: no chained httpx error with its text.
             raise DestinationError(
                 f"could not reach the connectivity service token endpoint: {failure}"
             )
         if response.status_code >= 400:
+            # The status, and the OAuth error code when it has the form of
+            # one. Never `error_description` or the raw body.
+            code = ""
+            try:
+                answer = response.json()
+            except ValueError:
+                answer = None
+            if isinstance(answer, dict):
+                error = answer.get("error")
+                if isinstance(error, str) and _OAUTH_ERROR_CODE.fullmatch(error):
+                    code = f" ({error})"
             raise DestinationError(
-                f"connectivity service {what} request returned "
-                f"{response.status_code}: {_scrub(response.text, *secrets)[:400]}"
+                f"connectivity service {what} request returned {response.status_code}{code}"
             )
         try:
             body = response.json() or {}

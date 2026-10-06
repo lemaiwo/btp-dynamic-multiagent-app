@@ -102,6 +102,7 @@ import httpx
 from pydantic import ValidationError
 
 from agents.destination import DestinationError
+from agents.destination_auth import PROXY_REFUSED_TEXT, proxy_refused_hint
 
 from .models import (
     EDM_NAME_RE,
@@ -1150,7 +1151,18 @@ class ODataClient:
 
     # -- the call -----------------------------------------------------------
     def _sap_error(self, status: int, content_type: str, body: bytes | None) -> ODataError:
-        """The error of a non-2xx answer: SAP's own code and text, or the status."""
+        """The error of a non-2xx answer: SAP's own code and text, or the status.
+
+        A 407 is the connectivity proxy's answer, not SAP's: its body is
+        never read, and the model is told that the proxy refused, with its
+        own code -- not that SAP did."""
+        if status == 407:
+            return ODataError(
+                "proxy_refused",
+                PROXY_REFUSED_TEXT,
+                status=status,
+                hint=proxy_refused_hint(self._user_context is True),
+            )
         snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
         code, text = self._dialect.parse_error(snapshot)
         code, text = _plain(code, 80), _plain(text)

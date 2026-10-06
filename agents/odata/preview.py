@@ -64,10 +64,13 @@ from agents.destination import (
 )
 from agents.destination_auth import (
     PLACEHOLDER_BASE,
+    PROXY_REFUSED_TEXT,
     DestinationAuth,
     DestinationUserRequired,
-    connectivity_transport,
+    OnPremiseRefused,
+    proxy_refused_hint,
     resolver_for,
+    routed_auth,
 )
 from agents.odata import common
 from agents.odata.metadata import (
@@ -139,10 +142,6 @@ _STATUS_HINTS = {
     401: "the destination's credential was not accepted",
     403: "the user is not authorised for this service in SAP",
     404: "no service answers at this path (is it activated, and is the path right?)",
-    407: (
-        "the connectivity proxy refused the request (this app's connectivity "
-        "binding, or the destination's Cloud Connector location)"
-    ),
 }
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 _HTML_STARTS = (b"<!doctype html", b"<html")
@@ -175,23 +174,17 @@ class OneShotAuth(DestinationAuth):
     connectivity proxy: the connectivity tokens are new for this call too.)
 
     An OnPremise destination goes through the connectivity proxy, by the
-    rules of ``DestinationAuth``; build the auth with ``connectivity=`` and
-    the client with :func:`wire`.
+    rules of ``DestinationAuth``; the auth and its transport are built
+    together by :func:`one_shot`.
     """
 
     resolved: Destination | None = None
 
-    async def _proxy_headers(self, destination: Destination, *args: Any, **kwargs: Any) -> Any:
+    def on_resolved(self, destination: Destination) -> None:
         # Before the rules decide: also the type of a destination that is
         # refused (an OnPremise one without a binding, or of the wrong
         # authentication type for a user) is what a caller reports.
         self.resolved = destination
-        return await super()._proxy_headers(destination, *args, **kwargs)
-
-    def send_through(self, request: httpx.Request, destination: Destination) -> None:
-        # `resolved` stays the destination as it was resolved: for a user's
-        # request through the proxy, the one shaped here has no headers.
-        super().send_through(request, destination)
 
 
 class MetadataAuth(OneShotAuth):
@@ -244,17 +237,37 @@ def _proxy_transport() -> httpx.AsyncBaseTransport | None:
     return None
 
 
-def wire(
+def one_shot(
+    auth_class: type[OneShotAuth],
+    resolver: Any,
     connectivity: Any,
     direct: httpx.AsyncBaseTransport | None,
     proxied: httpx.AsyncBaseTransport | None,
-) -> httpx.AsyncBaseTransport | None:
-    """The transport of a one-shot client: with ``connectivity`` the router
-    that keeps the proxy path and the direct path apart, without it
-    ``direct`` as before."""
-    if connectivity is None:
-        return direct
-    return connectivity_transport(connectivity, direct=direct, proxied=proxied)
+    *,
+    user_context: bool,
+    server_key: str,
+) -> tuple[OneShotAuth, httpx.AsyncBaseTransport | None]:
+    """The auth and the transport of one admin-triggered request, built
+    together (``destination_auth.routed_auth``): with ``connectivity`` the
+    router that keeps the proxy path and the direct path apart, without it
+    ``direct`` as before. No retry, see :class:`OneShotAuth`."""
+    auth, transport = routed_auth(
+        resolver,
+        connectivity,
+        auth_class=auth_class,
+        direct=direct,
+        proxied=proxied,
+        user_context=user_context,
+        server_key=server_key,
+        retry_on_401=False,
+    )
+    return auth, transport  # type: ignore[return-value]
+
+
+def refused_text(exc: OnPremiseRefused) -> str:
+    """The fixed text of an OnPremise refusal, for an admin: it names the
+    destination (which the admin typed) and nothing else of the landscape."""
+    return plain(exc.admin_text, MAX_MESSAGE_CHARS)
 
 
 # ----------------------------------------------------------------- the fetch
@@ -281,8 +294,17 @@ def _message_of(message: Any) -> Any:
     return message.get("value") if isinstance(message, dict) else message
 
 
-def sap_error(status: int, content_type: str, body: bytes) -> PreviewError:
-    """A non-2xx answer as SAP's own short code and message, or the status."""
+def sap_error(
+    status: int, content_type: str, body: bytes, *, user_context: bool = False
+) -> PreviewError:
+    """A non-2xx answer as SAP's own short code and message, or the status.
+
+    A 407 is the connectivity proxy's, not SAP's: its body is never read,
+    and the answer is the code ``proxy_refused`` with what to check."""
+    if status == 407:
+        return PreviewError(
+            502, "proxy_refused", f"{PROXY_REFUSED_TEXT}: {proxy_refused_hint(user_context)}"
+        )
     snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
     code, text = common.read_error(snapshot, _message_of)
     code, text = plain(code, 80), plain(text, MAX_MESSAGE_CHARS)
@@ -372,7 +394,12 @@ async def read_document(
                         502, "too_large", f"the $metadata document is larger than {limit} bytes"
                     )
     if failed:
-        raise sap_error(status, content_type, bytes(body[:limit]))
+        raise sap_error(
+            status,
+            content_type,
+            bytes(body[:limit]),
+            user_context=getattr(client.auth, "user_context", False) is True,
+        )
     if not looks_like_xml(bytes(body[:1024])):
         raise PreviewError(502, "not_xml", _NOT_XML_TEXT)
     return body
@@ -399,19 +426,20 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         # behalf of nobody, and never a fall-back to its own credential.
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
     try:
-        connectivity = _connectivity()
-        auth = MetadataAuth(
+        auth, transport = one_shot(
+            MetadataAuth,
             _resolver(destination),
+            _connectivity(),
+            _transport(),
+            _proxy_transport(),
             user_context=user_context is True,
             server_key=SERVER_KEY,
-            retry_on_401=False,
-            connectivity=connectivity,
         )
         client = httpx.AsyncClient(
             base_url=PLACEHOLDER_BASE,
             auth=auth,
             timeout=httpx.Timeout(PREVIEW_BUDGET_SECONDS),
-            transport=wire(connectivity, _transport(), _proxy_transport()),
+            transport=transport,
             cookies=NoCookieJar(),
             follow_redirects=False,
         )
@@ -428,6 +456,12 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         raise
     except DestinationUserRequired:
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT) from None
+    except OnPremiseRefused as exc:
+        # A fixed text that says what to change; nothing was sent.
+        logger.warning(
+            "odata metadata: destination '%s' was refused (%s)", destination, type(exc).__name__
+        )
+        raise PreviewError(502, "destination_error", refused_text(exc)) from None
     except (DestinationError, ValueError) as exc:
         # ValueError: `resolver_for` on an empty name. The text can quote the
         # destination service's answer, so it goes to the log only, URLs masked.

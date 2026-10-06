@@ -589,7 +589,10 @@ async def test_an_on_premise_user_test_on_a_technical_destination_sends_nothing(
     remote.resolver = OnPremiseResolver()
     body = (await client.post(URL, json={}, headers=bearer("alice"))).json()
     assert body["ok"] is False and body["code"] == "destination_error"
-    assert body["message"] == preview.DESTINATION_TEXT
+    assert body["message"] == (
+        "OnPremise destination 'S4_ODATA_TECH' cannot act as the signed-in user: "
+        "its Authentication must be PrincipalPropagation"
+    )
     assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
 
 
@@ -598,30 +601,53 @@ async def test_an_https_on_premise_destination_sends_nothing(client, remote, pro
     remote.resolver = OnPremiseResolver(url="https://s4.internal:44300")
     body = (await client.post(URL, json={})).json()
     assert body["ok"] is False and body["code"] == "destination_error"
+    assert body["message"] == (
+        "OnPremise destination 'S4_ODATA_TECH' must use an http:// address "
+        "(virtual host and port): the Cloud Connector tunnel is what encrypts it"
+    )
     assert body["status"] is None and body["proxy_type"] == "OnPremise"
     assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
 
 
 async def test_an_on_premise_destination_without_a_connectivity_binding_sends_nothing(
-    client, remote, caplog
+    client, remote
 ):
     """The real connectivity seam, in an environment without a binding."""
-    caplog.set_level(logging.WARNING, logger=testcall.logger.name)
     await seed(client)
     remote.resolver = OnPremiseResolver()
     body = (await client.post(URL, json={})).json()
     assert body["ok"] is False and body["code"] == "destination_error"
-    assert body["message"] == preview.DESTINATION_TEXT
-    assert "no connectivity service binding" in caplog.text
+    assert body["message"] == (
+        "destination 'S4_ODATA_TECH' is an OnPremise destination, but this app has no "
+        "connectivity service binding"
+    )
     assert remote.requests == []
 
 
-async def test_a_407_of_the_proxy_is_one_request_and_no_retry(client, remote, proxy):
-    await seed(client)
+@pytest.mark.parametrize("operations", [["list", "get"], ["get"]])
+@pytest.mark.parametrize("as_user", [False, True])
+async def test_a_407_of_the_proxy_has_its_own_code_and_says_what_to_check(
+    client, remote, proxy, as_user, operations
+):
+    """For the list and for the reachability check alike."""
+    extra: dict[str, Any] = {"definition": definition(**{HEADER: operations, ITEM: operations})}
+    headers: dict[str, str] = {}
     remote.resolver = OnPremiseResolver()
-    proxy.sap = Sap(httpx.Response(407, text="Proxy Authentication Required"))
-    body = (await client.post(URL, json={})).json()
-    assert body["ok"] is False and body["status"] == 407 and body["code"] == "sap_error"
+    if as_user:
+        extra.update(user_context=True, destination="S4_ODATA_USER")
+        remote.resolver = OnPremiseResolver(name="S4_ODATA_USER", auth_type="PrincipalPropagation")
+        headers = bearer("alice")
+    await seed(client, **extra)
+    proxy.sap = Sap(
+        httpx.Response(407, json={"error": {"code": "X/1", "message": {"value": "tenant-zone-9"}}})
+    )
+    body = (await client.post(URL, json={}, headers=headers)).json()
+    assert body["ok"] is False and body["status"] == 407 and body["code"] == "proxy_refused"
+    message = body["message"]
+    assert message.startswith("HTTP 407 from the connectivity proxy: ")
+    assert "connectivity service binding" in message and "CloudConnectorLocationId" in message
+    assert ("CONNECTIVITY_PP_MODE" in message) is as_user
+    assert "tenant-zone-9" not in message and "OData service" not in message
     assert len(proxy.requests) == 1 and proxy.tokens.invalidated == []
 
 

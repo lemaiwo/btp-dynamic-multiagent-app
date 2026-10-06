@@ -51,49 +51,74 @@ presenting the token it was obtained with.
 
 OnPremise destinations (``ProxyType: OnPremise``, a virtual host behind a
 Cloud Connector) are reached through the connectivity service's HTTP proxy,
-and only by a caller that hands this auth the connectivity tokens
-(``connectivity=``) and sends through :class:`OnPremiseRouter` --
-``destination_http_client(..., connectivity=...)`` does both. The mechanism
-is the one ``scripts/probe_odata_connectivity.py`` proved against a
-landscape: the request keeps the destination's ``http://`` URL, goes to the
-proxy in HTTP forward mode (no CONNECT tunnel) and carries a per-request
+and only by a client built for it: :func:`routed_auth` builds the auth and
+the :class:`OnPremiseRouter` together, and ``destination_http_client(...,
+connectivity=...)`` uses it. Today that is the OData toolset, its
+``$metadata`` preview and its test call; every other built-in refuses an
+OnPremise destination and says that it cannot reach one. The mechanism is the
+one ``scripts/probe_odata_connectivity.py`` proved against a landscape: the
+request keeps the destination's ``http://`` URL, goes to the proxy in HTTP
+forward mode (no CONNECT tunnel) and carries a per-request
 ``Proxy-Authorization``.
 
 * **Technical user** (``user_context`` off): the application's connectivity
   token in ``Proxy-Authorization``; the destination's own ``Authorization``
   travels to the target as for an Internet destination.
 * **Signed-in user** (``user_context`` on): the destination must be
-  ``PrincipalPropagation``, and nothing stored in the destination is sent --
-  a credential next to the user's identity would let the target answer as
-  the technical user and pass for principal propagation. The identity
-  travels in one of two ways (:data:`DEFAULT_PP_MODE`, env
-  ``CONNECTIVITY_PP_MODE``): ``exchange`` puts a token exchanged from the
-  user's JWT at the connectivity instance's XSUAA into
-  ``Proxy-Authorization``; ``header`` puts the application's token there and
-  the user's JWT into ``SAP-Connectivity-Authentication``. No JWT bound is
-  :class:`DestinationUserRequired` before any token or proxy call; there is
-  no path from a user run to the application's identity.
+  ``PrincipalPropagation``, and no credential travels next to the user's
+  identity -- nothing stored in the destination, and no ``Authorization``
+  the caller set: either would let the target answer as somebody else and
+  pass for principal propagation. The identity travels in one of two ways
+  (:data:`DEFAULT_PP_MODE`, env ``CONNECTIVITY_PP_MODE``): ``exchange`` puts
+  a token exchanged from the user's JWT at the connectivity instance's XSUAA
+  into ``Proxy-Authorization``; ``header`` puts the application's token
+  there and the user's JWT into ``SAP-Connectivity-Authentication``. The
+  variable is read when a user's OnPremise request needs it and at no other
+  time; a value that is neither mode refuses that request (it never picks a
+  mechanism nobody chose). No JWT bound is :class:`DestinationUserRequired`
+  before any token or proxy call; there is no path from a user run to the
+  application's identity.
+* **Whose identity.** The user is the owner of the JWT bound to the run. A
+  job started with "Run now" carries the JWT of whoever started it, so it
+  runs in SAP as that person, whatever run-as principal the job names.
 * ``SAP-Connectivity-SCC-Location_ID`` is sent when the destination names a
   Cloud Connector location.
 * ``http://`` is accepted for an OnPremise destination that goes through the
   proxy, and for nothing else; an ``https://`` OnPremise URL is refused,
   because a CONNECT tunnel would carry the request's ``Proxy-Authorization``
   to the target instead of the proxy.
-* The three connectivity headers are set by the flow only. A destination's
-  ``URL.headers.*``, a caller and a subclass cannot set them, and the router
-  refuses a request that carries one without having been shaped for the
-  proxy, so the proxy token never leaves on the direct path.
+* The connectivity headers (``Proxy-Authorization``,
+  ``SAP-Connectivity-Authentication``,
+  ``SAP-Connectivity-Technical-Authentication``,
+  ``SAP-Connectivity-SCC-Location_ID``) are set by the flow only. A caller
+  and a subclass cannot set them, and the router refuses a request that
+  carries a proxy token without having been shaped for the proxy, so the
+  proxy token never leaves on the direct path.
 * A 407 from the proxy drops the connectivity token that was used (that
-  user's only) and retries once, like the 401 rule.
+  user's only, and only if nobody renewed it meanwhile) and retries once,
+  like the 401 rule.
 
-A destination's ``URL.queries.*`` properties (``sap-client``, ...) are added
-to every request, OnPremise or not; a parameter the caller already sends
-wins, whatever its case.
+Two rules hold for EVERY destination, OnPremise or not:
+
+* a destination's ``URL.headers.*`` cannot set the connectivity headers
+  above or ``Host``: such a property is dropped;
+* a destination's ``URL.queries.*`` properties (``sap-client``, ...) are
+  added to every request; a parameter the caller already sends wins,
+  whatever its case. A client built for the connectivity route (the OData
+  callers) additionally skips query names that start with ``$`` -- a
+  destination must not add ``$filter`` or ``$expand`` behind the argument
+  checks of the tools -- and takes one spelling per name.
+
+A client built with ``connectivity`` has the router as its transport, so
+httpx applies no ``HTTP_PROXY``/``HTTPS_PROXY``/``NO_PROXY`` from the
+environment to it, on either path: nothing outside the binding can change
+where a request with a proxy token goes.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import logging
 import os
 import re
@@ -124,11 +149,16 @@ ON_PREMISE = PROXY_TYPE_ON_PREMISE
 PROXY_AUTH_HEADER = "Proxy-Authorization"
 SCC_LOCATION_HEADER = "SAP-Connectivity-SCC-Location_ID"
 PP_HEADER = "SAP-Connectivity-Authentication"
+TECHNICAL_AUTH_HEADER = "SAP-Connectivity-Technical-Authentication"
 # Decide which identity the proxy and the Cloud Connector see, so only the
-# flow sets them (compared in lower case).
-_RESERVED_HEADERS = frozenset(
-    h.lower() for h in (PROXY_AUTH_HEADER, SCC_LOCATION_HEADER, PP_HEADER)
+# flow sets them: removed from every request before it leaves (lower case).
+_IDENTITY_HEADERS = frozenset(
+    h.lower()
+    for h in (PROXY_AUTH_HEADER, SCC_LOCATION_HEADER, PP_HEADER, TECHNICAL_AUTH_HEADER)
 )
+# What a destination's `URL.headers.*` can never set: the above, and where
+# the request goes.
+_DESTINATION_RESERVED = _IDENTITY_HEADERS | {"host"}
 PRINCIPAL_PROPAGATION = "PrincipalPropagation"
 # How a signed-in user's identity reaches the proxy; see the module docstring.
 PP_MODES = ("exchange", "header")
@@ -143,23 +173,67 @@ _LOCATION_ID = re.compile(r"[A-Za-z0-9_.:@-]{1,128}")
 _PROXY_HOST = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 
 
+class OnPremiseRefused(DestinationError):
+    """An OnPremise destination that cannot be used as it is configured.
+
+    ``admin_text`` is a fixed text that names the destination and nothing
+    else of the landscape: what an admin screen may show as it is.
+    """
+
+    def __init__(self, message: str, *, admin_text: str) -> None:
+        super().__init__(message)
+        self.admin_text = admin_text
+
+
+PP_MODE_TEXT = f"{PP_MODE_ENV} must be exchange or header"
+PROXY_REFUSED_TEXT = "HTTP 407 from the connectivity proxy"
+
+
+def proxy_refused_hint(user_context: bool) -> str:
+    """What to check after a 407 of the connectivity proxy. Fixed text: the
+    proxy's own answer is never read."""
+    hint = (
+        "the connectivity proxy refused the request before it reached SAP: check this "
+        "app's connectivity service binding and the destination's CloudConnectorLocationId"
+    )
+    if user_context:
+        hint += (
+            f"; for a service that acts as the signed-in user also {PP_MODE_ENV} "
+            "(exchange or header) and the Cloud Connector's trust configuration for "
+            "principal propagation"
+        )
+    return hint
+
+
 def pp_mode_from_environment(environ: Mapping[str, str] | None = None) -> str:
     """The principal-propagation mode: ``CONNECTIVITY_PP_MODE``, else the default.
 
-    A value that is neither mode falls back to the default with a warning
-    (the value itself is not logged). That is safe because both modes are
-    user modes: neither is a way to the technical user.
+    A value that is neither mode is refused, without the value in the text:
+    falling back would send a user's identity by a mechanism nobody chose.
     """
     raw = str((os.environ if environ is None else environ).get(PP_MODE_ENV) or "")
     mode = raw.strip().lower()
     if not mode:
         return DEFAULT_PP_MODE
     if mode not in PP_MODES:
-        logger.warning(
-            "%s is not one of %s; using %r", PP_MODE_ENV, " | ".join(PP_MODES), DEFAULT_PP_MODE
-        )
-        return DEFAULT_PP_MODE
+        raise OnPremiseRefused(PP_MODE_TEXT, admin_text=PP_MODE_TEXT)
     return mode
+
+
+@dataclasses.dataclass(frozen=True)
+class _Route:
+    """That an auth was built together with its transport (:func:`routed_auth`).
+
+    ``tokens`` are the ``ConnectivityTokens``, or None when the app has no
+    connectivity binding. Only the factory makes one.
+    """
+
+    tokens: Any
+
+
+# `destination_http_client(connectivity=...)`: not passed at all is a caller
+# that knows nothing of OnPremise; passed as None is one without a binding.
+_NOT_GIVEN: Any = object()
 
 
 def proxy_url_of(config: ConnectivityConfig) -> str:
@@ -230,8 +304,8 @@ class DestinationAuth(httpx.Auth):
         expected_hosts: Iterable[str] = (),
         server_key: str = "",
         retry_on_401: bool = True,
-        connectivity: Any = None,
         pp_mode: str | None = None,
+        _route: _Route | None = None,
     ) -> None:
         self._resolver = resolver
         self.user_context = bool(user_context)
@@ -240,16 +314,19 @@ class DestinationAuth(httpx.Auth):
         # a retry would only repeat a refused logon. It turns the 407 retry
         # off as well: such a caller's connectivity tokens are new too.
         self.retry_on_401 = bool(retry_on_401)
-        # `ConnectivityTokens`, or None: then no request of this auth goes
-        # through the connectivity proxy. A caller that passes it must send
-        # through an `OnPremiseRouter` (`connectivity_transport`).
-        self._connectivity = connectivity
-        if pp_mode is None:
-            pp_mode = pp_mode_from_environment()
-        if pp_mode not in PP_MODES:
+        # Set by `routed_auth` only, which builds the router with it: an auth
+        # that knows the connectivity tokens on a client without the router
+        # would send a proxy token on the direct path.
+        if _route is not None and not isinstance(_route, _Route):
+            raise TypeError("a connectivity-aware auth is built by routed_auth()")
+        self._route = _route
+        self._connectivity = _route.tokens if _route is not None else None
+        if pp_mode is not None and pp_mode not in PP_MODES:
             raise ValueError(f"pp_mode must be one of {', '.join(PP_MODES)}")
-        self.pp_mode = pp_mode
+        # None: the environment's, read when a user's OnPremise request needs it.
+        self._pp_mode = pp_mode
         self._route_noted = False
+        self._queries_noted = False
         self.expected_hosts = tuple(h.lower() for h in expected_hosts)
         self.server_key = server_key or "destination"
         self._proxy_noted = False
@@ -330,32 +407,55 @@ class DestinationAuth(httpx.Auth):
             # httpx set Host when the request was built, from the placeholder.
             request.headers["Host"] = target.netloc.decode("ascii")
         for key, value in destination.headers.items():
-            if key.lower() not in _RESERVED_HEADERS:
+            if key.lower() not in _DESTINATION_RESERVED:
                 request.headers[key] = value
         self._add_queries(request, destination)
         self._applied = request.url
 
-    @staticmethod
-    def _add_queries(request: httpx.Request, destination: Destination) -> None:
+    def _add_queries(self, request: httpx.Request, destination: Destination) -> None:
         """Append the destination's ``URL.queries.*`` the request lacks.
 
         The caller's own query is left byte for byte as it is (an OData
         ``$filter`` must not be re-encoded on the way); a name the caller
         already sends wins, compared without case because SAP reads
         ``sap-client`` that way. Applied again on a retry it adds nothing.
+
+        A client built for the connectivity route is an OData caller, and
+        for those a destination's ``$``-prefixed names are skipped (said
+        once per auth, with the destination's name only): ``$filter``,
+        ``$expand``, ``$top``, ``$format`` or ``$skiptoken`` from a
+        destination would get behind the argument checks of the tools. Such
+        a caller also takes one spelling per name, the destination's first.
         """
         if not destination.queries:
             return
+        odata = self._route is not None
         raw = request.url.query
         present = {
             name.lower()
             for name, _ in parse_qsl(raw.decode("ascii", "replace"), keep_blank_values=True)
         }
-        extra = "&".join(
-            f"{quote(str(name), safe='')}={quote(str(value), safe='')}"
-            for name, value in destination.queries.items()
-            if str(name).lower() not in present
-        ).encode("ascii")
+        pairs: list[str] = []
+        skipped = False
+        for name, value in destination.queries.items():
+            name = str(name)
+            if name.lower() in present:
+                continue
+            if odata:
+                if name.startswith("$"):
+                    skipped = True
+                    continue
+                present.add(name.lower())
+            pairs.append(f"{quote(name, safe='')}={quote(str(value), safe='')}")
+        if skipped and not self._queries_noted:
+            self._queries_noted = True
+            logger.warning(
+                "%s: destination %r has URL.queries properties that start with '$'; "
+                "they are not sent (OData query options come from the tool only)",
+                self.server_key,
+                self.destination_name,
+            )
+        extra = "&".join(pairs).encode("ascii")
         if extra:
             request.url = request.url.copy_with(query=raw + b"&" + extra if raw else extra)
 
@@ -364,29 +464,67 @@ class DestinationAuth(httpx.Auth):
         """Whether requests for ``destination`` go through the connectivity
         proxy; raises when it is OnPremise and cannot.
 
-        The one place that allows ``http://``: an OnPremise destination, and
-        only with the connectivity tokens to really send it through the
-        proxy. Without them an ``http://`` OnPremise destination is refused
-        with the reason; an ``https://`` one is left to the rules every
+        The one place that allows ``http://``: an OnPremise destination on
+        an auth built for the connectivity route (``routed_auth``), with the
+        connectivity tokens to really send it through the proxy. Such an
+        auth refuses an OnPremise destination that is not ``http://`` and one
+        it has no binding for (:class:`OnPremiseRefused`). Any other auth --
+        a built-in that knows nothing of OnPremise -- refuses an ``http://``
+        one saying so, and leaves an ``https://`` one to the rules every
         destination had before (it is not routed, and gets no proxy token).
         """
         if not _is_on_premise(destination):
             return False
+        name = self.destination_name
         scheme = _scheme_of(destination.url)
-        if self._connectivity is None:
+        if self._route is None:
+            # A built-in that was not built for the connectivity route
+            # (Gmail, Jira, MCP ...): a binding would not help it.
             if scheme == "http":
-                raise DestinationError(
-                    f"destination {self.destination_name!r} is an OnPremise destination, "
-                    f"but this app has no connectivity service binding"
+                text = (
+                    f"{self.server_key} cannot reach OnPremise destinations (only OData "
+                    f"services go through the connectivity proxy)"
                 )
+                raise OnPremiseRefused(f"{text}: destination {name!r}", admin_text=text)
             return False
         if scheme != "http":
-            raise DestinationError(
-                f"OnPremise destination {self.destination_name!r} must use "
+            raise OnPremiseRefused(
+                f"OnPremise destination {name!r} must use "
                 f"http://<virtual host>:<port>: the connectivity proxy forwards plain "
-                f"HTTP and the Cloud Connector tunnel is what encrypts it"
+                f"HTTP and the Cloud Connector tunnel is what encrypts it",
+                admin_text=(
+                    f"OnPremise destination '{name}' must use an http:// address (virtual "
+                    f"host and port): the Cloud Connector tunnel is what encrypts it"
+                ),
             )
+        if self._connectivity is None:
+            text = (
+                f"destination '{name}' is an OnPremise destination, but this app has no "
+                f"connectivity service binding"
+            )
+            raise OnPremiseRefused(text, admin_text=text)
         return True
+
+    def _mode(self) -> str:
+        """The principal-propagation mode of this request: the one the auth
+        was built with, else the environment's -- read here, by a user's
+        OnPremise request only. Raises for a value that is neither mode."""
+        return self._pp_mode if self._pp_mode is not None else pp_mode_from_environment()
+
+    async def _token(self, fetch: Any, drop: Any, refused: str | None) -> str:
+        """A connectivity token; after a 407, one that is not the refused one.
+
+        ``refused`` is the token the proxy just answered 407 to. It is
+        dropped only when it is still the cached one: when another request
+        renewed it meanwhile, that newer token is used and nothing is
+        fetched again. So a 407 costs at most one token request, also for
+        the application's token that every user shares in ``header`` mode.
+        """
+        token = await fetch()
+        if refused is not None and token == refused:
+            drop()
+            token = await fetch()
+        return token
 
     async def _proxy_headers(
         self,
@@ -394,7 +532,7 @@ class DestinationAuth(httpx.Auth):
         token: str | None,
         principal: str | None,
         *,
-        force: bool = False,
+        refused: dict[str, str] | None = None,
     ) -> dict[str, str] | None:
         """The connectivity headers of one attempt; ``None`` = not through the proxy.
 
@@ -404,6 +542,9 @@ class DestinationAuth(httpx.Auth):
         not ``PrincipalPropagation`` it raises, and in ``header`` mode the
         application's token only opens the proxy while the user's JWT rides
         next to it. Every refusal comes before a token is asked for.
+
+        ``refused`` is what this function answered for the attempt the proxy
+        just refused with a 407 (see ``_token``).
         """
         if not self._through_proxy(destination):
             return None
@@ -417,21 +558,35 @@ class DestinationAuth(httpx.Auth):
             )
         tokens = self._connectivity
         headers: dict[str, str] = {}
+        old = (refused or {}).get(PROXY_AUTH_HEADER, "").removeprefix("Bearer ") or None
+        mode = ""
+
+        async def app() -> str:
+            return await self._token(tokens.app_token, tokens.invalidate, old)
+
         if self.user_context:
             if not token:
                 raise DestinationUserRequired(self.server_key, name)
             if auth_type != PRINCIPAL_PROPAGATION:
-                raise DestinationError(
+                raise OnPremiseRefused(
                     f"{self.server_key}: OnPremise destination {name!r} is set to act as "
                     f"the signed-in user, which needs Authentication PrincipalPropagation; "
-                    f"its own credential is never sent next to a user's identity"
+                    f"its own credential is never sent next to a user's identity",
+                    admin_text=(
+                        f"OnPremise destination '{name}' cannot act as the signed-in user: "
+                        f"its Authentication must be PrincipalPropagation"
+                    ),
                 )
-            if self.pp_mode == "exchange":
-                exchanged = await tokens.user_token(token, principal, force=force)
+            mode = self._mode()  # raises for an unknown value: before any token call
+            if mode == "exchange":
+                exchanged = await self._token(
+                    lambda: tokens.user_token(token, principal),
+                    lambda: tokens.invalidate(tokens.user_key(principal, token)),
+                    old,
+                )
                 headers[PROXY_AUTH_HEADER] = f"Bearer {exchanged}"
             else:
-                app = await tokens.app_token(force=force)
-                headers[PROXY_AUTH_HEADER] = f"Bearer {app}"
+                headers[PROXY_AUTH_HEADER] = f"Bearer {await app()}"
                 headers[PP_HEADER] = f"Bearer {token}"
         else:
             if auth_type == PRINCIPAL_PROPAGATION:
@@ -440,8 +595,7 @@ class DestinationAuth(httpx.Auth):
                     f"signed-in user; resolve it with user context or use a "
                     f"technical-user destination"
                 )
-            app = await tokens.app_token(force=force)
-            headers[PROXY_AUTH_HEADER] = f"Bearer {app}"
+            headers[PROXY_AUTH_HEADER] = f"Bearer {await app()}"
         if location:
             headers[SCC_LOCATION_HEADER] = location
         if not self._route_noted:
@@ -450,17 +604,14 @@ class DestinationAuth(httpx.Auth):
                 "%s: destination %r goes through the connectivity proxy as %s",
                 self.server_key,
                 name,
-                f"the signed-in user ({self.pp_mode})" if self.user_context else "a technical user",
+                f"the signed-in user ({mode})" if self.user_context else "a technical user",
             )
         return headers
 
-    def _drop_proxy_token(self, token: str | None, principal: str | None) -> None:
-        """Forget the connectivity token the last attempt used -- that one only."""
-        tokens = self._connectivity
-        if self.user_context and self.pp_mode == "exchange" and token:
-            tokens.invalidate(tokens.user_key(principal, token))
-        else:
-            tokens.invalidate()
+    def on_resolved(self, destination: Destination) -> None:
+        """Called with every destination the flow resolved, before any rule
+        looks at it -- also one that is then refused. For a subclass that
+        reports what was resolved; it decides nothing."""
 
     def send_through(self, request: httpx.Request, destination: Destination) -> None:
         """Shape ``request`` for ``destination``, just before it is sent.
@@ -493,7 +644,8 @@ class DestinationAuth(httpx.Auth):
         ``proxy`` is what ``_proxy_headers`` answered for this attempt. The
         connectivity headers are set here, last, and any the request already
         carries are removed first: they cannot come from the destination, the
-        caller or an override of ``send_through``.
+        caller or an override of ``send_through``. On a user's request
+        through the proxy no ``Authorization`` is left either, whoever set it.
         """
         self._applied = None
         if proxy is not None and self.user_context:
@@ -513,9 +665,13 @@ class DestinationAuth(httpx.Auth):
                 f"{self.destination_name!r} does not point where the destination "
                 f"rules put it; refusing to send"
             )
-        for name in _RESERVED_HEADERS:
+        for name in _IDENTITY_HEADERS:
             if name in request.headers:
                 del request.headers[name]
+        if proxy is not None and self.user_context and "authorization" in request.headers:
+            # The caller's, or a subclass's: a credential next to the user's
+            # identity is what a user run never sends.
+            del request.headers["authorization"]
         request.extensions.pop(PROXY_ROUTE_EXTENSION, None)
         if proxy is not None:
             dest_url = httpx.URL(destination.url)
@@ -541,6 +697,7 @@ class DestinationAuth(httpx.Auth):
     async def async_auth_flow(self, request):  # type: ignore[override]
         token, principal = self._user()
         destination = await self._resolve(token, principal)
+        self.on_resolved(destination)
         proxy = await self._proxy_headers(destination, token, principal)
         self._shape(request, destination, proxy)
         response = yield request
@@ -549,11 +706,10 @@ class DestinationAuth(httpx.Auth):
             return
         if response.status_code == 407 and proxy is not None:
             # The proxy refused its token: aged out or revoked. Drop the one
-            # that was used -- this user's only in exchange mode -- and retry
-            # exactly once with a new one. The destination was not the
-            # problem and stays cached.
-            self._drop_proxy_token(token, principal)
-            proxy = await self._proxy_headers(destination, token, principal, force=True)
+            # that was used -- this user's only in exchange mode, and only if
+            # it is still the cached one -- and retry exactly once. The
+            # destination was not the problem and stays cached.
+            proxy = await self._proxy_headers(destination, token, principal, refused=proxy)
             self._shape(request, destination, proxy)
             yield request
         elif response.status_code == 401:
@@ -566,6 +722,7 @@ class DestinationAuth(httpx.Auth):
             else:
                 self._resolver.invalidate()
             destination = await self._resolve(token, principal, force=True)
+            self.on_resolved(destination)
             proxy = await self._proxy_headers(destination, token, principal)
             self._shape(request, destination, proxy)
             yield request
@@ -623,31 +780,44 @@ class OnPremiseRouter(httpx.AsyncBaseTransport):
             await self._proxied.aclose()
 
 
-def connectivity_transport(
+def routed_auth(
+    resolver: Any,
     connectivity: Any,
     *,
+    auth_class: type[DestinationAuth] = DestinationAuth,
     direct: httpx.AsyncBaseTransport | None = None,
     proxied: httpx.AsyncBaseTransport | None = None,
-) -> OnPremiseRouter:
-    """The transport of a client whose auth was given ``connectivity``.
+    **auth_args: Any,
+) -> tuple[DestinationAuth, httpx.AsyncBaseTransport | None]:
+    """The auth and the transport of a client that may reach OnPremise
+    destinations: ``(auth, transport)``, to be given to ONE ``httpx`` client.
 
-    ``direct`` and ``proxied`` are seams for tests. Left out, the direct side
-    is httpx's own transport and the proxied side one pointed at the
-    binding's on-premise proxy. Building it sends nothing. ``trust_env`` is
-    off for the proxied side, as in the probe: nothing in the environment
-    may change where a request with a proxy token goes.
+    The only place a connectivity-aware auth is built, so that it never
+    exists without the router that keeps its proxy token off the direct
+    path. ``connectivity`` is the app's ``ConnectivityTokens``, or None
+    when there is no binding: the auth then refuses an OnPremise
+    destination with the missing binding as the reason, and the transport
+    is ``direct`` as it was given.
 
-    Because the router is passed to the client as its transport, httpx does
-    not apply ``HTTP_PROXY``/``HTTPS_PROXY`` from the environment to such a
-    client -- on either path.
+    ``direct`` and ``proxied`` are seams for tests. Left out, the direct
+    side is httpx's own transport and the proxied side one pointed at the
+    binding's on-premise proxy; building them sends nothing. ``trust_env``
+    is off for the proxied side, as in the probe.
     """
-    if proxied is None:
-        proxied = httpx.AsyncHTTPTransport(
-            proxy=httpx.Proxy(proxy_url_of(connectivity.config)), trust_env=False
+    if not (inspect.isclass(auth_class) and issubclass(auth_class, DestinationAuth)):
+        raise TypeError("auth_class must be a DestinationAuth")
+    transport: httpx.AsyncBaseTransport | None = direct
+    if connectivity is not None:
+        if proxied is None:
+            proxied = httpx.AsyncHTTPTransport(
+                proxy=httpx.Proxy(proxy_url_of(connectivity.config)), trust_env=False
+            )
+        transport = OnPremiseRouter(
+            direct=direct if direct is not None else httpx.AsyncHTTPTransport(),
+            proxied=proxied,
         )
-    if direct is None:
-        direct = httpx.AsyncHTTPTransport()
-    return OnPremiseRouter(direct=direct, proxied=proxied)
+    auth = auth_class(resolver, _route=_Route(connectivity), **auth_args)
+    return auth, transport
 
 
 def destination_http_client(
@@ -658,7 +828,7 @@ def destination_http_client(
     server_key: str = "",
     transport: httpx.AsyncBaseTransport | None = None,
     timeout: float = 30.0,
-    connectivity: Any = None,
+    connectivity: Any = _NOT_GIVEN,
     proxy_transport: httpx.AsyncBaseTransport | None = None,
     pp_mode: str | None = None,
 ) -> httpx.AsyncClient:
@@ -671,25 +841,27 @@ def destination_http_client(
     ``connectivity`` (``ConnectivityTokens``) lets the client reach OnPremise
     destinations through the connectivity proxy; ``proxy_transport`` is the
     test seam of that side and ``pp_mode`` the principal-propagation mode
-    (default: the environment's). Without ``connectivity`` the client is
-    exactly the one this function always returned, and an ``http://``
-    OnPremise destination is refused with the missing binding as the reason.
+    (default: the environment's, read per user request). Passed as None it
+    says "this caller would, but the app has no connectivity binding": the
+    refusal of an OnPremise destination then names the binding. Not passed
+    at all, the client is exactly the one this function always returned.
     """
-    if connectivity is not None:
+    if connectivity is not _NOT_GIVEN:
+        auth, routed = routed_auth(
+            resolver,
+            connectivity,
+            direct=transport,
+            proxied=proxy_transport,
+            user_context=user_context,
+            expected_hosts=expected_hosts,
+            server_key=server_key,
+            pp_mode=pp_mode,
+        )
         return httpx.AsyncClient(
             base_url=PLACEHOLDER_BASE,
-            auth=DestinationAuth(
-                resolver,
-                user_context=user_context,
-                expected_hosts=expected_hosts,
-                server_key=server_key,
-                connectivity=connectivity,
-                pp_mode=pp_mode,
-            ),
+            auth=auth,
             timeout=httpx.Timeout(timeout),
-            transport=connectivity_transport(
-                connectivity, direct=transport, proxied=proxy_transport
-            ),
+            transport=routed,
         )
     return httpx.AsyncClient(
         base_url=PLACEHOLDER_BASE,

@@ -66,7 +66,12 @@ from agents.destination import (
     DestinationError,
     connectivity_from_environment,
 )
-from agents.destination_auth import PLACEHOLDER_BASE, DestinationUserRequired, resolver_for
+from agents.destination_auth import (
+    PLACEHOLDER_BASE,
+    DestinationUserRequired,
+    OnPremiseRefused,
+    resolver_for,
+)
 from agents.odata import preview
 from agents.odata.calls import DIALECTS
 from agents.odata.client import ODataClient, ODataError, ReadQuery
@@ -191,13 +196,14 @@ def _proxy_transport() -> httpx.AsyncBaseTransport | None:
 
 
 def _http(
-    auth: preview.OneShotAuth, wire: _Wire, budget: float, connectivity: Any = None
+    auth: preview.OneShotAuth,
+    wire: _Wire,
+    budget: float,
+    transport: httpx.AsyncBaseTransport | None,
 ) -> httpx.AsyncClient:
     """A throw-away client that lets exactly one request out.
 
-    ``connectivity`` is what ``auth`` was built with: with it the client
-    sends through the router that keeps the connectivity proxy and the
-    direct path apart."""
+    ``auth`` and ``transport`` are the pair ``preview.one_shot`` built."""
 
     async def leaving(_request: httpx.Request) -> None:
         # After the destination shaped the request, before it is sent.
@@ -214,7 +220,7 @@ def _http(
         auth=auth,
         # Above the budget: the one clock is `asyncio.timeout` in `run_test_call`.
         timeout=httpx.Timeout(budget + 5.0),
-        transport=preview.wire(connectivity, _transport(), _proxy_transport()),
+        transport=transport,
         cookies=NoCookieJar(),
         follow_redirects=False,
         event_hooks={"request": [leaving], "response": [arrived]},
@@ -231,6 +237,9 @@ def _refused_read(exc: ODataError, wire: _Wire) -> _Outcome:
     if wire.blocked and status is not None and 200 <= status < 300:
         # The one answer was a proper, empty page; its paging link was not followed.
         return _Outcome(True, None, _NO_ROW_TEXT, status, 0, ["paging_not_followed"])
+    if exc.code == "proxy_refused":
+        # The connectivity proxy's answer, not SAP's: what to check.
+        return _failed("proxy_refused", f"{exc.message}: {exc.hint}", status)
     if exc.code == "destination_error":
         # The client's code for every transport failure: no connection, or
         # one that broke while the body arrived (the status is then known).
@@ -459,16 +468,17 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             raise refuse(preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT))
         try:
             auth_class = preview.OneShotAuth if chosen is not None else preview.MetadataAuth
-            connectivity = _connectivity()
-            auth = auth_class(
+            auth, transport = preview.one_shot(
+                auth_class,
                 _resolver(destination),
+                _connectivity(),
+                _transport(),
+                _proxy_transport(),
                 user_context=user_context,
                 server_key=SERVER_KEY,
-                retry_on_401=False,
-                connectivity=connectivity,
             )
             async with asyncio.timeout(budget) as clock:
-                async with _http(auth, wire, budget, connectivity) as http:
+                async with _http(auth, wire, budget, transport) as http:
                     if chosen is not None:
                         outcome = await _list(http, service, definition, chosen, wire)
                     else:
@@ -481,6 +491,14 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             raise refuse(
                 preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
             ) from None
+        except OnPremiseRefused as exc:
+            # A fixed text that says what to change; nothing was sent.
+            logger.warning(
+                "odata test call: destination '%s' was refused (%s)",
+                destination,
+                type(exc).__name__,
+            )
+            outcome = _failed("destination_error", preview.refused_text(exc))
         except (DestinationError, ValueError) as exc:
             # ValueError: `resolver_for` on an empty name. The text can quote the
             # destination service's answer, so it goes to the log only, URLs masked.

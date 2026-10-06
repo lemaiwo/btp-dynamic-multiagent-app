@@ -794,6 +794,10 @@ async def test_an_on_premise_user_fetch_on_a_technical_destination_sends_nothing
     remote.resolver = OnPremiseResolver()
     r = await client.post(URL, json=request(user_context=True), headers=bearer("alice-id"))
     assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert r.json() == {
+        "detail": "OnPremise destination 'S4_ODATA_TECH' cannot act as the signed-in user: "
+        "its Authentication must be PrincipalPropagation"
+    }
     assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
 
 
@@ -803,28 +807,60 @@ async def test_an_https_on_premise_destination_is_refused_before_anything_is_sen
     remote.resolver = OnPremiseResolver(url="https://s4.internal:44300")
     r = await client.post(URL, json=REQUEST)
     assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert r.json() == {
+        "detail": "OnPremise destination 'S4_ODATA_TECH' must use an http:// address "
+        "(virtual host and port): the Cloud Connector tunnel is what encrypts it"
+    }
     assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
 
 
-async def test_an_on_premise_destination_without_a_connectivity_binding_says_so_in_the_log(
-    client, remote, caplog
-):
-    """The real connectivity seam, in an environment without a binding."""
-    caplog.set_level(logging.WARNING, logger=preview.logger.name)
+async def test_an_on_premise_destination_without_a_connectivity_binding_says_so(client, remote):
+    """The real connectivity seam, in an environment without a binding: the
+    admin reads what is missing, not "check the log"."""
     remote.resolver = OnPremiseResolver()
     r = await client.post(URL, json=REQUEST)
     assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
-    assert r.json() == {"detail": preview.DESTINATION_TEXT}
-    assert "no connectivity service binding" in caplog.text
+    assert r.json() == {
+        "detail": "destination 'S4_ODATA_TECH' is an OnPremise destination, but this app "
+        "has no connectivity service binding"
+    }
     assert remote.requests == []
 
 
-async def test_a_407_of_the_proxy_is_one_request_and_no_retry(client, remote, proxy):
+async def test_an_unknown_pp_mode_refuses_a_user_fetch_and_says_which_setting(
+    client, remote, proxy, monkeypatch
+):
+    monkeypatch.setenv("CONNECTIVITY_PP_MODE", "s3cret-typo")
+    remote.resolver = OnPremiseResolver(name="S4_ODATA_USER", auth_type="PrincipalPropagation")
+    body = request(destination="S4_ODATA_USER", user_context=True)
+    r = await client.post(URL, json=body, headers=bearer("alice-id"))
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert r.json() == {"detail": "CONNECTIVITY_PP_MODE must be exchange or header"}
+    assert proxy.requests == [] and proxy.tokens.calls == []
+
+
+@pytest.mark.parametrize("as_user", [False, True])
+async def test_a_407_of_the_proxy_has_its_own_code_and_says_what_to_check(
+    client, remote, proxy, as_user
+):
+    body, headers = REQUEST, {}
     remote.resolver = OnPremiseResolver()
-    proxy.sap = Sap(httpx.Response(407, text="Proxy Authentication Required"))
-    r = await client.post(URL, json=REQUEST)
-    assert r.status_code == 502 and r.headers["x-odata-error"] == "sap_error"
-    assert "connectivity proxy" in r.json()["detail"]
+    if as_user:
+        remote.resolver = OnPremiseResolver(name="S4_ODATA_USER", auth_type="PrincipalPropagation")
+        body, headers = request(destination="S4_ODATA_USER", user_context=True), bearer("alice-id")
+    # A body that looks like an OData error: it is the proxy's, and never read.
+    proxy.sap = Sap(
+        httpx.Response(407, json={"error": {"code": "X/1", "message": {"value": "tenant-zone-9"}}})
+    )
+    r = await client.post(URL, json=body, headers=headers)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "proxy_refused"
+    detail = r.json()["detail"]
+    assert detail.startswith("HTTP 407 from the connectivity proxy: ")
+    assert "connectivity service binding" in detail and "CloudConnectorLocationId" in detail
+    assert ("CONNECTIVITY_PP_MODE" in detail) is as_user
+    assert ("trust configuration for principal propagation" in detail) is as_user
+    assert "tenant-zone-9" not in detail and "OData service" not in detail
+    # One request, no retry.
     assert len(proxy.requests) == 1 and proxy.tokens.invalidated == []
 
 

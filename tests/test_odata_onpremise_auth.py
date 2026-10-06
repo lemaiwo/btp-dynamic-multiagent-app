@@ -112,7 +112,8 @@ def pp_resolver(**overrides: Any) -> Resolver:
 
 
 class FakeTokens:
-    """``ConnectivityTokens`` without a token endpoint."""
+    """``ConnectivityTokens`` without a token endpoint, with its cache rule:
+    a token stays the same until ``invalidate`` drops it."""
 
     config = ConnectivityConfig(
         client_id="cid",
@@ -132,14 +133,10 @@ class FakeTokens:
 
     async def app_token(self, *, force: bool = False) -> str:
         self.calls.append(("app", force))
-        if force:
-            self.generation += 1
         return "APP" + self._suffix()
 
     async def user_token(self, user_jwt: str, principal: str | None, *, force: bool = False) -> str:
         self.calls.append(("user", user_jwt, principal, force))
-        if force:
-            self.generation += 1
         # Bound to the JWT as the real cache is (principal AND token digest).
         return f"UX-{principal}-{user_jwt}" + self._suffix()
 
@@ -149,6 +146,7 @@ class FakeTokens:
 
     def invalidate(self, principal: str | None = None) -> None:
         self.invalidated.append(principal)
+        self.generation += 1
 
 
 class Wire:
@@ -290,22 +288,55 @@ async def test_exchange_is_the_default_mode_and_the_environment_can_switch_it(mo
     switched = destination_auth.pp_mode_from_environment({"CONNECTIVITY_PP_MODE": " Header "})
     assert switched == "header"
     w = World(pp_resolver())
+    # Read when a user run needs it, not when the client is built.
+    http = w.client(user_context=True)
     monkeypatch.setenv("CONNECTIVITY_PP_MODE", "header")
     with as_user(*ALICE):
-        async with w.client(user_context=True) as http:
+        async with http:
             await http.get(PATH)
     assert w.proxy.requests[0].headers[PP_HEADER] == "Bearer jwt-a"
 
 
-def test_an_unknown_mode_is_refused_or_falls_back_to_the_default(caplog):
+def test_an_unknown_mode_argument_is_refused():
     with pytest.raises(ValueError, match="pp_mode"):
-        DestinationAuth(Resolver(), connectivity=FakeTokens(), pp_mode="basic")
-    caplog.set_level(logging.WARNING)
-    # Both modes are user modes, so the default is a safe answer to a typo.
-    assert destination_auth.pp_mode_from_environment({"CONNECTIVITY_PP_MODE": "s3cret-typo"}) == (
-        "exchange"
-    )
-    assert "CONNECTIVITY_PP_MODE" in caplog.text and "s3cret-typo" not in caplog.text
+        destination_http_client(Resolver(), connectivity=FakeTokens(), pp_mode="basic")
+
+
+async def test_an_unknown_mode_in_the_environment_fails_closed(monkeypatch, caplog):
+    """No fall-back: a typo must not pick a mechanism nobody chose."""
+    caplog.set_level(logging.DEBUG)
+    with pytest.raises(DestinationError) as info:
+        destination_auth.pp_mode_from_environment({"CONNECTIVITY_PP_MODE": "s3cret-typo"})
+    assert str(info.value) == "CONNECTIVITY_PP_MODE must be exchange or header"
+
+    monkeypatch.setenv("CONNECTIVITY_PP_MODE", "s3cret-typo")
+    w = World(pp_resolver())
+    with as_user(*ALICE):
+        async with w.client(user_context=True) as http:
+            with pytest.raises(DestinationError, match="CONNECTIVITY_PP_MODE must be") as info:
+                await http.get(PATH)
+    assert "s3cret-typo" not in str(info.value) and "s3cret-typo" not in caplog.text
+    # Refused before any token call, and nothing left.
+    assert w.tokens.calls == [] and not w.proxy.requests and not w.direct.requests
+
+
+async def test_the_mode_is_never_read_on_a_technical_or_an_internet_path(monkeypatch, caplog):
+    """Gmail, Jira, MCP ... and a technical OnPremise run do not care what
+    the variable holds, and say nothing about it."""
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setenv("CONNECTIVITY_PP_MODE", "s3cret-typo")
+    w = World()
+    async with w.client() as http:
+        assert (await http.get(PATH)).status_code == 200
+    w = World(Resolver(url="https://api.example.com", proxy_type="Internet"))
+    with as_user(*ALICE):
+        async with w.client(user_context=True) as http:
+            assert (await http.get(PATH)).status_code == 200
+        async with destination_http_client(
+            w.resolver, user_context=True, transport=w.direct.transport
+        ) as http:
+            assert (await http.get(PATH)).status_code == 200
+    assert "CONNECTIVITY_PP_MODE" not in caplog.text
 
 
 @pytest.mark.parametrize("mode", ["exchange", "header"])
@@ -401,12 +432,54 @@ async def test_onpremise_https_is_refused():
 
 
 async def test_onpremise_without_binding_names_the_binding():
+    """The OData path (``connectivity`` passed, and it is None)."""
     w = World()
     async with w.client(connectivity=None) as http:
-        with pytest.raises(DestinationError, match="no connectivity service binding") as info:
+        with pytest.raises(destination_auth.OnPremiseRefused) as info:
             await http.get(PATH)
+    assert "no connectivity service binding" in str(info.value)
     assert "S4_ODATA_TECH" in str(info.value)
+    assert info.value.admin_text == (
+        "destination 'S4_ODATA_TECH' is an OnPremise destination, but this app has no "
+        "connectivity service binding"
+    )
     assert not w.proxy.requests and not w.direct.requests
+
+
+async def test_a_built_in_that_never_passes_connectivity_says_what_it_cannot_do():
+    """Gmail, Jira, MCP ...: a binding would not help them."""
+    w = World()
+    http = destination_http_client(
+        w.resolver, server_key="builtin:jira", transport=w.direct.transport
+    )
+    async with http:
+        with pytest.raises(DestinationError) as info:
+            await http.get(PATH)
+    text = str(info.value)
+    assert "builtin:jira cannot reach OnPremise destinations" in text
+    assert "only OData services go through the connectivity proxy" in text
+    assert "binding" not in text
+    assert not w.direct.requests
+
+
+async def test_the_three_refusals_carry_a_fixed_text_for_the_admin():
+    w = World(Resolver(url="https://s4.internal:44300"))
+    async with w.client() as http:
+        with pytest.raises(destination_auth.OnPremiseRefused) as info:
+            await http.get(PATH)
+    assert info.value.admin_text == (
+        "OnPremise destination 'S4_ODATA_TECH' must use an http:// address "
+        "(virtual host and port): the Cloud Connector tunnel is what encrypts it"
+    )
+    w = World(Resolver())
+    with as_user(*ALICE):
+        async with w.client(user_context=True) as http:
+            with pytest.raises(destination_auth.OnPremiseRefused) as info:
+                await http.get(PATH)
+    assert info.value.admin_text == (
+        "OnPremise destination 'S4_ODATA_TECH' cannot act as the signed-in user: its "
+        "Authentication must be PrincipalPropagation"
+    )
 
 
 async def test_without_connectivity_the_client_is_the_one_of_today():
@@ -538,6 +611,48 @@ def test_the_real_proxy_transport_is_built_from_the_binding_only():
     assert destination_auth.proxy_url_of(FakeTokens.config) == "http://proxy.internal:20003"
 
 
+def test_environment_proxies_do_not_apply_to_a_client_with_connectivity(monkeypatch):
+    """Accepted rule: the router is the client's transport, so httpx mounts
+    nothing from ``HTTP_PROXY``/``HTTPS_PROXY``/``NO_PROXY`` -- nothing in the
+    environment can change where a request with a proxy token goes."""
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("NO_PROXY", "s4.internal")
+    http = destination_http_client(Resolver(), connectivity=FakeTokens())
+    assert http._mounts == {}
+    # The client every other destination user gets is untouched by this.
+    assert destination_http_client(Resolver())._mounts != {}
+
+
+def test_only_the_factory_builds_a_connectivity_aware_auth():
+    """An auth that knows the connectivity tokens on a client without the
+    router would send a proxy token directly; so the two are built together,
+    in one place."""
+    tokens = FakeTokens()
+    with pytest.raises(TypeError):
+        DestinationAuth(Resolver(), connectivity=tokens)
+    with pytest.raises(TypeError):
+        DestinationAuth(Resolver(), _route=tokens)
+    auth, transport = destination_auth.routed_auth(Resolver(), tokens)
+    assert isinstance(transport, destination_auth.OnPremiseRouter)
+    assert auth._connectivity is tokens
+    # Without a binding: the same auth class, the caller's own transport.
+    auth, transport = destination_auth.routed_auth(Resolver(), None, direct=None)
+    assert transport is None and auth._connectivity is None
+
+    import re as _re
+
+    pattern = _re.compile(r"\b_Route\(|\bOnPremiseRouter\(|_route=")
+    offenders = [
+        f"{path.relative_to(ROOT)}:{n}"
+        for path in sorted((ROOT / "agents").rglob("*.py"))
+        if path.name != "destination_auth.py"
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert offenders == []
+
+
 # ------------------------------------------------------------------- queries
 
 
@@ -570,7 +685,7 @@ async def test_407_invalidates_that_principals_token_and_retries_once():
             response = await http.get(PATH)
     assert response.status_code == 200
     assert w.tokens.invalidated == ["alice@example.com"]
-    assert [c[-1] for c in w.tokens.calls] == [False, True]
+    assert all(c[0] == "user" and c[-1] is False for c in w.tokens.calls)
     first, second = w.proxy.requests
     assert first.headers[PROXY_AUTH] == "Bearer UX-alice@example.com-jwt-a"
     assert second.headers.get_list(PROXY_AUTH) == ["Bearer UX-alice@example.com-jwt-a#1"]
@@ -586,7 +701,22 @@ async def test_407_for_the_technical_user_drops_the_app_token_only():
     # A second 407 is a real refusal, not a loop.
     assert response.status_code == 407 and len(w.proxy.requests) == 2
     assert w.tokens.invalidated == [None]
-    assert w.tokens.calls == [("app", False), ("app", True)]
+    assert [r.headers[PROXY_AUTH] for r in w.proxy.requests] == ["Bearer APP", "Bearer APP#1"]
+
+
+async def test_a_407_does_not_drop_a_token_somebody_else_already_renewed():
+    """Overlapping requests refused with the same old token: the shared app
+    token is fetched again once, not once per request."""
+    w = World(proxy=Wire(407, 200))
+    async with w.client() as http:
+        request = http.build_request("GET", PATH)
+        flow = http.auth.async_auth_flow(request)
+        await flow.__anext__()  # shaped with the old token
+        w.tokens.invalidate()  # another request renewed it meanwhile
+        w.tokens.invalidated.clear()
+        await flow.asend(httpx.Response(407, request=request))
+    assert w.tokens.invalidated == []
+    assert request.headers[PROXY_AUTH] == "Bearer APP#1"
 
 
 async def test_407_in_header_mode_drops_the_app_token():
@@ -596,6 +726,7 @@ async def test_407_in_header_mode_drops_the_app_token():
             await http.get(PATH)
     assert w.tokens.invalidated == [None]
     assert w.proxy.requests[1].headers[PP_HEADER] == "Bearer jwt-a"
+    assert w.proxy.requests[1].headers[PROXY_AUTH] == "Bearer APP#1"
 
 
 async def test_existing_401_retry_still_works_for_onpremise():
@@ -614,8 +745,13 @@ async def test_no_retry_at_all_for_a_one_shot_auth():
     """``retry_on_401=False`` (a resolver and tokens made for one request)
     turns the 407 retry off as well."""
     w = World(proxy=Wire(407, 200))
-    auth = DestinationAuth(w.resolver, connectivity=w.tokens, retry_on_401=False)
-    router = destination_auth.OnPremiseRouter(direct=w.direct.transport, proxied=w.proxy.transport)
+    auth, router = destination_auth.routed_auth(
+        w.resolver,
+        w.tokens,
+        direct=w.direct.transport,
+        proxied=w.proxy.transport,
+        retry_on_401=False,
+    )
     async with httpx.AsyncClient(
         base_url=destination_auth.PLACEHOLDER_BASE, auth=auth, transport=router
     ) as http:
@@ -665,3 +801,319 @@ async def test_nothing_secret_is_logged(caplog):
     text = caplog.text
     for secret in ("jwt-a", "APP", BASIC, "s3cret", "stored-value"):
         assert secret not in text
+
+
+# ------------------------------------------------- fix round 1: more rules
+
+
+async def test_a_callers_authorization_does_not_travel_on_a_user_run():
+    w = World(pp_resolver())
+    with as_user(*ALICE):
+        async with w.client(user_context=True, pp_mode="exchange") as http:
+            await http.get(PATH, headers={"Authorization": "Basic Y2FsbGVyOng="})
+    (r,) = w.proxy.requests
+    assert "Authorization" not in r.headers
+    assert r.headers[PROXY_AUTH] == "Bearer UX-alice@example.com-jwt-a"
+
+
+async def test_caller_set_identity_headers_are_dropped_on_the_proxy_path():
+    w = World()
+    async with w.client() as http:
+        await http.get(
+            PATH,
+            headers={
+                PP_HEADER: "Bearer someone-else",
+                LOCATION: "OTHER",
+                PROXY_AUTH: "Bearer from-caller",
+                "SAP-Connectivity-Technical-Authentication": "Basic eDp5",
+            },
+        )
+    (r,) = w.proxy.requests
+    assert PP_HEADER not in r.headers
+    assert "SAP-Connectivity-Technical-Authentication" not in r.headers
+    assert r.headers.get_list(LOCATION) == ["LOC1"]
+    assert r.headers.get_list(PROXY_AUTH) == ["Bearer APP"]
+
+    w = World(Resolver(location_id=""))
+    async with w.client() as http:
+        await http.get(PATH, headers={LOCATION: "OTHER"})
+    assert LOCATION not in w.proxy.requests[0].headers
+
+
+@pytest.mark.parametrize("proxy_type", ["OnPremise", "Internet"])
+async def test_a_destination_cannot_set_host_or_the_technical_authentication(proxy_type):
+    """Accepted rule: reserved headers of a destination are dropped for
+    every destination, not only OnPremise ones."""
+    url = VIRTUAL if proxy_type == "OnPremise" else "https://api.example.com"
+    w = World(
+        Resolver(
+            url=url,
+            proxy_type=proxy_type,
+            headers={
+                "Authorization": BASIC,
+                "Host": "evil.example.com",
+                "SAP-Connectivity-Technical-Authentication": "Basic eDp5",
+                "X-Custom": "kept",
+            },
+        )
+    )
+    async with w.client() as http:
+        await http.get(PATH)
+    (r,) = (w.proxy if proxy_type == "OnPremise" else w.direct).requests
+    assert r.headers["Host"] == httpx.URL(url).netloc.decode()
+    assert "SAP-Connectivity-Technical-Authentication" not in r.headers
+    assert r.headers["X-Custom"] == "kept" and r.headers["Authorization"] == BASIC
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "http://s4.internal:44301/sap/x",  # the virtual host, another port
+        "https://s4.internal:44300/sap/x",  # the virtual host, over https
+        "https://s4.internal/sap/x",
+    ],
+)
+async def test_an_absolute_link_off_the_destinations_address_is_refused(link):
+    w = World()
+    async with w.client() as http:
+        with pytest.raises(DestinationError, match="refusing to send"):
+            await http.get(link)
+    assert not w.proxy.requests and not w.direct.requests
+
+
+async def test_an_absolute_link_to_the_virtual_host_itself_goes_through_the_proxy():
+    w = World()
+    async with w.client() as http:
+        await http.get(f"{VIRTUAL}{PATH}?$skiptoken=20")
+    (r,) = w.proxy.requests
+    assert r.url.query == b"$skiptoken=20&sap-client=100"
+    assert r.headers[PROXY_AUTH] == "Bearer APP"
+
+
+async def test_a_plain_http_link_on_the_direct_path_is_refused_with_connectivity():
+    """An Internet destination's client that has the router: an http:// link
+    to its own host must not leave (and never with the credential)."""
+    w = World(Resolver(url="https://api.example.com", proxy_type="Internet"))
+    async with w.client() as http:
+        with pytest.raises(DestinationError, match="refusing to send"):
+            await http.get("http://api.example.com/v1/next")
+    assert not w.proxy.requests and not w.direct.requests
+
+
+async def test_a_401_retry_on_a_user_run_still_sends_no_destination_header():
+    w = World(pp_resolver(), proxy=Wire(401, 200))
+    with as_user(*ALICE):
+        async with w.client(user_context=True, pp_mode="exchange") as http:
+            response = await http.get(PATH, headers={"Authorization": "Basic Y2FsbGVyOng="})
+    assert response.status_code == 200 and len(w.proxy.requests) == 2
+    assert [c[2] for c in w.resolver.calls] == [False, True]
+    for r in w.proxy.requests:
+        assert "Authorization" not in r.headers and "X-Stored" not in r.headers
+        assert r.headers[PROXY_AUTH] == "Bearer UX-alice@example.com-jwt-a"
+    assert w.resolver.invalidated == ["alice@example.com"]
+
+
+async def test_a_redirect_answered_on_the_proxy_path_is_not_followed():
+    w = World()
+
+    def redirect(request: httpx.Request) -> httpx.Response:
+        w.proxy.requests.append(request)
+        return httpx.Response(302, headers={"Location": "https://evil.example.com/login"})
+
+    http = destination_http_client(
+        w.resolver,
+        connectivity=w.tokens,
+        transport=w.direct.transport,
+        proxy_transport=httpx.MockTransport(redirect),
+    )
+    async with http:
+        response = await http.get(PATH)
+    assert response.status_code == 302
+    assert len(w.proxy.requests) == 1 and not w.direct.requests
+
+
+# -------------------------------------------- queries: the OData callers
+
+
+async def test_odata_callers_skip_dollar_queries_of_a_destination(caplog):
+    """A destination must not add ``$filter``, ``$expand``, ``$top`` ...
+    behind the argument checks of the tools."""
+    caplog.set_level(logging.WARNING, logger=destination_auth.logger.name)
+    queries = {
+        "$filter": "Secret eq 'x'",
+        "$expand": "to_All",
+        "$top": "9999",
+        "$format": "xml",
+        "$skiptoken": "5",
+        "sap-client": "100",
+    }
+    w = World(Resolver(queries=queries))
+    async with w.client() as http:
+        await http.get(PATH, params={"$top": "1"})
+        await http.get(PATH)
+    first, second = w.proxy.requests
+    assert first.url.query == b"%24top=1&sap-client=100"
+    assert second.url.query == b"sap-client=100"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    # Once per destination, the destination's name only.
+    assert len(warnings) == 1 and "S4_ODATA_TECH" in warnings[0]
+    assert "Secret" not in caplog.text and "9999" not in caplog.text
+
+
+async def test_odata_callers_deduplicate_destination_queries_without_case():
+    w = World(Resolver(queries={"sap-client": "100", "SAP-CLIENT": "200", "sap-language": "EN"}))
+    async with w.client() as http:
+        await http.get(PATH)
+        await http.get(PATH, params={"Sap-Client": "300"})
+    first, second = w.proxy.requests
+    # The first spelling of the destination; then the caller's wins.
+    assert first.url.query == b"sap-client=100&sap-language=EN"
+    assert second.url.query == b"Sap-Client=300&sap-language=EN"
+
+
+async def test_a_next_link_with_a_skiptoken_keeps_it_and_gets_no_second_client():
+    w = World(Resolver(queries={"sap-client": "100", "$skiptoken": "1"}))
+    async with w.client() as http:
+        await http.get(f"{PATH}?$skiptoken=abc%2F20&sap-client=100")
+    (r,) = w.proxy.requests
+    assert r.url.query == b"$skiptoken=abc%2F20&sap-client=100"
+
+
+async def test_other_destination_users_keep_append_when_absent():
+    """No OData rules for Gmail, Jira, MCP ...: every query property the
+    request lacks is appended, ``$`` or not."""
+    w = World(
+        Resolver(
+            url="https://api.example.com",
+            proxy_type="Internet",
+            queries={"$format": "json", "key": "1", "KEY": "2"},
+        )
+    )
+    async with destination_http_client(w.resolver, transport=w.direct.transport) as http:
+        await http.get("/v1/things", params={"q": "x"})
+    assert w.direct.requests[0].url.query == b"q=x&%24format=json&key=1&KEY=2"
+
+
+# ------------------------------------- the real ConnectivityTokens behind it
+
+
+class Uaa:
+    """The connectivity service's XSUAA: a new token per call."""
+
+    def __init__(self) -> None:
+        self.forms: list[dict[str, str]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        from urllib.parse import parse_qs
+
+        form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+        self.forms.append(form)
+        n = len(self.forms)
+        if form["grant_type"] == "client_credentials":
+            token = f"app-{n}"
+        else:
+            token = f"user-of-{form['assertion']}-{n}"
+        return httpx.Response(200, json={"access_token": token, "expires_in": 3600})
+
+    def grants(self, kind: str) -> list[dict[str, str]]:
+        app = kind == "app"
+        return [f for f in self.forms if (f["grant_type"] == "client_credentials") == app]
+
+
+def real_world(resolver: Resolver, proxy: Wire) -> tuple[World, Uaa]:
+    from agents.destination import ConnectivityTokens
+
+    uaa = Uaa()
+    w = World(resolver, proxy=proxy)
+    w.tokens = ConnectivityTokens(FakeTokens.config, transport=httpx.MockTransport(uaa.handler))
+    return w, uaa
+
+
+async def test_real_tokens_a_407_invalidates_and_the_next_request_uses_the_new_token():
+    w, uaa = real_world(pp_resolver(), Wire(200, 407, 200, 200))
+    async with w.client(user_context=True, pp_mode="exchange") as http:
+        with as_user(*ALICE):
+            await http.get(PATH)
+            await http.get(PATH)  # 407, then retried
+            await http.get(PATH)
+        with as_user(*BOB):
+            await http.get(PATH)
+    sent = [r.headers[PROXY_AUTH] for r in w.proxy.requests]
+    assert sent == [
+        "Bearer user-of-jwt-a-1",
+        "Bearer user-of-jwt-a-1",
+        "Bearer user-of-jwt-a-2",
+        "Bearer user-of-jwt-a-2",
+        "Bearer user-of-jwt-b-3",
+    ]
+    assert [f["assertion"] for f in uaa.forms] == ["jwt-a", "jwt-a", "jwt-b"]
+    assert uaa.grants("app") == []
+
+
+async def test_real_tokens_header_mode_refetches_the_app_token_once_per_407():
+    w, uaa = real_world(pp_resolver(), Wire(407, 200, 200))
+    with as_user(*ALICE):
+        async with w.client(user_context=True, pp_mode="header") as http:
+            await http.get(PATH)
+            await http.get(PATH)
+    assert [r.headers[PROXY_AUTH] for r in w.proxy.requests] == [
+        "Bearer app-1",
+        "Bearer app-2",
+        "Bearer app-2",
+    ]
+    assert len(uaa.grants("app")) == 2 and uaa.grants("user") == []
+
+
+async def test_real_tokens_the_same_principal_with_another_jwt_is_no_cache_hit():
+    """ "Run now": the trigger's JWT under the run-as principal must not be
+    served the token exchanged from that user's own JWT, or the reverse."""
+    w, uaa = real_world(pp_resolver(), Wire())
+    async with w.client(user_context=True, pp_mode="exchange") as http:
+        for jwt in ("jwt-b", "jwt-a", "jwt-b"):
+            with as_user(jwt, "bob@example.com"):
+                await http.get(PATH)
+    assert [r.headers[PROXY_AUTH] for r in w.proxy.requests] == [
+        "Bearer user-of-jwt-b-1",
+        "Bearer user-of-jwt-a-2",
+        "Bearer user-of-jwt-b-1",
+    ]
+    assert [f["assertion"] for f in uaa.forms] == ["jwt-b", "jwt-a"]
+
+
+async def test_a_failing_token_endpoint_names_nothing_of_what_it_answered(caplog):
+    """The REAL ``ConnectivityTokens``: neither the endpoint's body nor an
+    httpx error text reaches the error or the log."""
+    from agents.destination import ConnectivityTokens
+
+    caplog.set_level(logging.DEBUG)
+
+    def refuses(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            json={
+                "error": "unauthorized",
+                "error_description": "client sb-clone-12345!b999 of zone acme-prod-zone is locked",
+            },
+        )
+
+    def odd_code(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "Client sb-clone-12345!b999 unknown"})
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to tok-9f8e7d6c5b4a secret-looking", request=request)
+
+    texts = []
+    for handler in (refuses, odd_code, unreachable):
+        w = World()
+        w.tokens = ConnectivityTokens(FakeTokens.config, transport=httpx.MockTransport(handler))
+        async with w.client() as http:
+            with pytest.raises(DestinationError) as info:
+                await http.get(PATH)
+        assert info.value.__cause__ is None and info.value.__context__ is None
+        texts.append(str(info.value))
+        assert not w.proxy.requests
+    assert "500" in texts[0] and "unauthorized" in texts[0]
+    assert "401" in texts[1] and "ConnectError" in texts[2]
+    for leaked in ("sb-clone", "acme-prod-zone", "locked", "unknown", "tok-9f8e7d6c5b4a", "s3cret"):
+        assert all(leaked not in text for text in texts), leaked
+        assert leaked not in caplog.text, leaked

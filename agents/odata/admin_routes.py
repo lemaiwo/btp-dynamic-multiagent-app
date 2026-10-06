@@ -573,8 +573,10 @@ async def api_preview_odata_metadata(request: Request) -> dict[str, Any]:
     fetched; then, each with a stable code in the ``X-OData-Error`` header:
     429 ``busy`` (``preview.MAX_CONCURRENT_PREVIEWS`` are running); 422
     ``invalid_path``; 424 ``user_token_required``; 502
-    ``destination_error`` (also an OnPremise destination that cannot go
-    through the connectivity proxy), ``unreachable``,
+    ``destination_error`` (for an OnPremise destination that cannot go
+    through the connectivity proxy the detail is a fixed text that says
+    what to change), ``proxy_refused`` (a 407 of the connectivity proxy:
+    what to check, never the proxy's own answer), ``unreachable``,
     ``redirect``, ``sap_error`` (SAP's short code and message),
     ``not_xml`` (a sign-in page, a compressed answer), ``too_large``; 504
     ``timeout`` (fetch plus parse, ``preview.PREVIEW_BUDGET_SECONDS``); 422
@@ -640,8 +642,10 @@ async def api_test_odata_service(name: str, request: Request) -> dict[str, Any]:
     code>: <SAP's text>``, one line, capped, URLs masked), ``redirect``,
     ``unexpected_answer`` (a sign-in page at 200, another shape),
     ``unreachable``, ``timeout`` (``preview.PREVIEW_BUDGET_SECONDS``),
-    ``destination_error`` (also an OnPremise destination that cannot go
-    through the connectivity proxy; nothing sent),
+    ``destination_error`` (nothing sent; for an OnPremise destination that
+    cannot go through the connectivity proxy the message is a fixed text
+    that says what to change), ``proxy_refused`` (a 407 of the connectivity
+    proxy: what to check, never the proxy's own answer),
     ``invalid_definition`` (the stored service cannot be read; nothing
     sent), a catalogue code of ``ODataClient.check_read`` (nothing sent),
     ``test_failed`` (a defect: fixed text). ``warnings`` is a list of

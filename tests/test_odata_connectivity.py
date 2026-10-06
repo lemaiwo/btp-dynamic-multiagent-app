@@ -1036,7 +1036,8 @@ async def test_a_percent_encoded_secret_echoed_from_the_form_body_is_scrubbed():
     with pytest.raises(DestinationError, match="returned 401") as user_err:
         await tokens.user_token(user_jwt, "alice@example.com")
     text = str(user_err.value)
-    assert "client_secret=***" in text and "assertion=***" in text
+    # The connectivity token endpoint's answer is not repeated at all.
+    assert text == "connectivity service user token request returned 401"
     for value in (secret, quote_plus(secret), user_jwt, quote_plus(user_jwt)):
         assert value not in text
 
