@@ -201,7 +201,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   exchanged from the user's JWT in `Proxy-Authorization`) or `header` (the
   application's token there plus the JWT in `SAP-Connectivity-Authentication`);
   the variable is read only when such a request needs it and any other value
-  refuses that request. No JWT bound is `DestinationUserRequired` before any
+  refuses that request (one WARNING at startup, `app.warn_on_unknown_pp_mode`).
+  The signed-in-user path through the proxy is unit-tested only: it has not
+  run against a landscape. No JWT bound is `DestinationUserRequired` before any
   token or proxy call: a user run never falls back to the application's
   identity. `SAP-Connectivity-SCC-Location_ID` is sent when the destination
   names a location; no connectivity binding is a `DestinationError`; a 407
@@ -302,7 +304,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     (no `IEEE754Compatible`); `@odata.context` is not yet required to
     confirm a V4 write (undecided until the pilot; each confirmed V4 write
     logs status and whether `@odata.context` / `@odata.etag` were present);
-    V4 enum members are not read from `$metadata`
+    V4 enum members are not read from `$metadata`; SAP's own error text (up
+    to 500 characters, URLs masked) reaches the model. A proxy 407 that came
+    through the connectivity proxy is `proxy_refused`, with a hint for the
+    admin (binding, location id, `CONNECTIVITY_PP_MODE`, Cloud Connector
+    trust) in the preview and test call, and one for the model (nothing was
+    changed, tell the user, do not retry)
   - `session.py` — `CsrfSessionStore`: token and SAP session cookies per
     destination and per user, in memory, never in the shared HTTP client; the
     key follows the credential that is *sent* (`user:<principal>:<sha256 jwt>`),
@@ -364,10 +371,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     and answered as `reload_failed: true`, never as a 500 (the log names
     the exception class only). The rebuild reaches only the app instance
     that served the request: run one app instance, or restart all instances
-    after an edit that closes access. A service that
+    after an edit that closes access. A rebuild also discards the ETag
+    handles and CSRF sessions of the old toolset (an agent re-reads before an
+    update). A service that
     acts as the signed-in user on a destination that does not sign in as the
     user is refused by the preview and the test call with `destination_error`
-    and a fixed text. `POST /metadata`,
+    and a fixed text (the picker, the preview and the save checks still treat
+    `SAMLAssertion` as user-propagating and do not know `SystemUser`: such a
+    destination is offered, then refused at run time). CSRF on the admin
+    routes is unchanged. `POST /metadata`,
     `POST /services/{name}/test`, `GET /destinations`, `GET /audit`. A
     preview, test or destination-list failure carries a stable code in the
     `X-OData-Error` header (`busy`, `invalid_path`, `user_token_required`,
@@ -845,7 +857,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
 - `templates/admin.html` — Admin UI (single-page, vanilla JS); attaches
   catalogue services to an agent (checkbox list and Allow writes), the
-  catalogue itself is edited only in `ui5-admin/`
+  catalogue itself is edited only in `ui5-admin/`; it does not read
+  `reloaded` / `reload_failed`, so a failed reload is not shown there
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is unchanged and still the supported admin at
@@ -854,18 +867,61 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
   auth modes the server accepts per built-in. The **OData services** area
   (nav entry between Skills and Runs; `view/ODataServices` = list with Used by,
-  Write tag, import of a configuration; `view/ODataServiceDetail` = identity
+  Write tag, import of a service file; `view/ODataServiceDetail` = identity
   ("Runs as" signed-in or technical user, destination field), purpose / not
   for, entity sets, operations, used by, test call) keeps its logic in
-  `model/odataCatalog.ts` and `model/odataDestinations.ts` and its dialogs in
-  `controller/odata/` (entity set, operation, `$metadata` import, duplicate).
-  Rules the UI enforces: nothing is ticked by an import; every path that
-  stores or enables a write (a ticked create/update/delete, an enabled
-  data-changing operation) or widens access (unticking Changes data) lists it
-  and asks on Save; a save is a GET plus a `PUT` with `expected_updated_at`;
-  the destination field is an `sap.m.Input` with suggestions, `autocomplete`
-  off and a value help (own picker on a phone), so the stored value is what was
-  typed or explicitly picked; it relies on public API only
+  `model/odataCatalog.ts`, `model/odataDestinations.ts`, `model/odataEntry.ts`
+  (the agent's entry) and `model/importBundle.ts` (what a configuration bundle
+  opens), and its dialogs in `controller/odata/` (entity set, operation,
+  `$metadata` import; duplicate on the page controller). One write rule
+  everywhere; the UI mirrors the server's and adds none.
+  - Destination field (page and Duplicate dialog): an `sap.m.Input` with
+    suggestions (what each destination signs in as, a warning when it does
+    not match "Runs as"), `autocomplete` off and a value-help list; on a phone
+    a plain field and an own picker (`fragment/ODataDestinationPicker`),
+    because the full-screen suggestion dialog completes typed text. The stored
+    value is what was typed or explicitly picked; what the field shows is
+    stored when Escape, Enter or leaving the field settles it. Public API only.
+  - Import from `$metadata` (`ODataImportDialog`): nothing arrives ticked or
+    enabled (new entity sets without List, new operations disabled, declared
+    capabilities are information); a re-import lists new / changed / removed,
+    never overwrites admin work (a label the admin wrote, a title, a key
+    change only when ticked) and removes only what is ticked, with what agents
+    lose and which bound operations block it; an answer that arrives after the
+    dialog was closed or another service shown is dropped.
+  - Operations: a table (Enabled, Changes data; a POST cannot be unticked) with
+    the server's `uncallable_operations` reason per row; a row press opens
+    the operation dialog, where only business name and description are
+    editable (the rest is shown as read from SAP). The pending strip has a
+    second category beside the writes: operations newly marked as only
+    reading ("no longer recorded and callable without Allow writes"), also
+    asked on Save, naming the agents without Allow writes that use the service.
+  - Agent server dialog (`McpServerDialog`, `model/odataEntry.ts`): toolset
+    "OData services" (auth mode fixed to destination), a multi-select of
+    catalogue services showing "Runs as", missing / disabled services, a
+    warning for a signed-in-user service on an agent with a run endpoint, and
+    Allow writes with the list of what it opens (enabled writes of the
+    selected services, "could not be read" when the catalogue read fails);
+    at most one OData entry per agent; a stored entry in another spelling
+    (`Builtin:OData`, trailing `/`, as the save gate accepts) opens with its
+    controls. The agent's Save asks when it newly gives writes or adds
+    services (a generic question when what it opens cannot be read; the
+    question and the PUT use one snapshot) and always sends the entry as
+    exactly `{services, allow_write: <boolean>}`.
+  - Rules the UI enforces: every path that stores or enables a write (a
+    ticked create/update/delete, an enabled data-changing operation, an
+    service created from a file or by Duplicate, a bundle) or widens access (unticking
+    Changes data) lists it and asks on Save / Create / Import; the Settings
+    import and the list page's file import ASK before they open writes (a file
+    without a boolean `enabled` is created switched off) and show the
+    server's warnings, removed services and identity changes; a changed
+    destination, service path or OData version of a service in use is asked
+    about; a save is a GET plus a `PUT` with `expected_updated_at`.
+  - A save, delete or import whose answer says `reload_failed` (JSON key, or
+    the `X-OData-Reload-Failed` header of a 204) shows a warning that stays
+    ("Saved, but not active yet": press Reload in Settings), through
+    `BaseController.warnIfNotLive`; the two outcome keys are never sent back
+    in a body
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
