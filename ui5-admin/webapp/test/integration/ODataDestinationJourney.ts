@@ -8,14 +8,14 @@ import type StandardListItem from "sap/m/StandardListItem";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
 import {
-    DESTINATION, PAGE, VIEW, announced, destinationOf, formOf, keyInDestination, leaveDestination, pressSegment,
-    stateOf, toasts, typeDestination,
-    type DestinationField
+    DESTINATION, DUPLICATE_DESTINATION, PAGE, VIEW, announced, asOnAPhone, destinationOf, formOf, keyInDestination,
+    leaveDestination, openDestinationList, pressSegment, stateOf, toasts, typeDestination,
+    type DestinationField, type Typing
 } from "./pages/ODataDetail";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
-QUnit.module("OData destination dropdown journey");
+QUnit.module("OData destination field journey");
 
 /** Technical user through S4_ODATA_TECH, used by agents. */
 const JOBS = "purchase-requisitions-jobs";
@@ -477,37 +477,79 @@ function withNewPp(): void {
     });
 }
 
-/** Types `text` as keystrokes do and waits until the field shows `completed`. */
-function iType(When: Common, Then: Common, text: string, completed: string): void {
+/** Types `text` as keystrokes do (`how`) and waits until the field shows `shown`. */
+function iType(When: Common, Then: Common, text: string, shown: string, how?: Typing): void {
     When.waitFor({
         id: PAGE,
         viewName: VIEW,
-        success: function (page: UI5Element) { typeDestination(page, text); },
+        success: function (page: UI5Element) { typeDestination(page, text, how); },
         errorMessage: "No page to type in"
     });
     Then.waitFor({
         id: PAGE,
         viewName: VIEW,
-        check: function (page: UI5Element) { return destinationOf(page).shown === completed; },
+        check: function (page: UI5Element) { return destinationOf(page).shown === shown; },
         success: function (page: UI5Element) {
-            Opa5.assert.strictEqual(destinationOf(page).shown, completed, `while typing, the field shows ${completed}`);
+            Opa5.assert.strictEqual(destinationOf(page).shown, shown, `after typing ${text} the field shows ${shown}`);
         },
-        errorMessage: `Typing ${text} did not show ${completed}`
+        errorMessage: `Not seen: ${shown} in the field after typing ${text}`
     });
 }
 
-function iLeaveTheField(When: Common, how: "blur" | "enter"): void {
+type Key = "Enter" | "ArrowDown" | "Escape" | "Tab" | "F4";
+
+function iPressKey(When: Common, key: Key): void {
+    When.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) { keyInDestination(page, key); },
+        errorMessage: "No page"
+    });
+}
+
+function iLeaveTheField(When: Common, how: "blur" | "enter" | "tab"): void {
     When.waitFor({
         id: PAGE,
         viewName: VIEW,
         success: function (page: UI5Element) {
             if (how === "enter") {
                 keyInDestination(page, "Enter");
-            } else {
-                leaveDestination(page);
+                return;
             }
+            if (how === "tab") {
+                keyInDestination(page, "Tab");
+            }
+            leaveDestination(page);
         },
         errorMessage: "No page"
+    });
+}
+
+/** Waits for the list of the field to be open (`names`: exactly these) or
+ *  closed. `inDialog`: the field is in a dialog, the page behind it. */
+function iSeeTheList(Then: Common, open: boolean, what: string, names?: string[], inDialog = false): void {
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        autoWait: !inDialog,
+        check: function () {
+            const listed = openDestinationList();
+            return open ? listed.length > 0 && (!names || listed.join() === names.join()) : listed.length === 0;
+        },
+        success: function () {
+            Opa5.assert.deepEqual(openDestinationList(), open ? (names ?? openDestinationList()) : [], what);
+        },
+        errorMessage: `Not seen: ${what}`
+    });
+}
+
+function iPickFromTheList(When: Common, name: string): void {
+    When.waitFor({
+        controlType: "sap.m.StandardListItem",
+        searchOpenDialogs: true,
+        matchers: function (item: UI5Element) { return (item as StandardListItem).getTitle() === name; },
+        actions: new Press(),
+        errorMessage: `${name} is not in the open list`
     });
 }
 
@@ -530,7 +572,7 @@ opaTest("a typed name that begins a listed one is stored as typed when the field
         Opa5.assert.notOk(field.choices.some((choice) => choice[0] === "S4_NEW"), "S4_NEW is not");
     });
 
-    iType(When, Then, "S4_NEW", "S4_NEW_PP");
+    iType(When, Then, "S4_NEW", "S4_NEW");
     iLeaveTheField(When, "blur");
     iSeeTheField(Then, UNUSED, "the typed name after leaving", (field) => field.state === "Information", function (field) {
         Opa5.assert.strictEqual(field.value, "S4_NEW", "the field holds what was typed, not the completion");
@@ -547,7 +589,7 @@ opaTest("a typed name that begins a listed one is stored as typed after Enter", 
         Opa5.assert.ok(true, "the list is there");
     });
 
-    iType(When, Then, "S4_NEW", "S4_NEW_PP");
+    iType(When, Then, "S4_NEW", "S4_NEW");
     iLeaveTheField(When, "enter");
     iSeeTheField(Then, UNUSED, "the typed name after Enter", (field) => field.state === "Information", function (field) {
         Opa5.assert.strictEqual(field.value, "S4_NEW", "the field holds what was typed, not the completion");
@@ -564,7 +606,7 @@ opaTest("a name typed in another case than the listed one is kept as typed and s
         Opa5.assert.ok(true, "the list is there");
     });
 
-    iType(When, Then, "s4_dev_basic", "S4_DEV_BASIC");
+    iType(When, Then, "s4_dev_basic", "s4_dev_basic");
     iLeaveTheField(When, "blur");
     iSeeTheField(Then, UNUSED, "the lower-case name", (field) => field.state === "Information", function (field) {
         Opa5.assert.strictEqual(field.value, "s4_dev_basic", "kept as typed");
@@ -603,13 +645,9 @@ opaTest("a typed beginning and then the arrow key takes the listed name", functi
         Opa5.assert.ok(true, "the list is there");
     });
 
-    iType(When, Then, "S4_ODATA_T", "S4_ODATA_TECH");
-    When.waitFor({
-        id: PAGE,
-        viewName: VIEW,
-        success: function (page: UI5Element) { keyInDestination(page, "ArrowDown"); },
-        errorMessage: "No page"
-    });
+    iType(When, Then, "S4_ODATA_T", "S4_ODATA_T");
+    iSeeTheList(Then, true, "the one name that holds what was typed", ["S4_ODATA_TECH"]);
+    iPressKey(When, "ArrowDown");
     iLeaveTheField(When, "blur");
     iSeeTheField(Then, UNUSED, "the name moved to with the arrow key", (field) => field.state === "Warning", function (field) {
         Opa5.assert.strictEqual(field.value, "S4_ODATA_TECH", "going through the list is picking from it");
@@ -619,25 +657,410 @@ opaTest("a typed beginning and then the arrow key takes the listed name", functi
     Then.iStopTheApp();
 });
 
-opaTest("a typed beginning and then a click on the completed item takes the listed name", function (Given: Common, When: Common, Then: Common) {
+opaTest("a typed beginning and then a click on the suggested item takes the listed name", function (Given: Common, When: Common, Then: Common) {
     iOpen(Given, UNUSED);
     iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
         Opa5.assert.ok(true, "the list is there");
     });
 
-    iType(When, Then, "S4_ODATA_T", "S4_ODATA_TECH");
-    When.waitFor({
-        controlType: "sap.m.StandardListItem",
-        searchOpenDialogs: true,
-        matchers: function (item: UI5Element) { return (item as StandardListItem).getTitle() === "S4_ODATA_TECH"; },
-        actions: new Press(),
-        errorMessage: "S4_ODATA_TECH is not in the open dropdown"
-    });
+    iType(When, Then, "S4_ODATA_T", "S4_ODATA_T");
+    iPickFromTheList(When, "S4_ODATA_TECH");
     iSeeTheField(Then, UNUSED, "the clicked name", (field) => field.state === "Warning", function (field) {
-        Opa5.assert.strictEqual(field.value, "S4_ODATA_TECH", "the item that was clicked, though it was already the completion");
+        Opa5.assert.strictEqual(field.value, "S4_ODATA_TECH", "the item that was clicked");
         Opa5.assert.strictEqual(field.stateText, FIXED_ACCOUNT);
     });
     iSaveAndSeeStored(When, Then, "S4_ODATA_TECH", "the clicked name");
+    Then.iStopTheApp();
+});
+
+opaTest("a typed name that begins a listed one is stored as typed after Tab", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    iType(When, Then, "S4_NEW", "S4_NEW");
+    iSeeTheList(Then, true, "the listed name that holds the typed one is offered", ["S4_NEW_PP"]);
+    iLeaveTheField(When, "tab");
+    iSeeTheField(Then, UNUSED, "the typed name after Tab", (field) => field.state === "Information", function (field) {
+        Opa5.assert.strictEqual(field.value, "S4_NEW", "an offered name is not taken by Tab");
+        Opa5.assert.strictEqual(field.shown, "S4_NEW");
+        Opa5.assert.strictEqual(field.stateText, NOT_LISTED);
+    });
+    iSaveAndSeeStored(When, Then, "S4_NEW", "the typed name");
+    Then.iStopTheApp();
+});
+
+opaTest("a typed name that begins a listed one is stored as typed when Save is pressed straight from the field", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    iType(When, Then, "S4_NEW", "S4_NEW");
+    iSeeTheList(Then, true, "the list is open while Save is pressed", ["S4_NEW_PP"]);
+    iSaveAndSeeStored(When, Then, "S4_NEW", "the typed name");
+    iSeeTheField(Then, UNUSED, "the typed name after the save", (field) => field.state === "Information", function (field) {
+        Opa5.assert.deepEqual([field.value, field.shown], ["S4_NEW", "S4_NEW"], "the field shows what was stored");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a name typed again in another case, or pasted over, is stored as it was entered last", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    iType(When, Then, "s4_dev_basic", "s4_dev_basic");
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the lower-case name", (field) => field.state === "Information", function (field) {
+        Opa5.assert.strictEqual(field.value, "s4_dev_basic");
+    });
+    // Everything selected, typed again in upper case.
+    iType(When, Then, "S4_DEV_BASIC", "S4_DEV_BASIC");
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the upper-case name", (field) => field.state === "Warning", function (field) {
+        Opa5.assert.strictEqual(field.value, "S4_DEV_BASIC", "the case typed last, not the one typed first");
+        Opa5.assert.strictEqual(field.stateText, FIXED_ACCOUNT, "and it is the listed destination now");
+    });
+
+    // Typed, then pasted over.
+    iType(When, Then, "s4_dev_u", "s4_dev_u");
+    iType(When, Then, "S4_Dev_User", "S4_Dev_User", { paste: true });
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the pasted name", (field) => field.value === "S4_Dev_User" && field.state === "Information", function (field) {
+        Opa5.assert.strictEqual(field.shown, "S4_Dev_User", "as pasted, character for character");
+    });
+    iSaveAndSeeStored(When, Then, "S4_Dev_User", "the pasted name");
+    Then.iStopTheApp();
+});
+
+opaTest("after Escape, once or twice, what is typed next is what the field shows and what is stored", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function (field) {
+        Opa5.assert.strictEqual(field.value, "S4_ODATA_USER");
+    });
+
+    // Twice: the list closes, then the field goes back to what it held.
+    iType(When, Then, "s4_od", "s4_od");
+    iSeeTheList(Then, true, "names that hold what was typed", ["S4_ODATA_TECH", "S4_ODATA_USER"]);
+    iPressKey(When, "Escape");
+    iSeeTheList(Then, false, "Escape closes the list");
+    iPressKey(When, "Escape");
+    iSeeTheField(Then, UNUSED, "the name from before", (field) => field.shown === "S4_ODATA_USER", function (field) {
+        Opa5.assert.strictEqual(field.value, "S4_ODATA_USER", "the second Escape puts the field back");
+    });
+    iType(When, Then, "x", "S4_ODATA_USERx", { append: true });
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "what was typed behind it", (field) => field.state === "Information", function (field) {
+        Opa5.assert.deepEqual([field.value, field.shown], ["S4_ODATA_USERx", "S4_ODATA_USERx"],
+            "nothing of the text typed before Escape is left");
+    });
+
+    // Once: the list closes, the typed text stays and is typed on.
+    iType(When, Then, "s4_ne", "s4_ne");
+    iSeeTheList(Then, true, "the name that holds what was typed", ["S4_NEW_PP"]);
+    iPressKey(When, "Escape");
+    iSeeTheList(Then, false, "Escape closes the list");
+    iSeeTheField(Then, UNUSED, "the typed text is still there", (field) => field.shown === "s4_ne", function () {
+        Opa5.assert.ok(true, "one Escape leaves the text");
+    });
+    iType(When, Then, "w", "s4_new", { append: true });
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the text typed on", (field) => field.value === "s4_new", function (field) {
+        Opa5.assert.strictEqual(field.shown, "s4_new");
+        Opa5.assert.deepEqual([field.state, field.stateText], ["Information", NOT_LISTED]);
+    });
+    iSaveAndSeeStored(When, Then, "s4_new", "what the field shows");
+    Then.iStopTheApp();
+});
+
+opaTest("the list opened on an empty field and closed without a choice leaves the field empty", function (Given: Common, When: Common, Then: Common) {
+    const ALL = CHOICES.map((choice) => choice[0]);
+    iOpen(Given, "new");
+    iSeeTheField(Then, "", "the list on an empty form", (field) => field.choices.length > 0, function (field) {
+        Opa5.assert.deepEqual([field.value, field.valueHelp], ["", true], "an empty field with a value help icon");
+    });
+
+    // By the keyboard.
+    When.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) {
+            // Nothing typed: only the focus goes to the field.
+            typeDestination(page, "");
+            keyInDestination(page, "F4");
+        },
+        errorMessage: "No page"
+    });
+    iSeeTheList(Then, true, "F4 opens the whole list", ALL);
+    iPressKey(When, "Escape");
+    iSeeTheList(Then, false, "Escape closes it");
+    iLeaveTheField(When, "tab");
+    iSeeTheField(Then, "", "an empty field after F4, Escape, Tab", (field) => field.state === "None", function (field) {
+        Opa5.assert.deepEqual([field.value, field.shown], ["", ""], "no name was taken");
+    });
+
+    // By the icon.
+    iPress(When, DESTINATION);
+    iSeeTheList(Then, true, "the icon opens the whole list", ALL);
+    iPressKey(When, "Escape");
+    iSeeTheList(Then, false, "Escape closes it");
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, "", "an empty field after the icon and Escape", (field) => field.state === "None", function (field) {
+        Opa5.assert.deepEqual([field.value, field.shown], ["", ""], "no name was taken");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("the arrow keys and Enter take the listed name, and picking the stored name changes nothing", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    iType(When, Then, "s4_odata_t", "s4_odata_t");
+    iSeeTheList(Then, true, "found whatever the case", ["S4_ODATA_TECH"]);
+    iPressKey(When, "ArrowDown");
+    iPressKey(When, "Enter");
+    iSeeTheField(Then, UNUSED, "the name taken with Enter", (field) => field.state === "Warning", function (field) {
+        Opa5.assert.deepEqual([field.value, field.shown], ["S4_ODATA_TECH", "S4_ODATA_TECH"], "in the listed spelling");
+        Opa5.assert.strictEqual(field.stateText, FIXED_ACCOUNT);
+    });
+    iSeeTheList(Then, false, "the list is closed");
+    iSaveAndSeeStored(When, Then, "S4_ODATA_TECH", "the picked name");
+
+    // The stored name, picked again from the whole list.
+    iPress(When, DESTINATION);
+    iSeeTheList(Then, true, "the whole list, whatever the field holds", CHOICES.map((choice) => choice[0]));
+    iPickFromTheList(When, "S4_ODATA_TECH");
+    iSeeTheList(Then, false, "the list is closed");
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) {
+            const field = destinationOf(page);
+            Opa5.assert.deepEqual([field.value, field.state, field.stateText], ["S4_ODATA_TECH", "Warning", FIXED_ACCOUNT],
+                "the field is as it was");
+            Opa5.assert.strictEqual(backend.countRequests(PUT_UNUSED), 1, "nothing was sent for it");
+        }
+    });
+    When.waitFor({ success: function () { HashChanger.getInstance().setHash("odata-services"); } });
+    Then.waitFor({
+        id: "sideNavigation",
+        viewName: "App",
+        check: function () { return HashChanger.getInstance().getHash() === "odata-services"; },
+        success: function () { iSeeNoDialog("nothing counts as unsaved: the page is left without a question"); },
+        errorMessage: "The page was not left"
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a name entered through an input method is stored as typed", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    iType(When, Then, "S4_NEW", "S4_NEW", { compose: true });
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the composed name", (field) => field.state === "Information", function (field) {
+        Opa5.assert.deepEqual([field.value, field.shown], ["S4_NEW", "S4_NEW"], "the end of a composition takes no listed name");
+        Opa5.assert.strictEqual(field.stateText, NOT_LISTED);
+    });
+    iSaveAndSeeStored(When, Then, "S4_NEW", "the composed name");
+    Then.iStopTheApp();
+});
+
+opaTest("what the field holds is judged also when Escape brought it back and no change was told", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+    iEnter(When, DESTINATION, "S4_ODATA_TECH");
+    iSeeTheField(Then, UNUSED, "the mismatch", (field) => field.state === "Warning", function (field) {
+        Opa5.assert.strictEqual(field.stateText, FIXED_ACCOUNT);
+    });
+
+    // Typed, then Escape to the name before: the field is not left.
+    iType(When, Then, "zz", "zz");
+    iSeeTheField(Then, UNUSED, "nothing said while typing", (field) => field.state === "None", function (field) {
+        Opa5.assert.strictEqual(field.stateText, "");
+    });
+    iPressKey(When, "Escape");
+    iSeeTheField(Then, UNUSED, "the name before, judged again", (field) => field.state === "Warning", function (field) {
+        Opa5.assert.deepEqual([field.shown, field.stateText], ["S4_ODATA_TECH", FIXED_ACCOUNT]);
+    });
+
+    // Typed, moved into the list, Escape: the typed text is back, without a change.
+    iType(When, Then, "s4_dev_u", "s4_dev_u");
+    iSeeTheList(Then, true, "the name that holds it", ["S4_DEV_USER"]);
+    iPressKey(When, "ArrowDown");
+    iSeeTheField(Then, UNUSED, "the name moved to", (field) => field.shown === "S4_DEV_USER", function () {
+        Opa5.assert.ok(true, "the arrow key shows the listed name");
+    });
+    iPressKey(When, "Escape");
+    iSeeTheField(Then, UNUSED, "the typed text again", (field) => field.shown === "s4_dev_u", function () {
+        Opa5.assert.ok(true, "Escape gives the typed text back");
+    });
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the typed text, judged", (field) => field.state === "Information", function (field) {
+        Opa5.assert.deepEqual([field.value, field.stateText], ["s4_dev_u", NOT_LISTED]);
+    });
+    iSaveAndSeeStored(When, Then, "s4_dev_u", "what the field shows");
+    Then.iStopTheApp();
+});
+
+opaTest("without the list under it, as on a phone, the field is a plain one and the icon opens the list to pick from", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function (field, page) {
+        Opa5.assert.ok(field.valueHelp, "the icon is there");
+        asOnAPhone(page);
+    });
+
+    iType(When, Then, "S4_NEW", "S4_NEW");
+    // The list would be open by now (300 ms): the next step waits longer than that.
+    iLeaveTheField(When, "blur");
+    iSeeTheField(Then, UNUSED, "the typed name", (field) => field.state === "Information", function (field) {
+        Opa5.assert.deepEqual(openDestinationList(), [], "no list was offered");
+        Opa5.assert.deepEqual([field.value, field.shown, field.stateText], ["S4_NEW", "S4_NEW", NOT_LISTED], "stored as typed");
+    });
+
+    iPress(When, DESTINATION);
+    When.waitFor({
+        controlType: "sap.m.StandardListItem",
+        searchOpenDialogs: true,
+        success: function (items: UI5Element[]) {
+            Opa5.assert.deepEqual(
+                items.map((item) => [(item as StandardListItem).getTitle(), (item as StandardListItem).getDescription()]),
+                CHOICES.concat([["S4_NEW_PP", `${AS_USER} · on-premise · subaccount`]]).sort(),
+                "the dialog lists the same destinations with the same lines"
+            );
+        },
+        errorMessage: "No dialog with the destinations"
+    });
+    iPickFromTheList(When, "S4_ODATA_TECH");
+    iSeeTheField(Then, UNUSED, "the picked name", (field) => field.value === "S4_ODATA_TECH", function (field) {
+        Opa5.assert.deepEqual([field.state, field.stateText], ["Warning", FIXED_ACCOUNT], "taken and judged");
+    });
+    iSaveAndSeeStored(When, Then, "S4_ODATA_TECH", "the picked name");
+    Then.iStopTheApp();
+});
+
+// --- the same field in the duplicate dialog ------------------------------------------
+
+function iSeeTheDuplicateField(
+    Then: Common, what: string, check: (field: DestinationField) => boolean, assert: (field: DestinationField) => void
+): void {
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        // The page is behind an open dialog.
+        autoWait: false,
+        check: function (page: UI5Element) {
+            return document.querySelectorAll(".sapMDialogOpen").length === 1
+                && check(destinationOf(page, DUPLICATE_DESTINATION, "odataDuplicateDestinationHint"));
+        },
+        success: function (page: UI5Element) {
+            assert(destinationOf(page, DUPLICATE_DESTINATION, "odataDuplicateDestinationHint"));
+        },
+        errorMessage: `Not seen in the duplicate dialog: ${what}`
+    });
+}
+
+function iDoInTheDialog(When: Common, action: (page: UI5Element) => void): void {
+    When.waitFor({ id: PAGE, viewName: VIEW, autoWait: false, success: action, errorMessage: "No page" });
+}
+
+opaTest("the destination of a copy is the same field: the list, the hint, the warning for the copy's own Runs as, and what was typed", function (Given: Common, When: Common, Then: Common) {
+    const DUPLICATE = `POST odata/services/${UNUSED}/duplicate`;
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    iPress(When, "odataDuplicateButton");
+    iSeeTheDuplicateField(Then, "the field", (field) => field.choices.length > 0, function (field) {
+        Opa5.assert.deepEqual(field.choices.map((choice) => choice[0]),
+            ["S4_DEV", "S4_DEV_BASIC", "S4_DEV_USER", "S4_NEW_PP", "S4_ODATA_TECH", "S4_ODATA_USER"].sort(),
+            "the usable destinations of the page's list");
+        Opa5.assert.deepEqual([field.value, field.state], ["S4_ODATA_USER", "None"], "the source's destination, which fits");
+        Opa5.assert.strictEqual(field.hint, UNUSABLE, "the same hint");
+        Opa5.assert.ok(field.hintDescribes, "as the field's description");
+        Opa5.assert.strictEqual(field.label, "Destination");
+        Opa5.assert.strictEqual(backend.countRequests(LIST_CALL), 1, "the list is not read again for the dialog");
+    });
+
+    // The copy runs as a technical user: judged by the dialog's choice, not the page's.
+    When.waitFor({
+        controlType: "sap.m.SegmentedButton",
+        searchOpenDialogs: true,
+        matchers: function (segmented: UI5Element) { return segmented.getId().endsWith("odataDuplicateRunsAs"); },
+        actions: function (segmented: UI5Element | null) { pressSegment(segmented as UI5Element, "technical"); },
+        errorMessage: "No Runs as in the dialog"
+    });
+    iSeeTheDuplicateField(Then, "the mismatch for the copy", (field) => field.state === "Warning", function (field) {
+        Opa5.assert.strictEqual(field.stateText, NEEDS_USER);
+        Opa5.assert.strictEqual(announced(), NEEDS_USER, "said, since it came from Runs as");
+    });
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        autoWait: false,
+        success: function (page: UI5Element) {
+            Opa5.assert.deepEqual([destinationOf(page).state, formOf(page).runsAs], ["None", "user"],
+                "the page's own field and Runs as are untouched");
+        }
+    });
+
+    // Picked from the list by the icon.
+    When.waitFor({
+        controlType: "sap.m.Input",
+        searchOpenDialogs: true,
+        matchers: function (input: UI5Element) { return input.getId().endsWith(DUPLICATE_DESTINATION); },
+        actions: new Press(),
+        errorMessage: "No destination field in the dialog"
+    });
+    iPickFromTheList(When, "S4_ODATA_TECH");
+    iSeeTheDuplicateField(Then, "the picked name", (field) => field.value === "S4_ODATA_TECH", function (field) {
+        Opa5.assert.strictEqual(field.state, "None", "a fixed account for a technical user");
+    });
+
+    // Typed: the beginning of a listed name stays what it is.
+    iDoInTheDialog(When, function (page) { typeDestination(page, "S4_NEW", { id: DUPLICATE_DESTINATION }); });
+    iSeeTheList(Then, true, "the listed name that holds the typed one is offered", ["S4_NEW_PP"], true);
+    iSeeTheDuplicateField(Then, "the typed name", (field) => field.shown === "S4_NEW", function (field) {
+        Opa5.assert.strictEqual(field.shown, "S4_NEW", "no completion");
+    });
+    When.waitFor({
+        controlType: "sap.m.Input",
+        searchOpenDialogs: true,
+        matchers: function (input: UI5Element) { return input.getId().endsWith("odataDuplicateName"); },
+        actions: new EnterText({ text: "purchase-requisitions-copy" }),
+        errorMessage: "No name field in the dialog"
+    });
+    iSeeTheDuplicateField(Then, "the note", (field) => field.state === "Information", function (field) {
+        Opa5.assert.deepEqual([field.value, field.stateText], ["S4_NEW", NOT_LISTED]);
+    });
+    When.waitFor({
+        controlType: "sap.m.Button",
+        searchOpenDialogs: true,
+        matchers: function (button: UI5Element) { return button.getId().endsWith("odataDuplicateConfirm"); },
+        actions: new Press(),
+        errorMessage: "No Duplicate button"
+    });
+    Then.waitFor({
+        check: function () { return backend.countRequests(DUPLICATE) > 0; },
+        success: function () {
+            Opa5.assert.deepEqual(
+                [backend.bodies[DUPLICATE]?.destination, backend.bodies[DUPLICATE]?.user_context], ["S4_NEW", false],
+                "the copy is asked for with the typed name and the dialog's identity"
+            );
+            Opa5.assert.strictEqual(stored("purchase-requisitions-copy").destination, "S4_NEW", "and stored so");
+        },
+        errorMessage: "No copy was made"
+    });
     Then.iStopTheApp();
 });
 

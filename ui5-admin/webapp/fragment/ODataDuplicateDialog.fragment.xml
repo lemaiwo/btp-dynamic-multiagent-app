@@ -50,15 +50,36 @@
                     submit=".onDuplicateConfirm" />
 
                 <Label text="{i18n>odataDestination}" required="true" labelFor="odataDuplicateDestination" />
-                <Input
-                    id="odataDuplicateDestination"
-                    value="{svc>/duplicate/destination}"
-                    valueState="{ path: 'svc>/duplicate/errors/destination', formatter: '.formatErrorState' }"
-                    valueStateText="{svc>/duplicate/errors/destination}"
-                    class="odataTechnical"
-                    app:field="destination"
-                    liveChange=".onDuplicateEdit"
-                    submit=".onDuplicateConfirm" />
+                <!-- The same field as on the page (see there), judged
+                     against the identity chosen in this dialog. Enter
+                     in it takes a name from the list, so it does not
+                     also create the copy. -->
+                <VBox>
+                    <Input
+                        id="odataDuplicateDestination"
+                        value="{svc>/duplicate/destination}"
+                        showSuggestion="{= !${device>/system/phone} }"
+                        autocomplete="false"
+                        showValueHelp="{= ${dest>/items}.length > 0 }"
+                        suggestionItems="{ path: 'dest>/items', templateShareable: false }"
+                        valueState="{ parts: ['svc>/duplicate/errors/destination', 'dest>/duplicate/notice'], formatter: '.formatDestinationState' }"
+                        valueStateText="{ parts: ['svc>/duplicate/errors/destination', 'dest>/duplicate/noticeText'], formatter: '.formatDestinationStateText' }"
+                        class="odataTechnical"
+                        app:field="destination"
+                        ariaDescribedBy="odataDuplicateDestinationHint"
+                        valueHelpRequest=".onDestinationValueHelp"
+                        liveChange=".onDestinationLiveChange"
+                        change=".onDestinationChange">
+                        <suggestionItems>
+                            <core:ListItem text="{dest>name}" additionalText="{dest>info}" />
+                        </suggestionItems>
+                    </Input>
+                    <Text
+                        id="odataDuplicateDestinationHint"
+                        text="{dest>/hint}"
+                        visible="{= !!${dest>/hint} }"
+                        class="odataHint" />
+                </VBox>
 
                 <Label id="odataDuplicateRunsAsLabel" text="{i18n>odataRunsAs}" labelFor="odataDuplicateRunsAs" />
                 <VBox>

@@ -266,29 +266,40 @@
 
                     <core:Title text="{i18n>odataGroupConnection}" level="H3" />
 
-                    <!-- A combo box, not a select: the list is a help. The
-                         stored value is what is in the field, listed or not
-                         (a destination can be created after the list was
-                         read, and the list can be missing). `dest` holds
-                         what the destination service lists; it is read
-                         once per visit and outlives a reload of `svc`. -->
+                    <!-- An input with the listed destinations under it, and
+                         no autocomplete: the field holds what was typed or
+                         the name that was picked, never a completion (the
+                         destination decides the identity of every call).
+                         The list is a help: any name can be typed, since a
+                         destination can be created after the list was read
+                         and the list can be missing. `dest` holds what the
+                         destination service lists; it is read once per
+                         visit and outlives a reload of `svc`. The items
+                         have no key: nothing is selected, the text is all.
+                         On a phone the input would list them in a dialog
+                         whose own input does complete, so there the field
+                         is a plain one and the icon opens a picker. -->
                     <Label text="{i18n>odataDestination}" required="true" labelFor="odataDestination" />
                     <VBox>
-                        <ComboBox
+                        <Input
                             id="odataDestination"
-                            width="100%"
                             value="{svc>/data/destination}"
-                            items="{ path: 'dest>/items', templateShareable: false }"
-                            showSecondaryValues="true"
+                            showSuggestion="{= !${device>/system/phone} }"
+                            autocomplete="false"
+                            showValueHelp="{= ${dest>/items}.length > 0 }"
+                            suggestionItems="{ path: 'dest>/items', templateShareable: false }"
                             valueState="{ parts: ['svc>/errors/destination', 'dest>/notice'], formatter: '.formatDestinationState' }"
                             valueStateText="{ parts: ['svc>/errors/destination', 'dest>/noticeText'], formatter: '.formatDestinationStateText' }"
                             class="odataTechnical"
                             app:field="destination"
                             ariaDescribedBy="odataDestinationHint"
-                            selectionChange=".onDestinationSelect"
+                            valueHelpRequest=".onDestinationValueHelp"
+                            liveChange=".onDestinationLiveChange"
                             change=".onDestinationChange">
-                            <core:ListItem key="{dest>name}" text="{dest>name}" additionalText="{dest>info}" />
-                        </ComboBox>
+                            <suggestionItems>
+                                <core:ListItem text="{dest>name}" additionalText="{dest>info}" />
+                            </suggestionItems>
+                        </Input>
                         <Text
                             id="odataDestinationHint"
                             text="{dest>/hint}"

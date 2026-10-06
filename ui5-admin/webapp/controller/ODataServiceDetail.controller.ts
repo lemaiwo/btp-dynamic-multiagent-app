@@ -20,8 +20,12 @@ import { canonical } from "../model/runsPanel";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type Dialog from "sap/m/Dialog";
+import type Input from "sap/m/Input";
+import type { Input$LiveChangeEvent } from "sap/m/Input";
+import type Item from "sap/ui/core/Item";
+import type SelectDialog from "sap/m/SelectDialog";
+import type { SelectDialog$ConfirmEvent, SelectDialog$LiveChangeEvent } from "sap/m/SelectDialog";
 import type CheckBox from "sap/m/CheckBox";
-import type ComboBox from "sap/m/ComboBox";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Page from "sap/m/Page";
 import type Table from "sap/m/Table";
@@ -114,39 +118,17 @@ export default class ODataServiceDetail extends ODataController {
 
     private duplicateDialog?: Dialog;
 
+    /** The list of destinations as a dialog, for a field without a list
+     *  under it (on a phone), and the field it was opened for. */
+    private destinationPicker?: SelectDialog;
+    private pickerField?: Input;
+
     /** What the destination service lists, for the destination field. */
     private destinations: DestinationsState = "loading";
 
     /** Counts the reads of that list, so that the answer for an earlier
      *  visit of the page is dropped. */
     private destinationsCount = 0;
-
-    /** The text the admin typed into the destination field since an item
-     *  was last picked; undefined when what the field holds was picked. */
-    private typedDestination?: string;
-
-    /** The combo box is handling a keystroke: a selection it reports now
-     *  is its own completion of the typed text, not a pick. */
-    private typingDestination = false;
-
-    /**
-     * Hears a keystroke in the destination field before the combo box
-     * does (capture phase): at this moment the input holds the new key
-     * and no completion yet. The combo box then completes the text to the
-     * first listed name that starts with it and rewrites all of it in the
-     * listed case, and would store that; `typedText` follows what was
-     * really typed across those rewrites.
-     */
-    private readonly onDestinationInput = (event: globalThis.Event): void => {
-        const field = this.byId("odataDestination") as ComboBox | undefined;
-        if (field && event.target === field.getFocusDomRef()) {
-            this.typedDestination = odataDestinations.typedText(
-                this.typedDestination, (event.target as HTMLInputElement).value
-            );
-            this.typingDestination = true;
-            this.onDestinationTyping();
-        }
-    };
 
     /** The dialog of one entity set; it is open while `entityOpen`. */
     private entityDialog?: EntitySetDialog;
@@ -189,24 +171,15 @@ export default class ODataServiceDetail extends ODataController {
 
     public onInit(): void {
         this.setModel(new JSONModel(this.blankState("")), "svc");
-        // `items`: what the destination field offers; `hint`: the line
-        // under it; `notice`: what there is to say about the name in it
-        // (a `DestinationNotice`). Apart from `svc`, which is replaced on
-        // every load and save.
-        // `noticeText`: the notice in words.
-        this.setModel(new JSONModel({ items: [], hint: "", notice: "", noticeText: "" }), "dest");
-        // A combo box has no liveChange: typing is heard on its input, once
-        // before the combo box handles the keystroke (`onDestinationInput`)
-        // and once after it did (event delegates run after the control).
-        document.addEventListener("input", this.onDestinationInput, true);
-        // The keys the combo box moves through its list with: from there on
-        // the field holds a picked name, and nothing typed is left to keep.
-        const picked = (): void => { this.typedDestination = undefined; };
-        (this.byId("odataDestination") as ComboBox).addEventDelegate({
-            oninput: () => { this.typingDestination = false; },
-            onsapdown: picked, onsapup: picked, onsaphome: picked, onsapend: picked,
-            onsappagedown: picked, onsappageup: picked
-        });
+        // `items`: what a destination field offers; `hint`: the line
+        // under it; `notice`: what there is to say about the name in the
+        // page's field (a `DestinationNotice`), `noticeText`: that in
+        // words; `duplicate`: the same two for the field of the duplicate
+        // dialog. Apart from `svc`, which is replaced on every load and save.
+        this.setModel(new JSONModel({
+            items: [], hint: "", notice: "", noticeText: "", duplicate: { notice: "", noticeText: "" }
+        }), "dest");
+        this.asDestinationField(this.byId("odataDestination") as Input);
         this.getRouter().getRoute(ROUTE)?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
             const name = (event.getParameter("arguments") as { serviceName: string }).serviceName;
             if (this.restoring) {
@@ -315,7 +288,6 @@ export default class ODataServiceDetail extends ODataController {
         this.leaveEntityDialog();
         this.slotObserver?.disconnect();
         window.removeEventListener("beforeunload", this.onBeforeUnload);
-        document.removeEventListener("input", this.onDestinationInput, true);
         this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
         this.getRouter().detachBypassed(this.onLeft, this);
         this.getOwnerComponentTyped().setLeaveGuard(undefined);
@@ -486,7 +458,6 @@ export default class ODataServiceDetail extends ODataController {
         this.showOperations();
         this.showUsedBy();
         this.filterEntitySets(search);
-        this.typedDestination = undefined;
         this.checkDestination();
     }
 
@@ -527,7 +498,6 @@ export default class ODataServiceDetail extends ODataController {
             this.serviceName = undefined;
             model.setData({ ...this.blankState(this.text("odataNewService")), isNew: true, loaded: true });
             this.filterEntitySets("");
-            this.typedDestination = undefined;
             this.checkDestination();
             return;
         }
@@ -591,6 +561,117 @@ export default class ODataServiceDetail extends ODataController {
             InvisibleMessage.getInstance().announce(odataDestinations.hint(state, text), InvisibleMessageMode.Polite);
         }
         this.checkDestination(announce);
+        this.checkDuplicateDestination();
+    }
+
+    /**
+     * Makes `field` a destination field: an input that never completes
+     * what is typed (`autocomplete="false"` in the view), so that it holds
+     * what the admin typed or the name the admin picked and nothing else.
+     * The page's field and the one of the duplicate dialog are both set up
+     * here and share the handlers below.
+     *
+     * Not on a phone: the listed names that hold the typed text are
+     * offered under the field, and one gets into the field only by a click
+     * on it or by the arrow keys. On a phone the field is a plain text
+     * field (`showSuggestion` is off there: the full-screen dialog the
+     * input would use has an input of its own that does complete), and the
+     * value help icon opens the list as a dialog to pick from.
+     */
+    private asDestinationField(field: Input): void {
+        field.setFilterFunction((typed: string, item: Item) => odataDestinations.suggests(typed, item.getText()));
+        // What the field holds when it is left is judged, also when no
+        // `change` tells of it (Escape from the list after the arrow keys
+        // puts the typed text back without one).
+        field.addEventDelegate({ onfocusout: () => this.judgeDestination(field) });
+    }
+
+    private isDuplicateField(field: Input): boolean {
+        return field === this.byId("odataDuplicateDestination");
+    }
+
+    private judgeDestination(field: Input): void {
+        if (this.isDuplicateField(field)) {
+            this.checkDuplicateDestination(false, false, field.getValue());
+        } else {
+            this.checkDestination(false, field.getValue());
+        }
+    }
+
+    /** The field has another name, or one is being typed: what the last
+     *  refused save or copy said about it is gone. */
+    private destinationEdited(field: Input): void {
+        if (this.isDuplicateField(field)) {
+            this.svc().setProperty("/duplicate/errors/destination", "");
+        } else {
+            this.svc().setProperty("/errors/destination", "");
+            this.svc().setProperty("/saveError", "");
+        }
+    }
+
+    /** The value help icon or F4: the whole list, whatever the field
+     *  holds; under the field, or as a dialog where it has no list. */
+    public onDestinationValueHelp(event: Event): void {
+        const field = event.getSource() as Input;
+        if (field.getShowSuggestion()) {
+            field.showItems(() => true);
+        } else {
+            void this.openDestinationPicker(field);
+        }
+    }
+
+    private async openDestinationPicker(field: Input): Promise<void> {
+        this.pickerField = field;
+        if (!this.destinationPicker) {
+            this.destinationPicker = await Fragment.load({
+                id: this.getView()!.getId(),
+                name: "com.agent.admin.fragment.ODataDestinationPicker",
+                controller: this
+            }) as SelectDialog;
+            this.getView()!.addDependent(this.destinationPicker);
+        }
+        (this.destinationPicker.getBinding("items") as ListBinding).filter([]);
+        this.destinationPicker.open("");
+    }
+
+    /** The search field of the dialog: the names that hold the text. */
+    public onDestinationPickerSearch(event: SelectDialog$LiveChangeEvent): void {
+        const typed = event.getParameter("value") ?? "";
+        (event.getParameter("itemsBinding") as ListBinding).filter(typed ? [new Filter({
+            path: "name", test: (name: string) => odataDestinations.suggests(typed, name)
+        })] : []);
+    }
+
+    /** A name was tapped in the dialog: it is the field's name now. */
+    public onDestinationPicked(event: SelectDialog$ConfirmEvent): void {
+        const item = event.getParameter("selectedItem");
+        const field = this.pickerField;
+        if (item && field) {
+            // Through the field: its binding writes the model.
+            field.setValue(item.getTitle());
+            this.destinationEdited(field);
+            this.judgeDestination(field);
+        }
+    }
+
+    /**
+     * Writes into `dest` at `path` what the list knows about the
+     * destination `name` for the identity `userContext`, and says it when
+     * asked to (`announce`; `always`: also when it is what was there
+     * before). `judged`: false while there is nothing to judge.
+     */
+    private noteDestination(
+        path: string, name: string, userContext: boolean, judged: boolean, announce: boolean, always: boolean
+    ): string {
+        const model = this.getModel("dest") as JSONModel;
+        const notice: DestinationNotice = judged ? odataDestinations.notice(this.destinations, name, userContext) : "";
+        const words = odataDestinations.noticeText(
+            notice, (key, args) => this.text(key, args), odataDestinations.listedAs(this.destinations, name)
+        );
+        const changed = notice !== model.getProperty(`${path}/notice`) || words !== model.getProperty(`${path}/noticeText`);
+        model.setProperty(`${path}/notice`, notice);
+        model.setProperty(`${path}/noticeText`, words);
+        return announce && words && (changed || always) ? words : "";
     }
 
     /**
@@ -604,76 +685,54 @@ export default class ODataServiceDetail extends ODataController {
      * Runs as the admin wants to know what holds now).
      */
     private checkDestination(announce = false, name = this.data().destination, always = false): void {
-        const model = this.getModel("dest") as JSONModel;
-        const loaded = this.svc().getProperty("/loaded") === true;
-        const notice: DestinationNotice = loaded
-            ? odataDestinations.notice(this.destinations, name, this.data().user_context === true)
-            : "";
-        const words = odataDestinations.noticeText(
-            notice, (key, args) => this.text(key, args), odataDestinations.listedAs(this.destinations, name)
+        const words = this.noteDestination(
+            "", name, this.data().user_context === true, this.svc().getProperty("/loaded") === true, announce, always
         );
-        const changed = notice !== model.getProperty("/notice") || words !== model.getProperty("/noticeText");
-        model.setProperty("/notice", notice);
-        model.setProperty("/noticeText", words);
-        if (announce && words && (changed || always) && !this.svc().getProperty("/errors/destination")) {
+        if (words && !this.svc().getProperty("/errors/destination")) {
             InvisibleMessage.getInstance().announce(words, InvisibleMessageMode.Polite);
         }
     }
 
-    /** While a name is being typed nothing is said about it: neither the
-     *  last error nor what the list knew about the name before. */
-    private onDestinationTyping(): void {
-        this.svc().setProperty("/errors/destination", "");
-        this.svc().setProperty("/saveError", "");
-        (this.getModel("dest") as JSONModel).setProperty("/notice", "");
-        (this.getModel("dest") as JSONModel).setProperty("/noticeText", "");
+    /** The same for the field of the duplicate dialog, against the
+     *  identity chosen in the dialog. */
+    private checkDuplicateDestination(announce = false, always = false, name?: string): void {
+        const state = this.svc().getProperty("/duplicate") as DuplicateState;
+        const words = this.noteDestination(
+            "/duplicate", name ?? state.destination, state.user_context === true,
+            this.duplicateDialog?.isOpen() === true, announce, always
+        );
+        if (words && !state.errors.destination) {
+            InvisibleMessage.getInstance().announce(words, InvisibleMessageMode.Polite);
+        }
     }
 
     /**
-     * The field was left, or Enter was pressed in it, or an item was
-     * picked.
-     *
-     * What is stored is what the admin typed. The combo box hands over its
-     * completion instead (a typed beginning of a listed name becomes that
-     * name, and a name in another case the listed spelling), which can be
-     * another destination than the one meant: one that is not listed yet.
-     * So typed text is put back, in the model and in the field.
+     * A key in a destination field. While a name is being typed nothing
+     * is said about it: neither the last error nor what the list knew
+     * about the name before. Escape that puts the field back to the name
+     * it held is the exception: that name is the stored one again and no
+     * `change` follows, so it is judged here.
+     */
+    public onDestinationLiveChange(event: Input$LiveChangeEvent): void {
+        const field = event.getSource();
+        this.destinationEdited(field);
+        if (event.getParameter("escPressed")) {
+            this.judgeDestination(field);
+        } else {
+            this.noteDestination(this.isDuplicateField(field) ? "/duplicate" : "", "", false, false, false, false);
+        }
+    }
+
+    /**
+     * A destination field was left, or Enter was pressed in it, or a name
+     * was picked from the list under it. The field holds what the admin
+     * typed or picked and nothing else: the input does not complete typed
+     * text. (The binding has written the model already.)
      */
     public onDestinationChange(event: Event): void {
-        const field = event.getSource() as ComboBox;
-        if (event.getParameter("itemPressed" as never)) {
-            // A click on an item, also on the one the typed text was
-            // completed to (which is no change of the selection).
-            this.typedDestination = undefined;
-        }
-        const name = odataDestinations.kept(this.typedDestination, field.getValue());
-        if (name !== field.getValue()) {
-            // Without its item first: setting the value alone would leave
-            // the completed item selected.
-            field.setSelectedItem(null);
-            field.setValue(name);
-            this.svc().setProperty("/data/destination", name);
-        }
-        this.onEdit(event);
-        // From the field: the binding writes the model in the same event.
-        this.checkDestination(false, name);
-    }
-
-    /**
-     * An item got the selection. By a click or by the arrow keys (which put
-     * its name in the field at once) it is a pick: the name is judged right
-     * away and nothing typed is left to keep (see also the key delegate in
-     * `onInit` and `itemPressed` in `onDestinationChange`, for a pick that
-     * does not change the selection). While a keystroke is handled
-     * it is the combo box's completion of the typed text, and is ignored.
-     * Typing that matches no item also ends here, without an item.
-     */
-    public onDestinationSelect(event: Event): void {
-        const item = (event.getSource() as ComboBox).getSelectedItem();
-        if (item && !this.typingDestination) {
-            this.typedDestination = undefined;
-            this.checkDestination(false, item.getText());
-        }
+        const field = event.getSource() as Input;
+        this.destinationEdited(field);
+        this.judgeDestination(field);
     }
 
     /** An error of the field (a refused save) comes before what the list
@@ -2061,6 +2120,10 @@ export default class ODataServiceDetail extends ODataController {
                 controller: this
             }) as Dialog;
             this.getView()!.addDependent(this.duplicateDialog);
+            this.asDestinationField(this.byId("odataDuplicateDestination") as Input);
+            // Open: the field is judged. Closed: nothing of it is left to say.
+            this.duplicateDialog.attachAfterOpen(() => this.checkDuplicateDestination());
+            this.duplicateDialog.attachAfterClose(() => this.checkDuplicateDestination());
         }
         this.duplicateDialog.setInitialFocus(this.byId(state.writes ? "odataDuplicateCancel" : "odataDuplicateName") as Control);
         this.duplicateDialog.open();
@@ -2078,7 +2141,10 @@ export default class ODataServiceDetail extends ODataController {
     public onDuplicateRunsAsChange(event: Event): void {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/duplicate/user_context", key === "user");
+        this.checkDuplicateDestination(true, true);
     }
+
+
 
     public onDuplicateCancel(): void {
         this.duplicateDialog?.close();

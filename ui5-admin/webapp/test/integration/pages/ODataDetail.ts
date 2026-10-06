@@ -1,6 +1,5 @@
 import Press from "sap/ui/test/actions/Press";
 import type Input from "sap/m/Input";
-import type ComboBox from "sap/m/ComboBox";
 import type ListItem from "sap/ui/core/ListItem";
 import type TextArea from "sap/m/TextArea";
 import type Text from "sap/m/Text";
@@ -71,7 +70,7 @@ export function formOf(element: UI5Element): FormTexts {
         purpose: control<TextArea>(element, "odataPurpose").getValue(),
         counter: control<ObjectStatus>(element, "odataPurposeCounter").getText(),
         notFor: control<Input>(element, "odataNotFor").getValue(),
-        destination: control<ComboBox>(element, DESTINATION).getValue(),
+        destination: control<Input>(element, DESTINATION).getValue(),
         runsAs: control<SegmentedButton>(element, "odataRunsAs").getSelectedKey(),
         runsAsHint: control<Text>(element, "odataRunsAsHint").getText(false),
         version: control<SegmentedButton>(element, "odataVersion").getSelectedKey(),
@@ -101,15 +100,18 @@ export function stripOf(element: UI5Element, id: string): { visible: boolean; te
 
 // --- the destination field ------------------------------------------------------
 
-/** The destination field: a combo box that also takes a typed name. */
+/** The destination field of the page: an input with the listed destinations
+ *  as suggestions, without autocomplete. */
 export const DESTINATION = "odataDestination";
+/** The same field in the duplicate dialog. */
+export const DUPLICATE_DESTINATION = "odataDuplicateDestination";
 
-/** What the destination field shows. */
+/** What a destination field shows. */
 export interface DestinationField {
     value: string;
     state: string;
     stateText: string;
-    /** What the dropdown offers: [name, the line that describes it]. */
+    /** What the list offers: [name, the line that describes it]. */
     choices: string[][];
     /** The line under the field, "" when there is none. */
     hint: string;
@@ -119,42 +121,92 @@ export interface DestinationField {
     describedText: string;
     /** The text of the label whose `for` is the field's input. */
     label: string;
-    /** What the input shows right now (while typing, the combo box's completion included). */
+    /** What the input element shows right now. */
     shown: string;
+    /** Whether the field has a value help icon to open the list with. */
+    valueHelp: boolean;
 }
 
-function destinationInput(element: UI5Element): HTMLInputElement {
-    return control<ComboBox>(element, DESTINATION).getFocusDomRef() as HTMLInputElement;
+function destinationInput(element: UI5Element, id = DESTINATION): HTMLInputElement {
+    return control<Input>(element, id).getFocusDomRef() as HTMLInputElement;
+}
+
+/** How `typeDestination` enters the text. */
+export interface Typing {
+    /** The field, `DESTINATION` by default. */
+    id?: string;
+    /** Typed behind what the field holds; by default everything is selected
+     *  first, so the first key replaces it. */
+    append?: boolean;
+    /** All of it in one go over the selection, as a paste does. */
+    paste?: boolean;
+    /** Through an input method: the keys are a composition that ends. */
+    compose?: boolean;
 }
 
 /**
- * Types `text` into the destination field key by key, the way keystrokes
- * arrive: each character replaces what is selected (the tail the combo box
- * completed the last key to) and an `input` event is fired, so the combo
- * box completes again as it does for a user. (OPA's EnterText sets the
- * value and leaves the field in one go; it never shows what a half-typed
- * name is completed to.) The field is emptied first.
+ * Types `text` into a destination field key by key, the way keystrokes
+ * arrive: a `keydown`, the character in place of what is selected, an
+ * `input` event, a `keyup`. (OPA's EnterText sets the value and leaves the
+ * field in one go; it never shows what the field makes of a half-typed
+ * name.)
  */
-export function typeDestination(element: UI5Element, text: string): void {
-    const input = destinationInput(element);
-    input.focus();
-    input.setSelectionRange(0, input.value.length);
-    text.split("").forEach((key) => {
+export function typeDestination(element: UI5Element, text: string, how: Typing = {}): void {
+    const input = destinationInput(element, how.id);
+    if (document.activeElement === input) {
+        // OPA's EnterText leaves a field with events only; the element
+        // keeps the focus and `focus()` would tell the control nothing.
+        input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    } else {
+        input.focus();
+    }
+    if (how.append) {
+        input.setSelectionRange(input.value.length, input.value.length);
+    } else {
+        input.setSelectionRange(0, input.value.length);
+    }
+    const put = (characters: string, inputType: string, isComposing = false): void => {
         const start = input.selectionStart ?? input.value.length;
         const end = input.selectionEnd ?? start;
+        input.value = input.value.slice(0, start) + characters + input.value.slice(end);
+        input.setSelectionRange(start + characters.length, start + characters.length);
+        input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType, data: characters, isComposing }));
+    };
+    if (how.paste) {
+        put(text, "insertFromPaste");
+        return;
+    }
+    if (how.compose) {
+        input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true, data: "" }));
+    }
+    text.split("").forEach((key) => {
         input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
-        input.value = input.value.slice(0, start) + key + input.value.slice(end);
-        input.setSelectionRange(start + 1, start + 1);
-        input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: key }));
+        put(key, how.compose ? "insertCompositionText" : "insertText", !!how.compose);
+        input.dispatchEvent(new KeyboardEvent("keyup", { key, bubbles: true }));
     });
+    if (how.compose) {
+        input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: text }));
+    }
 }
 
-/** A key that is not a character, pressed in the destination field. */
-export function keyInDestination(element: UI5Element, key: "Enter" | "ArrowDown"): void {
-    const keyCode = key === "Enter" ? 13 : 40;
-    destinationInput(element).dispatchEvent(new KeyboardEvent("keydown", {
-        key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true
-    } as KeyboardEventInit));
+/** A key that is not a character, pressed in a destination field. */
+export function keyInDestination(
+    element: UI5Element, key: "Enter" | "ArrowDown" | "Escape" | "Tab" | "F4", id = DESTINATION
+): void {
+    const input = destinationInput(element, id);
+    const keyCode = { Enter: 13, ArrowDown: 40, Escape: 27, Tab: 9, F4: 115 }[key];
+    const init = { key, code: key, keyCode, which: keyCode, bubbles: true, cancelable: true } as KeyboardEventInit;
+    input.dispatchEvent(new KeyboardEvent("keydown", init));
+    input.dispatchEvent(new KeyboardEvent("keyup", init));
+}
+
+/**
+ * Makes the destination field what it is on a phone: without the list
+ * under it. (The view switches it off by the device; a test run is not a
+ * phone, and the device cannot be changed for one journey.)
+ */
+export function asOnAPhone(element: UI5Element, id = DESTINATION): void {
+    control<Input>(element, id).setShowSuggestion(false);
 }
 
 /** Leaves the destination field for the one above it, as a click there does. */
@@ -162,22 +214,30 @@ export function leaveDestination(element: UI5Element): void {
     control<Input>(element, "odataNotFor").focus();
 }
 
-export function destinationOf(element: UI5Element): DestinationField {
-    const field = control<ComboBox>(element, DESTINATION);
-    const hint = control<Text>(element, "odataDestinationHint");
+/** The names in the open list of a destination field, in order; empty when
+ *  no list is open. */
+export function openDestinationList(): string[] {
+    return Array.from(document.querySelectorAll(".sapMSuggestionsPopover li [id$='-titleText']"))
+        .map((title) => title.textContent ?? "");
+}
+
+export function destinationOf(element: UI5Element, id = DESTINATION, hintId = "odataDestinationHint"): DestinationField {
+    const field = control<Input>(element, id);
+    const hint = control<Text>(element, hintId);
     const described = (field.getFocusDomRef()?.getAttribute("aria-describedby") ?? "").split(" ");
     return {
         value: field.getValue(),
         state: field.getValueState(),
         stateText: field.getValueStateText(),
-        choices: field.getItems().map((item) => [item.getText(), (item as ListItem).getAdditionalText()]),
+        choices: field.getSuggestionItems().map((item) => [item.getText(), (item as ListItem).getAdditionalText()]),
         hint: hint.getVisible() ? hint.getText(false) : "",
         hintDescribes: described.indexOf(hint.getId()) !== -1,
         describedText: described.map((id) => (id && document.getElementById(id)?.textContent) || "").join(""),
         label: Array.from(document.querySelectorAll("label"))
-            .filter((label) => label.htmlFor === destinationInput(element).id)
+            .filter((label) => label.htmlFor === destinationInput(element, id).id)
             .map((label) => label.textContent ?? "").join("|"),
-        shown: destinationInput(element).value
+        shown: destinationInput(element, id).value,
+        valueHelp: field.getShowValueHelp()
     };
 }
 

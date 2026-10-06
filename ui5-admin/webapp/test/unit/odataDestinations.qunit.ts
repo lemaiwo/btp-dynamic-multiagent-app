@@ -192,25 +192,11 @@ QUnit.test("a name that differs from a listed one only in case is said, with the
     );
 });
 
-QUnit.test("the field keeps what was typed, not what the list completed it to", function (assert) {
-    assert.strictEqual(odataDestinations.kept("S4_NEW", "S4_NEW_PP"), "S4_NEW", "a completed prefix");
-    assert.strictEqual(odataDestinations.kept("s4_dev_basic", "S4_DEV_BASIC"), "s4_dev_basic", "a folded case");
-    assert.strictEqual(odataDestinations.kept("S4_DEV", "S4_DEV"), "S4_DEV");
-    assert.strictEqual(odataDestinations.kept("", "S4_DEV"), "", "an emptied field stays empty");
-    assert.strictEqual(odataDestinations.kept(undefined, "S4_DEV_USER"), "S4_DEV_USER", "picked from the list: nothing was typed");
-});
-
-QUnit.test("what was typed is followed key by key, in the case it was typed in", function (assert) {
-    // The field shows the listed spelling of what was typed so far, with
-    // its completion; the next key lands behind the typed part.
-    assert.strictEqual(odataDestinations.typedText(undefined, "s"), "s", "the first key");
-    assert.strictEqual(odataDestinations.typedText("s", "S4"), "s4", "the field had made S of s");
-    assert.strictEqual(odataDestinations.typedText("s4_dev_basi", "S4_DEV_BASIc"), "s4_dev_basic");
-    assert.strictEqual(odataDestinations.typedText("S4_NE", "S4_NEW"), "S4_NEW");
-    assert.strictEqual(odataDestinations.typedText("s4_dev", "S4_DE"), "s4_de", "a key deleted at the end");
-    assert.strictEqual(odataDestinations.typedText("s4_dev", ""), "", "everything deleted");
-    assert.strictEqual(odataDestinations.typedText("s4_dev", "S4_xEV"), "s4_xEV",
-        "changed in the middle: as typed up to there, then as the field shows it");
-    assert.strictEqual(odataDestinations.typedText("abc", "S4_DEV"), "S4_DEV", "replaced as a whole (pasted)");
-    assert.strictEqual(odataDestinations.typedText(undefined, "S4_DEV_USERx"), "S4_DEV_USERx", "typed behind a picked name");
+QUnit.test("the list offers every name that holds the typed text, whatever the case, and looks at the name only", function (assert) {
+    assert.ok(odataDestinations.suggests("S4_NEW", "S4_NEW_PP"), "the beginning");
+    assert.ok(odataDestinations.suggests("odata", "S4_ODATA_USER"), "the middle, in another case");
+    assert.ok(odataDestinations.suggests(" s4_dev ", "S4_DEV"), "spaces around it do not count");
+    assert.ok(odataDestinations.suggests("", "S4_DEV"), "nothing typed: every name");
+    assert.notOk(odataDestinations.suggests("S4_DEV_BASIC", "S4_DEV"), "not a name that is shorter than the text");
+    assert.notOk(odataDestinations.suggests("signs", "S4_DEV"), "not what the describing line says");
 });

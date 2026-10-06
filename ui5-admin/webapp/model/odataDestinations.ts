@@ -17,7 +17,7 @@ export type DestinationsState = "loading" | "unavailable" | ODataDestinationList
 /** Resource bundle lookup: the text of `key` with `args` filled in. */
 export type Translate = (key: string, args?: (string | number)[]) => string;
 
-/** One entry of the dropdown. */
+/** One entry of the list under the field. */
 export interface DestinationChoice {
     name: string;
     /** Sign-in, network, level and description, in words. */
@@ -146,35 +146,14 @@ export default {
     listedAs,
 
     /**
-     * The text the admin has typed, after one more keystroke.
-     *
-     * `shown` is what the input holds at that keystroke. It is not simply
-     * what was typed: after every key the combo box rewrites the input to
-     * the listed spelling of the name it completes to, so the keys typed
-     * before are shown in the list's case. `before` is what was typed up
-     * to the last key (undefined: nothing, the field held a picked or
-     * stored name). The part of `shown` that still agrees with `before`,
-     * case aside, is taken from `before`; the rest is new and taken as
-     * shown.
+     * Whether the list under the field offers `name` for the text `typed`:
+     * every name that holds it, whatever the case. Only the name counts,
+     * not the line that describes it ("s" is in every "Signs in ...").
+     * Offering is all the field does with it: a name is taken only when
+     * the admin picks it.
      */
-    typedText(before: string | undefined, shown: string): string {
-        const typed = before ?? shown;
-        let same = 0;
-        while (same < typed.length && same < shown.length
-            && typed[same].toLowerCase() === shown[same].toLowerCase()) {
-            same++;
-        }
-        return typed.slice(0, same) + shown.slice(same);
-    },
-
-    /**
-     * What the field holds after it was left: `typed`, the text the admin
-     * typed, whatever the combo box made of it (`value`: it completes a
-     * typed beginning to the first listed name that starts with it, in the
-     * listed case). Without typed text -- an item was picked -- `value`.
-     */
-    kept(typed: string | undefined, value: string): string {
-        return typed === undefined ? value : typed;
+    suggests(typed: string, name: string): boolean {
+        return (name ?? "").toLowerCase().indexOf((typed ?? "").trim().toLowerCase()) !== -1;
     },
 
     /**
