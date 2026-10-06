@@ -133,6 +133,14 @@ html.sapUiTheme-sap_horizon .odataMeta.sapMText {
 }
 .odataRowMessage .sapMObjStatusText {
     white-space: normal;
+    /* In the popin layout of a phone the cell is as narrow as the window. */
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+.odataRowMessage.sapMObjStatus {
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
 }
 .odataRowMessage.sapMObjStatus {
     display: flex;
@@ -171,4 +179,51 @@ html.sapUiTheme-sap_horizon .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
 }
 html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
     border-color: var(--sapCriticalElementColor, #e76500);
+}
+
+/* The import dialog (ODataImportDialog.fragment.xml). A row: the tick, what
+   it is with its facts underneath, and its status at the end. */
+.odataImportRow {
+    padding: 0.25rem 0.5rem 0.25rem 0;
+    width: 100%;
+    box-sizing: border-box;
+}
+.odataImportRow[data-level="child"] {
+    padding-left: 2rem;
+}
+.odataImportLead {
+    flex: none;
+    min-width: 5rem;
+    justify-content: flex-end;
+}
+.odataImportRow[data-level="child"] .odataImportLead {
+    min-width: 2.75rem;
+}
+.odataImportBody {
+    min-width: 0;
+    padding-top: 0.5rem;
+}
+.odataImportRow[data-level="top"] .odataImportName.sapMText {
+    font-weight: bold;
+}
+.odataImportWrap.sapMText {
+    overflow-wrap: anywhere;
+}
+.odataImportStatus.sapMObjStatus {
+    flex: none;
+    margin: 0.5rem 0 0 0.5rem;
+}
+@media (max-width: 599px) {
+    .odataImportRow {
+        flex-wrap: wrap;
+    }
+    .odataImportLead {
+        min-width: 2.75rem;
+    }
+    .odataImportBody {
+        flex-basis: calc(100% - 3.5rem);
+    }
+    .odataImportStatus.sapMObjStatus {
+        margin: 0 0 0.25rem 3.25rem;
+    }
 }

@@ -120,6 +120,8 @@ export default class EntitySetDialog {
     private original!: ODataEntitySet;
     private source!: ODataEntitySet;
     private resolve?: (result: EntityDialogResult | undefined) => void;
+    /** The page was left while the dialog was on its way (`dismiss`). */
+    private dismissed = false;
     /** What `open` answers once the dialog has closed. */
     private result?: EntityDialogResult;
     /** The entity set as the dialog showed it when it opened, canonical:
@@ -138,6 +140,7 @@ export default class EntitySetDialog {
     ): Promise<EntityDialogResult | undefined> {
         this.view = view;
         this.context = context;
+        this.dismissed = false;
         this.original = entitySet;
         this.source = JSON.parse(JSON.stringify(entitySet)) as ODataEntitySet;
         this.readAllTicked = [];
@@ -164,6 +167,11 @@ export default class EntitySetDialog {
                 resolve?.(result);
             });
             view.addDependent(this.dialog);
+        }
+        if (this.dismissed) {
+            // The page was left during the first load of the fragment:
+            // nothing opens over whatever is shown now.
+            return undefined;
         }
         const source = this.source;
         const keys = (source.keys ?? []).map((key) => key.name);
@@ -233,6 +241,7 @@ export default class EntitySetDialog {
      *  gone already (a view that is destroyed takes its dialog along, and
      *  nobody is left to be answered). */
     public dismiss(): void {
+        this.dismissed = true;
         if (this.resolve && this.dialog && !this.dialog.isDestroyed() && this.dialog.isOpen()) {
             this.close(undefined);
         }

@@ -3172,9 +3172,9 @@ opaTest("an operation is removed after a question, and Save sends the definition
         Opa5.assert.strictEqual(
             messageOf(dialog),
             "Remove the operation \"Release item\" (ReleaseItem) from this service? Agents can no longer call it once the "
-            + "service is saved. This cannot be undone on this page after Save. Before Save, leave the page and "
-            + "discard the changes.",
-            "the question names the operation and promises no way back that the page does not have"
+            + "service is saved. An import from $metadata brings the operation back, switched off, without its title "
+            + "and description.",
+            "the question names the operation and the way back the page has: the import"
         );
     }, "the remove question");
     iPressInDialog(When, "Cancel");
@@ -3480,7 +3480,7 @@ opaTest("marking an enabled operation as only reading is said next to Save and a
             "the Save question names the operation and the agents without Allow writes"
         );
         Opa5.assert.strictEqual(
-            (dialog as unknown as { getTitle(): string }).getTitle(), "Stop recording these calls?", "under its own title"
+            (dialog as unknown as { getTitle(): string }).getTitle(), "Save these operations as only reading?", "under its own title"
         );
         Opa5.assert.strictEqual(backend.countRequests(PUT), 0, "nothing is sent before the answer");
         Opa5.assert.strictEqual(stripOf(shown, "odataPendingWrites").visible, true, "the strip stays until it is saved");
@@ -3835,5 +3835,70 @@ opaTest("the result of a test call goes with the first change of the form and wh
     iSee(Then, "no strip after a tick", function (page: UI5Element) {
         return !testStripOf(page).visible;
     }, function () { Opa5.assert.ok(true, "a change of the definition takes it away too"); });
+    Then.iStopTheApp();
+});
+
+opaTest("the operation dialog goes when another service is shown, keeps a title that is too long with its error, and Escape asks about a change", function (Given: Common, When: Common, Then: Common) {
+    let shown: UI5Element;
+    const title = () => viewOf(shown).byId("operationTitle") as Input;
+
+    iOpenPrepared(Given, When, JOBS, function () { /* as seeded */ });
+    iSeeTheService(Then, JOBS, "the service is loaded", function (page: UI5Element) { shown = page; });
+
+    // Another service by the address: the dialog is closed, and that
+    // service's form is as stored.
+    iOpenOperation(When, RELEASE_ROW);
+    iSeeADialog(Then, function () {
+        HashChanger.getInstance().setHash(`odata-services/${UNUSED}`);
+    }, "the operation dialog");
+    iSeeTheService(Then, UNUSED, "the other service is shown", function () {
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "the dialog did not stay open over it");
+        const model = viewOf(shown).getModel("svc") as unknown as { getProperty(path: string): unknown };
+        Opa5.assert.strictEqual(
+            JSON.stringify(model.getProperty("/data/definition")), JSON.stringify(stored(UNUSED).definition),
+            "the form of the other service is unchanged"
+        );
+    });
+
+    // A title of 121 characters: Apply is not taken, and the field says why.
+    When.waitFor({
+        id: PAGE, viewName: VIEW,
+        success: function () { HashChanger.getInstance().setHash(`odata-services/${JOBS}`); }
+    });
+    iSeeTheService(Then, JOBS, "the first service again");
+    iOpenOperation(When, RELEASE_ROW);
+    iSeeADialog(Then, function () {
+        title().setValue("x".repeat(121));
+    }, "the operation dialog, again");
+    When.waitFor({
+        controlType: "sap.m.Button", searchOpenDialogs: true, matchers: withId("operationApplyButton"),
+        actions: new Press(), errorMessage: "No Apply in the operation dialog"
+    });
+    iSeeADialog(Then, function () {
+        Opa5.assert.strictEqual(title().getValueState(), "Error", "the dialog stays, with the title marked");
+        Opa5.assert.ok(title().getValueStateText().length > 0, "and a text that says why");
+        Opa5.assert.strictEqual(formOperation(shown, 0).title, "Release item", "nothing was applied");
+    }, "the dialog after a refused Apply");
+
+    // Escape with a change asks before the dialog closes.
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        (dialog as unknown as { onsapescape(event: object): void }).onsapescape({
+            preventDefault: function () { /* nothing to prevent */ }, stopPropagation: function () { /* nor to stop */ },
+            originalEvent: {}
+        });
+    }, "the dialog before Escape");
+    Then.waitFor({
+        controlType: "sap.m.Dialog",
+        searchOpenDialogs: true,
+        check: function (dialogs: UI5Element[]) { return dialogs.length === 2; },
+        success: function (dialogs: UI5Element[]) {
+            Opa5.assert.strictEqual(messageOf(dialogs[1]), "Discard the changes to this operation?", "Escape asks first");
+        },
+        errorMessage: "No question after Escape"
+    });
+    iPressInDialog(When, "Discard");
+    iSeeNoDialog(Then, "closed after the answer", function () {
+        Opa5.assert.strictEqual(formOperation(shown, 0).title, "Release item", "and nothing of it is in the form");
+    });
     Then.iStopTheApp();
 });

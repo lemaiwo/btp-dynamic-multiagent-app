@@ -1,0 +1,186 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!-- Import from $metadata: reads the document of the service the form
+         describes and lists what it declares against what the form holds.
+         The destination, path, version and identity are the form's and are
+         shown, not edited. Nothing in here is stored: Apply writes into the
+         form of the page (model `imp`, `controller/odata/ImportDialog.ts`),
+         and the page's Save stores it. Whatever is added arrives switched
+         off. Every name, label and message comes from a remote document or
+         from SAP and is bound as text. -->
+    <Dialog
+        id="odataImportDialog"
+        title="{i18n>odataImportTitle}"
+        contentWidth="56rem"
+        contentHeight="80%"
+        resizable="true"
+        draggable="true"
+        verticalScrolling="true">
+        <content>
+            <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTopBottom odataImport">
+                <Text id="importIntro" text="{i18n>odataImportIntro}" class="odataHint sapUiTinyMarginBottom" />
+                <VBox id="importWhere" visible="{imp>/where/ok}">
+                    <HBox wrap="Wrap" alignItems="Baseline">
+                        <Label text="{i18n>odataDestination}" class="sapUiTinyMarginEnd" />
+                        <Text id="importDestination" text="{imp>/where/destination}" class="odataFieldName sapUiSmallMarginEnd" />
+                        <Label text="{i18n>odataVersion}" class="sapUiTinyMarginEnd" />
+                        <Text id="importVersion" text="{imp>/where/version}" />
+                    </HBox>
+                    <HBox wrap="Wrap" alignItems="Baseline">
+                        <Label text="{i18n>odataServicePath}" class="sapUiTinyMarginEnd" />
+                        <Text id="importPath" text="{imp>/where/path}" class="odataFieldName odataImportWrap" />
+                    </HBox>
+                    <Text id="importIdentity" text="{imp>/where/identity}" class="odataHint" />
+                </VBox>
+                <Button
+                    id="importReadButton"
+                    text="{= ${imp>/reading} ? ${i18n>odataImportReading} : ${i18n>odataReadMetadata} }"
+                    icon="sap-icon://download-from-cloud"
+                    enabled="{= !${imp>/reading} }"
+                    press=".onRead"
+                    class="sapUiTinyMarginTopBottom" />
+                <MessageStrip
+                    id="importError"
+                    text="{imp>/error}"
+                    type="Error"
+                    showIcon="true"
+                    visible="{= !!${imp>/error} }"
+                    class="sapUiTinyMarginBottom" />
+                <MessageStrip
+                    id="importSummary"
+                    text="{imp>/summary}"
+                    type="Information"
+                    showIcon="true"
+                    visible="{imp>/read}"
+                    class="sapUiTinyMarginBottom" />
+                <MessageStrip
+                    id="importTruncated"
+                    text="{imp>/truncated}"
+                    type="Warning"
+                    showIcon="true"
+                    visible="{= !!${imp>/truncated} }"
+                    class="sapUiTinyMarginBottom" />
+                <MessageStrip
+                    id="importRemovalsUnknown"
+                    text="{i18n>odataImportRemovalsUnknown}"
+                    type="Warning"
+                    showIcon="true"
+                    visible="{imp>/removalsUnknown}"
+                    class="sapUiTinyMarginBottom" />
+                <VBox id="importWarnings" items="{imp>/warnings}">
+                    <MessageStrip text="{imp>text}" type="Warning" showIcon="true" class="sapUiTinyMarginBottom" />
+                </VBox>
+                <!-- What the parser left out: the count, and the list on demand. -->
+                <Panel
+                    id="importSkipped"
+                    headerText="{imp>/skippedTitle}"
+                    expandable="true"
+                    expanded="false"
+                    visible="{= !!${imp>/skippedTitle} }"
+                    class="sapUiTinyMarginBottom">
+                    <VBox id="importSkippedList" items="{imp>/skipped}">
+                        <Text text="{imp>text}" class="odataImportWrap" />
+                    </VBox>
+                    <Text text="{imp>/skippedMore}" visible="{= !!${imp>/skippedMore} }" class="odataHint" />
+                </Panel>
+                <OverflowToolbar id="importToolbar" visible="{imp>/read}" design="Transparent">
+                    <SearchField
+                        id="importSearch"
+                        width="16rem"
+                        value="{imp>/query}"
+                        placeholder="{i18n>odataImportSearch}"
+                        tooltip="{i18n>odataImportSearch}"
+                        liveChange=".onSearch"
+                        search=".onSearch">
+                        <layoutData>
+                            <OverflowToolbarLayoutData minWidth="8rem" shrinkable="true" priority="NeverOverflow" />
+                        </layoutData>
+                    </SearchField>
+                    <Select
+                        id="importFilter"
+                        selectedKey="{imp>/filter}"
+                        tooltip="{i18n>odataImportFilter}"
+                        ariaLabelledBy="importFilterLabel"
+                        change=".onFilter">
+                        <core:Item key="all" text="{i18n>odataImportFilterAll}" />
+                        <core:Item key="new" text="{i18n>odataImportFilterNew}" />
+                        <core:Item key="changed" text="{i18n>odataImportFilterChanged}" />
+                        <core:Item key="in_service" text="{i18n>odataImportFilterInService}" />
+                        <core:Item key="removed" text="{i18n>odataImportFilterRemoved}" />
+                        <layoutData>
+                            <OverflowToolbarLayoutData priority="NeverOverflow" />
+                        </layoutData>
+                    </Select>
+                    <ToolbarSpacer />
+                    <Button
+                        id="importSelectRemoved"
+                        text="{ path: 'imp>/removable', formatter: '.formatRemoveAll' }"
+                        visible="{= ${imp>/removable} > 0 }"
+                        press=".onSelectRemoved" />
+                </OverflowToolbar>
+                <core:InvisibleText id="importFilterLabel" text="{i18n>odataImportFilter}" />
+                <List
+                    id="importList"
+                    items="{imp>/rows}"
+                    visible="{imp>/read}"
+                    growing="true"
+                    growingThreshold="50"
+                    noDataText="{imp>/noRows}"
+                    ariaLabelledBy="importSummary">
+                    <CustomListItem>
+                        <HBox alignItems="Start" class="odataImportRow">
+                            <customData>
+                                <core:CustomData key="level" value="{= ${imp>parent} ? 'child' : 'top' }" writeToDom="true" />
+                            </customData>
+                            <HBox class="odataImportLead" alignItems="Center">
+                                <Button
+                                    type="Transparent"
+                                    icon="{ path: 'imp>expanded', formatter: '.formatToggleIcon' }"
+                                    tooltip="{ parts: ['imp>expanded', 'imp>name', 'imp>children'], formatter: '.formatToggleTooltip' }"
+                                    visible="{= ${imp>children} > 0 }"
+                                    press=".onToggle" />
+                                <CheckBox
+                                    selected="{imp>selected}"
+                                    visible="{imp>selectable}"
+                                    tooltip="{ path: 'imp>', formatter: '.formatTick' }"
+                                    select=".onSelect" />
+                            </HBox>
+                            <VBox class="odataImportBody">
+                                <layoutData>
+                                    <FlexItemData growFactor="1" minWidth="0" />
+                                </layoutData>
+                                <Text text="{ path: 'imp>', formatter: '.formatName' }" class="odataFieldName odataImportName odataImportWrap" />
+                                <Text text="{ path: 'imp>', formatter: '.formatHint' }" class="odataHint odataImportWrap" />
+                                <ObjectStatus
+                                    text="{ path: 'imp>', formatter: '.formatNote' }"
+                                    visible="{ path: 'imp>', formatter: '.formatHasNote' }"
+                                    state="{ path: 'imp>status', formatter: '.formatNoteState' }"
+                                    icon="sap-icon://alert"
+                                    class="odataRowMessage" />
+                            </VBox>
+                            <ObjectStatus
+                                text="{ path: 'imp>', formatter: '.formatStatus' }"
+                                state="{ path: 'imp>status', formatter: '.formatStatusState' }"
+                                inverted="true"
+                                class="odataImportStatus" />
+                        </HBox>
+                    </CustomListItem>
+                </List>
+                <VBox id="importBlocked" items="{imp>/blocked}">
+                    <MessageStrip text="{imp>text}" type="Error" showIcon="true" class="sapUiTinyMarginTop" />
+                </VBox>
+                <Text id="importFooter" text="{i18n>odataImportFooter}" class="odataHint sapUiSmallMarginTop" />
+            </VBox>
+        </content>
+        <buttons>
+            <Button
+                id="importApplyButton"
+                text="{imp>/selection}"
+                type="Emphasized"
+                enabled="{imp>/canApply}"
+                press=".onApply" />
+            <Button id="importCancelButton" text="{i18n>cancel}" press=".onCancel" />
+        </buttons>
+    </Dialog>
+</core:FragmentDefinition>

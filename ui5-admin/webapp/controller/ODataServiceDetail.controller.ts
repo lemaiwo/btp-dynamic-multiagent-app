@@ -10,6 +10,7 @@ import { InvisibleMessageMode, ValueState } from "sap/ui/core/library";
 import ODataController from "./odata/ODataController";
 import EntitySetDialog from "./odata/EntitySetDialog";
 import OperationDialog from "./odata/OperationDialog";
+import ImportDialog from "./odata/ImportDialog";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
@@ -37,8 +38,8 @@ import type ListBinding from "sap/ui/model/ListBinding";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
 import type {
-    ODataDefinition, ODataEntityOp, ODataEntitySet, ODataOperation, ODataService, ODataServiceInput,
-    ODataServiceUpdate, ODataTestResult, ODataUsedBy
+    ODataDefinition, ODataEntityOp, ODataEntitySet, ODataMetadataRequest, ODataOperation, ODataService,
+    ODataServiceInput, ODataServiceUpdate, ODataTestResult, ODataUsedBy
 } from "../service/types";
 
 const ROUTE = "odataServiceDetail";
@@ -153,6 +154,10 @@ export default class ODataServiceDetail extends ODataController {
      *  it is open or on its way. */
     private operationDialog?: OperationDialog;
     private operationOpen = false;
+
+    /** The import dialog, and whether it is open or on its way. */
+    private importDialog?: ImportDialog;
+    private importOpen = false;
 
     /** Watches the height of what the slot of the pending-writes strip holds. */
     private slotObserver?: ResizeObserver;
@@ -351,6 +356,10 @@ export default class ODataServiceDetail extends ODataController {
         if (this.operationOpen) {
             // Closed as Cancel does; nothing of it is written into the form.
             this.operationDialog?.dismiss();
+        }
+        if (this.importOpen) {
+            // Likewise: an import that was not applied changes nothing.
+            this.importDialog?.dismiss();
         }
         if (!this.entityOpen) {
             return;
@@ -1128,7 +1137,9 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty("/pendingWrites", [
             count ? this.text("odataPendingWrites", [this.writeList(pending, STRIP_CAP)]) : "",
             reads.length ? [
-                this.text("odataPendingReads", [this.operationList(reads, STRIP_CAP)]),
+                this.text(reads.length === 1 ? "odataPendingReads" : "odataPendingReadsMany", [
+                    this.operationList(reads, STRIP_CAP)
+                ]),
                 this.readAgents(model.getProperty("/used_by") as ODataUsedBy[], STRIP_CAP)
             ].join(" ") : ""
         ].filter(Boolean).join(" "));
@@ -1373,8 +1384,8 @@ export default class ODataServiceDetail extends ODataController {
         // being loaded after a first press): `openEntitySet` would not open
         // a second one, and the entity set pushed here would stay behind
         // without a dialog to cancel it in.
-        if (this.entityOpen || this.operationOpen || this.working || model.getProperty("/asking") === true
-            || entitySets.length >= odataCatalog.MAX_ENTITY_SETS) {
+        if (this.entityOpen || this.operationOpen || this.importOpen || this.working
+            || model.getProperty("/asking") === true || entitySets.length >= odataCatalog.MAX_ENTITY_SETS) {
             return;
         }
         entitySets.push(odataCatalog.emptyEntitySet(
@@ -1426,7 +1437,7 @@ export default class ODataServiceDetail extends ODataController {
     private async openEntitySet(index: number, added = false): Promise<void> {
         const model = this.svc();
         const entitySet = this.definition().entity_sets[index];
-        if (!entitySet || this.entityOpen || this.operationOpen || this.working
+        if (!entitySet || this.entityOpen || this.operationOpen || this.importOpen || this.working
             || model.getProperty("/asking") === true) {
             return;
         }
@@ -1518,6 +1529,97 @@ export default class ODataServiceDetail extends ODataController {
             (candidate.getBindingContext("svc")?.getObject() as ODataEntityRow | undefined)?.index === index
         ))[0];
         ((item ?? this.byId("odataAddEntitySetButton")) as Control | undefined)?.focus();
+    }
+
+    // --- import from $metadata ----------------------------------------------
+
+    /**
+     * Opens the import dialog. It reads the `$metadata` document of the
+     * service as the FORM describes it (destination, service path, version
+     * and identity, read when "Read metadata" is pressed) and compares it
+     * with the definition of the form.
+     *
+     * Nothing is stored: on Apply the merged definition and the time of the
+     * read are written into the form, and Save stores them. What an import
+     * adds arrives switched off (`odataCatalog.mergeImport`), so it opens
+     * nothing by itself; whatever the admin enables afterwards goes through
+     * the pending strip and the Save question like every other tick.
+     */
+    public onImportMetadata(): void {
+        const model = this.svc();
+        if (this.importOpen || this.entityOpen || this.operationOpen || this.working
+            || model.getProperty("/asking") === true || model.getProperty("/loaded") !== true) {
+            return;
+        }
+        this.openImport().catch((error: unknown) => ErrorHandler.handle(error));
+    }
+
+    /** Where the form says the service is, for the read of the import; or
+     *  nothing while destination or service path could not be sent. */
+    private metadataRequest(): ODataMetadataRequest | undefined {
+        // As Save does: what the destination field shows is what is read.
+        this.storeShownDestination(this.byId("odataDestination") as Input);
+        const data = this.data();
+        const problems = odataCatalog.validate(data);
+        if (problems.destination || problems.service_path) {
+            return undefined;
+        }
+        const request: ODataMetadataRequest = {
+            destination: data.destination, service_path: data.service_path,
+            odata_version: data.odata_version === "v4" ? "v4" : "v2", user_context: data.user_context === true
+        };
+        if (this.svc().getProperty("/exists") === true && this.serviceName) {
+            // The server compares with the stored service: it knows what a
+            // long document no longer declares.
+            request.service = this.serviceName;
+        }
+        return request;
+    }
+
+    private async openImport(): Promise<void> {
+        if (!this.importDialog) {
+            this.importDialog = new ImportDialog();
+        }
+        const definition = this.definition();
+        this.importOpen = true;
+        let result;
+        try {
+            result = await this.importDialog.open(this.getView()!, {
+                definition,
+                request: () => this.metadataRequest(),
+                read: (body) => this.getAdminService().readODataMetadata(body),
+                handled: (error) => {
+                    const kind = ErrorHandler.classify(error);
+                    if (kind === "session" || kind === "forbidden") {
+                        ErrorHandler.handle(error);
+                        return true;
+                    }
+                    return false;
+                },
+                text: (key, args) => this.text(key, args)
+            });
+        } finally {
+            this.importOpen = false;
+        }
+        if (!result) {
+            return;
+        }
+        const model = this.svc();
+        if (model.getProperty("/loaded") !== true || this.definition() !== definition) {
+            // The form was loaded anew while the dialog was open: what was
+            // merged is about another definition.
+            InvisibleMessage.getInstance().announce(this.text("odataImportRefreshed"), InvisibleMessageMode.Polite);
+            return;
+        }
+        model.setProperty("/data/definition", result.definition);
+        model.setProperty("/data/metadata_fetched_at", result.metadata_fetched_at);
+        model.setProperty("/saveError", "");
+        // What a refused save said was about another list; no row is hidden.
+        this.clearEntitySearch();
+        this.filterEntitySets("");
+        this.showEntitySets(true);
+        MessageToast.show(this.text("odataImportApplied"));
+        (this.byId("odataEntityTable") as Control | undefined)?.focus();
     }
 
     // --- operations ---------------------------------------------------------
@@ -1620,7 +1722,8 @@ export default class ODataServiceDetail extends ODataController {
     public onOpenOperation(event: Event): void {
         const model = this.svc();
         const { row, operation } = this.operationAt(event.getSource() as Control);
-        if (!row || this.operationOpen || this.entityOpen || this.working || model.getProperty("/asking") === true) {
+        if (!row || this.operationOpen || this.entityOpen || this.importOpen || this.working
+            || model.getProperty("/asking") === true) {
             return;
         }
         if (!operation) {
@@ -1970,6 +2073,9 @@ export default class ODataServiceDetail extends ODataController {
         if (this.working || model.getProperty("/asking") === true || model.getProperty("/loaded") !== true) {
             return;
         }
+        // A tap on Save that does not move the focus (a touch tablet)
+        // leaves the field without its `change`: what it shows is stored.
+        this.storeShownDestination(this.byId("odataDestination") as Input);
         model.setProperty("/saveError", "");
         // Both checks run, so that everything wrong is marked at once.
         const general = this.showProblems(odataCatalog.validate(this.data()));
@@ -2426,6 +2532,8 @@ export default class ODataServiceDetail extends ODataController {
         if (this.working || !this.serviceName) {
             return;
         }
+        // As Save does: a tap on Create that does not move the focus.
+        this.storeShownDestination(this.byId("odataDuplicateDestination") as Input);
         const state = model.getProperty("/duplicate") as DuplicateState;
         const body = { name: state.name, destination: state.destination, user_context: state.user_context };
         const problems = odataCatalog.validateDuplicate(body);

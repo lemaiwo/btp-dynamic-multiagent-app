@@ -51,6 +51,8 @@ export default class OperationDialog {
     private readonly model = new JSONModel();
     private context!: OperationDialogContext;
     private resolve?: (result: OperationDialogResult | undefined) => void;
+    /** The page was left while the dialog was on its way (`dismiss`). */
+    private dismissed = false;
     /** What `open` answers once the dialog has closed. */
     private result?: OperationDialogResult;
     /** The two texts as the dialog showed them when it opened. */
@@ -61,6 +63,7 @@ export default class OperationDialog {
     ): Promise<OperationDialogResult | undefined> {
         this.view = view;
         this.context = context;
+        this.dismissed = false;
         if (!this.dialog) {
             this.dialog = await Fragment.load({
                 id: view.getId(), name: "com.agent.admin.fragment.ODataOperationDialog", controller: this
@@ -81,6 +84,11 @@ export default class OperationDialog {
             });
             view.addDependent(this.dialog);
         }
+        if (this.dismissed) {
+            // The page was left during the first load of the fragment:
+            // nothing opens over whatever is shown now.
+            return undefined;
+        }
         const text = context.text;
         const setLabel = (name: string): string => {
             const set = (context.definition.entity_sets ?? []).filter((e: ODataEntitySet) => e.name === name)[0];
@@ -94,6 +102,7 @@ export default class OperationDialog {
             title: operation.title ?? "", description: operation.description ?? "", errors: {},
             name: operation.name,
             method: operation.http_method,
+            post: operation.http_method === "POST",
             kind: text(KIND_TEXT[operation.kind] ?? "odataReturnsUnknown"),
             boundTo: bound ? text("odataBoundToSet", [setLabel(bound), bound]) : text("odataUnbound"),
             returns: returns && returns.entity_set
@@ -131,6 +140,7 @@ export default class OperationDialog {
     /** Closes the dialog as Cancel does, without a question: the page it
      *  belongs to is left. Does nothing when it is not open. */
     public dismiss(): void {
+        this.dismissed = true;
         if (this.resolve && this.dialog && !this.dialog.isDestroyed() && this.dialog.isOpen()) {
             this.close(undefined);
         }

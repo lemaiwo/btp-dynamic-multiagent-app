@@ -49,7 +49,11 @@
                 <Label text="{i18n>odataEntityName}" />
                 <Text id="operationName" text="{op>/name}" class="odataFieldName" />
                 <Label text="{i18n>odataOperationSentWith}" />
-                <Text id="operationMethod" text="{op>/method}" class="odataFieldName" />
+                <VBox>
+                    <Text id="operationMethod" text="{op>/method}" class="odataFieldName" />
+                    <!-- Why "Changes data" cannot be unticked for it. -->
+                    <Text id="operationPostNote" text="{i18n>odataOperationPostNote}" visible="{op>/post}" class="odataHint" />
+                </VBox>
                 <Label text="{i18n>odataOperationKind}" />
                 <Text id="operationKind" text="{op>/kind}" />
                 <Label text="{i18n>odataColBoundTo}" />

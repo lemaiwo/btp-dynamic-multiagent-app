@@ -46,8 +46,19 @@
                     tooltip="{i18n>odataTagSavedTooltip}"
                     visible="{= ${svc>/exists} &amp;&amp; !${svc>/original/enabled} }" />
                 <ToolbarSpacer />
-                <!-- Later: "Import from $metadata" (odataImportMetadataButton)
-                     goes here, before "Test call". -->
+                <!-- Reads the service's $metadata as the form describes it
+                     and offers what it declares; nothing is stored by it. -->
+                <Button
+                    id="odataImportMetadataButton"
+                    text="{i18n>odataImportTitle}"
+                    icon="sap-icon://download-from-cloud"
+                    tooltip="{i18n>odataImportTooltip}"
+                    enabled="{= ${svc>/loaded} &amp;&amp; !${svc>/busy} &amp;&amp; !${svc>/asking} }"
+                    press=".onImportMetadata">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
                 <!-- One read of one row through the STORED service: does its
                      destination, identity and path work? -->
                 <Button
