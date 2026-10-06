@@ -15,10 +15,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-(ROOT / "tests" / "_test_ide_seed.db").unlink(missing_ok=True)  # fresh DB per run
-os.environ.setdefault(
-    "DATABASE_URL", f"sqlite+aiosqlite:///{ROOT / 'tests' / '_test_ide_seed.db'}"
-)
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 
@@ -47,10 +46,9 @@ def _write(tmp_path: Path, skills=(), agents=()) -> Path:
     return p
 
 
-# Every name this module seeds. The DB may be shared with other test modules
-# in the same pytest process (DATABASE_URL is set by whichever module imports
-# agents.db first) and may keep rows from an earlier run, so each test starts
-# by removing these names instead of assuming an empty DB.
+# Every name this module seeds. The DB is shared with the other test modules
+# in the same pytest process (tests/conftest.py, one database per session),
+# so each test starts by removing these names instead of assuming an empty DB.
 _NAMES = ("ide-seed-sk", "ide-seed-ag", "ide-edit-sk", "ide-valid-ag", "ide-off-ag")
 
 

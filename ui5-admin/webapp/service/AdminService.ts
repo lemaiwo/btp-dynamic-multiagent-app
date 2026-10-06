@@ -1,6 +1,9 @@
 import type {
-    Agent, AgentInput, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
-    JobRun, JobRunDetail, ModelInfo, OrchestratorInfo, ReloadResult, Skill, SkillInput, WhoAmI,
+    ImportResult,
+    Agent, AgentInput, AgentSaved, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
+    JobRun, JobRunDetail, ModelInfo, ODataDestinationList, ODataDuplicateRequest, ODataMetadataPreview,
+    ODataMetadataRequest, ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
+    OrchestratorInfo, ReloadOutcome, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
 
@@ -14,13 +17,17 @@ export class AdminError extends Error {
     public readonly status: number;
     public readonly detail: string;
     public readonly fieldErrors: Record<string, string>;
+    /** The stable code of a refusal, from the `X-OData-Error` header of the
+     *  OData routes (`busy`, `user_token_required`, ...); "" without one. */
+    public readonly code: string;
 
-    public constructor(status: number, detail: string, fieldErrors: Record<string, string> = {}) {
+    public constructor(status: number, detail: string, fieldErrors: Record<string, string> = {}, code = "") {
         super(detail || `Request failed with status ${status}`);
         this.name = "AdminError";
         this.status = status;
         this.detail = detail;
         this.fieldErrors = fieldErrors;
+        this.code = code;
     }
 }
 
@@ -37,7 +44,8 @@ export default class AdminService {
 
     private static readonly PREFIX = "backend/";
 
-    private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    /** The answer of a call that worked; a non-2xx one rejects. */
+    private async send(path: string, init?: RequestInit): Promise<Response> {
         const response = await fetch(AdminService.PREFIX + path, {
             ...init,
             headers: {
@@ -50,6 +58,11 @@ export default class AdminService {
         if (!response.ok) {
             throw await AdminService.toError(response);
         }
+        return response;
+    }
+
+    private async request<T>(path: string, init?: RequestInit): Promise<T> {
+        const response = await this.send(path, init);
         if (response.status === 204) {
             return undefined as T;
         }
@@ -78,7 +91,17 @@ export default class AdminService {
         } catch {
             detail = response.statusText;
         }
-        return new AdminError(response.status, detail, fieldErrors);
+        return new AdminError(response.status, detail, fieldErrors, response.headers?.get("X-OData-Error") ?? "");
+    }
+
+    /**
+     * A DELETE whose 204 says in two headers whether the running agents were
+     * reloaded. A header that is missing (an older server) reads as false.
+     */
+    private async remove(path: string): Promise<ReloadOutcome> {
+        const response = await this.send(path, { method: "DELETE" });
+        const flag = (name: string) => (response.headers?.get(name) ?? "").trim().toLowerCase() === "true";
+        return { reloaded: flag("X-OData-Reloaded"), reload_failed: flag("X-OData-Reload-Failed") };
     }
 
     private static json(body: unknown): RequestInit {
@@ -95,14 +118,15 @@ export default class AdminService {
     }
 
     /** POSTs when `id` is omitted, PUTs when it is supplied. */
-    public upsertAgent(agent: AgentInput, id?: number): Promise<Agent> {
+    public upsertAgent(agent: AgentInput, id?: number): Promise<AgentSaved> {
         return id === undefined
-            ? this.request<Agent>("agents", { method: "POST", ...AdminService.json(agent) })
-            : this.request<Agent>(`agents/${id}`, { method: "PUT", ...AdminService.json(agent) });
+            ? this.request<AgentSaved>("agents", { method: "POST", ...AdminService.json(agent) })
+            : this.request<AgentSaved>(`agents/${id}`, { method: "PUT", ...AdminService.json(agent) });
     }
 
-    public deleteAgent(id: number): Promise<void> {
-        return this.request<void>(`agents/${id}`, { method: "DELETE" });
+    /** Resolves with what the 204 says about the reload of the running agents. */
+    public deleteAgent(id: number): Promise<ReloadOutcome> {
+        return this.remove(`agents/${id}`);
     }
 
     public agentCredentials(id: number, principal = ""): Promise<CredentialStatus[]> {
@@ -195,8 +219,8 @@ export default class AdminService {
         return this.request<ImportPayload>("export");
     }
 
-    public importConfig(payload: ImportPayload): Promise<unknown> {
-        return this.request<unknown>("import", { method: "POST", ...AdminService.json(payload) });
+    public importConfig(payload: ImportPayload): Promise<ImportResult> {
+        return this.request<ImportResult>("import", { method: "POST", ...AdminService.json(payload) });
     }
 
     public whoami(): Promise<WhoAmI> {
@@ -249,5 +273,71 @@ export default class AdminService {
      * disabled ones included and flagged. */
     public getAgentWhereUsed(id: number): Promise<AgentWhereUsed> {
         return this.request<AgentWhereUsed>(`agents/${id}/where-used`);
+    }
+
+    // --- odata ---
+    // The catalogue of OData services (`/admin/api/odata/...`). A service is
+    // addressed by its name, the slug agents use, not by an id.
+    private static odataServicePath(name: string): string {
+        return `odata/services/${encodeURIComponent(name)}`;
+    }
+
+    /** The list carries no definitions; `getODataService` does. */
+    public listODataServices(): Promise<ODataServiceSummary[]> {
+        return this.request<ODataServiceSummary[]>("odata/services");
+    }
+
+    public getODataService(name: string): Promise<ODataService> {
+        return this.request<ODataService>(AdminService.odataServicePath(name));
+    }
+
+    public createODataService(input: ODataServiceInput): Promise<ODataService> {
+        return this.request<ODataService>("odata/services", { method: "POST", ...AdminService.json(input) });
+    }
+
+    /** The name is immutable: `input.name` must be `name`, or the server
+     * answers 422. With `expected_updated_at`, a service that was changed
+     * since that moment is not overwritten: 409. */
+    public updateODataService(name: string, input: ODataServiceUpdate): Promise<ODataService> {
+        return this.request<ODataService>(AdminService.odataServicePath(name), {
+            method: "PUT", ...AdminService.json(input)
+        });
+    }
+
+    /** Rejects with a 409 while an agent, enabled or not, uses the service.
+     *  Resolves with what the 204 says about the reload of the running agents. */
+    public deleteODataService(name: string): Promise<ReloadOutcome> {
+        return this.remove(AdminService.odataServicePath(name));
+    }
+
+    /** A copy with the same definition under another name, e.g. the same
+     * service through a technical-user destination for jobs. */
+    public duplicateODataService(name: string, body: ODataDuplicateRequest): Promise<ODataService> {
+        return this.request<ODataService>(`${AdminService.odataServicePath(name)}/duplicate`, {
+            method: "POST", ...AdminService.json(body)
+        });
+    }
+
+    /**
+     * The destinations a service can name, read from the destination
+     * service on every call (the server caches nothing). Rejects when there
+     * is no list at all (503, 502, 504): the name can then only be typed.
+     * The route takes no parameter.
+     */
+    public listODataDestinations(): Promise<ODataDestinationList> {
+        return this.request<ODataDestinationList>("odata/destinations");
+    }
+
+    /** Reads a service's $metadata through its destination. Stores nothing. */
+    public readODataMetadata(body: ODataMetadataRequest): Promise<ODataMetadataPreview> {
+        return this.request<ODataMetadataPreview>("odata/metadata", { method: "POST", ...AdminService.json(body) });
+    }
+
+    /** One read of one row through the stored service; the answer says
+     * whether it worked and as whom, never what was read. */
+    public testODataService(name: string): Promise<ODataTestResult> {
+        return this.request<ODataTestResult>(`${AdminService.odataServicePath(name)}/test`, {
+            method: "POST", ...AdminService.json({})
+        });
     }
 }

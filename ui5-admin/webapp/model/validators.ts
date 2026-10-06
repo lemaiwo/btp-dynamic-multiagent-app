@@ -1,6 +1,13 @@
 import type { AuthMode, DeepConfig, McpServer, OAuthClient, WorkflowStep } from "../service/types";
 import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
+import odataEntry from "./odataEntry";
+
+// --- odata ---
+/** `SERVICE_NAME_RE` in agents/odata/models.py: the slug of a catalogue service. */
+const ODATA_SERVICE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$/;
+/** `MAX_ODATA_ENTRY_SERVICES` in agents/db.py. */
+const MAX_ODATA_ENTRY_SERVICES = 50;
 
 // --- destinations ---
 /** What a BTP destination may be called. Mirrors `_DESTINATION_NAME_RE` in
@@ -102,6 +109,46 @@ export default {
         return "";
     },
 
+    // --- odata ---
+    /**
+     * The rules of a `builtin:odata` entry. Mirrors `_validate_odata_entry`
+     * in `agents/admin.py`: destination mode, at least one service, only
+     * `services` and `allow_write`, and `allow_write` a real boolean. The
+     * messages name the field, never a value.
+     */
+    validateODataEntry(oauth: OAuthClient | undefined, authMode: AuthMode): string {
+        if (authMode !== "destination") {
+            return "OData services requires auth mode 'destination': every catalogue "
+                + "service is reached through the BTP destination it names.";
+        }
+        const cfg = (oauth || {}) as Record<string, unknown>;
+        // `has_client_secret: false` is the server's own echo on every stored
+        // block (`_redact_servers`); it accepts it back, as this does.
+        const stray = Object.keys(cfg).filter((k) => k !== "services" && k !== "allow_write"
+            && !(k === "has_client_secret" && cfg[k] === false));
+        if (stray.length) {
+            return "An OData services entry holds only the services and 'Allow writes': "
+                + "the destination and the identity belong to each catalogue service.";
+        }
+        if (cfg.allow_write !== undefined && typeof cfg.allow_write !== "boolean") {
+            return "'Allow writes' must be on or off; any other value does not open writes.";
+        }
+        const services = cfg.services;
+        if (!Array.isArray(services) || services.length === 0) {
+            return "Select at least one OData service.";
+        }
+        if (services.length > MAX_ODATA_ENTRY_SERVICES) {
+            return `At most ${MAX_ODATA_ENTRY_SERVICES} OData services per agent.`;
+        }
+        if (services.some((name) => typeof name !== "string" || !ODATA_SERVICE_NAME_RE.test(name))) {
+            return "An OData service name is not valid (lower-case letters, digits and '-').";
+        }
+        if (new Set(services).size !== services.length) {
+            return "An OData service is listed twice.";
+        }
+        return "";
+    },
+
     /** True when this url may carry a public config block on `none`. */
     carriesPublicConfig(url: string): boolean {
         return (BUILTIN_URLS as readonly string[])
@@ -131,6 +178,11 @@ export default {
 
     /** Returns an error message, or an empty string when the config is valid. */
     validateOAuth(oauth: OAuthClient | undefined, authMode: AuthMode, url = ""): string {
+        if (odataEntry.isODataUrl(url)) {
+            // Its own rules and none of the destination ones below: this
+            // entry names no destination.
+            return this.validateODataEntry(oauth, authMode);
+        }
         if (this.isTeams(url)) {
             const teamsError = this.validateTeams(oauth, authMode);
             if (teamsError) {
@@ -283,7 +335,9 @@ export default {
             }
             const key = (server.url || "").trim().replace(/\/+$/, "").toLowerCase();
             if (seen.has(key)) {
-                errors[index] = "This is a duplicate URL; each server may appear once.";
+                errors[index] = key === odataEntry.ODATA_URL
+                    ? "An agent has one OData services entry; add the services to the existing one."
+                    : "This is a duplicate URL; each server may appear once.";
                 return;
             }
             seen.add(key);

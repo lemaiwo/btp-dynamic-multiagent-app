@@ -136,6 +136,20 @@ export type OAuthClient =
            * `true`. See agents/destination_auth.py.
            */
           user_context?: boolean;
+          // --- odata ---
+          /**
+           * `builtin:odata` only. The catalogue services (their slugs, 1-50
+           * distinct) this agent may call. The entry carries no `destination`
+           * and no `user_context`: both belong to each catalogue service.
+           */
+          services?: string[];
+          /**
+           * `builtin:odata` only. Opens the write operations the catalogue
+           * enables for the attached services, and only as the boolean `true`.
+           * The dialog always sends a real boolean; the server stores the key
+           * only when it is `true`.
+           */
+          allow_write?: boolean;
       };
 
 export interface McpServer {
@@ -170,6 +184,23 @@ export interface AgentInput {
     deep?: DeepConfig;
 }
 
+/**
+ * Whether a change reached the running agents (`reload_after_catalogue_change`
+ * and `_reload_for_odata_entry` on the server). `reloaded`: they were rebuilt,
+ * the change is live. `reload_failed`: the change IS stored, the rebuild
+ * failed, and the running agents keep the previous configuration until a
+ * reload works. Never both; both false (or absent, on an older server and on
+ * the routes that report none): no rebuild was due.
+ *
+ * JSON keys on `PUT odata/services/{name}`, `POST agents`, `PUT agents/{id}`
+ * and `POST import`; the headers `X-OData-Reloaded` / `X-OData-Reload-Failed`
+ * on the 204 of `DELETE odata/services/{name}` and `DELETE agents/{id}`.
+ */
+export interface ReloadOutcome {
+    reloaded?: boolean;
+    reload_failed?: boolean;
+}
+
 /** What GET /admin/api/agents returns. Servers are redacted. */
 export interface Agent extends AgentInput {
     id: number;
@@ -180,6 +211,9 @@ export interface Agent extends AgentInput {
     created_at: string | null;
     updated_at: string | null;
 }
+
+/** What POST /admin/api/agents and PUT /admin/api/agents/{id} answer. */
+export type AgentSaved = Agent & ReloadOutcome;
 
 export interface SkillInput {
     name: string;
@@ -338,8 +372,40 @@ export interface ImportPayload {
     /** Optional: an export made before workflows existed carries none, and
      * `replace` only removes workflows when the bundle has this section. */
     workflows?: WorkflowInput[];
+    /** Optional: an export made before the OData catalogue existed carries
+     * none. Imported before the agents, which refer to services by name. */
+    odata_services?: ODataServiceInput[];
     /** If true, delete agents/skills/workflows absent from the import. */
     replace: boolean;
+}
+
+/** A catalogue service in use whose destination or identity an import
+ * changed, and the agents that now act differently in SAP. */
+export interface ODataIdentityChangeReport {
+    service: string;
+    changed: ("destination" | "user_context")[];
+    agents: string[];
+}
+
+/** POST /admin/api/import. The OData keys are optional: a backend from
+ * before the catalogue does not send them. */
+export interface ImportResult extends ReloadOutcome {
+    status: string;
+    imported?: number;
+    imported_skills?: number;
+    imported_workflows?: number;
+    /** Created plus updated. */
+    imported_odata_services?: number;
+    created_odata_services?: number;
+    updated_odata_services?: number;
+    removed?: number;
+    removed_skills?: number;
+    removed_workflows?: number;
+    removed_odata_services?: number;
+    removed_odata_service_names?: string[];
+    odata_identity_changes?: ODataIdentityChangeReport[];
+    /** One line of text each, among them every identity change. */
+    warnings?: string[];
 }
 
 /** POST /admin/api/reload. `agents` is the total; `enabled` the subset the
@@ -600,3 +666,380 @@ export const DEEP_DEFAULTS: Readonly<DeepConfig> = Object.freeze({
     subagent_max_depth: 1,
     subagent_instructions: ""
 });
+
+// --- odata ---
+// Mirrors of `agents/odata/models.py` (the definition a catalogue service
+// stores) and of the answers of `/admin/api/odata/...`.
+
+export type ODataVersion = "v2" | "v4";
+
+/** What an entity set can offer an agent. `create`, `update` and `delete`
+ * are the write operations an agent gets only with `allow_write`. */
+export type ODataEntityOp = "list" | "get" | "create" | "update" | "delete";
+
+export interface ODataKey {
+    name: string;
+    /** An EDM type name; the server's default is `Edm.String`. */
+    type: string;
+}
+
+/** What one coded value of a field means, e.g. `05` = released. */
+export interface ODataValueMeaning {
+    value: string;
+    meaning: string;
+}
+
+export interface ODataField {
+    name: string;
+    type: string;
+    label: string;
+    /** Returned to the agent and allowed in `$select`. */
+    selectable: boolean;
+    /** Allowed in `$filter` and `$orderby`. */
+    filterable: boolean;
+    /** Accepted in a create or update body. */
+    writable: boolean;
+    hint: string;
+    values: ODataValueMeaning[];
+    personal_data: boolean;
+}
+
+export interface ODataNavigation {
+    name: string;
+    /** The name of the entity set the navigation leads to. */
+    target: string;
+    collection: boolean;
+    description: string;
+}
+
+export interface ODataExampleQuery {
+    description: string;
+    filter: string;
+    select: string[];
+    orderby: string;
+    top: number | null;
+}
+
+export interface ODataEntitySet {
+    name: string;
+    title: string;
+    /** The path segment under the service path; blank means `name`. */
+    path: string;
+    entity_type: string;
+    description: string;
+    keys: ODataKey[];
+    operations: ODataEntityOp[];
+    fields: ODataField[];
+    navigations: ODataNavigation[];
+    examples: ODataExampleQuery[];
+}
+
+export interface ODataParam {
+    name: string;
+    type: string;
+    required: boolean;
+}
+
+/** A V2 function import, or a V4 action (POST) or function (GET). */
+export interface ODataOperation {
+    name: string;
+    /** V4 only: the namespace-qualified name. Blank on V2. */
+    qualified_name: string;
+    title: string;
+    kind: "function_import" | "action" | "function";
+    http_method: "GET" | "POST";
+    /** The name of the entity set the operation is bound to, if any. */
+    bound_to: string | null;
+    parameters: ODataParam[];
+    description: string;
+    enabled: boolean;
+    /** On, the operation is a write: an agent needs `allow_write` for it. */
+    changes_data: boolean;
+    /** The entity set whose entities the operation returns, one or many
+     *  (`ReturnDef`); absent or null when that is not known. */
+    returns?: { entity_set: string; collection: boolean } | null;
+}
+
+export interface ODataDefinition {
+    entity_sets: ODataEntitySet[];
+    operations: ODataOperation[];
+}
+
+/** What POST/PUT /admin/api/odata/services accepts (`ODataServicePayload`). */
+export interface ODataServiceInput {
+    /** The slug agents and server entries use. Immutable once created. */
+    name: string;
+    title: string;
+    purpose: string;
+    not_for: string;
+    destination: string;
+    /** On, calls run as the signed-in user; off, as the destination's
+     * technical user. */
+    user_context: boolean;
+    odata_version: ODataVersion;
+    service_path: string;
+    enabled: boolean;
+    definition: ODataDefinition;
+    /** ISO timestamp of the last metadata import, or null. */
+    metadata_fetched_at: string | null;
+}
+
+/**
+ * What PUT /admin/api/odata/services/{name} accepts: the payload plus the
+ * `updated_at` the service had when the form loaded it. The server compares
+ * it with the stored value and answers 409 when they differ, so a save
+ * from a stale page cannot overwrite what someone else saved meanwhile.
+ * Left out or null: not checked.
+ */
+export interface ODataServiceUpdate extends ODataServiceInput {
+    expected_updated_at?: string | null;
+}
+
+/** One agent that lists the service in a `builtin:odata` server entry. */
+export interface ODataUsedBy {
+    agent_id: number;
+    agent: string;
+    enabled: boolean;
+    expose_api: boolean;
+    api_slug: string;
+    allow_write: boolean;
+}
+
+/** One row of GET /admin/api/odata/services: everything but the definition. */
+export interface ODataServiceSummary extends Omit<ODataServiceInput, "definition"> {
+    id: number;
+    created_at: string | null;
+    updated_at: string | null;
+    counts: { entity_sets: number; operations: number };
+    /** An entity set with a write operation, or an enabled operation that
+     * changes data. */
+    has_write: boolean;
+    used_by: ODataUsedBy[];
+}
+
+/** Why no agent can call an enabled operation (`CALL_REFUSALS` in
+ *  agents/odata/client.py). Open-ended: a newer server may know more. */
+export interface ODataUncallableOperation {
+    name: string;
+    /** `calls_not_available`, `bound_set_missing`, `bound_set_without_key`,
+     *  `key_not_declared`, `bound_key_type`, `parameter_type`,
+     *  `invalid_definition`, ... */
+    reason: string;
+}
+
+/** GET /admin/api/odata/services/{name}. The answer of a PUT also carries
+ *  the `ReloadOutcome` keys; a GET, a create and a duplicate do not. */
+export interface ODataService extends ODataServiceSummary, ReloadOutcome {
+    definition: ODataDefinition;
+    /** Read-only, about the STORED service: the enabled operations no agent
+     *  can ever call. Never part of a payload. Absent on an older server. */
+    uncallable_operations?: ODataUncallableOperation[];
+}
+
+/** POST /admin/api/odata/metadata. Nothing is stored. */
+export interface ODataMetadataRequest {
+    destination: string;
+    service_path: string;
+    odata_version: ODataVersion;
+    user_context?: boolean;
+    /** The stored service to compare against; without it everything is new. */
+    service?: string;
+}
+
+export type ODataPreviewStatus = "new" | "in_service" | "changed";
+
+/** A field as the $metadata declares it. What SAP says a field can do sits
+ *  under `declared` on purpose: it is information, never a catalogue switch. */
+export interface ODataPreviewField {
+    name: string;
+    type: string;
+    label: string;
+    declared: { filterable: boolean; creatable: boolean; updatable: boolean };
+}
+
+/** An entity set of the answer (`_entity_set` in agents/odata/preview.py).
+ *  `status`, `new_fields`, `removed_fields`, `changed_keys` and
+ *  `changed_types` compare with the STORED service the request named. */
+export interface ODataPreviewEntitySet {
+    name: string;
+    /** The URL segment; the entity set's name. */
+    path: string;
+    entity_type: string;
+    label: string;
+    keys: ODataKey[];
+    keys_total: number;
+    /** At most 500, key fields always; `fields_total` counts the document's. */
+    fields: ODataPreviewField[];
+    fields_total: number;
+    navigations: { name: string; target: string; collection: boolean }[];
+    navigations_total: number;
+    declared: { creatable: boolean; updatable: boolean; deletable: boolean };
+    status: ODataPreviewStatus;
+    new_fields: string[];
+    new_fields_total: number;
+    removed_fields: string[];
+    changed_keys: boolean;
+    changed_types: string[];
+    /** Fields, keys, navigations or new fields were cut. */
+    truncated: boolean;
+}
+
+/** What the document says an operation returns; `entity_set` is an entity
+ *  set of the preview or null, `type` a primitive EDM name or "". */
+export interface ODataPreviewReturns {
+    entity_set: string | null;
+    collection: boolean;
+    type: string;
+}
+
+export interface ODataPreviewOperation {
+    name: string;
+    qualified_name: string;
+    kind: ODataOperation["kind"];
+    http_method: ODataOperation["http_method"];
+    bound_to: string | null;
+    parameters: ODataParam[];
+    parameters_total: number;
+    label: string;
+    status: "new" | "in_service";
+    /** A suggestion for `changes_data`; `known` false: nothing is known,
+     *  and the operation counts as changing data. */
+    suggested: { changes_data: boolean; known: boolean; returns: ODataPreviewReturns | null };
+    truncated: boolean;
+}
+
+/**
+ * Something the $metadata declares that the parser left out
+ * (`SkippedElement` in agents/odata/metadata.py). Never the element's own
+ * text: `entity_set` is the owning set (for kind `entity_set` its own name,
+ * blank when that name was the problem) and `position` is its 1-based place
+ * in the document, which is how an admin finds it.
+ */
+export interface ODataSkippedElement {
+    kind: "entity_set" | "property" | "navigation" | "operation";
+    entity_set: string;
+    position: number;
+    /** A reason code, e.g. `invalid_name`, `invalid_type`, `duplicate_name`,
+     * `unrepresentable_key`, `unresolved_target`. Open-ended on purpose. */
+    reason: string;
+    /** The entity type of the owning set, "" when unknown. */
+    entity_type: string;
+}
+
+/** `code` is stable (`metadata_incomplete`);
+ *  `message` is the server's text. */
+export interface ODataPreviewWarning {
+    code: string;
+    message: string;
+}
+
+/** What the service's $metadata offers (`build_preview` in
+ *  agents/odata/preview.py): names, types and labels only, no data. */
+export interface ODataMetadataPreview {
+    fetched_at: string;
+    entity_sets: ODataPreviewEntitySet[];
+    operations: ODataPreviewOperation[];
+    /** What the parser left out (at most 1,000 listed); empty when it took everything. */
+    skipped: ODataSkippedElement[];
+    /** Stored entity sets / operations the document no longer declares;
+     *  null when that is not known (`removed_complete` false). */
+    removed_entity_sets: string[] | null;
+    removed_operations: string[] | null;
+    removed_complete: boolean;
+    /** Stored entity sets the document still declares but the parser left out. */
+    skipped_stored_entity_sets: { name: string; reason: string }[];
+    summary: {
+        entity_sets: number; operations: number; in_service: number; changed: number; skipped: number;
+        removed_entity_sets: number | null; removed_operations: number | null; skipped_stored_entity_sets: number;
+    };
+    /** Something was cut; `totals` counts the whole document. */
+    truncated: boolean;
+    totals: { entity_sets: number; operations: number; skipped: number };
+    warnings: ODataPreviewWarning[];
+}
+
+/** Something a test call has to say besides its outcome. `code` is
+ *  stable (`service_disabled`, `technical_credential`,
+ *  `no_list_entity_set`, `paging_not_followed`); `message` is the
+ *  server's text. */
+export interface ODataTestWarning {
+    code: string;
+    message: string;
+}
+
+/**
+ * POST /admin/api/odata/services/{name}/test (`run_test_call` in
+ * agents/odata/testcall.py). HTTP 200 also when the test FAILED: `ok` is
+ * then false and `code` says why. Never a data value.
+ */
+export interface ODataTestResult {
+    ok: boolean;
+    /** null when `ok`; else `sap_error`, `unreachable`, `timeout`, ... */
+    code: string | null;
+    /** The HTTP status the OData service answered, or null without one. */
+    status: number | null;
+    duration_ms: number;
+    service: string;
+    enabled: boolean;
+    /** What was read: one row of `target`, or only the `$metadata`
+     *  document when no entity set has List enabled. */
+    read: "list" | "metadata";
+    target: string;
+    rows: number;
+    /** As whom the call ran; `unknown` when the destination was never resolved. */
+    identity: "user" | "technical" | "unknown";
+    per_user: boolean;
+    destination: string;
+    auth_type: string;
+    proxy_type: string;
+    message: string;
+    warnings: ODataTestWarning[];
+}
+
+/** POST /admin/api/odata/services/{name}/duplicate. What is left out is
+ * taken from the source. */
+export interface ODataDuplicateRequest {
+    name: string;
+    title?: string;
+    destination?: string;
+    user_context?: boolean;
+}
+
+/** One destination of `GET odata/destinations`: a fixed description, never
+ *  its URL or credential. `type`, `proxy_type` and `authentication` are a
+ *  known identifier, `other`, or "" when the destination does not say. */
+export interface ODataDestination {
+    name: string;
+    description: string;
+    type: string;
+    proxy_type: string;
+    authentication: string;
+    level: "instance" | "subaccount";
+    /** The destination signs in as the user who makes the call. */
+    user_propagating: boolean;
+    /** Whether an OData service can name it; `reason` says why not
+     *  (`invalid_name`, `not_http`). The `name` of an invalid one is the
+     *  shown form, not necessarily the stored one. */
+    usable: boolean;
+    reason: string | null;
+    notes: string[];
+    shadows_subaccount: boolean;
+}
+
+/** A level (instance or subaccount) that could not be listed. */
+export interface ODataDestinationWarning {
+    code: string;
+    level?: string;
+    reason?: string;
+    status?: number | null;
+    message?: string;
+}
+
+export interface ODataDestinationList {
+    items: ODataDestination[];
+    /** More destinations exist than `items` holds. */
+    truncated: boolean;
+    skipped: number;
+    /** Not empty: the list is partial. */
+    warnings: ODataDestinationWarning[];
+}

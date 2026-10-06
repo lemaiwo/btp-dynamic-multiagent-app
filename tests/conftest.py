@@ -8,15 +8,71 @@ collected in the same pytest process. Each stub keeps the function it
 replaced as ``_unpatched``; the ``real_agents_and_mcp`` fixture follows that
 chain back to the real one for the duration of a test.
 
-This module deliberately imports nothing from ``agents``: ``agents.db`` reads
-``DATABASE_URL`` at import, and each suite sets its own before importing it.
+One database per test session: ``agents.db`` reads ``DATABASE_URL`` at
+import and builds its engine then, so this module chooses the database and
+imports ``agents.db`` before pytest imports any test module. No test module
+names, sets or deletes a database file (see ``tests/testdb.py`` for why);
+``tests/test_testdb.py`` holds that rule. Suites share the session database
+and clean the rows they need gone in their own fixtures.
 """
 
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tests.testdb import use_test_database  # noqa: E402
+
+# A postgres binding in VCAP_SERVICES would win over DATABASE_URL.
+os.environ.pop("VCAP_SERVICES", None)
+os.environ.pop("VCAP_APPLICATION", None)
+SESSION_DB = use_test_database()
+
+# Bind the engine now. A module that still set DATABASE_URL in its header
+# would otherwise decide the database for the whole process whenever it is
+# the first one imported.
+import agents.db  # noqa: E402,F401,I001
+
+
+_BINDING_PREFIXES = ("DESTINATION_", "CONNECTIVITY_")
+
+
+@pytest.fixture(autouse=True)
+def _binding_env_does_not_leak():
+    """Put the destination/connectivity binding variables back after a test.
+
+    Some suites set them straight in ``os.environ`` and leave them; a later
+    suite in the same process then saw a bound destination service where it
+    expects none (credential health answered ``error`` instead of ``unbound``),
+    depending only on which files ran before it.
+    """
+    before = {k: v for k, v in os.environ.items() if k.startswith(_BINDING_PREFIXES)}
+    yield
+    for key in [k for k in os.environ if k.startswith(_BINDING_PREFIXES)]:
+        if key not in before:
+            del os.environ[key]
+    os.environ.update(before)
+
+
+@pytest.fixture(autouse=True)
+def _catalogue_edits_do_not_reload_the_registry(monkeypatch):
+    """An OData catalogue write rebuilds the running agents when the service
+    is in use (``agents.odata.admin_routes.reload_after_catalogue_change``).
+
+    The registry is one object per process: whether it holds a build depends
+    on which suites ran before. So by default a test sees "nothing is running
+    yet" (no rebuild, ``reloaded: false``), whatever the file order;
+    ``tests/test_odata_catalogue_reload.py`` puts the real seam back.
+    """
+    module = sys.modules.get("agents.odata.admin_routes")
+    if module is not None:
+        monkeypatch.setattr(module, "_live_registry", lambda: None)
+    yield
 
 
 def unpatched(fn):

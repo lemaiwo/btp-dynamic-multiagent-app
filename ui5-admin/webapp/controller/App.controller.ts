@@ -14,6 +14,8 @@ const NAV_KEY_BY_ROUTE: Record<string, string> = {
     agentDetail: "agents",
     skills: "skills",
     skillDetail: "skills",
+    odataServices: "odataServices",
+    odataServiceDetail: "odataServices",
     runs: "runs",
     runDetail: "runs",
     workflows: "workflows",
@@ -27,6 +29,11 @@ const NAV_KEY_BY_ROUTE: Record<string, string> = {
  * @namespace com.agent.admin.controller
  */
 export default class App extends BaseController {
+
+    /** The navigation key of the route that is shown. Kept apart from the
+     *  model's `selectedKey`, which the side navigation overwrites with
+     *  whatever item was pressed, before anyone agreed to leave. */
+    private shownKey = "";
 
     public onInit(): void {
         const model = new JSONModel({
@@ -51,7 +58,8 @@ export default class App extends BaseController {
 
         this.getRouter().attachRouteMatched((event: Router$RouteMatchedEvent) => {
             const name = (event.getParameter("name") as string) || "";
-            model.setProperty("/selectedKey", NAV_KEY_BY_ROUTE[name] ?? "");
+            this.shownKey = NAV_KEY_BY_ROUTE[name] ?? "";
+            model.setProperty("/selectedKey", this.shownKey);
         });
 
         // routeMatched never fires for the bypassed target, so notFound
@@ -62,6 +70,7 @@ export default class App extends BaseController {
         // setSelectedItem(""); the model property is kept in sync too so
         // any future binding-driven reads stay consistent.
         this.getRouter().attachBypassed((_event: Router$BypassedEvent) => {
+            this.shownKey = "";
             model.setProperty("/selectedKey", "");
             (this.byId("sideNavigation") as SideNavigation).setSelectedItem("");
         });
@@ -92,8 +101,19 @@ export default class App extends BaseController {
         model.setProperty("/sideExpanded", !model.getProperty("/sideExpanded"));
     }
 
-    public onNavItemSelect(event: SideNavigation$ItemSelectEvent): void {
-        const item = event.getParameter("item") as NavigationListItem;
-        this.getRouter().navTo(item.getKey());
+    /**
+     * Navigates to the pressed item, unless the page that is shown objects
+     * (a form with unsaved changes asks first, `Component.canLeave`). The
+     * control has already highlighted the pressed item by then, so a "no"
+     * puts the highlight back on the page that stays.
+     */
+    public async onNavItemSelect(event: SideNavigation$ItemSelectEvent): Promise<void> {
+        const key = (event.getParameter("item") as NavigationListItem).getKey();
+        if (await this.getOwnerComponentTyped().canLeave()) {
+            this.getRouter().navTo(key);
+            return;
+        }
+        (this.getModel("appView") as JSONModel).setProperty("/selectedKey", this.shownKey);
+        (this.byId("sideNavigation") as SideNavigation).setSelectedKey(this.shownKey);
     }
 }

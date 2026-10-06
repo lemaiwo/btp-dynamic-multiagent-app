@@ -1,0 +1,116 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1">
+    <Dialog
+        id="odataDuplicateDialog"
+        title="{i18n>odataDuplicateTitle}"
+        contentWidth="32rem">
+        <content>
+            <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop">
+                <Text id="odataDuplicateHint" text="{i18n>odataDuplicateHint}" />
+                <MessageStrip
+                    id="odataDuplicateUnsaved"
+                    visible="{svc>/duplicate/unsaved}"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"
+                    text="{i18n>odataDuplicateUnsaved}" />
+                <!-- The copy is the stored service whole, its write
+                     operations included: they are listed, with who can run
+                     them. Not by colour alone: an icon and the words. -->
+                <MessageStrip
+                    id="odataDuplicateWrites"
+                    visible="{= !!${svc>/duplicate/writes} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"
+                    text="{ path: 'svc>/duplicate/writes', formatter: '.formatDuplicateWrites' }" />
+                <!-- What the server refuses about anything but the two
+                     fields below, in its own words, as plain text. -->
+                <MessageStrip
+                    id="odataDuplicateError"
+                    visible="{= !!${svc>/duplicate/error} }"
+                    type="Error"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"
+                    text="{svc>/duplicate/error}" />
+            </VBox>
+            <f:SimpleForm editable="true" layout="ResponsiveGridLayout">
+                <Label text="{i18n>odataName}" required="true" labelFor="odataDuplicateName" />
+                <Input
+                    id="odataDuplicateName"
+                    value="{svc>/duplicate/name}"
+                    valueState="{ path: 'svc>/duplicate/errors/name', formatter: '.formatErrorState' }"
+                    valueStateText="{svc>/duplicate/errors/name}"
+                    class="odataTechnical"
+                    app:field="name"
+                    liveChange=".onDuplicateEdit"
+                    submit=".onDuplicateConfirm" />
+
+                <Label text="{i18n>odataDestination}" required="true" labelFor="odataDuplicateDestination" />
+                <!-- The same field as on the page (see there), judged
+                     against the identity chosen in this dialog. Enter
+                     in it takes a name from the list, so it does not
+                     also create the copy. -->
+                <VBox>
+                    <Input
+                        id="odataDuplicateDestination"
+                        value="{svc>/duplicate/destination}"
+                        showSuggestion="{= !${device>/system/phone} }"
+                        autocomplete="false"
+                        showValueHelp="{= ${dest>/items}.length > 0 }"
+                        suggestionItems="{ path: 'dest>/items', templateShareable: false }"
+                        valueState="{ parts: ['svc>/duplicate/errors/destination', 'dest>/duplicate/notice'], formatter: '.formatDestinationState' }"
+                        valueStateText="{ parts: ['svc>/duplicate/errors/destination', 'dest>/duplicate/noticeText'], formatter: '.formatDestinationStateText' }"
+                        class="odataTechnical"
+                        app:field="destination"
+                        ariaDescribedBy="odataDuplicateDestinationHint"
+                        valueHelpRequest=".onDestinationValueHelp"
+                        liveChange=".onDestinationLiveChange"
+                        change=".onDestinationChange">
+                        <suggestionItems>
+                            <core:ListItem text="{dest>name}" additionalText="{dest>info}" />
+                        </suggestionItems>
+                    </Input>
+                    <Text
+                        id="odataDuplicateDestinationHint"
+                        text="{dest>/hint}"
+                        visible="{= !!${dest>/hint} }"
+                        class="odataHint" />
+                </VBox>
+
+                <Label id="odataDuplicateRunsAsLabel" text="{i18n>odataRunsAs}" labelFor="odataDuplicateRunsAs" />
+                <VBox>
+                    <SegmentedButton
+                        id="odataDuplicateRunsAs"
+                        selectedKey="{ path: 'svc>/duplicate/user_context', formatter: '.formatRunsAsKey' }"
+                        selectionChange=".onDuplicateRunsAsChange"
+                        ariaLabelledBy="odataDuplicateRunsAsLabel"
+                        ariaDescribedBy="odataDuplicateRunsAsHint">
+                        <items>
+                            <SegmentedButtonItem key="user" text="{i18n>odataRunsAsUser}" />
+                            <SegmentedButtonItem key="technical" text="{i18n>odataRunsAsTechnical}" />
+                        </items>
+                    </SegmentedButton>
+                    <Text
+                        id="odataDuplicateRunsAsHint"
+                        text="{ path: 'svc>/duplicate/user_context', formatter: '.formatRunsAsHint' }"
+                        class="odataHint" />
+                </VBox>
+            </f:SimpleForm>
+        </content>
+        <beginButton>
+            <Button
+                id="odataDuplicateConfirm"
+                text="{ path: 'svc>/duplicate/writes', formatter: '.formatDuplicateAction' }"
+                type="Emphasized"
+                enabled="{= !${svc>/busy} }"
+                press=".onDuplicateConfirm" />
+        </beginButton>
+        <endButton>
+            <Button id="odataDuplicateCancel" text="{i18n>cancel}" press=".onDuplicateCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

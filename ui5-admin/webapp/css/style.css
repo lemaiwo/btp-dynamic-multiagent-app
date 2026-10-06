@@ -58,3 +58,175 @@
     font-size: 0.875rem;
     line-height: 1.4;
 }
+/* OData service detail (ODataServiceDetail.view.xml): technical values --
+   the name agents use, the destination, the service path -- read as code,
+   and the explanation under a field reads as a hint, not as a value. */
+.odataTechnical .sapMInputBaseInner {
+    font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+}
+.odataCounter .sapMObjStatusText {
+    font-size: 0.75rem;
+}
+.odataHint.sapMText,
+.sapUiForm .sapUiFormResGrid .odataHint.sapMText {
+    font-size: 0.75rem;
+    /* A form gives its texts the line height of a field; a hint of two
+       lines would be spread over two field heights. */
+    line-height: 1.4;
+    margin-top: 0.25rem;
+}
+/* The entity sets table of an OData service: the three write columns
+   (Create, Update, Delete) are tinted, header and cells, so a tick there
+   does not read like a tick under List or Get. The column header says
+   "Write" as well; the tint is not the only sign. UI5 1.120 does not put
+   the theme parameters on :root here, so a var(--sap...) resolves to
+   nothing: the colours are the sap_horizon values and apply in that theme
+   only. In the dark and high-contrast themes there is no tint and the
+   texts keep the theme's own colour; the word "Write" carries the meaning. */
+html.sapUiTheme-sap_horizon .sapMListTbl th.odataWriteCol,
+html.sapUiTheme-sap_horizon .sapMListTbl td.odataWriteCol,
+html.sapUiTheme-sap_horizon .sapMListTblSubCntRow.odataWriteCol {
+    background-color: #fff8d6;
+}
+.odataWriteMarker.sapMText {
+    font-size: 0.6875rem;
+    line-height: 1.2;
+}
+html.sapUiTheme-sap_horizon .odataWriteMarker.sapMText {
+    color: #a93e00;
+}
+.odataMeta.sapMText {
+    font-size: 0.75rem;
+}
+html.sapUiTheme-sap_horizon .odataMeta.sapMText {
+    color: #556b82;
+}
+/* What the ticked, unsaved writes will allow stays under the toolbar with
+   Save while the page scrolls: it must be in view whenever a write is
+   pending, wherever in a long table the tick was set. The strip sits in a
+   slot that is there at all times and keeps the room of a two-line strip,
+   so the table does not move under the pointer when the strip comes and
+   goes; an empty slot lets clicks through to what scrolls under it. */
+.odataStickySlot.sapMFlexBox {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    min-height: 3.625rem;
+    pointer-events: none;
+}
+.odataStickySlot .odataPendingStrip.sapMMsgStrip {
+    pointer-events: auto;
+    /* A last resort on a small screen with long names: the strip never
+       takes more than part of the window, and scrolls in itself. */
+    max-height: min(12rem, 45vh);
+    overflow-y: auto;
+}
+/* A strip that needs more than the slot's room moves what is below it; the
+   controller scrolls the page by as much (holdPlace). The browser's own
+   scroll anchoring would do the same a second time where it exists. */
+.odataDetailPage.sapMPage > section {
+    overflow-anchor: none;
+}
+/* A message on a row is a sentence and wraps under the description. */
+.odataRowMessage.sapMObjStatus {
+    margin-top: 0.25rem;
+}
+.odataRowMessage .sapMObjStatusText {
+    white-space: normal;
+    /* In the popin layout of a phone the cell is as narrow as the window. */
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+.odataRowMessage.sapMObjStatus {
+    max-width: 100%;
+    min-width: 0;
+    box-sizing: border-box;
+}
+.odataRowMessage.sapMObjStatus {
+    display: flex;
+    align-items: flex-start;
+}
+.odataRowMessage .sapMObjStatusIcon {
+    flex: none;
+}
+/* The hint's grey is sap_horizon's label colour; other themes keep theirs. */
+html.sapUiTheme-sap_horizon .odataHint.sapMText,
+html.sapUiTheme-sap_horizon .sapUiForm .sapUiFormResGrid .odataHint.sapMText {
+    color: #556b82;
+}
+/* The entity set dialog (ODataEntitySetDialog.fragment.xml). Technical
+   names are monospaced, as in the General section. */
+.odataFieldName.sapMText,
+.odataFieldName .sapMObjStatusText {
+    font-family: "72Mono", Consolas, "Courier New", monospace;
+    overflow-wrap: anywhere;
+}
+.odataEntityHeadField.sapMFlexBox {
+    flex: 1 1 16rem;
+    min-width: 0;
+}
+/* The question a row asks before personal data becomes readable. Its
+   border is the theme's colour for a warning (sapCriticalElementColor)
+   where the theme parameters are there as CSS variables; in sap_horizon,
+   where UI5 1.120 does not write them, that parameter's value; in any
+   other theme the text colour. The question is words and two buttons: the
+   border only sets it apart. */
+.odataFieldConfirm.sapMFlexBox {
+    margin-top: 0.25rem;
+    padding: 0.5rem;
+    border: 1px solid var(--sapCriticalElementColor, currentColor);
+    border-radius: 0.5rem;
+}
+html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
+    border-color: var(--sapCriticalElementColor, #e76500);
+}
+
+/* The import dialog (ODataImportDialog.fragment.xml). A row: the tick, what
+   it is with its facts underneath, and its status at the end. */
+.odataImportRow {
+    padding: 0.25rem 0.5rem 0.25rem 0;
+    width: 100%;
+    box-sizing: border-box;
+}
+.odataImportRow[data-level="child"] {
+    padding-left: 2rem;
+}
+.odataImportLead {
+    flex: none;
+    min-width: 5rem;
+    justify-content: flex-end;
+}
+.odataImportRow[data-level="child"] .odataImportLead {
+    min-width: 2.75rem;
+}
+/* Its width comes from the row (base size 0 in the fragment), not from its
+   longest line: it stays beside the tick also in a row that wraps. */
+.odataImportBody {
+    min-width: 0;
+    padding-top: 0.5rem;
+}
+.odataImportRow[data-level="top"] .odataImportName.sapMText {
+    font-weight: bold;
+}
+.odataImportWrap.sapMText {
+    overflow-wrap: anywhere;
+}
+.odataImportStatus.sapMObjStatus {
+    flex: none;
+    margin: 0.5rem 0 0 0.5rem;
+}
+@media (max-width: 599px) {
+    /* The status moves under the row: the name keeps the width. */
+    .odataImportRow {
+        flex-wrap: wrap;
+    }
+    .odataImportLead {
+        min-width: 2.75rem;
+    }
+    .odataImportRow.sapMFlexBox > .odataImportStatus.sapMObjStatus {
+        flex: 0 0 100%;
+        box-sizing: border-box;
+        margin: 0 0 0.25rem 0;
+        padding-left: 3.25rem;
+    }
+}

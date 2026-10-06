@@ -1,0 +1,779 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.ODataServiceDetail"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form"
+    xmlns:app="http://schemas.sap.com/sapui5/extension/sap.ui.core.CustomData/1">
+    <Page
+        id="odataServiceDetailPage"
+        title="{svc>/title}"
+        showNavButton="true"
+        class="odataDetailPage"
+        navButtonPress=".onBack">
+        <!-- Tags and actions sit in a toolbar of their own, not in the page
+             header: the header has no overflow handling, so three buttons
+             there cut the title on a narrow window. Here the secondary
+             actions move into the overflow menu and Save always stays. -->
+        <subHeader>
+            <OverflowToolbar id="odataDetailToolbar">
+                <!-- The tags describe the service as it is SAVED, which is
+                     what agents get; the form below may be ahead of it. -->
+                <ObjectStatus
+                    id="odataTagVersion"
+                    text="{ path: 'svc>/original/odata_version', formatter: '.formatVersion' }"
+                    inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
+                    visible="{svc>/exists}" />
+                <ObjectStatus
+                    id="odataTagRunsAs"
+                    text="{ path: 'svc>/original/user_context', formatter: '.formatRunsAs' }"
+                    state="{ path: 'svc>/original/user_context', formatter: '.formatRunsAsState' }"
+                    inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
+                    visible="{svc>/exists}" />
+                <ObjectStatus
+                    id="odataTagWrite"
+                    text="{i18n>odataTagWrite}"
+                    state="Warning"
+                    inverted="true"
+                    visible="{ parts: ['svc>/exists', 'svc>/original/definition'], formatter: '.formatWriteTag' }" />
+                <ObjectStatus
+                    id="odataTagDisabled"
+                    text="{i18n>odataTagDisabled}"
+                    state="Error"
+                    inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
+                    visible="{= ${svc>/exists} &amp;&amp; !${svc>/original/enabled} }" />
+                <ToolbarSpacer />
+                <!-- Reads the service's $metadata as the form describes it
+                     and offers what it declares; nothing is stored by it. -->
+                <Button
+                    id="odataImportMetadataButton"
+                    text="{i18n>odataImportTitle}"
+                    icon="sap-icon://download-from-cloud"
+                    tooltip="{i18n>odataImportTooltip}"
+                    enabled="{= ${svc>/loaded} &amp;&amp; !${svc>/busy} &amp;&amp; !${svc>/asking} }"
+                    press=".onImportMetadata">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
+                <!-- One read of one row through the STORED service: does its
+                     destination, identity and path work? -->
+                <Button
+                    id="odataTestCallButton"
+                    text="{i18n>odataTestCall}"
+                    icon="sap-icon://connected"
+                    tooltip="{i18n>odataTestCallTooltip}"
+                    enabled="{= ${svc>/exists} &amp;&amp; !${svc>/busy} &amp;&amp; !${svc>/asking} }"
+                    press=".onTestCall">
+                    <!-- The first to move into the overflow menu when the
+                         window is narrow: Duplicate and Delete keep their
+                         place. -->
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </Button>
+                <Button
+                    id="odataDuplicateButton"
+                    text="{i18n>odataDuplicate}"
+                    icon="sap-icon://duplicate"
+                    enabled="{= ${svc>/exists} &amp;&amp; !${svc>/busy} }"
+                    press=".onDuplicate" />
+                <Button
+                    id="odataDeleteButton"
+                    text="{i18n>delete}"
+                    icon="sap-icon://delete"
+                    type="Transparent"
+                    enabled="{= ${svc>/exists} &amp;&amp; !${svc>/busy} }"
+                    press=".onDelete" />
+                <Button
+                    id="odataSaveButton"
+                    text="{i18n>save}"
+                    type="Emphasized"
+                    enabled="{= ${svc>/loaded} &amp;&amp; !${svc>/busy} &amp;&amp; !${svc>/asking} }"
+                    press=".onSave">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" />
+                    </layoutData>
+                </Button>
+            </OverflowToolbar>
+        </subHeader>
+        <content>
+            <!-- Writes that are ticked but not saved: what they will let
+                 agents do, said before Save. Its slot is sticky under the
+                 toolbar that holds Save, so the strip is in view wherever
+                 the page is scrolled to, and it keeps room for the strip at
+                 all times, so the table does not move when the strip comes
+                 and goes (`holdPlace` in the controller covers a strip that
+                 needs more room). The inner box is what the controller
+                 watches for a change of height; it never changes the height
+                 of that one itself. The controller announces each change
+                 to screen readers. -->
+            <VBox id="odataPendingSlot" class="odataStickySlot">
+                <VBox id="odataPendingInner">
+                    <MessageStrip
+                        id="odataPendingWrites"
+                        visible="{= !!${svc>/pendingWrites} }"
+                        type="Warning"
+                        showIcon="true"
+                        class="odataPendingStrip sapUiSmallMarginBeginEnd sapUiTinyMarginTop"
+                        text="{svc>/pendingWrites}" />
+                </VBox>
+            </VBox>
+            <!-- A service that could not be read is said here, with a retry,
+                 and the form stays away: an empty form with a Save button
+                 could be saved over the real service. -->
+            <MessageStrip
+                id="odataDetailLoadFailed"
+                visible="{svc>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{svc>/loadError}">
+                <link>
+                    <Link id="odataDetailRetry" text="{i18n>odataRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
+            <!-- Saved elsewhere since the form loaded it: nothing is sent
+                 over it. The input stays until the admin reloads. -->
+            <MessageStrip
+                id="odataChangedElsewhere"
+                visible="{svc>/changedElsewhere}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{i18n>odataChangedElsewhere}">
+                <link>
+                    <Link id="odataReload" text="{i18n>odataReload}" press=".onReload" />
+                </link>
+            </MessageStrip>
+            <!-- Deleted elsewhere: the input stays and can be saved as a
+                 new service. -->
+            <MessageStrip
+                id="odataDeletedElsewhere"
+                visible="{svc>/deletedElsewhere}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{i18n>odataDeletedElsewhere}">
+                <link>
+                    <Link id="odataSaveAsNew" text="{i18n>odataSaveAsNew}" press=".onSaveAsNew" />
+                </link>
+            </MessageStrip>
+            <!-- What a refused save says about anything that has no field of
+                 its own below. The server's words, as plain text. -->
+            <MessageStrip
+                id="odataSaveError"
+                visible="{= !!${svc>/saveError} }"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{svc>/saveError}" />
+            <!-- The result of "Test call": status, destination, duration,
+                 rows and identity, never a value that was read. What SAP or
+                 the server said about a failure is shown as plain text. -->
+            <MessageStrip
+                id="odataTestStrip"
+                visible="{= !!${svc>/test} }"
+                type="{= ${svc>/test/type} || 'Information' }"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+                text="{svc>/test/text}" />
+            <Panel
+                id="odataGeneralPanel"
+                visible="{svc>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title text="{i18n>odataGeneral}" level="H2" />
+                        <ToolbarSpacer />
+                        <Label id="odataEnabledLabel" text="{i18n>odataEnabled}" labelFor="odataEnabledSwitch" />
+                        <Switch
+                            id="odataEnabledSwitch"
+                            state="{svc>/data/enabled}"
+                            change=".onEnabledChange"
+                            ariaLabelledBy="odataEnabledLabel" />
+                    </Toolbar>
+                </headerToolbar>
+                <!-- Left: what the service is for (this is what an agent
+                     reads). Right: where it is and who calls it. -->
+                <f:SimpleForm
+                    id="odataGeneralForm"
+                    editable="true"
+                    layout="ResponsiveGridLayout"
+                    columnsM="1"
+                    columnsL="2"
+                    columnsXL="2"
+                    labelSpanS="12"
+                    labelSpanM="12"
+                    labelSpanL="12"
+                    labelSpanXL="12"
+                    singleContainerFullSize="false">
+                    <core:Title text="{i18n>odataGroupPurpose}" level="H3" />
+
+                    <Label text="{i18n>odataTitle}" required="true" labelFor="odataTitle" />
+                    <Input
+                        id="odataTitle"
+                        value="{svc>/data/title}"
+                        valueState="{ path: 'svc>/errors/title', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/title}"
+                        app:field="title"
+                        liveChange=".onEdit" />
+
+                    <Label text="{i18n>odataName}" required="true" labelFor="odataName" />
+                    <VBox>
+                        <Input
+                            id="odataName"
+                            value="{svc>/data/name}"
+                            editable="{svc>/isNew}"
+                            valueState="{ path: 'svc>/errors/name', formatter: '.formatErrorState' }"
+                            valueStateText="{svc>/errors/name}"
+                            ariaDescribedBy="odataNameHint"
+                            class="odataTechnical"
+                            app:field="name"
+                            liveChange=".onEdit" />
+                        <Text
+                            id="odataNameHint"
+                            text="{ path: 'svc>/isNew', formatter: '.formatNameHint' }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label text="{i18n>odataPurpose}" required="true" labelFor="odataPurpose" />
+                    <VBox>
+                        <!-- valueLiveUpdate: the counter follows each key. No
+                             maxLength: a pasted text that is too long is shown
+                             whole and refused, not silently cut. -->
+                        <TextArea
+                            id="odataPurpose"
+                            value="{svc>/data/purpose}"
+                            valueLiveUpdate="true"
+                            rows="3"
+                            width="100%"
+                            valueState="{ path: 'svc>/errors/purpose', formatter: '.formatErrorState' }"
+                            valueStateText="{svc>/errors/purpose}"
+                            ariaDescribedBy="odataPurposeCounter"
+                            app:field="purpose"
+                            liveChange=".onEdit" />
+                        <!-- Turns red as soon as the text is too long, not
+                             only when Save refuses it. -->
+                        <ObjectStatus
+                            id="odataPurposeCounter"
+                            text="{ path: 'svc>/data/purpose', formatter: '.formatPurposeCounter' }"
+                            state="{ path: 'svc>/data/purpose', formatter: '.formatPurposeCounterState' }"
+                            class="odataCounter" />
+                    </VBox>
+
+                    <Label text="{i18n>odataNotFor}" labelFor="odataNotFor" />
+                    <Input
+                        id="odataNotFor"
+                        value="{svc>/data/not_for}"
+                        valueState="{ path: 'svc>/errors/not_for', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/not_for}"
+                        app:field="not_for"
+                        liveChange=".onEdit" />
+
+                    <core:Title text="{i18n>odataGroupConnection}" level="H3" />
+
+                    <!-- An input with the listed destinations under it, and
+                         no autocomplete: the field holds what was typed or
+                         the name that was picked, never a completion (the
+                         destination decides the identity of every call).
+                         The list is a help: any name can be typed, since a
+                         destination can be created after the list was read
+                         and the list can be missing. `dest` holds what the
+                         destination service lists; it is read once per
+                         visit and outlives a reload of `svc`. The items
+                         have no key: nothing is selected, the text is all.
+                         On a phone the input would list them in a dialog
+                         whose own input does complete, so there the field
+                         is a plain one and the icon opens a picker. -->
+                    <Label text="{i18n>odataDestination}" required="true" labelFor="odataDestination" />
+                    <VBox>
+                        <Input
+                            id="odataDestination"
+                            value="{svc>/data/destination}"
+                            showSuggestion="{= !${device>/system/phone} }"
+                            autocomplete="false"
+                            showValueHelp="{= ${dest>/items}.length > 0 }"
+                            suggestionItems="{ path: 'dest>/items', templateShareable: false }"
+                            valueState="{ parts: ['svc>/errors/destination', 'dest>/notice'], formatter: '.formatDestinationState' }"
+                            valueStateText="{ parts: ['svc>/errors/destination', 'dest>/noticeText'], formatter: '.formatDestinationStateText' }"
+                            class="odataTechnical"
+                            app:field="destination"
+                            ariaDescribedBy="odataDestinationHint"
+                            valueHelpRequest=".onDestinationValueHelp"
+                            liveChange=".onDestinationLiveChange"
+                            change=".onDestinationChange">
+                            <suggestionItems>
+                                <core:ListItem text="{dest>name}" additionalText="{dest>info}" />
+                            </suggestionItems>
+                        </Input>
+                        <Text
+                            id="odataDestinationHint"
+                            text="{dest>/hint}"
+                            visible="{= !!${dest>/hint} }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label id="odataRunsAsLabel" text="{i18n>odataRunsAs}" labelFor="odataRunsAs" />
+                    <VBox>
+                        <SegmentedButton
+                            id="odataRunsAs"
+                            selectedKey="{ path: 'svc>/data/user_context', formatter: '.formatRunsAsKey' }"
+                            selectionChange=".onRunsAsChange"
+                            ariaLabelledBy="odataRunsAsLabel"
+                            ariaDescribedBy="odataRunsAsHint">
+                            <items>
+                                <SegmentedButtonItem id="odataRunsAsUser" key="user" text="{i18n>odataRunsAsUser}" />
+                                <SegmentedButtonItem id="odataRunsAsTechnical" key="technical" text="{i18n>odataRunsAsTechnical}" />
+                            </items>
+                        </SegmentedButton>
+                        <Text
+                            id="odataRunsAsHint"
+                            text="{ path: 'svc>/data/user_context', formatter: '.formatRunsAsHint' }"
+                            class="odataHint" />
+                    </VBox>
+
+                    <Label id="odataVersionLabel" text="{i18n>odataVersion}" labelFor="odataVersion" />
+                    <SegmentedButton
+                        id="odataVersion"
+                        selectedKey="{svc>/data/odata_version}"
+                        selectionChange=".onVersionChange"
+                        ariaLabelledBy="odataVersionLabel">
+                        <items>
+                            <SegmentedButtonItem key="v2" text="{i18n>odataVersionV2}" />
+                            <SegmentedButtonItem key="v4" text="{i18n>odataVersionV4}" />
+                        </items>
+                    </SegmentedButton>
+
+                    <Label text="{i18n>odataServicePath}" required="true" labelFor="odataServicePath" />
+                    <Input
+                        id="odataServicePath"
+                        value="{svc>/data/service_path}"
+                        valueState="{ path: 'svc>/errors/service_path', formatter: '.formatErrorState' }"
+                        valueStateText="{svc>/errors/service_path}"
+                        class="odataTechnical"
+                        app:field="service_path"
+                        liveChange=".onEdit" />
+                </f:SimpleForm>
+            </Panel>
+            <!-- The entity sets: which of them agents get, and what they may
+                 do with each. Nothing is on unless it is ticked here. The
+                 table shows `svc>/rows`, one flat row per entity set that the
+                 controller works out when an entity set changes; the entity
+                 sets themselves are in `svc>/data/definition` and go out with
+                 Save like the rest of the form. -->
+            <Panel
+                id="odataEntityPanel"
+                visible="{svc>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <OverflowToolbar id="odataEntityToolbar">
+                        <Title
+                            id="odataEntityTitle"
+                            text="{ path: 'svc>/rows/length', formatter: '.formatEntitySetsTitle' }"
+                            level="H2" />
+                        <ToolbarSpacer />
+                        <SearchField
+                            id="odataEntitySearch"
+                            width="14rem"
+                            value="{svc>/entitySearch}"
+                            placeholder="{i18n>odataEntitySearch}"
+                            tooltip="{i18n>odataEntitySearch}"
+                            liveChange=".onEntitySearch"
+                            search=".onEntitySearch">
+                            <layoutData>
+                                <OverflowToolbarLayoutData minWidth="8rem" shrinkable="true" priority="NeverOverflow" />
+                            </layoutData>
+                        </SearchField>
+                        <Button
+                            id="odataAddEntitySetButton"
+                            text="{i18n>odataAddEntitySet}"
+                            icon="sap-icon://add"
+                            enabled="{ parts: ['svc>/busy', 'svc>/rows/length'], formatter: '.formatCanAddEntitySet' }"
+                            press=".onAddEntitySet">
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="NeverOverflow" />
+                            </layoutData>
+                        </Button>
+                    </OverflowToolbar>
+                </headerToolbar>
+                <!-- Under the toolbar, not in it: on a phone the toolbar has
+                     room for the title, the search and Add only. -->
+                <Text
+                    id="odataMetadataInfo"
+                    text="{ path: 'svc>/data/metadata_fetched_at', formatter: '.formatMetadataInfo' }"
+                    class="odataMeta sapUiTinyMarginBottom" />
+                <!-- The operation names the checkboxes are labelled with:
+                     "<operation> <entity set>". -->
+                <core:InvisibleText id="odataOpNameList" text="{i18n>odataOpList}" />
+                <core:InvisibleText id="odataOpNameGet" text="{i18n>odataOpGet}" />
+                <core:InvisibleText id="odataOpNameCreate" text="{i18n>odataOpCreate}" />
+                <core:InvisibleText id="odataOpNameUpdate" text="{i18n>odataOpUpdate}" />
+                <core:InvisibleText id="odataOpNameDelete" text="{i18n>odataOpDelete}" />
+                <core:InvisibleText id="odataOpWriteName" text="{i18n>odataWriteOperation}" />
+                <!-- After a refused save whose marked rows were not all on
+                     screen, the table shows the marked rows alone; this says
+                     so and is the way back. -->
+                <MessageStrip
+                    id="odataProblemsOnly"
+                    visible="{= !!${svc>/problemsOnly} }"
+                    type="Information"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{svc>/problemsOnly}">
+                    <link>
+                        <Link id="odataShowAll" text="{i18n>odataShowAll}" press=".onShowAllEntitySets" />
+                    </link>
+                </MessageStrip>
+                <!-- Growing: a service can hold 200 entity sets; twenty rows
+                     at a time keep the page quick. The search filters all of
+                     them, shown or not. -->
+                <Table
+                    id="odataEntityTable"
+                    items="{ path: 'svc>/rows', key: 'index' }"
+                    growing="true"
+                    growingThreshold="20"
+                    popinLayout="GridSmall"
+                    noDataText="{ path: 'svc>/entitySearch', formatter: '.formatNoEntitySets' }"
+                    ariaLabelledBy="odataEntityTitle">
+                    <columns>
+                        <Column width="16rem">
+                            <Label text="{i18n>odataColEntitySet}" />
+                        </Column>
+                        <Column minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColAgentDescription}" />
+                        </Column>
+                        <Column hAlign="Center" width="4.5rem" minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataOpList}" />
+                        </Column>
+                        <Column hAlign="Center" width="4.5rem" minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataOpGet}" />
+                        </Column>
+                        <Column
+                            hAlign="Center"
+                            width="4.5rem"
+                            minScreenWidth="Tablet"
+                            demandPopin="true"
+                            styleClass="odataWriteCol">
+                            <VBox alignItems="Center" tooltip="{i18n>odataWriteColumnTooltip}">
+                                <Label text="{i18n>odataOpCreate}" />
+                                <Text text="{i18n>odataWriteMarker}" class="odataWriteMarker" />
+                            </VBox>
+                        </Column>
+                        <Column
+                            hAlign="Center"
+                            width="4.5rem"
+                            minScreenWidth="Tablet"
+                            demandPopin="true"
+                            styleClass="odataWriteCol">
+                            <VBox alignItems="Center" tooltip="{i18n>odataWriteColumnTooltip}">
+                                <Label text="{i18n>odataOpUpdate}" />
+                                <Text text="{i18n>odataWriteMarker}" class="odataWriteMarker" />
+                            </VBox>
+                        </Column>
+                        <Column
+                            hAlign="Center"
+                            width="4.5rem"
+                            minScreenWidth="Tablet"
+                            demandPopin="true"
+                            styleClass="odataWriteCol">
+                            <VBox alignItems="Center" tooltip="{i18n>odataWriteColumnTooltip}">
+                                <Label text="{i18n>odataOpDelete}" />
+                                <Text text="{i18n>odataWriteMarker}" class="odataWriteMarker" />
+                            </VBox>
+                        </Column>
+                        <Column width="6rem" minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataColFields}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <!-- U5: pressing a row opens the entity set dialog
+                             (`openEntitySet` in the controller). -->
+                        <ColumnListItem type="Navigation" press=".onOpenEntitySet">
+                            <cells>
+                                <VBox>
+                                    <ObjectIdentifier
+                                        title="{svc>title}"
+                                        text="{ parts: ['svc>name', 'svc>path'], formatter: '.formatEntityTechnical' }" />
+                                    <core:InvisibleText id="odataEntityRowName" text="{svc>label}" />
+                                </VBox>
+                                <VBox>
+                                    <Text text="{svc>description}" visible="{svc>described}" />
+                                    <!-- A warning once an operation is on:
+                                         agents find an entity set by its
+                                         description. -->
+                                    <ObjectStatus
+                                        text="{i18n>odataNoDescription}"
+                                        tooltip="{i18n>odataNoDescriptionTooltip}"
+                                        visible="{= !${svc>described} }"
+                                        state="{ path: 'svc>anyOperation', formatter: '.formatNoDescriptionState' }"
+                                        inverted="true" />
+                                    <ObjectStatus
+                                        text="{i18n>odataNavigationHint}"
+                                        visible="{svc>navigationHint}"
+                                        state="Information"
+                                        icon="sap-icon://hint"
+                                        class="odataRowMessage" />
+                                    <!-- Why the last tick was not taken. -->
+                                    <ObjectStatus
+                                        text="{svc>note}"
+                                        visible="{= !!${svc>note} }"
+                                        state="Warning"
+                                        icon="sap-icon://alert"
+                                        class="odataRowMessage" />
+                                    <!-- What a refused save said about this
+                                         row; the server's words, as text. -->
+                                    <ObjectStatus
+                                        text="{svc>error}"
+                                        visible="{= !!${svc>error} }"
+                                        state="Error"
+                                        icon="sap-icon://error"
+                                        class="odataRowMessage" />
+                                </VBox>
+                                <CheckBox
+                                    selected="{ path: 'svc>list', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    tooltip="{ parts: ['i18n>odataOpList', 'svc>title'], formatter: '.formatOperationOf' }"
+                                    ariaLabelledBy="odataOpNameList odataEntityRowName"
+                                    app:op="list"
+                                    select=".onToggleOperation" />
+                                <CheckBox
+                                    selected="{ path: 'svc>get', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    tooltip="{ parts: ['i18n>odataOpGet', 'svc>title'], formatter: '.formatOperationOf' }"
+                                    ariaLabelledBy="odataOpNameGet odataEntityRowName"
+                                    app:op="get"
+                                    select=".onToggleOperation" />
+                                <CheckBox
+                                    selected="{ path: 'svc>create', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    valueState="{ path: 'svc>create', formatter: '.formatWriteState' }"
+                                    tooltip="{ parts: ['i18n>odataOpCreate', 'svc>title'], formatter: '.formatWriteOperationOf' }"
+                                    ariaLabelledBy="odataOpNameCreate odataEntityRowName odataOpWriteName"
+                                    app:op="create"
+                                    select=".onToggleOperation" />
+                                <CheckBox
+                                    selected="{ path: 'svc>update', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    valueState="{ path: 'svc>update', formatter: '.formatWriteState' }"
+                                    tooltip="{ parts: ['i18n>odataOpUpdate', 'svc>title'], formatter: '.formatWriteOperationOf' }"
+                                    ariaLabelledBy="odataOpNameUpdate odataEntityRowName odataOpWriteName"
+                                    app:op="update"
+                                    select=".onToggleOperation" />
+                                <CheckBox
+                                    selected="{ path: 'svc>delete', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    valueState="{ path: 'svc>delete', formatter: '.formatWriteState' }"
+                                    tooltip="{ parts: ['i18n>odataOpDelete', 'svc>title'], formatter: '.formatWriteOperationOf' }"
+                                    ariaLabelledBy="odataOpNameDelete odataEntityRowName odataOpWriteName"
+                                    app:op="delete"
+                                    select=".onToggleOperation" />
+                                <Text
+                                    text="{ parts: ['svc>selectable', 'svc>total'], formatter: '.formatFieldsCount' }"
+                                    tooltip="{ parts: ['svc>selectable', 'svc>total'], formatter: '.formatFieldsCountTooltip' }" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+            <!-- The operations: function imports (V2), actions and functions
+                 (V4). Each is off until it is enabled here, and counts as a
+                 write unless it is sent with GET and marked as only
+                 reading. Enabling a write is said next to Save and asked
+                 about by Save, like a ticked write of an entity set. The
+                 table shows `svc>/opRows`, one flat row per operation of
+                 `svc>/data/definition`. Names, titles, descriptions and
+                 parameter names come from a remote $metadata document and
+                 are rendered as text. -->
+            <Panel
+                id="odataOperationsPanel"
+                visible="{svc>/loaded}"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title
+                            id="odataOperationsTitle"
+                            text="{ path: 'svc>/opRows/length', formatter: '.formatOperationsTitle' }"
+                            level="H2" />
+                    </Toolbar>
+                </headerToolbar>
+                <Text id="odataOperationsHint" text="{i18n>odataOperationsHint}" class="odataMeta sapUiTinyMarginBottom" />
+                <core:InvisibleText id="odataOpNameChanges" text="{i18n>odataColChangesData}" />
+                <core:InvisibleText id="odataOpNameEnabled" text="{i18n>odataColEnabled}" />
+                <!-- Enabled operations of the stored service that no agent
+                     can call; each row says why. -->
+                <MessageStrip
+                    id="odataUncallableStrip"
+                    visible="{= !!${svc>/uncallableText} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{svc>/uncallableText}" />
+                <Table
+                    id="odataOperationsTable"
+                    items="{ path: 'svc>/opRows', key: 'index' }"
+                    growing="true"
+                    growingThreshold="20"
+                    popinLayout="GridSmall"
+                    noDataText="{i18n>odataNoOperations}"
+                    ariaLabelledBy="odataOperationsTitle">
+                    <columns>
+                        <Column width="14rem">
+                            <Label text="{i18n>odataColOperation}" />
+                        </Column>
+                        <Column minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColAgentDescription}" />
+                        </Column>
+                        <Column width="10rem" minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColBoundTo}" />
+                        </Column>
+                        <Column minScreenWidth="Desktop" demandPopin="true">
+                            <Label text="{i18n>odataColParameters}" />
+                        </Column>
+                        <Column hAlign="Center" width="6rem" minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataColChangesData}" wrapping="true" />
+                        </Column>
+                        <Column
+                            hAlign="Center"
+                            width="5rem"
+                            minScreenWidth="Tablet"
+                            demandPopin="true"
+                            styleClass="odataWriteCol">
+                            <Label text="{i18n>odataColEnabled}" tooltip="{i18n>odataOperationEnabledTooltip}" />
+                        </Column>
+                        <Column hAlign="End" width="3rem">
+                            <core:InvisibleText text="{i18n>odataColActions}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <!-- A press on the row opens the dialog with its
+                             name and description for the agent. -->
+                        <ColumnListItem
+                            type="Navigation"
+                            tooltip="{ path: 'svc>title', formatter: '.formatOpenOperation' }"
+                            press=".onOpenOperation">
+                            <cells>
+                                <VBox>
+                                    <ObjectIdentifier title="{svc>title}" text="{svc>technical}" />
+                                    <core:InvisibleText id="odataOperationRowName" text="{svc>label}" />
+                                </VBox>
+                                <VBox>
+                                    <Text text="{svc>description}" visible="{= !!${svc>description} }" />
+                                    <!-- Enabled, and still no agent can call
+                                         it: why, in plain words. -->
+                                    <ObjectStatus
+                                        text="{ path: 'svc>uncallable', formatter: '.formatUncallable' }"
+                                        visible="{= !!${svc>uncallable} }"
+                                        state="Error"
+                                        icon="sap-icon://error"
+                                        class="odataRowMessage" />
+                                    <!-- Why the last click was not taken. -->
+                                    <ObjectStatus
+                                        text="{svc>note}"
+                                        visible="{= !!${svc>note} }"
+                                        state="Warning"
+                                        icon="sap-icon://alert"
+                                        class="odataRowMessage" />
+                                </VBox>
+                                <Text text="{ path: 'svc>boundTo', formatter: '.formatBoundTo' }" />
+                                <Text text="{svc>parameters}" class="odataFieldName" />
+                                <!-- Sent with POST it is a write whatever
+                                     the flag says: the box is shown, not
+                                     offered, and says why. -->
+                                <CheckBox
+                                    selected="{ path: 'svc>write', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    editable="{= !${svc>post} }"
+                                    tooltip="{ parts: ['i18n>odataColChangesData', 'svc>title', 'svc>post'], formatter: '.formatChangesDataTooltip' }"
+                                    ariaLabelledBy="odataOpNameChanges odataOperationRowName"
+                                    app:flag="changes_data"
+                                    select=".onToggleChangesData" />
+                                <CheckBox
+                                    selected="{ path: 'svc>enabled', mode: 'OneWay' }"
+                                    enabled="{= !${svc>/busy} }"
+                                    valueState="{ parts: ['svc>enabled', 'svc>write'], formatter: '.formatEnabledWriteState' }"
+                                    tooltip="{ parts: ['svc>title', 'svc>write'], formatter: '.formatEnableOperation' }"
+                                    ariaLabelledBy="odataOpNameEnabled odataOperationRowName"
+                                    app:flag="enabled"
+                                    select=".onToggleOperationEnabled" />
+                                <Button
+                                    icon="sap-icon://decline"
+                                    type="Transparent"
+                                    enabled="{= !${svc>/busy} }"
+                                    tooltip="{ path: 'svc>title', formatter: '.formatRemoveOperation' }"
+                                    press=".onRemoveOperation" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+            <!-- Who gets what this page enables: the agents that list the
+                 STORED service in a server entry, whether their entry
+                 allows writes, and whether they can be started without a
+                 user (a run endpoint for the job scheduler). Read with the
+                 service; a save reads it again. -->
+            <Panel
+                id="odataUsedByPanel"
+                visible="{= ${svc>/loaded} &amp;&amp; ${svc>/exists} }"
+                class="sapUiResponsiveMargin"
+                width="auto">
+                <headerToolbar>
+                    <Toolbar>
+                        <Title id="odataUsedByTitle" text="{i18n>odataUsedBy}" level="H2" />
+                    </Toolbar>
+                </headerToolbar>
+                <MessageStrip
+                    id="odataUsedByWarning"
+                    visible="{= !!${svc>/usedByWarning} }"
+                    type="Warning"
+                    showIcon="true"
+                    class="sapUiTinyMarginBottom"
+                    text="{svc>/usedByWarning}" />
+                <Table
+                    id="odataUsedByTable"
+                    items="{svc>/used_by}"
+                    noDataText="{i18n>odataNotUsed}"
+                    ariaLabelledBy="odataUsedByTitle">
+                    <columns>
+                        <Column>
+                            <Label text="{i18n>odataColAgent}" />
+                        </Column>
+                        <Column>
+                            <Label text="{i18n>odataColWritesAllowed}" wrapping="true" />
+                        </Column>
+                        <Column minScreenWidth="Tablet" demandPopin="true">
+                            <Label text="{i18n>odataColRunEndpoint}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <VBox>
+                                    <ObjectIdentifier title="{svc>agent}" />
+                                    <ObjectStatus
+                                        text="{i18n>odataAgentDisabled}"
+                                        visible="{= ${svc>enabled} === false }"
+                                        state="None"
+                                        inverted="true" />
+                                </VBox>
+                                <ObjectStatus
+                                    text="{ path: 'svc>allow_write', formatter: '.formatYesNo' }"
+                                    state="{ path: 'svc>allow_write', formatter: '.formatWritesAllowedState' }"
+                                    inverted="true" />
+                                <Text
+                                    text="{ parts: ['svc>expose_api', 'svc>api_slug'], formatter: '.formatRunEndpoint' }"
+                                    class="odataFieldName" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
+            </Panel>
+        </content>
+    </Page>
+</mvc:View>

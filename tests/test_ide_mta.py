@@ -32,14 +32,15 @@ def test_ide_env_vars_are_quoted_strings():
         assert isinstance(value, str), (key, value)
 
 
-def test_mta_version_is_2_19_0():
+def test_mta_version_is_2_20_0():
     mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
-    assert mta["version"] == "2.19.0"
+    assert mta["version"] == "2.20.0"
 
 
-def test_every_ide_property_is_read_by_the_app():
+def test_every_ide_and_odata_property_is_read_by_the_app():
     """A descriptor property nobody reads is a setting that silently does nothing."""
-    names = [k for k in _app_properties() if k.startswith("IDE_")]
+    names = [k for k in _app_properties() if k.startswith(("IDE_", "ODATA_"))]
+    assert any(n.startswith("ODATA_") for n in names), "no ODATA_* properties in mta.yaml"
     sources = [ROOT / "app.py", *(ROOT / "agents").rglob("*.py")]
     code = "\n".join(p.read_text() for p in sources)
     unread = [n for n in names if n not in code]

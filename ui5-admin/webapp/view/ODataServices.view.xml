@@ -1,0 +1,115 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.ODataServices"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="odataServicesPage" title="{i18n>navODataServices}">
+        <headerContent>
+            <Button
+                id="addODataServiceButton"
+                type="Emphasized"
+                icon="sap-icon://add"
+                text="{i18n>odataNewService}"
+                press=".onCreate" />
+        </headerContent>
+        <content>
+            <!-- A failed load is said here, with a retry, so that the empty
+                 table below it cannot be read as an empty catalogue. -->
+            <MessageStrip
+                id="odataLoadFailed"
+                visible="{view>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{view>/loadError}">
+                <link>
+                    <Link id="odataRetry" text="{i18n>odataRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
+            <Table
+                id="odataServicesTable"
+                items="{odata>/items}"
+                growing="true"
+                growingThreshold="50"
+                sticky="ColumnHeaders"
+                popinLayout="GridSmall"
+                noDataText="{ parts: ['view>/loadFailed', 'view>/query'], formatter: '.formatNoData' }">
+                <!-- Search and import sit in the table's toolbar, as the
+                     search does on the Agents page: the page header has no
+                     overflow handling, so on a narrow window they are clipped
+                     there and push the title out. -->
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <SearchField
+                            id="odataSearch"
+                            placeholder="{i18n>odataSearch}"
+                            liveChange=".onSearch"
+                            search=".onSearch">
+                            <!-- The search stays on a phone; only the import
+                                 button moves into the overflow menu. -->
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" maxWidth="18rem" />
+                            </layoutData>
+                        </SearchField>
+                        <ToolbarSpacer />
+                        <Button
+                            id="importODataConfigButton"
+                            icon="sap-icon://upload"
+                            text="{i18n>odataImportConfiguration}"
+                            enabled="{= !${view>/busy} }"
+                            press=".onImportConfiguration" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <Column><Text text="{i18n>odataColService}" /></Column>
+                    <Column width="11rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>odataColDestination}" /></Column>
+                    <Column width="5rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>odataColVersion}" /></Column>
+                    <Column width="9rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>odataColRunsAs}" /></Column>
+                    <Column width="6rem" minScreenWidth="Desktop" demandPopin="true" hAlign="End"><Text text="{i18n>odataColEntitySets}" /></Column>
+                    <Column width="6rem" minScreenWidth="Desktop" demandPopin="true" hAlign="End"><Text text="{i18n>odataColOperations}" /></Column>
+                    <Column width="7rem" minScreenWidth="Desktop" demandPopin="true"><Text text="{i18n>odataColUsedBy}" /></Column>
+                    <Column width="4rem" hAlign="End"><Text text="{i18n>colActions}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <VBox>
+                                <ObjectIdentifier title="{odata>title}" text="{odata>name}" />
+                                <Text text="{odata>purpose}" maxLines="2" />
+                                <HBox>
+                                    <ObjectStatus
+                                        text="{i18n>odataTagWrite}"
+                                        state="Warning"
+                                        inverted="true"
+                                        visible="{odata>has_write}"
+                                        class="sapUiTinyMarginEnd sapUiTinyMarginTop" />
+                                    <ObjectStatus
+                                        text="{i18n>odataTagDisabled}"
+                                        state="Error"
+                                        inverted="true"
+                                        visible="{= !${odata>enabled} }"
+                                        class="sapUiTinyMarginTop" />
+                                </HBox>
+                            </VBox>
+                            <Text text="{odata>destination}" />
+                            <Text text="{ path: 'odata>odata_version', formatter: '.formatVersion' }" />
+                            <ObjectStatus
+                                text="{ path: 'odata>user_context', formatter: '.formatRunsAs' }"
+                                state="{ path: 'odata>user_context', formatter: '.formatRunsAsState' }" />
+                            <Text text="{odata>counts/entity_sets}" />
+                            <Text text="{odata>counts/operations}" />
+                            <Text
+                                text="{ path: 'odata>used_by', formatter: '.formatUsedBy' }"
+                                tooltip="{ path: 'odata>used_by', formatter: '.formatUsedByNames' }" />
+                            <Button
+                                icon="sap-icon://delete"
+                                type="Transparent"
+                                tooltip="{i18n>delete}"
+                                enabled="{= !${view>/busy} }"
+                                press=".onDelete" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
+    </Page>
+</mvc:View>

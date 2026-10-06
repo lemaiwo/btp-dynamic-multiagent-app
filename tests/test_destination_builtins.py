@@ -524,3 +524,277 @@ async def test_destination_health_resolves_with_the_app_token_and_warns_on_misma
     assert gone["state"] == "error" and "does not exist" in gone["error"]
     text = json.dumps(out)
     assert "s3cr3t" not in text and "Authorization" not in text
+
+
+# --- derived-data caches belong to principal AND token -----------------------
+#
+# Under destination + user_context the Graph data is fetched with the bound
+# JWT, while the caches were keyed by `current_principal` alone. A run-as job
+# binds the trigger's token with the run-as user's principal, so the two can
+# name different people.
+
+
+class TokenResolver(FakeResolver):
+    """Hands back a credential that names the user token it was resolved with."""
+
+    async def resolve(self, *, force: bool = False, user_token=None, principal=None) -> Destination:
+        self.calls.append((user_token, principal))
+        return Destination(
+            url=self.url, headers={"Authorization": f"Bearer cred-of-{user_token}"},
+            expires_at=time.monotonic() + 60, per_user=bool(user_token),
+        )
+
+
+async def _as(jwt: str, principal: str, call):
+    j = current_jwt.set(jwt)
+    p = current_principal.set(principal)
+    try:
+        return await call()
+    finally:
+        current_principal.reset(p)
+        current_jwt.reset(j)
+
+
+async def test_outlook_folder_cache_is_not_shared_across_tokens_under_user_context():
+    from agents.outlook_tools import outlook_toolset
+
+    listed: list[str] = []
+    folder_fetches: list[str] = []
+
+    def graph(request: httpx.Request) -> httpx.Response:
+        who = request.headers["Authorization"].removeprefix("Bearer cred-of-jwt-").upper()
+        path = request.url.path
+        if path.endswith("/me/mailFolders/inbox/childFolders"):
+            folder_fetches.append(who)
+            return httpx.Response(200, json={"value": [
+                {"id": f"{who}-agent", "displayName": "agent"}]})
+        if "/mailFolders/" in path and path.endswith("/messages"):
+            listed.append(path.split("/mailFolders/")[1].split("/")[0])
+            return httpx.Response(200, json={"value": []})
+        return httpx.Response(404, json={"error": {"message": path}})
+
+    rec = Recorder(graph)
+    toolset = outlook_toolset(
+        {"destination": "GRAPH", "user_context": True}, auth_mode="destination",
+        http=_http(TokenResolver("https://graph.microsoft.com"), rec, user_context=True,
+                   server_key="builtin:outlook", expected_hosts=("graph.microsoft.com",)),
+    )
+    pending = toolset.tools["list_pending"].function
+    # Alice triggers a job that runs as Bob: her token, his principal.
+    await _as("jwt-alice", "bob@example.com", lambda: pending("agent"))
+    # Bob's own request must look up Bob's folders, not reuse Alice's ids.
+    await _as("jwt-bob", "bob@example.com", lambda: pending("agent"))
+    # ... and Alice's own request is not served the entry filed under Bob.
+    await _as("jwt-alice", "alice@example.com", lambda: pending("agent"))
+    assert listed == ["ALICE-agent", "BOB-agent", "ALICE-agent"]
+    # Each (principal, token) pair is still cached for itself.
+    await _as("jwt-bob", "bob@example.com", lambda: pending("agent"))
+    assert folder_fetches == ["ALICE", "BOB", "ALICE"] and listed[-1] == "BOB-agent"
+
+
+async def test_teams_channel_cache_is_not_shared_across_tokens_under_user_context():
+    from agents.teams_tools import teams_toolset
+
+    fetches: list[str] = []
+
+    def graph(request: httpx.Request) -> httpx.Response:
+        who = request.headers["Authorization"].removeprefix("Bearer cred-of-jwt-")
+        fetches.append(who)
+        return httpx.Response(200, json={"value": [
+            {"id": f"19:{who}", "displayName": f"Private to {who}", "description": ""}]})
+
+    rec = Recorder(graph)
+    toolset = teams_toolset(
+        {"destination": "GRAPH", "user_context": True, "team": "team-1"},
+        auth_mode="destination",
+        http=_http(TokenResolver("https://graph.microsoft.com"), rec, user_context=True,
+                   server_key="builtin:teams"),
+    )
+    channels = toolset.tools["list_channels"].function
+    first = await _as("jwt-alice", "bob@example.com", channels)
+    bob = await _as("jwt-bob", "bob@example.com", channels)
+    alice = await _as("jwt-alice", "alice@example.com", channels)
+    assert [c[0]["id"] for c in (first, bob, alice)] == ["19:alice", "19:bob", "19:alice"]
+    assert await _as("jwt-bob", "bob@example.com", channels) == bob
+    assert fetches == ["alice", "bob", "alice"]
+
+
+async def test_graph_caches_keep_their_key_outside_user_context(signed_in):
+    """Pinned mailbox / app-level destination: the data is the mailbox's or the
+    team's as the app sees it, so the key does not depend on the bound token."""
+    from agents.outlook_tools import OutlookClient, outlook_toolset
+    from agents.teams_tools import TeamsClient
+
+    fetches: list[str] = []
+
+    def graph(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/childFolders"):
+            fetches.append("folders")
+            return httpx.Response(200, json={"value": [{"id": "F1", "displayName": "agent"}]})
+        return httpx.Response(200, json={"value": []})
+
+    rec = Recorder(graph)
+    toolset = outlook_toolset(
+        {"destination": "GRAPH", "mailbox": "svc@example.com"}, auth_mode="destination",
+        http=_http(FakeResolver("https://graph.microsoft.com"), rec, user_context=False,
+                   server_key="builtin:outlook"),
+    )
+    pending = toolset.tools["list_pending"].function
+    await _as("jwt-alice", "alice@example.com", lambda: pending("agent"))
+    await _as("jwt-bob", "bob@example.com", lambda: pending("agent"))
+    assert fetches == ["folders"], "one pinned mailbox, one lookup, whoever asks"
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com", transport=rec.transport())
+    outlook = OutlookClient(http)  # oauth2: the principal's own stored token
+    assert outlook.token_bound is False and outlook._cache_key() == "ann"
+    assert OutlookClient(http, mailbox="svc@example.com", token_bound=True)._cache_key() == (
+        "svc@example.com")
+    teams = TeamsClient(http, "team-1")
+    assert teams.token_bound is False and teams._cache_key() == "ann"
+    bound = TeamsClient(http, "team-1", token_bound=True)._cache_key()
+    assert bound[0] == "ann" and "jwt-ann" not in repr(bound)
+
+
+async def test_graph_caches_expire(monkeypatch, signed_in):
+    from agents import outlook_tools, teams_tools
+    from agents.outlook_tools import OutlookClient
+    from agents.teams_tools import TeamsClient
+
+    fetches: list[str] = []
+
+    def graph(request: httpx.Request) -> httpx.Response:
+        fetches.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(200, json={"value": [{"id": "X", "displayName": "agent"}]})
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                             transport=httpx.MockTransport(graph))
+    outlook, teams = OutlookClient(http), TeamsClient(http, "team-1")
+    for _ in range(2):
+        await outlook._folder_id("agent")
+        await teams.list_channels()
+    assert fetches == ["childFolders", "channels"]
+    monkeypatch.setattr(outlook_tools, "FOLDER_CACHE_TTL_SECONDS", 0)
+    monkeypatch.setattr(teams_tools, "CHANNEL_CACHE_TTL_SECONDS", 0)
+    outlook._folders.clear()
+    teams._channels.clear()
+    for _ in range(2):  # stored already expired: every call looks again
+        await outlook._folder_id("agent")
+        await teams.list_channels()
+    assert fetches[2:] == ["childFolders", "channels", "childFolders", "channels"]
+
+
+async def test_graph_caches_drop_expired_entries_on_insert():
+    """A refreshed JWT leaves a dead entry behind under user_context; those
+    must not fill the slots that live entries need."""
+    from agents.outlook_tools import OutlookClient
+    from agents.teams_tools import TeamsClient
+
+    def graph(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [{"id": "X", "displayName": "agent"}]})
+
+    http = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                             transport=httpx.MockTransport(graph))
+    outlook = OutlookClient(http, token_bound=True)
+    teams = TeamsClient(http, "team-1", token_bound=True)
+
+    async def touch():
+        await outlook._folder_id("agent")
+        await teams.list_channels()
+
+    await _as("jwt-bob-1", "bob@example.com", touch)
+    await _as("jwt-alice", "alice@example.com", touch)
+    assert len(outlook._folders) == 2 and len(teams._channels) == 2
+    bob_old = next(iter(outlook._folders))
+    for cache in (outlook._folders, teams._channels):
+        first = next(iter(cache))
+        cache[first] = (0.0, cache[first][1])  # Bob's first entry has expired
+    await _as("jwt-bob-2", "bob@example.com", touch)
+    for cache in (outlook._folders, teams._channels):
+        assert [k[0] for k in cache] == ["alice@example.com", "bob@example.com"]
+    assert bob_old not in outlook._folders
+
+
+# ---------------------------------------------------------------------------
+# `send_through` is a hook AROUND the destination being applied: whatever an
+# override does, the request leaves for the host and scheme the destination
+# rules chose, or not at all.
+# ---------------------------------------------------------------------------
+
+from agents.destination_auth import PLACEHOLDER_BASE, DestinationAuth  # noqa: E402
+
+
+async def _send_with(auth_class, recorder, **options):
+    resolver = FakeResolver("https://api.example.com/base")
+    auth = auth_class(resolver, server_key="builtin:test", **options)
+    async with httpx.AsyncClient(
+        base_url=PLACEHOLDER_BASE, auth=auth, transport=recorder.transport()
+    ) as http:
+        return await http.get("/v1/things")
+
+
+async def test_an_override_may_pin_headers_after_the_destination_is_applied():
+    class Pinned(DestinationAuth):
+        def send_through(self, request, destination):
+            super().send_through(request, destination)
+            request.headers["Accept"] = "application/xml"
+
+    recorder = Recorder(lambda request: httpx.Response(200))
+    assert (await _send_with(Pinned, recorder)).status_code == 200
+    (sent,) = recorder.requests
+    assert str(sent.url) == "https://api.example.com/base/v1/things"
+    assert sent.headers["Authorization"] == "Bearer dest-token"
+    assert sent.headers["Accept"] == "application/xml"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda url: url.copy_with(host="elsewhere.example.org"),
+        lambda url: url.copy_with(scheme="http"),
+        lambda url: url.copy_with(port=8443),
+    ],
+    ids=["host", "scheme", "port"],
+)
+async def test_an_override_cannot_send_the_credential_somewhere_else(change):
+    class Moved(DestinationAuth):
+        def send_through(self, request, destination):
+            super().send_through(request, destination)
+            request.url = change(request.url)
+
+    recorder = Recorder(lambda request: httpx.Response(200))
+    with pytest.raises(DestinationError, match="refusing to send") as caught:
+        await _send_with(Moved, recorder)
+    assert recorder.requests == []
+    assert "example" not in str(caught.value)  # names no host
+
+
+async def test_an_override_that_never_applies_the_destination_sends_nothing():
+    class Skipped(DestinationAuth):
+        def send_through(self, request, destination):
+            request.headers["Authorization"] = "Bearer of-its-own"
+
+    recorder = Recorder(lambda request: httpx.Response(200))
+    with pytest.raises(DestinationError, match="refusing to send"):
+        await _send_with(Skipped, recorder)
+    assert recorder.requests == []
+
+
+async def test_the_retry_after_a_401_is_checked_like_the_first_attempt():
+    class MovedOnRetry(DestinationAuth):
+        attempts = 0
+
+        def send_through(self, request, destination):
+            super().send_through(request, destination)
+            self.attempts += 1
+            if self.attempts == 2:
+                request.url = request.url.copy_with(host="elsewhere.example.org")
+
+    hosts: list[str] = []  # at the moment of sending: the request object is reused
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(401)
+
+    with pytest.raises(DestinationError, match="refusing to send"):
+        await _send_with(MovedOnRetry, Recorder(refuse))
+    assert hosts == ["api.example.com"]

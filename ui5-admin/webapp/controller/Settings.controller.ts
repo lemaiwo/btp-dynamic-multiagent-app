@@ -4,7 +4,14 @@ import MessageToast from "sap/m/MessageToast";
 import Fragment from "sap/ui/core/Fragment";
 import type Dialog from "sap/m/Dialog";
 import BaseController from "./BaseController";
-import type { ImportPayload } from "../service/types";
+import ErrorHandler from "../service/ErrorHandler";
+import importBundle, { type BundleOpens } from "../model/importBundle";
+import type { ImportPayload, ImportResult } from "../service/types";
+
+/** How an import names the fields of `odata_identity_changes`. */
+const IDENTITY_FIELD_TEXT: Record<string, string> = {
+    destination: "importIdentityFieldDestination", user_context: "importIdentityFieldRunsAs"
+};
 
 /** Shape of `POST /admin/api/restart`'s body (agents/admin.py:api_restart).
  * The endpoint always answers 200 even when the CF bounce itself did not
@@ -20,6 +27,9 @@ interface RestartResult {
 export default class Settings extends BaseController {
 
     private importDialog?: Dialog;
+
+    /** An import is being asked about or sent: no second one meanwhile. */
+    private importing = false;
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -180,28 +190,142 @@ export default class Settings extends BaseController {
         this.importDialog?.close();
     }
 
-    public async onConfirmImport(): Promise<void> {
+    /**
+     * Imports the pasted bundle.
+     *
+     * A bundle can create or replace catalogue services (with their writes,
+     * their destination and the identity they run as), give an agent "Allow
+     * writes" and, with "replace", delete catalogue services. So what it
+     * opens is read from the bundle first and asked about, with Cancel as
+     * the default; a bundle without any of it imports as it always did.
+     * When that cannot be read from the bundle the question is asked all the
+     * same, in general words: never an import of this kind unseen.
+     */
+    public onConfirmImport(): void {
+        if (this.importing) {
+            return;
+        }
         const importModel = this.getModel("import") as JSONModel;
         const raw = importModel.getProperty("/text") as string;
 
-        let payload: ImportPayload;
+        let parsed: unknown;
         try {
-            payload = JSON.parse(raw) as ImportPayload;
+            parsed = JSON.parse(raw);
         } catch {
             MessageBox.error(this.text("importInvalidJson"));
             return;
         }
-        payload.replace = importModel.getProperty("/replace") as boolean;
-
-        const ok = await this.runOk(
-            this.getAdminService().importConfig(payload),
-            "The import failed."
-        );
-        if (ok) {
-            this.importDialog?.close();
-            MessageToast.show(this.text("importDone"));
-            void this.load();
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+            // No bundle at all: nothing the server could import.
+            MessageBox.error(this.text("importNotBundle"));
+            return;
         }
+        const payload = parsed as ImportPayload;
+        payload.replace = importModel.getProperty("/replace") === true;
+
+        const found = importBundle.opens(payload);
+        const question = !found
+            ? this.text("importAskUnknown")
+            : importBundle.mustAsk(found, payload.replace) ? this.importQuestion(found, payload.replace) : "";
+        if (!question) {
+            void this.sendImport(payload);
+            return;
+        }
+        const go = this.text("importConfig");
+        this.importing = true;
+        MessageBox.warning(question, {
+            title: this.text("importAskTitle"),
+            actions: [go, MessageBox.Action.CANCEL],
+            emphasizedAction: go,
+            initialFocus: MessageBox.Action.CANCEL,
+            onClose: (action: string | null) => {
+                this.importing = false;
+                if (action === go) {
+                    void this.sendImport(payload);
+                }
+            }
+        });
+    }
+
+    /** What the import brings, service by service and agent by agent. */
+    private importQuestion(found: BundleOpens, replace: boolean): string {
+        const parts: string[] = [this.text("importAskIntro")];
+        if (found.services.length) {
+            parts.push([this.text("importAskServices")].concat(found.services.map((service) => this.text(
+                service.writes.length ? "importAskService" : "importAskServiceNoWrites", [
+                    service.title, service.name,
+                    this.text(service.userContext ? "odataRunsAsUser" : "odataRunsAsTechnical"),
+                    service.destination, service.writes.join("; ")
+                ]
+            ))).join("\n"));
+        }
+        if (found.writers.length) {
+            parts.push([this.text("importAskWriters")].concat(found.writers.map((writer) => (
+                this.text("importAskWriter", [writer.agent, writer.services.join(", ")])
+            ))).join("\n"));
+        }
+        if (replace && found.hasCatalogue) {
+            parts.push(this.text("importAskReplace"));
+        }
+        return parts.join("\n\n");
+    }
+
+    private async sendImport(payload: ImportPayload): Promise<void> {
+        if (this.importing) {
+            return;
+        }
+        this.importing = true;
+        let result: ImportResult;
+        try {
+            result = await this.getAdminService().importConfig(payload);
+        } catch (error) {
+            ErrorHandler.handle(error, "The import failed.");
+            return;
+        } finally {
+            this.importing = false;
+        }
+        this.importDialog?.close();
+        const notes = this.importNotes(result ?? { status: "" });
+        if (notes.length) {
+            // What the import changed for agents in use, and a reload that
+            // failed, stay on screen until they are closed.
+            MessageBox.warning([this.text("importDone")].concat(notes).join("\n\n"), {
+                title: this.text("importNotesTitle")
+            });
+        } else {
+            MessageToast.show(this.text("importDone"));
+        }
+        void this.load();
+    }
+
+    /**
+     * What the answer of an import says besides "imported": the catalogue
+     * services it deleted, the services in use whose destination or identity
+     * it changed, the server's other warnings (its text, shown as text), and
+     * a reload of the running agents that failed.
+     */
+    private importNotes(result: ImportResult): string[] {
+        const notes: string[] = [];
+        const removed = (result.removed_odata_service_names ?? []).filter((name) => typeof name === "string");
+        if (removed.length) {
+            notes.push(this.text("importRemovedServices", [removed.join(", ")]));
+        }
+        (result.odata_identity_changes ?? []).forEach((change) => {
+            const fields = (change.changed ?? []).map((field) => (
+                IDENTITY_FIELD_TEXT[field] ? this.text(IDENTITY_FIELD_TEXT[field]) : String(field)
+            ));
+            notes.push(this.text("importIdentityChange", [
+                String(change.service), fields.join(", "), (change.agents ?? []).join(", ")
+            ]));
+        });
+        const others = importBundle.otherWarnings(result);
+        if (others.length) {
+            notes.push([this.text("importWarnings")].concat(others).join("\n"));
+        }
+        if (result.reload_failed === true) {
+            notes.push(this.text("reloadFailedText", [this.text("reloadFailedImported")]));
+        }
+        return notes;
     }
 
 }

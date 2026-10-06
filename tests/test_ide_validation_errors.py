@@ -1,5 +1,8 @@
 """A refused IDE request body is a 422 that never echoes the input.
 
+(The handler is app-wide since it moved to ``agents/validation_errors.py``;
+this file pins the IDE routes.)
+
 FastAPI's default 422 carries each error's ``input``. A lone surrogate
 (half a UTF-16 pair, e.g. a field cut inside an emoji) in that input cannot
 be encoded as UTF-8, so the error answer itself failed: a 500. The IDE
@@ -20,11 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-(ROOT / "tests" / "_test_ide_validation_errors.db").unlink(missing_ok=True)
-os.environ.setdefault(
-    "DATABASE_URL",
-    f"sqlite+aiosqlite:///{ROOT / 'tests' / '_test_ide_validation_errors.db'}",
-)
+from tests.testdb import use_test_database  # noqa: E402
+
+use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 
@@ -158,10 +159,11 @@ async def test_title_of_only_control_characters_is_422(client, sid):
     _assert_plain_422(r)
 
 
-async def test_other_routes_keep_fastapi_default(client):
+async def test_other_routes_get_the_same_answer(client):
+    # The handler started as IDE-only; it now covers every route of the app
+    # (agents/validation_errors, tests/test_admin_validation_errors.py).
     r = await client.post("/other", json={})
-    assert r.status_code == 422
-    assert "input" in r.json()["detail"][0]
+    _assert_plain_422(r)
 
 
 def test_app_installs_the_handler():
@@ -169,4 +171,4 @@ def test_app_installs_the_handler():
 
     handler = app_module.app.exception_handlers.get(RequestValidationError)
     assert handler is not None
-    assert getattr(handler, "__module__", "") == "agents.ide.routes"
+    assert getattr(handler, "__module__", "") == "agents.validation_errors"

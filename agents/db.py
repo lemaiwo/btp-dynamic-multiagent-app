@@ -14,7 +14,7 @@ import os
 import re
 import ssl
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -33,8 +33,19 @@ from sqlalchemy import (
     text,
     update,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from agents.odata import BUILTIN_ODATA_URL
+
+# The catalogue's save-time gate lives with its models; re-exported because
+# every other `validate_*` of a stored definition is found in this module.
+from agents.odata.models import SERVICE_NAME_RE as _ODATA_SERVICE_NAME_RE
+from agents.odata.models import WRITE_OPS as _ODATA_WRITE_OPS
+from agents.odata.models import ServiceDefinition as _ODataServiceDefinition
+from agents.odata.models import operation_is_write as _odata_operation_is_write
+from agents.odata.models import validate_odata_service  # noqa: F401  (re-export)
 
 # Supported MCP auth modes
 AUTH_MODE_JWT = "jwt"
@@ -474,6 +485,284 @@ class SkillConfig(Base):
             "name": self.name,
             "description": self.description,
             "content": self.content,
+        }
+
+
+
+def _odata_stamp(value: datetime | None) -> str | None:
+    """A stored timestamp the way ``ODataServicePayload`` dumps one.
+
+    SQLite hands a timezone-aware column back naive, Postgres hands it back
+    aware; both hold UTC (`_odata_utc` writes it). Formatting it here the way
+    pydantic does keeps ``to_export()`` equal to a payload dump on either
+    database, so an export imports unchanged.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    text_value = value.astimezone(timezone.utc).isoformat()
+    return text_value.replace("+00:00", "Z")
+
+
+def _odata_utc(value: Any) -> datetime | None:
+    """``metadata_fetched_at`` of a validated payload as an aware UTC datetime.
+
+    A value without an offset is taken as UTC: the app writes this stamp
+    itself (the moment `$metadata` was read), always in UTC.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, datetime):
+        value = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+class ODataService(Base):
+    """One catalogue service of ``builtin:odata``.
+
+    What an admin curated from a service's ``$metadata``: the destination it
+    is reached through, whose identity a call carries (``user_context``) and
+    the entity sets, fields and operations that exist for agents
+    (``definition_json``, an ``agents.odata.models.ServiceDefinition``).
+    Agents attach a service by ``name``, like skills, so the name is the
+    stable handle and is never changed after creation.
+    """
+
+    __tablename__ = "odata_services"
+    __table_args__ = (UniqueConstraint("name", name="uq_odata_services_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Widths follow the limits in agents/odata/models.py. SQLite ignores
+    # them and Postgres does not (see AUTH_MODE_MAX_LENGTH above), so a
+    # limit raised there must be raised here too; tests/test_odata_db.py
+    # holds the two together.
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(String(120), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(200), nullable=False)
+    not_for: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="", server_default=""
+    )
+    destination: Mapped[str] = mapped_column(String(200), nullable=False)
+    # 1 = every call runs as the signed-in user (principal propagation);
+    # 0 = as the destination's technical user. Integer 0/1 like expose_chat.
+    user_context: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    odata_version: Mapped[str] = mapped_column(String(2), nullable=False)
+    service_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    definition_json: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    enabled: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    # The version the admin API compares with ``expected_updated_at``. The
+    # default stamps a new row; no ``onupdate``: `_next_odata_stamp` owns the
+    # column on update (`update_odata_service`), and a second source would
+    # be whole seconds on SQLite and the transaction's start on Postgres.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    def _stored_definition(self) -> dict[str, Any] | None:
+        """The stored definition, or None when it is not a JSON object."""
+        try:
+            value = json.loads(self.definition_json or "")
+        except (TypeError, ValueError):
+            logger.warning("Malformed definition_json on OData service %s", self.name)
+            return None
+        return value if isinstance(value, dict) else None
+
+    @property
+    def definition(self) -> dict[str, Any]:
+        """The definition as a plain dict; ``{}`` when the stored text is
+        unreadable, so a broken row still lists and can be repaired."""
+        return self._stored_definition() or {}
+
+    def _counts_and_write(self) -> tuple[dict[str, int], bool]:
+        """Entity set and operation counts, and whether anything can change
+        data in SAP (same rule as ``ServiceDefinition.has_write``).
+
+        Read from the dict rather than through the models: the service list
+        asks this for every row, and re-validating up to 2 MB per row would
+        make the list as slow as the largest definition. An unreadable
+        definition counts as writing: this flag labels a service in the
+        admin list, and "read-only" must never be the answer to "unknown".
+        """
+        stored = self._stored_definition()
+        if stored is None:
+            return {"entity_sets": 0, "operations": 0}, True
+        sets = [e for e in stored.get("entity_sets") or [] if isinstance(e, dict)]
+        ops = [o for o in stored.get("operations") or [] if isinstance(o, dict)]
+        has_write = any(
+            op in _ODATA_WRITE_OPS for e in sets for op in e.get("operations") or []
+        ) or any(
+            # The models' own rule: a missing flag and every POST are writes.
+            bool(o.get("enabled"))
+            and _odata_operation_is_write(o.get("changes_data"), o.get("http_method"))
+            for o in ops
+        )
+        return {"entity_sets": len(sets), "operations": len(ops)}, has_write
+
+    def to_export(self) -> dict[str, Any]:
+        """Exactly an ``ODataServicePayload`` dump: portable, no ids, and no
+        timestamp except when the metadata was read."""
+        return {
+            "name": self.name,
+            "title": self.title,
+            "purpose": self.purpose,
+            "not_for": self.not_for or "",
+            "destination": self.destination,
+            "user_context": bool(self.user_context),
+            "odata_version": self.odata_version,
+            "service_path": self.service_path,
+            "enabled": bool(self.enabled),
+            "definition": self.definition,
+            "metadata_fetched_at": _odata_stamp(self.metadata_fetched_at),
+        }
+
+    def to_summary(self, used_by: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """``to_dict`` without the definition, for the service list."""
+        counts, has_write = self._counts_and_write()
+        data = self.to_export()
+        del data["definition"]
+        data.update(
+            id=self.id,
+            created_at=self.created_at.isoformat() if self.created_at else None,
+            updated_at=self.updated_at.isoformat() if self.updated_at else None,
+            counts=counts,
+            has_write=has_write,
+            used_by=list(used_by or []),
+        )
+        return data
+
+    def to_dict(self, used_by: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """``to_summary`` plus the definition and ``uncallable_operations``:
+        the ENABLED operations no agent can ever call, as ``[{name,
+        reason}]`` (``agents.odata.calls``). A warning for the admin UI, not
+        a refusal -- the save stands. Not in the summary: it validates every
+        operation, which the service list must not do per row."""
+        # Imported here: the dialects pull in the OData client.
+        from agents.odata.calls import uncallable_operations
+
+        data = self.to_summary(used_by)
+        data["definition"] = self.definition
+        data["uncallable_operations"] = uncallable_operations(
+            self.definition, self.odata_version
+        )
+        return data
+
+
+class ODataAuditLog(Base):
+    """One row per create, update or delete an agent sent through
+    ``builtin:odata``: who, which service and entity, and how it ended.
+
+    Written in two steps by ``agents.odata.audit.StoredWriteRecorder``: the
+    row is inserted with outcome ``intent`` before anything is sent, and
+    finalised exactly once afterwards (a conditional UPDATE on ``outcome =
+    'intent'``): by ``result``, or by ``abandon``, which closes the intent
+    of a write that was never sent as ``refused`` / ``token``. Those two
+    statements are the only ones that update a row, and only
+    ``purge_odata_audit`` deletes rows, by age. A row that stays ``intent`` is explained in the
+    docstring of ``agents.odata.audit``.
+
+    Two identities, on purpose: ``sent_as`` is whose credential SAP saw
+    (derived from the token actually sent, or ``technical:<destination>``),
+    ``run_principal`` is the principal of the run -- in a job the run-as
+    user, which can differ from the owner of the token the run carries.
+
+    ``key_json`` / ``created_key_json`` hold the key VALUES of the entity
+    touched (an audit must name it) and ``body_fields_json`` the *names* of
+    the fields sent, never their values. So the table can hold personal
+    data (key values, principals): it is read by admins only and purged by
+    age. Never stored: a body value, a token, a cookie, an ETag. No foreign
+    key to ``odata_services`` -- the log outlives the service it names.
+    """
+
+    __tablename__ = "odata_audit_log"
+    __table_args__ = (
+        UniqueConstraint("call_id", name="uq_odata_audit_log_call_id"),
+        # What an operator asks: one service, one sender, or "what is still
+        # open" (outcome = intent), each newest first.
+        Index("ix_odata_audit_log_service_created", "service", "created_at"),
+        Index("ix_odata_audit_log_sent_as_created", "sent_as", "created_at"),
+        Index("ix_odata_audit_log_outcome_created", "outcome", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # UTC. `created_at` is when the intent was recorded (before the request),
+    # `finished_at` when the result was; NULL while the row is an intent.
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    call_id: Mapped[str] = mapped_column(String(32), nullable=False)  # uuid4 hex
+    agent: Mapped[str] = mapped_column(String(64), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # "technical:<destination>", the principal of the token sent, or
+    # "token:<sha256>" when that token's owner could not be named.
+    sent_as: Mapped[str] = mapped_column(String(255), nullable=False)
+    run_principal: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    token_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)  # sha256 hex
+    service: Mapped[str] = mapped_column(String(64), nullable=False)
+    target: Mapped[str] = mapped_column(String(128), nullable=False)
+    operation: Mapped[str] = mapped_column(String(16), nullable=False)  # create|update|delete
+    key_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_key_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    body_fields_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # NULL while the row is an intent (nothing is known yet -- it must not
+    # read as "nothing left"); then "token": no modifying request left the
+    # app, or "write": one did.
+    phase: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # intent | ok | refused | sap_error | unknown | cancelled
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    def to_dict(self) -> dict[str, Any]:
+        """The row for the admin audit route (key values included)."""
+
+        def stamp(value: datetime | None) -> str | None:
+            if value is None:
+                return None
+            # SQLite hands a timestamp back without its zone; it was UTC.
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat()
+
+        def loaded(text_value: str | None) -> Any:
+            if text_value is None:
+                return None
+            try:
+                return json.loads(text_value)
+            except ValueError:
+                return None
+
+        return {
+            "id": self.id,
+            "call_id": self.call_id,
+            "created_at": stamp(self.created_at),
+            "finished_at": stamp(self.finished_at),
+            "agent": self.agent,
+            "run_id": self.run_id,
+            "service": self.service,
+            "target": self.target,
+            "operation": self.operation,
+            "key": loaded(self.key_json),
+            "created_key": loaded(self.created_key_json),
+            "fields": loaded(self.body_fields_json) or [],
+            "phase": self.phase,
+            "outcome": self.outcome,
+            "status": self.http_status,
+            "sent_as": self.sent_as,
+            "run_principal": self.run_principal,
+            "token_digest": self.token_digest,
         }
 
 
@@ -1329,7 +1618,7 @@ def validate_api_slug(slug: str | None) -> str | None:
         return None
     if not API_SLUG_RE.match(text_):
         raise ValueError(
-            f"api_slug {text_!r} is invalid: use lower-case letters, digits and "
+            "api_slug is invalid: use lower-case letters, digits and "
             "hyphens, starting with a letter or digit (max 64 characters)"
         )
     return text_
@@ -1480,6 +1769,9 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     src = oauth if isinstance(oauth, dict) else {}
     cleaned: dict[str, Any] = {}
     builtin = str(url or "").strip().rstrip("/").lower()
+    if builtin == BUILTIN_ODATA_URL:
+        # The one destination-mode block without a destination name.
+        return _clean_odata_entry(src)
     if builtin in _DEST_KEYS_BY_URL:
         # The built-ins that gained destination mode later keep their own
         # pinned keys plus the user-context switch; see `# --- destinations ---`.
@@ -1634,6 +1926,7 @@ def prepare_servers(
                 prev_oauth_by_url[s["url"]] = s["oauth"]
 
     normalized: list[dict[str, Any]] = []
+    odata_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
         mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
@@ -1641,6 +1934,17 @@ def prepare_servers(
             raise ValueError("MCP server url is required")
         if mode not in VALID_AUTH_MODES:
             raise ValueError(f"invalid auth_mode {mode!r}")
+        if url.rstrip("/").lower() == BUILTIN_ODATA_URL:
+            # Stored under exactly this spelling. `odata_entries` (who uses a
+            # service) forgives case and a trailing slash, the registry's
+            # built-in lookup does not: any other spelling would be an entry
+            # that blocks the delete of a service it can never call.
+            url = BUILTIN_ODATA_URL
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(_ODATA_MODE_MESSAGE)
+            if odata_seen:
+                raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
+            odata_seen = True
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
@@ -1654,6 +1958,23 @@ def prepare_servers(
     )
     primary_clean = {"url": primary["url"], "auth_mode": primary["auth_mode"]}
     return primary_clean, extras, primary_oauth_json
+
+
+def prepared_server_list(
+    primary: dict[str, Any], extras: list[dict[str, Any]], primary_oauth_json: str | None
+) -> list[dict[str, Any]]:
+    """`prepare_servers` output as one server list, primary first: the list
+    the row will hold (``AgentConfig.mcp_servers`` after the write).
+
+    For checks that must judge what is stored rather than what was sent
+    (`check_odata_services`): a second reading of the raw input would be a
+    second normaliser of URL spelling and block shape, free to drift from
+    the one that decides what is written.
+    """
+    first = dict(primary)
+    if primary_oauth_json:
+        first["oauth"] = json.loads(primary_oauth_json)
+    return [first, *extras]
 
 
 async def normalize_skills_json(
@@ -1736,6 +2057,13 @@ async def upsert_agent(
     name = name.strip()
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
+    # Here rather than in the admin routes: scripts and seeds write agents
+    # through this function too, and none of them may store a service name
+    # the catalogue does not have. On the prepared list, i.e. on exactly the
+    # entries the row is about to hold.
+    await check_odata_services(
+        session, prepared_server_list(primary, extras, primary_oauth_json)
+    )
     extras_json = json.dumps(extras) if extras else None
     skills_json = await normalize_skills_json(session, skills)
     # Order-preserving de-duplication: the same peer listed twice would
@@ -2035,6 +2363,430 @@ async def delete_skill(session: AsyncSession, skill_id: int) -> bool:
     await session.delete(row)
     await session.commit()
     return True
+
+
+
+# --- OData services ---
+def odata_service_columns(data: dict[str, Any]) -> dict[str, Any]:
+    """Column values for a service from ``validate_odata_service`` output.
+
+    The definition is stored as ``ServiceDefinition.model_dump_json()``, the
+    exact text ``MAX_DEFINITION_BYTES`` was measured on, so a definition that
+    passed the cap is never larger in the table than the gate allowed.
+
+    Public, and pure, for a caller that writes many services in one request
+    (the bundle import): building the JSON runs the definition models once
+    more, which for a large definition is work to do off the event loop and
+    then hand to `create_odata_service` / `update_odata_service` as
+    ``columns``.
+    """
+    definition = _ODataServiceDefinition.model_validate(data.get("definition") or {})
+    return {
+        "title": data["title"],
+        "purpose": data["purpose"],
+        "not_for": data.get("not_for") or "",
+        "destination": data["destination"],
+        "user_context": 1 if data.get("user_context") is True else 0,
+        "odata_version": data["odata_version"],
+        "service_path": data["service_path"],
+        "definition_json": definition.model_dump_json(),
+        "metadata_fetched_at": _odata_utc(data.get("metadata_fetched_at")),
+        "enabled": 0 if data.get("enabled") is False else 1,
+    }
+
+
+async def list_odata_services(
+    session: AsyncSession, *, lock: bool = False
+) -> list[ODataService]:
+    """Every catalogue service, in name order.
+
+    ``lock`` takes an exclusive row lock on each (Postgres; SQLite has none
+    and serialises writers), held until the caller's transaction ends. For a
+    writer of many services at once (the bundle import): an agent save that
+    attaches one of them waits (`existing_odata_service_names`), exactly as
+    it does for the delete route. The name order is the lock order, so two
+    such writers cannot wait for each other.
+    """
+    result = await session.execute(_list_odata_services_query(lock=lock))
+    return list(result.scalars().all())
+
+
+def _list_odata_services_query(*, lock: bool) -> Any:
+    """The statement of `list_odata_services`; a function of its own so a
+    test can compile it for Postgres (``FOR UPDATE``)."""
+    query = select(ODataService).order_by(ODataService.name)
+    if lock:
+        query = query.with_for_update()
+    return query
+
+
+async def get_odata_service(session: AsyncSession, name: str) -> ODataService | None:
+    result = await session.execute(select(ODataService).where(ODataService.name == name))
+    return result.scalar_one_or_none()
+
+
+async def existing_odata_service_names(
+    session: AsyncSession, names: list[str], *, lock: bool = False
+) -> set[str]:
+    """Which of ``names`` are catalogue services right now (enabled or not).
+
+    ``lock`` takes a shared row lock on the services found, held until the
+    caller's transaction ends: an agent write that attaches them cannot
+    commit a name whose delete has already been issued (the select waits for
+    that delete and then no longer finds the row). A delete issued later
+    waits for the agent write; whether it then still goes through is decided
+    by the delete's own referrer check. Postgres only; SQLite has no row
+    locks, ignores the clause and serialises writers anyway.
+    """
+    if not names:
+        return set()
+    query = _existing_odata_names_query(names, lock=lock)
+    return set((await session.execute(query)).scalars().all())
+
+
+def _existing_odata_names_query(names: list[str], *, lock: bool) -> Any:
+    """The statement of `existing_odata_service_names`; a function of its own
+    so a test can compile it for Postgres (``FOR SHARE``), which no
+    SQLite-backed suite would otherwise see."""
+    query = select(ODataService.name).where(ODataService.name.in_(sorted(set(names))))
+    if lock:
+        query = query.with_for_update(read=True)
+    return query
+
+
+async def check_odata_services(session: AsyncSession, servers: list[dict[str, Any]]) -> None:
+    """Refuse a server list that attaches a service the catalogue lacks.
+
+    ``ValueError("unknown OData service 'x'")``, every missing name in the
+    order listed. Called by every write of an agent's servers
+    (`upsert_agent`, and the admin update route beside its own
+    `prepare_servers`), in the session that then writes the row and with the
+    found rows locked, so the answer holds until that write commits. Both
+    hand over `prepared_server_list(...)`, the entries as they will be
+    stored, so this check and storage cannot disagree on what counts as a
+    ``builtin:odata`` entry.
+
+    A dangling name is not harmless: the agent would be attached, with
+    whatever ``allow_write`` its entry holds, to the next service somebody
+    creates under that name, without anyone saving the agent again. A
+    disabled service exists and may be attached: an admin prepares the agent
+    first and switches the service on later; the run time leaves it out
+    until then.
+
+    A name is repeated in the message only when it has the form of a service
+    name; anything else is "invalid service name", without the value.
+    """
+    names: list[str] = []
+    for block in odata_entries(servers):
+        services = block.get("services")
+        for name in services if isinstance(services, list) else []:
+            if not isinstance(name, str) or not re.fullmatch(_ODATA_SERVICE_NAME_RE, name):
+                raise ValueError("invalid service name")
+            if name not in names:
+                names.append(name)
+    if not names:
+        return
+    found = await existing_odata_service_names(session, names, lock=True)
+    missing = [n for n in names if n not in found]
+    if missing:
+        raise ValueError("unknown OData service " + ", ".join(f"'{n}'" for n in missing))
+
+
+async def _begin_before_savepoint(session: AsyncSession) -> None:
+    """Make sure a real transaction is open before a SAVEPOINT on SQLite.
+
+    The sqlite3 driver opens its transaction only at the first INSERT,
+    UPDATE or DELETE. A SAVEPOINT issued before that is the outermost one,
+    and releasing it COMMITS: the row of a caller with ``commit=False``
+    would be stored at once and survive that caller's rollback (a refused
+    import kept the services it had created first). An explicit BEGIN makes
+    the savepoint a nested one, as it always is on Postgres, where this does
+    nothing.
+    """
+    if session.get_bind().dialect.name != "sqlite":
+        return
+    connection = await session.connection()
+    raw = await connection.get_raw_connection()
+    if not raw.driver_connection.in_transaction:
+        await connection.exec_driver_sql("BEGIN")
+
+
+async def begin_exclusive_write(session: AsyncSession) -> None:
+    """Make this transaction a writer from its first statement, on SQLite.
+
+    For a route that reads a row, decides on what it read and then writes
+    it (the catalogue update: compare ``updated_at``, then replace). On
+    Postgres the read itself takes the row lock (``FOR UPDATE``) and this
+    does nothing. SQLite has no row locks and takes its write lock only at
+    the first INSERT, UPDATE or DELETE, so two such requests would both read
+    the old row and both write. ``BEGIN IMMEDIATE`` takes the write lock up
+    front: the second request waits here and then reads what the first one
+    committed. That wait is the sqlite3 driver's busy timeout (5 s by
+    default), after which the request fails with "database is locked";
+    SQLite is the local and test database only, so nothing here tunes it.
+
+    Call it before the first statement of the session. In a transaction
+    that is already open at the driver it can take no lock, and whatever
+    that transaction read before is not protected: it logs a WARNING and
+    does nothing, because that is a mistake in the caller.
+    """
+    if session.get_bind().dialect.name != "sqlite":
+        return
+    connection = await session.connection()
+    raw = await connection.get_raw_connection()
+    if raw.driver_connection.in_transaction:
+        logger.warning(
+            "begin_exclusive_write: the transaction is already open, no write lock "
+            "taken; call it before the session's first statement"
+        )
+        return
+    await connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def _odata_now() -> datetime:
+    """The clock `update_odata_service` stamps with; a function so a test
+    can stop it."""
+    return datetime.now(timezone.utc)
+
+
+def _next_odata_stamp(previous: datetime | None) -> datetime:
+    """The ``updated_at`` of an update: now, and always later than ``previous``.
+
+    ``updated_at`` is the version a client hands back as
+    ``expected_updated_at``, so two updates must never leave the same value.
+    The column default cannot promise that: SQLite's ``CURRENT_TIMESTAMP``
+    counts in seconds, and Postgres' ``now()`` is the start of the
+    transaction, which for a writer that waited for the row lock lies
+    *before* the value the winner stored. So the stamp is set here, from the
+    row read under the lock: the clock when it is ahead, otherwise the
+    stored value plus one microsecond (the resolution of both column types).
+    """
+    now = _odata_now()
+    stored = _odata_utc(previous)
+    if stored is None or now > stored:
+        return now
+    return stored + timedelta(microseconds=1)
+
+
+async def create_odata_service(
+    session: AsyncSession,
+    data: dict[str, Any],
+    *,
+    commit: bool = True,
+    columns: dict[str, Any] | None = None,
+) -> ODataService:
+    """Store a new catalogue service; ``data`` is `validate_odata_service` output.
+
+    ``columns`` is `odata_service_columns(data)` when the caller already
+    built it (see there); never anything else.
+
+    A taken name is a ``ValueError``. The lookup gives the readable answer;
+    the unique constraint closes the check-then-write race, and the insert
+    runs in a SAVEPOINT so losing that race costs a caller with
+    ``commit=False`` (an import) only this row, not its whole transaction.
+    """
+    name = data["name"]
+    taken = f"Service name {name!r} already exists"
+    if await get_odata_service(session, name) is not None:
+        raise ValueError(taken)
+    row = ODataService(name=name, **(columns or odata_service_columns(data)))
+    await _begin_before_savepoint(session)
+    try:
+        async with session.begin_nested():
+            session.add(row)
+            await session.flush()
+    except IntegrityError:
+        raise ValueError(taken) from None
+    if commit:
+        await session.commit()
+    await session.refresh(row)
+    return row
+
+
+def odata_service_unchanged(row: ODataService, columns: dict[str, Any]) -> bool:
+    """Whether writing ``columns`` (`odata_service_columns` output) to ``row``
+    would change nothing.
+
+    Stored form against stored form: the definition as the text the models
+    serialise (what the row holds), the flags as 0/1, the metadata stamp as
+    an instant (SQLite hands it back naive). For a bulk writer (the bundle
+    import) that must not restamp, and so make stale for every open admin
+    tab, a service it does not change. A row whose definition is unreadable
+    never equals a validated one, so it is rewritten.
+    """
+    for column, value in columns.items():
+        stored = getattr(row, column)
+        if column == "metadata_fetched_at":
+            stored, value = _odata_utc(stored), _odata_utc(value)
+        if stored != value:
+            return False
+    return True
+
+
+async def update_odata_service(
+    session: AsyncSession,
+    row: ODataService,
+    data: dict[str, Any],
+    *,
+    commit: bool = True,
+    columns: dict[str, Any] | None = None,
+) -> ODataService:
+    """Replace everything but the name with ``data`` (`validate_odata_service` output).
+
+    ``columns`` as in `create_odata_service`.
+
+    The name is refused rather than ignored: agents attach a service by
+    name, so a silent rename would detach every one of them.
+
+    ``updated_at`` moves forward on every call, also when no field changed
+    (`_next_odata_stamp`): it is the version the admin API compares against
+    ``expected_updated_at``. That is only race-free when ``row`` was read
+    under a lock the caller still holds (the update route, the bundle
+    import); the function itself takes none.
+    """
+    if data["name"] != row.name:
+        raise ValueError("name cannot be changed; duplicate the service instead")
+    for column, value in (columns or odata_service_columns(data)).items():
+        setattr(row, column, value)
+    row.updated_at = _next_odata_stamp(row.updated_at)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    await session.refresh(row)
+    return row
+
+
+async def delete_odata_service(
+    session: AsyncSession, row: ODataService, *, commit: bool = True
+) -> bool:
+    """Delete the service. Whether agents still use it is the caller's
+    question (`odata_service_referrers`); nothing is detached here."""
+    await session.delete(row)
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    return True
+
+
+def odata_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``builtin:odata`` config blocks of a server list, in order.
+
+    An entry without a block, or with one that is not an object, has no
+    services and is left out.
+    """
+    blocks: list[dict[str, Any]] = []
+    for server in servers or []:
+        if not isinstance(server, dict):
+            continue
+        url = str(server.get("url") or "").strip().rstrip("/").lower()
+        if url == BUILTIN_ODATA_URL and isinstance(server.get("oauth"), dict):
+            blocks.append(server["oauth"])
+    return blocks
+
+
+async def odata_service_referrers(
+    session: AsyncSession, name: str | None = None
+) -> dict[str, list[dict[str, Any]]]:
+    """Which agents attach which catalogue service.
+
+    ``{service name: [{agent_id, agent, enabled, expose_api, api_slug,
+    allow_write}]}``, agents in name order, enabled and disabled alike: a
+    disabled agent still breaks when its service is deleted and it is turned
+    back on. One pass over the agents whatever the number of services;
+    ``name`` narrows the answer to one service (absent when nobody uses it).
+    An agent listing a service on two entries appears once, with
+    ``allow_write`` if either entry allows it. Only a real ``true`` counts.
+    """
+    found: dict[str, dict[int, dict[str, Any]]] = {}
+    for agent in await list_agents(session):
+        for block in odata_entries(agent.mcp_servers):
+            services = block.get("services")
+            if not isinstance(services, (list, tuple)):
+                continue
+            allow_write = block.get("allow_write") is True
+            for service in services:
+                if not isinstance(service, str) or (name is not None and service != name):
+                    continue
+                entry = found.setdefault(service, {}).setdefault(agent.id, {
+                    "agent_id": agent.id,
+                    "agent": agent.name,
+                    "enabled": bool(agent.enabled),
+                    "expose_api": bool(agent.expose_api),
+                    "api_slug": agent.api_slug,
+                    "allow_write": False,
+                })
+                entry["allow_write"] = entry["allow_write"] or allow_write
+    return {service: list(by_agent.values()) for service, by_agent in found.items()}
+
+
+# The longest retention the purge computes with (100 years): a larger
+# value would take the cutoff below year 1 and raise OverflowError.
+ODATA_AUDIT_MAX_RETENTION_DAYS = 36_500
+ODATA_AUDIT_OUTCOMES = ("intent", "ok", "refused", "sap_error", "unknown", "cancelled")
+
+
+async def purge_odata_audit(session: AsyncSession, days: int) -> int:
+    """Delete audit rows older than ``days``; returns how many.
+
+    ``days < 1`` deletes nothing: 0 is how retention is switched off, and a
+    misread setting must not empty the log. A value beyond
+    ``ODATA_AUDIT_MAX_RETENTION_DAYS`` is treated as that bound. Rows are
+    aged by ``created_at`` whatever their outcome: an ``intent`` row that
+    never got a result is purged like any other.
+
+    This function COMMITS the session it is given. Call it with a session
+    of its own (``app._purge_ide_sessions`` does), never with one that
+    carries a caller's open transaction.
+    """
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1:
+        return 0
+    days = min(days, ODATA_AUDIT_MAX_RETENTION_DAYS)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    result = await session.execute(
+        delete(ODataAuditLog)
+        .where(ODataAuditLog.created_at < cutoff)
+        .execution_options(synchronize_session=False)
+    )
+    await session.commit()
+    return int(result.rowcount or 0)
+
+
+async def list_odata_audit(
+    session: AsyncSession,
+    *,
+    service: str | None = None,
+    sent_as: str | None = None,
+    outcome: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    before_id: int | None = None,
+    limit: int = 100,
+) -> list[ODataAuditLog]:
+    """Audit rows, newest first, at most ``limit``. Read-only.
+
+    ``service``, ``sent_as`` and ``outcome`` are exact matches; ``since`` /
+    ``until`` bound ``created_at`` (at or after / at or before);
+    ``before_id`` keeps rows with a smaller id. "Newest first" is by id,
+    the order in which the intents were recorded, so that ``before_id`` =
+    the last id of a page continues exactly where that page ended.
+    """
+    query = select(ODataAuditLog)
+    if service is not None:
+        query = query.where(ODataAuditLog.service == service)
+    if sent_as is not None:
+        query = query.where(ODataAuditLog.sent_as == sent_as)
+    if outcome is not None:
+        query = query.where(ODataAuditLog.outcome == outcome)
+    if since is not None:
+        query = query.where(ODataAuditLog.created_at >= since)
+    if until is not None:
+        query = query.where(ODataAuditLog.created_at <= until)
+    if before_id is not None:
+        query = query.where(ODataAuditLog.id < before_id)
+    query = query.order_by(ODataAuditLog.id.desc()).limit(limit)
+    return list((await session.execute(query)).scalars().all())
 
 
 VALID_ON_UNKNOWN_BRANCH = ("fail", "skip")
@@ -2954,6 +3706,23 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:sapnotedetail": _SAPNOTEDETAIL_DEST_KEYS,
     "builtin:smtp": _SMTP_DEST_KEYS,
 }
+# builtin:odata is not in the map above on purpose: its entry stores no
+# destination. Which destination a call goes through, and whether as the
+# signed-in user, belongs to each catalogue service (`ODataService`), so an
+# agent cannot pick another identity for a service by editing its own entry.
+# The entry names the services the agent may use and whether it may write.
+# Public because `agents.admin` refuses every other key at the payload
+# boundary (the reason `BUILTIN_PUBLIC_KEYS` is public).
+ODATA_ENTRY_KEYS = ("services", "allow_write")
+MAX_ODATA_ENTRY_SERVICES = 50
+ODATA_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:odata entry; list every service "
+    "in that entry's oauth.services"
+)
+_ODATA_MODE_MESSAGE = (
+    "builtin:odata requires auth_mode=destination: every catalogue service "
+    "is reached through the BTP destination it names"
+)
 # Built-ins whose destination may act as the signed-in user. NVD has no user
 # to act as and the me.sap.com cookie is one shared session, so the switch is
 # dropped for those rather than stored as a promise nothing keeps.
@@ -2984,4 +3753,43 @@ def _clean_builtin_destination(src: dict[str, Any], builtin: str) -> dict[str, A
         cleaned["user_context"] = True
     if builtin in _DEST_ALLOW_SEND_URLS:
         cleaned["allow_send"] = src.get("allow_send") is True
+    return cleaned
+
+
+def _clean_odata_entry(src: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:odata`` entry for storage.
+
+    Exactly ``{"services": [...]}`` plus ``"allow_write": True``; every other
+    key is dropped, ``destination`` and ``user_context`` included. The last
+    gate before the row, whoever the caller is, so it denies by default:
+
+    - ``services`` must be a list of service names (the catalogue's slug
+      form). Anything else is refused rather than skipped: an entry whose
+      list was silently shortened would be an agent with less than its admin
+      configured, and a non-string value has no meaning here. Duplicates are
+      dropped, first occurrence wins.
+    - ``allow_write`` is kept only for the JSON boolean ``true``. The string
+      "true" or the number 1 must not open writes; stored without the key,
+      the entry is read-only.
+
+    Whether the names exist in the catalogue is `check_odata_services`'
+    question (it needs the session). The message never repeats a refused
+    value.
+    """
+    raw = src.get("services")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("builtin:odata requires at least one service")
+    services: list[str] = []
+    for name in raw:
+        if not isinstance(name, str) or not re.fullmatch(_ODATA_SERVICE_NAME_RE, name):
+            raise ValueError("builtin:odata services: invalid service name")
+        if name not in services:
+            services.append(name)
+    if len(services) > MAX_ODATA_ENTRY_SERVICES:
+        raise ValueError(
+            f"builtin:odata allows at most {MAX_ODATA_ENTRY_SERVICES} services per entry"
+        )
+    cleaned: dict[str, Any] = {"services": services}
+    if src.get("allow_write") is True:
+        cleaned["allow_write"] = True
     return cleaned

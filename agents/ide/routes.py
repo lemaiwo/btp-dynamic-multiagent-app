@@ -42,7 +42,8 @@ Authorization rules (contract §1.2):
   (``conventions_destination``: it names the server raw runtime data is
   read from).
 - A refused request body is 422 ``{"detail": [{loc, msg, type}]}`` without
-  the client's ``input`` (``install_validation_handler``).
+  the client's ``input`` (``agents.validation_errors``, app-wide;
+  ``install_validation_handler`` is re-exported here).
 - ``waiting``, ``open_comments`` and ``unresolved_comments`` on every
   ``Session`` come from ``store.waiting_for`` / ``store.count_open_comments``
   over the caller's own sessions: a fixed number of grouped queries for the
@@ -132,16 +133,12 @@ from typing import Any
 from fastapi import (
     APIRouter,
     Depends,
-    FastAPI,
     HTTPException,
     Path,
     Query,
-    Request,
     Response,
     status,
 )
-from fastapi.exception_handlers import request_validation_exception_handler
-from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import (
     BaseModel,
@@ -225,6 +222,7 @@ from agents.ide.stages import (
     lost_flag_error,
     request_cap,
 )
+from agents.validation_errors import install_validation_handler  # noqa: F401 - re-export
 
 log = logging.getLogger(__name__)
 
@@ -1790,41 +1788,7 @@ async def search_objects(
 
 
 # --- refused request bodies ---------------------------------------------------
-
-IDE_PATH_PREFIX = "/ide/api/"
-
-
-def _validation_item(err: dict) -> dict[str, Any]:
-    # ``loc``/``msg``/``type`` only: ``input`` (and ``ctx``, which can hold
-    # it) is what the client sent -- a lone surrogate there cannot be
-    # encoded, and echoing request data back serves no one.
-    return {
-        "loc": [p if isinstance(p, int) else str(p) for p in err.get("loc", ())],
-        "msg": _encodable(str(err.get("msg", ""))),
-        "type": str(err.get("type", "")),
-    }
-
-
-def _encodable(text: str) -> str:
-    return text.encode("utf-8", "replace").decode("utf-8")
-
-
-async def _ide_validation_error(request: Request, exc: RequestValidationError):
-    """422 for a refused IDE request, without the client's input.
-
-    FastAPI's own answer echoes each error's ``input``; one holding a lone
-    surrogate (a field cut inside an emoji) fails to encode, and the refusal
-    became a 500. The shape the UI reads field errors from (``detail[]``
-    with ``loc``/``msg``) is kept. Other routes keep FastAPI's answer."""
-    if not request.url.path.startswith(IDE_PATH_PREFIX):
-        return await request_validation_exception_handler(request, exc)
-    return JSONResponse(
-        status_code=422,
-        content={"detail": [_validation_item(e) for e in exc.errors()]},
-    )
-
-
-def install_validation_handler(app: FastAPI) -> None:
-    """Register :func:`_ide_validation_error` on the app (a router cannot
-    carry an exception handler); app.py calls it."""
-    app.add_exception_handler(RequestValidationError, _ide_validation_error)
+#
+# The 422 without the client's input started here and now covers every route
+# of the app: `agents.validation_errors`. `install_validation_handler` stays
+# importable from this module, where app.py takes it.

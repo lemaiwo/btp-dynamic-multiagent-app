@@ -1,0 +1,76 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <!-- One operation of an OData service (function import, action,
+         function): what agents are told about it. Only the business name
+         and the description can be changed; what SAP's $metadata says about
+         the operation is shown for reference. Nothing in here is sent:
+         Apply writes into the form of the page, and the page's Save stores
+         it. The dialog works on a copy (model `op`,
+         `controller/odata/OperationDialog.ts`); every text that comes from
+         the backend is bound as text. -->
+    <Dialog
+        id="odataOperationDialog"
+        contentWidth="40rem"
+        resizable="true"
+        draggable="true"
+        verticalScrolling="true">
+        <content>
+            <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop">
+                <Text id="operationHint" text="{i18n>odataOperationDialogHint}" class="odataHint sapUiTinyMarginBottom" />
+                <Label text="{i18n>odataEntityTitle}" labelFor="operationTitle" />
+                <Input
+                    id="operationTitle"
+                    value="{op>/title}"
+                    maxLength="120"
+                    valueState="{ path: 'op>/errors/title', formatter: '.formatErrorState' }"
+                    valueStateText="{op>/errors/title}"
+                    liveChange=".onEdit" />
+                <Label text="{i18n>odataColAgentDescription}" labelFor="operationDescription" class="sapUiTinyMarginTop" />
+                <TextArea
+                    id="operationDescription"
+                    value="{op>/description}"
+                    rows="4"
+                    width="100%"
+                    maxLength="600"
+                    showExceededText="true"
+                    valueState="{ path: 'op>/errors/description', formatter: '.formatErrorState' }"
+                    valueStateText="{op>/errors/description}"
+                    liveChange=".onEdit" />
+            </VBox>
+            <f:SimpleForm
+                id="operationFacts"
+                editable="false"
+                layout="ResponsiveGridLayout"
+                labelSpanXL="4" labelSpanL="4" labelSpanM="4" labelSpanS="12"
+                singleContainerFullSize="true"
+                title="{i18n>odataOperationFacts}">
+                <Label text="{i18n>odataEntityName}" />
+                <Text id="operationName" text="{op>/name}" class="odataFieldName" />
+                <Label text="{i18n>odataOperationSentWith}" />
+                <VBox>
+                    <Text id="operationMethod" text="{op>/method}" class="odataFieldName" />
+                    <!-- Why "Changes data" cannot be unticked for it. -->
+                    <Text id="operationPostNote" text="{i18n>odataOperationPostNote}" visible="{op>/post}" class="odataHint" />
+                </VBox>
+                <Label text="{i18n>odataOperationKind}" />
+                <Text id="operationKind" text="{op>/kind}" />
+                <Label text="{i18n>odataColBoundTo}" />
+                <Text id="operationBoundTo" text="{op>/boundTo}" />
+                <Label text="{i18n>odataOperationReturns}" />
+                <Text id="operationReturns" text="{op>/returns}" />
+                <Label text="{i18n>odataColParameters}" />
+                <VBox id="operationParameters" items="{op>/parameters}">
+                    <Text text="{op>text}" class="odataFieldName" />
+                </VBox>
+            </f:SimpleForm>
+        </content>
+        <beginButton>
+            <Button id="operationApplyButton" text="{i18n>odataApply}" type="Emphasized" press=".onApply" />
+        </beginButton>
+        <endButton>
+            <Button id="operationCancelButton" text="{i18n>cancel}" press=".onCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

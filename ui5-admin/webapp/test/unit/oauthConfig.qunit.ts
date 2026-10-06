@@ -325,3 +325,45 @@ QUnit.test("on only for a remote url behind a destination", function (assert) {
     assert.strictEqual(oauthConfig.defaultUserContext("destination", ""), false);
     assert.strictEqual(oauthConfig.defaultUserContext("jwt", "https://arc1.example.com/mcp"), false);
 });
+
+// --- odata ---
+QUnit.module("oauthConfig: the builtin:odata entry");
+
+QUnit.test("an odata entry keeps exactly the services and allow_write as a real boolean", function (assert) {
+    assert.deepEqual(
+        oauthConfig.cleanOAuth(fullForm({ services: ["b", "a", "a"], allow_write: true, lookback: "2d" }), "destination", "builtin:odata"),
+        { services: ["b", "a"], allow_write: true },
+        "no destination, no user_context, no key of another toolset; duplicates dropped, order kept"
+    );
+    assert.deepEqual(
+        oauthConfig.cleanOAuth({ services: ["a"], allow_write: false }, "destination", "builtin:odata"),
+        { services: ["a"], allow_write: false }, "unticked is sent as false, not left out"
+    );
+    assert.deepEqual(
+        oauthConfig.cleanOAuth({ services: ["a"] }, "destination", "builtin:odata"),
+        { services: ["a"], allow_write: false }, "a missing key is false"
+    );
+    assert.strictEqual(oauthConfig.supportsUserContext("builtin:odata"), false, "the entry has no identity switch");
+});
+
+QUnit.test("only the boolean true opens writes", function (assert) {
+    for (const value of ["true", "TRUE", 1, "1", "on", {}, [], [true], null, undefined, "false", 0]) {
+        const cleaned = oauthConfig.cleanOAuth({ services: ["a"], allow_write: value }, "destination", "builtin:odata") as
+            Record<string, unknown>;
+        assert.strictEqual(cleaned.allow_write, false, `${JSON.stringify(value)} is sent as the boolean false`);
+    }
+    assert.strictEqual(
+        (oauthConfig.cleanOAuth({ services: ["a"], allow_write: true }, "destination", "builtin:odata") as
+            Record<string, unknown>).allow_write, true
+    );
+});
+
+QUnit.test("no other toolset keeps services or allow_write", function (assert) {
+    for (const [url, mode] of [["builtin:jira", "destination"], ["builtin:outlook", "destination"], ["builtin:slack", "destination"],
+        ["https://arc1.example.com/mcp", "destination"], ["builtin:gmail", "oauth2"], ["builtin:outlook", "app_only"],
+        ["builtin:sapnotes", "none"]] as [string, AuthMode][]) {
+        const cleaned = (oauthConfig.cleanOAuth(fullForm({ services: ["a"], allow_write: true }), mode, url) ?? {}) as
+            Record<string, unknown>;
+        assert.notOk("services" in cleaned || "allow_write" in cleaned, `${url} on ${mode}`);
+    }
+});

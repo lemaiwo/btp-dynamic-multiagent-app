@@ -3,6 +3,46 @@
     xmlns:core="sap.ui.core"
     xmlns:f="sap.ui.layout.form">
     <Dialog id="serverDialog" title="{i18n>mcpServer}" contentWidth="42rem">
+        <!-- odata: what the entry has to say about its selection, above the
+             form (a MessageStrip is no form content). Bound as text. -->
+        <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop"
+              visible="{= ${server>/url} === 'builtin:odata' }">
+        <MessageStrip
+            id="odataEntryDuplicate"
+            type="Error"
+            showIcon="true"
+            text="{server>/odata/duplicate}"
+            class="sapUiTinyMarginBottom"
+            visible="{= ${server>/url} === 'builtin:odata' &amp;&amp; !!${server>/odata/duplicate} }" />
+        <MessageStrip
+            id="odataEntryLoadError"
+            type="Error"
+            showIcon="true"
+            text="{server>/odata/loadError}"
+            class="sapUiTinyMarginBottom"
+            visible="{= ${server>/url} === 'builtin:odata' &amp;&amp; !!${server>/odata/loadError} }" />
+        <MessageStrip
+            id="odataEntryMissing"
+            type="Warning"
+            showIcon="true"
+            text="{server>/odata/missing}"
+            class="sapUiTinyMarginBottom"
+            visible="{= ${server>/url} === 'builtin:odata' &amp;&amp; !!${server>/odata/missing} }" />
+        <MessageStrip
+            id="odataEntryDisabled"
+            type="Information"
+            showIcon="true"
+            text="{server>/odata/disabled}"
+            class="sapUiTinyMarginBottom"
+            visible="{= ${server>/url} === 'builtin:odata' &amp;&amp; !!${server>/odata/disabled} }" />
+        <MessageStrip
+            id="odataEntryWarning"
+            type="Warning"
+            showIcon="true"
+            text="{server>/odata/warning}"
+            class="sapUiTinyMarginBottom"
+            visible="{= ${server>/url} === 'builtin:odata' &amp;&amp; !!${server>/odata/warning} }" />
+        </VBox>
         <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
 
             <Label text="{i18n>toolsetKind}" />
@@ -28,11 +68,13 @@
                 change=".onServerUrlChange"
                 visible="{= ${server>/kind} === 'mcp' }" />
 
-            <Label text="{i18n>authMode}" />
+            <!-- builtin:odata has one mode and nothing to choose: hidden there. -->
+            <Label text="{i18n>authMode}" visible="{= ${server>/url} !== 'builtin:odata' }" />
             <Select
                 id="serverAuthMode"
                 selectedKey="{server>/auth_mode}"
                 change=".onAuthModeChange"
+                visible="{= ${server>/url} !== 'builtin:odata' }"
                 items="{server>/authModes}">
                 <core:Item key="{server>key}" text="{server>text}" />
             </Select>
@@ -143,12 +185,12 @@
                 valueStateText="{server>/errors/theme}"
                 visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
 
-            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+            <Label text="{i18n>lookback}" visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+                visible="{= ${server>/auth_mode} === 'app_only' || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
 
             <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:gmail')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:smtp' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
             <CheckBox
@@ -165,13 +207,14 @@
                 placeholder="{i18n>minScorePlaceholder}"
                 visible="{= ${server>/url} === 'builtin:sapnotes' }" />
 
+            <!-- builtin:odata names no destination: each catalogue service has its own. -->
             <Label text="{i18n>destinationName}" required="true"
-                   visible="{= ${server>/auth_mode} === 'destination' }" />
+                   visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' }" />
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
                 placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
-                visible="{= ${server>/auth_mode} === 'destination' }" />
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' }" />
 
             <!-- destinations: whose credential the destination hands back.
                  Whatever is visible here must be kept by cleanOAuth too:
@@ -240,6 +283,62 @@
                 selected="{server>/oauth/allow_comment}"
                 text="{i18n>allowCommentHint}"
                 visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:jira' }" />
+
+            <!-- odata: the agent's one OData services entry. Its state lives
+                 under server>/odata, apart from server>/oauth, so that a click on
+                 another toolset and back cannot lose the selection and nothing of
+                 it leaks into another toolset's block. Every text below is bound
+                 as text: titles and purposes are admin text from the catalogue. -->
+            <!-- One way: the model is the selection, written only by
+                 onODataEntryChange. Two way, the box wrote the keys of the dialog
+                 shown before into a new entry once its items arrived. -->
+            <Label text="{i18n>odataEntryServices}" required="true" labelFor="odataEntryServices"
+                   visible="{= ${server>/url} === 'builtin:odata' }" />
+            <MultiComboBox
+                id="odataEntryServices"
+                width="100%"
+                showSecondaryValues="true"
+                placeholder="{i18n>odataEntryServicesPlaceholder}"
+                items="{server>/odata/options}"
+                selectedKeys="{ path: 'server>/odata/services', mode: 'OneWay' }"
+                selectionChange=".onODataEntryChange"
+                selectionFinish=".onODataEntryChange"
+                visible="{= ${server>/url} === 'builtin:odata' }">
+                <core:ListItem key="{server>key}" text="{server>text}" additionalText="{server>identity}" />
+            </MultiComboBox>
+
+            <Label text="" visible="{= ${server>/url} === 'builtin:odata' }" />
+            <List
+                id="odataEntrySelected"
+                width="100%"
+                items="{server>/odata/rows}"
+                noDataText="{server>/odata/noData}"
+                showSeparators="Inner"
+                ariaLabelledBy="odataEntrySelectedLabel"
+                visible="{= ${server>/url} === 'builtin:odata' }">
+                <StandardListItem
+                    title="{server>title}"
+                    description="{server>purpose}"
+                    info="{server>info}"
+                    infoState="{server>infoState}"
+                    wrapping="true" />
+            </List>
+            <core:InvisibleText id="odataEntrySelectedLabel" text="{i18n>odataEntrySelectedLabel}" />
+
+            <Label text="{i18n>odataEntryAllowWrite}" labelFor="odataEntryAllowWrite"
+                   visible="{= ${server>/url} === 'builtin:odata' }" />
+            <CheckBox
+                id="odataEntryAllowWrite"
+                selected="{server>/odata/allowWrite}"
+                select=".onODataEntryChange"
+                text="{i18n>odataEntryAllowWriteHint}"
+                wrapping="true"
+                ariaDescribedBy="odataEntryAllowWriteText"
+                visible="{= ${server>/url} === 'builtin:odata' }" />
+
+            <Label text="" visible="{= ${server>/url} === 'builtin:odata' }" />
+            <Text id="odataEntryAllowWriteText" text="{server>/odata/writeText}"
+                  visible="{= ${server>/url} === 'builtin:odata' }" />
 
         </f:SimpleForm>
         <beginButton>

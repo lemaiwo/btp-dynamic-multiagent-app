@@ -18,6 +18,9 @@ export default class Component extends UIComponent {
     // lifecycle method runs.
     private adminService!: AdminService;
 
+    /** Asked before the app leaves the page that set it; see `canLeave`. */
+    private leaveGuard?: () => Promise<boolean>;
+
     public init(): void {
         super.init();
         this.adminService = new AdminService();
@@ -33,6 +36,20 @@ export default class Component extends UIComponent {
     /** The single AdminService instance; reached via BaseController. */
     public getAdminService(): AdminService {
         return this.adminService;
+    }
+
+    /**
+     * Lets the page that is shown have a say before the app navigates away
+     * from it: a form with unsaved changes sets a guard that asks the user.
+     * The page clears it (`undefined`) when it is no longer shown.
+     */
+    public setLeaveGuard(guard?: () => Promise<boolean>): void {
+        this.leaveGuard = guard;
+    }
+
+    /** Whether the app may leave the current page. Without a guard: yes. */
+    public canLeave(): Promise<boolean> {
+        return this.leaveGuard ? this.leaveGuard() : Promise.resolve(true);
     }
 
     /** The application's single error policy; reached via BaseController. */

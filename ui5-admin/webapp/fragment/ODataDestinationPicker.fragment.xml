@@ -1,0 +1,17 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!-- The list of a destination field as a dialog, for where the field
+         has no list under it (a phone). A name is taken by a tap on it;
+         what is typed here only searches. -->
+    <SelectDialog
+        id="odataDestinationPicker"
+        title="{i18n>odataDestinationPickerTitle}"
+        noDataText="{i18n>odataDestinationPickerNone}"
+        items="{ path: 'dest>/items', templateShareable: false }"
+        liveChange=".onDestinationPickerSearch"
+        search=".onDestinationPickerSearch"
+        confirm=".onDestinationPicked">
+        <StandardListItem title="{dest>name}" description="{dest>info}" wrapping="true" />
+    </SelectDialog>
+</core:FragmentDefinition>

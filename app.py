@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -25,6 +26,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs "HTTP Request: <METHOD> <url>" at INFO for every request, with the
+# URL as it is sent: back-end host, key values in the path and query values
+# (an OData $filter, a search term) of every user. None of that belongs in the
+# platform log, so both libraries only log warnings and errors.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger("app")
 
 # Import after load_dotenv so SAP AI Core & XSUAA env vars are available.
@@ -49,6 +56,7 @@ from agents.chat_app import dynamic_chat_app  # noqa: E402
 from agents.db import (  # noqa: E402
     SessionLocal,
     init_db,
+    purge_odata_audit,
     sweep_stale_runs,
     sweep_stale_workflow_runs,
 )
@@ -70,6 +78,8 @@ from agents.ide.store import (  # noqa: E402
 )
 from agents.job_runner import cancel_all_runs  # noqa: E402
 from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
+from agents.odata import audit as odata_audit  # noqa: E402
+from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
 from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
@@ -202,6 +212,14 @@ async def _purge_ide_sessions() -> int:
         True,
         ide_approvals.sweep_interrupted,
     )
+    # The OData write audit log has its own clock (0 = keep forever). Not
+    # counted in the return value, which is the number of IDE sessions.
+    # `purge_odata_audit` commits the session this pass opens for it.
+    await _pass(
+        "odata audit rows purged",
+        ODATA_AUDIT_RETENTION_DAYS >= 1,
+        lambda s: purge_odata_audit(s, ODATA_AUDIT_RETENTION_DAYS),
+    )
     return purged
 
 
@@ -218,6 +236,46 @@ async def _ide_purge_loop(interval: float) -> None:
             raise
         except Exception:  # noqa: BLE001
             logger.warning("IDE session purge failed", exc_info=True)
+
+
+def warn_on_unknown_pp_mode(environ: Mapping[str, str] | None = None) -> bool:
+    """One WARNING at startup when ``CONNECTIVITY_PP_MODE`` is set to a value
+    that is neither mode; whether it warned.
+
+    A hint only. What enforces the setting is the refusal at request time
+    (``agents.destination_auth.pp_mode_from_environment``): a signed-in
+    user's on-premise OData call is refused rather than sent by a mechanism
+    nobody chose. Without this line an operator finds the typo only when
+    such a call fails. The value is not repeated.
+    """
+    from agents.destination import DestinationError
+    from agents.destination_auth import PP_MODE_ENV, PP_MODES, pp_mode_from_environment
+
+    try:
+        pp_mode_from_environment(os.environ if environ is None else environ)
+    except DestinationError:
+        logger.warning(
+            "%s is set to a value that is neither of %s: on-premise OData services "
+            "that act as the signed-in user will refuse every call until it is "
+            "corrected or removed",
+            PP_MODE_ENV,
+            " / ".join(PP_MODES),
+        )
+        return True
+    return False
+
+
+def serve_address(environ: Mapping[str, str] | None = None) -> tuple[str, int]:
+    """``(host, port)`` for ``python app.py``, the local start path.
+
+    Loopback unless ``HOST`` says otherwise: locally there is no XSUAA, so
+    the admin routes are open to whoever can reach the port. Cloud Foundry
+    does not come through here: ``mta.yaml`` starts uvicorn itself with
+    ``--host 0.0.0.0``.
+    """
+    env = os.environ if environ is None else environ
+    host = str(env.get("HOST") or "").strip() or "127.0.0.1"
+    return host, int(env.get("PORT") or 7932)
 
 
 @asynccontextmanager
@@ -250,6 +308,15 @@ async def lifespan(app: FastAPI):
             "each session is deleted by hand",
             IDE_DIAGNOSE_RETENTION_DAYS,
         )
+    if ODATA_AUDIT_RETENTION_DAYS < 1:
+        # Allowed, but said out loud: the audit rows name entities by key
+        # and users by principal, and nothing but this purge removes them.
+        logger.warning(
+            "ODATA_AUDIT_RETENTION_DAYS is %d: the OData write audit log is "
+            "never purged; its rows (entity keys, principals) are kept forever",
+            ODATA_AUDIT_RETENTION_DAYS,
+        )
+    warn_on_unknown_pp_mode()
     try:
         purged = await _purge_ide_sessions()
         if purged:
@@ -298,6 +365,15 @@ async def lifespan(app: FastAPI):
         logger.warning(
             "IDE approval call(s) still running at shutdown; the next start "
             "closes them as interrupted"
+        )
+    # A write whose run was cancelled above still has its result to store
+    # (its own shielded task). Bounded: `drain` gives up after its timeout
+    # and never raises; a row left `intent` is explained in agents.odata.audit.
+    left = await odata_audit.drain()
+    if left:
+        logger.warning(
+            "%d OData audit result(s) not stored at shutdown; their rows stay 'intent'",
+            left,
         )
     logger.info("Application shutdown complete")
 
@@ -516,8 +592,10 @@ app.include_router(runs_router)
 # The two routers share no path, so their order does not matter.
 app.include_router(ide_review_router)
 app.include_router(ide_router)
-# A refused IDE request is a 422 that never echoes the input (a lone
-# surrogate in it made FastAPI's own 422 a 500).
+# A refused request is a 422 that never echoes the input, on every route
+# (agents/validation_errors.py): a credential pasted into a refused field
+# must not come back, and a lone surrogate in it made FastAPI's own 422
+# a 500.
 install_validation_handler(app)
 
 
@@ -542,8 +620,8 @@ app.mount("/", dynamic_chat_app)
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", 7932))
-    print(f"Starting SAP BTP Management app on http://127.0.0.1:{port}")
-    print(f"  Chat:  http://127.0.0.1:{port}/")
-    print(f"  Admin: http://127.0.0.1:{port}/admin")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host, port = serve_address()
+    print(f"Starting SAP BTP Management app on http://{host}:{port}")
+    print(f"  Chat:  http://{host}:{port}/")
+    print(f"  Admin: http://{host}:{port}/admin")
+    uvicorn.run(app, host=host, port=port)

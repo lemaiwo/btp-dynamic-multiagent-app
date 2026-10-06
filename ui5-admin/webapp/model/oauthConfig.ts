@@ -2,6 +2,7 @@ import type { AuthMode, McpServer } from "../service/types";
 import validators from "./validators";
 import { findBuiltin } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
+import odataEntry from "./odataEntry";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -199,6 +200,13 @@ export default {
         raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
     ): McpServer["oauth"] {
         const key = builtinKey(url);
+        if (key === odataEntry.ODATA_URL) {
+            // --- odata --- First, and whatever the mode: this entry is the
+            // agent-side write switch. Exactly the services and `allow_write`
+            // as a real boolean (true only for exactly `true`); no
+            // destination, no user_context, nothing left from another type.
+            return odataEntry.clean(raw) as McpServer["oauth"];
+        }
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes
             // to a server with no credential in it, and it must stay that way

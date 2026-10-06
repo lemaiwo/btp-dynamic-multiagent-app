@@ -8,6 +8,8 @@ import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
+import odataEntry from "../model/odataEntry";
+import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
 import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
@@ -18,7 +20,7 @@ import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type Control from "sap/ui/core/Control";
 import type {
     Agent, AgentInput, AuthMode, CredentialStatus, DeepConfig, JobRun, McpServer,
-    WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
+    ODataDefinition, ODataServiceSummary, ReloadOutcome, WhereUsedPeer, WhereUsedStep, WhereUsedWorkflow
 } from "../service/types";
 import { DEEP_DEFAULTS } from "../service/types";
 
@@ -65,6 +67,21 @@ export default class AgentDetail extends BaseController {
     private snapshot?: string;
     /** Timers armed by Run now to reload the last-runs panel. */
     private runRefreshTimers: ReturnType<typeof setTimeout>[] = [];
+    // --- odata ---
+    /** The agent's servers as the server has them ([] for a new agent): what
+     *  Save compares with to tell whether it newly gives writes. */
+    private storedServers: McpServer[] = [];
+    /** The catalogue as read for the open server dialog; null while it is
+     *  not read or could not be read. */
+    private odataCatalogue: ODataServiceSummary[] | null = null;
+    /** Definitions read for the open dialog, by "=<name>"; null = the read
+     *  failed, absent = not read yet. */
+    private odataDefinitions: Record<string, ODataDefinition | null> = {};
+    /** Counts dialog openings, so an answer for an earlier one is dropped. */
+    private odataOpening = 0;
+    /** True from a Save press until its request is answered or its question
+     *  is cancelled: one press, one question, one request. */
+    private saving = false;
 
     public onInit(): void {
         this.setModel(new JSONModel({
@@ -99,6 +116,8 @@ export default class AgentDetail extends BaseController {
             model.setProperty("/errors", {});
             this.clearRunRefreshTimers();
             this.snapshot = undefined;
+            this.storedServers = [];
+            this.saving = false;
 
             // Issued together, not one after another: none of the three reads
             // the others' result, so awaiting them in sequence made opening an
@@ -191,6 +210,8 @@ export default class AgentDetail extends BaseController {
                 deep: { ...DEEP_DEFAULTS, ...(agent.deep ?? {}) } as DeepConfig
             } as AgentInput);
             model.setProperty("/title", agent.name);
+            // A copy: the form edits its own list, never this one.
+            this.storedServers = JSON.parse(JSON.stringify(agent.mcp_servers ?? [])) as McpServer[];
             this.snapshot = canonical(model.getProperty("/data"));
             model.setProperty("/canRun", AgentDetail.isRunnable(agent));
             // An agent must never be offered itself as a peer.
@@ -263,10 +284,30 @@ export default class AgentDetail extends BaseController {
 
     private async openServerDialog(server: McpServer): Promise<void> {
         const hasStoredSecret = !!(server.oauth as { has_client_secret?: boolean })?.has_client_secret;
+        // --- odata --- The entry's state is kept apart from `oauth` (see the
+        // fragment). A stored entry is shown with the catalogue read first,
+        // so that every stored name has its item from the start.
+        const isOData = odataEntry.isODataUrl(server.url);
+        const stored = odataEntry.clean(isOData ? server.oauth as Record<string, unknown> : undefined);
+        const opening = ++this.odataOpening;
+        this.odataCatalogue = null;
+        this.odataDefinitions = {};
+        const loadError = isOData ? await this.loadODataCatalogue() : "";
+        if (opening !== this.odataOpening) {
+            return;
+        }
         (this.getModel("server") as JSONModel).setData({
-            url: server.url,
+            // The fragment shows the services box and "Allow writes" for
+            // exactly `builtin:odata`: an entry stored in another spelling
+            // (`Builtin:OData`) is held in that one, or OK would write back
+            // an `allow_write` the admin never saw.
+            url: isOData ? odataEntry.ODATA_URL : server.url,
             auth_mode: server.auth_mode,
-            oauth: server.oauth ?? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false },
+            odata: {
+                services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
+                options: [], rows: [], noData: "", duplicate: "", missing: "", disabled: "", warning: "", writeText: ""
+            },
+            oauth: isOData || !server.oauth ? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false } : server.oauth,
             // "mcp" for a remote server, otherwise the built-in's url.
             kind: findBuiltin(server.url)?.url ?? "mcp",
             kinds: [{ key: "mcp", text: this.text("toolsetRemoteMcp") }].concat(
@@ -284,6 +325,8 @@ export default class AgentDetail extends BaseController {
         });
 
         this.syncServerKind();
+        this.showODataOptions();
+        this.showODataEntry();
 
         if (!this.serverDialog) {
             this.serverDialog = await Fragment.load({
@@ -304,6 +347,9 @@ export default class AgentDetail extends BaseController {
         if (builtin) {
             serverModel.setProperty("/url", builtin.url);
             serverModel.setProperty("/auth_mode", builtin.defaultAuthMode);
+            if (odataEntry.isODataUrl(builtin.url)) {
+                void this.enterODataEntry();
+            }
         } else if (findBuiltin(serverModel.getProperty("/url") as string)) {
             // Back to a remote server: the built-in's pseudo-url is no
             // starting point for a real one.
@@ -319,6 +365,290 @@ export default class AgentDetail extends BaseController {
         const url = serverModel.getProperty("/url") as string;
         serverModel.setProperty("/kind", findBuiltin(url)?.url ?? "mcp");
         this.syncServerKind();
+        if (odataEntry.isODataUrl(url)) {
+            // The spelling the fragment's bindings test for.
+            serverModel.setProperty("/url", odataEntry.ODATA_URL);
+            void this.enterODataEntry();
+        }
+    }
+
+    // --- odata: the agent's OData services entry ---------------------------
+
+    /** Reads the catalogue for the open dialog. Returns the text to show
+     *  when that failed; never a dialog of its own, because the admin may be
+     *  here for another toolset. */
+    private async loadODataCatalogue(): Promise<string> {
+        try {
+            this.odataCatalogue = await this.getAdminService().listODataServices();
+            return "";
+        } catch {
+            this.odataCatalogue = null;
+            return this.text("odataEntryLoadFailed");
+        }
+    }
+
+    /** "OData services" was picked in a dialog opened for something else:
+     *  read the catalogue once, then show. The selection is not touched. */
+    private async enterODataEntry(): Promise<void> {
+        const serverModel = this.getModel("server") as JSONModel;
+        if (serverModel.getProperty("/odata/loaded") !== true) {
+            serverModel.setProperty("/odata/loaded", true);
+            const opening = this.odataOpening;
+            const loadError = await this.loadODataCatalogue();
+            if (opening !== this.odataOpening) {
+                return;
+            }
+            serverModel.setProperty("/odata/loadError", loadError);
+            this.showODataOptions();
+        }
+        this.showODataEntry();
+    }
+
+    private odataSelection(): string[] {
+        const selected = (this.getModel("server") as JSONModel).getProperty("/odata/services") as unknown;
+        return odataEntry.clean({ services: selected }).services;
+    }
+
+    private odataIdentity(userContext: boolean): string {
+        return this.text(userContext ? "odataRunsAsUser" : "odataRunsAsTechnical");
+    }
+
+    /** The choices of the box: the catalogue, plus the selected names it
+     *  lacks, so that no selected key is ever without an item. The selection
+     *  is written again afterwards: the box matches keys to items when the
+     *  keys are set. The model is the selection; the box only shows it. */
+    private showODataOptions(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        const selected = this.odataSelection();
+        serverModel.setProperty("/odata/options", odataEntry.options(selected, this.odataCatalogue).map((option) => ({
+            key: option.key,
+            text: option.title,
+            identity: option.state === "missing" ? this.text("odataEntryRowMissing")
+                : option.state === "unknown" ? ""
+                    : option.state === "disabled"
+                        ? this.text("odataEntryOptionDisabled", [this.odataIdentity(option.userContext)])
+                        : this.odataIdentity(option.userContext)
+        })));
+        serverModel.setProperty("/odata/services", selected.slice());
+        // The box is told as well: an equal list is no change for the
+        // binding, and the box may still hold the keys of the dialog shown
+        // before (its items were gone and are back now).
+        (this.byId("odataEntryServices") as unknown as { setSelectedKeys(keys: string[]): void } | undefined)
+            ?.setSelectedKeys(selected.slice());
+    }
+
+    /** A tick, a selection or a removed token. The box's own keys are taken
+     *  as the selection, whatever the binding has done by now. */
+    public onODataEntryChange(event: Event): void {
+        const source = event.getSource() as Control & { getSelectedKeys?: () => string[] };
+        if (typeof source.getSelectedKeys === "function") {
+            (this.getModel("server") as JSONModel).setProperty("/odata/services", source.getSelectedKeys().slice());
+        }
+        this.showODataEntry();
+    }
+
+    private static quoted(names: string[]): string {
+        return names.map((name) => `"${name}"`).join(", ");
+    }
+
+    /**
+     * Everything the entry says about its selection: the services with who
+     * they run as, what is missing or disabled, the scheduled-run warning,
+     * a second entry, and what "Allow writes" opens. Reads the definitions
+     * it still needs and shows again when they are there.
+     */
+    private showODataEntry(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        if (!odataEntry.isODataUrl(serverModel.getProperty("/url") as string)) {
+            return;
+        }
+        const agentModel = this.getModel("agent") as JSONModel;
+        const rows = odataEntry.rows(this.odataSelection(), this.odataCatalogue);
+
+        serverModel.setProperty("/odata/rows", rows.map((row) => {
+            const runsAs = this.text("odataEntryRunsAs", [this.odataIdentity(row.userContext)]);
+            return {
+                title: row.title,
+                purpose: row.purpose,
+                info: row.state === "missing" ? this.text("odataEntryRowMissing")
+                    : row.state === "unknown" ? ""
+                        : row.state === "disabled" ? this.text("odataEntryRowDisabled", [runsAs]) : runsAs,
+                infoState: row.state === "missing" ? ValueState.Error
+                    : row.state === "disabled" ? ValueState.Warning
+                        : row.userContext ? ValueState.Information : ValueState.None
+            };
+        }));
+        serverModel.setProperty("/odata/noData", this.text(
+            this.odataCatalogue && this.odataCatalogue.length === 0 ? "odataEntryNoCatalogue" : "odataEntryNoServices"));
+
+        const other = odataEntry.entryIndex(
+            agentModel.getProperty("/data/mcp_servers") as McpServer[], this.editingServerIndex);
+        serverModel.setProperty("/odata/duplicate", other === -1 ? "" : this.text("odataEntryDuplicate", [String(other + 1)]));
+
+        const missing = rows.filter((row) => row.state === "missing").map((row) => row.name);
+        serverModel.setProperty("/odata/missing", missing.length === 0 ? ""
+            : missing.length === 1 ? this.text("odataEntryMissingOne", [missing[0]])
+                : this.text("odataEntryMissingMany", [AgentDetail.quoted(missing)]));
+
+        const disabled = rows.filter((row) => row.state === "disabled").map((row) => row.title);
+        serverModel.setProperty("/odata/disabled", disabled.length === 0 ? ""
+            : disabled.length === 1 ? this.text("odataEntryDisabledOne", [disabled[0]])
+                : this.text("odataEntryDisabledMany", [AgentDetail.quoted(disabled)]));
+
+        // A run started through the run endpoint has no signed-in user.
+        const asUser = agentModel.getProperty("/data/expose_api") === true
+            ? rows.filter((row) => row.userContext && row.state !== "missing").map((row) => row.title) : [];
+        serverModel.setProperty("/odata/warning", asUser.length === 0 ? ""
+            : asUser.length === 1 ? this.text("odataEntryScheduledWarning", [asUser[0]])
+                : this.text("odataEntryScheduledWarningMany", [AgentDetail.quoted(asUser)]));
+
+        serverModel.setProperty("/odata/writeText",
+            this.odataWriteText(rows, serverModel.getProperty("/odata/allowWrite") === true));
+        void this.readODataDefinitions(rows);
+    }
+
+    /** One line per service: what "Allow writes" opens there. */
+    private odataOpensLines(opens: ODataEntryOpens[], reading = false): string[] {
+        return opens.map((entry) => (
+            entry.items === null
+                ? this.text(reading && !(`=${entry.name}` in this.odataDefinitions)
+                    ? "odataEntryOpensReading" : "odataEntryOpensUnread", [entry.title])
+                : entry.items.length === 0 ? this.text("odataEntryOpensNothing", [entry.title])
+                    : this.text("odataEntryOpensLine", [entry.title, entry.items.join(", ")])
+        ));
+    }
+
+    private odataWriteText(rows: ODataEntryRow[], allowWrite: boolean): string {
+        const opens = odataEntry.opens(rows, this.odataDefinitions);
+        if (opens.length === 0) {
+            return this.text("odataEntryAllowWriteNoServices");
+        }
+        // "Nothing" is only said when every service was read and has none.
+        if (opens.every((entry) => entry.items !== null && entry.items.length === 0)) {
+            return this.text(allowWrite ? "odataEntryAllowWriteNothing" : "odataEntryAllowWriteNothingOff");
+        }
+        const lines = [this.text(allowWrite ? "odataEntryOpensOn" : "odataEntryOpensOff")]
+            .concat(this.odataOpensLines(opens, true));
+        if (allowWrite) {
+            lines.push(this.text("odataEntryOpensLater"));
+        }
+        return lines.join("\n");
+    }
+
+    /** Reads the definitions of the selected services that are not read
+     *  yet, then shows the entry again. A failed read is remembered as
+     *  such and said; it is never shown as "no write operation". */
+    private async readODataDefinitions(rows: ODataEntryRow[]): Promise<void> {
+        const wanted = rows.filter((row) => (row.state === "ok" || row.state === "disabled")
+            && !(`=${row.name}` in this.odataDefinitions) && !this.odataReading[`=${row.name}`]);
+        if (wanted.length === 0) {
+            return;
+        }
+        const opening = this.odataOpening;
+        const reading = this.odataReading;
+        const definitions = this.odataDefinitions;
+        wanted.forEach((row) => { reading[`=${row.name}`] = true; });
+        await Promise.all(wanted.map(async (row) => {
+            try {
+                definitions[`=${row.name}`] = (await this.getAdminService().getODataService(row.name)).definition;
+            } catch {
+                definitions[`=${row.name}`] = null;
+            }
+            delete reading[`=${row.name}`];
+        }));
+        if (opening === this.odataOpening && definitions === this.odataDefinitions) {
+            this.showODataEntry();
+        }
+    }
+
+    /** The reads of `readODataDefinitions` that are under way, by "=<name>". */
+    private odataReading: Record<string, boolean> = {};
+
+    /**
+     * OK on the OData services entry. False when the dialog must stay open:
+     * a second entry, no service, or a service the catalogue no longer has
+     * (asked about; only the admin's answer removes it).
+     */
+    private confirmODataEntry(): boolean {
+        const serverModel = this.getModel("server") as JSONModel;
+        this.showODataEntry();
+        const duplicate = serverModel.getProperty("/odata/duplicate") as string;
+        if (duplicate) {
+            MessageBox.error(duplicate);
+            return false;
+        }
+        const rows = odataEntry.rows(this.odataSelection(), this.odataCatalogue);
+        const missing = rows.filter((row) => row.state === "missing").map((row) => row.name);
+        if (missing.length > 0) {
+            const remove = this.text("odataEntryMissingRemove");
+            MessageBox.warning(this.text("odataEntryMissingConfirm", [AgentDetail.quoted(missing)]), {
+                title: this.text("odataEntryMissingTitle"),
+                actions: [remove, MessageBox.Action.CANCEL],
+                emphasizedAction: remove,
+                initialFocus: MessageBox.Action.CANCEL,
+                onClose: (action: string | null) => {
+                    if (action !== remove) {
+                        return;
+                    }
+                    serverModel.setProperty("/odata/services",
+                        this.odataSelection().filter((name) => missing.indexOf(name) === -1));
+                    this.showODataOptions();
+                    this.showODataEntry();
+                    this.onConfirmServer();
+                }
+            });
+            return false;
+        }
+        if (rows.length === 0) {
+            MessageBox.error(this.text(
+                this.odataCatalogue && this.odataCatalogue.length === 0 ? "odataEntryNoCatalogue" : "odataEntryNoServices"));
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * The question of Save when it newly gives writes, compared with the
+     * agent as the server has it: "Allow writes" goes on, or a service with
+     * enabled writes joins an entry that already had it. Undefined when
+     * there is nothing to ask. The services are read now, not taken from
+     * the dialog: the catalogue may have changed since. A service that
+     * cannot be read is asked about and said to be unread.
+     */
+    private async odataSaveQuestion(data: AgentInput, given: ODataEntryGiven): Promise<string | undefined> {
+        if (!given.switchedOn && given.services.length === 0) {
+            return undefined;
+        }
+        let catalogue: ODataServiceSummary[] | null = null;
+        try {
+            catalogue = await this.getAdminService().listODataServices();
+        } catch {
+            catalogue = null;
+        }
+        const definitions: Record<string, ODataDefinition | null> = {};
+        const rows = odataEntry.rows(given.services, catalogue).filter((row) => row.state !== "missing");
+        await Promise.all(rows.map(async (row) => {
+            try {
+                definitions[`=${row.name}`] = (await this.getAdminService().getODataService(row.name)).definition;
+            } catch {
+                definitions[`=${row.name}`] = null;
+            }
+        }));
+        const opens = odataEntry.opens(rows, definitions)
+            .filter((entry) => given.switchedOn || entry.items === null || entry.items.length > 0);
+        if (!given.switchedOn && opens.length === 0) {
+            return undefined;
+        }
+        const parts = [this.text(given.switchedOn ? "odataEntrySaveSwitchedOn" : "odataEntrySaveAdded", [data.name])];
+        const writing = opens.filter((entry) => entry.items === null || entry.items.length > 0);
+        if (writing.length > 0) {
+            parts.push([this.text("odataEntrySaveOpens")].concat(this.odataOpensLines(writing)).join("\n"));
+            parts.push(this.text("odataEntrySaveLater"));
+        } else {
+            parts.push(this.text("odataEntrySaveNothing"));
+        }
+        parts.push(this.text("odataWriteAudited"));
+        return parts.join("\n\n");
     }
 
     /**
@@ -378,6 +708,15 @@ export default class AgentDetail extends BaseController {
             {}, serverModel.getProperty("/oauth") as Record<string, unknown>
         );
         delete oauthRaw.theme;
+        if (odataEntry.isODataUrl(url)) {
+            // --- odata --- Only the entry's own two values reach cleanOAuth.
+            if (!this.confirmODataEntry()) {
+                return;
+            }
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.services = this.odataSelection();
+            oauthRaw.allow_write = serverModel.getProperty("/odata/allowWrite") === true;
+        }
         if (oauthConfig.supportsMailTheme(url)) {
             const parsedTheme = oauthConfig.parseMailTheme(serverModel.getProperty("/themeJson") as string);
             if (parsedTheme.error) {
@@ -424,7 +763,7 @@ export default class AgentDetail extends BaseController {
             // A destination stores no credential of its own, so there is no
             // secret to remember; leaving the flag out keeps the posted block
             // exactly what the server stores.
-            if (oauth.dcr !== true && !publicBuiltin && authMode !== "destination") {
+            if (oauth.dcr !== true && !publicBuiltin && authMode !== "destination" && !odataEntry.isODataUrl(url)) {
                 oauth.has_client_secret = !!oauth.client_secret
                     || !!(oauthRaw as { has_client_secret?: boolean }).has_client_secret;
             }
@@ -456,6 +795,9 @@ export default class AgentDetail extends BaseController {
 
     // --- Save -------------------------------------------------------------
     public async onSave(): Promise<void> {
+        if (this.saving) {
+            return;
+        }
         const model = this.getModel("agent") as JSONModel;
         model.setProperty("/errors", {});
         const data = model.getProperty("/data") as AgentInput;
@@ -481,9 +823,65 @@ export default class AgentDetail extends BaseController {
             return;
         }
 
+        // --- odata --- One question when this save newly gives writes.
+        // `toSave` is the form as it is now: the question is built from it
+        // and the same object is sent, so an edit made while the question
+        // reads the catalogue cannot be saved without having been asked about.
+        this.saving = true;
+        const agentId = this.agentId;
+        const toSave = JSON.parse(JSON.stringify(data)) as AgentInput;
+        // Decided before anything is read: whether this save gives writes
+        // does not depend on a read that can fail.
+        const given = odataEntry.newlyGiven(
+            odataEntry.entryOf(this.storedServers), odataEntry.entryOf(toSave.mcp_servers));
+        let question: string | undefined;
         try {
-            const saved = await this.getAdminService().upsertAgent(data, this.agentId);
-            MessageToast.show(this.text("agentSaved"));
+            question = await this.odataSaveQuestion(toSave, given);
+        } catch {
+            // What it opens could not be worked out: ask anyway, never save
+            // newly given writes without a question.
+            question = given.switchedOn || given.services.length > 0
+                ? this.text("odataEntrySaveUnknown", [toSave.name]) : undefined;
+        }
+        if (this.agentId !== agentId || !this.saving) {
+            return; // another agent was opened meanwhile
+        }
+        if (!question) {
+            await this.saveAgent(toSave);
+            return;
+        }
+        const save = this.text("save");
+        MessageBox.warning(question, {
+            title: this.text("odataEntrySaveTitle"),
+            actions: [save, MessageBox.Action.CANCEL],
+            emphasizedAction: save,
+            initialFocus: MessageBox.Action.CANCEL,
+            onClose: (action: string | null) => {
+                if (action === save && this.agentId === agentId && this.saving) {
+                    void this.saveAgent(toSave);
+                } else {
+                    this.saving = false;
+                }
+            }
+        });
+    }
+
+    private async saveAgent(data: AgentInput): Promise<void> {
+        try {
+            // --- odata --- The entry is sent as exactly { services,
+            // allow_write: <boolean> }, also when its dialog was never opened
+            // and the form still holds the form the server answered with.
+            const sent = { ...data, mcp_servers: odataEntry.explicit(data.mcp_servers) } as AgentInput & ReloadOutcome;
+            // What a save answers about the reload is no field of an agent;
+            // it never goes back in a body, whatever the form was filled from.
+            delete sent.reloaded;
+            delete sent.reload_failed;
+            const saved = await this.getAdminService().upsertAgent(sent, this.agentId);
+            // Stored, but the running agent still has its services and its
+            // "Allow writes" as they were: said in a box that stays.
+            if (!this.warnIfNotLive(saved, "reloadFailedAgentSaved")) {
+                MessageToast.show(this.text("agentSaved"));
+            }
             this.agentId = saved.id;
             this.getRouter().navTo("agents");
         } catch (error) {
@@ -492,6 +890,8 @@ export default class AgentDetail extends BaseController {
                 return;
             }
             ErrorHandler.handle(error, "Could not save the agent.");
+        } finally {
+            this.saving = false;
         }
     }
 

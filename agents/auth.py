@@ -142,6 +142,54 @@ def _principal_claim(payload: dict[str, Any]) -> str | None:
     return None
 
 
+# Claims that identify one issued token; compared one by one below.
+_TOKEN_IDENTITY_CLAIMS = (
+    "jti", "iat", "exp", "iss", "user_uuid", "sub", "user_name", "email", "origin",
+)
+# At least one of these must be on the token AND in the bound claims: two
+# sets of claims that carry none of them "agree" on every identifying claim
+# by both lacking it, which proves nothing about whose token it is.
+_TOKEN_ANCHOR_CLAIMS = ("jti", "user_uuid", "sub")
+
+
+def bound_token_principal() -> str | None:
+    """The principal of the token bound to this context, or ``None``.
+
+    For code that must name whose token is *sent* (an audit record), as
+    opposed to ``current_principal``, which ``run_as`` rebinds to the run-as
+    user while the trigger's token stays bound.
+
+    The answer comes from ``current_claims`` -- the claims the middleware
+    validated -- and only when they demonstrably belong to ``current_jwt``:
+    the token is decoded WITHOUT verification (no JWKS fetch, no second
+    validation) merely to compare its identifying claims with the bound
+    ones. ``None`` when no token or no claims are bound, when the token
+    cannot be decoded, when any identifying claim differs (stale claims
+    next to another token), when neither side carries a ``jti``,
+    ``user_uuid`` or ``sub`` that the other carries too (nothing ties the
+    claims to this token then), or when the claims name no principal. The
+    unverified decode is never the source of the answer.
+    """
+    token = current_jwt.get()
+    claims = current_claims.get()
+    if not token or not isinstance(claims, dict):
+        return None
+    try:
+        own = jwt.decode(token, options={"verify_signature": False})
+    except Exception:  # noqa: BLE001 - not a JWT we can compare against
+        return None
+    if not isinstance(own, dict):
+        return None
+    if any(own.get(name) != claims.get(name) for name in _TOKEN_IDENTITY_CLAIMS):
+        return None
+    if not any(
+        own.get(name) is not None and claims.get(name) is not None
+        for name in _TOKEN_ANCHOR_CLAIMS
+    ):
+        return None
+    return _principal_claim(claims)
+
+
 # ---------------------------------------------------------------------------
 # XSUAA credentials from VCAP_SERVICES
 # ---------------------------------------------------------------------------
@@ -434,10 +482,30 @@ def public_base_url() -> str | None:
 async def run_as(principal: str) -> AsyncIterator[None]:
     """Bind a non-interactive identity for a scheduled or API-triggered run.
 
-    Mirrors what JWTBindingMiddleware does per request, minus the JWT: there
-    is no user token to forward, so the run can only reach MCP servers on
-    auth_mode "oauth2" (per-user token store, keyed by this principal) or
-    "none". auth_mode "jwt" servers will fail, by design.
+    Binds the principal and the base URL, and nothing else: ``current_jwt``
+    is neither set nor cleared here. What token the run carries therefore
+    depends on where it was started:
+
+    * a run started outside a request, or by a request without a bearer
+      token, has no JWT bound. It can reach servers on auth_mode "oauth2"
+      (per-user token store, keyed by this principal), "none", or an
+      app-level credential; "jwt" servers and destinations with
+      ``user_context`` refuse it;
+    * a run started from a request is a task created inside that request
+      (``job_runner.start_run``; a workflow run behaves the same:
+      ``workflow_runner.start_workflow_run`` creates its task in the request
+      and each agent step enters ``run_as``), so it inherits whatever bearer token the
+      request carried: the admin's own JWT for "Run now", the caller's token
+      for an API trigger. In such a run ``current_principal`` is the agent's
+      run-as user while ``current_jwt`` is the token of whoever triggered
+      it: **the two can name different identities**. That is intended (the
+      run keeps the trigger's token).
+
+    Anything that caches per user must therefore not key on the principal
+    alone when the cached thing was obtained with the bound token: key on the
+    principal AND a digest of that token (``agents.destination._cache_key``,
+    ``agents.outlook_tools.owner_cache_key``), or one user is served what
+    another user's token fetched.
 
     current_base_url must be set for PerUserOAuth2Auth to resolve its DCR
     client, and no request exists to derive it from — hence public_base_url().
