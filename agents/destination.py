@@ -327,6 +327,11 @@ class Destination:
     location_id: str = ""
     # ``URL.queries.<name>`` properties, sent as query parameters.
     queries: dict[str, str] = field(default_factory=dict)
+    # Lower-case names of the ``headers`` that are stored ``URL.headers.*``
+    # properties, as opposed to the header the destination service minted
+    # (``authTokens``). A run as the signed-in user must be able to tell: a
+    # stored ``Authorization`` or ``Cookie`` is somebody else's credential.
+    static_headers: frozenset[str] = frozenset()
 
 
 # Destination property names whose value is a credential. Matched
@@ -632,9 +637,17 @@ class DestinationResolver:
                 f"could not reach the destination service token endpoint: {failure}"
             )
         if response.status_code >= 400:
+            # The status, and the OAuth error code when it has the form of
+            # one. Never `error_description` or the raw body: a UAA answer
+            # can name the client, the zone or what was sent, and this text
+            # is logged and shown on admin screens.
+            try:
+                answer = response.json()
+            except ValueError:
+                answer = None
+            code = _oauth_error_suffix(answer.get("error") if isinstance(answer, dict) else None)
             raise DestinationError(
-                f"destination service token request returned "
-                f"{response.status_code}: {_scrub(response.text, secret)[:400]}"
+                f"destination service token request returned {response.status_code}{code}"
             )
         try:
             body = response.json()
@@ -675,6 +688,7 @@ class DestinationResolver:
             and key[len(_STATIC_HEADER_PREFIX):]
             and str(value or "").strip()
         }
+        static = {name.lower() for name in headers}
         proxy_type = str(config.get("ProxyType") or "").strip()
         location_id = str(config.get("CloudConnectorLocationId") or "").strip()
         queries: dict[str, str] = {
@@ -714,7 +728,7 @@ class DestinationResolver:
                     url=url, headers=headers, expires_at=deadline,
                     auth_type=auth_type, per_user=per_user,
                     proxy_type=proxy_type, location_id=location_id,
-                    queries=queries,
+                    queries=queries, static_headers=frozenset(static),
                 )
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
@@ -735,21 +749,29 @@ class DestinationResolver:
         token = tokens[0] or {}
         if token.get("error"):
             what = "for the signed-in user" if per_user else "from the target"
-            # The service's own text, which says what to fix -- but it is
-            # remote text that gets logged and may reach a model, so it is
-            # scrubbed and cut like every other echoed message here.
-            detail = _scrub(str(token["error"]), *secrets)[:400]
+            # The service's own text can quote what the target's token
+            # endpoint answered, and this message is logged and may reach a
+            # model: only an OAuth error code is repeated, when the value
+            # has the form of one.
             raise DestinationError(
-                f"destination {self.name!r} could not obtain a token {what}: "
-                f"{detail}"
+                f"destination {self.name!r} could not obtain a token {what}"
+                f"{_oauth_error_suffix(token['error'])}"
             )
         header = token.get("http_header") or {}
         key = str(header.get("key") or "").strip()
         value = str(header.get("value") or "").strip()
+        minted = ""
         if key and value:
-            headers[key] = value
+            minted = key
         elif token.get("type") and token.get("value"):
-            headers["Authorization"] = f"{token['type']} {token['value']}"
+            minted, value = "Authorization", f"{token['type']} {token['value']}"
+        if minted:
+            # The minted header replaces a stored one of the same name
+            # whatever its case: two spellings must not both be kept.
+            for stored in [k for k in headers if k.lower() == minted.lower()]:
+                del headers[stored]
+            static.discard(minted.lower())
+            headers[minted] = value
         try:
             lifetime = int(float(token.get("expires_in")))
         except (TypeError, ValueError):
@@ -760,6 +782,7 @@ class DestinationResolver:
             url=url, headers=headers, expires_at=deadline,
             auth_type=auth_type, per_user=per_user,
             proxy_type=proxy_type, location_id=location_id, queries=queries,
+            static_headers=frozenset(static),
         )
 
 
@@ -829,6 +852,15 @@ JWT_BEARER_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 # The form of an OAuth error code (RFC 6749 section 5.2): the only part of a
 # token endpoint's error answer that is repeated.
 _OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,40}")
+
+
+def _oauth_error_suffix(error: Any) -> str:
+    """`` (<code>)`` when ``error`` has the form of an OAuth error code
+    (``invalid_grant``), else nothing. The one reduction for every token
+    endpoint answer this module reports."""
+    if isinstance(error, str) and _OAUTH_ERROR_CODE.fullmatch(error):
+        return f" ({error})"
+    return ""
 
 
 @dataclass(frozen=True)
@@ -1075,15 +1107,11 @@ class ConnectivityTokens:
         if response.status_code >= 400:
             # The status, and the OAuth error code when it has the form of
             # one. Never `error_description` or the raw body.
-            code = ""
             try:
                 answer = response.json()
             except ValueError:
                 answer = None
-            if isinstance(answer, dict):
-                error = answer.get("error")
-                if isinstance(error, str) and _OAUTH_ERROR_CODE.fullmatch(error):
-                    code = f" ({error})"
+            code = _oauth_error_suffix(answer.get("error") if isinstance(answer, dict) else None)
             raise DestinationError(
                 f"connectivity service {what} request returned {response.status_code}{code}"
             )

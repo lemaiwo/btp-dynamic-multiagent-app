@@ -190,8 +190,17 @@ async def test_user_token_error_from_the_service_names_the_user_case():
         "destinationConfiguration": {"URL": "https://graph.microsoft.com"},
         "authTokens": [{"type": "Bearer", "error": "invalid_grant: no trust"}],
     }
-    with pytest.raises(DestinationError, match="for the signed-in user.*invalid_grant"):
+    # Only an OAuth error code is repeated, never the service's free text
+    # (it can quote the token endpoint's answer).
+    with pytest.raises(DestinationError, match="for the signed-in user") as err:
         await svc.resolver().resolve(user_token="jwt-ann", principal="ann")
+    assert str(err.value) == "destination 'GRAPH' could not obtain a token for the signed-in user"
+    svc.payload_override["authTokens"][0]["error"] = "invalid_grant"
+    with pytest.raises(DestinationError) as err:
+        await svc.resolver().resolve(user_token="jwt-ann", principal="ann")
+    assert str(err.value) == (
+        "destination 'GRAPH' could not obtain a token for the signed-in user (invalid_grant)"
+    )
 
 
 async def test_require_credential_false_accepts_a_bare_url():

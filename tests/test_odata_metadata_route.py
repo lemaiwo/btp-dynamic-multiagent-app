@@ -1465,9 +1465,14 @@ async def test_an_http_internet_destination_is_refused_with_nothing_sent(client,
     assert remote.requests == [] and SAP_HOST not in r.text
 
 
-async def test_user_context_on_a_technical_destination_is_said_in_the_answer(
+async def test_user_context_on_a_technical_destination_is_refused_with_nothing_sent(
     client, remote, caplog
 ):
+    """Final review A1: the destination service ignores the user's token for
+    a destination with a stored credential, so the preview would read SAP as
+    that account. Refused before anything is sent, with a text that says what
+    to change."""
+
     class Technical(FakeResolver):
         async def resolve(self, **kwargs: Any) -> Destination:
             resolved = await super().resolve(**kwargs)
@@ -1482,13 +1487,17 @@ async def test_user_context_on_a_technical_destination_is_said_in_the_answer(
     caplog.set_level(logging.INFO, logger=preview.logger.name)
     remote.resolver = Technical(name="S4_ODATA_TECH")
     r = await client.post(URL, json=request(user_context=True), headers=bearer("alice-id"))
-    assert r.status_code == 200, r.text
-    (warning,) = r.json()["warnings"]
-    assert warning["code"] == "technical_credential"
-    assert "destination's own credential" in warning["message"]
-    # The log says how it WAS fetched, and by whom.
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert r.json()["detail"] == (
+        "destination 'S4_ODATA_TECH' does not sign in as the user: a service that runs as "
+        "the signed-in user needs a user-propagating destination (OAuth2JWTBearer, "
+        "OAuth2UserTokenExchange, OAuth2SAMLBearerAssertion) or, on-premise, "
+        "PrincipalPropagation"
+    )
+    assert remote.requests == []
+    # The log says how it was resolved, and by whom.
     (line,) = [x.getMessage() for x in caplog.records if "odata metadata preview" in x.getMessage()]
-    assert "auth_type=BasicAuthentication" in line and "by=alice-id" in line
+    assert "by=alice-id" in line and "code=destination_error" in line
     assert "user_context=True" in line and "dGVjaDp4" not in caplog.text
 
 

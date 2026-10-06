@@ -66,8 +66,8 @@ from agents.destination_auth import (
     PLACEHOLDER_BASE,
     PROXY_REFUSED_TEXT,
     DestinationAuth,
+    DestinationRefused,
     DestinationUserRequired,
-    OnPremiseRefused,
     proxy_refused_hint,
     resolver_for,
     routed_auth,
@@ -265,7 +265,7 @@ def one_shot(
     return auth, transport  # type: ignore[return-value]
 
 
-def refused_text(exc: OnPremiseRefused) -> str:
+def refused_text(exc: DestinationRefused) -> str:
     """The fixed text of an OnPremise refusal, for an admin: it names the
     destination (which the admin typed) and nothing else of the landscape."""
     return plain(exc.admin_text, MAX_MESSAGE_CHARS)
@@ -470,7 +470,7 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         raise
     except DestinationUserRequired:
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT) from None
-    except OnPremiseRefused as exc:
+    except DestinationRefused as exc:
         # A fixed text that says what to change; nothing was sent.
         logger.warning(
             "odata metadata: destination '%s' was refused (%s)", destination, type(exc).__name__

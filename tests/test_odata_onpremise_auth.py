@@ -332,7 +332,11 @@ async def test_the_mode_is_never_read_on_a_technical_or_an_internet_path(monkeyp
     w = World()
     async with w.client() as http:
         assert (await http.get(PATH)).status_code == 200
-    w = World(Resolver(url="https://api.example.com", proxy_type="Internet"))
+    # A user run of an OData client needs a destination that signs in as the
+    # user (final review A1), so this one is user-propagating.
+    w = World(
+        Resolver(url="https://api.example.com", proxy_type="Internet", auth_type="OAuth2JWTBearer")
+    )
     with as_user(*ALICE):
         async with w.client(user_context=True) as http:
             assert (await http.get(PATH)).status_code == 200
@@ -504,6 +508,9 @@ async def test_internet_destination_never_gets_proxy_headers():
         Resolver(
             url="https://api.example.com/base",
             proxy_type="Internet",
+            # User-propagating: a user run of an OData client is refused on
+            # any other Internet destination (final review A1).
+            auth_type="OAuth2JWTBearer",
             location_id="LOC1",
             headers={
                 "Authorization": BASIC,

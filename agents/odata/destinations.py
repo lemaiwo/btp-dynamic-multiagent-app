@@ -50,6 +50,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Iterator
 
 import httpx
@@ -411,7 +412,9 @@ async def _list_level(
 _TOKEN_UNREACHABLE_RE = re.compile(
     r"could not reach the destination service token endpoint: ([A-Za-z_][A-Za-z0-9_]{0,63}):"
 )
-_TOKEN_STATUS_RE = re.compile(r"destination service token request returned ([0-9]{3}):")
+_TOKEN_STATUS_RE = re.compile(
+    r"destination service token request returned ([0-9]{3})(?:$| \()"
+)
 
 
 def _token_failure_code(text: str) -> str:
@@ -432,6 +435,68 @@ def _token_failure_code(text: str) -> str:
     if text.endswith("carried no access_token"):
         return "no_access_token"
     return "failed"
+
+
+_FIND_STATUS_RE = re.compile(r"destination service returned ([0-9]{3}) for ")
+# code -> the fixed text an admin answer carries. Positive recognition of
+# the texts `agents.destination` raises; anything else is `failed`.
+_FAILURE_TEXTS = MappingProxyType({
+    "not_found": "the destination does not exist in the subaccount of this app's "
+    "destination service",
+    "unreachable": "the destination service could not be reached",
+    "token_unreachable": "the destination service's token endpoint could not be reached",
+    "no_credential": "the destination returned no credential: check its Authentication type",
+    "token_error": "the destination could not obtain a token from its target",
+    "needs_user": "the destination propagates the signed-in user and has no credential "
+    "of its own",
+    "no_url": "the destination has no URL",
+    "not_json": "the destination service's answer could not be read",
+    "no_access_token": "the destination service's token endpoint returned no token",
+    "failed": "the destination could not be resolved",
+})
+
+
+def destination_failure(text: str) -> tuple[str, str]:
+    """``(code, fixed text)`` for the text of a ``DestinationError``.
+
+    For an admin answer: the error's own text can quote the destination
+    service's answer or a URL, so only a code that was recognised
+    positively and a text written here leave the app. The text ends in
+    ``(<code>)``; the detail belongs in the log.
+    """
+    token = _token_failure_code(text)
+    found = _FIND_STATUS_RE.match(text)
+    if token.startswith("unreachable"):
+        code = "token_unreachable"
+    elif token.startswith("status "):
+        code = f"token_status_{token.removeprefix('status ')}"
+    elif "token" in text and token in ("not_json", "no_access_token"):
+        code = token
+    elif found:
+        code = f"status_{found.group(1)}"
+    elif text.startswith("could not reach the destination service"):
+        code = "unreachable"
+    elif " does not exist in the subaccount" in text:
+        code = "not_found"
+    elif " returned no authentication token" in text:
+        code = "no_credential"
+    elif " could not obtain a token " in text:
+        code = "token_error"
+    elif " uses PrincipalPropagation" in text:
+        code = "needs_user"
+    elif text.endswith("has no URL configured"):
+        code = "no_url"
+    elif text.endswith("is not JSON"):
+        code = "not_json"
+    else:
+        code = "failed"
+    if code.startswith("token_status_"):
+        message = "the destination service's token endpoint refused this app"
+    elif code.startswith("status_"):
+        message = "the destination service answered with an error"
+    else:
+        message = _FAILURE_TEXTS[code]
+    return code, f"{message} ({code})"
 
 
 def _level_text(level: str) -> str:

@@ -472,17 +472,26 @@ class Technical(FakeResolver):
         )
 
 
-async def test_user_context_on_a_technical_destination_is_said(client, remote, caplog):
+async def test_user_context_on_a_technical_destination_is_refused(client, remote, caplog):
+    """Final review A1: nothing is sent with the destination's own credential
+    for a service that runs as the signed-in user."""
     caplog.set_level(logging.DEBUG)
     await seed(client, user_context=True)
     remote.resolver = Technical(name="S4_ODATA_TECH")
     body = (await client.post(URL, json={}, headers=bearer("alice"))).json()
-    assert body["ok"] is True and body["identity"] == "technical" and body["per_user"] is True
+    assert body["ok"] is False and body["code"] == "destination_error"
+    assert remote.requests == []
+    assert body["message"] == (
+        "destination 'S4_ODATA_TECH' does not sign in as the user: a service that runs as "
+        "the signed-in user needs a user-propagating destination (OAuth2JWTBearer, "
+        "OAuth2UserTokenExchange, OAuth2SAMLBearerAssertion) or, on-premise, "
+        "PrincipalPropagation"
+    )
+    assert body["identity"] == "technical" and body["per_user"] is True
     assert body["auth_type"] == "BasicAuthentication" and body["proxy_type"] == "Internet"
-    codes = [w["code"] for w in body["warnings"]]
-    assert codes == ["technical_credential"]
-    assert body["warnings"][0]["message"] == testcall._WARNINGS["technical_credential"]
-    assert "the test ran" in body["warnings"][0]["message"]
+    # The warning stays, in the wording for a test that sent nothing.
+    (warning,) = body["warnings"]
+    assert warning["code"] == "technical_credential" and "ran" not in warning["message"]
     assert "dGVjaDp4" not in caplog.text
 
 

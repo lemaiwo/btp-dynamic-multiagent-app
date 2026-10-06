@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
@@ -237,6 +238,46 @@ async def _ide_purge_loop(interval: float) -> None:
             logger.warning("IDE session purge failed", exc_info=True)
 
 
+def warn_on_unknown_pp_mode(environ: Mapping[str, str] | None = None) -> bool:
+    """One WARNING at startup when ``CONNECTIVITY_PP_MODE`` is set to a value
+    that is neither mode; whether it warned.
+
+    A hint only. What enforces the setting is the refusal at request time
+    (``agents.destination_auth.pp_mode_from_environment``): a signed-in
+    user's on-premise OData call is refused rather than sent by a mechanism
+    nobody chose. Without this line an operator finds the typo only when
+    such a call fails. The value is not repeated.
+    """
+    from agents.destination import DestinationError
+    from agents.destination_auth import PP_MODE_ENV, PP_MODES, pp_mode_from_environment
+
+    try:
+        pp_mode_from_environment(os.environ if environ is None else environ)
+    except DestinationError:
+        logger.warning(
+            "%s is set to a value that is neither of %s: on-premise OData services "
+            "that act as the signed-in user will refuse every call until it is "
+            "corrected or removed",
+            PP_MODE_ENV,
+            " / ".join(PP_MODES),
+        )
+        return True
+    return False
+
+
+def serve_address(environ: Mapping[str, str] | None = None) -> tuple[str, int]:
+    """``(host, port)`` for ``python app.py``, the local start path.
+
+    Loopback unless ``HOST`` says otherwise: locally there is no XSUAA, so
+    the admin routes are open to whoever can reach the port. Cloud Foundry
+    does not come through here: ``mta.yaml`` starts uvicorn itself with
+    ``--host 0.0.0.0``.
+    """
+    env = os.environ if environ is None else environ
+    host = str(env.get("HOST") or "").strip() or "127.0.0.1"
+    return host, int(env.get("PORT") or 7932)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Fail closed before anything is served: with AUTH_REQUIRED on (the
@@ -275,6 +316,7 @@ async def lifespan(app: FastAPI):
             "never purged; its rows (entity keys, principals) are kept forever",
             ODATA_AUDIT_RETENTION_DAYS,
         )
+    warn_on_unknown_pp_mode()
     try:
         purged = await _purge_ide_sessions()
         if purged:
@@ -578,8 +620,8 @@ app.mount("/", dynamic_chat_app)
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", 7932))
-    print(f"Starting SAP BTP Management app on http://127.0.0.1:{port}")
-    print(f"  Chat:  http://127.0.0.1:{port}/")
-    print(f"  Admin: http://127.0.0.1:{port}/admin")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    host, port = serve_address()
+    print(f"Starting SAP BTP Management app on http://{host}:{port}")
+    print(f"  Chat:  http://{host}:{port}/")
+    print(f"  Admin: http://{host}:{port}/admin")
+    uvicorn.run(app, host=host, port=port)

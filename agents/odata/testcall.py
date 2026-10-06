@@ -68,8 +68,8 @@ from agents.destination import (
 )
 from agents.destination_auth import (
     PLACEHOLDER_BASE,
+    DestinationRefused,
     DestinationUserRequired,
-    OnPremiseRefused,
     proxy_refused_hint,
     resolver_for,
 )
@@ -127,7 +127,7 @@ _WARNINGS = {
     "technical_credential/unsent": (
         "the service is set to act as the signed-in user, but the destination's "
         "authentication type does not propagate a user: requests through this "
-        "destination use the destination's own credential"
+        "destination are refused, because they would use the destination's own credential"
     ),
     "no_list_entity_set": (
         "no entity set has 'list' enabled, so no data read was possible (a 'get' "
@@ -495,7 +495,7 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             raise refuse(
                 preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
             ) from None
-        except OnPremiseRefused as exc:
+        except DestinationRefused as exc:
             # A fixed text that says what to change; nothing was sent.
             logger.warning(
                 "odata test call: destination '%s' was refused (%s)",

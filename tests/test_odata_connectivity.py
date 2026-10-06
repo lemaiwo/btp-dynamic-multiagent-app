@@ -969,9 +969,10 @@ async def test_a_token_error_from_the_destination_service_is_scrubbed_and_cut():
     with pytest.raises(DestinationError, match="for the signed-in user") as err:
         await _resolver(payload).resolve(user_token=user_jwt, principal="alice@example.com")
     text = str(err.value)
-    assert "token exchange failed" in text and user_jwt not in text
-    assert f"secret {CONFIG.client_secret}:" not in text
-    assert len(text) < 600
+    # Final review A2: nothing of the service's own text is repeated.
+    assert "token exchange failed" not in text and user_jwt not in text
+    assert CONFIG.client_secret not in text and "xxxx" not in text
+    assert text.endswith("could not obtain a token for the signed-in user")
     # The app-level path keeps its wording and is cut the same way.
     with pytest.raises(DestinationError, match="from the target") as app_err:
         await _resolver(payload).resolve()
@@ -980,7 +981,7 @@ async def test_a_token_error_from_the_destination_service_is_scrubbed_and_cut():
     payload["authTokens"][0]["error"] = {"code": 401, "detail": user_jwt}
     with pytest.raises(DestinationError, match="could not obtain a token") as obj_err:
         await _resolver(payload).resolve(user_token=user_jwt, principal="alice@example.com")
-    assert user_jwt not in str(obj_err.value) and "401" in str(obj_err.value)
+    assert user_jwt not in str(obj_err.value) and "401" not in str(obj_err.value)
 
 
 async def test_a_non_json_answer_is_a_destination_error_without_the_body():
@@ -1043,7 +1044,9 @@ async def test_a_percent_encoded_secret_echoed_from_the_form_body_is_scrubbed():
     resolver = DestinationResolver("S4_ODATA_USER", config, transport=httpx.MockTransport(echo))
     with pytest.raises(DestinationError, match="token request returned 401") as err:
         await resolver.resolve()
-    assert "client_secret=***" in str(err.value)
+    # Final review A2: the token endpoint's answer is not repeated at all,
+    # as for the connectivity service below.
+    assert str(err.value) == "destination service token request returned 401"
     assert secret not in str(err.value) and quote_plus(secret) not in str(err.value)
 
     cconfig = ConnectivityConfig(
@@ -1089,3 +1092,38 @@ async def test_a_cancelled_waiter_leaves_the_holders_lock_alone():
     svc.release.set()
     assert await holder is await third
     assert svc.user_tokens == ["jwt-alice"] and resolver._user_locks.idle
+
+
+async def test_the_destination_token_endpoint_error_is_status_and_oauth_code_only():
+    """Final review A2: what the destination service's XSUAA answers to the
+    token request is reduced like the connectivity service's answer."""
+
+    def answer(body: object, status: int = 401):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if isinstance(body, str):
+                return httpx.Response(status, text=body)
+            return httpx.Response(status, json=body)
+
+        return handler
+
+    async def text_of(handler) -> str:
+        resolver = DestinationResolver(
+            "S4_ODATA_USER", CONFIG, transport=httpx.MockTransport(handler)
+        )
+        with pytest.raises(DestinationError) as err:
+            await resolver.resolve()
+        return str(err.value)
+
+    described = {
+        "error": "invalid_client",
+        "error_description": "client sb-clone-1!b9 of zone acme-zone is locked",
+    }
+    assert await text_of(answer(described)) == (
+        "destination service token request returned 401 (invalid_client)"
+    )
+    # Not the form of an OAuth error code: not repeated.
+    odd = {"error": "Bad credentials for zone acme-zone"}
+    assert await text_of(answer(odd)) == "destination service token request returned 401"
+    assert await text_of(answer("<html>acme-zone</html>", 503)) == (
+        "destination service token request returned 503"
+    )

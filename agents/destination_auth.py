@@ -107,7 +107,25 @@ Two rules hold for EVERY destination, OnPremise or not:
   whatever its case. A client built for the connectivity route (the OData
   callers) additionally skips query names that start with ``$`` -- a
   destination must not add ``$filter`` or ``$expand`` behind the argument
-  checks of the tools -- and takes one spelling per name.
+  checks of the tools --, the OData system option names without the ``$``
+  (``filter``, ``top``, ``id`` ...: OData 4.01 reads them alike), and takes
+  one spelling per name. For such a client the caller's ``If-Match``,
+  ``If-None-Match``, ``X-CSRF-Token``, ``Cookie``, ``X-HTTP-Method`` and
+  ``X-HTTP-Method-Override`` also win over a ``URL.headers.*`` property of
+  the same name.
+
+One rule holds for a client built for the connectivity route (the OData
+callers) on an Internet destination: with ``user_context`` on, the
+destination must sign in as that user (:meth:`DestinationAuth._as_user`,
+:class:`NotUserPropagating`). The destination service ignores the user's
+token for a destination with a stored credential, so without the rule every
+user's call would run in SAP as that one account. The other destination
+users (Gmail, Outlook, Teams, Slack, Jira, SAP notes, MCP over a
+destination, the workflow http step) are NOT held to it and behave as before.
+
+A 401 or a proxy 407 is retried once. When the retry cannot be prepared (the
+destination or the connectivity token could not be fetched again), the error
+is marked: :func:`request_left` tells a caller that a request did leave.
 
 A client built with ``connectivity`` has the router as its transport, so
 httpx applies no ``HTTP_PROXY``/``HTTPS_PROXY``/``NO_PROXY`` from the
@@ -130,6 +148,7 @@ import httpx
 
 from agents.destination import (
     PROXY_TYPE_ON_PREMISE,
+    USER_PROPAGATING_AUTH_TYPES,
     ConnectivityConfig,
     Destination,
     DestinationError,
@@ -159,6 +178,24 @@ _IDENTITY_HEADERS = frozenset(
 # What a destination's `URL.headers.*` can never set: the above, and where
 # the request goes.
 _DESTINATION_RESERVED = _IDENTITY_HEADERS | {"host"}
+# For a client built by `routed_auth` (the OData callers) only.
+# OData system query options, 4.01 spelling without the `$`: a destination's
+# `URL.queries.*` adds none of them, any case, with or without the `$`.
+_ODATA_SYSTEM_OPTIONS = frozenset({
+    "filter", "select", "expand", "orderby", "top", "skip", "count", "search", "apply",
+    "format", "skiptoken", "deltatoken", "compute", "levels", "schemaversion", "index", "id",
+})
+# Headers that carry the caller's concurrency token, CSRF session or method:
+# the caller's value wins over a destination's `URL.headers.*` of that name.
+_CALLER_WINS = frozenset({
+    "if-match", "if-none-match", "x-csrf-token", "cookie", "x-http-method",
+    "x-http-method-override",
+})
+# Stored credentials a run as the signed-in user never sends.
+_STORED_CREDENTIALS = frozenset({"authorization", "cookie"})
+# The header names (lower case) `_apply` set on a request from the
+# destination: on a retry they are not the caller's.
+_FROM_DESTINATION_EXTENSION = "agents.destination_auth.from_destination"
 PRINCIPAL_PROPAGATION = "PrincipalPropagation"
 # How a signed-in user's identity reaches the proxy; see the module docstring.
 PP_MODES = ("exchange", "header")
@@ -173,8 +210,8 @@ _LOCATION_ID = re.compile(r"[A-Za-z0-9_.:@-]{1,128}")
 _PROXY_HOST = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?")
 
 
-class OnPremiseRefused(DestinationError):
-    """An OnPremise destination that cannot be used as it is configured.
+class DestinationRefused(DestinationError):
+    """A destination that cannot be used as it is configured.
 
     ``admin_text`` is a fixed text that names the destination and nothing
     else of the landscape: what an admin screen may show as it is.
@@ -183,6 +220,36 @@ class OnPremiseRefused(DestinationError):
     def __init__(self, message: str, *, admin_text: str) -> None:
         super().__init__(message)
         self.admin_text = admin_text
+
+
+class OnPremiseRefused(DestinationRefused):
+    """An OnPremise destination that cannot be used as it is configured."""
+
+
+class NotUserPropagating(DestinationRefused):
+    """A service that runs as the signed-in user, on a destination that
+    would send somebody else's credential (or none that is the user's)."""
+
+
+def not_user_propagating(server_key: str, name: str) -> NotUserPropagating:
+    text = (
+        f"destination '{name}' does not sign in as the user: a service that runs as the "
+        f"signed-in user needs a user-propagating destination (OAuth2JWTBearer, "
+        f"OAuth2UserTokenExchange, OAuth2SAMLBearerAssertion) or, on-premise, "
+        f"PrincipalPropagation"
+    )
+    return NotUserPropagating(f"{server_key}: {text}", admin_text=text)
+
+
+_REQUEST_LEFT = "request_left"
+
+
+def request_left(exc: BaseException) -> bool:
+    """Whether ``exc`` was raised by the auth flow AFTER a request had been
+    sent and answered (a 401 or a proxy 407 whose retry could not be
+    prepared). The caller of a modifying request then knows that something
+    left the app, although the target refused it."""
+    return getattr(exc, _REQUEST_LEFT, None) is True
 
 
 PP_MODE_TEXT = f"{PP_MODE_ENV} must be exchange or header"
@@ -418,9 +485,19 @@ class DestinationAuth(httpx.Auth):
             request.url = target
             # httpx set Host when the request was built, from the placeholder.
             request.headers["Host"] = target.netloc.decode("ascii")
+        routed = self._route is not None
+        ours: set[str] = request.extensions.get(_FROM_DESTINATION_EXTENSION) or set()
+        applied: set[str] = set()
         for key, value in destination.headers.items():
-            if key.lower() not in _DESTINATION_RESERVED:
-                request.headers[key] = value
+            lower = key.lower()
+            if lower in _DESTINATION_RESERVED:
+                continue
+            if routed and lower in _CALLER_WINS and lower in request.headers and lower not in ours:
+                continue  # the caller's own value
+            request.headers[key] = value
+            applied.add(lower)
+        if routed:
+            request.extensions[_FROM_DESTINATION_EXTENSION] = applied
         self._add_queries(request, destination)
         self._applied = request.url
 
@@ -436,8 +513,10 @@ class DestinationAuth(httpx.Auth):
         for those a destination's ``$``-prefixed names are skipped (said
         once per auth, with the destination's name only): ``$filter``,
         ``$expand``, ``$top``, ``$format`` or ``$skiptoken`` from a
-        destination would get behind the argument checks of the tools. Such
-        a caller also takes one spelling per name, the destination's first.
+        destination would get behind the argument checks of the tools. So
+        are the same names without the ``$``, in any case: OData 4.01 reads
+        ``filter=`` as ``$filter=``. Such a caller also takes one spelling
+        per name, the destination's first.
         """
         if not destination.queries:
             return
@@ -454,7 +533,7 @@ class DestinationAuth(httpx.Auth):
             if name.lower() in present:
                 continue
             if odata:
-                if name.startswith("$"):
+                if name.startswith("$") or name.lower() in _ODATA_SYSTEM_OPTIONS:
                     skipped = True
                     continue
                 present.add(name.lower())
@@ -462,7 +541,8 @@ class DestinationAuth(httpx.Auth):
         if skipped and not self._queries_noted:
             self._queries_noted = True
             logger.warning(
-                "%s: destination %r has URL.queries properties that start with '$'; "
+                "%s: destination %r has URL.queries properties that are OData query "
+                "options ('$' names, or filter, select, expand, top ...); "
                 "they are not sent (OData query options come from the tool only)",
                 self.server_key,
                 self.destination_name,
@@ -625,6 +705,38 @@ class DestinationAuth(httpx.Auth):
             )
         return headers
 
+    def _as_user(self, destination: Destination) -> Destination:
+        """``destination`` as a run as the signed-in user may use it on the
+        direct path, for a client built by ``routed_auth``; raises
+        :class:`NotUserPropagating` when it would not sign in as that user.
+
+        The destination service ignores ``X-user-token`` for a destination
+        with a stored credential (``BasicAuthentication``, or
+        ``NoAuthentication`` plus ``URL.headers.Authorization`` or a stored
+        ``Cookie``): every user's request would then run in the target as
+        that one account. So the answer must have been resolved for the user
+        AND be of a user-propagating type, a stored ``Authorization`` or
+        ``Cookie`` is never sent, and what is left must still carry an
+        ``Authorization``: the one minted for the user.
+
+        NOT applied to the other destination users (Gmail, Outlook, Teams,
+        Slack, Jira, SAP notes, MCP, the workflow http step): their auths
+        are not built by ``routed_auth`` and behave as they always did.
+        """
+        name = self.destination_name
+        auth_type = (destination.auth_type or "").strip()
+        if not destination.per_user or auth_type not in USER_PROPAGATING_AUTH_TYPES:
+            raise not_user_propagating(self.server_key, name)
+        stored = destination.static_headers
+        headers = {
+            key: value
+            for key, value in destination.headers.items()
+            if not (key.lower() in _STORED_CREDENTIALS and key.lower() in stored)
+        }
+        if not any(key.lower() == "authorization" for key in headers):
+            raise not_user_propagating(self.server_key, name)
+        return dataclasses.replace(destination, headers=headers)
+
     def on_resolved(self, destination: Destination) -> None:
         """Called with every destination the flow resolved, before any rule
         looks at it -- also one that is then refused. For a subclass that
@@ -669,6 +781,10 @@ class DestinationAuth(httpx.Auth):
             # A user's request through the proxy: what the destination
             # stores is not even handed to the shaping code.
             destination = dataclasses.replace(destination, headers={})
+        elif proxy is None and self.user_context and self._route is not None:
+            # A user's request on the direct path of an OData client:
+            # refused unless the destination signs in as that user.
+            destination = self._as_user(destination)
         self.send_through(request, destination)
         applied, self._applied = self._applied, None
         url = request.url
@@ -721,28 +837,36 @@ class DestinationAuth(httpx.Auth):
 
         if not self.retry_on_401:
             return
-        if response.status_code == 407 and proxy is not None:
-            # The proxy refused its token: aged out or revoked. Drop the one
-            # that was used -- this user's only in exchange mode, and only if
-            # it is still the cached one -- and retry exactly once. The
-            # destination was not the problem and stays cached.
-            proxy = await self._proxy_headers(destination, token, principal, refused=proxy)
-            self._shape(request, destination, proxy)
-            yield request
-        elif response.status_code == 401:
-            # The cached entry aged out or was revoked. Drop it -- this user's
-            # only, under user_context -- and retry exactly once. A second 401
-            # is a real refusal and must not become a loop.
-            if token:
-                if principal:
-                    self._resolver.invalidate(principal)
+        # From here on a request has left and was answered. A failure to
+        # prepare the retry is marked (`request_left`), so that the caller of
+        # a modifying request does not record it as never sent.
+        try:
+            if response.status_code == 407 and proxy is not None:
+                # The proxy refused its token: aged out or revoked. Drop the one
+                # that was used -- this user's only in exchange mode, and only if
+                # it is still the cached one -- and retry exactly once. The
+                # destination was not the problem and stays cached.
+                proxy = await self._proxy_headers(destination, token, principal, refused=proxy)
+                self._shape(request, destination, proxy)
+            elif response.status_code == 401:
+                # The cached entry aged out or was revoked. Drop it -- this user's
+                # only, under user_context -- and retry exactly once. A second 401
+                # is a real refusal and must not become a loop.
+                if token:
+                    if principal:
+                        self._resolver.invalidate(principal)
+                else:
+                    self._resolver.invalidate()
+                destination = await self._resolve(token, principal, force=True)
+                self.on_resolved(destination)
+                proxy = await self._proxy_headers(destination, token, principal)
+                self._shape(request, destination, proxy)
             else:
-                self._resolver.invalidate()
-            destination = await self._resolve(token, principal, force=True)
-            self.on_resolved(destination)
-            proxy = await self._proxy_headers(destination, token, principal)
-            self._shape(request, destination, proxy)
-            yield request
+                return
+        except DestinationError as exc:
+            setattr(exc, _REQUEST_LEFT, True)
+            raise
+        yield request
 
     def sync_auth_flow(self, request):  # type: ignore[override]
         raise RuntimeError("DestinationAuth supports async clients only")
