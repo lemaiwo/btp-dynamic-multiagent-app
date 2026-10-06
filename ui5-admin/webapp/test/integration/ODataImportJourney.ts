@@ -521,9 +521,6 @@ opaTest("a re-import lists what the document no longer has and removes it only w
 opaTest("a refusal of the read is said inside the dialog by its code, in plain words and as text", function (Given: Common, When: Common, Then: Common) {
     let shown: UI5Element;
     const CASES: [string, number, string, string][] = [
-        ["on_premise_unavailable", 502, "on-premise destinations are not available yet in this version",
-            "Metadata not read: on-premise destinations cannot be read yet in this version. Entity sets can be added by hand "
-            + "with Add, or imported from a configuration file."],
         ["user_token_required", 424, "This fetch runs in SAP as the signed-in user",
             "Metadata not read: this service runs as the signed-in user, and no user sign-in reached the server with this "
             + "request. Sign in again and retry."],
@@ -534,6 +531,7 @@ opaTest("a refusal of the read is said inside the dialog by its code, in plain w
         ["sap_error", 502, "HTTP 403 from the OData service: <b>x</b> {y}",
             "Metadata not read. SAP answered: HTTP 403 from the OData service: <b>x</b> {y}"],
         // The status of another code: the code decides, not the status.
+        // Also what an on-premise destination that cannot be used answers.
         ["destination_error", 504, "the destination could not be resolved or used",
             "Metadata not read: the destination could not be resolved or used. Check its name and its authentication type; "
             + "the application log has the reason."]

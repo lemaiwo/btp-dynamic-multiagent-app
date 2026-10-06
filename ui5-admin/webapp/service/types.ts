@@ -145,7 +145,9 @@ export type OAuthClient =
           services?: string[];
           /**
            * `builtin:odata` only. Opens the write operations the catalogue
-           * enables for the attached services. Only sent as `true`.
+           * enables for the attached services, and only as the boolean `true`.
+           * The dialog always sends a real boolean; the server stores the key
+           * only when it is `true`.
            */
           allow_write?: boolean;
       };
@@ -937,8 +939,8 @@ export interface ODataMetadataPreview {
 
 /** Something a test call has to say besides its outcome. `code` is
  *  stable (`service_disabled`, `technical_credential`,
- *  `no_list_entity_set`, `paging_not_followed`,
- *  `destination_queries_not_applied`); `message` is the server's text. */
+ *  `no_list_entity_set`, `paging_not_followed`); `message` is the
+ *  server's text. */
 export interface ODataTestWarning {
     code: string;
     message: string;

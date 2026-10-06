@@ -58,7 +58,7 @@ const DECLARED_TEXT: Record<string, string> = {
 };
 /** A refusal of the metadata route by its stable code (`X-OData-Error`). */
 const ERROR_TEXT: Record<string, string> = {
-    user_token_required: "odataImportErrUser", on_premise_unavailable: "odataImportErrOnPremise",
+    user_token_required: "odataImportErrUser",
     destination_error: "odataImportErrDestination", unreachable: "odataImportErrUnreachable",
     redirect: "odataImportErrRedirect", not_xml: "odataImportErrNotXml", too_large: "odataImportErrTooLarge",
     timeout: "odataImportErrTimeout", busy: "odataImportErrBusy", preview_failed: "odataImportErrFailed"

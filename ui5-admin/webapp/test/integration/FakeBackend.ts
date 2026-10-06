@@ -1043,6 +1043,40 @@ export default class FakeBackend {
         };
     }
 
+    /**
+     * What a write of an agent does with its `builtin:odata` entries, as far
+     * as the journeys need it: `_validate_odata_entry` (agents/admin.py)
+     * refuses an `allow_write` that is no boolean and an entry without
+     * services, `check_odata_services` (agents/db.py) a name the catalogue
+     * lacks, and `_clean_odata_entry` stores `allow_write` only when it is
+     * `true`. `_redact_servers` then echoes `has_client_secret: false` on
+     * the block in every answer. Returns the refusal, or "" after rewriting
+     * the entries in `body` to what is stored.
+     */
+    private storeODataEntries(body: Record<string, unknown> | undefined): string {
+        const servers = (body?.mcp_servers ?? []) as { url: string; oauth?: Record<string, unknown> }[];
+        const entries = servers.filter((server) => String(server.url).trim().toLowerCase() === "builtin:odata");
+        if (entries.length > 1) {
+            return "an agent may have at most one builtin:odata entry; list every service in that entry's oauth.services";
+        }
+        for (const entry of entries) {
+            const oauth = entry.oauth ?? {};
+            if (oauth.allow_write !== undefined && oauth.allow_write !== null && typeof oauth.allow_write !== "boolean") {
+                return "oauth.allow_write must be the JSON boolean true or false; a string or a number does not open writes";
+            }
+            const services = oauth.services;
+            if (!Array.isArray(services) || services.length === 0) {
+                return "builtin:odata requires oauth.services: the names of the catalogue services this agent may use (at least one)";
+            }
+            const missing = (services as string[]).filter((name) => !this.odataServices.some((s) => s.name === name));
+            if (missing.length) {
+                return `unknown OData service ${missing.map((name) => `'${name}'`).join(", ")}`;
+            }
+            entry.oauth = { services: services.slice(), ...(oauth.allow_write === true ? { allow_write: true } : {}), has_client_secret: false };
+        }
+        return "";
+    }
+
     private seedOData(): void {
         const user = (agent: Agent, allowWrite = false): ODataUsedBy => ({
             agent_id: agent.id, agent: agent.name, enabled: agent.enabled,
@@ -1474,7 +1508,9 @@ export default class FakeBackend {
         const method = init?.method ?? "GET";
         const body = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : undefined;
         this.requests.push(`${method} ${path}`);
-        this.bodies[`${method} ${path}`] = body;
+        // A copy of what was sent: the routes below may rewrite `body` into
+        // what is stored (`storeODataEntries`).
+        this.bodies[`${method} ${path}`] = init?.body ? JSON.parse(init.body as string) as Record<string, unknown> : undefined;
 
         if (this.failNext && this.failNext.path === path
             && (!this.failNext.method || this.failNext.method === method)) {
@@ -1494,6 +1530,12 @@ export default class FakeBackend {
         }
         if (path === "agents" && method === "GET") {
             return this.json(this.agents);
+        }
+        if ((path === "agents" && method === "POST") || (/^agents\/\d+$/.test(path) && method === "PUT")) {
+            const refusal = this.storeODataEntries(body);
+            if (refusal) {
+                return this.json({ detail: refusal }, 422);
+            }
         }
         if (path === "agents" && method === "POST") {
             const created = { ...this.makeAgent(String(body?.name)), ...body, id: this.nextId++ } as Agent;

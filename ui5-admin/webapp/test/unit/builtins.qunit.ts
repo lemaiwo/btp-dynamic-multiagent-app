@@ -57,3 +57,9 @@ QUnit.test("every built-in restricts its auth modes to what its factory builds",
         assert.ok(Array.isArray(b.authModes) && b.authModes.length > 0, `${b.url} lists authModes`);
     });
 });
+
+// --- odata ---
+QUnit.test("builtin:odata offers only destination", function (assert) {
+    assert.deepEqual(authModesFor("builtin:odata"), ["destination"]);
+    assert.strictEqual(findBuiltin("builtin:odata")?.defaultAuthMode, "destination");
+});

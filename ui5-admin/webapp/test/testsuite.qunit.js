@@ -20,6 +20,7 @@ sap.ui.define(function () {
             "unit/odataDestinations": { title: "Unit: odataDestinations" },
             "unit/odataImport": { title: "Unit: odataCatalog, import from $metadata" },
             "unit/oauthConfig": { title: "Unit: oauthConfig" },
+            "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },
             "unit/workflowOrder": { title: "Unit: workflowOrder" },

@@ -71,6 +71,14 @@ export const BUILTINS: BuiltinToolset[] = [
     {
         url: "builtin:sapnotedetail", titleKey: "builtinSapNoteDetail", descriptionKey: "builtinSapNoteDetailDesc",
         defaultAuthMode: "session", authModes: ["session", "destination"]
+    },
+    // odata_toolset builds with nothing else: the entry names the catalogue
+    // services and holds no destination, no identity and no credential of
+    // its own (each service names its destination) -- see
+    // agents/odata/tools.py and `_validate_odata_entry` in agents/admin.py.
+    {
+        url: "builtin:odata", titleKey: "builtinOData", descriptionKey: "builtinODataDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
     }
 ];
 

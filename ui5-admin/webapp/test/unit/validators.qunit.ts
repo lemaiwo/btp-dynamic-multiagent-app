@@ -558,3 +558,40 @@ QUnit.test("subagent_max_depth must be 1..3", function (assert) {
     assert.deepEqual(Object.keys(both).sort(), ["max_subagents", "subagent_max_depth"],
         "both fields report at once so the form can flag both controls");
 });
+
+// --- odata ---
+QUnit.module("validators: the builtin:odata entry");
+
+QUnit.test("an odata entry needs a service and no destination", function (assert) {
+    assert.strictEqual(validators.validateOAuth({ services: ["a"] }, "destination", "builtin:odata"), "");
+    assert.strictEqual(validators.validateOAuth({ services: ["a"], allow_write: true }, "destination", "BUILTIN:OData/"), "");
+    assert.strictEqual(validators.validateOAuth({ services: [] }, "destination", "builtin:odata"), "Select at least one OData service.");
+    assert.strictEqual(validators.validateOAuth(undefined, "destination", "builtin:odata"), "Select at least one OData service.");
+});
+
+QUnit.test("an odata entry is refused with anything else in it", function (assert) {
+    const only = "An OData services entry holds only the services and 'Allow writes': "
+        + "the destination and the identity belong to each catalogue service.";
+    assert.strictEqual(validators.validateOAuth({ services: ["a"], destination: "S4_ODATA_TECH" }, "destination", "builtin:odata"), only);
+    assert.strictEqual(validators.validateOAuth({ services: ["a"], user_context: false }, "destination", "builtin:odata"), only);
+    assert.strictEqual(validators.validateOAuth({ services: ["a"], has_client_secret: true }, "destination", "builtin:odata"), only);
+    assert.strictEqual(
+        validators.validateOAuth({ services: ["a"], has_client_secret: false }, "destination", "builtin:odata"), "",
+        "the server's own echo on a stored entry is accepted, as the server accepts it"
+    );
+    assert.strictEqual(
+        validators.validateOAuth({ services: ["a"], allow_write: "true" } as never, "destination", "builtin:odata"),
+        "'Allow writes' must be on or off; any other value does not open writes."
+    );
+    assert.notStrictEqual(validators.validateOAuth({ services: ["a"] }, "oauth2", "builtin:odata"), "", "only destination mode");
+    assert.notStrictEqual(validators.validateOAuth({ services: ["Not A Slug"] }, "destination", "builtin:odata"), "");
+    assert.notStrictEqual(validators.validateOAuth({ services: ["a", "a"] }, "destination", "builtin:odata"), "");
+});
+
+QUnit.test("a second odata entry is refused with a text that points to the first", function (assert) {
+    const entry = { url: "builtin:odata", auth_mode: "destination" as const, oauth: { services: ["a"] } };
+    assert.deepEqual(
+        validators.validateServers([entry, { url: "https://x.hana.ondemand.com/mcp", auth_mode: "jwt" }, { ...entry }]),
+        { 2: "An agent has one OData services entry; add the services to the existing one." }
+    );
+});

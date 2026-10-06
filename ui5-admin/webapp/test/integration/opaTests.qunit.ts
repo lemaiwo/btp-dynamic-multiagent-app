@@ -13,6 +13,7 @@ Opa5.extendConfig({
 });
 
 import "./AgentJourney";
+import "./AgentODataJourney";
 import "./SkillJourney";
 import "./ODataListJourney";
 import "./ODataDetailJourney";
