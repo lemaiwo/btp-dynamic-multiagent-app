@@ -3803,6 +3803,28 @@ opaTest("a test call the route refuses says why by its code, and a service that 
     Then.iStopTheApp();
 });
 
+opaTest("a test call that the connectivity proxy refused is said in plain words", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        backend.testResult = {
+            ...backend.testResult, ok: false, code: "proxy_refused", status: 407, rows: 0,
+            message: "HTTP 407 from the connectivity proxy: <b>x</b> {y}"
+        };
+    });
+    iPressTestCall(When);
+    iSee(Then, "the refused test", function (page: UI5Element) {
+        return testStripOf(page).visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(testStripOf(page), {
+            visible: true, type: "Error", markup: false,
+            text: "Test call failed: the connectivity proxy refused the call to S4_ODATA_TECH as the technical user (HTTP 407) before it "
+                + "reached SAP. Check the connectivity service binding of this app and the CloudConnectorLocationId of the destination; "
+                + "for a service that runs as the signed-in user also the principal propagation mode and the trust of the Cloud Connector."
+        });
+    });
+    Then.iStopTheApp();
+});
+
 opaTest("the result of a test call goes with the first change of the form and when another service is shown", function (Given: Common, When: Common, Then: Common) {
     Given.iStartTheApp(`odata-services/${JOBS}`);
     iSeeTheService(Then, JOBS, "the service is loaded");

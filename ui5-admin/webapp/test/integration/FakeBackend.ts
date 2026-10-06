@@ -55,6 +55,10 @@ export default class FakeBackend {
      */
     public destinationsMode: "ok" | "unavailable" | "truncated" | "partial" | "held" = "ok";
     private heldDestinations: (() => void)[] = [];
+    /** `true`: every POST odata/metadata waits (its answer is worked out when
+     *  it is asked) until `releaseMetadata`. */
+    public metadataHeld = false;
+    private heldMetadata: (() => void)[] = [];
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
     /** Every intercepted call as "METHOD path" (query string dropped), in
@@ -307,6 +311,14 @@ export default class FakeBackend {
         if (this.heldDestinations.length > 0) {
             this.destinationsMode = "held";
         }
+    }
+
+    /** Answers a held metadata read: the first one asked (`0`), the last one
+     *  (`-1`), or all of them (`undefined`). */
+    public releaseMetadata(which?: number): void {
+        const released = which === undefined ? this.heldMetadata.splice(0)
+            : which === -1 ? this.heldMetadata.splice(-1) : this.heldMetadata.splice(which, 1);
+        released.forEach((release) => release());
     }
 
     /** How many times "METHOD path" was requested so far. */
@@ -1264,13 +1276,21 @@ export default class FakeBackend {
             // Compared with the stored service the request names; without
             // `service` everything is new. An unknown `service` is the 404
             // of `api_preview_odata_metadata`, before anything is fetched.
+            let answer: () => Promise<Response>;
             if (body?.service === undefined || body.service === null) {
-                return this.json(this.odataPreview(undefined));
+                const preview = this.odataPreview(undefined);
+                answer = () => this.json(preview);
+            } else {
+                const compared = this.odataServices.filter((s) => s.name === body.service)[0];
+                const preview = compared ? this.odataPreview(compared.definition) : undefined;
+                answer = () => preview ? this.json(preview) : this.json({ detail: "Service not found" }, 404);
             }
-            const compared = this.odataServices.filter((s) => s.name === body.service)[0];
-            return compared
-                ? this.json(this.odataPreview(compared.definition))
-                : this.json({ detail: "Service not found" }, 404);
+            if (this.metadataHeld) {
+                return new Promise<Response>((resolve) => {
+                    this.heldMetadata.push(() => resolve(answer()));
+                });
+            }
+            return answer();
         }
         if (path === "odata/services" && method === "GET") {
             const sorted = this.odataServices.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
@@ -1427,6 +1447,8 @@ export default class FakeBackend {
         const onPremise = { proxy_type: "OnPremise", notes: ["on_premise"] };
         this.destinationsMode = "ok";
         this.heldDestinations = [];
+        this.metadataHeld = false;
+        this.heldMetadata = [];
         this.odataDestinations = [
             item("S4_ODATA_USER", {
                 ...onPremise, authentication: "PrincipalPropagation", user_propagating: true,

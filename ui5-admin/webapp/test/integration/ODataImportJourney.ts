@@ -12,6 +12,7 @@ import type Panel from "sap/m/Panel";
 import type HBox from "sap/m/HBox";
 import type VBox from "sap/m/VBox";
 import type MessageStrip from "sap/m/MessageStrip";
+import type SearchField from "sap/m/SearchField";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type CustomListItem from "sap/m/CustomListItem";
 import type UI5Element from "sap/ui/core/Element";
@@ -20,9 +21,11 @@ import type JSONModel from "sap/ui/model/json/JSONModel";
 import Common, { backend } from "./pages/Common";
 import FakeBackend from "./FakeBackend";
 import { iPressInDialog } from "./pages/Dialogs";
+import { DIALOG as ENTITY_DIALOG, box as fieldBox, fieldItem, part as entityPart } from "./pages/ODataEntity";
 import { TABLE, VIEW as LIST_VIEW, messageOf } from "./pages/ODataList";
 import {
-    VIEW, entityRow, entityTitles, operationRow, operationsHeader, stripOf, toasts, viewOf, withId
+    VIEW, entityItem, entityRow, entityTitles, opBox, operationBox, operationItem, operationRow, operationsHeader, stripOf, toasts,
+    viewOf, withId
 } from "./pages/ODataDetail";
 import type { ODataEntitySet, ODataField, ODataServiceInput } from "../../service/types";
 
@@ -147,6 +150,26 @@ function iOpenTheImport(When: Common): void {
     When.waitFor({
         id: "odataDetailToolbar",
         viewName: VIEW,
+        success: function (toolbar: UI5Element) {
+            const button = viewOf(toolbar).byId("odataImportMetadataButton") as Control;
+            if (button.getDomRef()) {
+                new Press().executeOn(button);
+                return;
+            }
+            new Press().executeOn((toolbar as unknown as { _getOverflowButton(): Control })._getOverflowButton());
+            When.waitFor({
+                controlType: "sap.m.Button", searchOpenDialogs: true, matchers: withId("odataImportMetadataButton"),
+                actions: new Press(), errorMessage: "No import button in the overflow menu"
+            });
+        },
+        errorMessage: "No toolbar"
+    });
+}
+
+/** Presses "Import from $metadata" for a dialog that is a stand-in: nothing opens. */
+function iOpenTheImportStub(When: Common): void {
+    When.waitFor({
+        id: "odataDetailToolbar", viewName: VIEW,
         success: function (toolbar: UI5Element) {
             const button = viewOf(toolbar).byId("odataImportMetadataButton") as Control;
             if (button.getDomRef()) {
@@ -460,6 +483,7 @@ opaTest("a re-import lists what the document no longer has and removes it only w
         offer.skipped = [];
         const definition = stored(JOBS).definition;
         definition.operations[0].bound_to = "A_PurReqAddDelivery";
+        definition.entity_sets.filter((e) => e.name === "A_PurReqAddDelivery")[0].title = "<b>x</b> {y}";
         definition.entity_sets[0].fields.push({
             name: "PurchaseRequisitionItemText", type: "Edm.String", label: "Short text", selectable: true,
             filterable: false, writable: true, hint: "", values: [], personal_data: false
@@ -482,9 +506,11 @@ opaTest("a re-import lists what the document no longer has and removes it only w
             hint: "This service has PurchaseRequisition; the metadata says PurchaseRequisition, Client. "
                 + "Tick to take the key from the metadata."
         }, "a changed key is a row the admin must tick");
+        Opa5.assert.ok(renderedText(shown, "importList").indexOf("<b>x</b> {y}") !== -1, "a removed row shows the stored title as the characters it is");
+        Opa5.assert.strictEqual(markup(shown), 0);
         Opa5.assert.strictEqual(importRow(shown, "A_PurReqAddDelivery").note,
             "Tick to remove it from this service, with its title, description, fields and examples. "
-            + "The entity set \"Delivery address\" (A_PurReqAddDelivery) cannot be removed while these operations are bound to it: "
+            + "The entity set \"<b>x</b> {y}\" (A_PurReqAddDelivery) cannot be removed while these operations are bound to it: "
             + "Release item. Tick them for removal too, or untick the entity set.");
         Opa5.assert.strictEqual(importRow(shown, "ReleaseItem").note,
             "Tick to remove the operation from this service, with its title and description. It is enabled: agents can call it today.");
@@ -531,10 +557,14 @@ opaTest("a refusal of the read is said inside the dialog by its code, in plain w
         ["sap_error", 502, "HTTP 403 from the OData service: <b>x</b> {y}",
             "Metadata not read. SAP answered: HTTP 403 from the OData service: <b>x</b> {y}"],
         // The status of another code: the code decides, not the status.
-        // Also what an on-premise destination that cannot be used answers.
-        ["destination_error", 504, "the destination could not be resolved or used",
-            "Metadata not read: the destination could not be resolved or used. Check its name and its authentication type; "
-            + "the application log has the reason."]
+        // What an on-premise destination that cannot be used answers: the server's own text, as text.
+        ["destination_error", 504, "the destination <b>x</b> {y} has no CloudConnectorLocationId",
+            "Metadata not read: the destination <b>x</b> {y} has no CloudConnectorLocationId"],
+        ["proxy_refused", 502,
+            "HTTP 407 from the connectivity proxy: the connectivity proxy refused the request before it reached SAP",
+            "Metadata not read: the connectivity proxy refused the request before it reached SAP. Check this app's connectivity "
+            + "service binding and the CloudConnectorLocationId of the destination; for a service that runs as the signed-in user "
+            + "also the principal propagation mode and the trust of the Cloud Connector."]
     ];
 
     iOpen(Given, When, JOBS, function (element) { shown = element; });
@@ -582,7 +612,8 @@ opaTest("a cut document, an incomplete one and what could not be compared are sa
         offer.warnings = [
             { code: "metadata_incomplete", message: "parts of the $metadata document were too long to read" },
             { code: "technical_credential", message: "server words" },
-            { code: "something_new", message: "<i>a warning this page does not know</i>" }
+            { code: "something_new", message: "<i>a warning this page does not know</i>" },
+            { code: "another_new", message: "<b>x</b> {y}" }
         ];
     });
     iReadTheMetadata(When, Then, page);
@@ -596,7 +627,8 @@ opaTest("a cut document, an incomplete one and what could not be compared are sa
             "Parts of the $metadata document could not be read and were left out, so this preview may be incomplete.",
             "The read was asked for as you, but this destination does not pass on the signed-in user: the metadata was read "
             + "with the destination's own credential.",
-            "<i>a warning this page does not know</i>"
+            "<i>a warning this page does not know</i>",
+            "<b>x</b> {y}"
         ], "a known warning in this page's words, an unknown one in the server's, as text");
         Opa5.assert.strictEqual(importRow(shown, ITEM).note,
             "Only 91 of its 600 fields are listed. A key field may be missing: check the key after the import.");
@@ -605,6 +637,15 @@ opaTest("a cut document, an incomplete one and what could not be compared are sa
             "the two entity sets the document does not list are not called removed");
         Opa5.assert.strictEqual(byId<Button>(shown, "importSelectRemoved").getVisible(), false);
         Opa5.assert.strictEqual(markup(shown), 0, "no name, label or message became markup");
+        const warningsOnScreen = renderedText(shown, "importWarnings");
+        Opa5.assert.ok(warningsOnScreen.indexOf("<i>a warning this page does not know</i>") !== -1 && warningsOnScreen.indexOf("<b>x</b> {y}") !== -1,
+            `[${warningsOnScreen}] the warnings are on screen as the characters the server sent: no markup, no binding syntax taken`);
+        const strips = (byId<Control>(shown, "odataImportDialog") as unknown as {
+            findAggregatedObjects(deep: boolean, check: (c: Control) => boolean): MessageStrip[];
+        }).findAggregatedObjects(true, (control) => control.isA("sap.m.MessageStrip"));
+        Opa5.assert.ok(strips.length >= 5, `the dialog has its strips (${strips.length})`);
+        Opa5.assert.deepEqual(strips.filter((strip) => strip.getEnableFormattedText()).map((strip) => strip.getId()), [],
+            "no message strip of the dialog formats its text");
     });
     iPressInDialog(When, "Cancel");
     iSeeThePage(Then, "the page", function () { Opa5.assert.strictEqual(writes(), 0); });
@@ -716,5 +757,238 @@ opaTest("Save, Create in the duplicate dialog and Read metadata take the destina
         },
         errorMessage: "The duplicate was not sent"
     });
+    Then.iStopTheApp();
+});
+
+/** The dialog's own text of a region, as it is on screen. */
+function renderedText(page: UI5Element, id: string): string {
+    return byId<Control>(page, id).getDomRef()?.textContent ?? "";
+}
+
+/** Waits `ms` after `since()` before `assert` runs: what a held answer does once released. */
+function iSeeLater(Then: Common, since: () => number, ms: number, assert: () => void, inDialog = false): void {
+    Then.waitFor({
+        ...(inDialog ? { controlType: "sap.m.Dialog", searchOpenDialogs: true } : { id: "odataName", viewName: VIEW }),
+        check: function () { return Date.now() - since() > ms; },
+        success: assert,
+        errorMessage: "The wait did not end"
+    });
+}
+
+opaTest("an answer that comes after Cancel and reopening is not shown in the new dialog", function (Given: Common, When: Common, Then: Common) {
+    let shown: UI5Element;
+    let released = 0;
+    const page = () => shown;
+    void page;
+
+    iOpen(Given, When, JOBS, function (element) { shown = element; }, function () {
+        backend.metadataHeld = true;
+        backend.metadataPreview.warnings = [{ code: "something_new", message: "from the first read" }];
+    });
+    iOpenTheImport(When);
+    iPressInImport(When, "importReadButton");
+    iSeeInImport(Then, "the read is on its way", function () { return backend.countRequests(READ) === 1; }, function () {
+        Opa5.assert.strictEqual(byId<Button>(shown, "importReadButton").getText(), "Reading the metadata...");
+        Opa5.assert.strictEqual(byId<Button>(shown, "importReadButton").getEnabled(), false, "a second read cannot be started meanwhile");
+    });
+    iPressInImport(When, "importCancelButton");
+    iSeeThePage(Then, "the page after Cancel", function () { Opa5.assert.ok(true, "closed with nothing ticked: no question"); });
+    iOpenTheImport(When);
+    iSeeInImport(Then, "the reopened dialog", function () { return byId<Button>(shown, "importReadButton").getText() === "Read metadata"; }, function () {
+        Opa5.assert.ok(true, "it is not reading");
+    });
+    iDo(When, function () { released = Date.now(); backend.releaseMetadata(); });
+    iSeeLater(Then, () => released, 200, function () {
+        Opa5.assert.strictEqual(strip(shown, "importSummary"), "", "the answer to the first read is not listed");
+        Opa5.assert.deepEqual(texts(shown, "importWarnings"), [], "nor its warning");
+        Opa5.assert.deepEqual(importRows(shown), [], "nor its rows");
+        Opa5.assert.deepEqual(apply(shown), { text: "Nothing selected", enabled: false });
+        Opa5.assert.strictEqual(byId<Button>(shown, "importReadButton").getEnabled(), true, "and the dialog is not left reading");
+        backend.metadataHeld = false;
+    }, true);
+    iPressInImport(When, "importReadButton");
+    iSeeInImport(Then, "a read of the reopened dialog", function () { return strip(shown, "importSummary") !== ""; }, function () {
+        Opa5.assert.deepEqual(texts(shown, "importWarnings"), ["from the first read"], "the dialog works for a read of its own");
+    });
+    iPressInDialog(When, "Cancel");
+    iSeeThePage(Then, "the page", function () { Opa5.assert.strictEqual(writes(), 0); });
+    Then.iStopTheApp();
+});
+
+opaTest("an answer that comes after the address changed to another service is not shown there", function (Given: Common, When: Common, Then: Common) {
+    let shown: UI5Element;
+    let released = 0;
+
+    iOpen(Given, When, JOBS, function (element) { shown = element; }, function () {
+        backend.metadataHeld = true;
+        backend.metadataPreview.warnings = [{ code: "something_new", message: "from the first service" }];
+    });
+    iOpenTheImport(When);
+    iPressInImport(When, "importReadButton");
+    iSeeInImport(Then, "the read is on its way", function () { return backend.countRequests(READ) === 1; }, function () {
+        Opa5.assert.ok(true, "asked");
+    });
+    iDo(When, function () { HashChanger.getInstance().setHash(`odata-services/${UNUSED}`); });
+    iSeeThePage(Then, "the other service", function () {
+        Opa5.assert.strictEqual(
+            JSON.stringify(formData(shown).definition), JSON.stringify(stored(UNUSED).definition), "shown as stored"
+        );
+    }, function () { return byId<Input>(shown, "odataName").getValue() === UNUSED; });
+    // The import of the other service is opened before the first answer comes.
+    iOpenTheImport(When);
+    iSeeInImport(Then, "the import of the other service", function () { return byId<Button>(shown, "importReadButton").getText() === "Read metadata"; }, function () {
+        Opa5.assert.ok(true, "open, not reading");
+    });
+    iDo(When, function () { released = Date.now(); backend.releaseMetadata(); });
+    iSeeLater(Then, () => released, 200, function () {
+        Opa5.assert.strictEqual(strip(shown, "importSummary"), "", "the answer for the first service is not listed here");
+        Opa5.assert.deepEqual(texts(shown, "importWarnings"), []);
+        Opa5.assert.deepEqual(importRows(shown), []);
+        Opa5.assert.strictEqual(byId<Button>(shown, "importReadButton").getEnabled(), true);
+        backend.metadataHeld = false;
+    }, true);
+    iPressInDialog(When, "Cancel");
+    Then.iStopTheApp();
+});
+
+opaTest("an Apply that arrives after another service was loaded into the page is not written into that service", function (Given: Common, When: Common, Then: Common) {
+    let shown: UI5Element;
+    let answer: (result: { definition: ODataServiceInput["definition"]; metadata_fetched_at: string } | undefined) => void = () => undefined;
+    let waited = 0;
+
+    iOpen(Given, When, JOBS, function (element) { shown = element; });
+    // The dialog is a stand-in the test holds: its Apply comes when the test says, which is after the page
+    // has loaded the other service (a real one closes with an animation, and the answer can be that late).
+    When.waitFor({
+        id: "odataDetailToolbar", viewName: VIEW,
+        success: function () {
+            const controller = viewOf(shown).getController() as unknown as { importDialog: unknown };
+            controller.importDialog = {
+                open: () => new Promise((resolve) => { answer = resolve as typeof answer; }),
+                dismiss: () => undefined
+            };
+        },
+        errorMessage: "No toolbar"
+    });
+    iOpenTheImportStub(When);
+    When.waitFor({
+        id: "odataName", viewName: VIEW,
+        success: function () { HashChanger.getInstance().setHash(`odata-services/${UNUSED}`); },
+        errorMessage: "No page"
+    });
+    iSeeThePage(Then, "the other service", function () { Opa5.assert.ok(true, "shown"); },
+        function () { return byId<Input>(shown, "odataName").getValue() === UNUSED && (viewOf(shown).getModel("svc") as JSONModel).getProperty("/loaded") === true; });
+    When.waitFor({
+        id: "odataName", viewName: VIEW,
+        success: function () {
+            const merged = JSON.parse(JSON.stringify(stored(JOBS).definition)) as ODataServiceInput["definition"];
+            merged.entity_sets[0].title = "Written by the import of the first service";
+            answer({ definition: merged, metadata_fetched_at: "2026-10-05T09:00:00+00:00" });
+            waited = Date.now();
+        },
+        errorMessage: "No page"
+    });
+    iSeeLater(Then, () => waited, 300, function () {
+        Opa5.assert.strictEqual(
+            JSON.stringify(formData(shown).definition), JSON.stringify(stored(UNUSED).definition),
+            "the other service is as stored: nothing of the import of the first one is in it"
+        );
+        Opa5.assert.strictEqual(formData(shown).metadata_fetched_at, stored(UNUSED).metadata_fetched_at);
+        Opa5.assert.strictEqual(toasts().indexOf("Imported. Review the entity sets and save."), -1, "and it does not say it applied anything");
+        Opa5.assert.strictEqual(writes(), 0);
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("after a first import, an imported operation switched on and a field made writable on an imported entity set reach the pending strip and the Save question", function (Given: Common, When: Common, Then: Common) {
+    let shown: UI5Element;
+    const page = () => shown;
+    const FIELD = "PurReqnOrigin";
+
+    iOpen(Given, When, "new", function (element) { shown = element; });
+    When.waitFor({ id: "odataTitle", viewName: VIEW, actions: new EnterText({ text: "Imported service" }), errorMessage: "No title field" });
+    When.waitFor({ id: "odataName", viewName: VIEW, actions: new EnterText({ text: "imported-service" }), errorMessage: "No name field" });
+    When.waitFor({ id: "odataPurpose", viewName: VIEW, actions: new EnterText({ text: "Read requisitions" }), errorMessage: "No purpose field" });
+    When.waitFor({ id: "odataDestination", viewName: VIEW, actions: new EnterText({ text: "S4_ODATA_USER" }), errorMessage: "No destination field" });
+    When.waitFor({ id: "odataServicePath", viewName: VIEW, actions: new EnterText({ text: PATH }), errorMessage: "No path field" });
+    iReadTheMetadata(When, Then, page);
+    iTick(When, page, ITEM);
+    iTick(When, page, "ReleaseItem");
+    iPressInImport(When, "importApplyButton");
+    iSeeThePage(Then, "the imported service, nothing pending", function () {
+        Opa5.assert.strictEqual(stripOf(shown, "odataPendingWrites").visible, false, "the import opened nothing");
+    }, function () { return formData(shown).definition.entity_sets.length === 1; });
+    // The admin switches on the imported operation, makes a field of the imported entity set writable and ticks Create.
+    When.waitFor({
+        id: "odataOperationsTable", viewName: VIEW,
+        check: function (table: UI5Element) { return !!operationItem(table, "ReleaseItem"); },
+        success: function (table: UI5Element) { new Press().executeOn(operationBox(operationItem(table, "ReleaseItem"), "enabled")); },
+        errorMessage: "No operations table"
+    });
+    When.waitFor({
+        id: "odataEntityTable", viewName: VIEW,
+        success: function (table: UI5Element) { new Press().executeOn(entityItem(table, "Purchase requisition item")); },
+        errorMessage: "No entity sets table"
+    });
+    When.waitFor({
+        controlType: "sap.m.Dialog", searchOpenDialogs: true, matchers: withId(ENTITY_DIALOG),
+        success: function (dialogs: UI5Element[]) {
+            const search = entityPart<SearchField>(dialogs[0], "entityFieldSearch");
+            search.setValue(FIELD);
+            search.fireLiveChange({ newValue: FIELD });
+        },
+        errorMessage: "No entity set dialog"
+    });
+    When.waitFor({
+        controlType: "sap.m.Dialog", searchOpenDialogs: true, matchers: withId(ENTITY_DIALOG),
+        check: function (dialogs: UI5Element[]) { return !!fieldItem(dialogs[0], FIELD); },
+        success: function (dialogs: UI5Element[]) { new Press().executeOn(fieldBox(fieldItem(dialogs[0], FIELD), "write")); },
+        errorMessage: "No field to tick"
+    });
+    When.waitFor({
+        controlType: "sap.m.Dialog", searchOpenDialogs: true, matchers: withId(ENTITY_DIALOG),
+        success: function (dialogs: UI5Element[]) { new Press().executeOn(entityPart(dialogs[0], "entityApplyButton")); },
+        errorMessage: "No Apply in the entity set dialog"
+    });
+    When.waitFor({
+        id: "odataEntityTable", viewName: VIEW,
+        check: function (table: UI5Element) { return !!entityItem(table, "Purchase requisition item"); },
+        success: function (table: UI5Element) { new Press().executeOn(opBox(entityItem(table, "Purchase requisition item"), "create")); },
+        errorMessage: "No entity sets table"
+    });
+    let strip1 = "";
+    iSeeThePage(Then, "the pending strip", function () {
+        strip1 = stripOf(shown, "odataPendingWrites").text;
+        Opa5.assert.ok(strip1.indexOf("ReleaseItem") !== -1, `the imported operation is named: ${strip1}`);
+        Opa5.assert.ok(strip1.indexOf(FIELD) !== -1, `and the imported field made writable: ${strip1}`);
+        Opa5.assert.ok(/create/i.test(strip1), `and Create on the imported entity set: ${strip1}`);
+        Opa5.assert.strictEqual(writes(), 0, "nothing is sent yet");
+    }, function () { return stripOf(shown, "odataPendingWrites").visible; });
+    When.waitFor({ id: "odataSaveButton", viewName: VIEW, actions: new Press(), errorMessage: "No Save" });
+    Then.waitFor({
+        controlType: "sap.m.Dialog", searchOpenDialogs: true,
+        check: function (dialogs: UI5Element[]) { return dialogs.some((dialog) => messageOf(dialog).indexOf("Saving enables these writes in SAP") !== -1); },
+        success: function (dialogs: UI5Element[]) {
+            const asked = dialogs.map((dialog) => messageOf(dialog)).filter((text) => text.indexOf("Saving enables") !== -1)[0];
+            Opa5.assert.ok(asked.indexOf("ReleaseItem") !== -1 && asked.indexOf(FIELD) !== -1, `Save asks, naming both: ${asked}`);
+            Opa5.assert.strictEqual(writes(), 0, "nothing is sent before the answer");
+        },
+        errorMessage: "Save did not ask"
+    });
+    iPressInDialog(When, "Cancel");
+    Then.iStopTheApp();
+});
+
+opaTest("a service that runs as the signed-in user is read as the signed-in user", function (Given: Common, When: Common, Then: Common) {
+    let shown: UI5Element;
+    const page = () => shown;
+
+    iOpen(Given, When, "purchase-requisitions", function (element) { shown = element; });
+    iReadTheMetadata(When, Then, page);
+    iSeeInImport(Then, "the request", function () { return backend.countRequests(READ) === 1; }, function () {
+        Opa5.assert.strictEqual(backend.bodies[READ]?.user_context, true, "user_context is true in the request");
+        Opa5.assert.strictEqual(backend.bodies[READ]?.destination, "S4_ODATA_USER");
+    });
+    iPressInDialog(When, "Cancel");
     Then.iStopTheApp();
 });

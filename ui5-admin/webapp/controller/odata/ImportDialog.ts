@@ -58,8 +58,7 @@ const DECLARED_TEXT: Record<string, string> = {
 };
 /** A refusal of the metadata route by its stable code (`X-OData-Error`). */
 const ERROR_TEXT: Record<string, string> = {
-    user_token_required: "odataImportErrUser",
-    destination_error: "odataImportErrDestination", unreachable: "odataImportErrUnreachable",
+    user_token_required: "odataImportErrUser", proxy_refused: "odataImportErrProxy", unreachable: "odataImportErrUnreachable",
     redirect: "odataImportErrRedirect", not_xml: "odataImportErrNotXml", too_large: "odataImportErrTooLarge",
     timeout: "odataImportErrTimeout", busy: "odataImportErrBusy", preview_failed: "odataImportErrFailed"
 };
@@ -250,6 +249,11 @@ export default class ImportDialog {
             return text("odataImportErrPlain");
         }
         const detail = (error.detail ?? "").trim();
+        if (error.code === "destination_error") {
+            // The server says what is wrong with an on-premise destination
+            // in a fixed text of its own: shown as it is, as text.
+            return detail ? text("odataImportErrDestinationSaid", [detail]) : text("odataImportErrDestination");
+        }
         if (ERROR_TEXT[error.code]) {
             return text(ERROR_TEXT[error.code]);
         }

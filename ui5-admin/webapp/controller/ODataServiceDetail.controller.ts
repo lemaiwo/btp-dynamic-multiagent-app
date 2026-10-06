@@ -1977,6 +1977,9 @@ export default class ODataServiceDetail extends ODataController {
                     status, destination, duration, String(result.rows ?? 0), String(result.target ?? ""), as
                 ]);
         }
+        if (result.code === "proxy_refused") {
+            return this.text("odataTestProxyRefused", [destination, as]);
+        }
         // The server's words (SAP's code and text among them), as text.
         const said = String(result.message || result.code || "");
         if (status) {
