@@ -18,6 +18,7 @@ sap.ui.define(function () {
             "unit/odataCatalog": { title: "Unit: odataCatalog" },
             "unit/odataEntityDialog": { title: "Unit: odataCatalog, entity set dialog" },
             "unit/odataDestinations": { title: "Unit: odataDestinations" },
+            "unit/odataImport": { title: "Unit: odataCatalog, import from $metadata" },
             "unit/oauthConfig": { title: "Unit: oauthConfig" },
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },

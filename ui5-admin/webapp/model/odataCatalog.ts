@@ -1,6 +1,7 @@
 import type {
     ODataDefinition, ODataDuplicateRequest, ODataEntityOp, ODataEntitySet, ODataExampleQuery, ODataField,
-    ODataNavigation, ODataOperation, ODataServiceInput, ODataUsedBy, ODataValueMeaning
+    ODataMetadataPreview, ODataNavigation, ODataOperation, ODataPreviewEntitySet, ODataPreviewField,
+    ODataPreviewOperation, ODataServiceInput, ODataUsedBy, ODataValueMeaning
 } from "../service/types";
 
 /**
@@ -922,6 +923,571 @@ function removalBlockers(definition: ODataDefinition | undefined | null, name: s
 }
 
 
+// --- import from $metadata --------------------------------------------------
+
+/** What a row of the import dialog is about. */
+export type ODataImportKind = "entity_set" | "field" | "removed_field" | "key_change" | "type_change"
+    | "entity_type_change" | "operation" | "removed_entity_set" | "removed_operation" | "labels";
+
+/** How a row compares with the service as the FORM has it. */
+export type ODataImportStatus = "new" | "changed" | "in_service" | "removed";
+
+/**
+ * One thing the $metadata document offers, or one difference between the
+ * document and the service of the form. `id` is what a selection names:
+ * `set:<name>`, `field:<set>:<field>`, `rmfield:<set>:<field>`,
+ * `key:<set>`, `type:<set>:<field>`, `etype:<set>`, `op:<name>`,
+ * `rmset:<name>`, `rmop:<name>`, `labels`. EDM names hold no colon.
+ *
+ * Facts only, no sentence: the dialog words a row when it is shown.
+ */
+export interface ODataImportItem {
+    id: string;
+    kind: ODataImportKind;
+    /** The id of the entity set row this row sits under, or "". */
+    parent: string;
+    name: string;
+    /** SAP's label, or the admin's title of something that is removed. */
+    label: string;
+    status: ODataImportStatus;
+    /** Ticking it changes something; a row that is only shown is not. */
+    selectable: boolean;
+    /** How many rows sit under this entity set row. */
+    children: number;
+    /** A field's type, or the type the document has now. */
+    type: string;
+    /** What the service holds, and what the document says (a type, a key
+     *  as "A, B", an entity type). */
+    was: string;
+    now: string;
+    /** An entity set: fields listed, fields of the document, navigations. */
+    fields: number;
+    fieldsTotal: number;
+    navigations: number;
+    /** Fields, keys or navigations of the entity set were cut by the server. */
+    truncated: boolean;
+    /** An operation: kind, method, parameters, the entity set it is bound to. */
+    operationKind: string;
+    method: string;
+    parameters: number;
+    boundTo: string;
+    /** What SAP DECLARES (`creatable`, `updatable`, `deletable`,
+     *  `filterable`): information, never taken over. */
+    declared: string[];
+    /** A new operation bound to an entity set the service does not have. */
+    needs: string;
+    /** A removal: the entity-set operations agents lose, how many fields
+     *  they can read, filter or write today, whether an operation is
+     *  enabled, whether a field is part of the key. */
+    lostOperations: ODataEntityOp[];
+    lostReadable: number;
+    lostWritable: number;
+    lostEnabled: boolean;
+    lostKey: boolean;
+    /** Why an entity set cannot be removed while these operations stay. */
+    blockers: ODataRemovalBlocker[];
+    /** Declared by the document, but left out by the parser: the reason code. */
+    skippedReason: string;
+    /** `labels`: how many empty labels the document can fill. */
+    count: number;
+}
+
+export interface ODataImportPlan {
+    items: ODataImportItem[];
+    /** Top-level rows by status, and what the document offers in all. */
+    counts: { entitySets: number; operations: number; isNew: number; changed: number; inService: number; removed: number };
+    /** False: the document was not read to its end, so what was removed
+     *  from it is not known (which is not the same as nothing). */
+    removalsKnown: boolean;
+}
+
+/** Why Apply cannot take a selection as it is: an i18n key and its arguments. */
+export interface ODataImportBlock {
+    id: string;
+    key: string;
+    args: (string | number)[];
+}
+
+export interface ODataImportSummary {
+    add: number;
+    change: number;
+    remove: number;
+    total: number;
+    blocked: ODataImportBlock[];
+}
+
+const MAX_OPERATIONS = 200;
+// Control characters, the C1 block and the line separators: a label is one line.
+const LABEL_BREAK_RE = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]+", "g");
+
+/** A label of the document as the catalogue can store it: one line, at
+ *  most 120 characters. */
+function importLabel(text: string | undefined | null): string {
+    return String(text ?? "").replace(LABEL_BREAK_RE, " ").replace(/\s+/g, " ").trim().slice(0, MAX_LABEL);
+}
+
+function importId(kind: string, first = "", second = ""): string {
+    return [kind, first, second].filter(Boolean).join(":");
+}
+
+function blankImportItem(id: string, kind: ODataImportKind, name: string, status: ODataImportStatus): ODataImportItem {
+    return {
+        id, kind, parent: "", name, label: "", status, selectable: false, children: 0, type: "", was: "", now: "",
+        fields: 0, fieldsTotal: 0, navigations: 0, truncated: false, operationKind: "", method: "", parameters: 0,
+        boundTo: "", declared: [], needs: "", lostOperations: [], lostReadable: 0, lostWritable: 0,
+        lostEnabled: false, lostKey: false, blockers: [], skippedReason: "", count: 0
+    };
+}
+
+function namesOf(list: readonly { name: string }[] | undefined | null): string[] {
+    return (list ?? []).map((entry) => entry.name);
+}
+
+/** The rows under an entity set the service already has: what the document
+ *  says differently about it. */
+function importDifferences(
+    entitySet: ODataEntitySet, offered: ODataPreviewEntitySet, parent: string
+): ODataImportItem[] {
+    const rows: ODataImportItem[] = [];
+    const child = (id: string, kind: ODataImportKind, name: string, status: ODataImportStatus): ODataImportItem => {
+        const row = blankImportItem(id, kind, name, status);
+        row.parent = parent;
+        row.selectable = true;
+        rows.push(row);
+        return row;
+    };
+    const have = entitySet.fields ?? [];
+    const haveNames = namesOf(have);
+    const offer = offered.fields ?? [];
+    const offerNames = namesOf(offer);
+    const keysHave = namesOf(entitySet.keys);
+    const keysOffer = namesOf(offered.keys);
+    // A key the server cut cannot be taken over: it would not be the key.
+    if ((offered.keys_total ?? keysOffer.length) <= keysOffer.length && keysHave.join("\n") !== keysOffer.join("\n")) {
+        const row = child(importId("key", entitySet.name), "key_change", entitySet.name, "changed");
+        row.was = keysHave.join(", ");
+        row.now = keysOffer.join(", ");
+    }
+    if ((entitySet.entity_type ?? "") !== (offered.entity_type ?? "")) {
+        const row = child(importId("etype", entitySet.name), "entity_type_change", entitySet.name, "changed");
+        row.was = entitySet.entity_type ?? "";
+        row.now = offered.entity_type ?? "";
+    }
+    offer.forEach((field) => {
+        const at = haveNames.indexOf(field.name);
+        if (at !== -1 && (have[at].type ?? "Edm.String") !== field.type) {
+            const row = child(importId("type", entitySet.name, field.name), "type_change", field.name, "changed");
+            row.label = importLabel(field.label);
+            row.was = have[at].type ?? "Edm.String";
+            row.now = field.type;
+        }
+    });
+    offer.forEach((field) => {
+        if (haveNames.indexOf(field.name) === -1) {
+            const row = child(importId("field", entitySet.name, field.name), "field", field.name, "new");
+            row.label = importLabel(field.label);
+            row.type = field.type;
+            row.declared = (["filterable", "creatable", "updatable"] as const).filter((key) => field.declared?.[key] === true);
+        }
+    });
+    // Of a set whose fields were cut, a field that is not listed may still
+    // be in the document: only what the server compared is "removed".
+    const gone = offered.truncated
+        ? (offered.status === "new" ? [] : (offered.removed_fields ?? []).filter((name) => offerNames.indexOf(name) === -1))
+        : haveNames.filter((name) => offerNames.indexOf(name) === -1);
+    gone.forEach((name) => {
+        const field = have[haveNames.indexOf(name)];
+        if (!field) {
+            return;
+        }
+        const row = child(importId("rmfield", entitySet.name, name), "removed_field", name, "removed");
+        row.label = field.label ?? "";
+        row.type = field.type ?? "Edm.String";
+        row.lostReadable = field.selectable === true ? 1 : 0;
+        row.lostWritable = field.writable === true ? 1 : 0;
+        row.lostKey = keysHave.indexOf(name) !== -1;
+    });
+    return rows;
+}
+
+/**
+ * What the document `preview` offers, compared with `definition` -- the
+ * service as the FORM has it, which may be ahead of the stored one the
+ * server compared with. One row per entity set and operation of the
+ * document, the differences of an entity set underneath it, then what the
+ * service has and the document no longer declares.
+ */
+function importPlan(definition: ODataDefinition | undefined | null, preview: ODataMetadataPreview): ODataImportPlan {
+    const items: ODataImportItem[] = [];
+    const entitySets = definition?.entity_sets ?? [];
+    const operations = definition?.operations ?? [];
+    const setNames = namesOf(entitySets);
+    const offeredSets = preview.entity_sets ?? [];
+    const offeredOperations = preview.operations ?? [];
+    const counts = {
+        entitySets: offeredSets.length, operations: offeredOperations.length, isNew: 0, changed: 0, inService: 0, removed: 0
+    };
+    const count = (status: ODataImportStatus): void => {
+        counts[status === "new" ? "isNew" : status === "in_service" ? "inService" : status] += 1;
+    };
+    let emptyLabels = 0;
+    offeredSets.forEach((offered) => {
+        const id = importId("set", offered.name);
+        const row = blankImportItem(id, "entity_set", offered.name, "new");
+        const stored = entitySets[setNames.indexOf(offered.name)];
+        row.label = importLabel(offered.label);
+        row.fields = (offered.fields ?? []).length;
+        row.fieldsTotal = offered.fields_total ?? row.fields;
+        row.navigations = (offered.navigations ?? []).length;
+        row.truncated = offered.truncated === true;
+        row.declared = (["creatable", "updatable", "deletable"] as const).filter((key) => offered.declared?.[key] === true);
+        items.push(row);
+        if (!stored) {
+            row.selectable = true;
+            count("new");
+            return;
+        }
+        const children = importDifferences(stored, offered, id);
+        row.children = children.length;
+        row.status = children.length ? "changed" : "in_service";
+        count(row.status);
+        children.forEach((child) => items.push(child));
+        const labels: Record<string, string> = {};
+        (offered.fields ?? []).forEach((field) => { labels[field.name] = importLabel(field.label); });
+        emptyLabels += (stored.fields ?? []).filter((field) => !(field.label ?? "") && !!labels[field.name]).length;
+    });
+    // Declared by the document but left out by the parser: not "removed".
+    const leftOut: Record<string, string> = {};
+    (preview.skipped ?? []).forEach((entry) => {
+        if (entry.kind === "entity_set" && entry.entity_set && leftOut[entry.entity_set] === undefined) {
+            leftOut[entry.entity_set] = entry.reason;
+        }
+    });
+    (preview.skipped_stored_entity_sets ?? []).forEach((entry) => { leftOut[entry.name] = entry.reason; });
+    const removalsKnown = preview.removed_complete !== false;
+    const offeredSetNames = namesOf(offeredSets);
+    const setsCut = (preview.totals?.entity_sets ?? offeredSets.length) > offeredSets.length;
+    const operationsCut = (preview.totals?.operations ?? offeredOperations.length) > offeredOperations.length;
+    entitySets.forEach((entitySet) => {
+        if (offeredSetNames.indexOf(entitySet.name) !== -1) {
+            return;
+        }
+        if (leftOut[entitySet.name] !== undefined) {
+            const row = blankImportItem(importId("set", entitySet.name), "entity_set", entitySet.name, "in_service");
+            row.label = entitySet.title ?? "";
+            row.fields = row.fieldsTotal = (entitySet.fields ?? []).length;
+            row.navigations = (entitySet.navigations ?? []).length;
+            row.skippedReason = leftOut[entitySet.name];
+            items.push(row);
+            count("in_service");
+            return;
+        }
+        // Past the cut of a long document nothing is known about a set
+        // the server did not compare.
+        if (!removalsKnown || (setsCut && (preview.removed_entity_sets ?? []).indexOf(entitySet.name) === -1)) {
+            return;
+        }
+        const row = blankImportItem(importId("rmset", entitySet.name), "removed_entity_set", entitySet.name, "removed");
+        row.label = entitySet.title ?? "";
+        row.selectable = true;
+        row.fields = row.fieldsTotal = (entitySet.fields ?? []).length;
+        row.lostOperations = ENTITY_OPS.filter((op) => (entitySet.operations ?? []).indexOf(op) !== -1);
+        row.lostReadable = (entitySet.fields ?? []).filter((field) => field.selectable === true).length;
+        row.lostWritable = (entitySet.fields ?? []).filter((field) => field.writable === true).length;
+        row.blockers = removalBlockers(definition, entitySet.name);
+        items.push(row);
+        count("removed");
+    });
+    const operationNames = namesOf(operations);
+    offeredOperations.forEach((offered) => {
+        const known = operationNames.indexOf(offered.name) !== -1;
+        const row = blankImportItem(importId("op", offered.name), "operation", offered.name, known ? "in_service" : "new");
+        row.label = importLabel(offered.label);
+        row.operationKind = offered.kind;
+        row.method = offered.http_method;
+        row.parameters = (offered.parameters ?? []).length;
+        row.boundTo = offered.bound_to ?? "";
+        row.truncated = offered.truncated === true;
+        row.selectable = !known;
+        row.needs = !known && row.boundTo && setNames.indexOf(row.boundTo) === -1 ? row.boundTo : "";
+        items.push(row);
+        count(row.status);
+    });
+    const offeredOperationNames = namesOf(offeredOperations);
+    operations.forEach((operation) => {
+        if (offeredOperationNames.indexOf(operation.name) !== -1 || !removalsKnown
+            || (operationsCut && (preview.removed_operations ?? []).indexOf(operation.name) === -1)) {
+            return;
+        }
+        const row = blankImportItem(importId("rmop", operation.name), "removed_operation", operation.name, "removed");
+        row.label = operation.title ?? "";
+        row.selectable = true;
+        row.operationKind = operation.kind;
+        row.method = operation.http_method;
+        row.parameters = (operation.parameters ?? []).length;
+        row.boundTo = operation.bound_to ?? "";
+        row.lostEnabled = operation.enabled === true;
+        items.push(row);
+        count("removed");
+    });
+    if (emptyLabels) {
+        const row = blankImportItem("labels", "labels", "", "changed");
+        row.selectable = true;
+        row.count = emptyLabels;
+        items.push(row);
+    }
+    return { items, counts, removalsKnown };
+}
+
+/** A selection as a lookup: `{kind: {first: {second | "": true}}}`. */
+function importChoices(selection: readonly string[]): Record<string, Record<string, Record<string, boolean>>> {
+    const choices: Record<string, Record<string, Record<string, boolean>>> = {};
+    selection.forEach((id) => {
+        const [kind, first = "", second = ""] = id.split(":");
+        choices[kind] = choices[kind] ?? {};
+        choices[kind][first] = choices[kind][first] ?? {};
+        choices[kind][first][second] = true;
+    });
+    return choices;
+}
+
+/** A field as an import adds it: its name, type and label, and NOTHING an
+ *  agent could use it for. What SAP declares about it is not looked at. */
+function importedField(offered: ODataPreviewField): ODataField {
+    return {
+        name: offered.name, type: offered.type || "Edm.String", label: importLabel(offered.label),
+        selectable: false, filterable: false, writable: false, hint: "", values: [], personal_data: false
+    };
+}
+
+/** An entity set as an import adds it: no operation enabled, no field
+ *  ticked, no description. */
+function importedEntitySet(offered: ODataPreviewEntitySet): ODataEntitySet {
+    return {
+        name: offered.name, title: importLabel(offered.label), path: "",
+        entity_type: offered.entity_type ?? "", description: "",
+        keys: (offered.keys ?? []).map((key) => ({ name: key.name, type: key.type || "Edm.String" })),
+        operations: [],
+        fields: (offered.fields ?? []).slice(0, MAX_FIELDS).map(importedField),
+        navigations: (offered.navigations ?? []).map((navigation) => ({
+            name: navigation.name, target: navigation.target, collection: navigation.collection === true, description: ""
+        })),
+        examples: []
+    };
+}
+
+/**
+ * An operation as an import adds it: switched off. `changes_data` is the
+ * document's suggestion only when the document KNOWS (`suggested.known`);
+ * otherwise the operation counts as changing data, the safe side. What it
+ * returns is kept when that is an entity set the service will hold.
+ */
+function importedOperation(offered: ODataPreviewOperation, setNames: readonly string[]): ODataOperation {
+    const suggested = offered.suggested;
+    const returned = suggested?.returns?.entity_set;
+    return {
+        name: offered.name, qualified_name: offered.qualified_name ?? "", title: importLabel(offered.label),
+        kind: offered.kind, http_method: offered.http_method, bound_to: offered.bound_to ?? null,
+        parameters: (offered.parameters ?? []).map((parameter) => ({
+            name: parameter.name, type: parameter.type || "Edm.String", required: parameter.required !== false
+        })),
+        description: "", enabled: false,
+        changes_data: !(suggested?.known === true && suggested.changes_data === false),
+        returns: returned && setNames.indexOf(returned) !== -1
+            ? { entity_set: returned, collection: suggested?.returns?.collection === true } : null
+    };
+}
+
+/**
+ * The definition after an import: a copy of `definition` with what
+ * `selection` (ids of `importPlan` rows) names, and nothing else.
+ *
+ * - It widens nothing: whatever it adds arrives with every operation off,
+ *   no field ticked and every operation disabled.
+ * - It overwrites none of the admin's work: of an entity set, field or
+ *   operation the service already has, only what a ticked row names
+ *   changes (a type, the key, the entity type, an empty label).
+ * - It removes only what a ticked `rm...` row names; an entity set an
+ *   operation is still bound to or returns stays (`removalBlockers`), and a
+ *   new operation bound to an entity set the result does not hold is not
+ *   added (`importSummary` says both before Apply).
+ */
+function mergeImport(
+    definition: ODataDefinition | undefined | null, preview: ODataMetadataPreview, selection: readonly string[]
+): ODataDefinition {
+    const merged = JSON.parse(JSON.stringify({
+        entity_sets: definition?.entity_sets ?? [], operations: definition?.operations ?? []
+    })) as ODataDefinition;
+    const choices = importChoices(selection);
+    const chosen = (kind: string, first = "", second = ""): boolean => choices[kind]?.[first]?.[second] === true;
+    const fillLabels = chosen("labels");
+    (preview.entity_sets ?? []).forEach((offered) => {
+        const entitySet = merged.entity_sets.filter((candidate) => candidate.name === offered.name)[0];
+        if (!entitySet) {
+            if (chosen("set", offered.name) && merged.entity_sets.length < MAX_ENTITY_SETS) {
+                merged.entity_sets.push(importedEntitySet(offered));
+            }
+            return;
+        }
+        const name = entitySet.name;
+        const touched = fillLabels || !!choices.field?.[name] || !!choices.rmfield?.[name] || !!choices.type?.[name]
+            || chosen("key", name) || chosen("etype", name);
+        if (!touched) {
+            return;
+        }
+        if (chosen("etype", name)) {
+            entitySet.entity_type = offered.entity_type ?? "";
+        }
+        const offeredFields: Record<string, ODataPreviewField> = {};
+        (offered.fields ?? []).forEach((field) => { offeredFields[field.name] = field; });
+        entitySet.fields.forEach((field) => {
+            const said = offeredFields[field.name];
+            if (!said) {
+                return;
+            }
+            if (chosen("type", name, field.name)) {
+                field.type = said.type;
+                entitySet.keys.forEach((key) => {
+                    if (key.name === field.name) {
+                        key.type = said.type;
+                    }
+                });
+            }
+            if (fillLabels && !(field.label ?? "")) {
+                field.label = importLabel(said.label);
+            }
+        });
+        const add = (field: ODataPreviewField): void => {
+            if (entitySet.fields.length < MAX_FIELDS && !entitySet.fields.some((have) => have.name === field.name)) {
+                entitySet.fields.push(importedField(field));
+            }
+        };
+        (offered.fields ?? []).forEach((field) => {
+            if (chosen("field", name, field.name)) {
+                add(field);
+            }
+        });
+        const remove = choices.rmfield?.[name];
+        if (remove) {
+            // Only a field the document does not list: a ticked removal
+            // never takes a field that is still there.
+            const gone = (field: { name: string }): boolean => remove[field.name] === true && !offeredFields[field.name];
+            entitySet.fields = entitySet.fields.filter((field) => !gone(field));
+            entitySet.keys = entitySet.keys.filter((key) => !gone(key));
+        }
+        if (chosen("key", name)) {
+            // The key as the document has it; a key field the service does
+            // not hold yet comes along, unticked: a key names a field.
+            (offered.keys ?? []).forEach((key) => add(offeredFields[key.name] ?? {
+                name: key.name, type: key.type, label: "", declared: { filterable: false, creatable: false, updatable: false }
+            }));
+            entitySet.keys = (offered.keys ?? []).map((key) => ({ name: key.name, type: key.type || "Edm.String" }));
+        }
+    });
+    const dropOperations = choices.rmop ?? {};
+    const offeredOperations = namesOf(preview.operations);
+    merged.operations = merged.operations.filter((operation) => (
+        !dropOperations[operation.name] || offeredOperations.indexOf(operation.name) !== -1
+    ));
+    const offeredSets = namesOf(preview.entity_sets);
+    Object.keys(choices.rmset ?? {}).forEach((name) => {
+        if (offeredSets.indexOf(name) === -1 && removalBlockers(merged, name).length === 0) {
+            merged.entity_sets = merged.entity_sets.filter((entitySet) => entitySet.name !== name);
+        }
+    });
+    const setNames = namesOf(merged.entity_sets);
+    (preview.operations ?? []).forEach((offered) => {
+        if (!chosen("op", offered.name) || merged.operations.length >= MAX_OPERATIONS
+            || merged.operations.some((operation) => operation.name === offered.name)
+            || (offered.bound_to && setNames.indexOf(offered.bound_to) === -1)) {
+            return;
+        }
+        merged.operations.push(importedOperation(offered, setNames));
+    });
+    return merged;
+}
+
+/**
+ * What Apply will do with `selection`: how many things it adds, changes
+ * and removes, and what keeps it from being applied (`blocked`): a new
+ * operation bound to an entity set that is neither in the service nor
+ * ticked, an entity set to remove that an operation is still bound to or
+ * returns, and more entity sets, fields or operations than a service holds.
+ */
+function importSummary(
+    definition: ODataDefinition | undefined | null, preview: ODataMetadataPreview, selection: readonly string[]
+): ODataImportSummary {
+    const choices = importChoices(selection);
+    const size = (kind: string): number => Object.keys(choices[kind] ?? {})
+        .reduce((sum, first) => sum + Object.keys(choices[kind][first]).length, 0);
+    const add = size("set") + size("field") + size("op");
+    const change = size("key") + size("type") + size("etype") + size("labels");
+    const remove = size("rmset") + size("rmfield") + size("rmop");
+    const blocked: ODataImportBlock[] = [];
+    const entitySets = definition?.entity_sets ?? [];
+    const setNames = namesOf(entitySets);
+    const after = setNames.filter((name) => !choices.rmset?.[name]).concat(Object.keys(choices.set ?? {}));
+    (preview.operations ?? []).forEach((offered) => {
+        if (choices.op?.[offered.name] && offered.bound_to && after.indexOf(offered.bound_to) === -1) {
+            blocked.push({ id: importId("op", offered.name), key: "odataImportNeedsSet", args: [offered.name, offered.bound_to] });
+        }
+    });
+    const kept: ODataDefinition = {
+        entity_sets: entitySets,
+        operations: (definition?.operations ?? []).filter((operation) => !choices.rmop?.[operation.name])
+    };
+    Object.keys(choices.rmset ?? {}).forEach((name) => {
+        const entitySet = entitySets[setNames.indexOf(name)];
+        removalBlockers(kept, name).forEach((blocker) => {
+            blocked.push({
+                id: importId("rmset", name), key: blocker.key,
+                args: [entitySet ? titleOf(entitySet) : name, name, blocker.operations.join(", ")]
+            });
+        });
+    });
+    if (after.length > MAX_ENTITY_SETS) {
+        blocked.push({ id: "", key: "odataImportTooManySets", args: [after.length, MAX_ENTITY_SETS] });
+    }
+    const operationsAfter = (kept.operations ?? []).length + size("op");
+    if (operationsAfter > MAX_OPERATIONS) {
+        blocked.push({ id: "", key: "odataImportTooManyOperations", args: [operationsAfter, MAX_OPERATIONS] });
+    }
+    Object.keys(choices.field ?? {}).forEach((name) => {
+        const entitySet = entitySets[setNames.indexOf(name)];
+        const total = (entitySet?.fields ?? []).length + Object.keys(choices.field[name]).length
+            - Object.keys(choices.rmfield?.[name] ?? {}).length;
+        if (total > MAX_FIELDS) {
+            blocked.push({ id: importId("set", name), key: "odataImportTooManyFields", args: [name, total, MAX_FIELDS] });
+        }
+    });
+    return { add, change, remove, total: add + change + remove, blocked };
+}
+
+/** Which rows of a plan the dialog lists for a search text, a status filter
+ *  and the entity sets that are opened up. A row under an entity set is
+ *  listed when that set is expanded and the row itself matches; an entity
+ *  set also when one of its rows does. */
+function importRows(
+    items: readonly ODataImportItem[], query: string, filter: ODataImportStatus | "all",
+    expanded: Record<string, boolean>
+): ODataImportItem[] {
+    const needle = (query ?? "").trim().toLowerCase();
+    const matches = (item: ODataImportItem): boolean => (
+        (filter === "all" || item.status === filter)
+        && (!needle || item.name.toLowerCase().indexOf(needle) !== -1 || item.label.toLowerCase().indexOf(needle) !== -1)
+    );
+    const withMatch: Record<string, boolean> = {};
+    items.forEach((item) => {
+        if (item.parent && matches(item)) {
+            withMatch[item.parent] = true;
+        }
+    });
+    return items.filter((item) => (
+        item.parent ? expanded[item.parent] === true && matches(item) : matches(item) || withMatch[item.id] === true
+    ));
+}
+
+
 export default {
 
     ENTITY_OPS,
@@ -1141,6 +1707,12 @@ export default {
     entitySetIssues,
     boundOperations,
     removalBlockers,
+
+    importPlan,
+    mergeImport,
+    importSummary,
+    importRows,
+    importLabel,
 
     /** The most fields an entity set may hold. */
     MAX_FIELDS,

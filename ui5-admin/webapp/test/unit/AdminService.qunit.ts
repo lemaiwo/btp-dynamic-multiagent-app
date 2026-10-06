@@ -474,7 +474,7 @@ QUnit.test("metadata compares the offer with the service the request names", asy
         "without a service everything is new"
     );
     assert.deepEqual(fresh.operations.map((o) => o.status), ["new"]);
-    assert.deepEqual(fresh.summary, { entity_sets: 5, operations: 1, in_service: 0, changed: 0 });
+    assert.deepEqual(fresh.summary, { entity_sets: 5, operations: 1, in_service: 0, changed: 0, skipped: 1, removed_entity_sets: 0, removed_operations: 0, skipped_stored_entity_sets: 0 });
     assert.deepEqual(fresh.entity_sets[0].new_fields, [], "nothing to compare with, so no new fields");
 
     const compared = await service.readODataMetadata({ ...where, service: "purchase-requisitions-jobs" });
@@ -485,13 +485,18 @@ QUnit.test("metadata compares the offer with the service the request names", asy
     assert.deepEqual(compared.entity_sets[0].new_fields, ["PurReqnOrigin", "LastChangeDateTime"]);
     assert.deepEqual(compared.entity_sets[0].removed_fields, []);
     assert.deepEqual(compared.operations.map((o) => o.status), ["in_service"]);
-    assert.deepEqual(compared.summary, { entity_sets: 5, operations: 1, in_service: 4, changed: 1 });
+    assert.deepEqual(compared.summary, { entity_sets: 5, operations: 1, in_service: 4, changed: 1, skipped: 1, removed_entity_sets: 0, removed_operations: 0, skipped_stored_entity_sets: 0 });
 
     const other = await service.readODataMetadata({ ...where, service: "business-partners" });
-    assert.deepEqual(other.summary, { entity_sets: 5, operations: 1, in_service: 0, changed: 0 });
+    assert.deepEqual(other.removed_entity_sets, ["A_BusinessPartner", "A_Supplier", "A_BusinessPartnerAddress"],
+        "what the stored service has and the document does not");
+    assert.deepEqual(other.summary, { entity_sets: 5, operations: 1, in_service: 0, changed: 0, skipped: 1, removed_entity_sets: 3, removed_operations: 0, skipped_stored_entity_sets: 0 });
 
     assert.deepEqual(compared.skipped, [
-        { kind: "property", entity_set: "A_PurReqnAcctAssgmt", position: 38, reason: "invalid_type" }
+        {
+            kind: "property", entity_set: "A_PurReqnAcctAssgmt", position: 38, reason: "invalid_type",
+            entity_type: "API_PURCHASEREQ_PROCESS_SRV.A_PurReqnAcctAssgmtType"
+        }
     ], "what the parser left out is listed by kind, set, position and reason");
 });
 

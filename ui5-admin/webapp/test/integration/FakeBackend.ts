@@ -1,6 +1,6 @@
 import type {
     Agent, CredentialStatus, JobRunDetail, ODataDefinition, ODataEntityOp, ODataEntitySet, ODataField,
-    ODataDestination, ODataDestinationList, ODataMetadataPreview, ODataPreviewEntitySet, ODataService,
+    ODataDestination, ODataDestinationList, ODataMetadataPreview, ODataPreviewEntitySet, ODataPreviewOperation, ODataService,
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
@@ -947,34 +947,99 @@ export default class FakeBackend {
         };
     }
 
-    /** The offer in `metadataPreview` compared with a stored definition
-     * (`undefined`: nothing to compare with, so everything is new). */
+    /**
+     * The offer in `metadataPreview` compared with a stored definition
+     * (`undefined`: nothing to compare with, so everything is new), as
+     * `build_preview` in agents/odata/preview.py compares: names, field
+     * types and key names of the STORED service. `removed_*` are left alone
+     * (null) when the fixture says `removed_complete: false`.
+     */
     private odataPreview(stored: ODataDefinition | undefined): ODataMetadataPreview {
-        const entitySets = this.metadataPreview.entity_sets.map((offered) => {
+        const offer = this.metadataPreview;
+        const entitySets = offer.entity_sets.map((offered) => {
             const known = stored?.entity_sets.filter((e) => e.name === offered.name)[0];
             if (!known) {
-                return { ...offered, status: "new" as const, new_fields: [], removed_fields: [] };
+                return {
+                    ...offered, status: "new" as const, new_fields: [], new_fields_total: 0, removed_fields: [],
+                    changed_keys: false, changed_types: []
+                };
             }
             const have = known.fields.map((f) => f.name);
-            const offer = offered.fields.map((f) => f.name);
-            const added = offer.filter((name) => have.indexOf(name) === -1);
-            const removed = have.filter((name) => offer.indexOf(name) === -1);
+            const names = offered.fields.map((f) => f.name);
+            const added = names.filter((name) => have.indexOf(name) === -1);
+            // A fixture can name removed fields of a cut set itself.
+            const removed = offered.truncated && offered.removed_fields.length
+                ? offered.removed_fields : have.filter((name) => names.indexOf(name) === -1);
+            const types = known.fields.filter((f) => {
+                const said = offered.fields.filter((o) => o.name === f.name)[0];
+                return !!said && said.type !== (f.type ?? "Edm.String");
+            }).map((f) => f.name);
+            const keys = known.keys.map((k) => k.name).join("\n") !== offered.keys.map((k) => k.name).join("\n");
             return {
-                ...offered, new_fields: added, removed_fields: removed,
-                status: added.length || removed.length ? "changed" as const : "in_service" as const
+                ...offered, new_fields: added, new_fields_total: added.length, removed_fields: removed,
+                changed_keys: keys, changed_types: types,
+                status: added.length || removed.length || types.length || keys ? "changed" as const : "in_service" as const
             };
         });
-        const operations = this.metadataPreview.operations.map((offered) => ({
+        const operations = offer.operations.map((offered) => ({
             ...offered,
             status: stored?.operations.some((o) => o.name === offered.name) ? "in_service" as const : "new" as const
         }));
+        const complete = offer.removed_complete !== false;
+        const left = offer.skipped.filter((s) => s.kind === "entity_set").map((s) => s.entity_set);
+        const removedSets = !complete ? null : (stored?.entity_sets ?? []).map((e) => e.name)
+            .filter((name) => !offer.entity_sets.some((e) => e.name === name) && left.indexOf(name) === -1);
+        const removedOperations = !complete ? null : (stored?.operations ?? []).map((o) => o.name)
+            .filter((name) => !offer.operations.some((o) => o.name === name));
+        const skippedStored = (stored?.entity_sets ?? []).filter((e) => left.indexOf(e.name) !== -1)
+            .map((e) => ({ name: e.name, reason: offer.skipped.filter((s) => s.entity_set === e.name)[0].reason }));
         return {
-            ...this.metadataPreview, entity_sets: entitySets, operations,
+            ...offer, entity_sets: entitySets, operations,
+            removed_entity_sets: removedSets, removed_operations: removedOperations, removed_complete: complete,
+            skipped_stored_entity_sets: skippedStored,
             summary: {
                 entity_sets: entitySets.length, operations: operations.length,
                 in_service: entitySets.filter((e) => e.status === "in_service").length,
-                changed: entitySets.filter((e) => e.status === "changed").length
+                changed: entitySets.filter((e) => e.status === "changed").length,
+                skipped: offer.totals.skipped,
+                removed_entity_sets: removedSets ? removedSets.length : null,
+                removed_operations: removedOperations ? removedOperations.length : null,
+                skipped_stored_entity_sets: skippedStored.length
             }
+        };
+    }
+
+    /** An entity set of a `$metadata` answer (`_entity_set` in
+     *  agents/odata/preview.py) offering the fields and navigations of
+     *  `entitySet`; the comparison keys are placeholders (`odataPreview`). */
+    public static previewEntitySet(entitySet: ODataEntitySet, label = ""): ODataPreviewEntitySet {
+        return {
+            name: entitySet.name, path: entitySet.name, entity_type: entitySet.entity_type, label,
+            keys: entitySet.keys.map((k) => ({ name: k.name, type: k.type })), keys_total: entitySet.keys.length,
+            fields: entitySet.fields.map((f) => ({
+                name: f.name, type: f.type, label: f.label,
+                declared: { filterable: true, creatable: false, updatable: false }
+            })),
+            fields_total: entitySet.fields.length,
+            navigations: entitySet.navigations.map((n) => ({ name: n.name, target: n.target, collection: n.collection })),
+            navigations_total: entitySet.navigations.length,
+            declared: { creatable: false, updatable: false, deletable: false },
+            status: "new", new_fields: [], new_fields_total: 0, removed_fields: [],
+            changed_keys: false, changed_types: [], truncated: false
+        };
+    }
+
+    /** An operation of a `$metadata` answer (`_operation` there), with the
+     *  suggestion `_changes_data` makes for its kind and method. */
+    public static previewOperation(
+        operation: Pick<ODataPreviewOperation, "name" | "kind" | "http_method"> & Partial<ODataPreviewOperation>
+    ): ODataPreviewOperation {
+        const known = !(operation.kind === "function_import" && operation.http_method === "GET");
+        const parameters = operation.parameters ?? [];
+        return {
+            qualified_name: "", bound_to: null, label: "", status: "new", truncated: false,
+            suggested: { changes_data: operation.kind !== "function", known, returns: null },
+            ...operation, parameters, parameters_total: parameters.length
         };
     }
 
@@ -1104,33 +1169,41 @@ export default class FakeBackend {
             A_PurchaseReqnItemText: "Item text",
             A_PurReqAddDelivery: "Delivery address"
         };
-        const previewSets: ODataPreviewEntitySet[] = jobs.entity_sets.map((e) => ({
-            name: e.name, entity_type: e.entity_type, label: labels[e.name], keys: e.keys,
-            fields: e.fields.map((f) => ({
-                name: f.name, type: f.type, label: f.label, filterable: true, creatable: false, updatable: false
-            })),
-            navigations: e.navigations.map((n) => ({ name: n.name, target: n.target, collection: n.collection })),
-            capabilities: { creatable: false, updatable: e.name !== "A_PurReqAddDelivery", deletable: false },
-            status: "new", new_fields: [], removed_fields: []
-        }));
+        const previewSets = jobs.entity_sets.map((e) => {
+            const offered = FakeBackend.previewEntitySet(e, labels[e.name]);
+            offered.declared.updatable = e.name !== "A_PurReqAddDelivery";
+            return offered;
+        });
         previewSets[0].fields = previewSets[0].fields.concat([
             { name: "PurReqnOrigin", type: "Edm.String", label: "Origin of requisition",
-              filterable: true, creatable: false, updatable: false },
+              declared: { filterable: true, creatable: false, updatable: true } },
             { name: "LastChangeDateTime", type: "Edm.DateTimeOffset", label: "Last changed on",
-              filterable: true, creatable: false, updatable: false }
+              declared: { filterable: true, creatable: false, updatable: false } }
         ]);
+        previewSets[0].fields_total = previewSets[0].fields.length;
         this.metadataPreview = {
             fetched_at: "2026-10-05T09:00:00+00:00",
             entity_sets: previewSets,
-            operations: jobs.operations.map((o) => ({
+            operations: jobs.operations.map((o) => FakeBackend.previewOperation({
                 name: o.name, qualified_name: o.qualified_name, kind: o.kind, http_method: o.http_method,
-                bound_to: o.bound_to, parameters: o.parameters, label: "", status: "new"
+                bound_to: o.bound_to, parameters: o.parameters
             })),
             // One element the parser left out (`ParsedMetadata.skipped`), so
             // the import dialog has an "n elements skipped" to show. Set it
             // to [] in a journey for the ordinary case.
-            skipped: [{ kind: "property", entity_set: "A_PurReqnAcctAssgmt", position: 38, reason: "invalid_type" }],
-            summary: { entity_sets: 5, operations: 1, in_service: 0, changed: 0 }
+            skipped: [{
+                kind: "property", entity_set: "A_PurReqnAcctAssgmt", position: 38, reason: "invalid_type",
+                entity_type: "API_PURCHASEREQ_PROCESS_SRV.A_PurReqnAcctAssgmtType"
+            }],
+            removed_entity_sets: [], removed_operations: [], removed_complete: true,
+            skipped_stored_entity_sets: [],
+            summary: {
+                entity_sets: 5, operations: 1, in_service: 0, changed: 0, skipped: 1,
+                removed_entity_sets: 0, removed_operations: 0, skipped_stored_entity_sets: 0
+            },
+            truncated: false,
+            totals: { entity_sets: 5, operations: 1, skipped: 1 },
+            warnings: []
         };
         this.testResult = {
             ok: true, code: null, status: 200, duration_ms: 412, service: "purchase-requisitions-jobs",
@@ -1155,8 +1228,8 @@ export default class FakeBackend {
     ): Promise<Response> | undefined {
         if (path === "odata/metadata" && method === "POST") {
             // Compared with the stored service the request names; without
-            // `service` everything is new. (The real route does not exist
-            // yet: a 404 for an unknown `service` is this fake's assumption.)
+            // `service` everything is new. An unknown `service` is the 404
+            // of `api_preview_odata_metadata`, before anything is fetched.
             if (body?.service === undefined || body.service === null) {
                 return this.json(this.odataPreview(undefined));
             }

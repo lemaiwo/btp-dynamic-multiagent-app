@@ -825,26 +825,48 @@ export interface ODataMetadataRequest {
 
 export type ODataPreviewStatus = "new" | "in_service" | "changed";
 
+/** A field as the $metadata declares it. What SAP says a field can do sits
+ *  under `declared` on purpose: it is information, never a catalogue switch. */
 export interface ODataPreviewField {
     name: string;
     type: string;
     label: string;
-    filterable: boolean;
-    creatable: boolean;
-    updatable: boolean;
+    declared: { filterable: boolean; creatable: boolean; updatable: boolean };
 }
 
+/** An entity set of the answer (`_entity_set` in agents/odata/preview.py).
+ *  `status`, `new_fields`, `removed_fields`, `changed_keys` and
+ *  `changed_types` compare with the STORED service the request named. */
 export interface ODataPreviewEntitySet {
     name: string;
+    /** The URL segment; the entity set's name. */
+    path: string;
     entity_type: string;
     label: string;
     keys: ODataKey[];
+    keys_total: number;
+    /** At most 500, key fields always; `fields_total` counts the document's. */
     fields: ODataPreviewField[];
+    fields_total: number;
     navigations: { name: string; target: string; collection: boolean }[];
-    capabilities: { creatable: boolean; updatable: boolean; deletable: boolean };
+    navigations_total: number;
+    declared: { creatable: boolean; updatable: boolean; deletable: boolean };
     status: ODataPreviewStatus;
     new_fields: string[];
+    new_fields_total: number;
     removed_fields: string[];
+    changed_keys: boolean;
+    changed_types: string[];
+    /** Fields, keys, navigations or new fields were cut. */
+    truncated: boolean;
+}
+
+/** What the document says an operation returns; `entity_set` is an entity
+ *  set of the preview or null, `type` a primitive EDM name or "". */
+export interface ODataPreviewReturns {
+    entity_set: string | null;
+    collection: boolean;
+    type: string;
 }
 
 export interface ODataPreviewOperation {
@@ -854,8 +876,13 @@ export interface ODataPreviewOperation {
     http_method: ODataOperation["http_method"];
     bound_to: string | null;
     parameters: ODataParam[];
+    parameters_total: number;
     label: string;
-    status: ODataPreviewStatus;
+    status: "new" | "in_service";
+    /** A suggestion for `changes_data`; `known` false: nothing is known,
+     *  and the operation counts as changing data. */
+    suggested: { changes_data: boolean; known: boolean; returns: ODataPreviewReturns | null };
+    truncated: boolean;
 }
 
 /**
@@ -872,16 +899,40 @@ export interface ODataSkippedElement {
     /** A reason code, e.g. `invalid_name`, `invalid_type`, `duplicate_name`,
      * `unrepresentable_key`, `unresolved_target`. Open-ended on purpose. */
     reason: string;
+    /** The entity type of the owning set, "" when unknown. */
+    entity_type: string;
 }
 
-/** What the service's $metadata offers: names and labels only, no data. */
+/** `code` is stable (`metadata_incomplete`, `technical_credential`);
+ *  `message` is the server's text. */
+export interface ODataPreviewWarning {
+    code: string;
+    message: string;
+}
+
+/** What the service's $metadata offers (`build_preview` in
+ *  agents/odata/preview.py): names, types and labels only, no data. */
 export interface ODataMetadataPreview {
     fetched_at: string;
     entity_sets: ODataPreviewEntitySet[];
     operations: ODataPreviewOperation[];
-    /** What the parser left out; empty when it took everything. */
+    /** What the parser left out (at most 1,000 listed); empty when it took everything. */
     skipped: ODataSkippedElement[];
-    summary: { entity_sets: number; operations: number; in_service: number; changed: number };
+    /** Stored entity sets / operations the document no longer declares;
+     *  null when that is not known (`removed_complete` false). */
+    removed_entity_sets: string[] | null;
+    removed_operations: string[] | null;
+    removed_complete: boolean;
+    /** Stored entity sets the document still declares but the parser left out. */
+    skipped_stored_entity_sets: { name: string; reason: string }[];
+    summary: {
+        entity_sets: number; operations: number; in_service: number; changed: number; skipped: number;
+        removed_entity_sets: number | null; removed_operations: number | null; skipped_stored_entity_sets: number;
+    };
+    /** Something was cut; `totals` counts the whole document. */
+    truncated: boolean;
+    totals: { entity_sets: number; operations: number; skipped: number };
+    warnings: ODataPreviewWarning[];
 }
 
 /** Something a test call has to say besides its outcome. `code` is
