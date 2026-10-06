@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import SplitResult, urlsplit
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import (
@@ -1110,7 +1110,16 @@ async def api_list_agents() -> list[dict[str, Any]]:
     dependencies=[Depends(require_admin)],
 )
 async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
+    """Create an agent (or replace the one of that name: ``upsert_agent``).
+
+    The answer is the agent plus ``reloaded`` and ``reload_failed``, both
+    always present: see `_reload_for_odata_entry`.
+    """
     async with SessionLocal() as session:
+        from agents.db import get_agent_by_name
+
+        known = await get_agent_by_name(session, payload.name)
+        before = _odata_entry_signature(known.mcp_servers if known is not None else [])
         try:
             row = await upsert_agent(
                 session,
@@ -1133,7 +1142,43 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
         _unknown_model_note(payload.name, payload.model_name)
-        return row.to_dict()
+        answer = row.to_dict()
+        after = _odata_entry_signature(row.mcp_servers)
+    answer.update(await _reload_for_odata_entry(before, after, f"agent '{payload.name}' saved"))
+    return answer
+
+
+def _odata_entry_signature(servers: Any) -> list[tuple[tuple[str, ...], bool]]:
+    """What an agent's ``builtin:odata`` entries let it do: per entry the
+    attached services (sorted) and whether it may write. Order-free, so a
+    save that only reorders is no change; ``[]`` for an agent without one."""
+    out = []
+    for block in odata_entries(servers if isinstance(servers, list) else []):
+        services = block.get("services")
+        names = sorted({n for n in services if isinstance(n, str)}) if isinstance(
+            services, list
+        ) else []
+        out.append((tuple(names), block.get("allow_write") is True))
+    return sorted(out)
+
+
+async def _reload_for_odata_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
+    """``{reloaded, reload_failed}`` of an agent save, create or delete.
+
+    The running build answers from the entry it was built with. So a save
+    that changes the agent's ``builtin:odata`` entry -- a service added or
+    removed, Allow writes switched, the entry itself added or removed --
+    rebuilds the registry and the chat app after the commit: a closed write
+    must not stay open, and a write the admin was just asked about must not
+    need a second step. Any other agent save behaves as it always did (no
+    reload; the admin UIs call reload) and answers both keys ``false``.
+
+    Never a 500 for a rebuild that fails after the commit
+    (`agents.odata.admin_routes.reload_running_agents`).
+    """
+    if before == after:
+        return dict(NOT_RELOADED)
+    return await reload_running_agents(f"{what} with a changed OData entry")
 
 
 @router.get("/api/agents/{agent_id}", dependencies=[Depends(require_admin)])
@@ -1153,6 +1198,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             raise HTTPException(status_code=404, detail="Agent not found")
         old_name = row.name
         renamed = old_name != payload.name
+        odata_before = _odata_entry_signature(row.mcp_servers)
         if renamed:
             # Check uniqueness of new name
             from agents.db import get_agent_by_name
@@ -1231,7 +1277,15 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         await session.commit()
         await session.refresh(row)
         _unknown_model_note(payload.name, payload.model_name)
-        return row.to_dict()
+        answer = row.to_dict()
+        odata_after = _odata_entry_signature(row.mcp_servers)
+    # `reloaded` / `reload_failed`, always present: `_reload_for_odata_entry`.
+    answer.update(
+        await _reload_for_odata_entry(
+            odata_before, odata_after, f"agent '{payload.name}' saved"
+        )
+    )
+    return answer
 
 
 @router.delete(
@@ -1241,6 +1295,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
 )
 async def api_delete_agent(
     agent_id: int,
+    response: Response,
     force: bool = Query(
         default=False,
         description="Also strip the agent from other agents' peer lists. A "
@@ -1255,6 +1310,11 @@ async def api_delete_agent(
     trigger time). ``?force=true`` removes the peer references in the same
     transaction; a workflow step is never edited behind the operator's back,
     so it has to be changed first.
+
+    An agent that had a ``builtin:odata`` entry is taken out of the running
+    build at once (`_reload_for_odata_entry`). The 204 has no body: the
+    outcome is in the headers ``X-OData-Reloaded`` and
+    ``X-OData-Reload-Failed`` (``true`` / ``false``), always present.
     """
     async with SessionLocal() as session:
         row = await get_agent(session, agent_id)
@@ -1274,8 +1334,13 @@ async def api_delete_agent(
             )
         # Strip stale peer entries (including those on disabled agents) in
         # the same transaction as the delete; delete_agent commits.
+        name = row.name
+        odata_before = _odata_entry_signature(row.mcp_servers)
         await rename_agent_references(session, row.name, None)
         await delete_agent(session, agent_id)
+    outcome = await _reload_for_odata_entry(odata_before, [], f"agent '{name}' deleted")
+    response.headers["X-OData-Reloaded"] = str(outcome["reloaded"]).lower()
+    response.headers["X-OData-Reload-Failed"] = str(outcome["reload_failed"]).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -2927,6 +2992,7 @@ async def _odata_destination_health(
 from agents.odata.admin_routes import (  # noqa: E402
     NOT_RELOADED,
     reload_after_catalogue_change,
+    reload_running_agents,
 )
 from agents.odata.admin_routes import router as _odata_router  # noqa: E402
 

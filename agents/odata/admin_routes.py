@@ -387,15 +387,30 @@ async def reload_after_catalogue_change(
         return dict(NOT_RELOADED)
     if not any(referrers.get(name) or live.holds_odata_service(name) for name in names):
         return dict(NOT_RELOADED)
+    return await reload_running_agents(what)
+
+
+async def reload_running_agents(what: str) -> dict[str, bool]:
+    """Rebuild the registry and the chat app after a COMMITTED change:
+    ``{reloaded, reload_failed}``. Nothing happens while no build exists.
+
+    The one failure contract of every save that reloads by itself (a
+    catalogue service in use, an agent's ``builtin:odata`` entry): the rows
+    are stored, so a rebuild that fails is logged and answered as
+    ``reload_failed: true``, never raised.
+    """
+    live = _live_registry()
+    if live is None:
+        return dict(NOT_RELOADED)
     try:
         await live.reload()
         from agents.chat_app import dynamic_chat_app
 
         dynamic_chat_app.refresh()
     except Exception:  # noqa: BLE001 - the change is stored; see the docstring
-        logger.exception("odata catalogue: %s stored, but the agent reload failed", what)
+        logger.exception("odata: %s stored, but the agent reload failed", what)
         return {"reloaded": False, "reload_failed": True}
-    logger.info("odata catalogue: %s; running agents reloaded", what)
+    logger.info("odata: %s; running agents reloaded", what)
     return {"reloaded": True, "reload_failed": False}
 
 

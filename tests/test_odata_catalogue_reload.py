@@ -324,3 +324,121 @@ async def test_a_failing_reload_after_an_import_is_said_not_raised(live, client)
     assert r.status_code == 200, r.text
     assert r.json()["reload_failed"] is True and r.json()["reloaded"] is False
     assert r.json()["status"] == "imported"
+
+
+# ------------------------------------------------- C1b: the agent's own entry
+
+AGENTS = "/admin/api/agents"
+WRITE = {"operation": "update", "key": {"PurchaseRequisition": "1"}, "body": {"Note": "x"}}
+
+
+def agent_body(*servers: dict, **patch: Any) -> dict[str, Any]:
+    return {
+        "name": "buyer",
+        "description": "d",
+        "instructions": "You help buyers.",
+        "mcp_servers": list(servers),
+        **patch,
+    }
+
+
+def writable() -> dict[str, Any]:
+    data = payload()
+    entity_set = data["definition"]["entity_sets"][0]
+    entity_set["operations"] = ["list", "get", "update"]
+    entity_set["fields"].append({"name": "Note", "selectable": True, "writable": True})
+    return data
+
+
+@pytest.fixture
+async def saved(live, client) -> dict[str, Any]:
+    """``buyer`` saved through the API with both services and Allow writes,
+    the first service writable, and the registry reloaded once by hand."""
+    assert (await client.put(ONE, json=writable())).status_code == 200
+    async with SessionLocal() as s:
+        await s.execute(delete(AgentConfig))
+        await s.commit()
+    r = await client.post(AGENTS, json=agent_body(odata_server(PR, JOBS, allow_write=True)))
+    assert r.status_code == 201, r.text
+    await live.registry.reload()
+    live.reloads = live.refreshes = 0
+    return r.json()
+
+
+async def write_code(agent) -> str:
+    out = await call_tool(agent, "execute_operation", service=PR, target=SET, **WRITE)
+    return out["error"]["code"]
+
+
+async def test_unticking_allow_writes_closes_writes_for_the_next_run(live, client, saved):
+    assert await write_code(live.buyer) != "write_not_allowed"
+
+    r = await client.put(
+        f"{AGENTS}/{saved['id']}", json=agent_body(odata_server(PR, JOBS, allow_write=False))
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+    assert await write_code(live.buyer) == "write_not_allowed"
+
+
+async def test_removing_a_service_from_an_agent_closes_it_for_the_next_run(live, client, saved):
+    assert await services_found(live.buyer) == {PR, JOBS}
+    r = await client.put(
+        f"{AGENTS}/{saved['id']}", json=agent_body(odata_server(JOBS, allow_write=True))
+    )
+    assert r.status_code == 200 and r.json()["reloaded"] is True
+    assert await services_found(live.buyer) == {JOBS}
+    assert await execute_code(live.buyer) == "unknown_service"
+
+
+async def test_an_agent_edit_that_leaves_the_odata_entry_alone_does_not_reload(
+    live, client, saved
+):
+    body = agent_body(odata_server(PR, JOBS, allow_write=True), description="another text")
+    r = await client.put(f"{AGENTS}/{saved['id']}", json=body)
+    assert r.status_code == 200, r.text
+    assert r.json()["description"] == "another text"
+    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
+    # The order of the services is not a change either.
+    body = agent_body(odata_server(JOBS, PR, allow_write=True))
+    r = await client.put(f"{AGENTS}/{saved['id']}", json=body)
+    assert r.status_code == 200 and r.json()["reloaded"] is False
+    assert (live.reloads, live.refreshes) == (0, 0)
+
+
+async def test_a_failing_reload_after_an_agent_save_is_said_not_raised(live, client, saved):
+    live.fail = RuntimeError("boom at https://aicore.internal/secret-path")
+    r = await client.put(
+        f"{AGENTS}/{saved['id']}", json=agent_body(odata_server(PR, JOBS, allow_write=False))
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reload_failed"] is True and r.json()["reloaded"] is False
+    assert "secret-path" not in r.text
+    stored = (await client.get(f"{AGENTS}/{saved['id']}")).json()
+    assert stored["mcp_servers"][0]["oauth"].get("allow_write") is not True
+
+
+async def test_creating_and_deleting_an_agent_with_an_odata_entry_reloads(live, client, saved):
+    r = await client.post(
+        AGENTS, json=agent_body(odata_server(JOBS), name="second", description="s")
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["reloaded"] is True and live.reloads == 1
+    assert "second" in live.registry.build.specialists
+
+    r = await client.delete(f"{AGENTS}/{r.json()['id']}")
+    assert r.status_code == 204 and r.content == b""
+    assert r.headers["x-odata-reloaded"] == "true"
+    assert r.headers["x-odata-reload-failed"] == "false"
+    assert live.reloads == 2 and "second" not in live.registry.build.specialists
+
+
+async def test_an_agent_without_an_odata_entry_never_reloads(live, client, saved):
+    plain = {"url": "builtin:sapnotes", "auth_mode": "none"}
+    r = await client.post(AGENTS, json=agent_body(plain, name="notes"))
+    assert r.status_code == 201, r.text
+    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
+    r = await client.delete(f"{AGENTS}/{r.json()['id']}")
+    assert r.status_code == 204 and r.headers["x-odata-reloaded"] == "false"
+    assert live.reloads == 0

@@ -811,6 +811,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   does not reload the registry for agents, skills or workflows, but it does
   when it created, changed or removed a catalogue service that is in use
   (answer keys `reloaded`, `reload_failed`, as for the catalogue routes).
+  An agent create, update or delete that changes that agent's
+  `builtin:odata` entry (services, `allow_write`, the entry itself) reloads
+  the same way after the commit; create and update always answer `reloaded`
+  and `reload_failed` (both `false` for any other save, which does not
+  reload), the 204 of a delete carries the two `X-OData-*` headers.
   `GET /admin/api/credential-health` lists a
   `builtin:odata` entry once per attached service (`service`,
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
