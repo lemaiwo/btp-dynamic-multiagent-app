@@ -59,6 +59,22 @@ def _binding_env_does_not_leak():
     os.environ.update(before)
 
 
+@pytest.fixture(autouse=True)
+def _catalogue_edits_do_not_reload_the_registry(monkeypatch):
+    """An OData catalogue write rebuilds the running agents when the service
+    is in use (``agents.odata.admin_routes.reload_after_catalogue_change``).
+
+    The registry is one object per process: whether it holds a build depends
+    on which suites ran before. So by default a test sees "nothing is running
+    yet" (no rebuild, ``reloaded: false``), whatever the file order;
+    ``tests/test_odata_catalogue_reload.py`` puts the real seam back.
+    """
+    module = sys.modules.get("agents.odata.admin_routes")
+    if module is not None:
+        monkeypatch.setattr(module, "_live_registry", lambda: None)
+    yield
+
+
 def unpatched(fn):
     """The original behind a chain of import-time stubs (or ``fn`` itself)."""
     while getattr(fn, "_unpatched", None) is not None:

@@ -1994,6 +1994,8 @@ class _ODataImport:
         self.existing: dict[str, Any] = {}  # name -> row, as before the import
         self.created = 0
         self.updated = 0
+        # The services this import created or changed (not the unchanged).
+        self.changed: set[str] = set()
         # name -> the identity fields an update changed
         self.identity: dict[str, list[str]] = {}
 
@@ -2081,6 +2083,7 @@ async def _import_odata_services(
                 errors.append(f"{label}: {e}")
                 continue
             result.created += 1
+            result.changed.add(name)
             continue
         if odata_service_unchanged(row, columns):
             # Not written, so not restamped: `updated_at` is what an open
@@ -2093,6 +2096,7 @@ async def _import_odata_services(
         # By name, so the name cannot differ: a rename is impossible here.
         await update_odata_service(session, row, data, commit=False, columns=columns)
         result.updated += 1
+        result.changed.add(name)
         if changed:
             result.identity[name] = changed
     return result
@@ -2116,9 +2120,16 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     deletions. Errors are collected across the whole bundle rather than
     stopping at the first, so the operator fixes them in one round.
 
-    The registry is not rebuilt here (it never was: the admin UIs call
-    reload after an import), so an imported catalogue change takes effect at
-    the same reload as the agents of its bundle.
+    The registry is not rebuilt for agents, skills or workflows (it never
+    was: the admin UIs call reload after an import). It IS rebuilt, after
+    the commit, when the import created, changed or removed a catalogue
+    service that is in use -- attached by an agent as the import leaves it,
+    or held by the running build
+    (`agents.odata.admin_routes.reload_after_catalogue_change`): a catalogue
+    change that closes something must not wait for somebody to press
+    Reload. The answer says ``reloaded`` / ``reload_failed``; a rebuild that
+    fails after the commit is logged and answered as ``reload_failed:
+    true``, not as a 500.
 
     ``updated_odata_services`` counts the existing catalogue services whose
     stored form this import changed. One the bundle carries unchanged is
@@ -2319,7 +2330,17 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             await session.rollback()
             raise
 
+    reload_outcome = dict(NOT_RELOADED)
+    touched = sorted(odata.changed | set(removed_services))
+    if touched:
+        async with SessionLocal() as session:
+            referrers = await odata_service_referrers(session)
+        reload_outcome = await reload_after_catalogue_change(
+            touched, referrers, f"import changed {len(touched)} service(s)"
+        )
+
     return {
+        **reload_outcome,
         "status": "imported",
         "imported": len(payload.agents),
         "imported_skills": len(payload.skills),
@@ -2798,7 +2819,9 @@ async def _odata_destination_health(
     transient destination-service failure on the resolve is not visible
     here, and nothing says the destination works for a user. The answer
     carries the service and destination names, the identity and the auth
-    type: no host, no header.
+    type: no host, no header. A failed resolve is answered as a fixed text
+    ending in a code (`agents.odata.destinations.destination_failure`),
+    never as the resolver's own text, which goes to the log with URLs masked.
     """
     from agents.destination import (
         MISSING_BINDING_MESSAGE,
@@ -2806,6 +2829,8 @@ async def _odata_destination_health(
         DestinationError,
         DestinationResolver,
     )
+    from agents.odata.destinations import destination_failure
+    from agents.odata.preview import plain
 
     services = oauth.get("services")
     out: list[dict[str, Any]] = []
@@ -2863,9 +2888,25 @@ async def _odata_destination_health(
                 entry["auth_type"] = fallback
             entry["state"] = "resolvable"
         except DestinationError as e:
-            entry["error"] = str(e)[:400]
+            # The error's own text can quote the destination service's
+            # answer: a code and a fixed text are answered, the detail is
+            # logged with URLs masked.
+            code, entry["error"] = destination_failure(str(e))
+            logger.warning(
+                "credential health: destination '%s' of OData service '%s' failed (%s): %s",
+                destination,
+                name,
+                code,
+                plain(str(e), 400),
+            )
         except Exception as e:  # noqa: BLE001 - a health check must not 500
-            entry["error"] = f"{type(e).__name__}: {e}"[:400]
+            entry["error"] = f"the destination could not be checked ({type(e).__name__})"
+            logger.warning(
+                "credential health: destination '%s' of OData service '%s' failed (%s)",
+                destination,
+                name,
+                type(e).__name__,
+            )
         auth_type = str(entry["auth_type"] or "")
         if user_context and auth_type and auth_type not in USER_PROPAGATING_AUTH_TYPES:
             entry["warning"] = (
@@ -2883,6 +2924,10 @@ async def _odata_destination_health(
 # A late import: the routes live in their own module, which needs nothing
 # from this one. Each of them carries `require_admin` itself.
 # ---------------------------------------------------------------------------
+from agents.odata.admin_routes import (  # noqa: E402
+    NOT_RELOADED,
+    reload_after_catalogue_change,
+)
 from agents.odata.admin_routes import router as _odata_router  # noqa: E402
 
 router.include_router(_odata_router)

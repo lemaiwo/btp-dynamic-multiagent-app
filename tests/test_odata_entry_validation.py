@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 import time
@@ -867,7 +868,10 @@ async def test_health_resolves_as_the_app_and_reports_principal_propagation(clie
             if self.name == "S4_ODATA_USER":
                 raise DestinationError("uses PrincipalPropagation, which needs the signed-in user")
             if self.name == "S4_GONE":
-                raise DestinationError(f"destination does not exist; {SECRET}=never")
+                raise DestinationError(
+                    f"destination 'S4_GONE' does not exist in the subaccount; {SECRET}=never "
+                    f"at https://dest.internal/x?token={SECRET}"
+                )
             return Destination(
                 url="https://s4.internal:44300",
                 headers={"Authorization": f"Basic {SECRET}"},
@@ -896,9 +900,13 @@ async def test_health_resolves_as_the_app_and_reports_principal_propagation(clie
     assert tech["user_context"] is False and "warning" not in tech
     # A service meant to run as the user on a technical-user destination.
     assert "app-level type" in by_service["orders"]["warning"]
-    assert (
-        by_service["gone"]["state"] == "error" and "does not exist" in by_service["gone"]["error"]
+    # Final review C3: a fixed text and a code, never the resolver's own text.
+    assert by_service["gone"]["state"] == "error"
+    assert by_service["gone"]["error"] == (
+        "the destination does not exist in the subaccount of this app's destination "
+        "service (not_found)"
     )
+    assert SECRET not in json.dumps(out) and "dest.internal" not in json.dumps(out)
     unknown = by_service["nope"]
     assert unknown["state"] == "missing" and unknown["error"] == "unknown OData service"
     assert unknown["service_enabled"] is False and unknown["auth_type"] == ""
@@ -915,7 +923,7 @@ async def test_health_resolves_as_the_app_and_reports_principal_propagation(clie
     assert sorted(built) == ["JIRA", "S4_GONE", "S4_ODATA_TECH", "S4_ODATA_USER"]
     text = json.dumps(out)
     assert "Authorization" not in text and "s4.internal" not in text
-    assert text.count(SECRET) == 1, "only the destination service's own error text"
+    assert SECRET not in text, "not even the destination service's own error text"
 
 
 USER_TYPES = [
@@ -984,7 +992,8 @@ async def test_health_of_a_user_service_that_only_resolves_for_a_user(monkeypatc
             assert item["error"] is None and "warning" not in item
         else:
             assert item["state"] == "error" and item["auth_type"] == ""
-            assert item["error"] == "no token for the application"
+            # A fixed text and a code, not the resolver's text (final review C3).
+            assert item["error"] == "the destination could not be resolved (failed)"
 
 
 # --- end to end: saved through the API, built by the registry -----------------
@@ -1026,3 +1035,56 @@ async def test_an_agent_saved_through_the_api_is_built_with_both_odata_tools(
     tools, instructions = await seen_by_model(build.specialists["notes"])
     assert not ({"search_operations", "execute_operation"} & tools)
     assert "OData" not in instructions
+
+
+@pytest.mark.parametrize(
+    "text, code",
+    [
+        ("destination 'X' does not exist in the subaccount this app's ...", "not_found"),
+        ("destination service returned 500 for 'X': <html>zone-9</html>", "status_500"),
+        ("destination service token request returned 401 (invalid_client)", "token_status_401"),
+        (
+            "could not reach the destination service token endpoint: ConnectError: zone-9",
+            "token_unreachable",
+        ),
+        ("could not reach the destination service for 'X': ConnectError: zone-9", "unreachable"),
+        ("destination 'X' returned no authentication token; check ...", "no_credential"),
+        ("destination 'X' could not obtain a token from the target (invalid_grant)", "token_error"),
+        ("destination 'X' uses PrincipalPropagation, which needs the signed-in user", "needs_user"),
+        ("destination 'X' has no URL configured", "no_url"),
+        ("destination service answer for 'X' is not JSON", "not_json"),
+        ("anything else with zone-9 in it", "failed"),
+    ],
+)
+def test_a_destination_failure_is_answered_as_a_code_and_a_fixed_text(text, code):
+    from agents.odata.destinations import destination_failure
+
+    got, message = destination_failure(text)
+    assert got == code and message.endswith(f"({code})")
+    assert "zone-9" not in message and "'X'" not in message
+
+
+async def test_health_answers_no_exception_text_for_an_unexpected_failure(monkeypatch, caplog):
+    import agents.destination as dest_mod
+    from agents.destination import DestinationServiceConfig
+
+    class Boom:
+        def __init__(self, name, config, **kw):
+            pass
+
+        async def resolve(self, **kw):
+            raise RuntimeError(f"boom at https://dest.internal/x?token={SECRET}")
+
+    monkeypatch.setattr(dest_mod, "DestinationResolver", Boom)
+
+    class Service:
+        enabled, destination, user_context = True, "S4_ODATA_TECH", False
+
+    config = DestinationServiceConfig("id", "secret", "https://uaa/oauth/token", "https://api")
+    with caplog.at_level(logging.WARNING):
+        (entry_,) = await admin._odata_destination_health(
+            "a", {"services": ["stock"]}, {"stock": Service()}, config, {}
+        )
+    assert entry_["state"] == "error"
+    assert entry_["error"] == "the destination could not be checked (RuntimeError)"
+    assert SECRET not in caplog.text and "dest.internal" not in caplog.text

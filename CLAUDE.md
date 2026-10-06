@@ -210,8 +210,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   connectivity headers and `Host` cannot be set by a `URL.headers.*` property,
   and `URL.queries.*` are sent with every request (a caller's parameter of the
   same name wins; a client built for the connectivity route skips `$`-prefixed
-  names so a destination cannot add `$filter` or `$expand` behind the argument
-  checks)
+  names and the OData system option names without the `$` (`filter`, `top`,
+  `id`, ...), so a destination cannot add `$filter` or `$expand` behind the
+  argument checks, and for such a client the caller's `If-Match`,
+  `If-None-Match`, `X-CSRF-Token`, `Cookie`, `X-HTTP-Method` and
+  `X-HTTP-Method-Override` win over a `URL.headers.*` property of that name).
+  A client built for the connectivity route (the OData callers) that acts as
+  the signed-in user on an **Internet** destination requires a destination
+  that signs in as that user: resolved for the user, a user-propagating
+  `Authentication`, and an `Authorization` the destination service minted
+  (`Destination.static_headers` tells stored `URL.headers.*` from it; a
+  stored `Authorization` or `Cookie` is never sent on a user run). Otherwise
+  `NotUserPropagating` (a `DestinationRefused`, like `OnPremiseRefused`, with
+  a fixed `admin_text`) before anything is sent: the destination service
+  ignores the user's token for a destination with a stored credential. The
+  other destination users (Gmail, Outlook, Teams, Slack, Jira, SAP notes, MCP
+  over a destination, the workflow http step) are not held to that rule. A
+  401 or proxy 407 whose one retry could not be prepared is marked
+  (`request_left`), so a write is audited as sent. Token endpoint failures
+  are reported as status plus OAuth error code only, never the body
 - `agents/odata/` — OData V2/V4 services as an in-process toolset
   (`builtin:odata`). An admin curates a **catalogue** in the database (which
   services, entity sets, fields and operations exist *for agents*); an agent
@@ -263,10 +280,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     processed (one repeat after a 403 `Required`), never after a failure
     (`write_outcome_unknown`; `ODataError.sent` says whether the change left
     the app), and success is recognised positively (a sign-in page at 200 is
-    not a success). Known limits: V4 decimals below 0.0001 cannot be written
+    not a success). A 5xx on a modifying request is `sap_error` ("SAP
+    refused") only when it carries an OData error envelope; every other 5xx
+    (an HTML error page, a bare 503, a gateway's 502/504) is
+    `write_outcome_unknown`. A decimal given as a JSON number is sent only
+    with at most 15 significant digits, in a V2 or V4 body and URL literal
+    alike (`common.plain_float`, the one rule). A refused navigation names
+    the navigation, never its target entity set. A page of which not even
+    one row fits a tool result is the refusal `result_too_large`, not an
+    empty page. Known limits: V4 decimals below 0.0001 cannot be written
     (no `IEEE754Compatible`); `@odata.context` is not yet required to
-    confirm a V4 write (undecided until the pilot); V4 enum members are not
-    read from `$metadata`
+    confirm a V4 write (undecided until the pilot; each confirmed V4 write
+    logs status and whether `@odata.context` / `@odata.etag` were present);
+    V4 enum members are not read from `$metadata`
   - `session.py` — `CsrfSessionStore`: token and SAP session cookies per
     destination and per user, in memory, never in the shared HTTP client; the
     key follows the credential that is *sent* (`user:<principal>:<sha256 jwt>`),
@@ -278,8 +304,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     (`calls.py` is the one "callable" rule, also used to list uncallable
     enabled operations in the service detail)
   - `tools.py` — `odata_toolset(...)`: the two tools, snapshot loaded by the
-    registry at reload (no database read per call, an edit applies on the
-    next reload). Every refusal is `{"error": {code, message, hint?}}`, never
+    registry at reload (no database read per call). A catalogue edit of a
+    service that is in use reloads the registry itself, so it applies to the
+    next run; see `admin_routes.py`. Every refusal is `{"error": {code, message, hint?}}`, never
     an exception. The model never holds an ETag: a `get` returns an opaque
     handle (`h-...`, tied to identity, service, entity set and key, TTL 15
     min, bounded) only where the entity set can be changed and the entry has
@@ -316,7 +343,18 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `GET`/`PUT`/`DELETE /services/{name}`, `POST /services/{name}/duplicate`);
     a `PUT` takes `expected_updated_at` and answers 409 when the stored row
     moved (lock, compare, write in one transaction); `DELETE` answers 409 while
-    any agent, enabled or not, attaches the service; `POST /metadata`,
+    any agent, enabled or not, attaches the service. After the commit, a
+    `PUT` or `DELETE` of a service that is in use (an agent row attaches it,
+    or the running build still holds a copy of it) rebuilds the registry and
+    the chat app (`reload_after_catalogue_change`), so an edit that closes
+    something does not wait for a manual reload; a service nobody uses
+    triggers none. The `PUT` answer carries `reloaded` and `reload_failed`,
+    the 204 of a `DELETE` the headers `X-OData-Reloaded` and
+    `X-OData-Reload-Failed`; a rebuild that fails after the commit is logged
+    and answered as `reload_failed: true`, never as a 500. A service that
+    acts as the signed-in user on a destination that does not sign in as the
+    user is refused by the preview and the test call with `destination_error`
+    and a fixed text. `POST /metadata`,
     `POST /services/{name}/test`, `GET /destinations`, `GET /audit`. A
     preview, test or destination-list failure carries a stable code in the
     `X-OData-Error` header (`busy`, `invalid_path`, `user_token_required`,
@@ -769,11 +807,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `replace` deletes only a service that is absent from a non-empty section
   and attached by no remaining agent; the answer adds
   `imported_/created_/updated_/removed_odata_services`,
-  `removed_odata_service_names` and `odata_identity_changes`, and the import
-  does not reload the registry. `GET /admin/api/credential-health` lists a
+  `removed_odata_service_names` and `odata_identity_changes`. The import
+  does not reload the registry for agents, skills or workflows, but it does
+  when it created, changed or removed a catalogue service that is in use
+  (answer keys `reloaded`, `reload_failed`, as for the catalogue routes).
+  `GET /admin/api/credential-health` lists a
   `builtin:odata` entry once per attached service (`service`,
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
-  `error` | `unbound` | `missing`)
+  `error` | `unbound` | `missing`); its `error` for a failed resolve is a
+  fixed text ending in a code (`agents.odata.destinations.destination_failure`),
+  the resolver's own text goes to the log
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
   `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
   `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
@@ -820,7 +863,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `init_db` at start; 2.20.0 adds the `agent-connectivity` resource
   (`connectivity`, plan `lite`, bound to the app) and `ODATA_AUDIT_RETENTION_DAYS`
   (365); `CONNECTIVITY_PP_MODE` is not in the descriptor (set per landscape in
-  an `.mtaext`; default `exchange`)
+  an `.mtaext`; default `exchange`; an unknown value is one WARNING at
+  startup and a refusal of each affected call)
 - `scripts/probe_odata_connectivity.py` — standalone probe (stdlib + `httpx`,
   nothing imported from the app) run inside an app container that has the
   connectivity binding: proves HTTP forward mode on an `http://` virtual host,
@@ -884,7 +928,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env  # AICORE_* + (optional) DATABASE_URL
-python app.py
+python app.py         # listens on 127.0.0.1; HOST=0.0.0.0 to open it up
 # Chat:  http://127.0.0.1:7932/chat
 # Admin: http://127.0.0.1:7932/admin  (no XSUAA locally → open access)
 ```

@@ -542,6 +542,10 @@ class BuildResult:
     mcp_clients: list  # httpx.AsyncClient owned by MCP servers, for cleanup
     configs: list[dict]  # snapshot of AgentConfig.to_dict()
     in_flight: RunCounter = field(default_factory=RunCounter)
+    # The catalogue services this build's `builtin:odata` toolsets were
+    # handed (enabled or not). Each toolset keeps its own copy until the
+    # next reload, so a catalogue edit asks here whether a reload is due.
+    odata_services: frozenset[str] = frozenset()
 
 
 def _model_for(row: AgentConfig, *, default_model, default_name: str, cache: dict):
@@ -851,6 +855,7 @@ async def build_orchestrator() -> BuildResult:
         mcp_clients=mcp_clients,
         configs=configs,
         in_flight=in_flight,
+        odata_services=frozenset(odata_by_name),
     )
 
 
@@ -1041,6 +1046,17 @@ class Registry:
         if self._build is None:
             raise RuntimeError("Registry not initialized; call reload() first")
         return self._build
+
+    @property
+    def loaded(self) -> bool:
+        """Whether a build exists (the lifespan's first ``reload`` ran)."""
+        return self._build is not None
+
+    def holds_odata_service(self, name: str) -> bool:
+        """Whether the running build was handed the catalogue service
+        ``name``: its toolsets then answer from that copy until a reload,
+        whatever the catalogue or the agents' rows say by now."""
+        return self._build is not None and name in self._build.odata_services
 
     async def reload(self) -> BuildResult:
         """Rebuild the orchestrator from the current database state."""

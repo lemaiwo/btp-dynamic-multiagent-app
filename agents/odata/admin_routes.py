@@ -346,6 +346,59 @@ async def api_create_odata_service(request: Request) -> dict[str, Any]:
         return row.to_dict(used_by.get(row.name))
 
 
+def _live_registry() -> Any:
+    """The process's registry once it holds a build, else ``None`` (nothing
+    is running yet, so there is nothing to bring up to date). Looked up on
+    the module at call time: the tests' seam. Imported here, not at the top:
+    the registry imports the OData toolset."""
+    from agents.registry import registry
+
+    return registry if registry.loaded else None
+
+
+NOT_RELOADED: dict[str, bool] = {"reloaded": False, "reload_failed": False}
+
+
+async def reload_after_catalogue_change(
+    names: Any, referrers: dict[str, Any], what: str
+) -> dict[str, bool]:
+    """Rebuild the running agents after a COMMITTED catalogue change, when
+    one of the services ``names`` is in use: ``{reloaded, reload_failed}``.
+
+    Why: the registry hands every ``builtin:odata`` toolset a copy of its
+    services when it is built. Without a rebuild, an edit that closes
+    something -- a service disabled, an operation switched off, a field no
+    longer selectable, another identity -- stays open for the running agents
+    until somebody presses Reload.
+
+    "In use" is an agent row attaching the service (``referrers``, enabled
+    or not) or the running build holding a copy of it (a service whose agent
+    was detached after the last reload). A service nobody uses triggers no
+    rebuild. A run in flight keeps the build it started with, as on every
+    reload.
+
+    The rows are committed before this is called. So a rebuild that fails is
+    logged and answered as ``reload_failed: true``, never raised: a 500 for
+    a stored change would invite a retry that cannot help. The next
+    ``POST /admin/api/reload`` or restart picks the rows up.
+    """
+    live = _live_registry()
+    if live is None:
+        return dict(NOT_RELOADED)
+    if not any(referrers.get(name) or live.holds_odata_service(name) for name in names):
+        return dict(NOT_RELOADED)
+    try:
+        await live.reload()
+        from agents.chat_app import dynamic_chat_app
+
+        dynamic_chat_app.refresh()
+    except Exception:  # noqa: BLE001 - the change is stored; see the docstring
+        logger.exception("odata catalogue: %s stored, but the agent reload failed", what)
+        return {"reloaded": False, "reload_failed": True}
+    logger.info("odata catalogue: %s; running agents reloaded", what)
+    return {"reloaded": True, "reload_failed": False}
+
+
 @router.get("/services/{name}", dependencies=[Depends(require_admin)])
 async def api_get_odata_service(name: str) -> dict[str, Any]:
     name = _service_name(name)
@@ -405,6 +458,13 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
 
     No deadlock, for the reason given at the delete route: this transaction
     waits for this one row before it holds anything.
+
+    After the commit the running agents are rebuilt when the service is in
+    use (`reload_after_catalogue_change`), so the save applies to the next
+    run without a manual reload. The answer carries ``reloaded`` and
+    ``reload_failed`` (both ``false`` for a service nobody uses); a rebuild
+    that fails leaves the save stored and answers 200 with
+    ``reload_failed: true``.
     """
     name = _service_name(name)
     body = await _json_object(request)
@@ -436,7 +496,10 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
         used_by = await odata_service_referrers(session, name)
         answer = row.to_dict(used_by.get(name))
         await session.commit()
-        return answer
+    answer.update(
+        await reload_after_catalogue_change([name], used_by, f"service '{name}' updated")
+    )
+    return answer
 
 
 @router.delete(
@@ -444,7 +507,7 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_admin)],
 )
-async def api_delete_odata_service(name: str) -> None:
+async def api_delete_odata_service(name: str, response: Response) -> None:
     """Delete a service nobody attaches.
 
     Unlike a skill, a service is not detached from its agents: an agent
@@ -474,6 +537,13 @@ async def api_delete_odata_service(name: str) -> None:
 
     No ``expected_updated_at`` here: the stale-write check is the update
     route's alone.
+
+    A deleted service has no referrers, but the running build may still hold
+    a copy of it (an agent detached it after the last reload; saving an
+    agent does not reload). Then the agents are rebuilt after the commit
+    (`reload_after_catalogue_change`). The 204 has no body, so the outcome
+    is in the headers ``X-OData-Reloaded`` and ``X-OData-Reload-Failed``
+    (``true`` / ``false``).
     """
     name = _service_name(name)
     async with SessionLocal() as session:
@@ -488,6 +558,9 @@ async def api_delete_odata_service(name: str) -> None:
                 detail=f"Service '{name}' is used by agent(s) {agents}",
             )
         await delete_odata_service(session, row)
+    outcome = await reload_after_catalogue_change([name], {}, f"service '{name}' deleted")
+    response.headers["X-OData-Reloaded"] = str(outcome["reloaded"]).lower()
+    response.headers["X-OData-Reload-Failed"] = str(outcome["reload_failed"]).lower()
 
 
 @router.post(
