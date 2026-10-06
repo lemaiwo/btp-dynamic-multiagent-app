@@ -12,6 +12,8 @@ export interface FailNext {
     body: unknown;
     /** Only a call with this method fails; without it, the next call to `path`. */
     method?: string;
+    /** Response headers of the failure, e.g. `X-OData-Error`. */
+    headers?: Record<string, string>;
     /** No answer at all: the call fails the way `fetch` does when the
      *  server cannot be reached (`status` and `body` are then not used). */
     network?: boolean;
@@ -469,7 +471,10 @@ export default class FakeBackend {
             ...service,
             counts: { entity_sets: definition.entity_sets.length, operations: definition.operations.length },
             has_write: definition.entity_sets.some((e) => e.operations.some((op) => writes.indexOf(op) !== -1))
-                || definition.operations.some((o) => o.enabled && o.changes_data),
+                // `operation_is_write` in agents/odata/models.py: a read is
+                // only `changes_data: false` (exactly) sent with GET.
+                || definition.operations.some((o) => o.enabled === true
+                    && !(o.changes_data === false && o.http_method === "GET")),
             uncallable_operations: FakeBackend.odataUncallable(service)
         };
     }
@@ -1405,7 +1410,7 @@ export default class FakeBackend {
             if (failure.network) {
                 return Promise.reject(new TypeError("Failed to fetch"));
             }
-            return this.json(failure.body, failure.status);
+            return this.json(failure.body, failure.status, failure.headers);
         }
 
         if (path === "whoami") {

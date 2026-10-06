@@ -511,3 +511,52 @@ export function testStripOf(element: UI5Element): { visible: boolean; type: stri
         markup: !!message && message.querySelector("b, script, img, a") !== null
     };
 }
+
+/** The "Changes data" box of a row: whether it can be operated, and what
+ *  it says when it is pointed at. */
+export function changesDataOf(item: ColumnListItem): { editable: boolean; tooltip: string } {
+    const box = operationBox(item, "changes");
+    return { editable: box.getEditable(), tooltip: String(box.getTooltip() ?? "") };
+}
+
+// --- the operation dialog ---------------------------------------------------------
+
+/** What the dialog of an operation shows. */
+export interface OperationDialogTexts {
+    dialogTitle: string;
+    title: string;
+    description: string;
+    /** Whether each of the two fields can be typed into. */
+    editable: boolean[];
+    name: string;
+    method: string;
+    kind: string;
+    boundTo: string;
+    returns: string;
+    parameters: string[];
+    /** Whether the dialog renders an element out of a text it shows. */
+    markup: boolean;
+}
+
+/** The dialog of an operation, read off its controls. `element`: any
+ *  control of the view the dialog belongs to. */
+export function operationDialogOf(element: UI5Element): OperationDialogTexts {
+    const text = (id: string) => control<Text>(element, id).getText(false);
+    const dialog = control<Control>(element, "odataOperationDialog");
+    return {
+        dialogTitle: (dialog as unknown as { getTitle(): string }).getTitle(),
+        title: control<Input>(element, "operationTitle").getValue(),
+        description: control<TextArea>(element, "operationDescription").getValue(),
+        editable: [
+            control<Input>(element, "operationTitle").getEditable(),
+            control<TextArea>(element, "operationDescription").getEditable()
+        ],
+        name: text("operationName"),
+        method: text("operationMethod"),
+        kind: text("operationKind"),
+        boundTo: text("operationBoundTo"),
+        returns: text("operationReturns"),
+        parameters: (control<VBox>(element, "operationParameters").getItems() as Text[]).map((item) => item.getText(false)),
+        markup: (dialog.getDomRef()?.querySelectorAll("b, script, img, i").length ?? 0) > 0
+    };
+}

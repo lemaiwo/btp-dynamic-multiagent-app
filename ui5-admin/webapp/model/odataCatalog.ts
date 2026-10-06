@@ -37,6 +37,8 @@ const MAX_TYPE = 200;
 const MAX_VALUE = 64;
 const MAX_MEANING = 200;
 const MAX_ENTITY_DESCRIPTION = 600;
+// `OperationDef.description` in agents/odata/models.py.
+const MAX_OPERATION_DESCRIPTION = 600;
 const MAX_NAV_DESCRIPTION = 300;
 const MAX_EXAMPLE_DESCRIPTION = 200;
 const MAX_EXAMPLE_FILTER = 1000;
@@ -139,7 +141,8 @@ export interface ODataOperationRow {
     /** Sent with POST: "Changes data" cannot be unticked. */
     post: boolean;
     /** Why no agent can call it although it is enabled, as an i18n key; ""
-     *  when it can be called, or is not enabled. */
+     *  when it can be called, is not enabled, or was changed on the page
+     *  (the reason is about the operation as it is stored). */
     uncallable: string;
     /** Why the last click was not taken (already in the user's language). */
     note: string;
@@ -324,8 +327,7 @@ function writeOpsOf(entitySet: ODataEntitySet): ODataEntityOp[] {
 
 /**
  * Whether calling `operation` is a write. THE rule, the server's
- * (`operation_changes_data` in agents/odata/search.py, `call_changes_data`
- * in agents/odata/client.py): a read is only what is marked
+ * (`operation_is_write` in agents/odata/models.py): a read is only what is marked
  * `changes_data: false` (exactly) AND is sent with GET. A missing flag does
  * not read as "only reads", and a POST is a write whatever the flag says.
  * The Write tag, the pending strip, the Save question and the duplicate
@@ -343,6 +345,50 @@ function writeOperations(definition: ODataDefinition | undefined | null): ODataO
 
 function operationTitle(operation: ODataOperation): string {
     return (operation.title ?? "").trim() || operation.name;
+}
+
+/** The operations of a definition that every agent using the service can
+ *  call, with or without `allow_write`, and whose calls are not recorded
+ *  in the audit: enabled, and a read by `operationIsWrite`. */
+function readOperations(definition: ODataDefinition | undefined | null): ODataOperation[] {
+    return (definition?.operations ?? []).filter((o) => o.enabled === true && !operationIsWrite(o));
+}
+
+/**
+ * The operations saving `current` over `stored` newly opens as READS:
+ * enabled and a read in `current`, and not that in `stored` (matched by
+ * name: a write there -- its flag set or missing --, not enabled, or
+ * absent). A call of such an operation needs no `allow_write` any more and
+ * is no longer recorded, so this is a widening like a new write, and is
+ * said and asked about like one. An operation `stored` already has enabled
+ * as a read is no entry, and a POST never is one: it stays a write whatever
+ * its flag says.
+ */
+function newReadOperations(
+    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+): ODataNewOperation[] {
+    const had = readOperations(stored).map((o) => o.name);
+    return readOperations(current)
+        .filter((o) => had.indexOf(o.name) === -1)
+        .map((o) => ({ name: o.name, title: operationTitle(o) }));
+}
+
+/** The title and description of an operation as the server would refuse
+ *  them (`OperationDef`): field -> i18n key; empty means valid. */
+function operationTextProblems(
+    title: string | undefined | null, description: string | undefined | null
+): { title?: string; description?: string } {
+    const problems: { title?: string; description?: string } = {};
+    const name = title ?? "";
+    if (name.length > MAX_TITLE) {
+        problems.title = "odataErrTitleTooLong";
+    } else if (!isOneLine(name)) {
+        problems.title = "odataErrTitleOneLine";
+    }
+    if ((description ?? "").length > MAX_OPERATION_DESCRIPTION) {
+        problems.description = "odataErrEntityDescriptionTooLong";
+    }
+    return problems;
 }
 
 function newEntityWrites(
@@ -402,16 +448,20 @@ function uncallableKey(reason: string | undefined | null): string {
  * operation name -> reason code, as the server said it about the STORED
  * service; it is shown while the row is enabled (a reason for an operation
  * that the admin has switched off again would describe nothing an agent
- * meets).
+ * meets). `stored`: the definition that reason is about; an operation that
+ * is not (or no longer) as it is there shows no reason, which would be
+ * about another operation than the row shows.
  */
 function operationRow(
     operation: ODataOperation, index: number, definition: ODataDefinition | undefined | null,
-    uncallable: Record<string, string> = {}
+    uncallable: Record<string, string> = {}, stored?: ODataDefinition | null
 ): ODataOperationRow {
     const title = operationTitle(operation);
     const bound = operation.bound_to === null || operation.bound_to === undefined ? "" : operation.bound_to;
     const set = bound ? (definition?.entity_sets ?? []).filter((e) => e.name === bound)[0] : undefined;
-    const reason = Object.prototype.hasOwnProperty.call(uncallable, `=${operation.name}`)
+    const saved = stored ? (stored.operations ?? []).filter((o) => o.name === operation.name)[0] : operation;
+    const asSaved = !!saved && JSON.stringify(saved) === JSON.stringify(operation);
+    const reason = asSaved && Object.prototype.hasOwnProperty.call(uncallable, `=${operation.name}`)
         ? uncallable[`=${operation.name}`] : "";
     return {
         index,
@@ -888,10 +938,9 @@ export default {
     /**
      * Whether the definition lets an agent with `allow_write` change data:
      * an entity set with create, update or delete, or an enabled operation
-     * that is a write (`operationIsWrite`). That is the rule the server RUNS
-     * calls by; the `has_write` flag in its answers is narrower (it leaves
-     * out an enabled POST marked `changes_data: false`), so the detail page
-     * shows its Write tag by this function and not by that flag.
+     * that is a write (`operationIsWrite`): the rule the server runs calls
+     * by, and the one behind the `has_write` flag of its answers
+     * (`operation_is_write` in agents/odata/models.py).
      */
     hasWrite(definition: ODataDefinition | undefined | null): boolean {
         return (definition?.entity_sets ?? []).some((e) => writeOpsOf(e).length > 0)
@@ -906,12 +955,19 @@ export default {
 
     /** One table row per operation, in the definition's order. */
     operationRows(
-        definition: ODataDefinition | undefined | null, uncallable: Record<string, string> = {}
+        definition: ODataDefinition | undefined | null, uncallable: Record<string, string> = {},
+        stored?: ODataDefinition | null
     ): ODataOperationRow[] {
         return (definition?.operations ?? []).map((operation, index) => (
-            operationRow(operation, index, definition, uncallable)
+            operationRow(operation, index, definition, uncallable, stored)
         ));
     },
+
+    operationTitle,
+    operationTextProblems,
+
+    /** The most characters the description of an operation may have. */
+    MAX_OPERATION_DESCRIPTION,
 
     /** `uncallable_operations` of a service answer as a lookup for
      *  `operationRow`: operation name (behind "=", so that no name collides
@@ -930,10 +986,13 @@ export default {
 
     uncallableKey,
 
-    /** The agents of `usedBy` that have a run endpoint, by name: runs
-     *  started there have no signed-in user. */
+    /** The agents of `usedBy` that the job scheduler can start, by name:
+     *  runs started there have no signed-in user. An agent that is switched
+     *  off is not started, and `expose_api` without a slug is no endpoint. */
     jobAgents(usedBy: readonly ODataUsedBy[] | undefined | null): string[] {
-        return (usedBy ?? []).filter((used) => used.expose_api === true).map((used) => used.agent);
+        return (usedBy ?? [])
+            .filter((used) => used.expose_api === true && used.enabled !== false && !!(used.api_slug ?? "").trim())
+            .map((used) => used.agent);
     },
 
     /**
@@ -1002,6 +1061,24 @@ export default {
             operations: newWriteOperations(stored, current, switchedOn),
             fields: newWritableFields(stored, current)
         };
+    },
+
+    /**
+     * The operations saving `current` over `stored` newly lets EVERY agent
+     * that uses the service call, without `allow_write` and without a
+     * record in the audit (`newReadOperations`). Beside `pendingWrites`,
+     * not in it: who it reaches and what it means are other sentences.
+     */
+    pendingReads(
+        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+    ): ODataNewOperation[] {
+        return newReadOperations(stored, current);
+    },
+
+    /** The operations of `list` that `other` does not name. */
+    operationsMinus(list: readonly ODataNewOperation[], other: readonly ODataNewOperation[]): ODataNewOperation[] {
+        const names = other.map((operation) => operation.name);
+        return list.filter((operation) => names.indexOf(operation.name) === -1);
     },
 
     /** How many things `pending` holds: each ticked operation of each

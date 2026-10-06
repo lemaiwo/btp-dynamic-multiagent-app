@@ -641,7 +641,12 @@
                         </Column>
                     </columns>
                     <items>
-                        <ColumnListItem>
+                        <!-- A press on the row opens the dialog with its
+                             name and description for the agent. -->
+                        <ColumnListItem
+                            type="Navigation"
+                            tooltip="{ path: 'svc>title', formatter: '.formatOpenOperation' }"
+                            press=".onOpenOperation">
                             <cells>
                                 <VBox>
                                     <ObjectIdentifier title="{svc>title}" text="{svc>technical}" />
@@ -667,10 +672,14 @@
                                 </VBox>
                                 <Text text="{ path: 'svc>boundTo', formatter: '.formatBoundTo' }" />
                                 <Text text="{svc>parameters}" class="odataFieldName" />
+                                <!-- Sent with POST it is a write whatever
+                                     the flag says: the box is shown, not
+                                     offered, and says why. -->
                                 <CheckBox
                                     selected="{ path: 'svc>write', mode: 'OneWay' }"
                                     enabled="{= !${svc>/busy} }"
-                                    tooltip="{ parts: ['i18n>odataColChangesData', 'svc>title'], formatter: '.formatOperationOf' }"
+                                    editable="{= !${svc>post} }"
+                                    tooltip="{ parts: ['i18n>odataColChangesData', 'svc>title', 'svc>post'], formatter: '.formatChangesDataTooltip' }"
                                     ariaLabelledBy="odataOpNameChanges odataOperationRowName"
                                     app:flag="changes_data"
                                     select=".onToggleChangesData" />

@@ -9,11 +9,13 @@ import MessageToast from "sap/m/MessageToast";
 import { InvisibleMessageMode, ValueState } from "sap/ui/core/library";
 import ODataController from "./odata/ODataController";
 import EntitySetDialog from "./odata/EntitySetDialog";
+import OperationDialog from "./odata/OperationDialog";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
 import odataCatalog, {
-    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataOperationRow, type ODataPending
+    type ODataEntityRow, type ODataErrorField, type ODataErrors, type ODataNewOperation, type ODataOperationRow,
+    type ODataPending
 } from "../model/odataCatalog";
 import odataDestinations, { type DestinationNotice, type DestinationsState } from "../model/odataDestinations";
 import { canonical } from "../model/runsPanel";
@@ -142,6 +144,11 @@ export default class ODataServiceDetail extends ODataController {
      *  the admin: nothing on the page gets the focus for it. */
     private entityDismissed = false;
 
+    /** The dialog of one operation (its name and description), and whether
+     *  it is open or on its way. */
+    private operationDialog?: OperationDialog;
+    private operationOpen = false;
+
     /** Watches the height of what the slot of the pending-writes strip holds. */
     private slotObserver?: ResizeObserver;
 
@@ -171,6 +178,13 @@ export default class ODataServiceDetail extends ODataController {
 
     public onInit(): void {
         this.setModel(new JSONModel(this.blankState("")), "svc");
+        // A field of the form was changed through its binding: what the
+        // last test call said is about the service before that.
+        this.svc().attachPropertyChange((event) => {
+            if (String(event.getParameter("path") ?? "").indexOf("/data/") === 0) {
+                this.clearTest();
+            }
+        });
         // `items`: what a destination field offers; `hint`: the line
         // under it; `notice`: what there is to say about the name in the
         // page's field (a `DestinationNotice`), `noticeText`: that in
@@ -329,6 +343,10 @@ export default class ODataServiceDetail extends ODataController {
      * with nothing unsaved.
      */
     private leaveEntityDialog(): void {
+        if (this.operationOpen) {
+            // Closed as Cancel does; nothing of it is written into the form.
+            this.operationDialog?.dismiss();
+        }
         if (!this.entityOpen) {
             return;
         }
@@ -408,8 +426,10 @@ export default class ODataServiceDetail extends ODataController {
             // `problemsOnly`: the table shows the marked rows alone, and
             // this is the sentence that says so.
             // `asking`: a question about the save is open.
+            // `pendingReads`: the operations a save newly marks as only
+            // reading (callable without "Allow writes", not recorded).
             rows: [], entitySearch: "", pendingWrites: "", asking: false, problemsOnly: "",
-            pending: odataCatalog.noPending(),
+            pending: odataCatalog.noPending(), pendingReads: [],
             // `opRows`: what the operations table shows, one flat row per
             // operation of `data.definition` (`odataCatalog.operationRow`).
             // `uncallable`: what the server said about the STORED service's
@@ -801,8 +821,8 @@ export default class ODataServiceDetail extends ODataController {
     /**
      * The Write tag: the stored service lets an agent with "Allow writes"
      * change data. By the rule the Save question goes by
-     * (`odataCatalog.hasWrite`), not by the server's `has_write` flag, which
-     * leaves out an enabled POST operation marked as only reading.
+     * (`odataCatalog.hasWrite`), worked out from the definition the page
+     * holds as stored.
      */
     public formatWriteTag(exists: boolean | undefined, definition: ODataDefinition | undefined): boolean {
         return exists === true && odataCatalog.hasWrite(definition);
@@ -913,6 +933,17 @@ export default class ODataServiceDetail extends ODataController {
         return this.text(write ? "odataEnableWriteOperation" : "odataEnableOperation", [title ?? ""]);
     }
 
+    /** What a press on a row of the operations table opens. */
+    public formatOpenOperation(title: string | undefined): string {
+        return this.text("odataOpenOperation", [title ?? ""]);
+    }
+
+    /** What the Changes data box switches -- or, for an operation that is
+     *  sent with POST, why it cannot be switched. */
+    public formatChangesDataTooltip(label: string | undefined, title: string | undefined, post: boolean | undefined): string {
+        return post === true ? this.text("odataChangesDataPost") : this.formatOperationOf(label, title);
+    }
+
     public formatRemoveOperation(title: string | undefined): string {
         return this.text("odataRemoveOperation", [title ?? ""]);
     }
@@ -1013,16 +1044,28 @@ export default class ODataServiceDetail extends ODataController {
     private showPendingWrites(announce = false): void {
         const model = this.svc();
         const before = model.getProperty("/pending") as ODataPending;
+        const readsBefore = (model.getProperty("/pendingReads") ?? []) as ODataNewOperation[];
         if (announce) {
+            // The admin just changed the form: the last test is about the
+            // service before that.
+            this.clearTest();
             this.keepPlace();
         }
-        const pending = model.getProperty("/loaded") === true
-            ? this.newWrites(this.original()) : odataCatalog.noPending();
+        const loaded = model.getProperty("/loaded") === true;
+        const pending = loaded ? this.newWrites(this.original()) : odataCatalog.noPending();
+        // The other widening: a call that stops being a write.
+        const reads = loaded ? this.newReads(this.original()) : [];
         const count = odataCatalog.pendingCount(pending);
         model.setProperty("/pending", pending);
+        model.setProperty("/pendingReads", reads);
         // The strip names a few and counts the rest: it stays over the page.
-        model.setProperty("/pendingWrites", count
-            ? this.text("odataPendingWrites", [this.writeList(pending, STRIP_CAP)]) : "");
+        model.setProperty("/pendingWrites", [
+            count ? this.text("odataPendingWrites", [this.writeList(pending, STRIP_CAP)]) : "",
+            reads.length ? [
+                this.text("odataPendingReads", [this.operationList(reads, STRIP_CAP)]),
+                this.readAgents(model.getProperty("/used_by") as ODataUsedBy[], STRIP_CAP)
+            ].join(" ") : ""
+        ].filter(Boolean).join(" "));
         if (!announce) {
             return;
         }
@@ -1040,9 +1083,57 @@ export default class ODataServiceDetail extends ODataController {
                 this.writeList(removed, STRIP_CAP, "odataWriteMoreShort"), count
             ]);
         }
+        // One announcement for both: a second one would replace the first.
+        const readsAdded = odataCatalog.operationsMinus(reads, readsBefore);
+        const readsRemoved = odataCatalog.operationsMinus(readsBefore, reads);
+        const saidReads = [
+            readsAdded.length ? this.text("odataAnnounceReadAdded", [this.operationList(readsAdded, STRIP_CAP)]) : "",
+            readsRemoved.length
+                ? this.text("odataAnnounceReadRemoved", [this.operationList(readsRemoved, STRIP_CAP, "odataWriteMoreShort")])
+                : ""
+        ].filter(Boolean).join(" ");
+        said = [said, saidReads].filter(Boolean).join(" ");
         if (said) {
             InvisibleMessage.getInstance().announce(said, InvisibleMessageMode.Polite);
         }
+    }
+
+    /**
+     * The operations saving the form over `stored` newly marks as only
+     * reading: every agent that uses the service can then call them, also
+     * without "Allow writes", and their calls are no longer recorded
+     * (`odataCatalog.pendingReads`).
+     */
+    private newReads(stored: ODataServiceInput): ODataNewOperation[] {
+        return odataCatalog.pendingReads(stored.definition, this.definition());
+    }
+
+    /** "the operation "Release strategy" (GetReleaseStrategy); ...": with
+     *  `cap`, at most that many and the number of the others. */
+    private operationList(list: readonly ODataNewOperation[], cap = Infinity, more = "odataWriteMore"): string {
+        const entries = list.map((operation) => this.text("odataWriteOperationItem", [operation.title, operation.name]));
+        return entries.length <= cap
+            ? entries.join("; ")
+            : this.text(more, [entries.slice(0, cap).join("; "), entries.length - cap]);
+    }
+
+    /**
+     * Whom an operation that is marked as only reading newly reaches: the
+     * agents of `usedBy` without "Allow writes", by name (they could not
+     * call it while it was a write) -- or that there is no such agent.
+     */
+    private readAgents(usedBy: readonly ODataUsedBy[] | undefined | null, cap = Infinity): string {
+        const all = usedBy ?? [];
+        if (!all.length) {
+            return this.text("odataReadAgentsNone");
+        }
+        const others = odataCatalog.writers(all).others;
+        if (!others.length) {
+            return this.text("odataReadAgentsAllAllowed");
+        }
+        return this.text("odataReadAgentsWithout", [others.length <= cap
+            ? others.join(", ")
+            : this.text("odataWriteFieldsMore", [others.slice(0, cap).join(", "), others.length - cap])]);
     }
 
     /**
@@ -1216,7 +1307,7 @@ export default class ODataServiceDetail extends ODataController {
         // being loaded after a first press): `openEntitySet` would not open
         // a second one, and the entity set pushed here would stay behind
         // without a dialog to cancel it in.
-        if (this.entityOpen || this.working || model.getProperty("/asking") === true
+        if (this.entityOpen || this.operationOpen || this.working || model.getProperty("/asking") === true
             || entitySets.length >= odataCatalog.MAX_ENTITY_SETS) {
             return;
         }
@@ -1269,7 +1360,8 @@ export default class ODataServiceDetail extends ODataController {
     private async openEntitySet(index: number, added = false): Promise<void> {
         const model = this.svc();
         const entitySet = this.definition().entity_sets[index];
-        if (!entitySet || this.entityOpen || this.working || model.getProperty("/asking") === true) {
+        if (!entitySet || this.entityOpen || this.operationOpen || this.working
+            || model.getProperty("/asking") === true) {
             return;
         }
         if (!this.entityDialog) {
@@ -1371,7 +1463,10 @@ export default class ODataServiceDetail extends ODataController {
     private showOperations(): void {
         const model = this.svc();
         const rows = model.getProperty("/loaded") === true
-            ? odataCatalog.operationRows(this.definition(), model.getProperty("/uncallable") as Record<string, string>)
+            ? odataCatalog.operationRows(
+                this.definition(), model.getProperty("/uncallable") as Record<string, string>,
+                this.original().definition
+            )
             : [];
         model.setProperty("/opRows", rows);
         this.countUncallable();
@@ -1405,7 +1500,8 @@ export default class ODataServiceDetail extends ODataController {
         }
         model.setProperty(`/opRows/${index}`, {
             ...odataCatalog.operationRow(
-                operation, index, this.definition(), model.getProperty("/uncallable") as Record<string, string>
+                operation, index, this.definition(), model.getProperty("/uncallable") as Record<string, string>,
+                this.original().definition
             ),
             note
         });
@@ -1435,15 +1531,89 @@ export default class ODataServiceDetail extends ODataController {
         if (!operation) {
             this.showOperations();
             this.resetOperationBox(box);
-            const text = this.text("odataOperationsRefreshed");
-            const index = (model.getProperty("/opRows") as ODataOperationRow[]).map((r) => r.name).indexOf(row.name);
-            if (index !== -1) {
-                model.setProperty(`/opRows/${index}/note`, text);
-            }
-            InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
+            this.sayOperationsRefreshed(row.name);
             return undefined;
         }
         return operation;
+    }
+
+    /** Says that the operations were listed anew and the click was not
+     *  taken: on the row of the operation `name`, when there still is one,
+     *  and to a screen reader. */
+    private sayOperationsRefreshed(name: string): void {
+        const model = this.svc();
+        const text = this.text("odataOperationsRefreshed");
+        const index = (model.getProperty("/opRows") as ODataOperationRow[]).map((r) => r.name).indexOf(name);
+        if (index !== -1) {
+            model.setProperty(`/opRows/${index}/note`, text);
+        }
+        InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
+    }
+
+    /** A row of the operations table was pressed. */
+    public onOpenOperation(event: Event): void {
+        const model = this.svc();
+        const { row, operation } = this.operationAt(event.getSource() as Control);
+        if (!row || this.operationOpen || this.entityOpen || this.working || model.getProperty("/asking") === true) {
+            return;
+        }
+        if (!operation) {
+            // The row is not the operation at its position: nothing opens.
+            this.showOperations();
+            this.sayOperationsRefreshed(row.name);
+            return;
+        }
+        this.openOperation(operation).catch((error: unknown) => ErrorHandler.handle(error));
+    }
+
+    /**
+     * Opens the dialog of an operation: its business name and description
+     * for the agent, and what SAP says about it, read-only.
+     *
+     * The dialog edits a copy and sends nothing. On Apply the two texts --
+     * and nothing else -- are written into the operation of the form, when
+     * they differ from what it holds; the page's Save stores them. The
+     * operation is found again by identity when the dialog closes: if the
+     * form was loaded anew meanwhile, nothing is written into it.
+     */
+    private async openOperation(operation: ODataOperation): Promise<void> {
+        if (!this.operationDialog) {
+            this.operationDialog = new OperationDialog();
+        }
+        this.operationOpen = true;
+        let result;
+        try {
+            result = await this.operationDialog.open(this.getView()!, operation, {
+                definition: this.definition(),
+                text: (key, args) => this.text(key, args)
+            });
+        } finally {
+            this.operationOpen = false;
+        }
+        if (!result) {
+            return;
+        }
+        if (this.definition().operations.indexOf(operation) === -1) {
+            this.showOperations();
+            this.sayOperationsRefreshed(operation.name);
+            return;
+        }
+        let changed = false;
+        if (result.title !== (operation.title ?? "")) {
+            operation.title = result.title;
+            changed = true;
+        }
+        if (result.description !== (operation.description ?? "")) {
+            operation.description = result.description;
+            changed = true;
+        }
+        if (!changed) {
+            return;
+        }
+        this.showOperation(operation);
+        this.svc().setProperty("/saveError", "");
+        // A pending operation is named by its title.
+        this.showPendingWrites(true);
     }
 
     /**
@@ -1659,8 +1829,11 @@ export default class ODataServiceDetail extends ODataController {
             return;
         }
         const reason = ErrorHandler.messageFor(error, "");
-        this.showTest("Error", error instanceof AdminError && error.status === 424 ? this.text("odataTestNoUser")
-            : error instanceof AdminError && error.status === 429 ? this.text("odataTestBusy")
+        // By the stable code of the refusal (`X-OData-Error`), not by its
+        // HTTP status: a proxy on the way answers with those statuses too.
+        const code = error instanceof AdminError ? error.code : "";
+        this.showTest("Error", code === "user_token_required" ? this.text("odataTestNoUser")
+            : code === "busy" ? this.text("odataTestBusy")
                 : reason ? this.text("odataTestNotMade", [reason]) : this.text("odataTestNotMadePlain"));
     }
 
@@ -1672,6 +1845,14 @@ export default class ODataServiceDetail extends ODataController {
         InvisibleMessage.getInstance().announce(text, InvisibleMessageMode.Polite);
     }
 
+    /** Takes the strip of the test call away: it is about the service
+     *  as it was before the form was changed. */
+    private clearTest(): void {
+        if (this.svc().getProperty("/test")) {
+            this.svc().setProperty("/test", null);
+        }
+    }
+
     // --- editing ------------------------------------------------------------
 
     /** Typing in a field takes its error away, and with it what the last
@@ -1680,12 +1861,14 @@ export default class ODataServiceDetail extends ODataController {
         const field = (event.getSource() as Control).data("field") as string;
         this.svc().setProperty(`/errors/${field}`, "");
         this.svc().setProperty("/saveError", "");
+        this.clearTest();
     }
 
     public onRunsAsChange(event: Event): void {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/user_context", key === "user");
         this.svc().setProperty("/saveError", "");
+        this.clearTest();
         this.showUsedBy();
         this.checkDestination(true, undefined, true);
     }
@@ -1694,6 +1877,7 @@ export default class ODataServiceDetail extends ODataController {
         const key = (event.getSource() as SegmentedButton).getSelectedKey();
         this.svc().setProperty("/data/odata_version", key === "v4" ? "v4" : "v2");
         this.svc().setProperty("/saveError", "");
+        this.clearTest();
     }
 
     public onEnabledChange(): void {
@@ -1808,6 +1992,8 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty("/changedElsewhere", false);
         model.setProperty("/used_by", fresh.used_by ?? []);
         this.showUsedBy();
+        // The strip names agents, too.
+        this.showPendingWrites();
         return fresh;
     }
 
@@ -1907,16 +2093,21 @@ export default class ODataServiceDetail extends ODataController {
      *   only when there are such agents;
      * - which write operations the catalogue newly lets agents run -- always,
      *   also when no agent uses the service yet: the next agent attached
-     *   with "Allow writes" gets them without this page being opened again.
+     *   with "Allow writes" gets them without this page being opened again;
+     * - which operations are newly marked as only reading -- always, too:
+     *   they become callable without "Allow writes" and are no longer
+     *   recorded, with the agents that have no "Allow writes" by name.
      *
-     * One question for both.
+     * One question for all of it.
      */
     private saveQuestion(stored: ODataServiceInput, usedBy: ODataUsedBy[]): SaveQuestion | undefined {
         const change = odataCatalog.identityChange(stored, this.data());
         const identity = usedBy.length > 0 && (!!change.runsAs || !!change.destination);
         const writes = this.newWrites(stored);
         const anyWrite = odataCatalog.pendingCount(writes) > 0;
-        if (!identity && !anyWrite) {
+        const reads = this.newReads(stored);
+        const anyRead = reads.length > 0;
+        if (!identity && !anyWrite && !anyRead) {
             return undefined;
         }
         const names = usedBy.map((used) => used.agent);
@@ -1956,8 +2147,16 @@ export default class ODataServiceDetail extends ODataController {
             }
             parts.push(this.text("odataWriteAudited"));
         }
-        const title = identity && anyWrite ? "odataSaveConfirmTitle"
-            : identity ? "odataIdentityConfirmTitle" : "odataWriteConfirmTitle";
+        if (anyRead) {
+            // The other way a save opens something: a call that stops
+            // being a write reaches the agents WITHOUT "Allow writes", and
+            // nobody can look it up afterwards. Every operation is named.
+            parts.push(this.text("odataReadSaveIntro", [this.operationList(reads)]));
+            parts.push(this.readAgents(usedBy));
+        }
+        const kinds = [identity, anyWrite, anyRead].filter(Boolean).length;
+        const title = kinds > 1 ? "odataSaveConfirmTitle"
+            : identity ? "odataIdentityConfirmTitle" : anyWrite ? "odataWriteConfirmTitle" : "odataReadConfirmTitle";
         return { title: this.text(title), text: parts.join("\n\n") };
     }
 

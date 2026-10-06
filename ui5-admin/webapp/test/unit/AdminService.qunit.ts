@@ -495,6 +495,43 @@ QUnit.test("metadata compares the offer with the service the request names", asy
     ], "what the parser left out is listed by kind, set, position and reason");
 });
 
+QUnit.test("a refusal carries the stable code of its X-OData-Error header, and none without it", async function (this: { backend: FakeBackend }, assert) {
+    const backend = this.backend;
+    backend.failNext = {
+        path: "odata/services/purchase-requisitions-jobs/test", status: 429, body: { detail: "busy, try again" },
+        headers: { "X-OData-Error": "busy" }
+    };
+    let refused: unknown;
+    await new AdminService().testODataService("purchase-requisitions-jobs").catch((error: unknown) => { refused = error; });
+    assert.ok(refused instanceof AdminError, "an AdminError");
+    assert.strictEqual((refused as AdminError).status, 429);
+    assert.strictEqual((refused as AdminError).code, "busy", "the code of the header");
+    assert.strictEqual((refused as AdminError).detail, "busy, try again");
+
+    backend.failNext = { path: "odata/services/purchase-requisitions-jobs/test", status: 429, body: { detail: "from a proxy" } };
+    await new AdminService().testODataService("purchase-requisitions-jobs").catch((error: unknown) => { refused = error; });
+    assert.strictEqual((refused as AdminError).code, "", "no header, no code");
+    assert.strictEqual(new AdminError(500, "x").code, "", "and none by default");
+});
+
+QUnit.test("the fake's has_write goes by the server's write rule for operations", async function (this: { backend: FakeBackend }, assert) {
+    const backend = this.backend;
+    const service = backend.odataServices.filter((s) => s.name === "purchase-requisitions-jobs")[0];
+    service.definition.entity_sets.forEach((entitySet) => {
+        entitySet.operations = entitySet.operations.filter((op) => op === "list" || op === "get");
+    });
+    const flag = async () => (await new AdminService().getODataService("purchase-requisitions-jobs")).has_write;
+    const operation = service.definition.operations[0];
+    operation.changes_data = false;
+    assert.strictEqual(await flag(), true, "an enabled POST stored with changes_data false counts");
+    operation.http_method = "GET";
+    assert.strictEqual(await flag(), false, "a GET marked as only reading does not");
+    delete (operation as unknown as Record<string, unknown>).changes_data;
+    assert.strictEqual(await flag(), true, "a missing flag is a write");
+    operation.enabled = false;
+    assert.strictEqual(await flag(), false, "an operation that is off is none");
+});
+
 QUnit.test("the test call answers with the fake's result", async function (assert) {
     const result = await new AdminService().testODataService("purchase-requisitions-jobs");
 

@@ -17,13 +17,17 @@ export class AdminError extends Error {
     public readonly status: number;
     public readonly detail: string;
     public readonly fieldErrors: Record<string, string>;
+    /** The stable code of a refusal, from the `X-OData-Error` header of the
+     *  OData routes (`busy`, `user_token_required`, ...); "" without one. */
+    public readonly code: string;
 
-    public constructor(status: number, detail: string, fieldErrors: Record<string, string> = {}) {
+    public constructor(status: number, detail: string, fieldErrors: Record<string, string> = {}, code = "") {
         super(detail || `Request failed with status ${status}`);
         this.name = "AdminError";
         this.status = status;
         this.detail = detail;
         this.fieldErrors = fieldErrors;
+        this.code = code;
     }
 }
 
@@ -81,7 +85,7 @@ export default class AdminService {
         } catch {
             detail = response.statusText;
         }
-        return new AdminError(response.status, detail, fieldErrors);
+        return new AdminError(response.status, detail, fieldErrors, response.headers?.get("X-OData-Error") ?? "");
     }
 
     private static json(body: unknown): RequestInit {
@@ -313,9 +317,9 @@ export default class AdminService {
 
     /** One read of one row through the stored service; the answer says
      * whether it worked and as whom, never what was read. */
-    public testODataService(name: string, entitySet?: string): Promise<ODataTestResult> {
+    public testODataService(name: string): Promise<ODataTestResult> {
         return this.request<ODataTestResult>(`${AdminService.odataServicePath(name)}/test`, {
-            method: "POST", ...AdminService.json(entitySet ? { entity_set: entitySet } : {})
+            method: "POST", ...AdminService.json({})
         });
     }
 }

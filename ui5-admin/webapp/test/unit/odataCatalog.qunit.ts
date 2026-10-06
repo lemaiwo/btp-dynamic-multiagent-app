@@ -757,5 +757,97 @@ QUnit.test("jobAgents: the agents with a run endpoint", function (assert) {
     });
     assert.deepEqual(odataCatalog.jobAgents([used("chat", false), used("nightly", true)]), ["nightly"]);
     assert.deepEqual(odataCatalog.jobAgents(undefined), []);
+    assert.deepEqual(
+        odataCatalog.jobAgents([{ ...used("off", true), enabled: false }, used("nightly", true)]), ["nightly"],
+        "an agent that is switched off is not started by the scheduler"
+    );
+    assert.deepEqual(
+        odataCatalog.jobAgents([{ ...used("no-slug", true), api_slug: "" }, { ...used("blank", true), api_slug: "  " }]), [],
+        "expose_api without a slug is no run endpoint"
+    );
+});
+
+// --- U6 fix round 1 ------------------------------------------------------------
+
+/** A definition with the one operation `over` describes. */
+function withOperation(over: Record<string, unknown> | null): ODataDefinition {
+    const operation = {
+        name: "GetStrategy", qualified_name: "", title: "Release strategy", kind: "function_import",
+        http_method: "GET", bound_to: null, parameters: [], description: "", enabled: true, changes_data: true, ...over
+    };
+    return { entity_sets: [], operations: over === null ? [] : [operation] } as unknown as ODataDefinition;
+}
+
+QUnit.test("pendingReads: an operation that a save newly marks as only reading", function (assert) {
+    const entry = [{ name: "GetStrategy", title: "Release strategy" }];
+    const read = withOperation({ changes_data: false });
+
+    assert.deepEqual(odataCatalog.pendingReads(withOperation({}), read), entry, "GET, Changes data true -> false");
+    const noFlag = withOperation({});
+    delete (noFlag.operations[0] as unknown as Record<string, unknown>).changes_data;
+    assert.deepEqual(odataCatalog.pendingReads(noFlag, read), entry, "a missing flag is a write: -> false is an entry");
+    assert.deepEqual(odataCatalog.pendingReads(noFlag, noFlag), [], "and a missing flag is never a read");
+    assert.deepEqual(
+        odataCatalog.pendingReads(withOperation({ enabled: false, changes_data: false }), read), entry,
+        "stored switched off and marked as reading, then enabled"
+    );
+    assert.deepEqual(
+        odataCatalog.pendingReads(withOperation({}), withOperation({ enabled: false, changes_data: false })), [],
+        "marked as reading but not enabled: nothing an agent can call yet"
+    );
+    assert.deepEqual(
+        odataCatalog.pendingReads(withOperation({ http_method: "POST" }), withOperation({ http_method: "POST", changes_data: false })),
+        [], "a POST never: it stays a write whatever its flag says"
+    );
+    assert.deepEqual(odataCatalog.pendingReads(read, read), [], "a stored read stays a read: no entry");
+    assert.deepEqual(odataCatalog.pendingReads(read, withOperation({})), [], "a read that becomes a write is no entry here");
+    assert.deepEqual(odataCatalog.pendingReads(withOperation(null), read), entry, "not stored at all (matched by name)");
+    assert.deepEqual(odataCatalog.pendingReads(undefined, read), entry, "a new service, or one saved as new");
+    assert.deepEqual(
+        odataCatalog.pendingReads(undefined, withOperation({ changes_data: false, title: " " })),
+        [{ name: "GetStrategy", title: "GetStrategy" }], "named by its name without a title"
+    );
+    assert.deepEqual(odataCatalog.pendingReads(read, undefined), [], "no definition, no entry");
+    // The two categories never hold the same operation.
+    assert.deepEqual(odataCatalog.pendingWrites(withOperation({}), read).operations, [], "and it is no pending write");
+});
+
+QUnit.test("operationsMinus: what one click added to or took from the pending reads", function (assert) {
+    const a = { name: "A", title: "a" };
+    const b = { name: "B", title: "b" };
+    assert.deepEqual(odataCatalog.operationsMinus([a, b], [a]), [b]);
+    assert.deepEqual(odataCatalog.operationsMinus([a], [a, b]), []);
+    assert.deepEqual(odataCatalog.operationsMinus([], [a]), []);
+});
+
+QUnit.test("operationRow: a reason is about the stored operation and goes when the row was changed on the page", function (assert) {
+    const stored = withOperation({});
+    const uncallable = odataCatalog.uncallableByName([{ name: "GetStrategy", reason: "parameter_type" }]);
+    const reasonOf = (current: ODataDefinition, saved?: ODataDefinition) => (
+        odataCatalog.operationRows(current, uncallable, saved)[0].uncallable
+    );
+    assert.strictEqual(reasonOf(stored, stored), "odataUncallableParameterType", "as stored: the reason");
+    assert.strictEqual(reasonOf(withOperation({}), stored), "odataUncallableParameterType", "equal by content, not by identity");
+    assert.strictEqual(reasonOf(withOperation({ description: "Changed" }), stored), "", "changed on the page: no reason");
+    assert.strictEqual(reasonOf(withOperation({ changes_data: false }), stored), "", "its flag changed: no reason");
+    assert.strictEqual(reasonOf(stored, withOperation(null)), "", "not stored: the reason is about nothing");
+    assert.strictEqual(reasonOf(stored), "odataUncallableParameterType", "without the stored definition, as before");
+});
+
+QUnit.test("operationTextProblems: the title and description the server would refuse", function (assert) {
+    assert.deepEqual(odataCatalog.operationTextProblems("Release item", "Releases one item."), {});
+    assert.deepEqual(odataCatalog.operationTextProblems("", ""), {}, "both may be empty");
+    assert.deepEqual(odataCatalog.operationTextProblems(undefined, null), {});
+    assert.deepEqual(odataCatalog.operationTextProblems("x".repeat(120), "y".repeat(600)), {}, "at the caps");
+    assert.deepEqual(odataCatalog.operationTextProblems("x".repeat(121), ""), { title: "odataErrTitleTooLong" });
+    assert.deepEqual(odataCatalog.operationTextProblems("a\tb", ""), { title: "odataErrTitleOneLine" }, "a tab");
+    assert.deepEqual(odataCatalog.operationTextProblems("a\u2028b", ""), { title: "odataErrTitleOneLine" }, "a line separator");
+    assert.deepEqual(
+        odataCatalog.operationTextProblems("", "one\ntwo"), {}, "a description may have several lines, as the server takes it"
+    );
+    assert.deepEqual(
+        odataCatalog.operationTextProblems("", "y".repeat(601)), { description: "odataErrEntityDescriptionTooLong" }
+    );
+    assert.strictEqual(odataCatalog.MAX_OPERATION_DESCRIPTION, 600);
 });
 
