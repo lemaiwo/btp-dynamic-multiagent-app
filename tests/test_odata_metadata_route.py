@@ -61,7 +61,13 @@ from agents.destination import Destination, DestinationError  # noqa: E402
 from agents.odata import preview  # noqa: E402
 from agents.odata.metadata import parse_metadata  # noqa: E402
 from agents.odata.models import MAX_ENTITY_SETS, MAX_FIELDS, MAX_OPERATIONS  # noqa: E402
-from tests.odata_helpers import SAP_URL, FakeResolver, Sap  # noqa: E402
+from tests.odata_helpers import (  # noqa: E402
+    SAP_URL,
+    FakeConnectivity,
+    FakeResolver,
+    OnPremiseResolver,
+    Sap,
+)
 
 URL = "/admin/api/odata/metadata"
 SERVICES = "/admin/api/odata/services"
@@ -721,29 +727,105 @@ async def test_no_destination_binding_is_a_destination_error(client):
     assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
 
 
-class OnPremise(FakeResolver):
-    async def resolve(self, **kwargs: Any) -> Destination:
-        resolved = await super().resolve(**kwargs)
-        return Destination(
-            url=self.url,
-            headers=resolved.headers,
-            expires_at=resolved.expires_at,
-            auth_type="BasicAuthentication",
-            proxy_type="OnPremise",
-        )
+class Proxy:
+    """The connectivity side of one test: the tokens and the proxy's wire."""
+
+    def __init__(self) -> None:
+        self.tokens = FakeConnectivity()
+        self.sap = Sap(xml(V2))
+
+    @property
+    def requests(self) -> list[httpx.Request]:
+        return self.sap.requests
 
 
-@pytest.mark.parametrize("url", ["https://s4.internal:44300", "http://s4.internal:44300"])
-async def test_an_on_premise_destination_is_refused_before_anything_is_sent(client, remote, url):
-    remote.resolver = OnPremise(url=url)
+@pytest.fixture
+def proxy(monkeypatch) -> Proxy:
+    state = Proxy()
+    monkeypatch.setattr(preview, "_connectivity", lambda: state.tokens)
+    monkeypatch.setattr(
+        preview,
+        "_proxy_transport",
+        lambda: httpx.MockTransport(unread(lambda r: state.sap.handler(r))),
+    )
+    return state
+
+
+async def test_an_on_premise_destination_is_fetched_through_the_connectivity_proxy(
+    client, remote, proxy
+):
+    remote.resolver = OnPremiseResolver()
     r = await client.post(URL, json=REQUEST)
-    assert r.status_code == 502, r.text
-    assert r.headers["x-odata-error"] == "on_premise_unavailable"
-    assert r.json() == {
-        "detail": "on-premise destinations are not available yet in this version"
-    }
-    # Nothing went out past the Cloud Connector.
+    assert r.status_code == 200, r.text
+    assert r.json()["summary"]["entity_sets"] > 0
+    # Nothing went out past the proxy.
     assert remote.requests == []
+    (sent,) = proxy.requests
+    assert str(sent.url) == f"http://s4.internal:44300{PATH}/$metadata?sap-client=100"
+    assert sent.headers["Proxy-Authorization"] == "Bearer APP"
+    assert sent.headers["Authorization"] == "Basic dGVjaDp4"
+    assert sent.headers["SAP-Connectivity-SCC-Location_ID"] == "LOC1"
+    assert "SAP-Connectivity-Authentication" not in sent.headers
+    assert sent.headers["Accept"] == "application/xml"
+    assert sent.headers["Accept-Encoding"] == "identity"
+    assert proxy.tokens.calls == [("app", False)]
+
+
+async def test_an_on_premise_fetch_as_the_signed_in_user_carries_only_that_user(
+    client, remote, proxy
+):
+    remote.resolver = OnPremiseResolver(name="S4_ODATA_USER", auth_type="PrincipalPropagation")
+    headers = bearer("alice-id")
+    body = request(destination="S4_ODATA_USER", user_context=True)
+    r = await client.post(URL, json=body, headers=headers)
+    assert r.status_code == 200, r.text
+    assert remote.requests == []
+    (sent,) = proxy.requests
+    assert sent.headers["Proxy-Authorization"] == "Bearer UX-alice-id"
+    # The destination's stored credential is not sent next to the user.
+    assert "Authorization" not in sent.headers
+    jwt_sent = headers["Authorization"].removeprefix("Bearer ")
+    assert proxy.tokens.calls == [("user", jwt_sent, "alice-id", False)]
+
+
+async def test_an_on_premise_user_fetch_on_a_technical_destination_sends_nothing(
+    client, remote, proxy
+):
+    remote.resolver = OnPremiseResolver()
+    r = await client.post(URL, json=request(user_context=True), headers=bearer("alice-id"))
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
+
+
+async def test_an_https_on_premise_destination_is_refused_before_anything_is_sent(
+    client, remote, proxy
+):
+    remote.resolver = OnPremiseResolver(url="https://s4.internal:44300")
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
+
+
+async def test_an_on_premise_destination_without_a_connectivity_binding_says_so_in_the_log(
+    client, remote, caplog
+):
+    """The real connectivity seam, in an environment without a binding."""
+    caplog.set_level(logging.WARNING, logger=preview.logger.name)
+    remote.resolver = OnPremiseResolver()
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "destination_error"
+    assert r.json() == {"detail": preview.DESTINATION_TEXT}
+    assert "no connectivity service binding" in caplog.text
+    assert remote.requests == []
+
+
+async def test_a_407_of_the_proxy_is_one_request_and_no_retry(client, remote, proxy):
+    remote.resolver = OnPremiseResolver()
+    proxy.sap = Sap(httpx.Response(407, text="Proxy Authentication Required"))
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "sap_error"
+    assert "connectivity proxy" in r.json()["detail"]
+    assert len(proxy.requests) == 1 and proxy.tokens.invalidated == []
 
 
 # ------------------------------------------------------------------ identity

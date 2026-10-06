@@ -57,15 +57,16 @@ from typing import Any
 import httpx
 
 from agents.destination import (
-    PROXY_TYPE_ON_PREMISE,
     USER_PROPAGATING_AUTH_TYPES,
     Destination,
     DestinationError,
+    connectivity_from_environment,
 )
 from agents.destination_auth import (
     PLACEHOLDER_BASE,
     DestinationAuth,
     DestinationUserRequired,
+    connectivity_transport,
     resolver_for,
 )
 from agents.odata import common
@@ -105,7 +106,6 @@ MAX_PREVIEW_KEYS = 64
 MAX_PREVIEW_NAVIGATIONS = 200
 MAX_PREVIEW_PARAMETERS = 100  # client.MAX_CALL_PARAMS
 
-ON_PREMISE_TEXT = "on-premise destinations are not available yet in this version"
 _USER_REQUIRED_TEXT = (
     "This fetch runs in SAP as the signed-in user, but no user token "
     "reached the backend. Sign in again and retry."
@@ -139,6 +139,10 @@ _STATUS_HINTS = {
     401: "the destination's credential was not accepted",
     403: "the user is not authorised for this service in SAP",
     404: "no service answers at this path (is it activated, and is the path right?)",
+    407: (
+        "the connectivity proxy refused the request (this app's connectivity "
+        "binding, or the destination's Cloud Connector location)"
+    ),
 }
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+")
 _HTML_STARTS = (b"<!doctype html", b"<html")
@@ -159,35 +163,34 @@ class PreviewError(Exception):
         self.detail = detail
 
 
-class OnPremise(DestinationError):
-    """The destination is reached through the Cloud Connector."""
-
-
 class OneShotAuth(DestinationAuth):
-    """``DestinationAuth`` for one admin-triggered request: no on-premise
-    target, and it remembers the destination the request was shaped for.
+    """``DestinationAuth`` for one admin-triggered request: it remembers the
+    destination the request was resolved for.
 
     Shared by the preview (``MetadataAuth``) and the catalogue test call
-    (``agents.odata.testcall``), so that both refuse the same destinations.
-    Built with ``retry_on_401=False``: the resolver is new for this call, so
-    a second attempt could only repeat a refused logon -- against a system
-    that counts those.
+    (``agents.odata.testcall``), so that both go by the same rules. Built
+    with ``retry_on_401=False``: the resolver is new for this call, so a
+    second attempt could only repeat a refused logon -- against a system
+    that counts those. (That also turns off the retry after a 407 of the
+    connectivity proxy: the connectivity tokens are new for this call too.)
+
+    An OnPremise destination goes through the connectivity proxy, by the
+    rules of ``DestinationAuth``; build the auth with ``connectivity=`` and
+    the client with :func:`wire`.
     """
 
     resolved: Destination | None = None
 
-    def send_through(self, request: httpx.Request, destination: Destination) -> None:
-        # Also for a destination that is refused below: its type is what a
-        # caller reports.
+    async def _proxy_headers(self, destination: Destination, *args: Any, **kwargs: Any) -> Any:
+        # Before the rules decide: also the type of a destination that is
+        # refused (an OnPremise one without a binding, or of the wrong
+        # authentication type for a user) is what a caller reports.
         self.resolved = destination
-        if (destination.proxy_type or "").strip().lower() == PROXY_TYPE_ON_PREMISE.lower():
-            # Checked on the destination this very request would use, before
-            # anything is shaped: sent from here it would go straight to the
-            # virtual host, past the connectivity proxy and the Cloud
-            # Connector. The connectivity task (plan section 1.7, task C2:
-            # `DestinationAuth(connectivity=...)` + `OnPremiseRouter`) adds
-            # that route; this refusal goes when the fetch can take it.
-            raise OnPremise(ON_PREMISE_TEXT)
+        return await super()._proxy_headers(destination, *args, **kwargs)
+
+    def send_through(self, request: httpx.Request, destination: Destination) -> None:
+        # `resolved` stays the destination as it was resolved: for a user's
+        # request through the proxy, the one shaped here has no headers.
         super().send_through(request, destination)
 
 
@@ -227,6 +230,31 @@ def _resolver(destination: str) -> Any:
 def _transport() -> httpx.AsyncBaseTransport | None:
     """The transport of the fetch; ``None`` = httpx's own. A seam for tests."""
     return None
+
+
+def _connectivity() -> Any:
+    """The connectivity tokens of the fetch, ``None`` without a binding; new
+    per call, like the resolver. A seam for tests."""
+    return connectivity_from_environment()
+
+
+def _proxy_transport() -> httpx.AsyncBaseTransport | None:
+    """The transport towards the connectivity proxy; ``None`` = one built
+    from the binding. A seam for tests."""
+    return None
+
+
+def wire(
+    connectivity: Any,
+    direct: httpx.AsyncBaseTransport | None,
+    proxied: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncBaseTransport | None:
+    """The transport of a one-shot client: with ``connectivity`` the router
+    that keeps the proxy path and the direct path apart, without it
+    ``direct`` as before."""
+    if connectivity is None:
+        return direct
+    return connectivity_transport(connectivity, direct=direct, proxied=proxied)
 
 
 # ----------------------------------------------------------------- the fetch
@@ -371,17 +399,19 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         # behalf of nobody, and never a fall-back to its own credential.
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
     try:
+        connectivity = _connectivity()
         auth = MetadataAuth(
             _resolver(destination),
             user_context=user_context is True,
             server_key=SERVER_KEY,
             retry_on_401=False,
+            connectivity=connectivity,
         )
         client = httpx.AsyncClient(
             base_url=PLACEHOLDER_BASE,
             auth=auth,
             timeout=httpx.Timeout(PREVIEW_BUDGET_SECONDS),
-            transport=_transport(),
+            transport=wire(connectivity, _transport(), _proxy_transport()),
             cookies=NoCookieJar(),
             follow_redirects=False,
         )
@@ -398,8 +428,6 @@ async def fetch_metadata(destination: str, service_path: str, user_context: bool
         raise
     except DestinationUserRequired:
         raise PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT) from None
-    except OnPremise:
-        raise PreviewError(502, "on_premise_unavailable", ON_PREMISE_TEXT) from None
     except (DestinationError, ValueError) as exc:
         # ValueError: `resolver_for` on an empty name. The text can quote the
         # destination service's answer, so it goes to the log only, URLs masked.

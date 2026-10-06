@@ -27,7 +27,10 @@ service may be tested.
   bound to the request, through the destination); without one the answer is
   424 and nothing is resolved or sent, never the destination's own
   credential instead. False: the destination's own credential. An OnPremise
-  destination is refused before anything is sent, as in the preview.
+  destination is read through the connectivity proxy, by the rules of
+  ``agents.destination_auth`` (as the preview does): acting as the signed-in
+  user it must be a PrincipalPropagation destination, and nothing it stores
+  is sent next to the user's identity.
 * **What comes back.** Never a row, a field value or a key: the rows read
   are counted (0 or 1) and dropped here. The answer is the outcome, the HTTP
   status, the duration, what was tried, the destination's NAME and
@@ -50,7 +53,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -58,7 +60,12 @@ from typing import Any
 import httpx
 from pydantic import ValidationError
 
-from agents.destination import USER_PROPAGATING_AUTH_TYPES, Destination, DestinationError
+from agents.destination import (
+    USER_PROPAGATING_AUTH_TYPES,
+    Destination,
+    DestinationError,
+    connectivity_from_environment,
+)
 from agents.destination_auth import PLACEHOLDER_BASE, DestinationUserRequired, resolver_for
 from agents.odata import preview
 from agents.odata.calls import DIALECTS
@@ -74,11 +81,9 @@ MAX_MESSAGE_CHARS = 500
 # The reachability check reads this much of the `$metadata` and no more.
 PROBE_BYTES = 1024
 METADATA_TARGET = "$metadata"
-MAX_QUERY_NAMES = 10
 
 # The same objects the tools and the search go by (`calls.DIALECTS`).
 _DIALECTS: dict[str, Any] = DIALECTS
-_QUERY_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 _ROW_TEXT = "the read worked: one row came back"
 _NO_ROW_TEXT = "the read worked: the entity set answered without a row"
@@ -127,15 +132,6 @@ _WARNINGS = {
         "sends one request and did not follow it"
     ),
 }
-_QUERIES_WARNING = (
-    "the destination has URL.queries properties ({names}) that are not applied "
-    "to requests yet: the test ran without them, e.g. in the default SAP client"
-)
-_QUERIES_WARNING_UNSENT = (
-    "the destination has URL.queries properties ({names}) that are not applied "
-    "to requests yet: requests through this destination go without them, e.g. "
-    "to the default SAP client"
-)
 
 
 class _SecondRequest(httpx.TransportError):
@@ -179,11 +175,29 @@ def _transport() -> httpx.AsyncBaseTransport | None:
     return None
 
 
+def _connectivity() -> Any:
+    """The connectivity tokens of the test, ``None`` without a binding; new
+    per call, so no token outlives it. A seam for tests."""
+    return connectivity_from_environment()
+
+
+def _proxy_transport() -> httpx.AsyncBaseTransport | None:
+    """The transport towards the connectivity proxy; ``None`` = one built
+    from the binding. A seam for tests."""
+    return None
+
+
 # ------------------------------------------------------------------ the read
 
 
-def _http(auth: preview.OneShotAuth, wire: _Wire, budget: float) -> httpx.AsyncClient:
-    """A throw-away client that lets exactly one request out."""
+def _http(
+    auth: preview.OneShotAuth, wire: _Wire, budget: float, connectivity: Any = None
+) -> httpx.AsyncClient:
+    """A throw-away client that lets exactly one request out.
+
+    ``connectivity`` is what ``auth`` was built with: with it the client
+    sends through the router that keeps the connectivity proxy and the
+    direct path apart."""
 
     async def leaving(_request: httpx.Request) -> None:
         # After the destination shaped the request, before it is sent.
@@ -200,7 +214,7 @@ def _http(auth: preview.OneShotAuth, wire: _Wire, budget: float) -> httpx.AsyncC
         auth=auth,
         # Above the budget: the one clock is `asyncio.timeout` in `run_test_call`.
         timeout=httpx.Timeout(budget + 5.0),
-        transport=_transport(),
+        transport=preview.wire(connectivity, _transport(), _proxy_transport()),
         cookies=NoCookieJar(),
         follow_redirects=False,
         event_hooks={"request": [leaving], "response": [arrived]},
@@ -321,18 +335,6 @@ def _warnings(
         }
         for code in codes
     ]
-    # `DestinationAuth` does not add `URL.queries.*` (sap-client, ...) yet.
-    names = [n for n in (resolved.queries if resolved else {}) if _QUERY_NAME.fullmatch(str(n))]
-    if resolved is not None and resolved.queries:
-        shown = ", ".join(sorted(names)[:MAX_QUERY_NAMES]) or "names not shown"
-        warnings.append(
-            {
-                "code": "destination_queries_not_applied",
-                "message": (_QUERIES_WARNING if sent else _QUERIES_WARNING_UNSENT).format(
-                    names=shown
-                ),
-            }
-        )
     return warnings
 
 
@@ -457,14 +459,16 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             raise refuse(preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT))
         try:
             auth_class = preview.OneShotAuth if chosen is not None else preview.MetadataAuth
+            connectivity = _connectivity()
             auth = auth_class(
                 _resolver(destination),
                 user_context=user_context,
                 server_key=SERVER_KEY,
                 retry_on_401=False,
+                connectivity=connectivity,
             )
             async with asyncio.timeout(budget) as clock:
-                async with _http(auth, wire, budget) as http:
+                async with _http(auth, wire, budget, connectivity) as http:
                     if chosen is not None:
                         outcome = await _list(http, service, definition, chosen, wire)
                     else:
@@ -477,8 +481,6 @@ async def run_test_call(service: dict[str, Any], entity_set: str | None = None) 
             raise refuse(
                 preview.PreviewError(424, "user_token_required", _USER_REQUIRED_TEXT)
             ) from None
-        except preview.OnPremise:
-            outcome = _failed("on_premise_unavailable", preview.ON_PREMISE_TEXT)
         except (DestinationError, ValueError) as exc:
             # ValueError: `resolver_for` on an empty name. The text can quote the
             # destination service's answer, so it goes to the log only, URLs masked.

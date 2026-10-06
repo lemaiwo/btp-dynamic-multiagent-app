@@ -2,6 +2,8 @@
 
 * :class:`FakeResolver` stands in for the destination service (the same
   double as in ``tests/test_destination_builtins.py``).
+* :class:`OnPremiseResolver` and :class:`FakeConnectivity` are an OnPremise
+  destination and the connectivity service's tokens.
 * :func:`service_payload` is one valid catalogue service in the shape
   ``ODataService.to_dict()`` hands to the client and the tools.
 * :class:`Sap` + :func:`sap_v2` are the SAP side: an ``httpx.MockTransport``
@@ -52,6 +54,58 @@ class FakeResolver:
 
     def invalidate(self, principal: str | None = None) -> None:
         pass
+
+
+class FakeConnectivity:
+    """``ConnectivityTokens`` without a token endpoint: the application's
+    token is ``APP``, a user's is bound to the principal and the JWT."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+        self.invalidated: list[str | None] = []
+
+    async def app_token(self, *, force: bool = False) -> str:
+        self.calls.append(("app", force))
+        return "APP"
+
+    async def user_token(self, user_jwt: str, principal: str | None, *, force: bool = False) -> str:
+        self.calls.append(("user", user_jwt, principal, force))
+        return f"UX-{principal}"
+
+    @staticmethod
+    def user_key(principal: str | None, user_jwt: str) -> str:
+        return principal or "token"
+
+    def invalidate(self, principal: str | None = None) -> None:
+        self.invalidated.append(principal)
+
+
+class OnPremiseResolver(FakeResolver):
+    """An OnPremise destination: a technical user (Basic) by default,
+    ``PrincipalPropagation`` with ``auth_type``. The stored header is there
+    in both cases, because a user run must not send it."""
+
+    def __init__(
+        self,
+        url: str = "http://s4.internal:44300",
+        name: str = "S4_ODATA_TECH",
+        auth_type: str = "BasicAuthentication",
+    ):
+        super().__init__(url=url, headers={"Authorization": "Basic dGVjaDp4"}, name=name)
+        self.auth_type = auth_type
+
+    async def resolve(self, *, force: bool = False, user_token=None, principal=None) -> Destination:
+        self.calls.append((user_token, principal))
+        return Destination(
+            url=self.url,
+            headers=dict(self.headers),
+            expires_at=time.monotonic() + 60,
+            auth_type=self.auth_type,
+            per_user=bool(user_token),
+            proxy_type="OnPremise",
+            location_id="LOC1",
+            queries={"sap-client": "100"},
+        )
 
 
 def _field(

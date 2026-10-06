@@ -64,7 +64,9 @@ from agents.destination import Destination, DestinationError  # noqa: E402
 from agents.odata import preview, testcall  # noqa: E402
 from tests.odata_helpers import (  # noqa: E402
     SERVICE_PATH,
+    FakeConnectivity,
     FakeResolver,
+    OnPremiseResolver,
     Sap,
     service_payload,
     v2_error,
@@ -478,10 +480,9 @@ async def test_user_context_on_a_technical_destination_is_said(client, remote, c
     assert body["ok"] is True and body["identity"] == "technical" and body["per_user"] is True
     assert body["auth_type"] == "BasicAuthentication" and body["proxy_type"] == "Internet"
     codes = [w["code"] for w in body["warnings"]]
-    assert codes == ["technical_credential", "destination_queries_not_applied"]
+    assert codes == ["technical_credential"]
     assert body["warnings"][0]["message"] == testcall._WARNINGS["technical_credential"]
     assert "the test ran" in body["warnings"][0]["message"]
-    assert "the test ran" in body["warnings"][1]["message"]
     assert "dGVjaDp4" not in caplog.text
 
 
@@ -493,50 +494,135 @@ async def test_warnings_do_not_claim_a_run_when_nothing_was_sent(client, remote)
     assert body["code"] == "destination_error" and remote.requests == []
     assert body["identity"] == "technical" and body["auth_type"] == "BasicAuthentication"
     codes = [w["code"] for w in body["warnings"]]
-    assert codes == ["technical_credential", "destination_queries_not_applied"]
+    assert codes == ["technical_credential"]
     for warning in body["warnings"]:
         assert "ran" not in warning["message"], warning
         assert "requests through this destination" in warning["message"]
-    assert "sap-client" in body["warnings"][1]["message"]
 
 
-async def test_destination_query_properties_are_not_applied_and_said(client, remote):
+async def test_destination_query_properties_are_applied_and_no_longer_warned_about(client, remote):
     await seed(client)
     remote.resolver = Technical(name="S4_ODATA_TECH")
     r = await client.post(URL, json={})
-    (warning,) = r.json()["warnings"]
-    assert warning["code"] == "destination_queries_not_applied"
-    assert "sap-client" in warning["message"] and "sap-language" in warning["message"]
-    # Names only, and the request really went without them.
-    assert "100" not in warning["message"]
-    assert "sap-client" not in remote.requests[0].url.params
+    assert r.json()["ok"] is True and r.json()["warnings"] == []
+    params = remote.requests[0].url.params
+    assert params["sap-client"] == "100" and params["sap-language"] == "EN"
+    # The read's own options are still there, as the client wrote them.
+    assert params["$top"] == "1"
 
 
-class OnPremise(FakeResolver):
-    async def resolve(self, **kwargs: Any) -> Destination:
-        resolved = await super().resolve(**kwargs)
-        return Destination(
-            url=self.url,
-            headers=resolved.headers,
-            expires_at=resolved.expires_at,
-            auth_type="BasicAuthentication",
-            proxy_type="OnPremise",
-        )
+class Proxy:
+    """The connectivity side of one test: the tokens and the proxy's wire."""
+
+    def __init__(self) -> None:
+        self.tokens = FakeConnectivity()
+        self.sap = Sap(V2_ROWS)
+
+    @property
+    def requests(self) -> list[httpx.Request]:
+        return self.sap.requests
 
 
-@pytest.mark.parametrize("url", ["https://s4.internal:44300", "http://s4.internal:44300"])
+@pytest.fixture
+def proxy(monkeypatch) -> Proxy:
+    state = Proxy()
+    monkeypatch.setattr(testcall, "_connectivity", lambda: state.tokens)
+    monkeypatch.setattr(
+        testcall,
+        "_proxy_transport",
+        lambda: httpx.MockTransport(unread(lambda r: state.sap.handler(r))),
+    )
+    return state
+
+
 @pytest.mark.parametrize("operations", [["list", "get"], ["get"]])
-async def test_an_on_premise_destination_sends_nothing(client, remote, url, operations):
+async def test_an_on_premise_destination_is_read_through_the_connectivity_proxy(
+    client, remote, proxy, operations
+):
     await seed(client, definition=definition(**{HEADER: operations, ITEM: operations}))
-    remote.resolver = OnPremise(url=url, name="S4_ODATA_TECH")
+    remote.resolver = OnPremiseResolver()
+    if "list" not in operations:
+        proxy.sap = Sap(httpx.Response(200, content=b"<edmx:Edmx/>"))
     r = await client.post(URL, json={})
     body = r.json()
     assert r.status_code == 200, r.text
-    assert body["ok"] is False and body["code"] == "on_premise_unavailable"
-    assert body["message"] == preview.ON_PREMISE_TEXT
-    assert body["status"] is None and body["rows"] == 0
-    assert body["proxy_type"] == "OnPremise"
+    assert body["ok"] is True and body["status"] == 200, body
+    assert body["identity"] == "technical" and body["proxy_type"] == "OnPremise"
+    assert body["warnings"] == [] or [w["code"] for w in body["warnings"]] == [
+        "no_list_entity_set"
+    ]
     assert remote.requests == []
+    (sent,) = proxy.requests
+    assert sent.url.scheme == "http" and sent.url.host == "s4.internal"
+    assert sent.url.params["sap-client"] == "100"
+    assert sent.headers["Proxy-Authorization"] == "Bearer APP"
+    assert sent.headers["Authorization"] == "Basic dGVjaDp4"
+    assert sent.headers["SAP-Connectivity-SCC-Location_ID"] == "LOC1"
+    assert proxy.tokens.calls == [("app", False)]
+
+
+async def test_an_on_premise_test_as_the_signed_in_user_carries_only_that_user(
+    client, remote, proxy, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    await seed(client, user_context=True, destination="S4_ODATA_USER")
+    remote.resolver = OnPremiseResolver(name="S4_ODATA_USER", auth_type="PrincipalPropagation")
+    headers = bearer("alice")
+    body = (await client.post(URL, json={}, headers=headers)).json()
+    assert body["ok"] is True and body["identity"] == "user" and body["per_user"] is True
+    assert body["auth_type"] == "PrincipalPropagation" and body["warnings"] == []
+    assert remote.requests == []
+    (sent,) = proxy.requests
+    assert sent.headers["Proxy-Authorization"] == "Bearer UX-alice"
+    assert "Authorization" not in sent.headers
+    assert "SAP-Connectivity-Authentication" not in sent.headers
+    jwt_sent = headers["Authorization"].removeprefix("Bearer ")
+    assert proxy.tokens.calls == [("user", jwt_sent, "alice", False)]
+    assert jwt_sent not in caplog.text and "UX-alice" not in caplog.text
+
+
+async def test_an_on_premise_user_test_on_a_technical_destination_sends_nothing(
+    client, remote, proxy
+):
+    """Never the destination's stored credential next to a user's identity."""
+    await seed(client, user_context=True)
+    remote.resolver = OnPremiseResolver()
+    body = (await client.post(URL, json={}, headers=bearer("alice"))).json()
+    assert body["ok"] is False and body["code"] == "destination_error"
+    assert body["message"] == preview.DESTINATION_TEXT
+    assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
+
+
+async def test_an_https_on_premise_destination_sends_nothing(client, remote, proxy):
+    await seed(client)
+    remote.resolver = OnPremiseResolver(url="https://s4.internal:44300")
+    body = (await client.post(URL, json={})).json()
+    assert body["ok"] is False and body["code"] == "destination_error"
+    assert body["status"] is None and body["proxy_type"] == "OnPremise"
+    assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []
+
+
+async def test_an_on_premise_destination_without_a_connectivity_binding_sends_nothing(
+    client, remote, caplog
+):
+    """The real connectivity seam, in an environment without a binding."""
+    caplog.set_level(logging.WARNING, logger=testcall.logger.name)
+    await seed(client)
+    remote.resolver = OnPremiseResolver()
+    body = (await client.post(URL, json={})).json()
+    assert body["ok"] is False and body["code"] == "destination_error"
+    assert body["message"] == preview.DESTINATION_TEXT
+    assert "no connectivity service binding" in caplog.text
+    assert remote.requests == []
+
+
+async def test_a_407_of_the_proxy_is_one_request_and_no_retry(client, remote, proxy):
+    await seed(client)
+    remote.resolver = OnPremiseResolver()
+    proxy.sap = Sap(httpx.Response(407, text="Proxy Authentication Required"))
+    body = (await client.post(URL, json={})).json()
+    assert body["ok"] is False and body["status"] == 407 and body["code"] == "sap_error"
+    assert len(proxy.requests) == 1 and proxy.tokens.invalidated == []
 
 
 # ------------------------------------------------------------------ failures
