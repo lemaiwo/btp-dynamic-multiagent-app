@@ -1190,6 +1190,36 @@ async def test_a_connection_that_was_never_made_was_not_sent():
             "write_outcome_unknown",
         ),
         (httpx.Response(503), "write_outcome_unknown"),
+        # Final review follow-up N4: on a 5xx only SAP's own envelope counts
+        # (a string `code` AND the V2 message object); a gateway's JSON or
+        # XML that merely has a message leaves the outcome open.
+        (httpx.Response(502, json={"error": {"message": "upstream connect error"}}),
+         "write_outcome_unknown"),
+        (httpx.Response(500, json={"error": {"message": {"value": "no code"}}}),
+         "write_outcome_unknown"),
+        (httpx.Response(500, json={"error": {"code": "E", "message": "a V4-style string"}}),
+         "write_outcome_unknown"),
+        (httpx.Response(500, json={"error": {"code": 500, "message": {"value": "x"}}}),
+         "write_outcome_unknown"),
+        (httpx.Response(500, json={"error": {"code": "E", "message": {"lang": "en"}}}),
+         "write_outcome_unknown"),
+        (httpx.Response(504, headers={"content-type": "application/xml"},
+                        text="<fault><message>upstream timed out</message></fault>"),
+         "write_outcome_unknown"),
+        (httpx.Response(500, headers={"content-type": "application/xml"},
+                        text="<error><message>no code</message></error>"),
+         "write_outcome_unknown"),
+        (httpx.Response(500, headers={"content-type": "application/xml"},
+                        text="<code>A</code><message>not under error</message>"),
+         "write_outcome_unknown"),
+        (httpx.Response(500, json={"error": {
+            "code": "SY/530", "message": {"lang": "en", "value": "Runtime error"},
+            "innererror": {"transactionid": "X"}}}), "sap_error"),
+        (httpx.Response(
+            500, headers={"content-type": "application/xml;charset=utf-8"},
+            text='<?xml version="1.0" encoding="utf-8"?><error xmlns="http://schemas.'
+                 'microsoft.com/ado/2007/08/dataservices/metadata"><code>SY/530</code>'
+                 '<message xml:lang="en">Runtime error</message></error>'), "sap_error"),
         (httpx.Response(200, headers=LOGON_PAGE, text="<html>Logon</html>"), UNKNOWN),
         (httpx.Response(202), "write_outcome_unknown"),
         (httpx.ReadTimeout("timed out"), "write_outcome_unknown"),
@@ -1212,6 +1242,14 @@ async def test_everything_after_the_send_says_sent(operation, answer, code):
     }[operation]
     error = await refused(call())
     assert error.code == code and error.sent is True and len(sap.writes) == 1
+
+
+async def test_below_500_the_error_text_is_read_as_before():
+    """N4 narrows only the 5xx decision: a 4xx keeps its text, with or
+    without a code."""
+    sap = Sap(lambda _r: httpx.Response(400, json={"error": {"message": {"value": "Invalid"}}}))
+    error = await refused(client(sap).update(ES, KEY, {"Plant": "1"}))
+    assert (error.code, error.message) == ("sap_error", "Invalid")
 
 
 async def test_a_csrf_refusal_that_stays_says_sent():

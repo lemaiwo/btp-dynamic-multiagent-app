@@ -796,3 +796,9 @@ class V4Dialect:
         (``common.read_error`` explains what else is not).
         """
         return common.read_error(response, lambda message: message)
+
+    def is_error_envelope(self, response: httpx.Response) -> bool:
+        """Whether ``response`` is strictly the V4 envelope: a string
+        ``code`` and a string ``message`` (or the XML form). Used for the
+        5xx verdict on a write only (``common.is_error_envelope``)."""
+        return common.is_error_envelope(response, lambda message: isinstance(message, str))

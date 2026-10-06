@@ -575,6 +575,16 @@ async def test_success_is_recognised_positively(alice, answer):
      "write_outcome_unknown", "unknown"),
     (lambda: httpx.Response(503), "write_outcome_unknown", "unknown"),
     (lambda: httpx.Response(502, text="bad gateway"), "write_outcome_unknown", "unknown"),
+    # Follow-up N4: a gateway's JSON is not SAP's envelope.
+    (lambda: httpx.Response(502, json={"error": {"message": "Bad Gateway"}}),
+     "write_outcome_unknown", "unknown"),
+    (lambda: httpx.Response(500, json={"error": {"code": 500, "message": "Internal"}}),
+     "write_outcome_unknown", "unknown"),
+    (lambda: httpx.Response(500, json={"error": {"code": "E", "message": {"value": "V2 form"}}}),
+     "write_outcome_unknown", "unknown"),
+    (lambda: httpx.Response(500, json={"error": {
+        "code": "SY/530", "message": "Runtime error", "details": [], "innererror": {}}}),
+     "sap_error", "sap_error"),
     (lambda: v4_error(500, "SY/530", "Dump"), "sap_error", "sap_error"),
     (lambda: v4_error(503, "SY/530", "Busy"), "sap_error", "sap_error"),
 ])

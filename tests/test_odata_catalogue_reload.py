@@ -226,6 +226,11 @@ async def test_a_failing_reload_does_not_turn_a_stored_save_into_a_500(live, cli
     async with SessionLocal() as s:
         assert not (await get_odata_service(s, PR)).enabled
     assert any("reload failed" in rec.getMessage() for rec in caplog.records)
+    # The log names the exception's class, never its text (a database URL,
+    # a token endpoint's answer): not in the message, not in a traceback.
+    assert "RuntimeError" in caplog.text
+    assert "secret-path" not in caplog.text and "aicore.internal" not in caplog.text
+    assert all(rec.exc_info is None for rec in caplog.records)
 
 
 async def test_without_a_loaded_registry_nothing_is_reloaded(live, client, monkeypatch):
@@ -441,4 +446,122 @@ async def test_an_agent_without_an_odata_entry_never_reloads(live, client, saved
     assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
     r = await client.delete(f"{AGENTS}/{r.json()['id']}")
     assert r.status_code == 204 and r.headers["x-odata-reloaded"] == "false"
+    assert live.reloads == 0
+
+
+# ------------------------------- N2: the import and the enabled flag of an agent
+
+
+async def exported_agents(client) -> list[dict[str, Any]]:
+    r = await client.get("/admin/api/export")
+    assert r.status_code == 200, r.text
+    return r.json()["agents"]
+
+
+def odata_oauth(agent: dict[str, Any]) -> dict[str, Any]:
+    (entry,) = [s for s in agent["mcp_servers"] if s.get("url") == "builtin:odata"]
+    return entry["oauth"]
+
+
+async def test_an_import_that_closes_an_agents_writes_reloads(live, client, saved):
+    """No catalogue service is touched: the agent's own entry is the change."""
+    assert await write_code(live.buyer) != "write_not_allowed"
+    agents = await exported_agents(client)
+    odata_oauth(agents[0])["allow_write"] = False
+    r = await client.post("/admin/api/import", json={"agents": agents})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["reloaded"] is True and body["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+    assert await write_code(live.buyer) == "write_not_allowed"
+
+
+async def test_an_import_that_detaches_a_service_reloads(live, client, saved):
+    agents = await exported_agents(client)
+    odata_oauth(agents[0])["services"] = [JOBS]
+    r = await client.post("/admin/api/import", json={"agents": agents})
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and live.reloads == 1
+    assert await services_found(live.buyer) == {JOBS}
+    assert await execute_code(live.buyer) == "unknown_service"
+
+
+async def test_a_replace_import_that_removes_an_agent_with_an_entry_reloads(live, client, saved):
+    other = agent_body({"url": "builtin:sapnotes", "auth_mode": "none"}, name="notes")
+    r = await client.post("/admin/api/import", json={"agents": [other], "replace": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["removed"] == 1 and r.json()["reloaded"] is True
+    assert live.reloads == 1
+    assert "buyer" not in live.registry.build.specialists
+
+
+async def test_an_import_that_leaves_every_odata_entry_alone_does_not_reload(live, client, saved):
+    agents = await exported_agents(client)
+    agents[0]["description"] = "another text"
+    odata_oauth(agents[0])["services"].reverse()
+    plain = agent_body({"url": "builtin:sapnotes", "auth_mode": "none"}, name="notes")
+    r = await client.post("/admin/api/import", json={"agents": [*agents, plain]})
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is False and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (0, 0)
+
+
+async def test_an_import_reloads_once_when_a_service_and_an_entry_change(live, client, saved):
+    bundle = (await client.get("/admin/api/export")).json()
+    for service in bundle["odata_services"]:
+        if service["name"] == PR:
+            service["purpose"] = "Changed by the import"
+    odata_oauth(bundle["agents"][0])["allow_write"] = False
+    r = await client.post(
+        "/admin/api/import",
+        json={"agents": bundle["agents"], "odata_services": bundle["odata_services"]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True and live.reloads == 1
+
+
+async def test_a_failing_reload_after_an_agent_import_is_said_not_raised(live, client, saved):
+    agents = await exported_agents(client)
+    odata_oauth(agents[0])["allow_write"] = False
+    live.fail = RuntimeError("boom at https://aicore.internal/secret-path")
+    r = await client.post("/admin/api/import", json={"agents": agents})
+    assert r.status_code == 200, r.text
+    assert r.json()["reload_failed"] is True and r.json()["reloaded"] is False
+    assert r.json()["status"] == "imported" and "secret-path" not in r.text
+    assert live.reloads == 1  # not tried a second time
+
+
+async def test_disabling_an_agent_with_an_odata_entry_reloads(live, client, saved):
+    entry = odata_server(PR, JOBS, allow_write=True)
+    r = await client.put(f"{AGENTS}/{saved['id']}", json=agent_body(entry, enabled=False))
+    assert r.status_code == 200, r.text
+    assert r.json()["enabled"] is False
+    assert r.json()["reloaded"] is True and r.json()["reload_failed"] is False
+    assert (live.reloads, live.refreshes) == (1, 1)
+    # No new run of it can start: the build no longer has the agent.
+    assert "buyer" not in live.registry.build.specialists
+
+    r = await client.put(f"{AGENTS}/{saved['id']}", json=agent_body(entry, enabled=True))
+    assert r.status_code == 200 and r.json()["reloaded"] is True
+    assert live.reloads == 2
+    assert await services_found(live.buyer) == {PR, JOBS}
+
+
+async def test_an_import_that_disables_an_agent_with_an_odata_entry_reloads(live, client, saved):
+    agents = await exported_agents(client)
+    agents[0]["enabled"] = False
+    r = await client.post("/admin/api/import", json={"agents": agents})
+    assert r.status_code == 200, r.text
+    assert r.json()["reloaded"] is True
+    assert "buyer" not in live.registry.build.specialists
+
+
+async def test_disabling_an_agent_without_an_odata_entry_does_not_reload(live, client, saved):
+    plain = {"url": "builtin:sapnotes", "auth_mode": "none"}
+    r = await client.post(AGENTS, json=agent_body(plain, name="notes"))
+    assert r.status_code == 201, r.text
+    r = await client.put(
+        f"{AGENTS}/{r.json()['id']}", json=agent_body(plain, name="notes", enabled=False)
+    )
+    assert r.status_code == 200 and r.json()["reloaded"] is False
     assert live.reloads == 0

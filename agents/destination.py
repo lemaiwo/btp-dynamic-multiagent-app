@@ -332,6 +332,12 @@ class Destination:
     # (``authTokens``). A run as the signed-in user must be able to tell: a
     # stored ``Authorization`` or ``Cookie`` is somebody else's credential.
     static_headers: frozenset[str] = frozenset()
+    # True when the destination has a ``SystemUser`` property. For the SAML
+    # bearer types the destination service then mints the token for THAT
+    # fixed user, whatever user token it was sent: the answer looks like a
+    # user's (``per_user``, a user-propagating type, a minted header) and is
+    # not. Only the fact is kept, never the name.
+    system_user: bool = False
 
 
 # Destination property names whose value is a credential. Matched
@@ -691,6 +697,7 @@ class DestinationResolver:
         static = {name.lower() for name in headers}
         proxy_type = str(config.get("ProxyType") or "").strip()
         location_id = str(config.get("CloudConnectorLocationId") or "").strip()
+        system_user = bool(str(config.get("SystemUser") or "").strip())
         queries: dict[str, str] = {
             key[len(_STATIC_QUERY_PREFIX):]: str(value).strip()
             for key, value in config.items()
@@ -729,6 +736,7 @@ class DestinationResolver:
                     auth_type=auth_type, per_user=per_user,
                     proxy_type=proxy_type, location_id=location_id,
                     queries=queries, static_headers=frozenset(static),
+                    system_user=system_user,
                 )
             # A destination created with NoAuthentication resolves perfectly
             # well and hands back no credential at all. Saying so here beats
@@ -782,7 +790,7 @@ class DestinationResolver:
             url=url, headers=headers, expires_at=deadline,
             auth_type=auth_type, per_user=per_user,
             proxy_type=proxy_type, location_id=location_id, queries=queries,
-            static_headers=frozenset(static),
+            static_headers=frozenset(static), system_user=system_user,
         )
 
 

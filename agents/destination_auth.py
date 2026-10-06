@@ -109,17 +109,23 @@ Two rules hold for EVERY destination, OnPremise or not:
   destination must not add ``$filter`` or ``$expand`` behind the argument
   checks of the tools --, the OData system option names without the ``$``
   (``filter``, ``top``, ``id`` ...: OData 4.01 reads them alike), and takes
-  one spelling per name. For such a client the caller's ``If-Match``,
-  ``If-None-Match``, ``X-CSRF-Token``, ``Cookie``, ``X-HTTP-Method`` and
-  ``X-HTTP-Method-Override`` also win over a ``URL.headers.*`` property of
-  the same name.
+  one spelling per name. For such a client the caller's ``X-CSRF-Token``
+  and ``Cookie`` also win over a ``URL.headers.*`` property of the same
+  name, and ``If-Match``, ``If-None-Match``, ``X-HTTP-Method`` and
+  ``X-HTTP-Method-Override`` are never taken from a destination at all: a
+  stored ``If-Match: *`` would make every update or delete without an etag
+  unconditional.
 
 One rule holds for a client built for the connectivity route (the OData
 callers) on an Internet destination: with ``user_context`` on, the
 destination must sign in as that user (:meth:`DestinationAuth._as_user`,
 :class:`NotUserPropagating`). The destination service ignores the user's
-token for a destination with a stored credential, so without the rule every
-user's call would run in SAP as that one account. The other destination
+token for a destination with a stored credential, and mints the token for
+the fixed user of a destination that has a ``SystemUser`` property, so
+without the rule every user's call would run in SAP as that one account.
+For the same reason such a client that acts as the signed-in user, on either
+path, never sends a destination's ``sap-user``, ``sap-password`` or
+``mysapsso2`` header or query parameter (logon by HTTP fields). The other destination
 users (Gmail, Outlook, Teams, Slack, Jira, SAP notes, MCP over a
 destination, the workflow http step) are NOT held to it and behave as before.
 
@@ -148,7 +154,6 @@ import httpx
 
 from agents.destination import (
     PROXY_TYPE_ON_PREMISE,
-    USER_PROPAGATING_AUTH_TYPES,
     ConnectivityConfig,
     Destination,
     DestinationError,
@@ -185,14 +190,25 @@ _ODATA_SYSTEM_OPTIONS = frozenset({
     "filter", "select", "expand", "orderby", "top", "skip", "count", "search", "apply",
     "format", "skiptoken", "deltatoken", "compute", "levels", "schemaversion", "index", "id",
 })
-# Headers that carry the caller's concurrency token, CSRF session or method:
-# the caller's value wins over a destination's `URL.headers.*` of that name.
-_CALLER_WINS = frozenset({
-    "if-match", "if-none-match", "x-csrf-token", "cookie", "x-http-method",
-    "x-http-method-override",
+# Headers that carry the caller's CSRF session: the caller's value wins over
+# a destination's `URL.headers.*` of that name.
+_CALLER_WINS = frozenset({"x-csrf-token", "cookie"})
+# The concurrency token and the method override are the caller's alone: a
+# destination's `URL.headers.*` of these names is never applied, also when
+# the caller sends none (`If-Match: *` would make a change unconditional).
+_CALLER_ONLY = frozenset({
+    "if-match", "if-none-match", "x-http-method", "x-http-method-override",
 })
 # Stored credentials a run as the signed-in user never sends.
 _STORED_CREDENTIALS = frozenset({"authorization", "cookie"})
+# Logon by HTTP fields (header or query parameter, any case): a target that
+# accepts them would run a signed-in user's request as that stored user.
+_STORED_LOGON_FIELDS = frozenset({"sap-user", "sap-password", "mysapsso2"})
+# The authentication types whose minted token is the signed-in user's on the
+# direct path: exactly the ones `not_user_propagating` names to the admin.
+_SIGNS_IN_AS_USER = frozenset({
+    "OAuth2JWTBearer", "OAuth2UserTokenExchange", "OAuth2SAMLBearerAssertion",
+})
 # The header names (lower case) `_apply` set on a request from the
 # destination: on a retry they are not the caller's.
 _FROM_DESTINATION_EXTENSION = "agents.destination_auth.from_destination"
@@ -492,6 +508,10 @@ class DestinationAuth(httpx.Auth):
             lower = key.lower()
             if lower in _DESTINATION_RESERVED:
                 continue
+            if routed and lower in _CALLER_ONLY:
+                continue  # never a destination's to set
+            if routed and self.user_context and lower in _STORED_LOGON_FIELDS:
+                continue  # somebody else's logon
             if routed and lower in _CALLER_WINS and lower in request.headers and lower not in ours:
                 continue  # the caller's own value
             request.headers[key] = value
@@ -516,7 +536,9 @@ class DestinationAuth(httpx.Auth):
         destination would get behind the argument checks of the tools. So
         are the same names without the ``$``, in any case: OData 4.01 reads
         ``filter=`` as ``$filter=``. Such a caller also takes one spelling
-        per name, the destination's first.
+        per name, the destination's first. When it acts as the signed-in
+        user it also skips ``sap-user``, ``sap-password`` and ``mysapsso2``
+        (said nowhere: the names alone would be noise in every log).
         """
         if not destination.queries:
             return
@@ -535,6 +557,8 @@ class DestinationAuth(httpx.Auth):
             if odata:
                 if name.startswith("$") or name.lower() in _ODATA_SYSTEM_OPTIONS:
                     skipped = True
+                    continue
+                if self.user_context and name.lower() in _STORED_LOGON_FIELDS:
                     continue
                 present.add(name.lower())
             pairs.append(f"{quote(name, safe='')}={quote(str(value), safe='')}")
@@ -714,10 +738,12 @@ class DestinationAuth(httpx.Auth):
         with a stored credential (``BasicAuthentication``, or
         ``NoAuthentication`` plus ``URL.headers.Authorization`` or a stored
         ``Cookie``): every user's request would then run in the target as
-        that one account. So the answer must have been resolved for the user
-        AND be of a user-propagating type, a stored ``Authorization`` or
-        ``Cookie`` is never sent, and what is left must still carry an
-        ``Authorization``: the one minted for the user.
+        that one account. For a destination with a ``SystemUser`` property
+        it mints the token for that fixed user instead. So the answer must
+        have been resolved for the user, be of one of the types the refusal
+        names (``_SIGNS_IN_AS_USER``) AND have no system user; a stored
+        ``Authorization`` or ``Cookie`` is never sent, and what is left must
+        still carry an ``Authorization``: the one minted for the user.
 
         NOT applied to the other destination users (Gmail, Outlook, Teams,
         Slack, Jira, SAP notes, MCP, the workflow http step): their auths
@@ -725,7 +751,11 @@ class DestinationAuth(httpx.Auth):
         """
         name = self.destination_name
         auth_type = (destination.auth_type or "").strip()
-        if not destination.per_user or auth_type not in USER_PROPAGATING_AUTH_TYPES:
+        if (
+            not destination.per_user
+            or auth_type not in _SIGNS_IN_AS_USER
+            or destination.system_user
+        ):
             raise not_user_propagating(self.server_key, name)
         stored = destination.static_headers
         headers = {

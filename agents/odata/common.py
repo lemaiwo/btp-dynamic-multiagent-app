@@ -40,6 +40,8 @@ _KEY_BREAKERS = ("/", "\\", "%", "?", "#")
 
 _XML_CODE = re.compile(r"<code[^<>]*>([^<]{0,200})</code>")
 _XML_MESSAGE = re.compile(r"<message[^<>]*>([^<]{0,2000})</message>")
+# The XML envelope as a whole: an `error` root (with or without a prefix).
+_XML_ERROR = re.compile(r"<(?:\w+:)?error[\s>](.*?)</(?:\w+:)?error\s*>", re.DOTALL)
 
 
 # Plain digits: no sign other than a leading minus, no exponent.
@@ -171,3 +173,43 @@ def read_error(response: httpx.Response, message_of: Callable[[Any], Any]) -> tu
     code = error.get("code")
     message = message_of(error.get("message"))
     return (code if isinstance(code, str) else "", message if isinstance(message, str) else "")
+
+
+def is_error_envelope(response: httpx.Response, message_form: Callable[[Any], bool]) -> bool:
+    """Whether ``response`` is SAP's OWN error envelope, read strictly.
+
+    For ONE decision: a 5xx on a modifying request. "SAP refused the change"
+    may be said only when SAP said so; anything else leaves the outcome open
+    (``write_outcome_unknown``). `read_error` is too generous for that -- it
+    takes a JSON ``{"error": {"message": ...}}`` without a code, or any XML
+    with a ``<message>``, which is also what a gateway in front of SAP
+    answers when the request may already have been committed. So here:
+
+    * JSON: ``error`` is an object with a string ``code`` AND a ``message``
+      of the dialect's own form (``message_form``: V2 an object with a
+      string ``value``, V4 a string);
+    * XML: an ``error`` element that holds both a ``code`` and a ``message``
+      element.
+
+    It decides nothing about the TEXT of an error (`read_error`, unchanged
+    for every status).
+    """
+    content_type = response.headers.get("content-type", "").lower()
+    if "html" in content_type:
+        return False
+    try:
+        text = response.text[:MAX_ERROR_BODY]
+    except Exception:  # noqa: BLE001 - an undecodable body is no envelope
+        return False
+    if "xml" in content_type:
+        inside = _XML_ERROR.search(text)
+        return bool(
+            inside and _XML_CODE.search(inside.group(1)) and _XML_MESSAGE.search(inside.group(1))
+        )
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError, RecursionError):
+        return False
+    if not isinstance(error, dict) or not isinstance(error.get("code"), str):
+        return False
+    return message_form(error.get("message")) is True

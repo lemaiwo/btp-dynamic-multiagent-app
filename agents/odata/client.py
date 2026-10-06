@@ -1768,6 +1768,12 @@ class ODataClient:
                 sent=True,
             ) from None
 
+    def _is_envelope(self, status: int, content_type: str, body: bytes | None) -> bool:
+        """Whether the answer is the dialect's own error envelope, read
+        strictly (``common.is_error_envelope``): the 5xx verdict of a write."""
+        snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
+        return self._dialect.is_error_envelope(snapshot)
+
     def _settle(
         self,
         plan: WritePlan | CallPlan,
@@ -1805,10 +1811,13 @@ class ODataClient:
                 error.hint = "read the entity again and retry with its etag"
             elif stale:
                 error.hint = "SAP did not accept the CSRF token; nothing was changed"
-            elif status >= 500 and error.code == "sap_error" and error.message.startswith("HTTP "):
+            elif status >= 500 and error.code == "sap_error" and not self._is_envelope(
+                status, answer.get("content-type", ""), body
+            ):
                 # A 5xx that does not carry SAP's own error (no OData error
-                # envelope: an HTML error page, a bare 503, a gateway's 502
-                # or 504). Nothing says that SAP refused the change: it may
+                # envelope, read strictly: an HTML error page, a bare 503, a
+                # gateway's 502 or 504, also one whose JSON or XML merely
+                # has a message). Nothing says that SAP refused the change: it may
                 # have arrived and been committed before something on the
                 # way, or SAP itself after the commit, gave up. "SAP refused"
                 # is said only when SAP said so.

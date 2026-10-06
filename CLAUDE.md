@@ -212,20 +212,27 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   same name wins; a client built for the connectivity route skips `$`-prefixed
   names and the OData system option names without the `$` (`filter`, `top`,
   `id`, ...), so a destination cannot add `$filter` or `$expand` behind the
-  argument checks, and for such a client the caller's `If-Match`,
-  `If-None-Match`, `X-CSRF-Token`, `Cookie`, `X-HTTP-Method` and
-  `X-HTTP-Method-Override` win over a `URL.headers.*` property of that name).
+  argument checks; for such a client the caller's `X-CSRF-Token` and
+  `Cookie` win over a `URL.headers.*` property of that name, and `If-Match`,
+  `If-None-Match`, `X-HTTP-Method` and `X-HTTP-Method-Override` are never
+  taken from a destination, so a stored `If-Match: *` cannot make a change
+  unconditional).
   A client built for the connectivity route (the OData callers) that acts as
   the signed-in user on an **Internet** destination requires a destination
-  that signs in as that user: resolved for the user, a user-propagating
-  `Authentication`, and an `Authorization` the destination service minted
+  that signs in as that user: resolved for the user, an `Authentication` of
+  `OAuth2JWTBearer`, `OAuth2UserTokenExchange` or `OAuth2SAMLBearerAssertion`
+  (the types the refusal names), no `SystemUser` property
+  (`Destination.system_user`: the destination service would mint the token
+  for that fixed user), and an `Authorization` the destination service minted
   (`Destination.static_headers` tells stored `URL.headers.*` from it; a
   stored `Authorization` or `Cookie` is never sent on a user run). Otherwise
   `NotUserPropagating` (a `DestinationRefused`, like `OnPremiseRefused`, with
   a fixed `admin_text`) before anything is sent: the destination service
-  ignores the user's token for a destination with a stored credential. The
-  other destination users (Gmail, Outlook, Teams, Slack, Jira, SAP notes, MCP
-  over a destination, the workflow http step) are not held to that rule. A
+  ignores the user's token for a destination with a stored credential. On
+  either path such a client that acts as the signed-in user never sends a
+  destination's `sap-user`, `sap-password` or `mysapsso2` header or query
+  parameter. The other destination users (Gmail, Outlook, Teams, Slack, Jira, SAP notes, MCP
+  over a destination, the workflow http step) are not held to these rules. A
   401 or proxy 407 whose one retry could not be prepared is marked
   (`request_left`), so a write is audited as sent. Token endpoint failures
   are reported as status plus OAuth error code only, never the body
@@ -281,8 +288,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     (`write_outcome_unknown`; `ODataError.sent` says whether the change left
     the app), and success is recognised positively (a sign-in page at 200 is
     not a success). A 5xx on a modifying request is `sap_error` ("SAP
-    refused") only when it carries an OData error envelope; every other 5xx
-    (an HTML error page, a bare 503, a gateway's 502/504) is
+    refused") only when it carries an OData error envelope, read strictly
+    for this one decision (`common.is_error_envelope`: a string `code` plus
+    the dialect's message form, or an XML `error` with `code` and
+    `message`); every other 5xx (an HTML error page, a bare 503, a
+    gateway's 502/504, also with a JSON or XML message of its own) is
     `write_outcome_unknown`. A decimal given as a JSON number is sent only
     with at most 15 significant digits, in a V2 or V4 body and URL literal
     alike (`common.plain_float`, the one rule). A refused navigation names
@@ -351,7 +361,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     triggers none. The `PUT` answer carries `reloaded` and `reload_failed`,
     the 204 of a `DELETE` the headers `X-OData-Reloaded` and
     `X-OData-Reload-Failed`; a rebuild that fails after the commit is logged
-    and answered as `reload_failed: true`, never as a 500. A service that
+    and answered as `reload_failed: true`, never as a 500 (the log names
+    the exception class only). The rebuild reaches only the app instance
+    that served the request: run one app instance, or restart all instances
+    after an edit that closes access. A service that
     acts as the signed-in user on a destination that does not sign in as the
     user is refused by the preview and the test call with `destination_error`
     and a fixed text. `POST /metadata`,
@@ -809,10 +822,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `imported_/created_/updated_/removed_odata_services`,
   `removed_odata_service_names` and `odata_identity_changes`. The import
   does not reload the registry for agents, skills or workflows, but it does
-  when it created, changed or removed a catalogue service that is in use
-  (answer keys `reloaded`, `reload_failed`, as for the catalogue routes).
+  when it created, changed or removed a catalogue service that is in use,
+  or changed what an agent's `builtin:odata` entry allows (the entry
+  changed, added or gone, the agent removed by `replace`, disabled or
+  enabled) (answer keys `reloaded`, `reload_failed`, as for the catalogue
+  routes).
   An agent create, update or delete that changes that agent's
-  `builtin:odata` entry (services, `allow_write`, the entry itself) reloads
+  `builtin:odata` entry (services, `allow_write`, the entry itself), or
+  disables or enables an agent that has one, reloads
   the same way after the commit; create and update always answer `reloaded`
   and `reload_failed` (both `false` for any other save, which does not
   reload), the 204 of a delete carries the two `X-OData-*` headers.

@@ -381,6 +381,10 @@ async def reload_after_catalogue_change(
     logged and answered as ``reload_failed: true``, never raised: a 500 for
     a stored change would invite a retry that cannot help. The next
     ``POST /admin/api/reload`` or restart picks the rows up.
+
+    The rebuild reaches only the app instance that served the request. Run
+    one app instance, or restart all instances after an edit that closes
+    access: another instance keeps its build until it is reloaded.
     """
     live = _live_registry()
     if live is None:
@@ -397,7 +401,8 @@ async def reload_running_agents(what: str) -> dict[str, bool]:
     The one failure contract of every save that reloads by itself (a
     catalogue service in use, an agent's ``builtin:odata`` entry): the rows
     are stored, so a rebuild that fails is logged and answered as
-    ``reload_failed: true``, never raised.
+    ``reload_failed: true``, never raised -- with the exception's class
+    name only (its text may hold a URL or a token endpoint's answer).
     """
     live = _live_registry()
     if live is None:
@@ -407,8 +412,12 @@ async def reload_running_agents(what: str) -> dict[str, bool]:
         from agents.chat_app import dynamic_chat_app
 
         dynamic_chat_app.refresh()
-    except Exception:  # noqa: BLE001 - the change is stored; see the docstring
-        logger.exception("odata: %s stored, but the agent reload failed", what)
+    except Exception as exc:  # noqa: BLE001 - the change is stored; see the docstring
+        # The class only, no text and no traceback: what failed can carry a
+        # database URL or what a token endpoint answered.
+        logger.error(
+            "odata: %s stored, but the agent reload failed (%s)", what, type(exc).__name__
+        )
         return {"reloaded": False, "reload_failed": True}
     logger.info("odata: %s; running agents reloaded", what)
     return {"reloaded": True, "reload_failed": False}

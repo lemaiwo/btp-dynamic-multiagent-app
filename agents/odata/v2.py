@@ -544,3 +544,13 @@ class V2Dialect:
         return common.read_error(
             response, lambda message: message.get("value") if isinstance(message, dict) else message
         )
+
+    def is_error_envelope(self, response: httpx.Response) -> bool:
+        """Whether ``response`` is strictly the V2 envelope: a string
+        ``code`` and ``message`` as an object with a string ``value`` (or
+        the XML form). Used for the 5xx verdict on a write only
+        (``common.is_error_envelope``)."""
+        return common.is_error_envelope(
+            response,
+            lambda message: isinstance(message, dict) and isinstance(message.get("value"), str),
+        )
