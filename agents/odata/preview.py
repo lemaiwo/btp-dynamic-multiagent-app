@@ -71,6 +71,7 @@ from agents.destination_auth import (
     proxy_refused_hint,
     resolver_for,
     routed_auth,
+    went_through_proxy,
 )
 from agents.odata import common
 from agents.odata.metadata import (
@@ -295,16 +296,27 @@ def _message_of(message: Any) -> Any:
 
 
 def sap_error(
-    status: int, content_type: str, body: bytes, *, user_context: bool = False
+    status: int,
+    content_type: str,
+    body: bytes,
+    *,
+    proxied: bool = False,
+    user_context: bool = False,
 ) -> PreviewError:
     """A non-2xx answer as SAP's own short code and message, or the status.
 
-    A 407 is the connectivity proxy's, not SAP's: its body is never read,
-    and the answer is the code ``proxy_refused`` with what to check."""
+    The body of a 407 is never read. When the request went through the
+    connectivity proxy (``proxied``) the 407 is the proxy's, not SAP's: the
+    code is ``proxy_refused`` with what an admin has to check. On the direct
+    path it is an answer of the service like any other, with a fixed text."""
     if status == 407:
-        return PreviewError(
-            502, "proxy_refused", f"{PROXY_REFUSED_TEXT}: {proxy_refused_hint(user_context)}"
-        )
+        if proxied:
+            return PreviewError(
+                502,
+                "proxy_refused",
+                f"{PROXY_REFUSED_TEXT}: {proxy_refused_hint(user_context)}",
+            )
+        return PreviewError(502, "sap_error", f"HTTP {status} from the OData service")
     snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
     code, text = common.read_error(snapshot, _message_of)
     code, text = plain(code, 80), plain(text, MAX_MESSAGE_CHARS)
@@ -356,6 +368,7 @@ async def read_document(
     ) as response:
         status = response.status_code
         content_type = response.headers.get("content-type", "")
+        proxied = went_through_proxy(response)
         if 300 <= status < 400:
             # The next hop would be chosen by the answer, not the destination.
             raise PreviewError(
@@ -398,6 +411,7 @@ async def read_document(
             status,
             content_type,
             bytes(body[:limit]),
+            proxied=proxied,
             user_context=getattr(client.auth, "user_context", False) is True,
         )
     if not looks_like_xml(bytes(body[:1024])):

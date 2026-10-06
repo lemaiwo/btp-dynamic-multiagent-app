@@ -102,7 +102,7 @@ import httpx
 from pydantic import ValidationError
 
 from agents.destination import DestinationError
-from agents.destination_auth import PROXY_REFUSED_TEXT, proxy_refused_hint
+from agents.destination_auth import PROXY_REFUSED_TEXT, went_through_proxy
 
 from .models import (
     EDM_NAME_RE,
@@ -290,6 +290,15 @@ _STATUS_HINTS = {
     404: "the service path, the entity set or the entity does not exist "
     "(or the service is not activated)",
 }
+
+
+# For the model: what happened and what to do. What an administrator has to
+# check (`destination_auth.proxy_refused_hint`) is nothing an agent can act on.
+PROXY_REFUSED_HINT = (
+    "the connectivity proxy refused the request before it reached SAP; nothing was "
+    "changed. An administrator has to fix the connectivity setup: tell the user instead "
+    "of retrying"
+)
 
 
 class ODataError(Exception):
@@ -1150,19 +1159,22 @@ class ODataClient:
         )
 
     # -- the call -----------------------------------------------------------
-    def _sap_error(self, status: int, content_type: str, body: bytes | None) -> ODataError:
+    def _sap_error(
+        self, status: int, content_type: str, body: bytes | None, *, proxied: bool = False
+    ) -> ODataError:
         """The error of a non-2xx answer: SAP's own code and text, or the status.
 
-        A 407 is the connectivity proxy's answer, not SAP's: its body is
-        never read, and the model is told that the proxy refused, with its
-        own code -- not that SAP did."""
+        The body of a 407 is never read. ``proxied`` says that the request
+        went through the connectivity proxy (``went_through_proxy``): its 407
+        is then the proxy's answer, not SAP's, and the model is told so with
+        a code of its own. On the direct path a 407 is an answer like any
+        other error of the service, with a fixed text."""
         if status == 407:
-            return ODataError(
-                "proxy_refused",
-                PROXY_REFUSED_TEXT,
-                status=status,
-                hint=proxy_refused_hint(self._user_context is True),
-            )
+            if proxied:
+                return ODataError(
+                    "proxy_refused", PROXY_REFUSED_TEXT, status=status, hint=PROXY_REFUSED_HINT
+                )
+            return ODataError("sap_error", f"HTTP {status} from the OData service", status=status)
         snapshot = httpx.Response(status, headers={"content-type": content_type}, content=body)
         code, text = self._dialect.parse_error(snapshot)
         code, text = _plain(code, 80), _plain(text)
@@ -1196,6 +1208,7 @@ class ODataClient:
         answer, not by the destination.
         """
         body = bytearray()
+        proxied = False
         try:
             async with self._http.stream(
                 "GET",
@@ -1206,6 +1219,7 @@ class ODataClient:
             ) as response:
                 status = response.status_code
                 headers = response.headers
+                proxied = went_through_proxy(response)
                 async for chunk in response.aiter_bytes():
                     body += chunk
                     if len(body) > MAX_RESPONSE_BYTES:
@@ -1223,7 +1237,9 @@ class ODataClient:
                 "destination_error", "the OData service could not be reached"
             ) from None
         if status >= 300:
-            raise self._sap_error(status, headers.get("content-type", ""), bytes(body))
+            raise self._sap_error(
+                status, headers.get("content-type", ""), bytes(body), proxied=proxied
+            )
         if status == 204 or not body:
             return None, headers, status
         try:
@@ -1424,6 +1440,7 @@ class ODataClient:
                 content_type = response.headers.get("content-type", "")
                 token = response.headers.get("x-csrf-token", "")
                 cookies = cookies_from_response(response)
+                proxied = went_through_proxy(response)
                 if status >= 300:
                     async for chunk in response.aiter_bytes():
                         body += chunk
@@ -1439,7 +1456,7 @@ class ODataClient:
                 "the OData service could not be reached; nothing was changed",
             ) from None
         if status >= 300:
-            error = self._sap_error(status, content_type, bytes(body))
+            error = self._sap_error(status, content_type, bytes(body), proxied=proxied)
             suffix = " (the CSRF token request was refused; nothing was changed)"
             error.message = error.message[: MAX_MESSAGE_CHARS - len(suffix)] + suffix
             error.args = (error.message,)
@@ -1461,8 +1478,9 @@ class ODataClient:
         *,
         operation: str = "",
         params: dict[str, str] | None = None,
-    ) -> tuple[int, httpx.Headers, bytes | None]:
-        """Send one modifying request. ``(status, headers, body)``.
+    ) -> tuple[int, httpx.Headers, bytes | None, bool]:
+        """Send one modifying request. ``(status, headers, body, proxied)``;
+        ``proxied``: it went through the connectivity proxy.
 
         Never retried here. What can go wrong is told apart by whether the
         request can have reached SAP:
@@ -1481,6 +1499,7 @@ class ODataClient:
         """
         body: bytearray | None = bytearray()
         status: int | None = None
+        proxied = False
         answer = httpx.Headers()
         try:
             async with self._http.stream(
@@ -1493,6 +1512,7 @@ class ODataClient:
             ) as response:
                 status = response.status_code
                 answer = response.headers
+                proxied = went_through_proxy(response)
                 async for chunk in response.aiter_bytes():
                     body += chunk
                     if len(body) > MAX_RESPONSE_BYTES:
@@ -1523,7 +1543,7 @@ class ODataClient:
                     sent=True,
                 ) from None
             body = None
-        return status, answer, None if body is None else bytes(body)
+        return status, answer, None if body is None else bytes(body), proxied
 
     def _is_entity(self, decoded: Any) -> bool:
         """Whether a decoded write answer is an entity as the dialect reads one.
@@ -1665,7 +1685,7 @@ class ODataClient:
                     sent["Cookie"] = cookie
                 # `_modify` says itself whether its request got out (a
                 # connection that was never made did not).
-                status, answer, body = await self._modify(
+                status, answer, body, proxied = await self._modify(
                     method, plan.path, sent, content, operation=plan.operation, params=params
                 )
                 left = True
@@ -1682,7 +1702,11 @@ class ODataClient:
                 # SAP refused the request before processing it, so sending it
                 # again changes nothing twice. Once.
                 session = await self._renew(sessions, key, session)
-            return status, answer, self._settle(plan, sessions, key, session, status, answer, body)
+            return (
+                status,
+                answer,
+                self._settle(plan, sessions, key, session, status, answer, body, proxied=proxied),
+            )
         except ODataError as exc:
             exc.sent = exc.sent or left
             raise
@@ -1713,6 +1737,8 @@ class ODataClient:
         status: int,
         answer: httpx.Headers,
         body: bytes | None,
+        *,
+        proxied: bool = False,
     ) -> Any:
         """The verdict on the answer of a modifying request that was sent.
 
@@ -1723,7 +1749,7 @@ class ODataClient:
         if status >= 300:
             # The session stays as it was sent: cookies of a refusal are not
             # taken (see the module docstring).
-            error = self._sap_error(status, answer.get("content-type", ""), body)
+            error = self._sap_error(status, answer.get("content-type", ""), body, proxied=proxied)
             if status == 428:
                 raise ODataError(
                     "etag_required",

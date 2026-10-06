@@ -398,14 +398,36 @@ async def test_invalidate_without_principal_drops_only_the_app_token():
     assert await tokens.user_token("jwt-a", "alice@example.com") == a and uaa.count(JWT_BEARER) == 1
 
 
-async def test_force_refetches():
-    uaa = Uaa()
-    tokens = _tokens(uaa)
-    await tokens.app_token()
-    await tokens.app_token(force=True)
-    await tokens.user_token("jwt-a", "alice@example.com")
-    await tokens.user_token("jwt-a", "alice@example.com", force=True)
-    assert (uaa.count("client_credentials"), uaa.count(JWT_BEARER)) == (2, 2)
+async def test_a_token_url_that_is_no_url_is_a_destination_error_without_its_text():
+    """``httpx.InvalidURL`` is not an ``httpx.HTTPError``; its text quotes the URL."""
+    config = ConnectivityConfig(
+        client_id="sb-conn",
+        client_secret=SECRET,
+        token_url="https://uaa-of-tenant-zone-9.example:port/oauth/token",
+        proxy_host="proxy.internal",
+        proxy_port=20003,
+    )
+    tokens = ConnectivityTokens(config, transport=httpx.MockTransport(Uaa().handler))
+    for call in (tokens.app_token(), tokens.user_token("jwt-a", "alice@example.com")):
+        with pytest.raises(DestinationError) as err:
+            await call
+        assert str(err.value) == (
+            "could not reach the connectivity service token endpoint: InvalidURL"
+        )
+        assert err.value.__cause__ is None and err.value.__context__ is None
+
+
+def test_the_token_methods_take_no_force_and_no_secrets():
+    """Dead parameters are gone: a 407 invalidates, nothing forces."""
+    import inspect
+
+    assert list(inspect.signature(ConnectivityTokens.app_token).parameters) == ["self"]
+    assert list(inspect.signature(ConnectivityTokens.user_token).parameters) == [
+        "self",
+        "user_jwt",
+        "principal",
+    ]
+    assert "secrets" not in inspect.signature(ConnectivityTokens._request).parameters
 
 
 async def test_tokens_expire_with_the_skew():

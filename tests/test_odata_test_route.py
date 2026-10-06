@@ -558,7 +558,7 @@ async def test_an_on_premise_destination_is_read_through_the_connectivity_proxy(
     assert sent.headers["Proxy-Authorization"] == "Bearer APP"
     assert sent.headers["Authorization"] == "Basic dGVjaDp4"
     assert sent.headers["SAP-Connectivity-SCC-Location_ID"] == "LOC1"
-    assert proxy.tokens.calls == [("app", False)]
+    assert proxy.tokens.calls == [("app",)]
 
 
 async def test_an_on_premise_test_as_the_signed_in_user_carries_only_that_user(
@@ -577,7 +577,7 @@ async def test_an_on_premise_test_as_the_signed_in_user_carries_only_that_user(
     assert "Authorization" not in sent.headers
     assert "SAP-Connectivity-Authentication" not in sent.headers
     jwt_sent = headers["Authorization"].removeprefix("Bearer ")
-    assert proxy.tokens.calls == [("user", jwt_sent, "alice", False)]
+    assert proxy.tokens.calls == [("user", jwt_sent, "alice")]
     assert jwt_sent not in caplog.text and "UX-alice" not in caplog.text
 
 
@@ -1133,3 +1133,27 @@ async def test_only_an_admin_reaches_the_test(client, monkeypatch, remote):
             assert len(remote.requests) == 1
     finally:
         auth.current_claims.reset(marker)
+
+
+@pytest.mark.parametrize("operations", [["list", "get"], ["get"]])
+async def test_a_407_on_the_direct_path_is_not_the_connectivity_proxys(client, remote, operations):
+    await seed(client, definition=definition(**{HEADER: operations, ITEM: operations}))
+    remote.answer(
+        httpx.Response(407, json={"error": {"code": "X/1", "message": {"value": "tenant-zone-9"}}})
+    )
+    body = (await client.post(URL, json={})).json()
+    assert body["ok"] is False and body["status"] == 407 and body["code"] == "sap_error"
+    assert body["message"] == "HTTP 407 from the OData service"
+
+
+async def test_an_unknown_pp_mode_refuses_a_user_test_and_says_which_setting(
+    client, remote, proxy, monkeypatch
+):
+    monkeypatch.setenv("CONNECTIVITY_PP_MODE", "s3cret-typo")
+    await seed(client, user_context=True, destination="S4_ODATA_USER")
+    remote.resolver = OnPremiseResolver(name="S4_ODATA_USER", auth_type="PrincipalPropagation")
+    body = (await client.post(URL, json={}, headers=bearer("alice"))).json()
+    assert body["ok"] is False and body["code"] == "destination_error"
+    assert body["message"] == "CONNECTIVITY_PP_MODE must be exchange or header"
+    assert body["status"] is None
+    assert remote.requests == [] and proxy.requests == [] and proxy.tokens.calls == []

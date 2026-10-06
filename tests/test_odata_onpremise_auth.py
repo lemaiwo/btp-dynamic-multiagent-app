@@ -131,12 +131,12 @@ class FakeTokens:
     def _suffix(self) -> str:
         return f"#{self.generation}" if self.generation else ""
 
-    async def app_token(self, *, force: bool = False) -> str:
-        self.calls.append(("app", force))
+    async def app_token(self) -> str:
+        self.calls.append(("app",))
         return "APP" + self._suffix()
 
-    async def user_token(self, user_jwt: str, principal: str | None, *, force: bool = False) -> str:
-        self.calls.append(("user", user_jwt, principal, force))
+    async def user_token(self, user_jwt: str, principal: str | None) -> str:
+        self.calls.append(("user", user_jwt, principal))
         # Bound to the JWT as the real cache is (principal AND token digest).
         return f"UX-{principal}-{user_jwt}" + self._suffix()
 
@@ -220,7 +220,7 @@ async def test_technical_user_goes_through_the_proxy_with_the_app_token():
     assert r.headers["Authorization"] == BASIC
     assert r.headers[LOCATION] == "LOC1"
     assert PP_HEADER not in r.headers
-    assert w.tokens.calls == [("app", False)]
+    assert w.tokens.calls == [("app",)]
 
 
 async def test_no_location_header_without_a_location_id():
@@ -245,8 +245,12 @@ async def test_technical_run_on_a_principal_propagation_destination_is_refused()
     """The real resolver refuses this already; the auth does not rely on it."""
     w = World(pp_resolver())
     async with w.client(user_context=False) as http:
-        with pytest.raises(DestinationError, match="signed-in user"):
+        with pytest.raises(destination_auth.OnPremiseRefused, match="signed-in user") as info:
             await http.get(PATH)
+    assert info.value.admin_text == (
+        "OnPremise destination 'S4_ODATA_USER' propagates the signed-in user: a service "
+        "that runs as a technical user needs a destination with a stored credential"
+    )
     assert w.tokens.calls == [] and not w.proxy.requests and not w.direct.requests
 
 
@@ -265,7 +269,7 @@ async def test_signed_in_user_exchange_mode():
     assert r.headers[LOCATION] == "LOC1"
     # Nothing stored in the destination travels next to the user's identity.
     assert "Authorization" not in r.headers and "X-Stored" not in r.headers
-    assert w.tokens.calls == [("user", "jwt-a", "alice@example.com", False)]
+    assert w.tokens.calls == [("user", "jwt-a", "alice@example.com")]
     assert w.resolver.calls == [("jwt-a", "alice@example.com", False)]
     assert str(r.url) == f"{VIRTUAL}{PATH}?sap-client=100"
 
@@ -279,7 +283,7 @@ async def test_signed_in_user_header_mode():
     assert r.headers[PROXY_AUTH] == "Bearer APP"
     assert r.headers[PP_HEADER] == "Bearer jwt-a"
     assert "Authorization" not in r.headers and "X-Stored" not in r.headers
-    assert w.tokens.calls == [("app", False)]
+    assert w.tokens.calls == [("app",)]
 
 
 async def test_exchange_is_the_default_mode_and_the_environment_can_switch_it(monkeypatch):
@@ -370,7 +374,7 @@ async def test_a_run_as_principal_with_the_triggers_jwt_gets_the_token_of_that_j
         "Bearer UX-bob@example.com-jwt-a",
         "Bearer UX-bob@example.com-jwt-b",
     ]
-    assert [c[:3] for c in w.tokens.calls] == [
+    assert w.tokens.calls == [
         ("user", "jwt-a", "bob@example.com"),
         ("user", "jwt-b", "bob@example.com"),
     ]
@@ -685,7 +689,7 @@ async def test_407_invalidates_that_principals_token_and_retries_once():
             response = await http.get(PATH)
     assert response.status_code == 200
     assert w.tokens.invalidated == ["alice@example.com"]
-    assert all(c[0] == "user" and c[-1] is False for c in w.tokens.calls)
+    assert all(c[0] == "user" for c in w.tokens.calls)
     first, second = w.proxy.requests
     assert first.headers[PROXY_AUTH] == "Bearer UX-alice@example.com-jwt-a"
     assert second.headers.get_list(PROXY_AUTH) == ["Bearer UX-alice@example.com-jwt-a#1"]

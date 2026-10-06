@@ -1682,6 +1682,16 @@ def odata_toolset(
         try:
             return await _execute(service, target, operation, args, run_id)
         except ODataError as exc:
+            if exc.code == "proxy_refused":
+                # The model is told to stop and tell the user; this line is
+                # what an operator finds. The service only: no host, no body.
+                logger.warning(
+                    "odata: the connectivity proxy refused a request of service '%s' "
+                    "(HTTP 407): check the connectivity binding, the destination's Cloud "
+                    "Connector location and, for a signed-in-user service, "
+                    "CONNECTIVITY_PP_MODE and the Cloud Connector's trust",
+                    label,
+                )
             if exc.code in _LOGGED_WRITE_REFUSALS and (
                 operation in WRITE_OPS
                 or args.get("write_attempt") is True

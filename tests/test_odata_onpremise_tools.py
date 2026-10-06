@@ -15,6 +15,7 @@ Run:  python -m pytest tests/test_odata_onpremise_tools.py
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -45,7 +46,7 @@ for _v in (
 
 import httpx  # noqa: E402
 
-from tests.odata_helpers import FakeConnectivity, OnPremiseResolver  # noqa: E402
+from tests.odata_helpers import FakeConnectivity, FakeResolver, OnPremiseResolver  # noqa: E402
 from tests.test_odata_write_guard import (  # noqa: E402
     ALICE,
     ITEM,
@@ -61,13 +62,20 @@ PROXY_AUTH = "Proxy-Authorization"
 TECHNICAL = "Bearer technical-credential"
 # What the proxy says in a 407; none of it may reach the model or the audit.
 PROXY_BODY = {"error": {"code": "X/1", "message": {"value": "tenant-zone-9"}}}
+MODEL_HINT = (
+    "the connectivity proxy refused the request before it reached SAP; nothing was "
+    "changed. An administrator has to fix the connectivity setup: tell the user instead "
+    "of retrying"
+)
 
 
 class OnPrem:
     """A toolset whose two services are OnPremise: ``pr`` as the signed-in
     user (PrincipalPropagation), ``pr-jobs`` as a technical user (Basic)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, internet: bool = False) -> None:
+        """``internet``: the same toolset (with the connectivity tokens) on
+        Internet destinations, so every request takes the direct path."""
         self.tokens = FakeConnectivity()
         self.direct: list[httpx.Request] = []
         self.proxy: list[httpx.Request] = []
@@ -75,15 +83,7 @@ class OnPrem:
         # Whether the proxy refuses this request with a 407.
         self.refuse: Callable[[httpx.Request], bool] = lambda request: False
 
-        def directly(request: httpx.Request) -> httpx.Response:
-            self.direct.append(request)
-            return httpx.Response(200, json=PAGE)
-
-        async def through_proxy(request: httpx.Request) -> httpx.Response:
-            # A copy: a retry re-shapes the very same request object.
-            self.proxy.append(
-                httpx.Request(request.method, request.url, headers=request.headers)
-            )
+        async def answer(request: httpx.Request) -> httpx.Response:
             if self.refuse(request):
                 self.statuses.append(407)
                 return httpx.Response(407, json=PROXY_BODY)
@@ -91,7 +91,20 @@ class OnPrem:
             self.statuses.append(response.status_code)
             return response
 
-        def resolver(destination: str) -> OnPremiseResolver:
+        async def directly(request: httpx.Request) -> httpx.Response:
+            self.direct.append(request)
+            return await answer(request)
+
+        async def through_proxy(request: httpx.Request) -> httpx.Response:
+            # A copy: a retry re-shapes the very same request object.
+            self.proxy.append(
+                httpx.Request(request.method, request.url, headers=request.headers)
+            )
+            return await answer(request)
+
+        def resolver(destination: str) -> Any:
+            if internet:
+                return FakeResolver(name=destination)
             if destination == "S4_ODATA_USER":
                 return OnPremiseResolver(name=destination, auth_type="PrincipalPropagation")
             technical = OnPremiseResolver(name=destination)
@@ -131,7 +144,7 @@ async def test_a_read_as_the_technical_user_goes_through_the_proxy():
     assert sent.headers[PROXY_AUTH] == "Bearer APP"
     assert sent.headers["Authorization"] == TECHNICAL
     assert sent.headers["SAP-Connectivity-SCC-Location_ID"] == "LOC1"
-    assert w.tokens.calls == [("app", False)]
+    assert w.tokens.calls == [("app",)]
 
 
 async def test_a_read_as_the_signed_in_user_carries_only_that_user():
@@ -143,7 +156,7 @@ async def test_a_read_as_the_signed_in_user_carries_only_that_user():
     (sent,) = w.proxy
     assert sent.headers[PROXY_AUTH] == f"Bearer UX-{ALICE}"
     assert "Authorization" not in sent.headers
-    assert w.tokens.calls == [("user", f"jwt-of-{ALICE}", ALICE, False)]
+    assert w.tokens.calls == [("user", f"jwt-of-{ALICE}", ALICE)]
 
 
 async def test_a_read_without_a_signed_in_user_is_no_user_and_sends_nothing():
@@ -172,28 +185,67 @@ async def test_a_write_fetches_its_token_and_is_sent_through_the_proxy():
     assert [r.outcome for r in w.world.audits] == ["ok"]
 
 
-async def test_a_407_reaches_the_model_as_proxy_refused_not_as_sap():
+async def test_a_407_reaches_the_model_as_proxy_refused_not_as_sap(caplog):
+    caplog.set_level(logging.WARNING)
     w = OnPrem()
     w.refuse = lambda request: True
     out = await w.run(service="pr-jobs", operation="list")
-    error = out["error"]
-    assert error["code"] == "proxy_refused"
-    assert error["message"] == "HTTP 407 from the connectivity proxy"
-    assert "connectivity service binding" in error["hint"]
-    assert "CONNECTIVITY_PP_MODE" not in error["hint"]  # a technical-user service
+    # For the model: what happened and what to do, nothing an agent cannot act on.
+    assert out["error"] == {
+        "code": "proxy_refused",
+        "message": "HTTP 407 from the connectivity proxy",
+        "hint": MODEL_HINT,
+    }
     assert "tenant-zone-9" not in str(out) and "X/1" not in str(out)
-    assert "SAP refused" not in str(out) and "OData service" not in str(out)
+    assert "CONNECTIVITY_PP_MODE" not in str(out) and "OData service" not in str(out)
     # Refused, the token dropped, tried once more, refused: no third request.
     assert w.statuses == [407, 407] and w.tokens.invalidated == [None]
     assert w.direct == []
+    # One line for the operator, with the service.
+    said = [r.getMessage() for r in caplog.records if "connectivity proxy" in r.getMessage()]
+    assert len(said) == 1 and "'pr-jobs'" in said[0] and "tenant-zone-9" not in caplog.text
 
     w = OnPrem()
     w.refuse = lambda request: True
     with signed_in(ALICE):
         out = await w.run(service="pr", operation="list")
-    assert out["error"]["code"] == "proxy_refused"
-    assert "CONNECTIVITY_PP_MODE" in out["error"]["hint"]
+    assert out["error"]["code"] == "proxy_refused" and out["error"]["hint"] == MODEL_HINT
     assert w.tokens.invalidated == [ALICE]
+
+
+async def test_a_407_on_the_direct_path_is_an_answer_of_the_service_not_of_the_proxy():
+    """Decided by where the request went, not by the status alone."""
+    w = OnPrem(internet=True)
+    w.refuse = lambda request: True
+    out = await w.run(service="pr-jobs", operation="list")
+    assert out["error"]["code"] == "sap_error"
+    assert out["error"]["message"] == "HTTP 407 from the OData service"
+    assert "tenant-zone-9" not in str(out) and "connectivity" not in str(out)
+    assert w.proxy == [] and len(w.direct) == 1 and w.tokens.calls == []
+
+    # A write: audited as any other error the service answered.
+    w = OnPrem(internet=True)
+    w.refuse = is_write
+    out = await w.run(service="pr-jobs", target=ITEM, **UPDATE)
+    assert out["error"]["code"] == "sap_error" and "tenant-zone-9" not in str(out)
+    (result,) = w.world.audits
+    assert (result.outcome, result.phase, result.status) == ("sap_error", "write", 407)
+    assert w.proxy == []
+
+
+async def test_an_unknown_pp_mode_refuses_a_write_before_anything_is_sent(monkeypatch):
+    monkeypatch.setenv("CONNECTIVITY_PP_MODE", "s3cret-typo")
+    w = OnPrem()
+    with signed_in(ALICE):
+        out = await w.run(service="pr", target=ITEM, **UPDATE)
+        read = await w.run(service="pr", operation="list")
+    assert out["error"]["code"] == "destination_error" and "nothing was changed" in str(out)
+    assert read["error"]["code"] == "destination_error"
+    assert "s3cret-typo" not in str(out) + str(read)
+    assert w.proxy == [] and w.direct == [] and w.tokens.calls == []
+    assert [r.outcome for r in w.world.recorder.intents] == ["intent"]
+    (result,) = w.world.audits
+    assert (result.outcome, result.phase) == ("refused", "token")
 
 
 async def test_a_write_the_proxy_refused_once_reaches_sap_exactly_once():
@@ -228,3 +280,5 @@ async def test_a_write_the_proxy_keeps_refusing_is_sent_twice_and_never_reaches_
     assert [r.outcome for r in w.world.recorder.intents] == ["intent"]
     (result,) = w.world.audits
     assert result.outcome == "refused" and result.status == 407
+    # A request did leave this app (to the proxy), which is what the phase says.
+    assert result.phase == "write"

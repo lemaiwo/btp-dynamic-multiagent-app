@@ -70,6 +70,7 @@ from agents.destination_auth import (
     PLACEHOLDER_BASE,
     DestinationUserRequired,
     OnPremiseRefused,
+    proxy_refused_hint,
     resolver_for,
 )
 from agents.odata import preview
@@ -227,7 +228,7 @@ def _http(
     )
 
 
-def _refused_read(exc: ODataError, wire: _Wire) -> _Outcome:
+def _refused_read(exc: ODataError, wire: _Wire, user_context: bool = False) -> _Outcome:
     """What an ``ODataError`` of the list means for the test.
 
     The client's texts are fixed ones or SAP's own short code and message;
@@ -238,8 +239,11 @@ def _refused_read(exc: ODataError, wire: _Wire) -> _Outcome:
         # The one answer was a proper, empty page; its paging link was not followed.
         return _Outcome(True, None, _NO_ROW_TEXT, status, 0, ["paging_not_followed"])
     if exc.code == "proxy_refused":
-        # The connectivity proxy's answer, not SAP's: what to check.
-        return _failed("proxy_refused", f"{exc.message}: {exc.hint}", status)
+        # The connectivity proxy's answer, not SAP's. The admin's hint (what
+        # to check), not the one the client words for a model.
+        return _failed(
+            "proxy_refused", f"{exc.message}: {proxy_refused_hint(user_context)}", status
+        )
     if exc.code == "destination_error":
         # The client's code for every transport failure: no connection, or
         # one that broke while the body arrived (the status is then known).
@@ -277,7 +281,7 @@ async def _list(
             ReadQuery(select=[], filter=None, expand=[], orderby=[], top=1, skip=0, count=True),
         )
     except ODataError as exc:
-        return _refused_read(exc, wire)
+        return _refused_read(exc, wire, service.get("user_context") is True)
     # Counted and dropped: no row and no count leaves this function.
     rows = 1 if result.get("items") else 0
     del result

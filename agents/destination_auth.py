@@ -205,6 +205,18 @@ def proxy_refused_hint(user_context: bool) -> str:
     return hint
 
 
+def went_through_proxy(response: httpx.Response) -> bool:
+    """Whether the request this response answers was sent through the
+    connectivity proxy (shaped and marked for it by :class:`DestinationAuth`).
+
+    What tells a 407 of the connectivity proxy from a 407 of anything else:
+    the route the request took, not the status."""
+    try:
+        return response.request.extensions.get(PROXY_ROUTE_EXTENSION) is True
+    except RuntimeError:  # a response nobody attached a request to
+        return False
+
+
 def pp_mode_from_environment(environ: Mapping[str, str] | None = None) -> str:
     """The principal-propagation mode: ``CONNECTIVITY_PP_MODE``, else the default.
 
@@ -590,10 +602,15 @@ class DestinationAuth(httpx.Auth):
                 headers[PP_HEADER] = f"Bearer {token}"
         else:
             if auth_type == PRINCIPAL_PROPAGATION:
-                raise DestinationError(
+                raise OnPremiseRefused(
                     f"destination {name!r} uses PrincipalPropagation, which needs the "
                     f"signed-in user; resolve it with user context or use a "
-                    f"technical-user destination"
+                    f"technical-user destination",
+                    admin_text=(
+                        f"OnPremise destination '{name}' propagates the signed-in user: a "
+                        f"service that runs as a technical user needs a destination with a "
+                        f"stored credential"
+                    ),
                 )
             headers[PROXY_AUTH_HEADER] = f"Bearer {await app()}"
         if location:

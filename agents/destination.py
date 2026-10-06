@@ -987,21 +987,21 @@ class ConnectivityTokens:
         """
         return _cache_owner(principal, user_jwt)
 
-    async def app_token(self, *, force: bool = False) -> str:
+    async def app_token(self) -> str:
         """The application's token (client_credentials), fetched or cached."""
         current = self._app
-        if not force and current is not None and time.monotonic() < current[1]:
+        if current is not None and time.monotonic() < current[1]:
             return current[0]
         async with self._lock:
             current = self._app
-            if not force and current is not None and time.monotonic() < current[1]:
+            if current is not None and time.monotonic() < current[1]:
                 return current[0]
             fetched = await self._request({"grant_type": "client_credentials"})
             self._app = fetched
             return fetched[0]
 
     async def user_token(
-        self, user_jwt: str, principal: str | None, *, force: bool = False
+        self, user_jwt: str, principal: str | None
     ) -> str:
         """A token for the signed-in user, exchanged from their XSUAA JWT.
 
@@ -1020,12 +1020,12 @@ class ConnectivityTokens:
             )
         key = _cache_key(principal, user_jwt)
         hit = self._per_user.get(key)
-        if not force and hit is not None and time.monotonic() < hit[1]:
+        if hit is not None and time.monotonic() < hit[1]:
             self._per_user.move_to_end(key)
             return hit[0]
         async with self._user_locks.hold(key):
             hit = self._per_user.get(key)
-            if not force and hit is not None and time.monotonic() < hit[1]:
+            if hit is not None and time.monotonic() < hit[1]:
                 self._per_user.move_to_end(key)
                 return hit[0]
             fetched = await self._request(
@@ -1035,7 +1035,6 @@ class ConnectivityTokens:
                     "token_format": "jwt",
                     "response_type": "token",
                 },
-                secrets=(user_jwt,),
                 what="user token",
             )
             _store(self._per_user, key, fetched, lambda entry: entry[1])
@@ -1045,14 +1044,12 @@ class ConnectivityTokens:
         self,
         form: dict[str, str],
         *,
-        secrets: tuple[str, ...] = (),
         what: str = "token",
     ) -> tuple[str, float]:
         # Nothing the endpoint (or httpx) says is repeated: an error text of
         # this class is logged as it is and shown on admin screens, and both
         # an httpx error and a UAA answer can name the client, the zone or
-        # what was sent. `secrets` is therefore not needed for a scrub.
-        del secrets
+        # what was sent.
         data = {
             **form,
             "client_id": self.config.client_id,

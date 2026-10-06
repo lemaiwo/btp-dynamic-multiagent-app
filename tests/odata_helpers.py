@@ -64,12 +64,12 @@ class FakeConnectivity:
         self.calls: list[tuple[Any, ...]] = []
         self.invalidated: list[str | None] = []
 
-    async def app_token(self, *, force: bool = False) -> str:
-        self.calls.append(("app", force))
+    async def app_token(self) -> str:
+        self.calls.append(("app",))
         return "APP"
 
-    async def user_token(self, user_jwt: str, principal: str | None, *, force: bool = False) -> str:
-        self.calls.append(("user", user_jwt, principal, force))
+    async def user_token(self, user_jwt: str, principal: str | None) -> str:
+        self.calls.append(("user", user_jwt, principal))
         return f"UX-{principal}"
 
     @staticmethod

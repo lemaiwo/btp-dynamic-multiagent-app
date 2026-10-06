@@ -768,7 +768,7 @@ async def test_an_on_premise_destination_is_fetched_through_the_connectivity_pro
     assert "SAP-Connectivity-Authentication" not in sent.headers
     assert sent.headers["Accept"] == "application/xml"
     assert sent.headers["Accept-Encoding"] == "identity"
-    assert proxy.tokens.calls == [("app", False)]
+    assert proxy.tokens.calls == [("app",)]
 
 
 async def test_an_on_premise_fetch_as_the_signed_in_user_carries_only_that_user(
@@ -785,7 +785,7 @@ async def test_an_on_premise_fetch_as_the_signed_in_user_carries_only_that_user(
     # The destination's stored credential is not sent next to the user.
     assert "Authorization" not in sent.headers
     jwt_sent = headers["Authorization"].removeprefix("Bearer ")
-    assert proxy.tokens.calls == [("user", jwt_sent, "alice-id", False)]
+    assert proxy.tokens.calls == [("user", jwt_sent, "alice-id")]
 
 
 async def test_an_on_premise_user_fetch_on_a_technical_destination_sends_nothing(
@@ -1722,3 +1722,14 @@ def test_plain_still_cleans_masks_and_caps():
         "x" * 30 + " <url>"
     )
     assert preview.plain(None, 10) == "" and preview.plain(b"x", 10) == ""
+
+
+async def test_a_407_on_the_direct_path_is_not_the_connectivity_proxys(client, remote):
+    """An Internet destination: whatever answered 407 was not the
+    connectivity proxy, so nobody is told to check the connectivity setup."""
+    remote.answer(
+        httpx.Response(407, json={"error": {"code": "X/1", "message": {"value": "tenant-zone-9"}}})
+    )
+    r = await client.post(URL, json=REQUEST)
+    assert r.status_code == 502 and r.headers["x-odata-error"] == "sap_error"
+    assert r.json() == {"detail": "HTTP 407 from the OData service"}
