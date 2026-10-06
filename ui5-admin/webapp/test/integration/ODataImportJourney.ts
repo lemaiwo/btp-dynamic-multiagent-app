@@ -240,7 +240,7 @@ opaTest("Read metadata posts destination, path, version and identity of the form
         }, "the request names the stored service, so the server compares with it");
         Opa5.assert.strictEqual(
             strip(shown, "importSummary"),
-            "Found 5 entity sets and 1 operations. New: 0. Changed: 1. Already in this service: 5. No longer in the metadata: 0."
+            "The metadata declares entity sets: 5, operations: 1. New: 0. Changed: 1. Already in this service: 5. No longer in the metadata: 0."
         );
         Opa5.assert.deepEqual(importRows(shown).map((row) => [row.name, row.status, row.canTick, row.child]), [
             [ITEM, "2 differences", false, false],
@@ -261,7 +261,7 @@ opaTest("Read metadata posts destination, path, version and identity of the form
             "Function import (V2) · POST · 3 parameters · bound to A_PurchaseRequisitionItem");
         Opa5.assert.deepEqual(importRows(shown).filter((row) => row.ticked), [], "nothing is ticked for the admin");
         Opa5.assert.deepEqual(apply(shown), { text: "Nothing selected", enabled: false });
-        Opa5.assert.strictEqual(byId<Panel>(shown, "importSkipped").getHeaderText(), "1 elements of the document were left out");
+        Opa5.assert.strictEqual(byId<Panel>(shown, "importSkipped").getHeaderText(), "Left out of the document, because it could not be read: 1");
         Opa5.assert.deepEqual(texts(shown, "importSkippedList"), ["Field at position 38 of A_PurReqnAcctAssgmt: invalid_type"]);
         Opa5.assert.strictEqual(markup(shown), 0);
     });
@@ -353,6 +353,10 @@ opaTest("a first import into a new service: whatever SAP declares, entity sets a
             new Array(7).fill(["new", true, false]), "everything is new, and nothing is ticked");
         Opa5.assert.strictEqual(importRow(shown, "GetStrategy").hint.indexOf("<b>x</b> {y} · "), 0, "a label is shown as the text it is");
         Opa5.assert.strictEqual(markup(shown), 0, "and makes no markup");
+        Opa5.assert.ok(
+            (byId<Control>(shown, "importList").getDomRef()?.textContent ?? "").indexOf("<b>x</b> {y} · Function import (V2)") !== -1,
+            "what is on screen is the label itself, character for character"
+        );
     });
     iTick(When, page, "ReleaseItem");
     iSeeInImport(Then, "what blocks Apply", function () { return texts(shown, "importBlocked").length === 1; }, function () {
@@ -465,7 +469,7 @@ opaTest("a re-import lists what the document no longer has and removes it only w
     iSeeInImport(Then, "what is gone", function () { return !!importRow(shown, "A_PurReqAddDelivery"); }, function () {
         Opa5.assert.strictEqual(
             strip(shown, "importSummary"),
-            "Found 4 entity sets and 0 operations. New: 0. Changed: 2. Already in this service: 2. No longer in the metadata: 2."
+            "The metadata declares entity sets: 4, operations: 0. New: 0. Changed: 2. Already in this service: 2. No longer in the metadata: 2."
         );
         Opa5.assert.deepEqual(importRow(shown, "PurchaseRequisitionItemText"), {
             name: "PurchaseRequisitionItemText", hint: "Short text · Edm.String", status: "no longer in the metadata",
@@ -484,7 +488,7 @@ opaTest("a re-import lists what the document no longer has and removes it only w
             + "Release item. Tick them for removal too, or untick the entity set.");
         Opa5.assert.strictEqual(importRow(shown, "ReleaseItem").note,
             "Tick to remove the operation from this service, with its title and description. It is enabled: agents can call it today.");
-        Opa5.assert.strictEqual(byId<Button>(shown, "importSelectRemoved").getText(), "Tick all 3 that are no longer in the metadata");
+        Opa5.assert.strictEqual(byId<Button>(shown, "importSelectRemoved").getText(), "Tick all 3 to remove");
     });
     iTick(When, page, "A_PurReqAddDelivery");
     iSeeInImport(Then, "the blocked removal", function () { return texts(shown, "importBlocked").length === 1; }, function () {
@@ -548,6 +552,10 @@ opaTest("a refusal of the read is said inside the dialog by its code, in plain w
             Opa5.assert.strictEqual(strip(shown, "importError"), expected, `${code} is said in plain words`);
             Opa5.assert.strictEqual(strip(shown, "importSummary"), "", "and nothing is listed");
             Opa5.assert.strictEqual(markup(shown), 0, "as text");
+            Opa5.assert.ok(
+                (byId<Control>(shown, "importError").getDomRef()?.textContent ?? "").indexOf(expected) !== -1,
+                `what is on screen is the text itself, character for character: ${code}`
+            );
             Opa5.assert.strictEqual(apply(shown).enabled, false);
         });
     });

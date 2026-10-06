@@ -112,13 +112,15 @@
                             <OverflowToolbarLayoutData priority="NeverOverflow" />
                         </layoutData>
                     </Select>
-                    <ToolbarSpacer />
-                    <Button
-                        id="importSelectRemoved"
-                        text="{ path: 'imp>/removable', formatter: '.formatRemoveAll' }"
-                        visible="{= ${imp>/removable} > 0 }"
-                        press=".onSelectRemoved" />
                 </OverflowToolbar>
+                <!-- On its own line: in the toolbar of a phone it would
+                     move into the overflow menu. Ticks; removes nothing. -->
+                <Button
+                    id="importSelectRemoved"
+                    text="{ path: 'imp>/removable', formatter: '.formatRemoveAll' }"
+                    visible="{= ${imp>/removable} > 0 }"
+                    press=".onSelectRemoved"
+                    class="sapUiTinyMarginBottom" />
                 <core:InvisibleText id="importFilterLabel" text="{i18n>odataImportFilter}" />
                 <List
                     id="importList"
@@ -129,7 +131,7 @@
                     noDataText="{imp>/noRows}"
                     ariaLabelledBy="importSummary">
                     <CustomListItem>
-                        <HBox alignItems="Start" class="odataImportRow">
+                        <HBox alignItems="Start" renderType="Bare" class="odataImportRow">
                             <customData>
                                 <core:CustomData key="level" value="{= ${imp>parent} ? 'child' : 'top' }" writeToDom="true" />
                             </customData>
@@ -148,7 +150,7 @@
                             </HBox>
                             <VBox class="odataImportBody">
                                 <layoutData>
-                                    <FlexItemData growFactor="1" minWidth="0" />
+                                    <FlexItemData growFactor="1" baseSize="0" minWidth="0" />
                                 </layoutData>
                                 <Text text="{ path: 'imp>', formatter: '.formatName' }" class="odataFieldName odataImportName odataImportWrap" />
                                 <Text text="{ path: 'imp>', formatter: '.formatHint' }" class="odataHint odataImportWrap" />

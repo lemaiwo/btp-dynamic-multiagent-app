@@ -199,6 +199,8 @@ html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
 .odataImportRow[data-level="child"] .odataImportLead {
     min-width: 2.75rem;
 }
+/* Its width comes from the row (base size 0 in the fragment), not from its
+   longest line: it stays beside the tick also in a row that wraps. */
 .odataImportBody {
     min-width: 0;
     padding-top: 0.5rem;
@@ -214,16 +216,17 @@ html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
     margin: 0.5rem 0 0 0.5rem;
 }
 @media (max-width: 599px) {
+    /* The status moves under the row: the name keeps the width. */
     .odataImportRow {
         flex-wrap: wrap;
     }
     .odataImportLead {
         min-width: 2.75rem;
     }
-    .odataImportBody {
-        flex-basis: calc(100% - 3.5rem);
-    }
-    .odataImportStatus.sapMObjStatus {
-        margin: 0 0 0.25rem 3.25rem;
+    .odataImportRow.sapMFlexBox > .odataImportStatus.sapMObjStatus {
+        flex: 0 0 100%;
+        box-sizing: border-box;
+        margin: 0 0 0.25rem 0;
+        padding-left: 3.25rem;
     }
 }
