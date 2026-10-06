@@ -123,7 +123,12 @@ export default class ODataServiceDetail extends ODataController {
     /** The list of destinations as a dialog, for a field without a list
      *  under it (on a phone), and the field it was opened for. */
     private destinationPicker?: SelectDialog;
+    private destinationPickerLoading?: Promise<SelectDialog>;
     private pickerField?: Input;
+    /** What a destination field held when its list was asked for by the
+     *  value help; gone with the next key that changes the text, with the
+     *  next `change`, and when the field is left. */
+    private heldAtValueHelp?: { field: Input; value: string };
 
     /** What the destination service lists, for the destination field. */
     private destinations: DestinationsState = "loading";
@@ -557,6 +562,7 @@ export default class ODataServiceDetail extends ODataController {
      */
     private async loadDestinations(): Promise<void> {
         const count = ++this.destinationsCount;
+        this.heldAtValueHelp = undefined;
         this.showDestinations("loading");
         let state: DestinationsState;
         try {
@@ -600,10 +606,56 @@ export default class ODataServiceDetail extends ODataController {
      */
     private asDestinationField(field: Input): void {
         field.setFilterFunction((typed: string, item: Item) => odataDestinations.suggests(typed, item.getText()));
-        // What the field holds when it is left is judged, also when no
-        // `change` tells of it (Escape from the list after the arrow keys
-        // puts the typed text back without one).
-        field.addEventDelegate({ onfocusout: () => this.judgeDestination(field) });
+        // These run after the input's own handlers.
+        field.addEventDelegate({
+            // What the field holds when it is left is stored and judged,
+            // also when no `change` tells of it (Escape from the list after
+            // the arrow keys puts the typed text back without one).
+            onfocusout: () => {
+                this.heldAtValueHelp = undefined;
+                this.storeShownDestination(field);
+                this.judgeDestination(field);
+            },
+            // Enter on the name the field held before it was emptied.
+            onsapenter: () => this.storeShownDestination(field),
+            onsapescape: () => this.restoreDestinationHeld(field)
+        });
+    }
+
+    /**
+     * Makes what `field` shows the stored destination, where the input
+     * itself may not have: with the list under it, the input writes "" to
+     * the model the moment the field is emptied, but keeps the name before
+     * as its last value. Whatever brings that same name back into the field
+     * (Escape, typing or pasting it, picking it from the list) is no
+     * `change` to the input, so the model would stay "" under a field that
+     * shows the name. Only ever stores what the field shows.
+     */
+    private storeShownDestination(field: Input): void {
+        const shown = field.getValue();
+        const stored = this.isDuplicateField(field)
+            ? (this.svc().getProperty("/duplicate/destination") as string | undefined) : this.data()?.destination;
+        if (shown !== (stored ?? "")) {
+            // Through the field: its binding writes the model.
+            field.setValue(shown);
+        }
+    }
+
+    /**
+     * Escape in `field`. When its list was opened by the value help and no
+     * text was typed since, the input puts back "what was typed", which is
+     * nothing (or the part before the selection) and not what the field
+     * held: with the text selected, as after Tab into the field, F4, an
+     * arrow key and Escape emptied the field and the model, and a second
+     * Escape had nothing to give back. The field gets back what it held.
+     */
+    private restoreDestinationHeld(field: Input): void {
+        const held = this.heldAtValueHelp;
+        this.heldAtValueHelp = undefined;
+        if (held && held.field === field && field.getValue() !== held.value) {
+            field.setValue(held.value);
+            this.judgeDestination(field);
+        }
     }
 
     private isDuplicateField(field: Input): boolean {
@@ -634,6 +686,7 @@ export default class ODataServiceDetail extends ODataController {
     public onDestinationValueHelp(event: Event): void {
         const field = event.getSource() as Input;
         if (field.getShowSuggestion()) {
+            this.heldAtValueHelp = { field, value: field.getValue() };
             field.showItems(() => true);
         } else {
             void this.openDestinationPicker(field);
@@ -642,12 +695,21 @@ export default class ODataServiceDetail extends ODataController {
 
     private async openDestinationPicker(field: Input): Promise<void> {
         this.pickerField = field;
+        if (this.destinationPickerLoading) {
+            // A second tap while the dialog of the first is being built.
+            return;
+        }
         if (!this.destinationPicker) {
-            this.destinationPicker = await Fragment.load({
+            this.destinationPickerLoading = Fragment.load({
                 id: this.getView()!.getId(),
                 name: "com.agent.admin.fragment.ODataDestinationPicker",
                 controller: this
-            }) as SelectDialog;
+            }) as Promise<SelectDialog>;
+            try {
+                this.destinationPicker = await this.destinationPickerLoading;
+            } finally {
+                this.destinationPickerLoading = undefined;
+            }
             this.getView()!.addDependent(this.destinationPicker);
         }
         (this.destinationPicker.getBinding("items") as ListBinding).filter([]);
@@ -737,8 +799,11 @@ export default class ODataServiceDetail extends ODataController {
         const field = event.getSource();
         this.destinationEdited(field);
         if (event.getParameter("escPressed")) {
+            // The name before is shown again; stored it may not be.
+            this.storeShownDestination(field);
             this.judgeDestination(field);
         } else {
+            this.heldAtValueHelp = undefined;
             this.noteDestination(this.isDuplicateField(field) ? "/duplicate" : "", "", false, false, false, false);
         }
     }
@@ -751,6 +816,7 @@ export default class ODataServiceDetail extends ODataController {
      */
     public onDestinationChange(event: Event): void {
         const field = event.getSource() as Input;
+        this.heldAtValueHelp = undefined;
         this.destinationEdited(field);
         this.judgeDestination(field);
     }
@@ -2342,8 +2408,6 @@ export default class ODataServiceDetail extends ODataController {
         this.svc().setProperty("/duplicate/user_context", key === "user");
         this.checkDuplicateDestination(true, true);
     }
-
-
 
     public onDuplicateCancel(): void {
         this.duplicateDialog?.close();

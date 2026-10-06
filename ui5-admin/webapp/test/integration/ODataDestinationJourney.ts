@@ -7,10 +7,13 @@ import type Input from "sap/m/Input";
 import type StandardListItem from "sap/m/StandardListItem";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
+import Component from "sap/ui/core/Component";
+import Device from "sap/ui/Device";
+import type JSONModel from "sap/ui/model/json/JSONModel";
 import {
-    DESTINATION, DUPLICATE_DESTINATION, PAGE, VIEW, announced, asOnAPhone, destinationOf, formOf, keyInDestination,
-    leaveDestination, openDestinationList, pressSegment, stateOf, toasts, typeDestination,
-    type DestinationField, type Typing
+    DESTINATION, DUPLICATE_DESTINATION, PAGE, VIEW, announced, asOnAPhone, askForTheList, destinationOf, emptyDestination,
+    formOf, keyInDestination, leaveDestination, openDestinationList, pressSegment, selectDestination, stateOf, toasts,
+    typeDestination, type DestinationField, type Typing
 } from "./pages/ODataDetail";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
@@ -1191,6 +1194,335 @@ opaTest("a page that showed one service shows nothing of its list while the next
     });
     iSeeTheField(Then, UNUSED, "this visit's list", (field) => field.choices.length > 0, function (field) {
         Opa5.assert.deepEqual([field.state, field.stateText], ["Warning", FIXED_ACCOUNT], "judged by its own list");
+    });
+    Then.iStopTheApp();
+});
+
+// --- what the field shows is what is stored (DL2 follow-up) --------------------------
+//
+// With the list under it, the input writes "" to the model the moment the
+// field is emptied and then forgets that it did: whatever brings the old
+// name back into the field afterwards tells of no change.
+
+const DUPLICATE_UNUSED = `POST odata/services/${UNUSED}/duplicate`;
+
+function iEmpty(When: Common, Then: Common): void {
+    When.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) { emptyDestination(page); },
+        errorMessage: "No page"
+    });
+    iSeeTheField(Then, UNUSED, "the emptied field", (field) => field.shown === "" && field.model === "", function () {
+        Opa5.assert.ok(true, "select all and Backspace empty the field");
+    });
+}
+
+function iSeeShownAndStored(Then: Common, name: string, what: string): void {
+    iSeeTheField(Then, UNUSED, what, (field) => field.shown === name && field.model === name, function (field) {
+        Opa5.assert.deepEqual([field.shown, field.model, field.state], [name, name, "None"], what);
+    });
+}
+
+function iPressInTheDialog(When: Common, type: string, matches: (control: UI5Element) => boolean, what: string): void {
+    When.waitFor({
+        controlType: type,
+        searchOpenDialogs: true,
+        matchers: matches,
+        actions: new Press(),
+        errorMessage: `Not in the dialog: ${what}`
+    });
+}
+
+opaTest("the name that Escape brings back into an emptied field is the stored one, also for Save pressed straight from the field", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function (field) {
+        Opa5.assert.deepEqual([field.shown, field.model], ["S4_ODATA_USER", "S4_ODATA_USER"]);
+    });
+    iEnter(When, "odataTitle", "Another title");
+
+    // Sequence 1: select all, Backspace, Escape.
+    iEmpty(When, Then);
+    iPressKey(When, "Escape");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "Escape gives the name back, to the field and to what is stored");
+
+    // Sequence 2: Backspace to empty, other text, Escape.
+    iEmpty(When, Then);
+    iType(When, Then, "zz", "zz", { append: true });
+    iPressKey(When, "Escape");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "Escape from other text gives the name back as well");
+
+    iSaveAndSeeStored(When, Then, "S4_ODATA_USER", "the name the field shows");
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) {
+            Opa5.assert.strictEqual(destinationOf(page).state, "None", "and no \"required\" on a field that shows a name");
+        }
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("the same name typed or picked again into an emptied field is the stored one", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+    iEnter(When, "odataTitle", "Another title");
+
+    // Sequence 3: Backspace to empty, the same name typed again, Tab.
+    iEmpty(When, Then);
+    iType(When, Then, "S4_ODATA_USER", "S4_ODATA_USER", { append: true });
+    iLeaveTheField(When, "tab");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "typed again and left: stored");
+
+    // Sequence 3, with Enter in place of Tab: the field is not left.
+    iEmpty(When, Then);
+    iType(When, Then, "S4_ODATA_USER", "S4_ODATA_USER", { append: true });
+    iPressKey(When, "Enter");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "typed again and Enter: stored");
+
+    // Sequence 4: Backspace to empty, a beginning, the arrow key and Enter on the same name.
+    iEmpty(When, Then);
+    iType(When, Then, "s4_odata_us", "s4_odata_us", { append: true });
+    iSeeTheList(Then, true, "the name that holds it", ["S4_ODATA_USER"]);
+    iPressKey(When, "ArrowDown");
+    iSeeTheField(Then, UNUSED, "the name moved to", (field) => field.shown === "S4_ODATA_USER", function () {
+        Opa5.assert.ok(true, "the arrow key shows the listed name");
+    });
+    iPressKey(When, "Enter");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "taken with the arrow key and Enter: stored");
+
+    // Sequence 4: Backspace to empty, F4, a click on the same name, the field left.
+    iEmpty(When, Then);
+    iPressKey(When, "F4");
+    iSeeTheList(Then, true, "F4 opens the whole list");
+    iPickFromTheList(When, "S4_ODATA_USER");
+    iSeeTheField(Then, UNUSED, "the clicked name", (field) => field.shown === "S4_ODATA_USER", function () {
+        Opa5.assert.ok(true, "the click shows the listed name");
+    });
+    iLeaveTheField(When, "blur");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "clicked and left: stored");
+
+    iSaveAndSeeStored(When, Then, "S4_ODATA_USER", "the name the field shows");
+    Then.iStopTheApp();
+});
+
+opaTest("in the duplicate dialog the name that Escape brings back into the emptied field is what the copy gets", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+    iPress(When, "odataDuplicateButton");
+    iSeeTheDuplicateField(Then, "the field", (field) => field.model === "S4_ODATA_USER", function (field) {
+        Opa5.assert.strictEqual(field.shown, "S4_ODATA_USER", "the source's destination");
+    });
+    When.waitFor({
+        controlType: "sap.m.Input",
+        searchOpenDialogs: true,
+        matchers: function (input: UI5Element) { return input.getId().endsWith("odataDuplicateName"); },
+        actions: new EnterText({ text: "purchase-requisitions-copy" }),
+        errorMessage: "No name field in the dialog"
+    });
+
+    iDoInTheDialog(When, function (page) { emptyDestination(page, DUPLICATE_DESTINATION); });
+    iSeeTheDuplicateField(Then, "the emptied field", (field) => field.shown === "" && field.model === "", function () {
+        Opa5.assert.ok(true, "emptied");
+    });
+    iDoInTheDialog(When, function (page) { keyInDestination(page, "Escape", DUPLICATE_DESTINATION); });
+    iSeeTheDuplicateField(Then, "the name back, shown and stored",
+        (field) => field.shown === "S4_ODATA_USER" && field.model === "S4_ODATA_USER", function (field) {
+            Opa5.assert.deepEqual([field.shown, field.model], ["S4_ODATA_USER", "S4_ODATA_USER"],
+                "Escape gives the name back and the dialog stays open");
+        });
+
+    iPressInTheDialog(When, "sap.m.Button", (button) => button.getId().endsWith("odataDuplicateConfirm"), "Duplicate");
+    Then.waitFor({
+        check: function () { return backend.countRequests(DUPLICATE_UNUSED) > 0; },
+        success: function () {
+            Opa5.assert.strictEqual(backend.bodies[DUPLICATE_UNUSED]?.destination, "S4_ODATA_USER",
+                "the copy is asked for with the name the field shows");
+        },
+        errorMessage: "No copy was made"
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Escape from the list that the value help opened gives back what the field held", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+
+    // Tab into the filled field (its text is selected), F4, an arrow key, Escape.
+    When.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) { selectDestination(page); },
+        errorMessage: "No page"
+    });
+    iPressKey(When, "F4");
+    iSeeTheList(Then, true, "F4 opens the whole list");
+    iPressKey(When, "ArrowDown");
+    iSeeTheField(Then, UNUSED, "a name moved to", (field) => field.shown === "S4_DEV", function (field) {
+        Opa5.assert.strictEqual(field.model, "S4_ODATA_USER", "shown, not taken yet");
+    });
+    iPressKey(When, "Escape");
+    iSeeTheList(Then, false, "Escape closes the list");
+    iSeeShownAndStored(Then, "S4_ODATA_USER", "the name the field held is back, shown and stored");
+
+    // The list asked for again, and then another name typed and taken with
+    // Enter: what the field held before is forgotten, a later Escape puts
+    // nothing older back.
+    iPressKey(When, "F4");
+    iSeeTheList(Then, true, "F4 opens the whole list again");
+    iType(When, Then, "S4_DEV_USER", "S4_DEV_USER");
+    iPressKey(When, "Enter");
+    iSeeTheField(Then, UNUSED, "the typed name", (field) => field.model === "S4_DEV_USER", function () {
+        Opa5.assert.deepEqual(openDestinationList(), [], "another name is typed and stored, the list is closed");
+    });
+    iPressKey(When, "Escape");
+    // (An older name would be back within the key press itself.)
+    iSeeTheField(Then, UNUSED, "the typed name still", (field) => field.shown === "S4_DEV_USER", function (field) {
+        Opa5.assert.deepEqual([field.shown, field.model], ["S4_DEV_USER", "S4_DEV_USER"], "Escape puts no older name back");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("Enter in the destination field of the duplicate dialog does not create the copy", function (Given: Common, When: Common, Then: Common) {
+    iOpen(Given, UNUSED, withNewPp);
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function () {
+        Opa5.assert.ok(true, "the list is there");
+    });
+    iPress(When, "odataDuplicateButton");
+    iSeeTheDuplicateField(Then, "the field", (field) => field.model === "S4_ODATA_USER", function () {
+        Opa5.assert.ok(true, "the dialog is open");
+    });
+    When.waitFor({
+        controlType: "sap.m.Input",
+        searchOpenDialogs: true,
+        matchers: function (input: UI5Element) { return input.getId().endsWith("odataDuplicateName"); },
+        actions: new EnterText({ text: "purchase-requisitions-copy" }),
+        errorMessage: "No name field in the dialog"
+    });
+    iDoInTheDialog(When, function (page) { typeDestination(page, "S4_NEW", { id: DUPLICATE_DESTINATION }); });
+    iSeeTheList(Then, true, "the listed name that holds the typed one is offered", ["S4_NEW_PP"], true);
+    iDoInTheDialog(When, function (page) { keyInDestination(page, "Enter", DUPLICATE_DESTINATION); });
+    iSeeTheDuplicateField(Then, "the typed name, taken by Enter", (field) => field.model === "S4_NEW", function (field) {
+        Opa5.assert.deepEqual([field.shown, field.stateText], ["S4_NEW", NOT_LISTED], "Enter takes what was typed");
+    });
+    // The copy would be there within the wait of this step.
+    iSeeTheDuplicateField(Then, "the dialog, still open", () => openDestinationList().length === 0, function () {
+        Opa5.assert.strictEqual(backend.countRequests(DUPLICATE_UNUSED), 0, "no copy was asked for");
+        Opa5.assert.strictEqual(stored("purchase-requisitions-copy"), undefined, "and none exists");
+    });
+    Then.iStopTheApp();
+});
+
+// --- on a phone ----------------------------------------------------------------------
+
+/** Makes the device a phone (or not) for the app under test: the `device`
+ *  model of the component wraps the device object the views bind to. */
+function setPhone(control: UI5Element, phone: boolean): void {
+    (Component.getOwnerComponentFor(control)!.getModel("device") as JSONModel).setProperty("/system/phone", phone);
+}
+
+/** What went wrong unseen while the picker was asked for twice. */
+const refused: string[] = [];
+function noteRefused(event: PromiseRejectionEvent): void {
+    refused.push(String(event.reason));
+    event.preventDefault();
+}
+
+QUnit.testDone(function () {
+    // Never leave the run a phone, whatever a journey did.
+    const system = Device.system as { phone: boolean };
+    if (system.phone) {
+        system.phone = false;
+    }
+});
+
+opaTest("on a phone the view gives the field no list under it; the picker is opened once, searched, cancelled and picked from", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp();
+    Given.waitFor({
+        id: "sideNavigation",
+        viewName: "App",
+        success: function (navigation: UI5Element) {
+            setPhone(navigation, true);
+            HashChanger.getInstance().setHash(`odata-services/${UNUSED}`);
+        },
+        errorMessage: "The app did not start"
+    });
+    iSeeTheField(Then, UNUSED, "the list", (field) => field.choices.length > 0, function (field) {
+        Opa5.assert.strictEqual(field.suggests, false, "the view switches the list under the field off on a phone");
+        Opa5.assert.ok(field.valueHelp, "the icon is there");
+    });
+
+    // An impatient double tap on the icon: one dialog.
+    When.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) {
+            window.addEventListener("unhandledrejection", noteRefused);
+            askForTheList(page, 2);
+        },
+        errorMessage: "No page"
+    });
+    When.waitFor({
+        controlType: "sap.m.SearchField",
+        searchOpenDialogs: true,
+        actions: new EnterText({ text: "odata_t", keepFocus: true }),
+        success: function () {
+            Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 1, "one dialog for two taps");
+        },
+        errorMessage: "No dialog with a search field"
+    });
+    Then.waitFor({
+        controlType: "sap.m.StandardListItem",
+        searchOpenDialogs: true,
+        check: function (items: UI5Element[]) { return items.length === 1; },
+        success: function (items: UI5Element[]) {
+            Opa5.assert.strictEqual((items[0] as StandardListItem).getTitle(), "S4_ODATA_TECH", "the search finds by the name");
+        },
+        errorMessage: "Not seen: the one name that holds the searched text"
+    });
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        autoWait: false,
+        success: function (page: UI5Element) {
+            const field = destinationOf(page);
+            Opa5.assert.deepEqual([field.shown, field.model], ["S4_ODATA_USER", "S4_ODATA_USER"],
+                "what is searched for is not the field's name");
+        }
+    });
+    iPressInTheDialog(When, "sap.m.Button", (button) => (button as unknown as { getText(): string }).getText() === "Cancel", "Cancel");
+    iSeeTheField(Then, UNUSED, "the field as it was", (field) => field.shown === "S4_ODATA_USER", function (field) {
+        iSeeNoDialog("the dialog is closed");
+        window.removeEventListener("unhandledrejection", noteRefused);
+        Opa5.assert.deepEqual(refused, [], "and the second tap built no second dialog that was then refused");
+        Opa5.assert.deepEqual([field.shown, field.model, field.state], ["S4_ODATA_USER", "S4_ODATA_USER", "None"],
+            "Cancel leaves the field alone, the searched text too");
+    });
+
+    // Opened again: the whole list, and a tap takes the name.
+    iPress(When, DESTINATION);
+    When.waitFor({
+        controlType: "sap.m.StandardListItem",
+        searchOpenDialogs: true,
+        check: function (items: UI5Element[]) { return items.length === CHOICES.length; },
+        success: function () { Opa5.assert.ok(true, "the icon opens the dialog with the whole list again"); },
+        errorMessage: "Not seen: the whole list in the dialog"
+    });
+    iPickFromTheList(When, "S4_DEV_USER");
+    iSeeShownAndStored(Then, "S4_DEV_USER", "the tapped name");
+    Then.waitFor({
+        id: PAGE,
+        viewName: VIEW,
+        success: function (page: UI5Element) {
+            setPhone(page, false);
+            Opa5.assert.strictEqual(destinationOf(page).suggests, true, "not a phone any more: the list is under the field again");
+        }
     });
     Then.iStopTheApp();
 });

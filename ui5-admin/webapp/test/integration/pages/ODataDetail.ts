@@ -19,6 +19,7 @@ import type View from "sap/ui/core/mvc/View";
 import type Control from "sap/ui/core/Control";
 import type UI5Element from "sap/ui/core/Element";
 import type ManagedObject from "sap/ui/base/ManagedObject";
+import type PropertyBinding from "sap/ui/model/PropertyBinding";
 
 /**
  * What the OData service detail journey reads off the page: the rendered
@@ -125,6 +126,10 @@ export interface DestinationField {
     shown: string;
     /** Whether the field has a value help icon to open the list with. */
     valueHelp: boolean;
+    /** What the model behind the field holds: what a save or a copy sends. */
+    model: string;
+    /** Whether the field offers the list under it (not on a phone). */
+    suggests: boolean;
 }
 
 function destinationInput(element: UI5Element, id = DESTINATION): HTMLInputElement {
@@ -144,6 +149,45 @@ export interface Typing {
     compose?: boolean;
 }
 
+/** Puts the focus in a destination field, as a click or Tab does. */
+function focusDestination(element: UI5Element, id = DESTINATION): HTMLInputElement {
+    const input = destinationInput(element, id);
+    if (document.activeElement === input) {
+        // OPA's EnterText leaves a field with events only; the element
+        // keeps the focus and `focus()` would tell the control nothing.
+        input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
+    } else {
+        input.focus();
+    }
+    return input;
+}
+
+/** Tab into a destination field: the focus, and all of its text selected. */
+export function selectDestination(element: UI5Element, id = DESTINATION): void {
+    const input = focusDestination(element, id);
+    input.setSelectionRange(0, input.value.length);
+}
+
+/** Select all and Backspace in a destination field, as the keys arrive. */
+export function emptyDestination(element: UI5Element, id = DESTINATION): void {
+    const input = focusDestination(element, id);
+    input.setSelectionRange(0, input.value.length);
+    const init = { key: "Backspace", code: "Backspace", keyCode: 8, which: 8, bubbles: true, cancelable: true } as KeyboardEventInit;
+    input.dispatchEvent(new KeyboardEvent("keydown", init));
+    input.value = "";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+    input.dispatchEvent(new KeyboardEvent("keyup", init));
+}
+
+/** The value help of a destination field asked for `times` in one go, as
+ *  an impatient double tap on the icon does. */
+export function askForTheList(element: UI5Element, times: number, id = DESTINATION): void {
+    const field = control<Input>(element, id);
+    for (let i = 0; i < times; i++) {
+        field.fireValueHelpRequest({ fromSuggestions: false });
+    }
+}
+
 /**
  * Types `text` into a destination field key by key, the way keystrokes
  * arrive: a `keydown`, the character in place of what is selected, an
@@ -152,14 +196,7 @@ export interface Typing {
  * name.)
  */
 export function typeDestination(element: UI5Element, text: string, how: Typing = {}): void {
-    const input = destinationInput(element, how.id);
-    if (document.activeElement === input) {
-        // OPA's EnterText leaves a field with events only; the element
-        // keeps the focus and `focus()` would tell the control nothing.
-        input.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
-    } else {
-        input.focus();
-    }
+    const input = focusDestination(element, how.id);
     if (how.append) {
         input.setSelectionRange(input.value.length, input.value.length);
     } else {
@@ -237,7 +274,9 @@ export function destinationOf(element: UI5Element, id = DESTINATION, hintId = "o
             .filter((label) => label.htmlFor === destinationInput(element, id).id)
             .map((label) => label.textContent ?? "").join("|"),
         shown: destinationInput(element, id).value,
-        valueHelp: field.getShowValueHelp()
+        valueHelp: field.getShowValueHelp(),
+        model: String((field.getBinding("value") as PropertyBinding | undefined)?.getValue() ?? ""),
+        suggests: field.getShowSuggestion()
     };
 }
 
