@@ -726,3 +726,295 @@ opaTest("reopening a stored entry shows it; a disabled service is said to be ski
     });
     Then.iStopTheApp();
 });
+
+// --- U8 review: the Save question cannot be skipped, the saved entry is explicit ---
+
+const SWITCHED_ON = "Saving lets the agent \"gmail-agent\" change data in SAP through its OData services.";
+const UNKNOWN = "Saving gives the agent \"gmail-agent\" write access through its OData services, or adds services to it. "
+    + "What that opens could not be read, so it is not listed here. Save anyway?";
+
+/** Presses Save after `prepare` ran, in the same step. */
+function iPressSaveAfter(When: Common, prepare: () => void): void {
+    When.waitFor({
+        id: "saveAgentButton",
+        viewName: VIEW,
+        actions: function (element: UI5Element | null) {
+            prepare();
+            new Press().executeOn(element as Control);
+        }
+    });
+}
+
+opaTest("Save still asks when what it opens cannot be worked out, and Cancel sends nothing", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101);
+    iAddAServer(When);
+    iPickTheKind(When, ODATA);
+    iSelect(When, [JOBS]);
+    iPressInTheDialog(When, "odataEntryAllowWrite");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry in the form", function () {
+        Opa5.assert.strictEqual(writes(), 0, "nothing sent so far");
+    }, (data) => data.mcp_servers.length === 3);
+
+    // The catalogue answers something that is no list: the question cannot be built.
+    iPressSaveAfter(When, function () {
+        backend.failNext = { path: "odata/services", method: "GET", status: 200, body: { detail: "not a list" } };
+    });
+    iSeeAMessage(Then, "the question without a list", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), UNKNOWN, "it says that what is opened could not be read, and asks");
+        Opa5.assert.strictEqual((dialog as Dialog).getTitle(), SAVE_TITLE, "under the title of the write question");
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Save", "Cancel"], "Save or Cancel");
+        const focus = Element.getElementById((dialog as Dialog).getInitialFocus() as string) as Button | undefined;
+        Opa5.assert.strictEqual(focus?.getText(), "Cancel", "Cancel is where the focus starts");
+        Opa5.assert.strictEqual(writes(), 0, "nothing is sent before the answer");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheForm(Then, "the form after Cancel", function (data) {
+        Opa5.assert.strictEqual(writes(), 0, "Cancel sends no PUT");
+        Opa5.assert.strictEqual(data.mcp_servers.length, 3, "and the entry stays in the form");
+    });
+
+    // The catalogue cannot be read at all: the services are read one by one and the question is asked.
+    iPressSaveAfter(When, function () {
+        backend.failNext = { path: "odata/services", method: "GET", status: 500, body: { detail: "down" } };
+    });
+    iSeeAMessage(Then, "the question with the catalogue unread", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog).indexOf(SWITCHED_ON), 0, "the write question is asked");
+        Opa5.assert.strictEqual(writes(), 0, "and nothing is sent before the answer");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheForm(Then, "the form after the second Cancel", function () {
+        Opa5.assert.strictEqual(writes(), 0, "Cancel sends no PUT");
+    });
+
+    // Answered with Save, the question that names nothing does save.
+    iPressSaveAfter(When, function () {
+        backend.failNext = { path: "odata/services", method: "GET", status: 200, body: { detail: "not a list" } };
+    });
+    iSeeAMessage(Then, "the question without a list, again", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), UNKNOWN);
+    });
+    iAnswer(When, "Save");
+    iSeeTheList(Then, "the saved agent", function () {
+        Opa5.assert.deepEqual(sentServers()[2].oauth, { services: [JOBS], allow_write: true }, "saved on the admin's answer");
+    }, () => backend.countRequests(PUT_101) === 1);
+    Then.iStopTheApp();
+});
+
+opaTest("an edit made while the Save question is being read is not saved with it: the PUT is what the question named", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101);
+    iAddAServer(When);
+    iPickTheKind(When, ODATA);
+    iSelect(When, [PARTNERS]);
+    iPressInTheDialog(When, "odataEntryAllowWrite");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry in the form", function () {
+        Opa5.assert.ok(true, "a service without writes, with Allow writes");
+    }, (data) => data.mcp_servers.length === 3);
+
+    // Save: its catalogue read is kept waiting.
+    iPressSaveAfter(When, function () { backend.catalogueHeld = true; });
+    Then.waitFor({
+        check: function () { return backend.heldCatalogueReads() === 1; },
+        success: function () {
+            backend.catalogueHeld = false; // only the read of Save waits
+            Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no question yet");
+        },
+        errorMessage: "Not seen: the catalogue read of Save, waiting"
+    });
+
+    // Meanwhile a service with writes is added to the entry.
+    iEditServer(When, 2, 3);
+    iSeeTheEntry(Then, "the entry, reopened", (entry) => entry.rows.length === 1 && entry.options.length === 4, function (entry) {
+        Opa5.assert.deepEqual(entry.keys, [PARTNERS]);
+    });
+    iSelect(When, [PARTNERS, JOBS]);
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the edited entry in the form", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2].oauth, { services: [PARTNERS, JOBS], allow_write: true }, "the form holds the edit");
+        Opa5.assert.strictEqual(writes(), 0, "nothing sent so far");
+        backend.releaseCatalogue();
+    }, (data) => ((data.mcp_servers[2]?.oauth as { services?: string[] })?.services ?? []).length === 2);
+
+    iSeeAMessage(Then, "the question of the Save that was pressed", function (dialog) {
+        Opa5.assert.strictEqual(
+            messageOf(dialog),
+            `${SWITCHED_ON}\n\nNo write operation is enabled in its services yet. Whatever is enabled there later opens for this `
+            + `agent without another question.\n\n${AUDITED}`,
+            "it names what the form held when Save was pressed"
+        );
+    });
+    iAnswer(When, "Save");
+    iSeeTheList(Then, "the saved agent", function () {
+        Opa5.assert.deepEqual(sentServers()[2].oauth, { services: [PARTNERS], allow_write: true },
+            "the PUT carries what the question was about, not the later edit");
+    }, () => backend.countRequests(PUT_101) === 1);
+    Then.iStopTheApp();
+});
+
+opaTest("an agent saved without opening its OData entry sends the entry as exactly services and a boolean allow_write", function (Given: Common, When: Common, Then: Common) {
+    let before: McpServer[] = [];
+    iOpenAgent(Given, When, 101, function () {
+        before = JSON.parse(JSON.stringify(backend.agents.filter((a) => a.id === 101)[0].mcp_servers)) as McpServer[];
+        storeEntry(101, [PARTNERS], false);
+    });
+    iSeeTheForm(Then, "the agent as stored", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2].oauth, { services: [PARTNERS], has_client_secret: false },
+            "the form holds the entry as the server answered it: no allow_write key");
+    }, (data) => data.mcp_servers.length === 3);
+
+    // The description only.
+    When.waitFor({ id: "agentDescription", viewName: VIEW, actions: new EnterText({ text: "Changed description" }) });
+    iPressSave(When);
+    iSeeTheList(Then, "the saved agent", function () {
+        const sent = sentServers();
+        Opa5.assert.strictEqual(backend.bodies[PUT_101]?.description, "Changed description", "the description was sent");
+        Opa5.assert.deepEqual(sent[2], { url: ODATA, auth_mode: "destination", oauth: { services: [PARTNERS], allow_write: false } },
+            "the entry is sent as exactly { services, allow_write }");
+        Opa5.assert.strictEqual((sent[2].oauth as { allow_write: unknown }).allow_write, false, "allow_write is the boolean false");
+        Opa5.assert.deepEqual(sent.slice(0, 2), before, "the other servers are sent unchanged");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no question: nothing new is given");
+    }, () => backend.countRequests(PUT_101) === 1);
+    Then.iStopTheApp();
+});
+
+opaTest("a tick that was cancelled is not carried into the next dialog, of this agent or another", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101);
+    iAddAServer(When);
+    iPickTheKind(When, ODATA);
+    iSelect(When, [JOBS]);
+    iPressInTheDialog(When, "odataEntryAllowWrite");
+    iSeeTheEntry(Then, "the tick", (entry) => entry.ticked && entry.rows.length === 1, function (entry) {
+        Opa5.assert.deepEqual(entry.keys, [JOBS], "ticked, with a service");
+    });
+    iPressInTheDialog(When, "serverCancel");
+    iSeeTheForm(Then, "the form after Cancel", function (data) {
+        Opa5.assert.strictEqual(data.mcp_servers.length, 2, "no entry was added");
+    });
+
+    iAddAServer(When);
+    iPickTheKind(When, ODATA);
+    iSeeTheEntry(Then, "a new entry of the same agent", (entry) => entry.options.length === 4, function (entry) {
+        Opa5.assert.strictEqual(entry.ticked, false, "Allow writes is not ticked");
+        Opa5.assert.deepEqual(entry.keys, [], "and nothing is selected");
+    });
+    iPressInTheDialog(When, "odataEntryAllowWrite");
+    iSeeTheEntry(Then, "the tick, again", (entry) => entry.ticked, function () { Opa5.assert.ok(true, "ticked again"); });
+    iPressInTheDialog(When, "serverCancel");
+
+    iSeeTheForm(Then, "the first agent", function () {
+        HashChanger.getInstance().setHash("agents/100");
+    });
+    iSeeTheForm(Then, "the other agent", function (data) {
+        Opa5.assert.strictEqual(data.name, "btp-agent");
+    }, (data) => data.name === "btp-agent");
+    iAddAServer(When);
+    iPickTheKind(When, ODATA);
+    iSeeTheEntry(Then, "a new entry of another agent", (entry) => entry.options.length === 4, function (entry) {
+        Opa5.assert.strictEqual(entry.ticked, false, "Allow writes is not ticked there either");
+        Opa5.assert.deepEqual(entry.keys, [], "and nothing is selected");
+        Opa5.assert.strictEqual(writes(), 0, "nothing was sent");
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("another toolset and back on a stored entry keeps its services and the stored Allow writes", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 101, () => storeEntry(101, [JOBS, PARTNERS], true));
+    iEditServer(When, 2, 3);
+    iSeeTheEntry(Then, "the stored entry", (entry) => entry.rows.length === 2, function (entry) {
+        Opa5.assert.strictEqual(entry.ticked, true, "the stored tick");
+    });
+    iPickTheKind(When, "builtin:jira");
+    Then.waitFor({
+        id: "oauthProject",
+        viewName: VIEW,
+        searchOpenDialogs: true,
+        success: function () { Opa5.assert.ok(true, "the Jira fields are shown"); }
+    });
+    iPickTheKind(When, ODATA);
+    iSeeTheEntry(Then, "the entry after the round trip", (entry) => entry.rows.length === 2, function (entry) {
+        Opa5.assert.deepEqual(entry.keys, [JOBS, PARTNERS], "the stored services are still selected");
+        Opa5.assert.strictEqual(entry.ticked, true, "and Allow writes is still ticked");
+    });
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry in the form", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[2], { url: ODATA, auth_mode: "destination", oauth: { services: [JOBS, PARTNERS], allow_write: true } },
+            "OK puts the stored services and the stored switch back, and nothing of the other toolset");
+    }, (data) => data.mcp_servers.length === 3 && !("has_client_secret" in (data.mcp_servers[2].oauth as object)));
+
+    iPressSave(When);
+    iSeeTheList(Then, "the saved agent", function () {
+        Opa5.assert.deepEqual(sentServers()[2].oauth, { services: [JOBS, PARTNERS], allow_write: true }, "saved as it was stored");
+        Opa5.assert.strictEqual(document.querySelectorAll(".sapMDialogOpen").length, 0, "no question: the stored agent already had it");
+    }, () => backend.countRequests(PUT_101) === 1);
+    Then.iStopTheApp();
+});
+
+/** Names the new agent and gives it an OData services entry with Allow writes. */
+function iFillANewAgentWithWrites(When: Common, Then: Common): void {
+    When.waitFor({ id: "agentName", viewName: VIEW, actions: new EnterText({ text: "new-agent" }) });
+    When.waitFor({ id: "agentDescription", viewName: VIEW, actions: new EnterText({ text: "A new agent" }) });
+    When.waitFor({ id: "agentInstructions", viewName: VIEW, actions: new EnterText({ text: "Do the thing." }) });
+    iAddAServer(When);
+    iPickTheKind(When, ODATA);
+    iSelect(When, [JOBS]);
+    iPressInTheDialog(When, "odataEntryAllowWrite");
+    iPressInTheDialog(When, "serverConfirm");
+    iSeeTheForm(Then, "the entry of the new agent", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers, [{ url: ODATA, auth_mode: "destination", oauth: { services: [JOBS], allow_write: true } }]);
+    }, (data) => data.mcp_servers.length === 1);
+}
+
+const NEW_QUESTION = "Saving lets the agent \"new-agent\" change data in SAP through its OData services.\n\n"
+    + `It opens these write operations, enabled in the catalogue:\n${JOBS_LINE}\n\n${SAVE_LATER}\n\n${AUDITED}`;
+
+opaTest("a new agent with Allow writes is asked about before it is created", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+    When.waitFor({ id: "addAgentButton", viewName: "Agents", actions: new Press() });
+    iFillANewAgentWithWrites(When, Then);
+
+    iPressSave(When);
+    iSeeAMessage(Then, "the write question for a new agent", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), NEW_QUESTION, "the question names the new agent and what is opened");
+        Opa5.assert.strictEqual(writes(), 0, "nothing is sent before the answer");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheForm(Then, "the form after Cancel", function () {
+        Opa5.assert.strictEqual(writes(), 0, "Cancel creates nothing");
+    });
+
+    iPressSave(When);
+    iSeeAMessage(Then, "the question again", function () { Opa5.assert.ok(true, "asked again"); });
+    iAnswer(When, "Save");
+    iSeeTheList(Then, "the created agent", function () {
+        Opa5.assert.deepEqual(backend.bodies["POST agents"]?.mcp_servers,
+            [{ url: ODATA, auth_mode: "destination", oauth: { services: [JOBS], allow_write: true } }],
+            "the POST carries exactly { services, allow_write }");
+        Opa5.assert.strictEqual(backend.countRequests("POST agents"), 1, "one POST");
+    }, () => backend.countRequests("POST agents") === 1);
+    Then.iStopTheApp();
+});
+
+opaTest("coming from an agent that has writes, a new agent with Allow writes is still asked about", function (Given: Common, When: Common, Then: Common) {
+    iOpenAgent(Given, When, 100, () => storeEntry(100, [JOBS], true));
+    iSeeTheForm(Then, "the agent that has writes", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers[data.mcp_servers.length - 1].oauth,
+            { services: [JOBS], allow_write: true, has_client_secret: false }, "the stored agent allows writes through the same service");
+        HashChanger.getInstance().setHash("agents/new");
+    }, (data) => data.name === "btp-agent" && data.mcp_servers.some((server) => server.url === ODATA));
+    iSeeTheForm(Then, "the empty form of a new agent", function (data) {
+        Opa5.assert.deepEqual(data.mcp_servers, [], "a new agent has no toolsets");
+    }, (data) => data.name === "" && data.mcp_servers.length === 0);
+    iFillANewAgentWithWrites(When, Then);
+
+    iPressSave(When);
+    iSeeAMessage(Then, "the write question for the new agent", function (dialog) {
+        Opa5.assert.strictEqual(messageOf(dialog), NEW_QUESTION, "compared with nothing stored, not with the agent seen before");
+        Opa5.assert.strictEqual(writes(), 0, "nothing is sent before the answer");
+    });
+    iAnswer(When, "Cancel");
+    iSeeTheForm(Then, "the form after Cancel", function () {
+        Opa5.assert.strictEqual(writes(), 0, "Cancel creates nothing");
+    });
+    Then.iStopTheApp();
+});

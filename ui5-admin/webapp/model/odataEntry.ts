@@ -100,6 +100,21 @@ function entryOf(servers: readonly McpServer[] | undefined | null): ODataEntry |
     return index === -1 ? undefined : clean((servers as McpServer[])[index].oauth as Record<string, unknown>);
 }
 
+/**
+ * The servers as a save sends them: every `builtin:odata` entry carries
+ * exactly `{services, allow_write: <boolean>}`, whatever form it was held in
+ * (the server answers with `has_client_secret` and leaves `allow_write` out
+ * when it is off). Every other server is passed on as it is; nothing given
+ * is changed.
+ */
+function explicit(servers: readonly McpServer[] | undefined | null): McpServer[] {
+    return (servers ?? []).map((server) => (
+        isODataUrl(server?.url)
+            ? { ...server, oauth: clean(server.oauth as Record<string, unknown>) as McpServer["oauth"] }
+            : server
+    ));
+}
+
 function stateOf(summary: ODataServiceSummary | undefined, catalogue: unknown): ODataEntryState {
     if (!Array.isArray(catalogue)) {
         return "unknown";
@@ -201,6 +216,7 @@ export default {
     clean,
     entryIndex,
     entryOf,
+    explicit,
     rows,
     options,
     opens,

@@ -59,6 +59,10 @@ export default class FakeBackend {
      *  it is asked) until `releaseMetadata`. */
     public metadataHeld = false;
     private heldMetadata: (() => void)[] = [];
+    /** While true, GET odata/services (the catalogue) is not answered until
+     *  `releaseCatalogue`. */
+    public catalogueHeld = false;
+    private heldCatalogue: (() => void)[] = [];
     /** Set to force the next matching call to fail. */
     public failNext?: FailNext;
     /** Every intercepted call as "METHOD path" (query string dropped), in
@@ -311,6 +315,18 @@ export default class FakeBackend {
         if (this.heldDestinations.length > 0) {
             this.destinationsMode = "held";
         }
+    }
+
+    /** Answers the catalogue reads that `catalogueHeld` kept waiting, with
+     *  the catalogue as it is now, and stops holding. */
+    public releaseCatalogue(): void {
+        this.catalogueHeld = false;
+        this.heldCatalogue.splice(0).forEach((answer) => answer());
+    }
+
+    /** How many catalogue reads are waiting. */
+    public heldCatalogueReads(): number {
+        return this.heldCatalogue.length;
     }
 
     /** Answers a held metadata read: the first one asked (`0`), the last one
@@ -1293,8 +1309,16 @@ export default class FakeBackend {
             return answer();
         }
         if (path === "odata/services" && method === "GET") {
-            const sorted = this.odataServices.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-            return this.json(sorted.map((s) => FakeBackend.odataSummary(s)));
+            const answer = (): Promise<Response> => {
+                const sorted = this.odataServices.slice().sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+                return this.json(sorted.map((s) => FakeBackend.odataSummary(s)));
+            };
+            if (this.catalogueHeld) {
+                return new Promise<Response>((resolve) => {
+                    this.heldCatalogue.push(() => resolve(answer()));
+                });
+            }
+            return answer();
         }
         if (path === "odata/services" && method === "POST") {
             const problems = FakeBackend.validateODataPayload(body);
@@ -1449,6 +1473,8 @@ export default class FakeBackend {
         this.heldDestinations = [];
         this.metadataHeld = false;
         this.heldMetadata = [];
+        this.catalogueHeld = false;
+        this.heldCatalogue = [];
         this.odataDestinations = [
             item("S4_ODATA_USER", {
                 ...onPremise, authentication: "PrincipalPropagation", user_propagating: true,

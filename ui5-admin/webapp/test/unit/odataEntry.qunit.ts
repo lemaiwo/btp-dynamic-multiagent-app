@@ -120,3 +120,24 @@ QUnit.test("newlyGiven: unticking, removing and no change give nothing", functio
     assert.deepEqual(odataEntry.newlyGiven({ services: ["a"], allow_write: false }, { services: ["a", "b"], allow_write: false }), none,
         "a service added without Allow writes");
 });
+
+QUnit.test("explicit: every odata entry is sent as exactly the services and a boolean allow_write, the other servers as they are", function (assert) {
+    const other: McpServer = { url: "https://x.hana.ondemand.com/mcp", auth_mode: "oauth2", oauth: { client_id: "c", has_client_secret: true } } as McpServer;
+    const echoedOff = { url: "builtin:odata", auth_mode: "destination", oauth: { services: ["a"], has_client_secret: false } } as unknown as McpServer;
+    const servers = [other, echoedOff];
+    const before = JSON.stringify(servers);
+
+    const sent = odataEntry.explicit(servers);
+    assert.deepEqual(sent[1], { url: "builtin:odata", auth_mode: "destination", oauth: { services: ["a"], allow_write: false } },
+        "stored off, echoed without the key: sent as the boolean false, without the echo");
+    assert.strictEqual(sent[0], other, "another server is passed on untouched");
+    assert.strictEqual(JSON.stringify(servers), before, "what was given is not changed");
+
+    const on = { url: " BUILTIN:OData/ ", auth_mode: "destination", oauth: { services: ["a", "b"], allow_write: true, has_client_secret: false } } as unknown as McpServer;
+    assert.deepEqual(odataEntry.explicit([on])[0].oauth, { services: ["a", "b"], allow_write: true }, "stored on stays on");
+    const text = { url: "builtin:odata", auth_mode: "destination", oauth: { services: ["a"], allow_write: "true" } } as unknown as McpServer;
+    assert.deepEqual(odataEntry.explicit([text])[0].oauth, { services: ["a"], allow_write: false }, "a text never opens writes");
+    const bare = { url: "builtin:odata", auth_mode: "destination" } as McpServer;
+    assert.deepEqual(odataEntry.explicit([bare])[0].oauth, { services: [], allow_write: false }, "an entry without a block still names both");
+    assert.deepEqual(odataEntry.explicit(undefined), [], "no servers");
+});

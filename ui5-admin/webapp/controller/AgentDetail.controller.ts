@@ -9,7 +9,7 @@ import { AdminError } from "../service/AdminService";
 import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import odataEntry from "../model/odataEntry";
-import type { ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
+import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
 import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
@@ -609,9 +609,7 @@ export default class AgentDetail extends BaseController {
      * the dialog: the catalogue may have changed since. A service that
      * cannot be read is asked about and said to be unread.
      */
-    private async odataSaveQuestion(data: AgentInput): Promise<string | undefined> {
-        const given = odataEntry.newlyGiven(
-            odataEntry.entryOf(this.storedServers), odataEntry.entryOf(data.mcp_servers));
+    private async odataSaveQuestion(data: AgentInput, given: ODataEntryGiven): Promise<string | undefined> {
         if (!given.switchedOn && given.services.length === 0) {
             return undefined;
         }
@@ -820,19 +818,30 @@ export default class AgentDetail extends BaseController {
         }
 
         // --- odata --- One question when this save newly gives writes.
+        // `toSave` is the form as it is now: the question is built from it
+        // and the same object is sent, so an edit made while the question
+        // reads the catalogue cannot be saved without having been asked about.
         this.saving = true;
         const agentId = this.agentId;
+        const toSave = JSON.parse(JSON.stringify(data)) as AgentInput;
+        // Decided before anything is read: whether this save gives writes
+        // does not depend on a read that can fail.
+        const given = odataEntry.newlyGiven(
+            odataEntry.entryOf(this.storedServers), odataEntry.entryOf(toSave.mcp_servers));
         let question: string | undefined;
         try {
-            question = await this.odataSaveQuestion(data);
+            question = await this.odataSaveQuestion(toSave, given);
         } catch {
-            question = undefined;
+            // What it opens could not be worked out: ask anyway, never save
+            // newly given writes without a question.
+            question = given.switchedOn || given.services.length > 0
+                ? this.text("odataEntrySaveUnknown", [toSave.name]) : undefined;
         }
         if (this.agentId !== agentId || !this.saving) {
             return; // another agent was opened meanwhile
         }
         if (!question) {
-            await this.saveAgent(data);
+            await this.saveAgent(toSave);
             return;
         }
         const save = this.text("save");
@@ -843,7 +852,7 @@ export default class AgentDetail extends BaseController {
             initialFocus: MessageBox.Action.CANCEL,
             onClose: (action: string | null) => {
                 if (action === save && this.agentId === agentId && this.saving) {
-                    void this.saveAgent(data);
+                    void this.saveAgent(toSave);
                 } else {
                     this.saving = false;
                 }
@@ -853,7 +862,11 @@ export default class AgentDetail extends BaseController {
 
     private async saveAgent(data: AgentInput): Promise<void> {
         try {
-            const saved = await this.getAdminService().upsertAgent(data, this.agentId);
+            // --- odata --- The entry is sent as exactly { services,
+            // allow_write: <boolean> }, also when its dialog was never opened
+            // and the form still holds the form the server answered with.
+            const sent = { ...data, mcp_servers: odataEntry.explicit(data.mcp_servers) };
+            const saved = await this.getAdminService().upsertAgent(sent, this.agentId);
             MessageToast.show(this.text("agentSaved"));
             this.agentId = saved.id;
             this.getRouter().navTo("agents");
