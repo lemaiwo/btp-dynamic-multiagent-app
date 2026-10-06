@@ -39,7 +39,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   tables back the workflow engine: `Workflow`, `WorkflowBranch`,
   `WorkflowStep` (the definition), and `WorkflowRun`, `WorkflowItemRun`,
   `WorkflowStepRun` (what happened on a run). `validate_workflow_parts` is
-  the save-time gate that rejects a definition that cannot run
+  the save-time gate that rejects a definition that cannot run. Two more
+  tables back `builtin:odata`: `ODataService` (`odata_services`, the
+  catalogue: identity columns plus `definition_json`, one `updated_at` per
+  row stamped by `update_odata_service`) and `ODataAuditLog`
+  (`odata_audit_log`, the write audit). `validate_odata_service` (re-exported
+  from `agents/odata/models.py`) is the save-time gate of a catalogue
+  service. The `builtin:odata` entry of an agent is exactly
+  `{"url": "builtin:odata", "auth_mode": "destination", "oauth": {"services":
+  [...], "allow_write": true}}` (`_clean_odata_entry`): 1 to 50 distinct
+  service slugs, `allow_write` stored only for the JSON boolean `true`, no
+  destination and no `user_context` (those belong to each catalogue service),
+  every other key dropped; an agent has at most one such entry, and
+  `check_odata_services` refuses an unknown service name at every agent
+  write, under a row lock
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin`/`require_developer` FastAPI dependencies
@@ -77,7 +90,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/oauth_routes.py` — `GET /oauth/callback` completes the flow
 - `agents/builtins.py` — registry of `builtin:` pseudo-URLs and the factory
   that turns one into a toolset. The set is closed; an unknown `builtin:` URL
-  is rejected at admin validation
+  is rejected at admin validation. `builtin:odata` is the one whose entry
+  names no destination and the one factory that also receives the catalogue
+  snapshot the registry loaded; it is always built with the storing audit
+  recorder (`stored_recorder()`), so no caller can build it with writes that
+  are not recorded
 - `agents/gmail_tools.py` — in-process Gmail tools over the REST API,
   attached when an agent lists the pseudo-URL `builtin:gmail` instead of an
   MCP endpoint. Google's hosted Gmail MCP server refuses every `tools/call`
@@ -134,10 +151,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `resolve(user_token=, principal=)` sends the user's JWT as `X-user-token`
   so a user-propagating destination (OAuth2UserTokenExchange, OAuth2JWTBearer,
   OAuth2SAMLBearerAssertion, PrincipalPropagation) returns that user's token;
-  per-user results live in a bounded LRU keyed by principal, apart from the
-  app-level entry. `Destination.auth_type` echoes the `Authentication` type
+  per-user results live in a bounded LRU keyed by principal AND a digest of
+  the token, apart from the app-level entry (a "Run now" job carries the
+  trigger's JWT under the run-as principal, so a principal alone would let
+  one user's credential serve another; the Outlook/Teams caches and the
+  OData CSRF store follow the same rule, the former with a 900 s TTL).
+  `Destination.auth_type` echoes the `Authentication` type
   for diagnostics; `require_credential=False` accepts a bare-URL destination
-  (public targets)
+  (public targets). `Destination` also carries `proxy_type`, `location_id`
+  (`CloudConnectorLocationId`) and `queries` (the `URL.queries.*`
+  properties, e.g. `sap-client`). `ConnectivityConfig` and
+  `connectivity_config_from_environment` read the connectivity binding from
+  `VCAP_SERVICES` (env fallback `CONNECTIVITY_*`); `ConnectivityTokens` gets
+  the application's token (client credentials) or a user's (jwt-bearer
+  exchange), cached per owner and token digest, and fails with class,
+  status and OAuth code only, never the endpoint's text
 - `agents/destination_auth.py` — `DestinationAuth` (httpx auth) and
   `destination_http_client`: a built-in issues requests against
   `PLACEHOLDER_BASE` (`https://destination.invalid`), the auth resolves the
@@ -149,10 +177,154 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   JWT is bound -- scheduled runs. Every built-in accepts
   `auth_mode="destination"` with `{destination, user_context}` plus its pinned
   keys; `user_context=false` keeps the app-only rules (mailbox required,
-  Teams read-only). Storage keys per built-in are `_DEST_KEYS_BY_URL` in
+  Teams read-only); `user_context` is stored for Gmail, Outlook and Teams
+  only (Jira, Slack, SMTP and the SAP-notes built-ins are app-level) and
+  `builtin:odata` carries it per catalogue service. Storage keys per
+  built-in are `_DEST_KEYS_BY_URL` in
   `agents/db.py`; save-time rules are `_validate_destination_config` in
   `agents/admin.py`; `GET /admin/api/credential-health` reports
-  destination servers under `destinations`
+  destination servers under `destinations`.
+  **OnPremise destinations** (`ProxyType: OnPremise`, a virtual host behind a
+  Cloud Connector) are reached only by a client built for it
+  (`routed_auth` / `destination_http_client(..., connectivity=...)`, today
+  the OData toolset, its `$metadata` preview and its test call; every other
+  built-in refuses one): the request keeps the destination's `http://` URL
+  (an `https://` OnPremise URL is refused: a CONNECT tunnel would hand the
+  proxy token to the target) and goes to the connectivity proxy in HTTP
+  forward mode with a per-request `Proxy-Authorization`, through
+  `OnPremiseRouter`, which refuses a request carrying a proxy token that was
+  not shaped for the proxy. A technical service sends the application's
+  connectivity token and the destination's own `Authorization`. A
+  signed-in-user service requires `Authentication: PrincipalPropagation`,
+  sends no credential stored in the destination and none the caller set, and
+  carries the identity by `CONNECTIVITY_PP_MODE`: `exchange` (default; a token
+  exchanged from the user's JWT in `Proxy-Authorization`) or `header` (the
+  application's token there plus the JWT in `SAP-Connectivity-Authentication`);
+  the variable is read only when such a request needs it and any other value
+  refuses that request. No JWT bound is `DestinationUserRequired` before any
+  token or proxy call: a user run never falls back to the application's
+  identity. `SAP-Connectivity-SCC-Location_ID` is sent when the destination
+  names a location; no connectivity binding is a `DestinationError`; a 407
+  from the proxy drops that owner's token, retries once and then surfaces as
+  the code `proxy_refused` (never blamed on SAP). For EVERY destination the
+  connectivity headers and `Host` cannot be set by a `URL.headers.*` property,
+  and `URL.queries.*` are sent with every request (a caller's parameter of the
+  same name wins; a client built for the connectivity route skips `$`-prefixed
+  names so a destination cannot add `$filter` or `$expand` behind the argument
+  checks)
+- `agents/odata/` — OData V2/V4 services as an in-process toolset
+  (`builtin:odata`). An admin curates a **catalogue** in the database (which
+  services, entity sets, fields and operations exist *for agents*); an agent
+  gets exactly two tools, `search_operations` and `execute_operation`, and
+  never a URL, a destination name or a free path: a name the catalogue does
+  not hold does not exist for the model. Identity is per catalogue service
+  (`destination` + `user_context`, "Runs as" in the UI), never per agent. The
+  agent's entry only lists services and says `allow_write`. Rules enforced in
+  code, not by prompt: **only fields marked readable (`selectable`) reach the
+  model**, whatever SAP sent (`__metadata`, `@odata.*` and the raw ETag are
+  dropped); a filterable field must be selectable (else a filter could probe
+  hidden values); key field NAMES are always visible, key VALUES come back only
+  for a selectable key; `$select` is always sent; a `filter` is only a
+  parameter value, checked field by field against the catalogue (V4 enum
+  fields only with a typed literal, complex and collection fields never); a
+  navigation or `$expand` needs the target set enabled in the catalogue.
+  **The write rule**: a call is a read only when the operation's
+  `changes_data` is false AND its method is `GET`; everything else (create,
+  update, delete, and every call that is not such a read, a V2 function import
+  or a V4 action always) is a write and needs the catalogue operation enabled
+  AND `allow_write` exactly `true`, and is audited. A `POST` stored with
+  `changes_data: false` is not refused at save: it is stored and run as an
+  audited write. Tools are denied in ABAP Assistant sessions by
+  `ReadOnlyGuard` (default-deny by name; they are not in `READONLY_POLICY`)
+  - `models.py` — the definition models (`ODataServicePayload`,
+    `ServiceDefinition`, `EntitySetDef`, `FieldDef`, `OperationDef`; all
+    `extra="forbid"`) and `validate_odata_service`, the save-time gate: names
+    unique, keys are fields, `list`/`get` need a selectable field, `create`/
+    `update` a writable one, V2 allows only function imports, V4 only actions
+    (`POST`) and functions (`GET`), `title`/`purpose`/`not_for` one line,
+    `definition` required, booleans strict. Refusals name the field and the
+    rule, never a value (`agents/loc_fields.py`). `OperationDef.is_write` is
+    the one write rule; `returns` names the entity set an operation answers
+    with. Never imports `agents.db`
+  - `urls.py`, `common.py` — path confinement (`confine_service_path`,
+    `join_path`: a model or admin value is only ever a path below the
+    destination's host), the key predicate (one segment, written by typed
+    literal; `/ \ % ? #` and `..` in a string key are refused because
+    `DestinationAuth` rebuilds the URL from the decoded path), `check_filter`,
+    and the error-envelope reader
+  - `client.py`, `v2.py`, `v4.py` — `ODataClient` re-enforces the catalogue
+    on the way out and on the way back (`check_read`, `check_write`,
+    `check_call`; rows cut to the selectable fields that were asked for),
+    one gate for both versions; the dialects hold literals, query option
+    names and payload shapes. Nothing a back end says reaches the caller
+    except the short code and message of a proper OData error envelope.
+    A write takes its CSRF token and cookies from the identity of this
+    request, is repeated only after a refusal that says it was not
+    processed (one repeat after a 403 `Required`), never after a failure
+    (`write_outcome_unknown`; `ODataError.sent` says whether the change left
+    the app), and success is recognised positively (a sign-in page at 200 is
+    not a success). Known limits: V4 decimals below 0.0001 cannot be written
+    (no `IEEE754Compatible`); `@odata.context` is not yet required to
+    confirm a V4 write (undecided until the pilot); V4 enum members are not
+    read from `$metadata`
+  - `session.py` — `CsrfSessionStore`: token and SAP session cookies per
+    destination and per user, in memory, never in the shared HTTP client; the
+    key follows the credential that is *sent* (`user:<principal>:<sha256 jwt>`),
+    so a user entry is served only to a request that carries the same token
+  - `search.py`, `calls.py` — `search_operations` over the snapshot: only
+    what the catalogue enables is listed, writes and `changes_data`
+    operations only with `allow_write`, results built key by key (a UI-only
+    flag cannot leak), and only what `execute_operation` can run
+    (`calls.py` is the one "callable" rule, also used to list uncallable
+    enabled operations in the service detail)
+  - `tools.py` — `odata_toolset(...)`: the two tools, snapshot loaded by the
+    registry at reload (no database read per call, an edit applies on the
+    next reload). Every refusal is `{"error": {code, message, hint?}}`, never
+    an exception. The model never holds an ETag: a `get` returns an opaque
+    handle (`h-...`, tied to identity, service, entity set and key, TTL 15
+    min, bounded) only where the entity set can be changed and the entry has
+    `allow_write`; the real ETag stays server-side and goes out as
+    `If-Match`. **Audit rule: no intent row, no write.** Every modifying call
+    that passed its checks has an `intent` row committed before a client is
+    built or anything is sent, and a result row exactly once afterwards;
+    without a storing recorder, or when the intent cannot be written,
+    nothing is sent (`audit_not_configured` / `audit_unavailable`)
+  - `audit.py` — `StoredWriteRecorder`, the `odata_audit_log` rows: names and
+    keys only (field NAMES, never a value, token, cookie or ETag), `sent_as`
+    (the identity SAP saw, from the validated JWT that was sent) and
+    `run_principal` separately; a row left `intent` means the write MAY
+    have been sent. Purged by age (`ODATA_AUDIT_RETENTION_DAYS`, default 365,
+    `0` keeps forever and logs a WARNING, floor 7 days) from `app.py`'s
+    retention pass; `drain()` at shutdown
+  - `metadata.py`, `preview.py`, `testcall.py` — `$metadata` import. The
+    parser treats the document as untrusted: no DTD (two layers), caps on
+    size (20 MB), depth, elements (75,000) and attributes (750,000), a work
+    budget, ASCII-only names; one odd element is skipped and recorded
+    (`ParsedMetadata.skipped`), not fatal. It is CPU work: call it through
+    `asyncio.to_thread`. `preview.py` fetches ONE document by destination
+    and service path (no redirect, no retry, a byte cap, 25 s for fetch and
+    parse, two previews at a time) and answers names, types, labels and what
+    SAP *declares* under `declared`/`suggested` keys, enabling nothing.
+    `testcall.py` does one `top=1` read through a stored service and answers
+    outcome, status, duration and names, never a row
+  - `destinations.py` — the destination dropdown: reads exactly five
+    properties of each destination (`Name`, `Description`, `Type`,
+    `ProxyType`, `Authentication`); URL, user and credential never leave it
+  - `admin_routes.py` — `/admin/api/odata/...`, every route with its own
+    `require_admin`, bodies read as raw JSON and validated in the handler so a
+    refusal never echoes input. Catalogue CRUD (`GET`/`POST /services`,
+    `GET`/`PUT`/`DELETE /services/{name}`, `POST /services/{name}/duplicate`);
+    a `PUT` takes `expected_updated_at` and answers 409 when the stored row
+    moved (lock, compare, write in one transaction); `DELETE` answers 409 while
+    any agent, enabled or not, attaches the service; `POST /metadata`,
+    `POST /services/{name}/test`, `GET /destinations`, `GET /audit`. A
+    preview, test or destination-list failure carries a stable code in the
+    `X-OData-Error` header (`busy`, `invalid_path`, `user_token_required`,
+    `destination_error`, `proxy_refused`, `unreachable`, `redirect`,
+    `sap_error`, `not_xml`, `too_large`, `timeout`, `invalid_metadata`,
+    `unknown_target`, `operation_disabled`, `no_destination_service`,
+    `token_failed`, `list_failed`); a test that ran and failed is a 200 with
+    `ok: false`
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -184,7 +356,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   tool per peer to that agent, so a chain can run specialist to specialist
   instead of through the orchestrator. Recursion is bounded by
   `AGENT_DELEGATION_MAX_DEPTH` and a re-entry guard. `AgentConfig.model_name`
-  overrides the globally active model per agent
+  overrides the globally active model per agent. For `builtin:odata` it loads
+  the catalogue snapshot of the services the agents list at reload and adds
+  an `## OData services` block to the specialist's instructions (one line per
+  attached service: name, title, purpose, "not for"; the text is stripped of
+  control characters and of the delimiter tag); an entry with no usable
+  service builds the agent without the OData tools; retired builds drain
+  their audit recorder
 - `agents/deep.py` — opt-in "deep agent" tools per specialist
   (`AgentConfig.deep_json`, parsed by `DeepConfig`): `write_todos`/
   `read_todos`, an in-memory per-run scratchpad (`ls`/`read_file`/
@@ -584,19 +762,45 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   and are substituted, never evaluated. Mirrored in the UI by
   `ui5-admin/webapp/model/stepKinds.ts` and the step editors in both admins
 - `agents/admin.py` — FastAPI `/admin` router: agent + skill + workflow CRUD,
-  reload, restart, import/export, seed-on-startup
+  reload, restart, import/export, seed-on-startup. It includes the OData
+  catalogue router (`agents/odata/admin_routes.py`). Export carries
+  `odata_services`; import takes them first (up to 200, `enabled` required,
+  a duplicate name refused, unchanged services not restamped) and with
+  `replace` deletes only a service that is absent from a non-empty section
+  and attached by no remaining agent; the answer adds
+  `imported_/created_/updated_/removed_odata_services`,
+  `removed_odata_service_names` and `odata_identity_changes`, and the import
+  does not reload the registry. `GET /admin/api/credential-health` lists a
+  `builtin:odata` entry once per attached service (`service`,
+  `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
+  `error` | `unbound` | `missing`)
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
   `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
   `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
-- `templates/admin.html` — Admin UI (single-page, vanilla JS)
+- `templates/admin.html` — Admin UI (single-page, vanilla JS); attaches
+  catalogue services to an agent (checkbox list and Allow writes), the
+  catalogue itself is edited only in `ui5-admin/`
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is unchanged and still the supported admin at
   `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
   `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
-  auth modes the server accepts per built-in
+  auth modes the server accepts per built-in. The **OData services** area
+  (nav entry between Skills and Runs; `view/ODataServices` = list with Used by,
+  Write tag, import of a configuration; `view/ODataServiceDetail` = identity
+  ("Runs as" signed-in or technical user, destination field), purpose / not
+  for, entity sets, operations, used by, test call) keeps its logic in
+  `model/odataCatalog.ts` and `model/odataDestinations.ts` and its dialogs in
+  `controller/odata/` (entity set, operation, `$metadata` import, duplicate).
+  Rules the UI enforces: nothing is ticked by an import; every path that
+  stores or enables a write (a ticked create/update/delete, an enabled
+  data-changing operation) or widens access (unticking Changes data) lists it
+  and asks on Save; a save is a GET plus a `PUT` with `expected_updated_at`;
+  the destination field is an `sap.m.Input` with suggestions, `autocomplete`
+  off and a value help (own picker on a phone), so the stored value is what was
+  typed or explicitly picked; it relies on public API only
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
@@ -613,7 +817,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `IDE_TRACE_MAX_HOURS`, `IDE_TRACE_ARM_TIMEOUT_S`; 2.19.0 is the ABAP
   Assistant release (review comments, revisions, pins, the reworked
   `ui5-ide`): no new env vars, the new IDE columns and tables are added by
-  `init_db` at start
+  `init_db` at start; 2.20.0 adds the `agent-connectivity` resource
+  (`connectivity`, plan `lite`, bound to the app) and `ODATA_AUDIT_RETENTION_DAYS`
+  (365); `CONNECTIVITY_PP_MODE` is not in the descriptor (set per landscape in
+  an `.mtaext`; default `exchange`)
+- `scripts/probe_odata_connectivity.py` — standalone probe (stdlib + `httpx`,
+  nothing imported from the app) run inside an app container that has the
+  connectivity binding: proves HTTP forward mode on an `http://` virtual host,
+  the technical-user path and which principal-propagation mode the proxy
+  accepts; prints names, statuses and the SAP user header, never a credential
+  or a body; a user run takes a one-time passcode from the terminal
 - `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
   resource group if missing, idempotent, no-op for `default`. Creates the
   group only; model deployments stay in `scripts/deploy_claude.py` because
@@ -658,6 +871,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 6. A diagnose run may end with `approval_required` (a proposed trace): the
    developer answers with `POST /ide/api/sessions/{id}/approvals/{aid}`
    (`approve`/`deny`); only that route arms the trace
+7. An agent with a `builtin:odata` entry calls `execute_operation`: catalogue
+   and write checks (service, target, fields, the two write switches) -> for a
+   write, the `intent` audit row is committed -> the service's destination is
+   resolved as its identity (technical, or the bound user JWT) -> a request
+   to the destination's host, through the connectivity proxy for an OnPremise
+   destination -> rows cut to the readable fields -> the result row is
+   written. A refusal or a SAP error is returned to the model as an `error`
+   object, never raised
 
 ## Running locally
 ```bash
@@ -678,6 +899,8 @@ bump a pin, rerun the suites, then deploy.
   meta package declares none of those extras; the imports work because it
   pulls them in anyway)
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
+- `builtin:odata` adds no dependency: `$metadata` is parsed with the standard
+  library's expat
 - `sqlalchemy[asyncio]`, `asyncpg` (Postgres on CF), `aiosqlite` (the
   local SQLite fallback) — dynamic agent storage
 - `pyjwt[crypto]` — XSUAA JWT validation
