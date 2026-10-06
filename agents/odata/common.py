@@ -13,7 +13,9 @@ so that an edit made for one version cannot silently change the other:
   the request URL from the *decoded* path, so an encoded ``%2F`` in a key
   would reach SAP as a real ``/`` and an encoded ``%`` would start an
   escape. ``urls.join_path`` checks the result again;
-* reading an error envelope, and nothing but an envelope, from an answer.
+* reading an error envelope, and nothing but an envelope, from an answer;
+* when a decimal given as a JSON NUMBER may be sent (``plain_float``): the
+  one rule for a V2 or V4 body and a V2 or V4 URL literal.
 
 No refusal repeats a value.
 """
@@ -21,6 +23,7 @@ No refusal repeats a value.
 from __future__ import annotations
 
 import html
+import math
 import re
 from collections.abc import Callable
 from typing import Any
@@ -37,6 +40,37 @@ _KEY_BREAKERS = ("/", "\\", "%", "?", "#")
 
 _XML_CODE = re.compile(r"<code[^<>]*>([^<]{0,200})</code>")
 _XML_MESSAGE = re.compile(r"<message[^<>]*>([^<]{0,2000})</message>")
+
+
+# Plain digits: no sign other than a leading minus, no exponent.
+_PLAIN_DECIMAL = re.compile(r"-?[0-9]{1,40}(?:\.[0-9]{1,40})?")
+# The most significant digits of a decimal passed as a NUMBER that are
+# trusted: the JSON parser that read it has already rounded a longer one.
+MAX_FLOAT_DIGITS = 15
+DECIMAL_TEXT_HINT = (
+    'pass it as text, for example "12.50": a number with more than 15 '
+    "significant digits may already be rounded and is not sent"
+)
+
+
+def plain_float(value: float) -> str | None:
+    """``repr(value)`` when a decimal given as a number may be sent as that
+    text, else ``None``.
+
+    THE rule for an ``Edm.Decimal`` that arrives as a JSON number, asked by
+    both dialects for a body value and for a URL literal (a key, a function
+    parameter): plain digits only (``repr`` switches to an exponent below
+    0.0001 and from 1e16 on), and at most ``MAX_FLOAT_DIGITS`` significant
+    digits; the ``.0`` that ``repr`` appends to a whole number is not one.
+    A longer number was rounded by whoever parsed the JSON: in a key it
+    could name another entity, in a body it would write another amount than
+    the one meant. As text, every digit goes out as given.
+    """
+    text = repr(value) if math.isfinite(value) else ""
+    if not _PLAIN_DECIMAL.fullmatch(text):
+        return None
+    digits = text.lstrip("-").removesuffix(".0").replace(".", "").lstrip("0")
+    return text if len(digits) <= MAX_FLOAT_DIGITS else None
 
 
 def refuse(edm_type: object) -> ODataError:

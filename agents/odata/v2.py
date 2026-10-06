@@ -39,9 +39,6 @@ _CLOCK = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]{1,
 _DATETIME = re.compile(_CLOCK)
 _DATETIMEOFFSET = re.compile(_CLOCK + r"(?:Z|[+-][0-9]{2}:[0-9]{2})")
 _TIME = re.compile(r"PT(?:[0-9]{1,2}H)?(?:[0-9]{1,2}M)?(?:[0-9]{1,2}(?:\.[0-9]{1,7})?S)?")
-# The most significant digits of a decimal passed as a NUMBER that are
-# trusted in a literal (the same rule as `v4._plain_float`).
-_MAX_FLOAT_DIGITS = 15
 _INTEGER_TYPES = {
     "Edm.Byte": "",
     "Edm.SByte": "",
@@ -69,12 +66,14 @@ _INTEGER_RANGES = {
 _JSON_DATE = re.compile(r"/Date\(-?[0-9]{1,15}\)/")
 _JSON_DATE_OFFSET = re.compile(r"/Date\(-?[0-9]{1,15}(?:[+-][0-9]{4})?\)/")
 _DATE_HINTS = {
+    "Edm.Decimal": common.DECIMAL_TEXT_HINT,
     "Edm.DateTime": "write it as 2026-10-05T00:00:00 (date and time, no time zone), "
     "or hand back the /Date(...)/ value a read returned",
     "Edm.DateTimeOffset": "write it in UTC as 2026-10-05T12:00:00Z (no other offset is "
     "accepted), or hand back the /Date(...)/ value a read returned",
 }
 _PARAM_HINTS = {
+    "Edm.Decimal": common.DECIMAL_TEXT_HINT,
     "Edm.DateTime": "write it as 2026-10-05T00:00:00 (date and time, no time zone)",
     "Edm.DateTimeOffset": "write it as 2026-10-05T12:00:00Z",
     "Edm.Time": "write it as an ISO 8601 duration, for example PT12H30M",
@@ -130,10 +129,7 @@ class V2Dialect:
                 # JSON: in a key it could name another entity than the one
                 # meant. As text, every digit goes out as given. (The `.0`
                 # that `repr` appends to a whole number is not a digit.)
-                text = repr(value) if math.isfinite(value) else ""
-                digits = text.lstrip("-").removesuffix(".0").replace(".", "").lstrip("0")
-                if len(digits) > _MAX_FLOAT_DIGITS:
-                    raise _refuse(edm_type)
+                text = common.plain_float(value)
             if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
                 raise _refuse(edm_type)
             return text + "M"
@@ -399,6 +395,10 @@ class V2Dialect:
             text = value
             if isinstance(value, int):
                 text = str(value)
+            elif isinstance(value, float) and edm_type == "Edm.Decimal":
+                # The rule of the V4 body and of both URL literals: a number
+                # with more than 15 significant digits was already rounded.
+                text = common.plain_float(value)
             elif isinstance(value, float) and math.isfinite(value):
                 text = repr(value)
             if not isinstance(text, str) or not _DECIMAL.fullmatch(text):

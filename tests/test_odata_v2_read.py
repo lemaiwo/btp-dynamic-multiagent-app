@@ -7,6 +7,7 @@ on what the back end would have received.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -879,8 +880,9 @@ def test_clip_result_handles_an_item_a_call_result_and_the_impossible():
         and len(json.dumps(text)) <= 500
         and text["result"].startswith("vvv")
     )
+    # Final review B5: no row fits -> a refusal, not an empty page (see below).
     tiny = clip_result({"items": [{"a": "x" * 500}], "truncated": False}, 60)
-    assert tiny == {"items": [], "truncated": True}
+    assert set(tiny) == {"error"} and tiny["error"]["code"] == "result_too_large"
     assert clip_result({"ok": True, "status": 204}, 10_000) == {
         "ok": True,
         "status": 204,
@@ -1112,3 +1114,78 @@ async def test_list_and_get_send_exactly_what_check_read_planned():
     await odata.get(ES_ITEM, KEY, select=["Plant"], expand=[])
     assert sap.requests[1].url.path == plan.path
     assert dict(sap.requests[1].url.params) == V2Dialect().read_params(plan.query)
+
+
+# -- final review B2: a refusal never names an entity set the agent did not name
+
+
+def _hidden_target(**target_patch) -> ODataClient:
+    """The item set navigates to the header set; ``target_patch`` closes the
+    header (no operations, or no selectable field). An agent that only knows
+    the item set and guesses the navigation must not learn the header's name."""
+    data = copy.deepcopy(SERVICE)
+    header = data["definition"]["entity_sets"][0]
+    assert header["name"] == "A_PurchaseRequisitionHeader"
+    header.update(target_patch)
+    return client(Sap(), data)
+
+
+@pytest.mark.parametrize(
+    "patch, call",
+    [
+        ({"operations": []}, {"navigation": "to_PurchaseReqn"}),
+        ({"operations": ["list"]}, {"navigation": "to_PurchaseReqn"}),
+        ({"operations": []}, {"expand": ["to_PurchaseReqn"]}),
+    ],
+)
+def test_a_refused_navigation_names_the_navigation_not_its_target(patch, call):
+    odata = _hidden_target(**patch)
+    item = odata._definition.entity_set("A_PurchaseRequisitionItem")
+    with pytest.raises(ODataError) as err:
+        odata.check_read(item, "get", key=KEY, **call)
+    assert err.value.code == "operation_disabled"
+    text = f"{err.value.message} {err.value.hint or ''}"
+    assert "A_PurchaseRequisitionHeader" not in text, text
+    assert "to_PurchaseReqn" in text and "cannot be" in text
+
+
+def test_a_target_without_a_readable_field_is_not_named_either():
+    """Not reachable through a saved definition (a readable set needs a
+    selectable field); the refusals hold the rule all the same."""
+    odata = client(Sap())
+    hidden = [f.model_copy(update={"selectable": False}) for f in ES_HEADER.fields]
+    target = ES_HEADER.model_copy(update={"fields": hidden})
+    with pytest.raises(ODataError) as via_navigation:
+        odata._projection(target, None, None, via="to_PurchaseReqn")
+    assert via_navigation.value.message == (
+        "the target of navigation 'to_PurchaseReqn' cannot be read"
+    )
+    odata._definition = odata._definition.model_copy(
+        update={"entity_sets": [target, ES_ITEM]}
+    )
+    with pytest.raises(ODataError) as expanded:
+        odata._projection(ES_ITEM, None, ["to_PurchaseReqn"])
+    for error in (via_navigation.value, expanded.value):
+        assert error.code == "operation_disabled"
+        assert "A_PurchaseRequisitionHeader" not in error.message
+    assert "to_PurchaseReqn" in expanded.value.message
+
+
+def test_a_page_of_which_no_row_fits_is_a_refusal_not_an_empty_page():
+    """Final review B5: an empty page with the unchanged ``next_skip`` would
+    send the model round in circles on the same row."""
+    rows = [{"a": "x" * 5000}, {"a": "y" * 5000}]
+    for extra, skip in (({"next_skip": 12}, None), ({}, 10), ({}, None)):
+        clipped = clip_result({"items": rows, "truncated": False, **extra}, 2000, skip=skip)
+        assert set(clipped) == {"error"}, clipped
+        assert clipped["error"]["code"] == "result_too_large"
+        assert "fewer fields or no expand" in clipped["error"]["hint"]
+        assert "xxx" not in json.dumps(clipped) and "next_skip" not in json.dumps(clipped)
+    # One row fits: a page as before, moved back to the first dropped row.
+    page = clip_result(
+        {"items": [{"a": "x" * 500}, {"a": "y" * 5000}], "truncated": False, "next_skip": 12},
+        2000,
+    )
+    assert len(page["items"]) == 1 and page["next_skip"] == 11 and page["truncated"] is True
+    # An empty page that fits stays an empty page.
+    assert clip_result({"items": [], "truncated": False}, 2000) == {"items": [], "truncated": False}

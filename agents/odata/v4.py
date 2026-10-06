@@ -117,26 +117,8 @@ _VALUE_HINTS = {
 # own digits, so only a NUMBER has a limit there.
 _LITERAL_HINTS = {
     **_VALUE_HINTS,
-    "Edm.Decimal": 'pass it as text, for example "12.50": a number with more than 15 '
-    "significant digits may already be rounded and is not sent",
+    "Edm.Decimal": common.DECIMAL_TEXT_HINT,
 }
-# The most significant digits of a decimal passed as a NUMBER that are
-# trusted: the JSON parser that read it has already rounded a longer one.
-_MAX_FLOAT_DIGITS = 15
-
-
-def _plain_float(value: float) -> str | None:
-    """``repr(value)`` when a decimal may be sent as that text, else ``None``.
-
-    Plain digits only (``repr`` switches to an exponent below 0.0001 and
-    from 1e16 on), and at most ``_MAX_FLOAT_DIGITS`` significant digits; the
-    ``.0`` that ``repr`` appends to a whole number is not one.
-    """
-    text = repr(value) if math.isfinite(value) else ""
-    if not _DECIMAL.fullmatch(text):
-        return None
-    digits = text.lstrip("-").removesuffix(".0").replace(".", "").lstrip("0")
-    return text if len(digits) <= _MAX_FLOAT_DIGITS else None
 
 
 def _type_shown(edm_type: str) -> str:
@@ -229,7 +211,7 @@ class V4Dialect:
             if isinstance(value, float):
                 # A long number was rounded by whoever parsed the JSON: in a
                 # key it could name another entity than the one meant.
-                text = _plain_float(value)
+                text = common.plain_float(value)
             if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
                 raise _refuse(edm_type)
             return text
@@ -369,9 +351,9 @@ class V4Dialect:
 
         * given as text, the float must read back as exactly the digits
           given (``12.50`` and ``12.5`` are the same number);
-        * given as a number, it has at most ``_MAX_FLOAT_DIGITS``
-          significant digits: whoever parsed the JSON has already rounded a
-          longer one, and what was meant cannot be told any more.
+        * given as a number, it passes ``common.plain_float`` (at most 15
+          significant digits): whoever parsed the JSON has already rounded
+          a longer one, and what was meant cannot be told any more.
 
         An integer (a number, or text without a point) is exact at any size.
         """
@@ -379,7 +361,7 @@ class V4Dialect:
         if isinstance(value, int) and not isinstance(value, bool):
             return value
         if isinstance(value, float):
-            if _plain_float(value) is None:
+            if common.plain_float(value) is None:
                 raise _refuse(edm_type)
             return value
         if not isinstance(value, str) or not _DECIMAL.fullmatch(value):

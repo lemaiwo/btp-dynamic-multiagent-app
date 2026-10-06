@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -567,6 +568,30 @@ async def test_success_is_recognised_positively(alice, answer):
         assert len(w.sap.calls) == 1
         row = (await all_rows())[-1]
         assert (row.outcome, row.phase) == ("unknown", "write")
+
+
+@pytest.mark.parametrize("answer, expected, outcome", [
+    (lambda: httpx.Response(500, headers={"content-type": "text/html"}, text="<html>Error"),
+     "write_outcome_unknown", "unknown"),
+    (lambda: httpx.Response(503), "write_outcome_unknown", "unknown"),
+    (lambda: httpx.Response(502, text="bad gateway"), "write_outcome_unknown", "unknown"),
+    (lambda: v4_error(500, "SY/530", "Dump"), "sap_error", "sap_error"),
+    (lambda: v4_error(503, "SY/530", "Busy"), "sap_error", "sap_error"),
+])
+async def test_a_5xx_without_an_error_envelope_leaves_the_outcome_open(
+    alice, answer, expected, outcome
+):
+    """Final review B1: "SAP refused" is said only when SAP said so."""
+    for call in (UPDATE, {"target": "Approve", "operation": "call", "key": KEY}):
+        w = World()
+        w.sap.answer = answer()
+        out = await w.run(**call)
+        assert code(out) == expected, out
+        assert len(w.sap.calls) == 1  # never repeated
+        if expected == "write_outcome_unknown":
+            assert "not known" in out["error"]["message"] and out["error"]["hint"]
+        row = (await all_rows())[-1]
+        assert (row.outcome, row.phase) == (outcome, "write")
 
 
 async def test_a_v4_error_envelope_reaches_the_model_as_code_and_text_only(alice):
@@ -1435,3 +1460,28 @@ def test_key_names_and_key_types_filter_the_same_keys_and_no_key_is_not_addressa
         )
         (match,) = found["matches"]
         assert match["operations"] == ["list", "create"] and match["key"] == []
+
+
+async def test_a_confirmed_v4_write_logs_what_the_pilot_needs_and_no_body(alice, caplog):
+    """Final review B4: whether to require ``@odata.context`` in a V4 write
+    answer waits for real answers; this line collects them. No body value."""
+    import agents.odata.client as client_module
+
+    w = World()
+    w.sap.answer = httpx.Response(
+        200,
+        json={"@odata.context": "$metadata#X/$entity", "@odata.etag": 'W/"7"', "Plant": "SECRET-1"},
+    )
+    with caplog.at_level(logging.INFO, logger=client_module.logger.name):
+        out = await w.run(**UPDATE)
+        assert "error" not in out, out
+        w.sap.answer = httpx.Response(204)
+        assert (await w.run(**DELETE)) == {"ok": True, "status": 204}
+    lines = [r.getMessage() for r in caplog.records if "v4 write confirmed" in r.getMessage()]
+    assert len(lines) == 2, caplog.text
+    assert "operation=update" in lines[0] and "status=200" in lines[0]
+    assert "context=True" in lines[0] and "etag=True" in lines[0]
+    assert "operation=delete" in lines[1] and "status=204" in lines[1]
+    assert "context=False" in lines[1] and "etag=False" in lines[1]
+    assert all("service=" in line for line in lines)
+    assert "SECRET-1" not in caplog.text

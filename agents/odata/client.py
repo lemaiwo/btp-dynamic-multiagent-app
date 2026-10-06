@@ -63,8 +63,10 @@ their own gate, ``check_write``, and three rules of their own:
   (a catalogue refusal, a failed CSRF token request, a connection that was
   never made -- "nothing was changed") and ``True`` from the moment a
   modifying request was handed to an open connection, whatever came back.
-  A ``DestinationError`` that passes through a write is always from before
-  the first send.
+  A ``DestinationError`` that passes through a write is from before the
+  first send, with one exception the client turns into an ``ODataError``
+  with ``sent=True`` itself: the auth layer's retry after a 401 or a proxy
+  407 that could not be prepared (``destination_auth.request_left``).
 * No token, cookie, body value or host appears in an error, a log line or a
   ``repr`` of this module.
 
@@ -102,7 +104,7 @@ import httpx
 from pydantic import ValidationError
 
 from agents.destination import DestinationError
-from agents.destination_auth import PROXY_REFUSED_TEXT, went_through_proxy
+from agents.destination_auth import PROXY_REFUSED_TEXT, request_left, went_through_proxy
 
 from .models import (
     EDM_NAME_RE,
@@ -445,6 +447,9 @@ class CallPlan:
         )
 
 
+_LOG_NAME = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+
+
 def _subject(plan: Any) -> str:
     """What a modifying request was about, for a log line: a catalogue name."""
     if isinstance(plan, CallPlan):
@@ -526,6 +531,9 @@ class ODataClient:
         # settings, never an argument of a call.
         self._destination = service.get("destination")
         self._user_context = service.get("user_context")
+        # For log lines only: the catalogue name, when it has the form of one.
+        name = service.get("name")
+        self._name = name if isinstance(name, str) and _LOG_NAME.fullmatch(name) else "?"
         try:
             self._service_path = confine_service_path(service.get("service_path"))  # type: ignore[arg-type]
         except ValueError:
@@ -581,9 +589,12 @@ class ODataClient:
                 f"the target of navigation {nav.name!r} is not in the catalogue",
             )
         if needed not in target.operations:
+            # By the navigation the caller named, never by `target.name`:
+            # the agent may not know that entity set at all.
             raise ODataError(
                 "operation_disabled",
-                f"{needed!r} is not enabled for entity set {target.name!r}",
+                f"the target of navigation {nav.name!r} cannot be read",
+                hint=_CATALOGUE_HINT,
             )
         return nav, target
 
@@ -628,7 +639,7 @@ class ODataClient:
             ) from None
 
     def _projection(
-        self, target: EntitySetDef, select: Any, expand: Any
+        self, target: EntitySetDef, select: Any, expand: Any, *, via: str | None = None
     ) -> tuple[list[str], list[tuple[NavigationDef, EntitySetDef]], list[str], list[str]]:
         """``(fields to return, expanded navigations, $select, $expand)``.
 
@@ -659,8 +670,14 @@ class ODataClient:
         if not names:
             names = target.selectable_names()
         if not names:
+            # `via`: the read went through a navigation the caller named, so
+            # `target` is a set the agent may not know: it is not named.
             raise ODataError(
-                "operation_disabled", f"entity set {target.name!r} has no readable field"
+                "operation_disabled",
+                f"the target of navigation {via!r} cannot be read"
+                if via is not None
+                else f"entity set {target.name!r} has no readable field",
+                hint=_CATALOGUE_HINT,
             )
         expands: list[tuple[NavigationDef, EntitySetDef]] = []
         nested: list[tuple[str, list[str]]] = []
@@ -674,8 +691,9 @@ class ODataClient:
                 # `$select` path for it would transport the whole entity.
                 raise ODataError(
                     "operation_disabled",
-                    f"entity set {nav_target.name!r} has no readable field, "
-                    f"so navigation {nav.name!r} cannot be expanded",
+                    f"the target of navigation {nav.name!r} has no readable field, "
+                    f"so it cannot be expanded",
+                    hint=_CATALOGUE_HINT,
                 )
             expands.append((nav, nav_target))
             nested.append((nav.name, readable))
@@ -766,7 +784,9 @@ class ODataClient:
         if operation not in ("list", "get"):
             raise ODataError("invalid_argument", "a read is either 'list' or 'get'")
         path, target = self._resolve(entity_set, key, navigation, operation)
-        names, expands, sent, expand_names = self._projection(target, select, expand)
+        names, expands, sent, expand_names = self._projection(
+            target, select, expand, via=navigation if isinstance(navigation, str) else None
+        )
         if operation == "get":
             if orderby or (filter is not None and filter != "") or top is not None or skip:
                 raise ODataError(
@@ -1488,6 +1508,11 @@ class ODataClient:
         * a ``DestinationError`` (the destination could not be resolved, no
           signed-in user) and a connection that was never made: nothing was
           sent, and the caller is told so (``sent`` stays ``False``);
+        * a ``DestinationError`` the auth layer marked ``request_left``: the
+          request went out, was answered 401 (or 407 by the connectivity
+          proxy) and its one retry could not be prepared. Nothing was
+          changed, but a modifying request left: ``destination_error`` with
+          ``sent=True``;
         * any other failure before SAP's status line arrived -- an httpx
           error, a transport's own exception, an inner timeout -- leaves the
           outcome open: ``write_outcome_unknown`` with ``sent=True``;
@@ -1518,8 +1543,23 @@ class ODataClient:
                     if len(body) > MAX_RESPONSE_BYTES:
                         body = None
                         break
-        except DestinationError:
+        except DestinationError as exc:
             if status is None:
+                if request_left(exc):
+                    # The request was sent and refused unprocessed (a 401, or
+                    # a 407 of the connectivity proxy), and the auth layer
+                    # could not prepare its one retry. The text can name the
+                    # destination: only the type is logged.
+                    logger.warning(
+                        "odata: a refused modifying request could not be sent again (%s)",
+                        type(exc).__name__,
+                    )
+                    raise ODataError(
+                        "destination_error",
+                        "the change was refused before SAP processed it and the "
+                        "destination could not be used to send it again; nothing was changed",
+                        sent=True,
+                    ) from None
                 raise
             body = None
         except Exception as exc:  # noqa: BLE001 - every failure of a write gets a verdict
@@ -1765,13 +1805,17 @@ class ODataClient:
                 error.hint = "read the entity again and retry with its etag"
             elif stale:
                 error.hint = "SAP did not accept the CSRF token; nothing was changed"
-            elif status in (502, 504) and error.message.startswith("HTTP "):
-                # A gateway on the way gave up, not SAP: the request may have
-                # arrived and been processed all the same.
+            elif status >= 500 and error.code == "sap_error" and error.message.startswith("HTTP "):
+                # A 5xx that does not carry SAP's own error (no OData error
+                # envelope: an HTML error page, a bare 503, a gateway's 502
+                # or 504). Nothing says that SAP refused the change: it may
+                # have arrived and been committed before something on the
+                # way, or SAP itself after the commit, gave up. "SAP refused"
+                # is said only when SAP said so.
                 raise ODataError(
                     "write_outcome_unknown",
-                    f"a gateway answered HTTP {status} for the change: it is not known "
-                    f"whether SAP applied it. The request was not repeated",
+                    f"HTTP {status} came back for the change without an error message of "
+                    f"SAP: it is not known whether SAP applied it. The request was not repeated",
                     status=status,
                     hint=_outcome_hint(plan.operation),
                 )
@@ -1786,6 +1830,21 @@ class ODataClient:
             # next write starts from a fresh token.
             sessions.drop(key, session)
             raise
+        if getattr(self._dialect, "version", "") == "v4":
+            # For the pilot: a V4 answer is not required to carry
+            # `@odata.context` to count as a confirmation (`_confirmed`).
+            # Whether it should be is decided from these lines: names, the
+            # status and two booleans, never a value of the body.
+            answered = decoded if isinstance(decoded, dict) else {}
+            logger.info(
+                "odata: v4 write confirmed service=%s operation=%s status=%s "
+                "context=%s etag=%s",
+                self._name,
+                plan.operation,
+                status,
+                "@odata.context" in answered,
+                "@odata.etag" in answered,
+            )
         # Only now, with the write confirmed, is the answer known to be
         # SAP's own: when it moved the session on, the next write of this
         # identity sends the new cookies. Done only while the store still
@@ -2039,7 +2098,9 @@ def clip_result(result: dict, max_chars: int, *, skip: int | None = None) -> dic
     set, and ``next_skip`` is moved back so that the next page starts at the
     first dropped row. When the result had no ``next_skip`` (it was the last
     page) the cut page gets one only if the caller passes the ``skip`` it
-    asked with. The input is not changed.
+    asked with. When not even the first row of a page fits, the answer is a
+    refusal (``{"error": {code: result_too_large, ...}}``) instead of an
+    empty page that would be asked for again. The input is not changed.
     """
     out = copy.deepcopy(result)
     out["truncated"] = bool(out.get("truncated", False))
@@ -2049,6 +2110,18 @@ def clip_result(result: dict, max_chars: int, *, skip: int | None = None) -> dic
     for key in ("items", "result"):
         if isinstance(out.get(key), list):
             dropped = _fit_list(out, key, max_chars)
+            if key == "items" and dropped and not out[key]:
+                # Not even the first row fits. An empty page with the same
+                # `next_skip` would have the model ask for that row again
+                # and again; a refusal says what to change instead.
+                return {
+                    "error": ODataError(
+                        "result_too_large",
+                        "one row of this result is larger than a tool result may be; "
+                        "no row was returned",
+                        hint="ask for fewer fields or no expand",
+                    ).to_dict()
+                }
             if key == "items" and dropped:
                 if isinstance(out.get("next_skip"), int):
                     out["next_skip"] -= dropped

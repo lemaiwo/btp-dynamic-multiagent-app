@@ -282,3 +282,67 @@ async def test_a_write_the_proxy_keeps_refusing_is_sent_twice_and_never_reaches_
     assert result.outcome == "refused" and result.status == 407
     # A request did leave this app (to the proxy), which is what the phase says.
     assert result.phase == "write"
+
+
+async def test_a_write_whose_retry_could_not_be_prepared_is_recorded_as_sent():
+    """Final review A5: the proxy refused the write (407) and the new
+    connectivity token could not be fetched. A modifying request DID leave
+    this app, and the audit says so; nothing was changed."""
+    from agents.destination import DestinationError
+
+    w = OnPrem()
+    w.refuse = is_write
+    real = w.tokens.app_token
+
+    async def app_token() -> str:
+        if w.statuses and w.statuses[-1] == 407:
+            raise DestinationError("connectivity service token request returned 500 (zone-9)")
+        return await real()
+
+    w.tokens.app_token = app_token  # type: ignore[method-assign]
+    out = await w.run(service="pr-jobs", target=ITEM, **UPDATE)
+    assert out["error"]["code"] == "destination_error", out
+    assert "nothing was changed" in out["error"]["message"] and "zone-9" not in str(out)
+    assert len(w.proxy_writes) == 1 and w.world.sap.writes == []
+    (result,) = w.world.audits
+    assert result.outcome == "refused" and result.phase == "write"
+
+
+async def test_a_user_service_on_a_technical_internet_destination_sends_nothing():
+    """Final review A1, through the toolset: the destination service ignores
+    the user's token for a destination with a stored credential, so the call
+    would run in SAP as that account while the audit names the user."""
+    import time
+
+    from agents.destination import Destination
+
+    class Basic(FakeResolver):
+        async def resolve(self, *, force=False, user_token=None, principal=None):
+            return Destination(
+                url=self.url,
+                headers={"Authorization": "Basic dGVjaDp4"},
+                expires_at=time.monotonic() + 60,
+                auth_type="BasicAuthentication",
+                per_user=bool(user_token),
+                proxy_type="Internet",
+            )
+
+    sent: list[httpx.Request] = []
+
+    def sap(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=PAGE)
+
+    world = World(
+        connectivity=None,
+        transport=httpx.MockTransport(sap),
+        resolver_factory=lambda destination: Basic(name=destination),
+    )
+    with signed_in(ALICE):
+        read = await world.run(service="pr", target=ITEM, operation="list")
+        write = await world.run(service="pr", target=ITEM, **UPDATE)
+    assert read["error"]["code"] == "destination_error", read
+    assert write["error"]["code"] == "destination_error", write
+    assert sent == [] and "dGVjaDp4" not in str(read) + str(write)
+    (result,) = world.audits
+    assert (result.outcome, result.phase) == ("refused", "token")

@@ -1183,6 +1183,13 @@ async def test_a_connection_that_was_never_made_was_not_sent():
         (v2_error(428, "A", "b"), "etag_required"),
         (v2_error(500, "A", "b"), "sap_error"),
         (httpx.Response(504, text="x"), "write_outcome_unknown"),
+        # Final review B1: ANY 5xx without SAP's error envelope leaves the
+        # outcome open (SAP may have committed before something broke).
+        (
+            httpx.Response(500, headers={"content-type": "text/html"}, text="<html>Error</html>"),
+            "write_outcome_unknown",
+        ),
+        (httpx.Response(503), "write_outcome_unknown"),
         (httpx.Response(200, headers=LOGON_PAGE, text="<html>Logon</html>"), UNKNOWN),
         (httpx.Response(202), "write_outcome_unknown"),
         (httpx.ReadTimeout("timed out"), "write_outcome_unknown"),
