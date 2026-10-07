@@ -753,3 +753,158 @@ opaTest("a remote server on a user-context destination keeps acting as the user 
 
     Then.iStopTheApp();
 });
+
+// --- sharepoint ---
+// One pinned workbook: site, library, path and the views (typed as JSON).
+// Generic placeholders only; a calendar view with a kind label carries `kinds`.
+const SHAREPOINT_VIEWS = {
+    team: { kind: "table", table: "TeamMembers", columns: ["Name", "Team", "ID"] },
+    planning: {
+        kind: "calendar", sheet: "{year}", date_row: 8, first_row: 10, first_date_column: "D",
+        labels: { member: "A", team: "B", kind: "C" },
+        kinds: ["Presence", "Guard"],
+        codes: { H: "unavailable", T: "available" }
+    }
+};
+
+/** Opens the server dialog of gmail-agent and picks the SharePoint toolset. */
+function iAddASharePointServer(Given: Common, When: Common): void {
+    Given.iStartTheApp("agents/101");
+    When.waitFor({ id: "addServerButton", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({
+        id: "serverKind",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            const item = select.getItems().find((i) => i.getText() === "SharePoint workbook (Excel, read-only)");
+            Opa5.assert.ok(item, "the toolset is offered under its name");
+            select.setSelectedKey("builtin:sharepoint");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+}
+
+function iTypeInTheServerDialog(When: Common, id: string, text: string): void {
+    When.waitFor({ id, viewName: "AgentDetail", searchOpenDialogs: true, actions: new EnterText({ text }) });
+}
+
+/** Sibling control of the server dialog, visible or not (OPA only finds visible ones). */
+function dialogControl<T extends UI5Element>(anchor: UI5Element, anchorId: string, id: string): T | undefined {
+    return Element.getElementById(anchor.getId().replace(new RegExp(`${anchorId}$`), id)) as T | undefined;
+}
+
+opaTest("a SharePoint server stores the pins and the views", function (Given: Common, When: Common, Then: Common) {
+    iAddASharePointServer(Given, When);
+
+    Then.waitFor({
+        id: "serverAuthMode",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const select = element as Select;
+            Opa5.assert.strictEqual(select.getSelectedKey(), "destination", "BTP destination is selected");
+            Opa5.assert.deepEqual(
+                select.getItems().map((i) => i.getKey()), ["app_only", "destination"],
+                "the two modes the built-in runs on are offered");
+        }
+    });
+    iTypeInTheServerDialog(When, "oauthDestination", "GRAPH");
+    iTypeInTheServerDialog(When, "oauthSharePointSite", "example.sharepoint.com:/sites/planning");
+    iTypeInTheServerDialog(When, "oauthSharePointLibrary", "Documents");
+    iTypeInTheServerDialog(When, "oauthSharePointPath", "Planning/Planning.xlsx");
+    iTypeInTheServerDialog(When, "oauthSharePointViews", JSON.stringify(SHAREPOINT_VIEWS));
+    When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const saved = backend.agents.find((a) => a.id === 101);
+            Opa5.assert.deepEqual(
+                saved?.mcp_servers[2],
+                {
+                    url: "builtin:sharepoint", auth_mode: "destination",
+                    oauth: {
+                        destination: "GRAPH",
+                        site: "example.sharepoint.com:/sites/planning",
+                        library: "Documents",
+                        path: "Planning/Planning.xlsx",
+                        views: SHAREPOINT_VIEWS
+                    }
+                },
+                "posted exactly {destination, site, library, path, views}"
+            );
+        }
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("invalid JSON in the SharePoint views field is refused inline and the dialog stays open", function (Given: Common, When: Common, Then: Common) {
+    iAddASharePointServer(Given, When);
+
+    iTypeInTheServerDialog(When, "oauthDestination", "GRAPH");
+    iTypeInTheServerDialog(When, "oauthSharePointSite", "example.sharepoint.com:/sites/planning");
+    iTypeInTheServerDialog(When, "oauthSharePointLibrary", "Documents");
+    iTypeInTheServerDialog(When, "oauthSharePointPath", "Planning/Planning.xlsx");
+    iTypeInTheServerDialog(When, "oauthSharePointViews", "{\"team\": ");
+    When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+
+    Then.waitFor({
+        id: "oauthSharePointViews",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const area = element as TextArea;
+            Opa5.assert.strictEqual(area.getValueState(), "Error", "the views field is flagged");
+            Opa5.assert.ok(area.getValueStateText().indexOf("not valid JSON") !== -1, "and says why");
+            const agent = area.getModel("agent") as JSONModel;
+            Opa5.assert.strictEqual(
+                (agent.getProperty("/data/mcp_servers") as unknown[]).length, 2, "no server was added");
+        }
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("the SharePoint server dialog shows its four fields and no mail or signed-in-user control, in both auth modes", function (Given: Common, When: Common, Then: Common) {
+    iAddASharePointServer(Given, When);
+
+    const HIDDEN = ["oauthMailbox", "oauthLookback", "oauthAllowSend", "oauthUserContext", "oauthTeam", "oauthMailTheme"];
+    const SHOWN = ["oauthSharePointSite", "oauthSharePointLibrary", "oauthSharePointPath", "oauthSharePointViews"];
+    const check = function (mode: string, alsoShown: string[], alsoHidden: string[]): void {
+        Then.waitFor({
+            id: "serverAuthMode",
+            viewName: "AgentDetail",
+            searchOpenDialogs: true,
+            matchers: function (element: UI5Element) {
+                return (element as Select).getSelectedKey() === mode;
+            },
+            success: function (element: UI5Element) {
+                SHOWN.concat(alsoShown).forEach((id) => {
+                    Opa5.assert.ok(
+                        dialogControl<Input>(element, "serverAuthMode", id)?.getVisible(), `${mode}: ${id} is shown`);
+                });
+                HIDDEN.concat(alsoHidden).forEach((id) => {
+                    const control = dialogControl<Input>(element, "serverAuthMode", id);
+                    Opa5.assert.ok(control, `${id} exists`);
+                    Opa5.assert.notOk(control?.getVisible(), `${mode}: ${id} is hidden`);
+                });
+            }
+        });
+    };
+
+    check("destination", ["oauthDestination"], ["oauthClientId", "oauthClientSecret"]);
+    When.waitFor({
+        id: "serverAuthMode",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            select.setSelectedKey("app_only");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+    check("app_only", ["oauthClientId", "oauthClientSecret", "oauthScope"], ["oauthDestination"]);
+    Then.iStopTheApp();
+});

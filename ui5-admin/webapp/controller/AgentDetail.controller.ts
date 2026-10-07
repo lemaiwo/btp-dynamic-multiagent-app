@@ -320,6 +320,8 @@ export default class AgentDetail extends BaseController {
             secretPlaceholder: hasStoredSecret ? this.text("secretStored") : "",
             // The mail theme is edited as JSON text; cleanOAuth gets the parsed object.
             themeJson: oauthConfig.formatMailTheme((server.oauth as { theme?: unknown } | undefined)?.theme),
+            // --- sharepoint --- The views are edited as JSON text; cleanOAuth gets the parsed object.
+            viewsJson: oauthConfig.formatViews((server.oauth as { views?: unknown } | undefined)?.views),
             scopeHint: "",
             errors: {}
         });
@@ -708,6 +710,8 @@ export default class AgentDetail extends BaseController {
             {}, serverModel.getProperty("/oauth") as Record<string, unknown>
         );
         delete oauthRaw.theme;
+        // --- sharepoint --- As the theme: only what the text area holds now counts.
+        delete oauthRaw.views;
         if (odataEntry.isODataUrl(url)) {
             // --- odata --- Only the entry's own two values reach cleanOAuth.
             if (!this.confirmODataEntry()) {
@@ -727,6 +731,20 @@ export default class AgentDetail extends BaseController {
             }
             if (parsedTheme.theme) {
                 oauthRaw.theme = parsedTheme.theme;
+            }
+        }
+        if (oauthConfig.supportsViews(url)) {
+            // --- sharepoint --- Only the JSON shape is refused here; the
+            // rules of a view are validators.validateSharePoint and the server.
+            const parsedViews = oauthConfig.parseViews(serverModel.getProperty("/viewsJson") as string);
+            if (parsedViews.error) {
+                serverModel.setProperty("/errors", {
+                    views: parsedViews.error, viewsState: ValueState.Error
+                });
+                return;
+            }
+            if (parsedViews.views) {
+                oauthRaw.views = parsedViews.views;
             }
         }
 
