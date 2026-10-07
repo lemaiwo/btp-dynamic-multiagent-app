@@ -176,8 +176,9 @@ export default {
         let parsed: unknown;
         try {
             parsed = JSON.parse(source);
-        } catch (e) {
-            return { error: `Mail theme is not valid JSON: ${(e as Error).message}` };
+        } catch {
+            // A fixed text: the parser's message can quote what was typed.
+            return { error: "Mail theme is not valid JSON." };
         }
         if (!isPlainObject(parsed)) {
             return { error: "Mail theme must be a JSON object, e.g. {\"band\": \"#1f3348\"}." };
@@ -211,8 +212,9 @@ export default {
         let parsed: unknown;
         try {
             parsed = JSON.parse(source);
-        } catch (e) {
-            return { error: `Views is not valid JSON: ${(e as Error).message}` };
+        } catch {
+            // A fixed text: the parser's message can quote what was typed.
+            return { error: "Views is not valid JSON." };
         }
         if (!isPlainObject(parsed)) {
             return { error: "Views must be a JSON object, e.g. {\"team\": {\"kind\": \"table\", ...}}." };

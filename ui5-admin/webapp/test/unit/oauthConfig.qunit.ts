@@ -447,3 +447,36 @@ QUnit.test("sharepoint: a calendar view keeps its kinds through the textarea and
     assert.deepEqual((out.views as typeof SP_CALENDAR_VIEWS).planning.kinds, ["Presence", "Guard"]);
     assert.strictEqual(validators.validateOAuth(out, "destination", "builtin:sharepoint"), "");
 });
+
+// --- sharepoint: fix round 1 ---
+QUnit.test("sharepoint: a views text that is no JSON is refused with a fixed text, never the typed text", function (assert) {
+    const refused = oauthConfig.parseViews("{ team: SECRETVALUE }");
+    assert.strictEqual(refused.error, "Views is not valid JSON.");
+    assert.strictEqual(refused.error.indexOf("SECRETVALUE"), -1, "the typed text is not echoed");
+    assert.notOk("views" in refused, "and nothing is parsed");
+});
+
+QUnit.test("sharepoint: a mail theme text that is no JSON is refused with a fixed text, never the typed text", function (assert) {
+    const refused = oauthConfig.parseMailTheme("{ band: SECRETVALUE }");
+    assert.strictEqual(refused.error, "Mail theme is not valid JSON.");
+    assert.strictEqual(refused.error.indexOf("SECRETVALUE"), -1, "the typed text is not echoed");
+});
+
+QUnit.test("sharepoint: formatViews then parseViews loses nothing of nested arrays and objects", function (assert) {
+    const views = {
+        team: { kind: "table", table: "TeamMembers", columns: ["Name", "Team", "ID"] },
+        planning: {
+            kind: "calendar", sheet: "{year}", date_row: 8, first_row: 10, first_date_column: "D",
+            labels: { member: "A", team: "B", kind: "C" }, kinds: ["Presence", "Guard"],
+            codes: { H: "unavailable", T: "available", GDI: "GDI" },
+            lookup: { view: "team", on: "Name", add: ["ID"] },
+            conflict: { kind: "Guard", against: "Presence", when: ["unavailable", "half_day"] },
+            nested: [[1, 2], [{ a: [true, null, "x"] }]]
+        }
+    };
+    const text = oauthConfig.formatViews(views);
+    const back = oauthConfig.parseViews(text);
+    assert.strictEqual(back.error, "");
+    assert.deepEqual(back.views, views, "the same object comes back");
+    assert.strictEqual(oauthConfig.formatViews(back.views), text, "and formats to the same text");
+});
