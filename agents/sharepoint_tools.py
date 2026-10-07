@@ -34,7 +34,19 @@ of a download in progress, whatever level the process logs at; it is put back
 before each download if a logging setup removed it). A download has a total
 deadline, so a host that trickles bytes cannot hold the file's lock. The bytes
 are kept in memory per file version (eTag) for a few minutes, so the tool calls of
-one run download once.
+one run download once, and are dropped when that time is over (a timer, not
+the next call) or the client is closed: they are the whole workbook, whatever
+the views pin.
+
+**One parse at a time.** Reading a view is CPU and memory work in a worker
+thread on a file somebody else wrote. The parses of all toolsets in this
+process take turns (:func:`_parse`), so the memory one workbook may need is
+needed once, however many tool calls run side by side.
+
+**What a run records.** A run's activity (the chat's tool card, and the row of
+an API-triggered run in the database) gets a fixed-form line of counts for
+these two tools (:func:`activity_summary`), never the head of the result:
+nothing from the workbook is stored in the database.
 
 Every refusal is ``{"error": {code, message, hint?}}``, never an exception,
 and nothing Graph says reaches the model: a status and a fixed text only.
@@ -59,11 +71,11 @@ import json
 import logging
 import re
 import time
+import weakref
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
 import httpx
-from pydantic_ai.messages import tool_return_ta
 from pydantic_ai.toolsets import FunctionToolset
 
 from agents.outlook_tools import GRAPH_V1
@@ -79,7 +91,8 @@ from agents.sharepoint_workbook import (
 from agents.sharepoint_workbook import read_calendar as read_calendar_view
 from agents.sharepoint_workbook import read_table as read_table_view
 
-__all__ = ["SharePointFile", "sharepoint_toolset", "BUILTIN_SHAREPOINT_URL"]
+__all__ = ["SharePointFile", "sharepoint_toolset", "activity_summary",
+           "BUILTIN_SHAREPOINT_URL"]
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +128,18 @@ _downloading: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # The download URLs in flight and their query strings (the token part), for
 # the time of the download only. Never logged, never returned.
 _in_flight: list[str] = []
+
+# The turn of a parse, per event loop: an ``asyncio`` primitive belongs to the
+# loop it first waits in, and the tests run one loop after another. The app
+# has one loop, so there this is one turn for the process.
+_parse_turns: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = \
+    weakref.WeakKeyDictionary()
+
+# The two tools as an agent lists them: plain, or behind the prefix the
+# registry gives each server of an agent that has several (``sharepoint_``,
+# or ``sharepoint_0_`` when two entries share the slug).
+_TOOL_NAME_RE = re.compile(r"(?:sharepoint(?:_[0-9]+)?_)?(read_table|read_calendar)")
+_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
 
 class _NoDownloadUrl(logging.Filter):
@@ -211,7 +236,33 @@ class SharePointFile:
         self._drive: tuple[float, str] | None = None
         # (deadline, eTag, bytes): one file, one version.
         self._file: tuple[float, str, bytes] | None = None
+        # Drops ``_file`` at its deadline, whether or not anybody calls again.
+        self._expiry: asyncio.TimerHandle | None = None
         self._lock = asyncio.Lock()
+
+    def forget(self) -> None:
+        """Drops the cached bytes and their timer."""
+        if self._expiry is not None:
+            self._expiry.cancel()
+            self._expiry = None
+        self._file = None
+
+    def _keep(self, etag: str | None, data: bytes) -> None:
+        """Caches one version until its deadline; the one before it goes now."""
+        self.forget()
+        # Without a version there is nothing to compare: not cached.
+        if not etag:
+            return
+        entry = (time.monotonic() + FILE_CACHE_TTL_SECONDS, etag, data)
+        self._file = entry
+        self._expiry = asyncio.get_running_loop().call_later(
+            FILE_CACHE_TTL_SECONDS, self._expire, entry)
+
+    def _expire(self, entry: tuple[float, str, bytes]) -> None:
+        # Only the entry this timer was set for, never a newer one.
+        if self._file is entry:
+            self._file = None
+            self._expiry = None
 
     async def _get(self, step: str, path: str, **params: str) -> dict[str, Any]:
         from agents.client_credentials import ClientCredentialsError
@@ -360,8 +411,7 @@ class SharePointFile:
             url = self._checked_download_url(item.get("@microsoft.graph.downloadUrl"))
             data = await self._download(url)
             check_archive(data)
-            # Without a version there is nothing to compare: not cached.
-            self._file = (time.monotonic() + FILE_CACHE_TTL_SECONDS, etag, data) if etag else None
+            self._keep(etag, data)
             return data, modified
 
 
@@ -382,10 +432,80 @@ def _result_chars(result: dict[str, Any]) -> int:
     ``json.dumps`` without ASCII escapes, the larger of the two counts: the
     cap must not be passed because of how it was measured.
     """
-    framework = len(tool_return_ta.dump_json(result).decode())
     plain = len(json.dumps(result, ensure_ascii=False, default=str,
                            separators=(",", ":")))
-    return max(framework, plain)
+    try:
+        # Imported here, not at the top: the admin routes and the built-in
+        # registry import this module, and a renamed name in pydantic-ai must
+        # cost this one measure, not the start of the app.
+        from pydantic_ai.messages import tool_return_ta
+    except ImportError:
+        return plain
+    return max(len(tool_return_ta.dump_json(result).decode()), plain)
+
+
+async def _parse(read: Callable[..., dict[str, Any]], *args: Any) -> dict[str, Any]:
+    """Runs one reader call in a worker thread, one at a time in this process.
+
+    The turn is given back when the thread has ended, not when the caller
+    stops waiting: a cancelled tool call cannot stop its thread, and the next
+    parse must not start beside it.
+    """
+    loop = asyncio.get_running_loop()
+    turn = _parse_turns.get(loop)
+    if turn is None:
+        turn = _parse_turns[loop] = asyncio.Semaphore(1)
+    await turn.acquire()
+    try:
+        job = loop.run_in_executor(None, read, *args)
+    except BaseException:
+        turn.release()
+        raise
+
+    def ended(job: asyncio.Future[dict[str, Any]]) -> None:
+        turn.release()
+        # Fetched here so that the failure of a parse nobody waits for any
+        # more is not reported by the loop with its text and traceback.
+        if not job.cancelled():
+            job.exception()
+
+    job.add_done_callback(ended)
+    return await asyncio.shield(job)
+
+
+def _count(value: Any) -> str:
+    return str(value) if type(value) is int and value >= 0 else "?"
+
+
+def activity_summary(tool_name: Any, result: Any) -> str | None:
+    """What a run's activity keeps of a result of the two tools, else ``None``.
+
+    Counts and a refusal's code only, in a fixed form: the activity is shown
+    in the chat and stored with an API-triggered run, and a result holds what
+    people typed into the workbook. Decided by the tool's name alone, plain or
+    prefixed, so a result that does not look like one of ours gets no preview
+    either.
+    """
+    match = _TOOL_NAME_RE.fullmatch(tool_name) if isinstance(tool_name, str) else None
+    if match is None:
+        return None
+    tool = match.group(1)
+    if not isinstance(result, dict):
+        return f"{tool}: no summary"
+    error = result.get("error")
+    if error is not None:
+        code = error.get("code") if isinstance(error, dict) else None
+        return f"error: {code}" if isinstance(code, str) and _CODE_RE.fullmatch(code) \
+            else "error"
+    skipped = _count(result.get("skipped_rows"))
+    if tool == "read_table":
+        rows = result.get("rows")
+        return f"{tool}: {_count(len(rows) if isinstance(rows, list) else None)} rows, " \
+               f"{skipped} skipped"
+    runs, conflicts = result.get("runs"), result.get("conflicts")
+    return (f"{tool}: {_count(len(runs) if isinstance(runs, list) else None)} runs, "
+            f"{_count(len(conflicts) if isinstance(conflicts, list) else None)} conflicts, "
+            f"{skipped} skipped, {_count(result.get('unmapped'))} unmapped")
 
 
 def sharepoint_toolset(
@@ -428,6 +548,15 @@ def sharepoint_toolset(
     toolset = FunctionToolset()
     # The registry closes `http_client` on old toolsets when it swaps a build.
     toolset.http_client = session  # type: ignore[attr-defined]
+    # With the client goes the cached workbook: `aclose` is the one thing a
+    # retired build is told, so the drop hangs on it.
+    close_client = session.aclose
+
+    async def aclose() -> None:
+        source.forget()
+        await close_client()
+
+    session.aclose = aclose  # type: ignore[method-assign]
 
     def _view(name: Any, kind: type) -> Any:
         """The view of that name and kind. The name the model sent is never
@@ -481,7 +610,7 @@ def sharepoint_toolset(
         async def read() -> dict[str, Any]:
             table = _view(view, TableView)
             data, modified = await source.fetch()
-            out = await asyncio.to_thread(read_table_view, data, table)
+            out = await _parse(read_table_view, data, table)
             return {"view": table.name, **out, "row_count": len(out["rows"]),
                     "last_modified": _timestamp(modified)}
 
@@ -519,7 +648,7 @@ def sharepoint_toolset(
             if not isinstance(lookup, TableView):
                 lookup = None
             data, modified = await source.fetch()
-            out = await asyncio.to_thread(read_calendar_view, data, calendar, lo, hi, lookup)
+            out = await _parse(read_calendar_view, data, calendar, lo, hi, lookup)
             return {"view": calendar.name, "from": lo.isoformat(), "to": hi.isoformat(),
                     **out, "last_modified": _timestamp(modified)}
 

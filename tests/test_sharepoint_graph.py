@@ -605,3 +605,47 @@ async def test_a_line_about_the_download_from_another_context_is_dropped_too(cap
     assert tools._in_flight == []
     httpx_log.info("after the download: %s", "tempauth-is-just-a-word-now")
     assert "tempauth-is-just-a-word-now" in caplog.text
+
+
+# --- final review: the cached bytes go when their time is over --------------
+
+async def test_the_cached_bytes_are_dropped_when_the_ttl_ends(monkeypatch):
+    monkeypatch.setattr(tools, "FILE_CACHE_TTL_SECONDS", 0.05)
+    graph = FakeGraph(WORKBOOK)
+    source = _file(graph)
+    await source.fetch()
+    assert source._file is not None and source._file[2] == WORKBOOK
+    await asyncio.sleep(0.15)
+    # Nobody called in between: the workbook is not kept until somebody does.
+    assert source._file is None
+    await source.fetch()
+    assert len(graph.downloads) == 2 and source._file is not None
+
+
+async def test_an_old_timer_does_not_drop_a_newer_version(monkeypatch):
+    monkeypatch.setattr(tools, "FILE_CACHE_TTL_SECONDS", 0.2)
+    graph = FakeGraph(WORKBOOK)
+    source = _file(graph)
+    await source.fetch()
+    first = source._expiry
+    await asyncio.sleep(0.12)
+    graph.etag = '"v2"'
+    await source.fetch()
+    assert first.cancelled() and source._expiry is not first
+    await asyncio.sleep(0.12)  # the first version's time is over, the second's is not
+    assert source._file is not None and source._file[1] == '"v2"'
+    await asyncio.sleep(0.15)
+    assert source._file is None and source._expiry is None
+
+
+async def test_forget_drops_the_bytes_and_the_timer_and_no_etag_keeps_nothing():
+    graph = FakeGraph(WORKBOOK)
+    source = _file(graph)
+    await source.fetch()
+    timer = source._expiry
+    source.forget()
+    assert source._file is None and source._expiry is None and timer.cancelled()
+    bare = FakeGraph(WORKBOOK, item={"eTag": None, "cTag": None})
+    source = _file(bare)
+    await source.fetch()
+    assert source._file is None and source._expiry is None

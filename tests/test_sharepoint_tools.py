@@ -514,3 +514,161 @@ async def test_concurrent_calls_on_one_toolset_resolve_and_download_once():
     assert results[1::2] == [await _call(alone, "read_table", view="team")] * 4
     assert results[0::2] == [await _call(alone, "read_calendar", **calendar)] * 4
     assert results[1]["row_count"] == 3 and results[0]["runs"]
+
+
+# --- final review: one parse at a time, the serialiser import ---------------
+
+class _Gauge:
+    """Counts the reader calls that run at the same time."""
+
+    def __init__(self, monkeypatch, hold: float = 0.02) -> None:
+        self.now = self.most = self.calls = 0
+        self._lock = threading.Lock()
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.hold: float | None = hold
+        for name in ("read_table_view", "read_calendar_view"):
+            monkeypatch.setattr(tools, name, self._spy(getattr(tools, name)))
+
+    def _spy(self, real):
+        def spy(*args):
+            with self._lock:
+                self.now += 1
+                self.calls += 1
+                self.most = max(self.most, self.now)
+            self.started.set()
+            try:
+                if self.hold is None:
+                    assert self.release.wait(5)
+                else:
+                    time.sleep(self.hold)
+                return real(*args)
+            finally:
+                with self._lock:
+                    self.now -= 1
+        return spy
+
+
+async def test_two_tool_calls_never_parse_at_the_same_time(monkeypatch):
+    gauge = _Gauge(monkeypatch)
+    calendar = {"view": "planning", "date_from": "2026-01-05", "date_to": "2026-01-11"}
+    # Two toolsets as well: the rule is per process, not per agent.
+    one, other = _toolset(FakeGraph(WORKBOOK)), _toolset(FakeGraph(WORKBOOK))
+    results = await asyncio.gather(*(
+        _call(one if i < 3 else other, "read_table", view="team") if i % 2 else
+        _call(one if i < 3 else other, "read_calendar", **calendar) for i in range(6)))
+    assert all("error" not in r for r in results)
+    assert gauge.calls == 6 and gauge.most == 1
+
+
+async def test_a_cancelled_call_keeps_its_turn_until_its_parse_has_ended(monkeypatch):
+    """A worker thread cannot be cancelled: the next parse waits for it."""
+    gauge = _Gauge(monkeypatch)
+    gauge.hold = None
+    toolset = _toolset(FakeGraph(WORKBOOK))
+    first = asyncio.ensure_future(_call(toolset, "read_table", view="team"))
+    assert await asyncio.to_thread(gauge.started.wait, 5)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    second = asyncio.ensure_future(_call(toolset, "read_table", view="team"))
+    await asyncio.sleep(0.1)
+    assert gauge.calls == 1 and not second.done()
+    gauge.release.set()
+    assert (await second)["row_count"] == 3
+    assert gauge.calls == 2 and gauge.most == 1
+
+
+def test_the_turn_works_under_one_event_loop_after_another(monkeypatch):
+    gauge = _Gauge(monkeypatch, hold=0.01)
+
+    async def contended():
+        toolset = _toolset(FakeGraph(WORKBOOK))
+        out = await asyncio.gather(*(_call(toolset, "read_table", view="team")
+                                     for _ in range(3)))
+        return [r.get("row_count") for r in out]
+
+    assert asyncio.run(contended()) == [3, 3, 3]
+    assert asyncio.run(contended()) == [3, 3, 3]
+    assert gauge.most == 1
+
+
+async def test_a_parse_that_fails_after_its_call_was_cancelled_is_not_logged(
+        monkeypatch, caplog):
+    _loud(caplog)
+    release = threading.Event()
+    started = threading.Event()
+
+    def broken(*args):
+        started.set()
+        release.wait(5)
+        raise RuntimeError(f"{MARKER} {DOWNLOAD_URL}")
+
+    monkeypatch.setattr(tools, "read_table_view", broken)
+    seen: list[dict] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: seen.append(context))
+    call = asyncio.ensure_future(_call(_toolset(FakeGraph(WORKBOOK)), "read_table", view="team"))
+    assert await asyncio.to_thread(started.wait, 5)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    release.set()
+    await asyncio.sleep(0.1)
+    import gc
+
+    gc.collect()
+    await asyncio.sleep(0)
+    assert seen == []
+    assert not any(s in r.getMessage() for r in caplog.records for s in SECRETS)
+
+
+def test_the_module_does_not_need_the_frameworks_serialiser_to_import():
+    """As after a rename in pydantic-ai: the module imports and measures."""
+    import subprocess
+
+    assert not hasattr(tools, "tool_return_ta")
+    code = ("import pydantic_ai.messages as m; del m.tool_return_ta; "
+            "import agents.sharepoint_tools as t; import agents.builtins; "
+            "print(t._result_chars({'a': 'b'}))")
+    done = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True,
+                          text=True, timeout=120)
+    assert done.returncode == 0, done.stderr[-400:]
+    assert done.stdout.strip() == "9"
+
+
+async def test_without_the_frameworks_serialiser_the_plain_measure_counts(monkeypatch):
+    import pydantic_ai.messages as messages
+
+    toolset = _toolset(FakeGraph(WORKBOOK))
+    out = await _call(toolset, "read_table", view="team")
+    both = tools._result_chars(out)
+    monkeypatch.delattr(messages, "tool_return_ta")
+    with pytest.raises(ImportError):
+        from pydantic_ai.messages import tool_return_ta  # noqa: F401
+    plain = len(json.dumps(out, ensure_ascii=False, default=str, separators=(",", ":")))
+    assert tools._result_chars(out) == plain <= both
+    assert (await _call(toolset, "read_table", view="team"))["row_count"] == 3
+    monkeypatch.setattr(tools, "MAX_RESULT_CHARS", plain - 1)
+    assert (await _call(toolset, "read_table", view="team"))["error"]["code"] == \
+        "result_too_large"
+
+
+async def test_closing_the_client_drops_the_cached_workbook(monkeypatch):
+    """A retired build is told one thing, ``http_client.aclose()``."""
+    dropped: list = []
+    real = tools.SharePointFile.forget
+
+    def forget(self):
+        real(self)
+        dropped.append(self)
+
+    monkeypatch.setattr(tools.SharePointFile, "forget", forget)
+    toolset = _toolset(FakeGraph(WORKBOOK))
+    await _call(toolset, "read_table", view="team")
+    source = dropped[-1]
+    assert source._file is not None and source._expiry is not None
+    timer = source._expiry
+    await toolset.http_client.aclose()
+    assert toolset.http_client.is_closed
+    assert dropped[-1] is source and source._file is None and timer.cancelled()

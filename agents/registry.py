@@ -40,6 +40,7 @@ from agents.shared import (
     get_model,
     run_usage_limits,
 )
+from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
 # --- deep agents ---
 from agents.deep import deep_toolset, scoped_deep_instructions
 from agents.ide.readonly import ReadOnlyGuard
@@ -153,6 +154,13 @@ def _short_tool_output(result) -> str:
     MCP tools can return large payloads we don't want to stream in full.
     """
     try:
+        # The SharePoint tools return what people typed into a workbook, and
+        # this preview is stored with an API-triggered run: counts only.
+        fixed = sharepoint_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
         content = getattr(result, "content", None)
         if content is None and hasattr(result, "model_response_str"):
             content = result.model_response_str()
