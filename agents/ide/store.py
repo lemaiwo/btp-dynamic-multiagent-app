@@ -38,6 +38,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agents.db import text_unchanged
 from agents.ide.models import (
     IDE_CHILD_MODELS,
     IdeApproval,
@@ -234,6 +235,13 @@ async def purge_sessions_older_than(
     exclusion sit in the DELETE itself, so a session that became active
     between selecting and deleting is kept; only the children of rows the
     DELETE actually removed are deleted. The audit log is never touched.
+
+    No ``DELETE ... RETURNING`` (SAP HANA has none): the candidates are
+    selected ``FOR UPDATE`` in id order, deleted under the same conditions,
+    and whichever of them is still there afterwards was not removed. On
+    Postgres and HANA the lock already makes the two sets equal; on SQLite,
+    which takes no row lock, the look afterwards is what keeps the children
+    of a session that became active in between.
     """
     if days < 1:
         raise ValueError("days must be >= 1")
@@ -242,21 +250,39 @@ async def purge_sessions_older_than(
     if by not in ("updated_at", "created_at"):
         raise ValueError(f"Unknown retention clock: {by!r}")
     cutoff = utcnow() - timedelta(days=days)
-    result = await db.execute(
-        delete(IdeSession)
-        .where(
-            getattr(IdeSession, by) < cutoff,
-            IdeSession.session_type == session_type,
-            IdeSession.status != "running",
-        )
-        .returning(IdeSession.id)
-        # The WHERE is the check; SQLite's naive datetimes cannot be compared
-        # with an aware cutoff by the in-Python evaluator.
-        .execution_options(synchronize_session=False)
+    purgeable = (
+        getattr(IdeSession, by) < cutoff,
+        IdeSession.session_type == session_type,
+        IdeSession.status != "running",
     )
-    sids = list(result.scalars().all())
-    if sids:
-        await _delete_children(db, sids)
+    candidates = list(
+        (
+            await db.execute(
+                # One order for every instance: two purging together lock
+                # the rows they both want in the same sequence (no deadlock).
+                select(IdeSession.id).where(*purgeable).order_by(IdeSession.id)
+                .with_for_update()
+            )
+        ).scalars().all()
+    )
+    sids: list[str] = []
+    for chunk in _chunks(candidates):
+        await db.execute(
+            delete(IdeSession)
+            .where(IdeSession.id.in_(chunk), *purgeable)
+            # The WHERE is the check; SQLite's naive datetimes cannot be
+            # compared with an aware cutoff by the in-Python evaluator.
+            .execution_options(synchronize_session=False)
+        )
+        kept = set(
+            (
+                await db.execute(select(IdeSession.id).where(IdeSession.id.in_(chunk)))
+            ).scalars().all()
+        )
+        removed = [sid for sid in chunk if sid not in kept]
+        if removed:
+            await _delete_children(db, removed)
+        sids.extend(removed)
     await db.commit()
     return len(sids)
 
@@ -269,10 +295,10 @@ async def purge_audit_older_than(db: AsyncSession, days: int) -> int:
     result = await db.execute(
         delete(IdeAuditLog)
         .where(IdeAuditLog.ts < utcnow() - timedelta(days=days))
-        .returning(IdeAuditLog.id)
         .execution_options(synchronize_session=False)
     )
-    n = len(result.scalars().all())
+    # The count of the DELETE itself; SAP HANA has no ``RETURNING``.
+    n = max(result.rowcount or 0, 0)
     await db.commit()
     return n
 
@@ -286,17 +312,41 @@ async def reset_running_ide_sessions(db: AsyncSession, *, min_age_s: float = 0.0
     may be a live run of another instance (rolling or blue-green deploy,
     several instances), whose heartbeat keeps it fresh: it is left alone.
     Returns the number of rows reset.
+
+    No ``UPDATE ... RETURNING`` (SAP HANA has none): the ghosts are selected
+    ``FOR UPDATE`` in id order and reset under the same conditions. A row a
+    heartbeat refreshed in between (possible on SQLite, which takes no row
+    lock) is still ``running`` afterwards and is left out, with its comments.
     """
     where = [IdeSession.status == "running"]
     if min_age_s > 0:
         where.append(IdeSession.updated_at < utcnow() - timedelta(seconds=min_age_s))
-    result = await db.execute(
-        update(IdeSession)
-        .where(*where)
-        .values(status="idle", run_id=None)
-        .returning(IdeSession.id)
+    ghosts = list(
+        (
+            await db.execute(
+                select(IdeSession.id).where(*where).order_by(IdeSession.id)
+                .with_for_update()
+            )
+        ).scalars().all()
     )
-    ids = list(result.scalars().all())
+    ids: list[str] = []
+    for chunk in _chunks(ghosts):
+        await db.execute(
+            update(IdeSession)
+            .where(IdeSession.id.in_(chunk), *where)
+            .values(status="idle", run_id=None)
+            .execution_options(synchronize_session=False)
+        )
+        alive = set(
+            (
+                await db.execute(
+                    select(IdeSession.id).where(
+                        IdeSession.id.in_(chunk), IdeSession.status == "running"
+                    )
+                )
+            ).scalars().all()
+        )
+        ids.extend(sid for sid in chunk if sid not in alive)
     # A comment is ``sent`` only while its run is in flight; the ghost run
     # will never resolve it, so it goes back to ``open`` with the lock.
     for chunk in _chunks(ids):
@@ -407,16 +457,16 @@ async def _next_version(db: AsyncSession, sid: str, kind: str) -> int:
 
 async def lock_session_row(db: AsyncSession, sid: str) -> None:
     """``SELECT ... FOR UPDATE`` on the session row, in the caller's
-    transaction. Serialises approve with comment writes on Postgres (READ
-    COMMITTED: a NOT EXISTS in approve's UPDATE would not see a comment
-    committed after its snapshot). SQLAlchemy drops the clause on SQLite,
-    whose single writer already serialises them.
+    transaction. Serialises approve with comment writes on Postgres and SAP
+    HANA (READ COMMITTED: a NOT EXISTS in approve's UPDATE would not see a
+    comment committed after its snapshot). SQLAlchemy drops the clause on
+    SQLite, whose single writer already serialises them.
 
     Lock order: every writer that touches both takes the session row FIRST
     and comments second (``runner._start``/``_reclaim``/``_release``, the
     comment writers here). The reverse order in one of them would let two
     requests each hold the row the other waits for -- a deadlock, one
-    request failing -- on Postgres."""
+    request failing -- on a database with row locks."""
     await db.execute(
         select(IdeSession.id).where(IdeSession.id == sid).with_for_update()
     )
@@ -1609,7 +1659,8 @@ async def mark_comments_sent(db: AsyncSession, sid: str, run_id: str) -> list[Id
             break
         chosen.append(cid)
         chars += length
-    ids: list[str] = []
+    tag = run_id[:36] if run_id else None
+    moved = 0
     for chunk in _chunks(chosen):
         res = await db.execute(
             update(IdeComment)
@@ -1618,20 +1669,30 @@ async def mark_comments_sent(db: AsyncSession, sid: str, run_id: str) -> list[Id
                 IdeComment.state == "open",
                 IdeComment.id.in_(chunk),
             )
-            .values(state="sent", sent_run_id=run_id[:36] if run_id else None,
-                    updated_at=utcnow())
-            .returning(IdeComment.id)
+            .values(state="sent", sent_run_id=tag, updated_at=utcnow())
             .execution_options(synchronize_session=False)
         )
-        ids.extend(res.scalars().all())
-    if not ids:
+        moved += max(res.rowcount or 0, 0)
+    if not moved:
         return []
     await touch_session(db, sid)
+    # Which of the chosen ones the UPDATE moved (no ``RETURNING``: SAP HANA
+    # has none): those that are ``sent`` by this run now. A comment that was
+    # dismissed or deleted between the select and the UPDATE is neither; one
+    # an earlier run sent was never ``open``, so it was never chosen.
+    sent_by_run = (
+        IdeComment.sent_run_id == tag if tag else IdeComment.sent_run_id.is_(None)
+    )
     out: list[IdeComment] = []
-    for chunk in _chunks(ids):
+    for chunk in _chunks(chosen):
         rows = await db.execute(
             select(IdeComment)
-            .where(IdeComment.session_id == sid, IdeComment.id.in_(chunk))
+            .where(
+                IdeComment.session_id == sid,
+                IdeComment.id.in_(chunk),
+                IdeComment.state == "sent",
+                sent_by_run,
+            )
             .execution_options(populate_existing=True)
         )
         out.extend(rows.scalars().all())
@@ -1648,19 +1709,46 @@ async def reopen_sent_comments(
     and when a dead run's lock is reclaimed: ``sent`` exists only while its
     run is in flight. Scoped to the run: a reclaimed run that finishes late
     must not reopen what a newer run sent and is still working on. Returns
-    the ids moved, oldest first."""
+    the ids moved, oldest first.
+
+    No ``UPDATE ... RETURNING`` (SAP HANA has none): the run's ``sent``
+    comments are selected ``FOR UPDATE`` and then moved under the same
+    conditions. Both callers hold the session row (``lock_session_row``, or
+    the run-lock UPDATE of a reclaim), which every comment writer takes
+    first, so nothing can change them between the two statements; a comment
+    the agent resolved meanwhile on a database without row locks is no
+    longer ``sent`` and is left out of the answer."""
     tag = IdeComment.sent_run_id == run_id[:36] if run_id else (
         IdeComment.sent_run_id.is_(None)
     )
-    res = await db.execute(
-        update(IdeComment)
-        .where(IdeComment.session_id == sid, IdeComment.state == "sent", tag)
-        .values(state="open", updated_at=utcnow())
-        .returning(IdeComment.id, IdeComment.created_at)
-        .execution_options(synchronize_session=False)
-    )
-    rows = sorted(res.all(), key=lambda r: (r[1], r[0]))
-    return [r[0] for r in rows]
+    left_sent = (IdeComment.session_id == sid, IdeComment.state == "sent", tag)
+    rows = (
+        await db.execute(
+            select(IdeComment.id, IdeComment.created_at)
+            .where(*left_sent)
+            .order_by(IdeComment.created_at, IdeComment.id)
+            .with_for_update()
+        )
+    ).all()
+    ids = [r[0] for r in rows]
+    reopened: set[str] = set()
+    for chunk in _chunks(ids):
+        await db.execute(
+            update(IdeComment)
+            .where(IdeComment.id.in_(chunk), *left_sent)
+            .values(state="open", updated_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        reopened.update(
+            (
+                await db.execute(
+                    select(IdeComment.id).where(
+                        IdeComment.id.in_(chunk), IdeComment.state == "open"
+                    )
+                )
+            ).scalars().all()
+        )
+    return [cid for cid in ids if cid in reopened]
 
 
 async def resolve_comments(
@@ -1828,7 +1916,9 @@ def _parse_pins(raw: Any) -> dict[str, Any]:
 async def _update_pins(db: AsyncSession, session: IdeSession, change) -> None:
     """Read-modify-write of ``pins_json`` as compare-and-set: the UPDATE
     only applies while the column still holds what was read, so two approve
-    requests cannot overwrite each other's pin. Retried on a lost race."""
+    requests cannot overwrite each other's pin. Retried on a lost race.
+    The compare is ``agents.db.text_unchanged``: in the UPDATE itself on
+    Postgres and SQLite, under a row lock on SAP HANA (no ``=`` on NCLOB)."""
     for _ in range(5):
         current = (
             await db.execute(
@@ -1837,10 +1927,8 @@ async def _update_pins(db: AsyncSession, session: IdeSession, change) -> None:
         ).scalar_one_or_none()
         pins = _parse_pins(current)
         change(pins)
-        guard = (
-            IdeSession.pins_json.is_(None)
-            if current is None
-            else IdeSession.pins_json == current
+        guard = await text_unchanged(
+            db, IdeSession.pins_json, current, IdeSession.id == session.id
         )
         new = json.dumps(pins, sort_keys=True)
         res = await db.execute(

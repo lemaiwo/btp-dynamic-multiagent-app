@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.20.0
+version: 2.21.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -132,6 +132,10 @@ modules:
       - name: aicore-service
       - name: uaa-service
       - name: agent-registry-db
+      # The SAP HANA alternative to agent-registry-db. The resource is
+      # inactive by default, and a requirement on an inactive resource is
+      # ignored: nothing is created or bound unless an .mtaext activates it.
+      - name: agent-registry-hana
       - name: agent-destination
       # The connectivity proxy for ProxyType OnPremise destinations (Cloud Connector).
       - name: agent-connectivity
@@ -284,6 +288,40 @@ resources:
         # storage: 20                   # GB; grow-only (default/floor is 20)
         multi_az: false               # false = no HA standby (dev). Set true for prod HA.
         # backup_retention_period: 14   # days; allowed 7–35
+
+  # The same storage on SAP HANA Cloud instead: an HDI container. Off by
+  # default; a landscape chooses its database by flipping `active` on the two
+  # resources in its extension descriptor (cf deploy ... -e <landscape>.mtaext):
+  #
+  #   resources:
+  #     - name: agent-registry-db
+  #       active: false
+  #     - name: agent-registry-hana
+  #       active: true
+  #
+  # The app takes whichever of the two is bound. With BOTH active it refuses
+  # to start until the extension also sets the module property DB_KIND to
+  # "postgres" or "hana". Nothing is copied from one database to the other:
+  # a landscape that switches starts with an empty registry (export the
+  # configuration in the admin UI first, import it afterwards).
+  #
+  # There is no deployer module and no .hdbtable file: at start the app
+  # generates the design-time artifacts from its models and deploys them
+  # with the container's design-time user (agents/hana_hdi.py). The
+  # container remembers the schema generation it holds: an OLDER app
+  # version (a rollback, an old instance during a rolling deploy) deploys
+  # nothing and runs on the newer schema, as it would on PostgreSQL. A
+  # table is never dropped unless the extension sets the module property
+  # HANA_HDI_ALLOW_DROP to "true" for that one deploy.
+  #
+  # Needs a HANA Cloud instance mapped to the space; with more than one,
+  # name it in the extension: parameters: { config: { database_id: <id> } }.
+  - name: agent-registry-hana
+    type: org.cloudfoundry.managed-service
+    active: false
+    parameters:
+      service: hana
+      service-plan: hdi-shared
 
   - name: ui5-admin-repo-host
     type: org.cloudfoundry.managed-service

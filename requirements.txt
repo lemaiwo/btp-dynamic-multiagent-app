@@ -16,4 +16,8 @@ python-multipart==0.0.32
 sqlalchemy[asyncio]==2.1.1
 asyncpg==0.31.0
 aiosqlite==0.22.1
+# SAP HANA Cloud (HDI container) as the alternative to Postgres: the dialect
+# and SAP's driver. Imported only when a hana binding or URL is in use.
+sqlalchemy-hana==5.0.0
+hdbcli==2.30.27
 pyjwt[crypto]==2.15.0

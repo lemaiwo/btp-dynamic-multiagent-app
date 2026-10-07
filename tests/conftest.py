@@ -41,6 +41,37 @@ import agents.db  # noqa: E402,F401,I001
 
 _BINDING_PREFIXES = ("DESTINATION_", "CONNECTIVITY_")
 
+# Every statement the suite executes on its SQLite engine is also compiled
+# for SAP HANA and checked for what HANA refuses (RETURNING, a comparison or
+# an ORDER BY on a Text column, ...): SQLite and Postgres accept all of it,
+# so nothing else would notice before a HANA landscape does. On by default;
+# HANA_SQL_CHECK=0 switches it off (it costs a few percent of the run time).
+HANA_SQL_CHECK = os.environ.get("HANA_SQL_CHECK", "1") != "0"
+if HANA_SQL_CHECK:
+    from tests import hana_sql  # noqa: E402
+
+    hana_sql.watch_engine()
+
+
+@pytest.fixture(autouse=True)
+def _statements_run_on_hana_too():
+    """Fail the test that executed a statement SAP HANA would refuse.
+
+    See ``tests/hana_sql.py`` for the rules and the two reasoned exceptions,
+    and ``agents.db.text_unchanged`` / ``agents/ide/store.py`` for how such a
+    statement is written instead.
+    """
+    if not HANA_SQL_CHECK:
+        yield
+        return
+    hana_sql.take_refused()
+    yield
+    refused = hana_sql.take_refused()
+    assert not refused, (
+        "SAP HANA would refuse a statement this test executed:\n  "
+        + "\n  ".join(refused)
+    )
+
 
 @pytest.fixture(autouse=True)
 def _binding_env_does_not_leak():

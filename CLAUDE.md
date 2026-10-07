@@ -20,7 +20,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 ## Architecture
 - **LLM**: SAP AI Core Generative AI Hub (`sap-ai-sdk-gen`) via
   OpenAI-compatible API
-- **Storage**: PostgreSQL (BTP `postgresql-db` service) via SQLAlchemy async
+- **Storage**: SQLAlchemy async on one of two databases, chosen per
+  landscape at deploy time: PostgreSQL (BTP `postgresql-db` service,
+  `asyncpg`) or SAP HANA Cloud through an HDI container (`hana` service,
+  plan `hdi-shared`, `hana+aiohdbcli`). SQLite is the local and test
+  default. The models are the schema on all three
 - **MCP**: Streamable HTTP with JWT forwarding (`JWTForwardAuth` in
   `agents/shared.py`) reading `agents.auth.current_jwt` per request
 - **Framework**: FastAPI app combining admin router + mounted
@@ -52,7 +56,133 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   destination and no `user_context` (those belong to each catalogue service),
   every other key dropped; an agent has at most one such entry, and
   `check_odata_services` refuses an unknown service name at every agent
-  write, under a row lock
+  write, under a row lock.
+  **Which database** (`_resolve_database`, read once at import): a bound
+  service wins over `DATABASE_URL`. One kind bound (a postgres label, or
+  `hana`; of several `hana` bindings the HDI container: plan `hdi-shared` or
+  credentials with an `hdi_user`) is used; with both bound the import fails
+  with `DatabaseConfigError` unless `DB_KIND` (`postgres` | `hana`) names
+  one, and a `DB_KIND` naming a kind that is not bound fails too (never
+  answered with the other one; `DB_KIND` is ignored when nothing is bound).
+  **On Cloud Foundry (`VCAP_APPLICATION` set) the app never ends on
+  SQLite**: unparseable `VCAP_SERVICES`, a database binding whose
+  `credentials` is not an object, no database binding and no `DATABASE_URL`,
+  or a SQLite `DATABASE_URL` are a `DatabaseConfigError` that names no value;
+  locally the same environment still falls back to the SQLite file. Locally
+  `DATABASE_URL` may be a `hana://` / `hana+aiohdbcli://` URL (the container
+  schema as `currentSchema`), with the design-time user in `HANA_HDI_USER` /
+  `HANA_HDI_PASSWORD`. A HANA connection is always encrypted and its
+  certificate validated: every spelling of `encrypt`,
+  `sslValidateCertificate` and `sslHostNameInCertificate` in a URL is dropped
+  (the driver reads its options in any case) before the fixed values are
+  set, with one WARNING when the URL asked for less; there is no insecure
+  switch as `PG_SSL_INSECURE` is for Postgres; the binding's `certificate` is
+  the trust store, passed in memory. `_target_from_url` and `bound_target`
+  build a target outside the app's own choice (for
+  `scripts/copy_registry_config.py`).
+  `init_db` has two schema steps: `_create_and_migrate` (Postgres, SQLite:
+  `create_all` plus the additive `_ensure_*` chain and the two IDE data
+  repairs, unchanged) and `_deploy_hana_schema` (HANA: `agents/hana_hdi.py`
+  instead of all of that; the repairs are for rows of versions that never ran
+  on HANA and are not run). The orchestrator row is ensured on all three.
+  **On HANA the models are the only DDL: a new NOT NULL column needs a
+  `server_default`** (HDI adds it to a table that holds rows;
+  `tests/test_hana_hdi.py` pins the NOT NULL columns without one that exist
+  today and fails for a new one), and every change of a model needs a new
+  schema generation (below).
+  **Statements must run on all three databases.** HANA has no `UPDATE` /
+  `DELETE ... RETURNING` and cannot compare, order, group or `DISTINCT` a
+  `Text` column (it is `NCLOB`; `IS NULL` and `length()` are fine), and it
+  has no `SELECT` without `FROM` (`app.HEARTBEAT` is a `select()`, not
+  `text("SELECT 1")`). The helpers: `has_row_locks(session)` (false on
+  SQLite only: every `FOR UPDATE` that used to be "Postgres only" applies on
+  HANA too), `compares_lobs(session)` (false on HANA only) and
+  `text_unchanged(session, column, seen, *row)`, the WHERE term of a
+  compare-and-set on a `Text` column: `column == seen` on Postgres and
+  SQLite (the value typed `ComparedText`, which is `Text` with a name), on
+  HANA a `FOR UPDATE` read compared in Python, the lock held to the end of
+  the caller's transaction (session pins, approve, seed refresh).
+  Instead of `RETURNING`, `agents/ide/store.py` selects the rows `FOR UPDATE`
+  in id order, writes under the same conditions and reads which of them the
+  write reached. **The whole suite checks this**: `tests/conftest.py` compiles
+  every statement a test executes on the SQLite engine for the HANA dialect
+  as well (`tests/hana_sql.py`) and fails the test that executed one HANA
+  would refuse (about 9% of the run time; `HANA_SQL_CHECK=0` switches it
+  off). Exempt are exactly the `ComparedText` compare and the one statement
+  of `_resync_ide_revisions`, neither of which is ever sent to HANA.
+  HANA hands timestamps back naive (UTC), as SQLite does
+- `agents/hana_hdi.py` — the schema in an HDI container. The app's runtime
+  user may only read and write rows (any DDL fails), so tables exist only as
+  design-time artifacts made by the container's design-time user
+  (`hdi_user`). `artifacts(metadata)` generates them from the models
+  (nothing is committed as `.hdbtable`, there is no Node deployer module):
+  one `.hdbtable` per table (`COLUMN TABLE`, columns and primary key only,
+  `DATETIME` written `TIMESTAMP`), one `.hdbindex` per index and per unique
+  constraint (the partial `api_slug` indexes are plain unique ones: HANA
+  allows several NULLs), one `.hdbconstraint` per foreign key, plus
+  `.hdiconfig` and `.hdinamespace`, all under `src/`; deterministic, and a
+  model construct without an artifact (unnamed unique constraint, CHECK) is an
+  `HdiError` in the unit tests rather than at deploy.
+  `deploy(credentials, metadata)` runs `deploy_files` in a thread (sync
+  `hdbcli`), under HDI's container lock (`#DI.LOCK`). Measured on a
+  container: while one connection holds the lock, a second one's `LOCK`
+  times out (driver error 131) before and after the holder's `WRITE`,
+  `DELETE` and `MAKE`, and gets the lock when the holder commits; so two
+  instances that start together run one after the other, and the second
+  finds nothing to do. That is as far as the serialisation goes: it covers
+  deployers that take this lock, not another tool writing to the container.
+  The wait is 30 s (`LOCK_WAIT_MS`), chosen to fit inside Cloud Foundry's
+  default 60 s start timeout (a first deploy of the whole schema measured
+  3 s, a redeploy 3-5 s, the check of a current container about 1 s); an
+  instance that waits longer fails its start with a clear error. Nothing is
+  retried. Under the lock: read the container's record; `LIST_DEPLOYED`;
+  when paths and SHA-256 already match nothing is made; otherwise `WRITE`,
+  `DELETE` and `MAKE` (deploy the generated set, undeploy what is deployed
+  and no longer generated). A message row of severity `ERROR` is the failure
+  (HDI's procedures do not raise).
+  **What a transaction does there (measured):** the lock lives in the
+  client's transaction, so the connection is switched off autocommit
+  (hdbcli's default is on, and the lock would be gone at once); but HDI
+  commits each of its calls itself: a rollback takes back neither a `WRITE`
+  or `DELETE` in the design-time file system nor a successful `MAKE`. A
+  `MAKE` is atomic in itself, the file system is not. So a deploy never
+  relies on rollback: it deletes exactly the files that are in the file
+  system and not generated (HDI refuses to delete a file that is not there)
+  and undeploys exactly what is deployed and not generated, and so succeeds
+  from whatever a failed deploy left behind.
+  **Two guards against an older app version** (a rollback, an old instance
+  during a rolling deploy), which would otherwise drop the newer tables and
+  columns with their rows where Postgres just runs old code on a superset
+  schema: (1) `HANA_SCHEMA_GENERATION`, a counter in the module;
+  `agents/hana_schema_history.json` pins the digest of each generation's
+  artifact set and a unit test fails when the models change without a new
+  generation (raise the counter by one, run
+  `scripts/hana_schema_history.py`, commit both). The container keeps a
+  record, `meta/generation.json` in its design-time file system, read and
+  written under the lock: `{generation, made, digest}`. A deploy writes it
+  as "not made" before its make and as "made" after the make succeeded
+  (HDI commits every call itself, so no transaction could keep record and
+  schema in step); `digest` identifies the artifact files and is compared
+  with what `LIST_DEPLOYED` reports. A record of a HIGHER generation that
+  is made and whose digest is what is deployed: the container is not
+  touched at all (no write, no make, no undeploy, one WARNING naming both
+  generations) and the app starts on the newer schema. A higher generation
+  that is NOT made (its make failed or was interrupted), or whose digest is
+  not what is deployed: `HdiError`, nothing changed and the app does not
+  start; an older version neither deploys over it nor runs on it, and the
+  version of that generation finishes it. Same generation: the unchanged
+  shortcut when the files match (the record is brought to "made"), else a
+  deploy; that is also how a failed first make recovers. **The guard fails
+  closed**: a record that is there and cannot be read, or a `LIST` that
+  answers any error other than HDI's file-not-found codes, is an `HdiError`,
+  never "no record"; and a record is never replaced by a lower generation.
+  (2) Whatever the generations say, a deploy that would undeploy an
+  `.hdbtable` is refused before anything is written unless
+  `HANA_HDI_ALLOW_DROP` is exactly `true`; indexes and constraints are
+  undeployed without it. Errors carry HDI's messages (cut, credential values
+  and the container schema name replaced) or the driver's error code, never
+  the driver's text, a password, the certificate or a URL. No `schema` plan
+  (no design-time user)
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin`/`require_developer` FastAPI dependencies
@@ -942,7 +1072,60 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (`connectivity`, plan `lite`, bound to the app) and `ODATA_AUDIT_RETENTION_DAYS`
   (365); `CONNECTIVITY_PP_MODE` is not in the descriptor (set per landscape in
   an `.mtaext`; default `exchange`; an unknown value is one WARNING at
-  startup and a refusal of each affected call)
+  startup and a refusal of each affected call); 2.21.0 adds the resource
+  `agent-registry-hana` (`hana`, plan `hdi-shared`) with `active: false`,
+  required by the app next to `agent-registry-db` (a requirement on an
+  inactive resource is ignored). A landscape switches database in its
+  `.mtaext` by setting `active` on the two resources (the snippet is a
+  comment in the descriptor); with both active it must also set `DB_KIND`.
+  Nothing is copied between the databases by a deploy (see
+  `scripts/copy_registry_config.py`). `HANA_HDI_ALLOW_DROP` is not in the
+  descriptor (an `.mtaext` sets it for the one deploy that may drop a table)
+- `scripts/copy_registry_config.py` — copies the registry's configuration
+  from one database to the other (a landscape that switches from PostgreSQL
+  to HANA, or back). **It is the only supported way to carry stored secrets
+  over** (`/admin/api/export` redacts them on purpose, and stays as it is):
+  rows go from one database to the other inside one process, never through
+  a file, a bundle, an argument or a log. **It copies configuration, not
+  history**: `agent_configs` (every column), `skill_configs`, the
+  orchestrator row, `workflows` with branches and steps, `odata_services`,
+  `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not job or
+  workflow runs, the audit logs, IDE sessions and their children, OAuth flow
+  states. Rows are matched by natural key (integer ids are the target's own;
+  branches and steps follow their workflow's name); a target row of the same
+  key is replaced, other target rows are left alone; a second run changes
+  nothing; one transaction on the target. The target's schema must exist
+  (start the app once on it); the source gets no writing statement (READ
+  ONLY on Postgres). As a CF task of an app with BOTH services bound:
+  `python scripts/copy_registry_config.py --from postgres --to hana`;
+  elsewhere `--from-env NAME --to-env NAME` name environment variables that
+  hold the URLs (never a URL as an argument). Both go through the resolver
+  of `agents/db.py` (a refused `--from` / `--to` value is not echoed).
+  `DB_KIND` chooses neither side; because `agents.db` refuses to be imported
+  with two bound services and no `DB_KIND`, the script sets
+  `DB_KIND=postgres` for its own process when the variable is unset, which
+  only decides the engine `agents.db` builds for itself and through which
+  the script reads and writes nothing. Dry run by default (`--apply`
+  writes): per table the counts to insert / replace / unchanged and the
+  names concerned (counts only for the OAuth tables); no other column value
+  is printed or logged, and a failure is reported by its class only.
+  Timestamps are handed over as aware UTC instants (Postgres returns aware
+  datetimes, HANA and SQLite naive UTC). Rows that exist only in the target
+  are listed per table (left alone); a unique value (`api_slug`) that a
+  target-only row holds and a source row of another name needs is a refusal
+  by table and names before anything is written. Setting `non_production`,
+  or the destination of a flagged target, writes the app's own audit rows
+  (`conventions_flag`, `conventions_destination`) in the same transaction,
+  as actor `script:copy_registry_config`. **Around `--apply`**: the app on
+  the source should be stopped or no longer in use; the app on the target
+  must be restarted (or reloaded) afterwards; user tokens are copied as
+  they are at that moment, so one that either side refreshes later makes the
+  other side's copy stale and a second run overwrites the target's. A
+  failure after the target's commit (closing the source) is reported as
+  "written", never as "nothing was written"
+- `scripts/hana_schema_history.py` — pins the digest of the current HANA
+  artifact set for `HANA_SCHEMA_GENERATION` in
+  `agents/hana_schema_history.json`; only ever adds a generation
 - `scripts/probe_odata_connectivity.py` — standalone probe (stdlib + `httpx`,
   nothing imported from the app) run inside an app container that has the
   connectivity binding: proves HTTP forward mode on an `http://` virtual host,
@@ -966,7 +1149,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `JOULE_A2A.md` — configuration guide for BTP + Joule Agent Hub
 
 ## Runtime flow
-1. Lifespan: `init_db()` → `seed_from_file_if_empty(SEED_FILE)` →
+1. Lifespan: `init_db()` (on SAP HANA: the HDI deploy of the generated
+   artifacts, a no-op when the container is current or holds a newer schema
+   generation) →
+   `seed_from_file_if_empty(SEED_FILE)` →
    `registry.reload()` → `dynamic_chat_app.refresh()`
 2. Request: `JWTBindingMiddleware` extracts bearer token → sets
    `current_jwt` contextvar → downstream code (chat → orchestrator →
@@ -1011,7 +1197,8 @@ python app.py         # listens on 127.0.0.1; HOST=0.0.0.0 to open it up
 # Admin: http://127.0.0.1:7932/admin  (no XSUAA locally → open access)
 ```
 
-Local falls back to SQLite if no `DATABASE_URL` is set.
+Local falls back to SQLite if no `DATABASE_URL` is set. A `hana://` URL
+needs `HANA_HDI_USER` / `HANA_HDI_PASSWORD` as well (see `agents/db.py`).
 
 ## Dependencies
 All pinned in `requirements.txt` to the versions the suites last ran on;
@@ -1024,8 +1211,19 @@ bump a pin, rerun the suites, then deploy.
 - `builtin:odata` adds no dependency: `$metadata` is parsed with the standard
   library's expat
 - `sqlalchemy[asyncio]`, `asyncpg` (Postgres on CF), `aiosqlite` (the
-  local SQLite fallback) — dynamic agent storage
+  local SQLite fallback), `sqlalchemy-hana` and `hdbcli` (SAP HANA Cloud;
+  imported only when a hana binding or URL is in use) — dynamic agent storage
 - `pyjwt[crypto]` — XSUAA JWT validation
+- Database-specific suites are opt-in and SKIPPED without their variable:
+  `TEST_POSTGRES_URL` (`tests/pg.py`, a schema per test:
+  `tests/test_odata_postgres.py`, `tests/test_ide_postgres.py` and one case
+  of `tests/test_copy_registry_config.py`) and
+  `TEST_HANA_SERVICE_KEY` (`tests/hana.py`: the JSON of a service key of a
+  throw-away `hdi-shared` container, in the environment only;
+  `tests/test_hana_integration.py` deploys through `init_db`, empties every
+  table around each test and must run serially, one process per container).
+  `tests/ide_concurrency.py` holds the races of the IDE store once; the
+  Postgres and the HANA suite both run them
 - Test-only: `pytest`, `pytest-asyncio` (`pytest.ini` sets
   `asyncio_mode = auto`), `jsdom` via the root `package.json`, `ruff`
   (`ruff.toml`, advisory in CI). Script-style suites patch

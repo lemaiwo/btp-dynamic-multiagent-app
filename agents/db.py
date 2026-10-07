@@ -1,9 +1,16 @@
 """Database layer for dynamic agent configuration.
 
-Uses PostgreSQL via SQLAlchemy async. On SAP BTP the connection URL is
-resolved from the `postgresql-db` service in VCAP_SERVICES. Locally it
-falls back to the DATABASE_URL environment variable (or an in-memory
-SQLite fallback for quick experiments).
+SQLAlchemy async on one of three databases. On SAP BTP the connection is
+resolved from VCAP_SERVICES: a `postgresql-db` binding (asyncpg), or an SAP
+HANA Cloud HDI container (`hana`, plan `hdi-shared`; `hana+aiohdbcli`),
+whichever is bound -- `DB_KIND` decides when both are. Locally it falls back
+to the DATABASE_URL environment variable (or a SQLite file for quick
+experiments).
+
+The models are the schema on all three. Postgres and SQLite get it from
+`create_all` plus the additive `_ensure_*` steps of `init_db`; an HDI
+container accepts no DDL from the app's user, so there `init_db` deploys the
+same models as design-time artifacts instead (agents/hana_hdi.py).
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ import os
 import re
 import ssl
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -26,17 +34,22 @@ from sqlalchemy import (
     UniqueConstraint,
     delete,
     exists,
+    false,
     func,
     insert,
     literal,
     select,
     text,
+    true,
     update,
 )
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.types import TypeDecorator
 
+from agents import hana_hdi
 from agents.odata import BUILTIN_ODATA_URL
 
 # The catalogue's save-time gate lives with its models; re-exported because
@@ -102,7 +115,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Connection string resolution
 # ---------------------------------------------------------------------------
-_vcap_ssl_ca: str | None = None  # populated when reading VCAP_SERVICES below
 
 
 def _build_ssl_context(ca_pem: str | None) -> ssl.SSLContext:
@@ -126,59 +138,329 @@ def _build_ssl_context(ca_pem: str | None) -> ssl.SSLContext:
     return ctx
 
 
-def _resolve_database_url() -> str:
-    """Build an async SQLAlchemy URL from VCAP_SERVICES or env."""
-    global _vcap_ssl_ca
+class DatabaseConfigError(RuntimeError):
+    """The environment does not say which database to use, or names one that
+    cannot be used. Raised while this module is imported, so the app does not
+    start; the message never repeats a credential or a URL."""
+
+
+# VCAP_SERVICES labels per database kind. ``hana`` is the label of SAP HANA
+# Cloud's schema and HDI container service (plan ``hdi-shared`` is the one
+# this app can use: see agents/hana_hdi.py).
+_POSTGRES_LABELS = ("postgresql-db", "postgresql", "hyperscaler-option-postgresql")
+_HANA_LABELS = ("hana",)
+DB_KINDS = ("postgres", "hana")
+HANA_DRIVER = "hana+aiohdbcli"
+# A HANA connection is always encrypted and its certificate always
+# validated. There is deliberately no switch for anything less (compare
+# PG_SSL_INSECURE above, which this does not copy).
+_HANA_TLS = {"encrypt": "true", "sslValidateCertificate": "true"}
+
+
+@dataclass(frozen=True)
+class DatabaseTarget:
+    """Which database this process uses. ``url`` holds the password, so a
+    ``repr`` names only the kind."""
+
+    url: str = field(repr=False)
+    kind: str  # "postgres", "hana" or "sqlite"; "other" for an unknown scheme
+    ssl_ca: str | None = field(default=None, repr=False)
+    # SAP HANA only: the design-time user that deploys the tables.
+    hdi: hana_hdi.HdiCredentials | None = field(default=None, repr=False)
+
+
+def _on_cloud_foundry() -> bool:
+    """A deployed app: the platform sets VCAP_APPLICATION for every one.
+
+    Decides one thing: locally an environment that names no usable database
+    ends on a SQLite file, which is a convenience; on Cloud Foundry the same
+    fallback would run the app on a file the next restart deletes, with
+    nobody told, so there it is a :class:`DatabaseConfigError` instead.
+    """
+    return bool(os.environ.get("VCAP_APPLICATION", "").strip())
+
+
+def _is_hdi_container(instance: Any) -> bool:
+    credentials = instance.get("credentials") if isinstance(instance, dict) else None
+    return isinstance(instance, dict) and (
+        instance.get("plan") == "hdi-shared"
+        or (isinstance(credentials, dict) and bool(credentials.get("hdi_user")))
+    )
+
+
+def _bound_databases(services: Any) -> dict[str, dict[str, Any]]:
+    """``{kind: credentials}`` of the database services bound to the app.
+
+    The first instance of a label, except for ``hana``: that label also
+    covers plain schemas, and of several bindings the HDI container (plan
+    ``hdi-shared``, or credentials with an ``hdi_user``) is the one the app
+    can create its tables in. A binding whose ``credentials`` is not an
+    object is skipped locally and refused on Cloud Foundry.
+    """
+    bound: dict[str, dict[str, Any]] = {}
+    if not isinstance(services, dict):
+        return bound
+    for kind, labels in (("postgres", _POSTGRES_LABELS), ("hana", _HANA_LABELS)):
+        for label in labels:
+            instances = services.get(label)
+            if not isinstance(instances, list) or not instances:
+                continue
+            chosen = instances[0]
+            if kind == "hana":
+                chosen = next((i for i in instances if _is_hdi_container(i)), chosen)
+            credentials = chosen.get("credentials") if isinstance(chosen, dict) else None
+            if isinstance(credentials, dict):
+                bound[kind] = credentials
+                break
+            if _on_cloud_foundry():
+                raise DatabaseConfigError(
+                    f"The credentials of the bound {label} service are not an object"
+                )
+    return bound
+
+
+def _choose_kind(bound: dict[str, dict[str, Any]]) -> str | None:
+    """Which of the bound databases to use; None when none is bound.
+
+    One kind bound: that one. Both bound: only what ``DB_KIND`` names; with
+    no ``DB_KIND`` the start is refused, because guessing would let a
+    landscape that switches from one to the other run on the wrong one (and
+    on HANA, deploy a schema) without anyone having said so. ``DB_KIND``
+    naming a kind that is not bound is refused as well, never answered with
+    the other one.
+    """
+    wanted = os.environ.get("DB_KIND", "").strip().lower()
+    if not bound:
+        return None
+    if wanted and wanted not in DB_KINDS:
+        raise DatabaseConfigError(
+            "DB_KIND must be 'postgres' or 'hana' (it selects one of the bound "
+            "database services)"
+        )
+    if wanted:
+        if wanted not in bound:
+            raise DatabaseConfigError(
+                f"DB_KIND names '{wanted}', but no such database service is bound"
+            )
+        return wanted
+    if len(bound) > 1:
+        raise DatabaseConfigError(
+            "Both a PostgreSQL and an SAP HANA service are bound. Set DB_KIND to "
+            "'postgres' or 'hana' to say which one this app uses, or unbind the other."
+        )
+    return next(iter(bound))
+
+
+def _postgres_target(creds: dict[str, Any]) -> DatabaseTarget:
+    # BTP PG credentials expose hostname, port, username, password, dbname, sslcert
+    host = creds.get("hostname") or creds.get("host")
+    port = creds.get("port", 5432)
+    user = creds.get("username")
+    password = creds.get("password")
+    dbname = creds.get("dbname") or creds.get("database")
+    # BTP exposes the server CA under one of these keys
+    ssl_ca = (
+        creds.get("sslrootcert")
+        or creds.get("sslcert")
+        or creds.get("ca")
+        or creds.get("cert")
+    )
+    sslmode = "require"
+    return DatabaseTarget(
+        f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
+        f"?ssl={sslmode}",
+        "postgres",
+        ssl_ca=ssl_ca,
+    )
+
+
+def _hana_target(creds: dict[str, Any]) -> DatabaseTarget:
+    """An ``hdi-shared`` binding: the runtime user for the engine, the
+    design-time user for :func:`init_db`."""
+    missing = [k for k in ("host", "port", "user", "password", "schema") if not creds.get(k)]
+    if missing:
+        raise DatabaseConfigError(
+            "The SAP HANA binding has no " + ", ".join(missing)
+        )
+    url = URL.create(
+        HANA_DRIVER,
+        username=str(creds["user"]),
+        password=str(creds["password"]),
+        host=str(creds["host"]),
+        port=int(creds["port"]),
+        query={**_HANA_TLS, "currentSchema": str(creds["schema"])},
+    )
+    try:
+        hdi = hana_hdi.credentials_from_binding(creds)
+    except hana_hdi.HdiError:
+        # Not an HDI container (plan ``schema``, say). init_db refuses it
+        # with the reason; rows of an existing schema could still be read.
+        hdi = None
+    certificate = creds.get("certificate")
+    return DatabaseTarget(
+        url.render_as_string(hide_password=False),
+        "hana",
+        ssl_ca=str(certificate) if certificate else None,
+        hdi=hdi,
+    )
+
+
+def _hana_target_from_url(raw: str) -> DatabaseTarget:
+    """A ``hana://`` ``DATABASE_URL`` (local runs, tests).
+
+    Any driver spelling becomes the async one, and the two TLS options are
+    set whatever the URL said. The design-time user, which a URL has no
+    place for, comes from ``HANA_HDI_USER`` / ``HANA_HDI_PASSWORD``; the
+    container schema is the URL's ``currentSchema``.
+    """
+    try:
+        url = make_url(raw)
+    except Exception:  # noqa: BLE001 -- the text would repeat the URL
+        raise DatabaseConfigError("DATABASE_URL is not a valid SAP HANA URL") from None
+    if not url.host:
+        raise DatabaseConfigError("The SAP HANA DATABASE_URL names no host")
+    # The driver reads its options whatever their case, so every spelling of
+    # a TLS option goes before the fixed values are set: `ENCRYPT=false`
+    # must not survive next to `encrypt=true`. sslHostNameInCertificate goes
+    # too: `*` would accept a valid certificate of any other host.
+    fixed = {key.lower(): value for key, value in _HANA_TLS.items()}
+    weaker = False
+    kept: dict[str, Any] = {}
+    for key, value in url.query.items():
+        name = key.lower()
+        if name in fixed:
+            weaker = weaker or str(value).lower() != fixed[name]
+        elif name == "sslhostnameincertificate":
+            weaker = True
+        else:
+            kept[key] = value
+    if weaker:
+        logger.warning(
+            "DATABASE_URL asked for an unencrypted or unvalidated SAP HANA "
+            "connection; ignored, the connection is encrypted and validated"
+        )
+    url = url.set(drivername=HANA_DRIVER, query={**kept, **_HANA_TLS})
+    hdi = None
+    user = os.environ.get("HANA_HDI_USER", "").strip()
+    password = os.environ.get("HANA_HDI_PASSWORD", "")
+    schema = url.query.get("currentSchema")
+    if user and password and url.host and isinstance(schema, str) and schema:
+        hdi = hana_hdi.HdiCredentials(
+            host=url.host, port=int(url.port or 443), schema=schema,
+            user=user, password=password,
+        )
+    return DatabaseTarget(url.render_as_string(hide_password=False), "hana", hdi=hdi)
+
+
+def _target_from_url(url: str, *, on_cf: bool = False) -> DatabaseTarget:
+    """A database named by a URL (``DATABASE_URL``, or the variable a script
+    was pointed at): the driver and TLS rules of each kind applied."""
+    if url.startswith(("hana://", "hana+")):
+        return _hana_target_from_url(url)
+    # Normalize common variants to async driver
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://") and "+asyncpg" not in url:
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    if url.startswith("postgresql"):
+        return DatabaseTarget(url, "postgres")
+    if not url.startswith("sqlite"):
+        return DatabaseTarget(url, "other")
+    if on_cf:
+        raise DatabaseConfigError(
+            "DATABASE_URL names a SQLite file, which a deployed app loses at "
+            "every restart; bind a PostgreSQL or SAP HANA service"
+        )
+    return DatabaseTarget(url, "sqlite")
+
+
+def bound_target(kind: str) -> DatabaseTarget:
+    """The bound database service of ``kind`` (``postgres`` | ``hana``),
+    whatever ``DB_KIND`` says: for a script that works on both at once
+    (scripts/copy_registry_config.py). ``DatabaseConfigError`` when no such
+    service is bound."""
+    if kind not in DB_KINDS:
+        raise DatabaseConfigError("A database kind is 'postgres' or 'hana'")
+    try:
+        services = json.loads(os.environ.get("VCAP_SERVICES") or "{}")
+    except ValueError:
+        raise DatabaseConfigError("VCAP_SERVICES is not valid JSON") from None
+    credentials = _bound_databases(services).get(kind)
+    if credentials is None:
+        raise DatabaseConfigError(f"No {kind} database service is bound")
+    return _hana_target(credentials) if kind == "hana" else _postgres_target(credentials)
+
+
+def _resolve_database() -> DatabaseTarget:
+    """The database from VCAP_SERVICES or the environment.
+
+    A bound service wins over ``DATABASE_URL``; which of two bound kinds is
+    :func:`_choose_kind`. Locally ``DATABASE_URL`` names PostgreSQL, SAP
+    HANA (``hana://`` or ``hana+aiohdbcli://``) or SQLite, and without it a
+    SQLite file is used.
+    """
+    on_cf = _on_cloud_foundry()
     vcap = os.environ.get("VCAP_SERVICES")
     if vcap:
         try:
             services = json.loads(vcap)
-            for key in ("postgresql-db", "postgresql", "hyperscaler-option-postgresql"):
-                if key in services and services[key]:
-                    creds = services[key][0]["credentials"]
-                    # BTP PG credentials expose hostname, port, username, password, dbname, sslcert
-                    host = creds.get("hostname") or creds.get("host")
-                    port = creds.get("port", 5432)
-                    user = creds.get("username")
-                    password = creds.get("password")
-                    dbname = creds.get("dbname") or creds.get("database")
-                    # BTP exposes the server CA under one of these keys
-                    _vcap_ssl_ca = (
-                        creds.get("sslrootcert")
-                        or creds.get("sslcert")
-                        or creds.get("ca")
-                        or creds.get("cert")
-                    )
-                    sslmode = "require"
-                    return (
-                        f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
-                        f"?ssl={sslmode}"
-                    )
         except Exception:
-            logger.exception("Failed to parse VCAP_SERVICES for postgres")
+            if on_cf:
+                raise DatabaseConfigError("VCAP_SERVICES is not valid JSON") from None
+            logger.exception("Failed to parse VCAP_SERVICES for a database binding")
+            services = None
+        bound = _bound_databases(services)
+        kind = _choose_kind(bound)
+        if kind == "hana":
+            return _hana_target(bound[kind])
+        if kind == "postgres":
+            try:
+                return _postgres_target(bound[kind])
+            except Exception:
+                if on_cf:
+                    raise DatabaseConfigError(
+                        "The bound PostgreSQL service could not be read"
+                    ) from None
+                logger.exception("Failed to parse VCAP_SERVICES for postgres")
 
     url = os.environ.get("DATABASE_URL")
     if url:
-        # Normalize common variants to async driver
-        if url.startswith("postgres://"):
-            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif url.startswith("postgresql://") and "+asyncpg" not in url:
-            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
-        return url
+        return _target_from_url(url, on_cf=on_cf)
 
+    if on_cf:
+        raise DatabaseConfigError(
+            "On Cloud Foundry no database service is bound (postgresql-db, or "
+            "hana with plan hdi-shared) and no DATABASE_URL is set"
+        )
     # Local dev fallback
-    logger.warning("No DATABASE_URL or VCAP postgres binding; using local SQLite")
-    return "sqlite+aiosqlite:///./agents_registry.db"
+    logger.warning("No DATABASE_URL or VCAP database binding; using local SQLite")
+    return DatabaseTarget("sqlite+aiosqlite:///./agents_registry.db", "sqlite")
 
 
-DATABASE_URL = _resolve_database_url()
+def _resolve_database_url() -> str:
+    """Build an async SQLAlchemy URL from VCAP_SERVICES or env."""
+    return _resolve_database().url
 
-_connect_args: dict[str, Any] = {}
-if DATABASE_URL.startswith("postgresql+asyncpg") and "ssl=" in DATABASE_URL:
-    # asyncpg expects ssl via connect_args, not URL; strip & pass through
-    base, _, query = DATABASE_URL.partition("?")
-    DATABASE_URL = base
-    _connect_args["ssl"] = _build_ssl_context(_vcap_ssl_ca)
+
+def _engine_settings(target: DatabaseTarget) -> tuple[str, dict[str, Any]]:
+    """``(url, connect_args)`` for ``create_async_engine``."""
+    url = target.url
+    connect_args: dict[str, Any] = {}
+    if url.startswith("postgresql+asyncpg") and "ssl=" in url:
+        # asyncpg expects ssl via connect_args, not URL; strip & pass through
+        url, _, _query = url.partition("?")
+        connect_args["ssl"] = _build_ssl_context(target.ssl_ca)
+    elif target.kind == "hana" and target.ssl_ca:
+        # The binding's CA as the trust store, in memory and out of the URL.
+        # Encryption and validation themselves are in the URL (_HANA_TLS).
+        connect_args["sslTrustStore"] = target.ssl_ca
+    return url, connect_args
+
+
+_target = _resolve_database()
+# The HDI design-time user, on SAP HANA; what init_db deploys the tables with.
+_hana_hdi: hana_hdi.HdiCredentials | None = _target.hdi
+DATABASE_URL, _connect_args = _engine_settings(_target)
 
 # Nothing touches Postgres between admin clicks, and CF's health check hits
 # /healthz, which answers from memory — so a pooled connection can sit idle
@@ -1232,6 +1514,48 @@ async def init_db() -> None:
     """Create tables and ensure an orchestrator config row exists."""
     import agents.ide.models  # noqa: F401  (registers the IDE tables on Base)
 
+    if engine.dialect.name == "hana":
+        await _deploy_hana_schema()
+    else:
+        await _create_and_migrate()
+
+    async with SessionLocal() as session:
+        existing = await session.get(OrchestratorConfig, 1)
+        if existing is None:
+            session.add(
+                OrchestratorConfig(id=1, instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
+            )
+            await session.commit()
+
+
+async def _deploy_hana_schema() -> None:
+    """The schema step of :func:`init_db` on SAP HANA.
+
+    The runtime user cannot run DDL in an HDI container, so neither
+    ``create_all`` nor the ``_ensure_*`` chain of :func:`_create_and_migrate`
+    can run. The tables are generated from the same models as design-time
+    artifacts and deployed by the design-time user (agents/hana_hdi.py); HDI
+    then migrates each table from the difference to what it deployed last
+    time, which is what the ``_ensure_column`` calls do by hand elsewhere.
+
+    The data steps of the other path are not run: both repair rows written
+    by app versions that never ran on HANA (proposals from before file
+    revisions, and proposals edited by 2.18.0 after a rollback), and
+    ``_resync_ide_revisions`` compares two ``Text`` columns in SQL, which
+    HANA cannot do.
+    """
+    if _hana_hdi is None:
+        raise DatabaseConfigError(
+            "SAP HANA needs the design-time user of an HDI container to create "
+            "the tables: bind a service of plan hdi-shared (binding fields "
+            "hdi_user / hdi_password), or set HANA_HDI_USER and HANA_HDI_PASSWORD "
+            "next to a hana DATABASE_URL that names currentSchema"
+        )
+    await hana_hdi.deploy(_hana_hdi, Base.metadata)
+
+
+async def _create_and_migrate() -> None:
+    """The schema step of :func:`init_db` on Postgres and SQLite."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         # Lightweight migrations: SQLAlchemy create_all doesn't add columns
@@ -1325,14 +1649,6 @@ async def init_db() -> None:
             conn, "uq_ide_artifacts_version", "ide_artifacts",
             ("session_id", "kind", "version"),
         )
-
-    async with SessionLocal() as session:
-        existing = await session.get(OrchestratorConfig, 1)
-        if existing is None:
-            session.add(
-                OrchestratorConfig(id=1, instructions=DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
-            )
-            await session.commit()
 
 
 async def _backfill_ide_revisions(conn) -> None:
@@ -2541,6 +2857,77 @@ async def begin_exclusive_write(session: AsyncSession) -> None:
         )
         return
     await connection.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+def has_row_locks(session: AsyncSession) -> bool:
+    """Whether ``FOR UPDATE`` / ``FOR SHARE`` lock a row on this database.
+
+    True on Postgres and on SAP HANA. SQLite has no row locks: it drops the
+    clause and serialises writers instead, so a caller that needs the lock
+    there takes the write lock up front (:func:`begin_exclusive_write`).
+    """
+    return session.get_bind().dialect.name != "sqlite"
+
+
+def compares_lobs(session: AsyncSession) -> bool:
+    """Whether a ``Text`` column can stand in a comparison on this database.
+
+    False on SAP HANA only: ``Text`` is ``NCLOB`` there, and HANA refuses
+    ``=`` on a LOB, against a value as much as against another column (as it
+    refuses ``ORDER BY``, ``GROUP BY`` and ``DISTINCT`` on one; ``IS NULL``
+    and ``length()`` are fine). See :func:`text_unchanged`.
+    """
+    return session.get_bind().dialect.name != "hana"
+
+
+class ComparedText(TypeDecorator):
+    """The type of the value :func:`text_unchanged` compares a ``Text``
+    column with, on the databases that can compare one.
+
+    It is ``Text`` in every respect (same SQL, same bind handling); what it
+    adds is a name. ``tests/hana_sql.py`` checks every statement the suite
+    executes against what SAP HANA refuses, and a comparison on a ``Text``
+    column is refused there -- except this one, which :func:`text_unchanged`
+    never builds on HANA. The type is how that one comparison is told from
+    a hand-written ``column == value``, which stays an error.
+    """
+
+    impl = Text
+    cache_ok = True
+
+
+async def text_unchanged(
+    session: AsyncSession, column: Any, seen: str | None, *row: Any
+) -> Any:
+    """The WHERE term "``column`` still holds ``seen``" of a conditional UPDATE.
+
+    For a read-modify-write of a ``Text`` column (the session pins, a seed
+    text): the UPDATE applies only while the column holds what was read, so
+    two writers cannot overwrite each other. ``row`` are the conditions that
+    name the one row; the caller's UPDATE repeats them.
+
+    Postgres and SQLite compare in the UPDATE itself: this returns
+    ``column == seen`` and sends nothing. SAP HANA cannot compare an
+    ``NCLOB``, so there the row is locked (``FOR UPDATE``), the column is
+    read again and the comparison is made here; the answer is a constant
+    true or false term. The lock lasts until the caller's transaction ends,
+    so the UPDATE that follows writes the row that was compared: the same
+    guarantee, bought with a lock instead of a predicate. A row that is gone
+    compares as changed.
+    """
+    if seen is None:
+        return column.is_(None)
+    if compares_lobs(session):
+        return column == literal(seen, ComparedText())
+    current = (
+        await session.execute(
+            select(column)
+            .where(*row)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).all()
+    return true() if [tuple(r) for r in current] == [(seen,)] else false()
 
 
 def _odata_now() -> datetime:
