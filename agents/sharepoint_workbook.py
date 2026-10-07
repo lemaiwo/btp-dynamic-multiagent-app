@@ -5,10 +5,12 @@ validated from :mod:`agents.sharepoint_views`). It is CPU work on a file
 somebody else wrote: call it through ``asyncio.to_thread``.
 
 What the file may do to us is bounded before and while it is read: the size,
-the number of archive members and their declared uncompressed size
-(:func:`check_archive`), the rows and columns of a view, and ``openpyxl`` in
-read-only mode (rows are streamed; with ``defusedxml`` installed, which
-``requirements.txt`` pins, it parses no DTD).
+the number of archive members and their declared uncompressed size, in total
+and per part that is read whole (:func:`check_archive`), the rows and columns
+of a view, and ``openpyxl`` in read-only mode (the rows of a sheet are
+streamed; with ``defusedxml`` installed, which ``requirements.txt`` pins, and
+without ``lxml``, a part with an entity declaration is refused, in whatever
+part it stands).
 
 Rules of what leaves this module:
 
@@ -42,6 +44,7 @@ from __future__ import annotations
 
 import io
 import posixpath
+import re
 import unicodedata
 import zipfile
 from datetime import date, datetime, timedelta
@@ -50,14 +53,24 @@ from typing import Any, Iterator
 from agents.sharepoint_views import CalendarView, TableView, column_index
 
 __all__ = [
-    "MAX_FILE_BYTES", "MAX_LABEL_CHARS", "MAX_WINDOW_DAYS", "Refused", "check_archive",
-    "check_window", "read_calendar", "read_table",
+    "MAX_FILE_BYTES", "MAX_LABEL_CHARS", "MAX_MEMBER_BYTES", "MAX_UNCOMPRESSED_BYTES",
+    "MAX_WINDOW_DAYS", "Refused", "check_archive", "check_window", "read_calendar",
+    "read_table",
 ]
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
 # Declared size of all archive members together, checked before anything is
-# inflated. A workbook of the size cap inflates to a fraction of this.
-MAX_UNCOMPRESSED_BYTES = 300 * 1024 * 1024
+# inflated. A planning workbook of 3 MB and some thirty sheets inflates to
+# about 25 MB; the app container has 1 GB for everything.
+MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
+# Declared size of one member that is not a sheet. Only the rows of a sheet
+# are streamed: the workbook part, the styles, the relationships and a table
+# are parsed into a tree several times their size, and the shared strings are
+# all kept, on every open of the bytes.
+MAX_MEMBER_BYTES = 16 * 1024 * 1024
+_SHEETS = "xl/worksheets/"
+# One piece of a member, inflated.
+_READ_BYTES = 64 * 1024
 MAX_ARCHIVE_MEMBERS = 5000
 MAX_WINDOW_DAYS = 120
 MAX_TABLE_ROWS = 5000
@@ -78,6 +91,8 @@ _MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _DOC_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _ERROR = object()  # a cell holding an Excel error value
+# ``date.fromisoformat`` alone also reads a week date (``2026-W01-1``).
+_DATE_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _YEAR = "{year}"
 
 
@@ -98,10 +113,10 @@ class Refused(Exception):
 
 
 def check_window(date_from: Any, date_to: Any) -> tuple[date, date]:
-    """Two ISO dates, in order, at most :data:`MAX_WINDOW_DAYS` days."""
+    """Two dates as ``YYYY-MM-DD``, in order, at most :data:`MAX_WINDOW_DAYS` days."""
     try:
         if not (isinstance(date_from, str) and isinstance(date_to, str)
-                and len(date_from) == 10 and len(date_to) == 10):
+                and _DATE_RE.fullmatch(date_from) and _DATE_RE.fullmatch(date_to)):
             raise ValueError
         lo, hi = date.fromisoformat(date_from), date.fromisoformat(date_to)
     except ValueError:
@@ -119,7 +134,11 @@ def check_window(date_from: Any, date_to: Any) -> tuple[date, date]:
 
 
 def check_archive(data: bytes) -> None:
-    """Size and archive caps, before the workbook is parsed."""
+    """Size and archive caps, before the workbook is parsed.
+
+    From the sizes the archive declares: nothing is inflated here.
+    :class:`_Archive` holds every later read to them.
+    """
     if len(data) > MAX_FILE_BYTES:
         raise Refused("too_large", "the workbook is larger than this tool reads")
     try:
@@ -130,14 +149,76 @@ def check_archive(data: bytes) -> None:
     if len(infos) > MAX_ARCHIVE_MEMBERS \
             or sum(i.file_size for i in infos) > MAX_UNCOMPRESSED_BYTES:
         raise Refused("too_large", "the workbook is larger than this tool reads")
+    for info in infos:
+        # A relationships part below the sheets' folder is read whole too.
+        streamed = info.filename.startswith(_SHEETS) and not info.filename.endswith(".rels")
+        if not streamed and info.file_size > MAX_MEMBER_BYTES:
+            raise Refused("too_large", "the workbook is larger than this tool reads")
+
+
+class _Member:
+    """An archive member as a stream that keeps to its declared size.
+
+    ``ZipExtFile.read()`` without a size inflates the whole compressed stream
+    and cuts it to the declared size afterwards, so a member that declares
+    100 bytes can put hundreds of megabytes in memory. Read in pieces it stops
+    at the declared size. Only what the parsers use is offered.
+    """
+
+    def __init__(self, raw: Any, size: int) -> None:
+        self._raw = raw
+        self._size = size
+
+    def read(self, n: int | None = -1) -> bytes:
+        if n is not None and n >= 0:
+            return self._raw.read(min(n, _READ_BYTES))
+        # Read whole: whatever the part is called, it is not a streamed sheet.
+        if self._size > MAX_MEMBER_BYTES:
+            raise Refused("too_large", "the workbook is larger than this tool reads")
+        pieces = []
+        while piece := self._raw.read(_READ_BYTES):
+            pieces.append(piece)
+        return b"".join(pieces)
+
+    def close(self) -> None:
+        self._raw.close()
+
+    def __enter__(self) -> "_Member":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
+
+
+class _Archive(zipfile.ZipFile):
+    """The package as openpyxl and this module read it: see :class:`_Member`.
+
+    ``ZipFile.read`` goes through ``open``, so this covers both.
+    """
+
+    def open(self, name: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        raw = super().open(name, mode, *args, **kwargs)
+        if mode != "r":
+            return raw
+        return _Member(raw, (name if isinstance(name, zipfile.ZipInfo)
+                             else self.getinfo(name)).file_size)
 
 
 def _open(data: bytes, *, data_only: bool) -> Any:
-    from openpyxl import load_workbook
+    # ``load_workbook`` is these three calls; the reader is built by hand
+    # only to hand it the archive that keeps to the declared sizes
+    # (``requirements.txt`` pins openpyxl and a test pins the version).
+    from openpyxl.reader.excel import ExcelReader
 
     try:
-        return load_workbook(io.BytesIO(data), read_only=True, data_only=data_only,
+        reader = ExcelReader(io.BytesIO(data), read_only=True, data_only=data_only,
                              keep_links=False)
+        reader.archive.close()
+        reader.archive = _Archive(io.BytesIO(data))
+        reader.read()
+        return reader.wb
+    except Refused:
+        raise
     except Exception:  # noqa: BLE001 - whatever the parser says, the answer is one code
         raise Refused("not_a_workbook", "the file is not an Excel workbook") from None
 
@@ -219,7 +300,7 @@ def _find_table(data: bytes, name: str) -> tuple[str, str, int]:
     from openpyxl.xml.functions import fromstring
 
     try:
-        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        with _Archive(io.BytesIO(data)) as zf:
             book = next((p for t, p in _rels(zf, "").values()
                          if t.endswith("/officeDocument")), "xl/workbook.xml")
             parts = _rels(zf, book)

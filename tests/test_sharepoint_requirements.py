@@ -1,4 +1,4 @@
-"""The spreadsheet reader of ``builtin:sharepoint`` is pinned and parses no DTD."""
+"""The spreadsheet reader of ``builtin:sharepoint`` is pinned and refuses entity declarations."""
 
 from __future__ import annotations
 
@@ -18,3 +18,12 @@ def test_openpyxl_uses_the_defused_parser():
 
     assert openpyxl.__version__ == "3.1.5"
     assert openpyxl.DEFUSEDXML is True
+
+
+def test_openpyxl_does_not_parse_with_lxml():
+    """With ``lxml`` installed openpyxl parses the parts it reads whole with
+    lxml's ``fromstring`` while ``DEFUSEDXML`` stays true: the reader's "no
+    entity declarations" then no longer rests on defusedxml."""
+    import openpyxl
+
+    assert openpyxl.LXML is False

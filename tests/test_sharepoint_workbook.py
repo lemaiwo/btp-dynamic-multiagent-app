@@ -26,6 +26,7 @@ from agents.sharepoint_workbook import (  # noqa: E402
     Refused,
     check_archive,
     check_window,
+    read_calendar,
     read_table,
 )
 from tests.sharepoint_helpers import VIEWS, build_workbook  # noqa: E402
@@ -39,7 +40,7 @@ def _refused(call, *args) -> Refused:
     return refused.value
 
 
-def test_openpyxl_parses_without_dtds():
+def test_openpyxl_parses_with_the_defused_parser():
     import openpyxl
 
     assert openpyxl.DEFUSEDXML is True
@@ -154,3 +155,193 @@ def test_text_in_a_column_that_is_not_pinned_does_not_skip_the_row():
     out = read_table(data, TEAM_VIEW)
     assert out["skipped_rows"] == 0 and len(out["rows"]) == 1
     assert read_table(build_workbook(), TEAM_VIEW)["skipped_rows"] == 0
+
+
+# --- final review: what a small file may inflate to, entities, the date form ---
+
+def _declaring(data: bytes, member: str, size: int) -> bytes:
+    """``data`` with ``size`` as the uncompressed size its directory declares
+    for ``member``. Nothing that large is in the file: the caps are decided
+    from the declared sizes, before anything is inflated."""
+    out = bytearray(data)
+    at = out.find(b"PK\x01\x02")
+    while at != -1:
+        name_len = int.from_bytes(out[at + 28:at + 30], "little")
+        if bytes(out[at + 46:at + 46 + name_len]) == member.encode():
+            out[at + 24:at + 28] = size.to_bytes(4, "little")
+            return bytes(out)
+        at = out.find(b"PK\x01\x02", at + 46)
+    raise AssertionError(member)
+
+
+def _with_member(data: bytes, member: str, change) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, \
+            zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        assert member in src.namelist(), member
+        for info in src.infolist():
+            body = src.read(info.filename)
+            dst.writestr(info, change(body) if info.filename == member else body)
+    return out.getvalue()
+
+
+SST = (b'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+       b"<si><t>one</t></si></sst>")
+
+
+def _with_shared_strings(data: bytes, body: bytes = SST) -> bytes:
+    """``data`` with a shared strings part, as Excel writes one (the
+    generated workbook holds its text inline)."""
+    declared = _with_member(data, "[Content_Types].xml", lambda types: types.replace(
+        b"</Types>",
+        b'<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.'
+        b'openxmlformats-officedocument.spreadsheetml.sharedStrings+xml" /></Types>'))
+    out = io.BytesIO(declared)
+    with zipfile.ZipFile(out, "a", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("xl/sharedStrings.xml", body)
+    return out.getvalue()
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("the workbook was parsed")
+
+
+CALENDAR_VIEW = parse_views(VIEWS)["planning"]
+YEAR = {2026: {("Ann Example", "Presence"): {"2026-01-05": "H"}}}
+
+
+def test_the_caps_are_the_ones_a_one_gigabyte_container_can_carry():
+    assert workbook.MAX_UNCOMPRESSED_BYTES == 64 * 1024 * 1024
+    assert workbook.MAX_MEMBER_BYTES == 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("member", [
+    "xl/styles.xml", "xl/sharedStrings.xml", "xl/workbook.xml", "[Content_Types].xml",
+    "xl/tables/table1.xml", "xl/_rels/workbook.xml.rels",
+    # Below the sheets' folder, but read whole like every other part.
+    "xl/worksheets/_rels/sheet1.xml.rels",
+])
+def test_a_part_that_is_not_streamed_has_its_own_cap_and_nothing_is_parsed(
+        member, monkeypatch):
+    data = _declaring(_with_shared_strings(build_workbook(YEAR)), member,
+                      workbook.MAX_MEMBER_BYTES + 1)
+    monkeypatch.setattr(workbook, "_open", _never)
+    monkeypatch.setattr(workbook, "_find_table", _never)
+    monkeypatch.setattr(zipfile.ZipFile, "read", _never)
+    monkeypatch.setattr(zipfile.ZipFile, "open", _never)
+    for refused in (
+        _refused(check_archive, data),
+        _refused(read_table, data, TEAM_VIEW),
+        _refused(read_calendar, data, CALENDAR_VIEW, date(2026, 1, 5), date(2026, 1, 6),
+                 TEAM_VIEW),
+    ):
+        assert refused.code == "too_large"
+        assert refused.message == "the workbook is larger than this tool reads"
+
+
+def test_a_sheet_is_streamed_and_counts_towards_the_total_only(monkeypatch):
+    sheet = "xl/worksheets/sheet1.xml"
+    check_archive(_declaring(build_workbook(), sheet, workbook.MAX_MEMBER_BYTES + 1))
+    check_archive(_declaring(build_workbook(), "xl/styles.xml", workbook.MAX_MEMBER_BYTES))
+    data = _declaring(build_workbook(), sheet, workbook.MAX_UNCOMPRESSED_BYTES)
+    monkeypatch.setattr(workbook, "_open", _never)
+    monkeypatch.setattr(workbook, "_find_table", _never)
+    assert _refused(read_table, data, TEAM_VIEW).code == "too_large"
+
+
+def _entity(body: bytes) -> bytes:
+    import re
+
+    root = re.search(rb"<(?![?!])", body).start()
+    return body[:root] + b'<!DOCTYPE x [<!ENTITY planted "zz-entity-text">]>' + body[root:]
+
+
+@pytest.mark.parametrize("member", [
+    "xl/workbook.xml", "xl/styles.xml",
+    "xl/worksheets/sheet1.xml", "xl/worksheets/sheet2.xml", "xl/tables/table1.xml",
+    "xl/_rels/workbook.xml.rels", "xl/worksheets/_rels/sheet1.xml.rels",
+    "[Content_Types].xml", "_rels/.rels",
+])
+def test_an_entity_declaration_in_any_part_is_not_a_workbook(member):
+    data = _with_member(build_workbook(YEAR), member, _entity)
+    for refused in (
+        _refused(read_table, data, TEAM_VIEW),
+        _refused(read_calendar, data, CALENDAR_VIEW, date(2026, 1, 5), date(2026, 1, 6),
+                 TEAM_VIEW),
+    ):
+        assert refused.code == "not_a_workbook"
+        assert "zz-entity" not in refused.message + (refused.hint or "")
+
+
+def test_an_entity_declaration_in_the_shared_strings_is_not_a_workbook():
+    # The part is read: without the declaration the same workbook is fine.
+    plain = _with_shared_strings(build_workbook(YEAR))
+    assert read_table(plain, TEAM_VIEW)["rows"]
+    data = _with_shared_strings(build_workbook(YEAR), _entity(SST).replace(
+        b"<t>one</t>", b"<t>&planted;</t>"))
+    for refused in (
+        _refused(read_table, data, TEAM_VIEW),
+        _refused(read_calendar, data, CALENDAR_VIEW, date(2026, 1, 5), date(2026, 1, 6),
+                 TEAM_VIEW),
+    ):
+        assert refused.code == "not_a_workbook"
+        assert "zz-entity" not in refused.message + (refused.hint or "")
+
+
+@pytest.mark.parametrize("bad", [
+    "2026-W01-1", "2026-W011 ", "２０２６-01-05", "2026-01-5 ", " 2026-01-05", "2026/01/05",
+    "2026-01-05\n", "+026-01-05",
+])
+def test_a_date_is_exactly_year_month_day(bad):
+    assert _refused(check_window, bad, "2026-12-31").code == "invalid_dates"
+    assert _refused(check_window, "2025-12-31", bad).code == "invalid_dates"
+
+
+def _padded(body: bytes, size: int) -> bytes:
+    return body + b"<!--" + b" " * size + b"-->"
+
+
+def test_a_member_is_never_inflated_beyond_the_size_it_declares():
+    """``ZipFile.read`` inflates the whole stream and cuts it to the declared
+    size afterwards: 64 MB behind a declared 100 bytes would be in memory."""
+    import tracemalloc
+
+    grown = _with_member(build_workbook(), "xl/styles.xml",
+                         lambda body: _padded(body, 64 * 1024 * 1024))
+    data = _declaring(grown, "xl/styles.xml", 100)
+    assert len(data) < 200_000
+    check_archive(data)  # what it declares is small
+    tracemalloc.start()
+    try:
+        refused = _refused(read_table, data, TEAM_VIEW)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert refused.code == "not_a_workbook"
+    assert peak < 16 * 1024 * 1024
+
+
+def test_a_part_read_whole_is_capped_wherever_the_package_puts_it():
+    """The cap by name is the early refusal; the read itself is capped too. A
+    sheet part the workbook calls a chart sheet is read whole by openpyxl."""
+    over = workbook.MAX_MEMBER_BYTES + 1
+    big = _with_member(build_workbook(YEAR), "xl/worksheets/sheet2.xml",
+                       lambda body: _padded(body, over))
+    check_archive(big)
+    # As a worksheet it is streamed, whatever its size.
+    assert read_table(big, TEAM_VIEW)["rows"]
+    assert read_calendar(big, CALENDAR_VIEW, date(2026, 1, 5), date(2026, 1, 6),
+                         TEAM_VIEW)["runs"]
+
+    def retyped(rels: bytes) -> bytes:
+        text = rels.decode()
+        at = text.index("sheet2.xml")
+        start = text.rindex("<Relationship", 0, at)
+        end = text.index(">", at) + 1
+        assert "relationships/worksheet" in text[start:end]
+        return (text[:start] + text[start:end].replace(
+            "relationships/worksheet", "relationships/chartsheet") + text[end:]).encode()
+
+    chart = _with_member(big, "xl/_rels/workbook.xml.rels", retyped)
+    check_archive(chart)
+    assert _refused(read_table, chart, TEAM_VIEW).code == "too_large"
