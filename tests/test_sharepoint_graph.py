@@ -11,6 +11,7 @@ Run:  python -m pytest tests/test_sharepoint_graph.py
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -389,3 +390,218 @@ async def test_the_download_client_ignores_the_environment_and_follows_nothing(m
     await source.fetch()
     assert seen["follow_redirects"] is False and seen["trust_env"] is False
     assert not {"auth", "headers", "cookies", "base_url"} & set(seen)
+
+
+# --- After review: deadline, unexpected errors, wire encoding, the filter ----
+
+
+def _secrets_absent(caplog, *texts: str, extra: tuple[str, ...] = ()) -> None:
+    for secret in (*SECRETS, *extra):
+        assert secret not in caplog.text
+        assert all(secret not in text for text in texts)
+
+
+class _Drip(httpx.AsyncByteStream):
+    """A body that never ends and never pauses long enough for a read timeout."""
+
+    async def __aiter__(self):
+        while True:
+            yield b"x"
+            await asyncio.sleep(0.01)
+
+
+async def test_a_download_that_never_ends_is_cut_off_and_frees_the_lock(monkeypatch, caplog):
+    _loud(caplog)
+    monkeypatch.setattr(tools, "DOWNLOAD_DEADLINE_SECONDS", 0.1)
+    graph = FakeGraph(WORKBOOK)
+    drips = [True]
+
+    def download(request):
+        if drips:
+            drips.pop()
+            return httpx.Response(200, stream=_Drip())
+        return httpx.Response(200, content=WORKBOOK)
+
+    source = SharePointFile(graph.client(), PINS["site"], PINS["library"], PINS["path"],
+                            download_transport=httpx.MockTransport(download))
+    with pytest.raises(Refused) as refused:
+        await asyncio.wait_for(source.fetch(), 5)
+    assert refused.value.code == "download_failed"
+    assert not source._lock.locked() and source._file is None
+    _secrets_absent(caplog, _said(refused.value))
+    # The next call is not queued behind the one that was cut off.
+    data, _ = await asyncio.wait_for(source.fetch(), 5)
+    assert data == WORKBOOK
+
+
+@pytest.mark.parametrize("error", [
+    httpx.InvalidURL(f"{MARKER} in URL"),
+    RuntimeError(f"{MARKER}: Bearer graph-token"),
+    TimeoutError(MARKER),
+    KeyError(MARKER),
+])
+async def test_an_unexpected_error_of_a_graph_read_is_read_failed(error, caplog):
+    _loud(caplog)
+
+    def boom(request):
+        raise error
+
+    client = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                               headers={"Authorization": "Bearer graph-token"},
+                               transport=httpx.MockTransport(boom))
+    with pytest.raises(Refused) as refused:
+        await SharePointFile(client, PINS["site"], PINS["library"], PINS["path"]).fetch()
+    assert refused.value.code == "read_failed"
+    _secrets_absent(caplog, _said(refused.value), extra=(MARKER,))
+    assert type(error).__name__ in caplog.text  # the class is what the log says
+
+
+async def test_an_unexpected_error_of_the_auth_class_is_read_failed(caplog):
+    _loud(caplog)
+
+    class Odd(httpx.Auth):
+        def auth_flow(self, request):
+            raise ValueError(f"{MARKER}: client_secret=graph-token")
+            yield request  # pragma: no cover
+
+    client = httpx.AsyncClient(base_url="https://graph.microsoft.com", auth=Odd(),
+                               transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    with pytest.raises(Refused) as refused:
+        await SharePointFile(client, PINS["site"], PINS["library"], PINS["path"]).fetch()
+    assert refused.value.code == "read_failed"
+    _secrets_absent(caplog, _said(refused.value), extra=(MARKER,))
+
+
+@pytest.mark.parametrize("make, code", [
+    (lambda url: httpx.InvalidURL(f"{MARKER} {url}"), "read_failed"),
+    (lambda url: RuntimeError(f"{MARKER} {url}"), "read_failed"),
+    (lambda url: OSError(f"{MARKER} {url}"), "read_failed"),
+    # Not this module's deadline: still a failed download, still no text.
+    (lambda url: TimeoutError(f"{MARKER} {url}"), "download_failed"),
+])
+async def test_an_unexpected_error_of_the_download_is_a_refusal(make, code, caplog):
+    _loud(caplog)
+    graph = FakeGraph(WORKBOOK)
+
+    def boom(request):
+        raise make(request.url)
+
+    source = SharePointFile(graph.client(), PINS["site"], PINS["library"], PINS["path"],
+                            download_transport=httpx.MockTransport(boom))
+    with pytest.raises(Refused) as refused:
+        await source.fetch()
+    assert refused.value.code == code
+    assert not tools._downloading.get() and tools._in_flight == []
+    _secrets_absent(caplog, _said(refused.value), extra=(MARKER,))
+
+
+@pytest.mark.parametrize("step", ["graph", "download"])
+async def test_a_cancellation_is_not_turned_into_a_refusal(step):
+    graph = FakeGraph(WORKBOOK)
+
+    def cancelled(request):
+        raise asyncio.CancelledError
+
+    client = graph.client() if step == "download" else httpx.AsyncClient(
+        base_url="https://graph.microsoft.com", transport=httpx.MockTransport(cancelled))
+    source = SharePointFile(client, PINS["site"], PINS["library"], PINS["path"],
+                            download_transport=httpx.MockTransport(cancelled))
+    with pytest.raises(asyncio.CancelledError):
+        await source.fetch()
+    assert not source._lock.locked()
+    assert not tools._downloading.get() and tools._in_flight == []
+
+
+async def test_the_file_path_is_percent_encoded_on_the_wire():
+    graph = FakeGraph(WORKBOOK)
+    await _file(graph).fetch()
+    item = graph.requests[-1]
+    assert item.url.raw_path == b"/v1.0/drives/b!drive1/root:/Team/Planning%202026.xlsx"
+    assert item.url.query == b""
+
+
+async def test_a_path_with_url_syntax_stays_one_path_on_the_wire():
+    # The save-time gate refuses these characters; this class must not depend
+    # on it: nothing of the path may become a query string or a fragment.
+    seen: list[httpx.Request] = []
+
+    def graph(request):
+        seen.append(request)
+        path = request.url.path
+        if path.endswith("/drives"):
+            return httpx.Response(200, json={"value": [{"id": "b!drive1", "name": "Documents"}]})
+        if path.startswith("/v1.0/drives/"):
+            return httpx.Response(404)
+        return httpx.Response(200, json={"id": "example.sharepoint.com,g1,g2"})
+
+    client = httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                               transport=httpx.MockTransport(graph))
+    source = SharePointFile(client, PINS["site"], PINS["library"], "Team/a?b=1#c%2Fd&e.xlsx")
+    with pytest.raises(Refused) as refused:
+        await source.fetch()
+    assert refused.value.code == "file_not_found"
+    item = seen[-1]
+    assert item.url.raw_path == b"/v1.0/drives/b!drive1/root:/Team/a%3Fb%3D1%23c%252Fd%26e.xlsx"
+    assert item.url.query == b"" and item.url.fragment == ""
+    assert item.url.path == "/v1.0/drives/b!drive1/root:/Team/a?b=1#c%2Fd&e.xlsx"
+
+
+def _httpx_filters() -> list:
+    return [f for f in logging.getLogger("httpx").filters
+            if type(f).__name__ == "_NoDownloadUrl"]
+
+
+async def test_a_logging_setup_that_drops_the_filter_does_not_uncover_the_url(caplog):
+    _loud(caplog)
+    assert len(_httpx_filters()) == 1
+    httpx_log = logging.getLogger("httpx")
+    # What a non-incremental dictConfig / fileConfig naming ``httpx`` does.
+    for installed in list(httpx_log.filters):
+        httpx_log.removeFilter(installed)
+    graph = FakeGraph(WORKBOOK)
+    await _file(graph).fetch()
+    refused = await _refused(FakeGraph(WORKBOOK, status={"download": 302}))
+    assert len(graph.downloads) == 1
+    assert "graph.microsoft.com/v1.0/sites" in caplog.text
+    _secrets_absent(caplog, _said(refused))
+    assert len(_httpx_filters()) == 1
+
+
+async def test_installing_twice_and_a_reload_leave_one_filter():
+    import importlib
+
+    tools._install_once()
+    tools._install_once()
+    assert len(_httpx_filters()) == 1
+    importlib.reload(tools)
+    assert len(_httpx_filters()) == 1
+
+
+async def test_a_line_about_the_download_from_another_context_is_dropped_too(caplog):
+    # The context variable names the downloading task. A record about the same
+    # URL that is created elsewhere (another task, a thread) is recognised by
+    # what it says: the URL in flight or its query string.
+    import contextvars
+
+    _loud(caplog)
+    graph = FakeGraph(WORKBOOK)
+    httpx_log = logging.getLogger("httpx")
+
+    def download(request):
+        elsewhere = contextvars.Context()
+        elsewhere.run(httpx_log.info, 'HTTP Request: GET %s "HTTP/1.1 200 OK"', request.url)
+        elsewhere.run(httpx_log.info, "retrying ?%s", request.url.query.decode())
+        elsewhere.run(httpx_log.info, "another client: %s", "https://graph.microsoft.com/v1.0/me")
+        elsewhere.run(httpx_log.info, "%s %s", "too few arguments")  # cannot be rendered
+        return httpx.Response(200, content=WORKBOOK)
+
+    source = SharePointFile(graph.client(), PINS["site"], PINS["library"], PINS["path"],
+                            download_transport=httpx.MockTransport(download))
+    await source.fetch()
+    assert "another client: https://graph.microsoft.com/v1.0/me" in caplog.text
+    assert "too few arguments" not in caplog.text
+    _secrets_absent(caplog)
+    # Nothing is in flight afterwards: the same words are an ordinary line again.
+    assert tools._in_flight == []
+    httpx_log.info("after the download: %s", "tempauth-is-just-a-word-now")
+    assert "tempauth-is-just-a-word-now" in caplog.text

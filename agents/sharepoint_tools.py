@@ -30,8 +30,10 @@ redirect, ignores the environment's proxy and netrc settings, and is used
 only for an ``https`` URL on the host the ``site`` pin names. The download
 URL is never logged or returned: not by this module, and not by ``httpx``,
 which logs every request URL at INFO (a filter on its logger drops the lines
-of a download in progress, whatever level the process logs at). The bytes are
-kept in memory per file version (eTag) for a few minutes, so the tool calls of
+of a download in progress, whatever level the process logs at; it is put back
+before each download if a logging setup removed it). A download has a total
+deadline, so a host that trickles bytes cannot hold the file's lock. The bytes
+are kept in memory per file version (eTag) for a few minutes, so the tool calls of
 one run download once.
 
 Every refusal is ``{"error": {code, message, hint?}}``, never an exception,
@@ -79,6 +81,10 @@ FILE_CACHE_TTL_SECONDS = 300
 # How long the resolved library id is trusted.
 DRIVE_CACHE_TTL_SECONDS = 900
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
+# The whole download, connect to last byte. The timeout above is per network
+# operation: a host that sends a byte now and then would never reach it, and
+# ``fetch`` holds the file's lock for as long as the download runs.
+DOWNLOAD_DEADLINE_SECONDS = 120.0
 # A result larger than this is refused, not cut off: a list that ends early
 # would read as "nobody else is planned".
 MAX_RESULT_CHARS = 60_000
@@ -88,6 +94,9 @@ _ADMIN = "an administrator must check the SharePoint server entry"
 # True in the task that is downloading, for the time of the download only.
 _downloading: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "sharepoint_downloading", default=False)
+# The download URLs in flight and their query strings (the token part), for
+# the time of the download only. Never logged, never returned.
+_in_flight: list[str] = []
 
 
 class _NoDownloadUrl(logging.Filter):
@@ -97,16 +106,47 @@ class _NoDownloadUrl(logging.Filter):
     The download URL carries its own token, so that line would put a
     credential into the log of any process that logs ``httpx`` at INFO
     (``app.py`` raises that logger to WARNING; a script, a test or a debug
-    session does not). A record is created in the task that sends the
-    request, so the context variable names exactly the download's lines: the
-    Graph requests and every other client are logged as before.
+    session does not). Two rules, either one drops the record:
+
+    * it is created in the task that is downloading (the context variable):
+      exactly the download's own lines, whatever they say;
+    * it is created elsewhere while a download is in flight and its text
+      holds that download's URL or query string. A record that cannot be
+      rendered is dropped for that time as well: it cannot be checked.
+
+    The Graph requests and every other client are logged as before.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return not _downloading.get()
+        if _downloading.get():
+            return False
+        if not _in_flight:
+            return True
+        try:
+            message = record.getMessage()
+        except Exception:
+            return False
+        return not any(part in message for part in tuple(_in_flight))
 
 
-logging.getLogger("httpx").addFilter(_NoDownloadUrl())
+def _install_once() -> None:
+    """Puts the filter on the ``httpx`` logger unless one is there.
+
+    Called at import and again before every download: a logging setup that
+    replaces the logger's filters (a non-incremental ``dictConfig`` /
+    ``fileConfig``) must not uncover the URL. Recognised by name, so that a
+    reloaded module does not stack a second one (the older instance reads
+    this module's current state: a reload keeps the module's namespace).
+    """
+    log = logging.getLogger("httpx")
+    for installed in log.filters:
+        kind = type(installed)
+        if kind.__name__ == _NoDownloadUrl.__name__ and kind.__module__ == __name__:
+            return
+    log.addFilter(_NoDownloadUrl())
+
+
+_install_once()
 
 
 def _status_refusal(step: str, status: int) -> Refused:
@@ -173,6 +213,12 @@ class SharePointFile:
             logger.warning("builtin:sharepoint: Graph unreachable (%s)", type(e).__name__)
             raise Refused("graph_unreachable", "Microsoft Graph could not be reached",
                           "try again later") from None
+        except Exception as e:
+            # Anything else (httpx.InvalidURL is no HTTPError; an error of the
+            # auth class): its text is not ours to pass on. The class only.
+            # A cancellation is no Exception and goes through.
+            logger.warning("builtin:sharepoint: Graph read failed (%s)", type(e).__name__)
+            raise Refused("read_failed", "the workbook could not be read") from None
         if r.status_code != 200:
             raise _status_refusal(step, r.status_code)
         try:
@@ -221,12 +267,19 @@ class SharePointFile:
     async def _download(self, url: httpx.URL) -> bytes:
         chunks: list[bytes] = []
         size = 0
-        # Set and reset in this coroutine: httpx must not log this URL.
+        # httpx must not log this URL: the filter is checked before every
+        # download, and told in two ways which lines are this download's.
+        _install_once()
+        query = url.query.decode("ascii", "replace")
+        secret = [str(url), query] if query else [str(url)]
+        deadline = asyncio.timeout(DOWNLOAD_DEADLINE_SECONDS)
+        # Set and reset in this coroutine.
         quiet = _downloading.set(True)
+        _in_flight.extend(secret)
         try:
             # A client of its own: no auth, no redirect, no proxy/netrc from
             # the environment. The Graph client must never send this request.
-            async with httpx.AsyncClient(
+            async with deadline, httpx.AsyncClient(
                 follow_redirects=False,
                 trust_env=False,
                 timeout=httpx.Timeout(DOWNLOAD_TIMEOUT_SECONDS),
@@ -243,12 +296,29 @@ class SharePointFile:
                             raise Refused("too_large",
                                           "the workbook is larger than this tool reads")
                         chunks.append(chunk)
+        except Refused:
+            raise
         except httpx.HTTPError as e:
             logger.warning("builtin:sharepoint: download failed (%s)", type(e).__name__)
             raise Refused("download_failed", "the workbook could not be downloaded",
                           "try again later") from None
+        except TimeoutError:
+            # Ours when the deadline expired; any other one is a failed
+            # download all the same, and says so without its text.
+            logger.warning("builtin:sharepoint: download failed (%s)",
+                           "deadline" if deadline.expired() else "TimeoutError")
+            raise Refused("download_failed", "the workbook could not be downloaded in time"
+                          if deadline.expired() else "the workbook could not be downloaded",
+                          "try again later") from None
+        except Exception as e:
+            # The class only; a cancellation is no Exception and goes through.
+            logger.warning("builtin:sharepoint: download failed unexpectedly (%s)",
+                           type(e).__name__)
+            raise Refused("read_failed", "the workbook could not be read") from None
         finally:
             _downloading.reset(quiet)
+            for part in secret:
+                _in_flight.remove(part)
         return b"".join(chunks)
 
     async def fetch(self) -> tuple[bytes, str]:
