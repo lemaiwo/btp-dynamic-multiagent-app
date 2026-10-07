@@ -278,7 +278,25 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   storage and at build, never silently ignored. `SharePointFile` resolves the
   file with three Graph reads (site, the site's libraries matched by name,
   the item), cached: the library id 900 s, the bytes per eTag 300 s (no eTag,
-  no cache), so the calls of one run download once. **The download URL is a
+  no cache), so the calls of one run download once. The cached bytes are the
+  whole workbook, whatever the views pin, so they are dropped when the 300 s
+  are over (a timer set for that entry, not the next call), when a newer
+  version replaces them and when the registry closes the toolset's
+  `http_client` (`SharePointFile.forget`). **One parse at a time per
+  process** (`_parse`): the two reader calls run in a worker thread and take
+  turns across all toolsets, and a turn is given back when the thread has
+  ended, not when a cancelled tool call stops waiting (a thread cannot be
+  cancelled); so the memory one workbook may need is needed once. **Nothing
+  from the workbook is stored in the database**: for these two tools the
+  preview a run's activity keeps (`registry._short_tool_output`, shown in the
+  chat's tool card and stored in `job_runs.activity_json`) is the fixed-form
+  line of `activity_summary`: `read_table: n rows, s skipped`,
+  `read_calendar: n runs, c conflicts, s skipped, u unmapped`, `error:
+  <code>` for a refusal, decided by the tool's name alone, plain or prefixed
+  (`sharepoint_read_table`, `sharepoint_0_read_table`), so another server's
+  tool of exactly these names gets the same line and no preview; every other
+  tool's preview is unchanged (`tests/test_sharepoint_activity.py`). The
+  agent's own answer is what the run stores as its report. **The download URL is a
   credential**: the content comes from the item's pre-authenticated URL
   through a separate client that sends no `Authorization`, follows no
   redirect, has `trust_env=False`, and is used only for an `https` URL on the
@@ -301,7 +319,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   traceback frame would hold the URL). `last_modified` is Graph's value only
   when it has the form of a UTC timestamp, else `null`. A result over
   `MAX_RESULT_CHARS` (60,000, measured with pydantic-ai's own tool-return
-  serialiser, or plain JSON when that is longer) is refused, not cut: a list
+  serialiser, or plain JSON when that is longer or the serialiser cannot be
+  imported: it is imported inside the measure, so a rename in pydantic-ai
+  does not stop the app at import) is refused, not cut: a list
   that ends early would read as complete. The window is checked before
   anything is fetched and again inside the reader. Misconfiguration is a
   `ValueError` at registry build. Denied in ABAP Assistant sessions (the tools
@@ -340,8 +360,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `tests/test_sharepoint_views.py`, `tests/test_sharepoint_registration.py`
 - `agents/sharepoint_workbook.py` — workbook bytes to view data
   (`read_table`, `read_calendar`), pure and CPU work on a file somebody else
-  wrote: call it through `asyncio.to_thread`. `openpyxl` in read-only mode
-  (with `defusedxml`, no DTD). Text in the workbook is data, never an
+  wrote: call it in a worker thread (the toolset's `_parse`). `openpyxl` in
+  read-only mode (with `defusedxml` and without `lxml`: a part with an entity
+  declaration is `not_a_workbook`, in whatever part it stands). Text in the
+  workbook is data, never an
   instruction, and **what leaves is default-deny**: a table view returns its
   pinned columns only, and a row with a text cell of a pinned column over 255
   characters or with a control, format or line-separator character is
@@ -359,9 +381,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `no_cached_values` when no formula of a view (date row and body judged
   separately) has a result, or when a requested day is missing while the
   date row has a formula without a result among its dates. Caps, each a
-  refusal: 20 MB, 5,000 archive members and 300 MB declared uncompressed
-  size (`check_archive`, before parsing), a window of 120 days
-  (`check_window`), 5,000 rows and 200 columns of a table, 2,000 calendar
+  refusal: 20 MB, 5,000 archive members, 64 MB declared uncompressed size in
+  total and 16 MB (`MAX_MEMBER_BYTES`) for every member that is not a sheet
+  under `xl/worksheets/` (`check_archive`, from the declared sizes, before
+  anything is inflated; sized for the 1 GB app container: only the rows of a
+  sheet are streamed, every other part is parsed whole into a tree several
+  times its size, on each of the 2 opens of a table read and the 2 per year
+  sheet, plus 2 for a lookup, of a calendar read). **The declared sizes are
+  held to**: openpyxl is given the reader's own archive (`_Archive`, through
+  `ExcelReader`, which is why the openpyxl version is pinned by a test), in
+  which no member is inflated beyond the size it declares (`ZipFile.read`
+  alone inflates the whole stream first: 64 MB behind a declared 100 bytes)
+  and a part that is read whole is capped at 16 MB wherever the package puts
+  it (a sheet part the workbook calls a chart sheet is read whole). A window
+  of 120 days, given as exactly `YYYY-MM-DD` (a week date is refused;
+  `check_window`), 5,000 rows and 200 columns of a table, 2,000 calendar
   rows (`stop_at` or 50 blank rows end them), 400 day columns. Its own codes:
   `table_not_found`, `column_not_found`, `sheet_not_found`,
   `dates_not_found` (a requested day missing or twice in the date row),
@@ -1106,11 +1140,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `reloaded` / `reload_failed`, so a failed reload is not shown there. It
   offers `builtin:sharepoint` in destination mode only, with the views
   edited as JSON and the three pins sent through `DESTINATION_EXACT_KEYS`
-  (as typed, never trimmed)
+  (as typed, never trimmed). A server stored on an auth mode this page does
+  not offer for its toolset (`app_only`, for every built-in; such an entry
+  is made in `ui5-admin/`) keeps that mode: it gets an option of its own,
+  the loaded block is posted back as it was loaded (no secret: the server
+  keeps the stored one) while that mode stays selected, and the row carries
+  a fixed note saying where the server is edited; before, such an agent
+  could not be saved here
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
-  `templates/admin.html`, which is unchanged and still the supported admin at
-  `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
+  `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
   `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
   auth modes the server accepts per built-in. For `builtin:sharepoint`
@@ -1342,8 +1381,11 @@ bump a pin, rerun the suites, then deploy.
 - `builtin:odata` adds no dependency: `$metadata` is parsed with the standard
   library's expat
 - `openpyxl` and `defusedxml` — `builtin:sharepoint` reads `.xlsx`; openpyxl
-  uses defusedxml when it is installed and then parses no DTD (both pins and
-  `openpyxl.DEFUSEDXML` asserted by `tests/test_sharepoint_requirements.py`)
+  uses defusedxml when it is installed and then refuses entity declarations
+  (not a DTD as such). That holds only without `lxml`: with it openpyxl
+  parses the parts it reads whole with lxml instead, so `lxml` must not be
+  added to `requirements.txt` (both pins, `openpyxl.DEFUSEDXML` and
+  `openpyxl.LXML is False` asserted by `tests/test_sharepoint_requirements.py`)
 - `sqlalchemy[asyncio]`, `asyncpg` (Postgres on CF), `aiosqlite` (the
   local SQLite fallback), `sqlalchemy-hana` and `hdbcli` (SAP HANA Cloud;
   imported only when a hana binding or URL is in use) — dynamic agent storage
