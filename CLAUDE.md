@@ -224,7 +224,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   names no destination and the one factory that also receives the catalogue
   snapshot the registry loaded; it is always built with the storing audit
   recorder (`stored_recorder()`), so no caller can build it with writes that
-  are not recorded
+  are not recorded. `builtin:sharepoint` is the one that is application-level
+  in both of its modes (`app_only`, `destination`): `user_context` is refused
 - `agents/gmail_tools.py` — in-process Gmail tools over the REST API,
   attached when an agent lists the pseudo-URL `builtin:gmail` instead of an
   MCP endpoint. Google's hosted Gmail MCP server refuses every `tools/call`
@@ -257,6 +258,116 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   posts as the signed-in user; `app_only` is read-only because Graph refuses
   application posts; `destination` follows `user_context` (posting only as
   the user). Unit-tested only; setup notes are in the module docstring
+- `agents/sharepoint_tools.py` — ONE Excel workbook in a SharePoint document
+  library, read through Microsoft Graph (`builtin:sharepoint`), read-only.
+  Scope is config, never a tool argument: `site`
+  (`<tenant>.sharepoint.com:/sites/<site>`), `library` and `path` pin the
+  file, `views` names what may be read from it; no site, path, sheet, range,
+  URL or destination ever comes from the model. Two tools:
+  `read_table(view)` answers `{view, columns, rows, skipped_rows, row_count,
+  last_modified}`, `read_calendar(view, date_from, date_to)` answers `{view,
+  from, to, runs, conflicts, skipped_rows, unmapped, lookup_misses, sheets,
+  last_modified}` (a run is member, team, kind, status, `from`, `to` plus the
+  lookup's columns; consecutive days of one status are one run). No tool
+  lists the views: an agent's instructions or a skill must name them (an
+  unknown name is refused as `unknown_view`, the name the model sent is not
+  echoed, the hint holds the configured names of that kind).
+  **Application-level only**: `destination` (the destination holds the
+  credential, via `DestinationAuth`) or `app_only` (client credentials stored
+  with the entry); `user_context` is refused in both modes, at the gate, in
+  storage and at build, never silently ignored. `SharePointFile` resolves the
+  file with three Graph reads (site, the site's libraries matched by name,
+  the item), cached: the library id 900 s, the bytes per eTag 300 s (no eTag,
+  no cache), so the calls of one run download once. **The download URL is a
+  credential**: the content comes from the item's pre-authenticated URL
+  through a separate client that sends no `Authorization`, follows no
+  redirect, has `trust_env=False`, and is used only for an `https` URL on the
+  host the `site` pin names (no userinfo, no other port). `httpx` logs every
+  request URL at INFO, so a filter on the `httpx` logger drops the records
+  made in the downloading task (a contextvar, set and reset in the download
+  coroutine) and any other record whose text holds a URL or query string in
+  flight; it is installed at import and again before every download (a
+  logging setup may have replaced the filters). A download has a total
+  deadline (`DOWNLOAD_DEADLINE_SECONDS`, 120 s, on top of the 60 s
+  per-operation timeout) because `fetch` holds the file's lock. Every failure
+  is `{"error": {code, message, hint?}}` with a fixed text, never an
+  exception and never Graph's text: `graph_unauthorized`, `graph_forbidden`,
+  `graph_throttled`, `graph_error`, `graph_unreachable`, `site_not_found`,
+  `file_not_found`, `library_not_found`, `not_a_file`, `destination_error`,
+  `token_failed`, `download_refused`, `download_redirect`, `download_failed`,
+  `too_large`, `not_a_workbook`, `result_too_large`, `unknown_view`,
+  `invalid_dates`, `window_too_long`, plus the reader's codes below; anything
+  unexpected is `read_failed` and logged by exception class name only (a
+  traceback frame would hold the URL). `last_modified` is Graph's value only
+  when it has the form of a UTC timestamp, else `null`. A result over
+  `MAX_RESULT_CHARS` (60,000, measured with pydantic-ai's own tool-return
+  serialiser, or plain JSON when that is longer) is refused, not cut: a list
+  that ends early would read as complete. The window is checked before
+  anything is fetched and again inside the reader. Misconfiguration is a
+  `ValueError` at registry build. Denied in ABAP Assistant sessions (the tools
+  are not in `READONLY_POLICY`). Unit-tested only
+  (`tests/test_sharepoint_graph.py`, `tests/test_sharepoint_tools.py`):
+  never run against a real tenant. Setup
+  notes (app registration with `Sites.Selected`, the destination) are in the
+  module docstring and in `docs/SHAREPOINT_SETUP.md` (local, not in repo)
+- `agents/sharepoint_views.py` — the one reading of a `builtin:sharepoint`
+  config, standard library only: the save-time gate, storage and the toolset
+  all call `check_pins` and `parse_views` / `clean_views`, so none accepts
+  what another refuses. 1 to 10 views, named `[a-z][a-z0-9_]{0,31}`, of two
+  kinds: `table` (an Excel table by name and the `columns`, at most 50, that
+  may be returned) and `calendar` (one column per day: `sheet`, which may
+  hold `{year}`, `date_row`, `first_date_column`, `first_row`, `labels` with
+  `member` required and `team` / `kind` optional, `codes` mapping a cell
+  value to a status (at most 100; `unmapped` is reserved), optional
+  `stop_at`, `lookup` (pinned columns of a table view of the same entry, by
+  member; `add` may not name a run key) and `conflict` (two kinds of row of
+  one member)). **A calendar view with a `kind` label must pin its `kinds`**
+  (1 to 10 distinct names; `conflict.kind` and `conflict.against` must be
+  among them), a view without one must not have `kinds`. Unknown keys are
+  refused, not dropped. **A pin is stored exactly as checked**: `check_pins`
+  returns nothing and refuses edge whitespace, control / separator characters
+  and a value that is not NFC instead of repairing them; `path` is an `.xlsx`
+  below the library root without `\ % ? # : * " < > |` or `.` / `..` parts.
+  A refusal (`ViewConfigError`) names the field and the rule, never a value.
+  The gate is `_validate_sharepoint` in `agents/admin.py`. Storage has its
+  own cleaner, `_clean_sharepoint_entry` in `agents/db.py`, because the
+  generic key tables trim and `str()` what they keep: it is the last gate
+  (reached without the admin payload by `scripts/import_bundle.py` and direct
+  `upsert_agent` callers), checks pins and views again, refuses
+  `user_context: true`, keeps only the destination name or the client
+  credential, the three pins and the cleaned views, and the entry's URL is
+  stored in the canonical spelling `builtin:sharepoint`.
+  `tests/test_sharepoint_views.py`, `tests/test_sharepoint_registration.py`
+- `agents/sharepoint_workbook.py` — workbook bytes to view data
+  (`read_table`, `read_calendar`), pure and CPU work on a file somebody else
+  wrote: call it through `asyncio.to_thread`. `openpyxl` in read-only mode
+  (with `defusedxml`, no DTD). Text in the workbook is data, never an
+  instruction, and **what leaves is default-deny**: a table view returns its
+  pinned columns only, and a row with a text cell of a pinned column over 255
+  characters or with a control, format or line-separator character is
+  skipped and counted; a calendar cell reaches the model only as the status
+  its code maps to (any other value, a number or an error value included, is
+  counted as `unmapped`, never passed on); a calendar row is skipped and
+  counted when it has no member, an error value in a label cell, a kind that
+  is not pinned, a member or team cell over 120 characters or with such a
+  character, or is a second row for the same member and kind (`skipped_rows`
+  on both results; the text of a skipped row goes nowhere). A lookup name
+  that is in the table twice is no key (`lookup_misses`). An Excel table is
+  found in the package parts (a read-only worksheet of openpyxl does not
+  load its tables). **No cached values is a refusal**: formula results are
+  read as the saving application stored them and nothing is calculated;
+  `no_cached_values` when no formula of a view (date row and body judged
+  separately) has a result, or when a requested day is missing while the
+  date row has a formula without a result among its dates. Caps, each a
+  refusal: 20 MB, 5,000 archive members and 300 MB declared uncompressed
+  size (`check_archive`, before parsing), a window of 120 days
+  (`check_window`), 5,000 rows and 200 columns of a table, 2,000 calendar
+  rows (`stop_at` or 50 blank rows end them), 400 day columns. Its own codes:
+  `table_not_found`, `column_not_found`, `sheet_not_found`,
+  `dates_not_found` (a requested day missing or twice in the date row),
+  `no_cached_values`, `too_large`, `not_a_workbook`.
+  `tests/test_sharepoint_workbook.py`, `tests/test_sharepoint_calendar.py`
+  (workbooks generated by `tests/sharepoint_helpers.py`)
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
   bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
   BTP destination (NoAuthentication + `URL.headers.Authorization`, which
@@ -980,7 +1091,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
   `error` | `unbound` | `missing`); its `error` for a failed resolve is a
   fixed text ending in a code (`agents.odata.destinations.destination_failure`),
-  the resolver's own text goes to the log
+  the resolver's own text goes to the log. The seed loop
+  (`seed_from_file_if_empty`) logs a refused entry of any type (skill, agent,
+  workflow) by its name (only when it has the form of a name) and the field
+  locations and error types of the refusal, or the exception class: never
+  the entry or the text of the error, which hold secrets, pins and input
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
   `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
   `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
@@ -988,14 +1103,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `templates/admin.html` — Admin UI (single-page, vanilla JS); attaches
   catalogue services to an agent (checkbox list and Allow writes), the
   catalogue itself is edited only in `ui5-admin/`; it does not read
-  `reloaded` / `reload_failed`, so a failed reload is not shown there
+  `reloaded` / `reload_failed`, so a failed reload is not shown there. It
+  offers `builtin:sharepoint` in destination mode only, with the views
+  edited as JSON and the three pins sent through `DESTINATION_EXACT_KEYS`
+  (as typed, never trimmed)
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is unchanged and still the supported admin at
   `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
   `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
-  auth modes the server accepts per built-in. The **OData services** area
+  auth modes the server accepts per built-in. For `builtin:sharepoint`
+  (`app_only` or `destination`) the dialog edits the views as JSON and sends
+  the three pins as typed, never trimmed (the server refuses edge whitespace
+  instead of repairing it). The **OData services** area
   (nav entry between Skills and Runs; `view/ODataServices` = list with Used by,
   Write tag, import of a service file; `view/ODataServiceDetail` = identity
   ("Runs as" signed-in or technical user, destination field), purpose / not
@@ -1080,7 +1201,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   comment in the descriptor); with both active it must also set `DB_KIND`.
   Nothing is copied between the databases by a deploy (see
   `scripts/copy_registry_config.py`). `HANA_HDI_ALLOW_DROP` is not in the
-  descriptor (an `.mtaext` sets it for the one deploy that may drop a table)
+  descriptor (an `.mtaext` sets it for the one deploy that may drop a table);
+  2.22.0 is the `builtin:sharepoint` release: no new resource and no new
+  environment variable
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -1132,6 +1255,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the technical-user path and which principal-propagation mode the proxy
   accepts; prints names, statuses and the SAP user header, never a credential
   or a body; a user run takes a one-time passcode from the terminal
+- `scripts/probe_sharepoint.py` — standalone go/no-go probe for
+  `builtin:sharepoint` (nothing imported from the app, reads only), run
+  inside an app container that has the destination binding: does the
+  destination hand out a Graph token, does it resolve the site, is the
+  library there under that name, is the file there with its download
+  location on the site's host, does the download answer with a workbook.
+  Prints names, sizes, statuses and host names, never a token, the download
+  URL or a byte of the file (`tests/test_probe_sharepoint.py`)
 - `scripts/ensure_aicore_setup.py` — creates the `AICORE_RESOURCE_GROUP`
   resource group if missing, idempotent, no-op for `default`. Creates the
   group only; model deployments stay in `scripts/deploy_claude.py` because
@@ -1210,6 +1341,9 @@ bump a pin, rerun the suites, then deploy.
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
 - `builtin:odata` adds no dependency: `$metadata` is parsed with the standard
   library's expat
+- `openpyxl` and `defusedxml` — `builtin:sharepoint` reads `.xlsx`; openpyxl
+  uses defusedxml when it is installed and then parses no DTD (both pins and
+  `openpyxl.DEFUSEDXML` asserted by `tests/test_sharepoint_requirements.py`)
 - `sqlalchemy[asyncio]`, `asyncpg` (Postgres on CF), `aiosqlite` (the
   local SQLite fallback), `sqlalchemy-hana` and `hdbcli` (SAP HANA Cloud;
   imported only when a hana binding or URL is in use) — dynamic agent storage
@@ -1229,7 +1363,11 @@ bump a pin, rerun the suites, then deploy.
   (`ruff.toml`, advisory in CI). Script-style suites patch
   `create_mcp_server` and `Agent.__init__` at import; `tests/conftest.py`'s
   `real_agents_and_mcp` fixture restores the real ones for tests that build
-  real agents. After a pydantic-ai bump rerun the deferred-tool spike with
+  real agents. `tests/test_admin_ui.py` (the classic admin in jsdom) is
+  script-style: run it as
+  `NODE_PATH=$(npm root) .venv/bin/python tests/test_admin_ui.py`; pytest
+  collects nothing from it. After a pydantic-ai bump rerun the deferred-tool
+  spike with
   `IDE_SPIKE_ALL=1 .venv/bin/python -m pytest tests/test_ide_deferred_spike.py`
 - Real-stream e2e backend (test-only, never imported by `agents/` or
   `app.py`): `.venv/bin/python tests/e2e/ide_stream_server.py` serves the
