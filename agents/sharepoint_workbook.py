@@ -35,14 +35,14 @@ import io
 import posixpath
 import unicodedata
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Iterator
 
-from agents.sharepoint_views import TableView
+from agents.sharepoint_views import CalendarView, TableView, column_index
 
 __all__ = [
     "MAX_FILE_BYTES", "MAX_WINDOW_DAYS", "Refused", "check_archive", "check_window",
-    "read_table",
+    "read_calendar", "read_table",
 ]
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -275,3 +275,218 @@ def read_table(data: bytes, view: TableView) -> dict[str, Any]:
         if any(v is not None for v in record.values()):
             rows.append(record)
     return {"columns": list(view.columns), "rows": rows}
+
+
+# --- calendar view --------------------------------------------------------
+
+def _as_date(cell: Any, epoch: Any) -> date | None:
+    value = cell.value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if type(value) in (int, float) and 1 <= value < 2_958_466:
+        from openpyxl.utils.datetime import from_excel
+
+        try:
+            moment = from_excel(value, epoch)
+        except Exception:  # noqa: BLE001
+            return None
+        return moment.date() if isinstance(moment, datetime) else None
+    return None
+
+
+def _read_year(data: bytes, view: CalendarView, lo: date, hi: date, state: dict[str, Any]) -> str:
+    """Adds the days ``lo``..``hi`` (one year) of the view to ``state``."""
+    title = view.sheet.replace("{year}", str(lo.year))
+    first_col = column_index(view.first_date_column)
+    last_col = first_col + MAX_DAY_COLUMNS - 1
+    label_cols = {k: column_index(c) for k, c in view.labels.items()}
+    wanted = {lo + timedelta(days=i) for i in range((hi - lo).days + 1)}
+
+    book = _open(data, data_only=True)
+    try:
+        if title not in book.sheetnames:
+            raise Refused("sheet_not_found", f"the workbook has no sheet for {lo.year}",
+                          "ask for a period the workbook covers")
+        ws = book[title]
+        day_cols: dict[date, int] = {}
+        date_values: dict[int, bool] = {}
+        for row in _rows(ws, view.date_row, view.date_row, last_col, first_col):
+            for offset, cell in enumerate(row):
+                day = _as_date(cell, book.epoch)
+                date_values[first_col + offset] = cell.value is not None
+                if day in wanted:
+                    day_cols.setdefault(day, first_col + offset)
+        max_col = max(day_cols.values(), default=first_col)
+        lines: list[tuple[int, list[Any]]] = []
+        blank = 0
+        stop = view.stop_at.casefold() if view.stop_at else None
+        for n, row in enumerate(_rows(ws, view.first_row,
+                                      view.first_row + MAX_CALENDAR_ROWS - 1, max_col)):
+            values = [_plain(c) for c in row]
+            values += [None] * (max_col - len(values))
+            labels = [values[c - 1] for c in label_cols.values()]
+            if stop and any(isinstance(v, str) and v.casefold() == stop for v in labels):
+                break
+            if all(v is None for v in values):
+                blank += 1
+                if blank >= BLANK_ROWS_END:
+                    break
+                continue
+            blank = 0
+            lines.append((view.first_row + n, values))
+    finally:
+        book.close()
+
+    # Second pass, formulas as written: which cells are formulas at all.
+    formulas = with_result = 0
+    date_formula_without_result = False
+    by_row = dict(lines)
+    book = _open(data, data_only=False)
+    try:
+        ws = book[title]
+        for row in _rows(ws, view.date_row, view.date_row, last_col, first_col):
+            for offset, cell in enumerate(row):
+                if cell.data_type == "f":
+                    formulas += 1
+                    if date_values.get(first_col + offset):
+                        with_result += 1
+                    else:
+                        date_formula_without_result = True
+        if lines:
+            for n, row in enumerate(_rows(ws, view.first_row, lines[-1][0], max_col)):
+                values = by_row.get(view.first_row + n)
+                for c, cell in enumerate(row):
+                    if cell.data_type == "f":
+                        formulas += 1
+                        with_result += values is not None and values[c] is not None
+    finally:
+        book.close()
+    _no_results(formulas, with_result)
+    if wanted - set(day_cols):
+        if date_formula_without_result:
+            _no_results(1, 0)
+        raise Refused(
+            "dates_not_found",
+            "the date row of the sheet does not hold every requested day",
+            "the layout of the sheet may differ from the configured view",
+        )
+
+    seen: set[tuple[str, str]] = set()
+    for _, values in lines:
+        label = {k: values[c - 1] for k, c in label_cols.items()}
+        member = label.get("member")
+        if not isinstance(member, str) or any(v is _ERROR for v in label.values()):
+            state["skipped_rows"] += 1
+            continue
+        kind = label.get("kind")
+        kind = kind if isinstance(kind, str) else ""
+        key = (member, kind.casefold())
+        if key in seen:
+            state["skipped_rows"] += 1
+            continue
+        seen.add(key)
+        team = label.get("team")
+        row_state = state["rows"].setdefault(
+            key, {"member": member, "kind": kind,
+                  "team": team if isinstance(team, str) else None, "days": {}})
+        for day, col in day_cols.items():
+            value = values[col - 1]
+            if value is None:
+                continue
+            status = None if value is _ERROR or isinstance(value, bool) \
+                else view.codes.get(str(value))
+            if status is None:
+                state["unmapped"] += 1
+            else:
+                row_state["days"][day] = status
+    return title
+
+
+def _runs(days: dict[date, Any]) -> Iterator[tuple[date, date, Any]]:
+    """Consecutive days with the same value, as (from, to, value)."""
+    start = prev = None
+    for day in sorted(days):
+        if start is not None and day - prev == timedelta(days=1) and days[day] == days[start]:
+            prev = day
+            continue
+        if start is not None:
+            yield start, prev, days[start]
+        start = prev = day
+    if start is not None:
+        yield start, prev, days[start]
+
+
+def read_calendar(
+    data: bytes,
+    view: CalendarView,
+    date_from: date,
+    date_to: date,
+    lookup: TableView | None = None,
+) -> dict[str, Any]:
+    """The runs of a calendar view between two dates (inclusive).
+
+    ``lookup`` is the table view ``view.lookup`` names; the caller resolves
+    it from the same config.
+    """
+    check_archive(data)
+    state: dict[str, Any] = {"rows": {}, "skipped_rows": 0, "unmapped": 0}
+    sheets = []
+    for year in range(date_from.year, date_to.year + 1):
+        lo = max(date_from, date(year, 1, 1))
+        hi = min(date_to, date(year, 12, 31))
+        sheets.append(_read_year(data, view, lo, hi, state))
+
+    extra: dict[str, dict[str, Any]] = {}
+    add: tuple[str, ...] = ()
+    if view.lookup is not None and lookup is not None:
+        add = view.lookup.add
+        seen: dict[str, int] = {}
+        table = read_table(data, lookup)["rows"]
+        for record in table:
+            key = record.get(view.lookup.on)
+            if isinstance(key, str):
+                seen[key] = seen.get(key, 0) + 1
+                extra[key] = record
+        # A name that is in the table twice is not a key: no guess.
+        extra = {k: v for k, v in extra.items() if seen[k] == 1}
+
+    runs: list[dict[str, Any]] = []
+    misses: set[str] = set()
+    for row in state["rows"].values():
+        found = extra.get(row["member"])
+        if add and found is None and row["days"]:
+            misses.add(row["member"])
+        for start, end, status in _runs(row["days"]):
+            run = {"member": row["member"], "team": row["team"], "kind": row["kind"],
+                   "status": status, "from": start.isoformat(), "to": end.isoformat()}
+            for column in add:
+                run[column] = found.get(column) if found else None
+            runs.append(run)
+    runs.sort(key=lambda r: (r["member"], r["kind"], r["from"]))
+
+    conflicts: list[dict[str, Any]] = []
+    if view.conflict is not None:
+        kind, against = view.conflict.kind.casefold(), view.conflict.against.casefold()
+        for (member, row_kind), row in state["rows"].items():
+            other = state["rows"].get((member, against))
+            if row_kind != kind or other is None:
+                continue
+            clash = {day: (status, other["days"][day])
+                     for day, status in row["days"].items()
+                     if other["days"].get(day) in view.conflict.when}
+            for start, end, (status, other_status) in _runs(clash):
+                conflicts.append({"member": member, "from": start.isoformat(),
+                                  "to": end.isoformat(), "status": status,
+                                  "against": other_status})
+        conflicts.sort(key=lambda c: (c["member"], c["from"]))
+
+    return {
+        "runs": runs,
+        "conflicts": conflicts,
+        "skipped_rows": state["skipped_rows"],
+        "unmapped": state["unmapped"],
+        "lookup_misses": len(misses),
+        "sheets": sheets,
+    }
