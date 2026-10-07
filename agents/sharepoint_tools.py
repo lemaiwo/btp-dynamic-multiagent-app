@@ -40,13 +40,22 @@ the views pin.
 
 **One parse at a time.** Reading a view is CPU and memory work in a worker
 thread on a file somebody else wrote. The parses of all toolsets in this
-process take turns (:func:`_parse`), so the memory one workbook may need is
-needed once, however many tool calls run side by side.
+process take turns (:func:`_parse`): one parse at a time per app instance,
+however many tool calls run side by side. That, with the reader's caps (a
+part read whole at most 16 MB, the archive at most 64 MB uncompressed), is
+what holds; it is no bound on memory. A hand-crafted worksheet or
+shared-strings part is bounded by the 64 MB total only and openpyxl's
+structures per row and per string can cost several times that. Byte caps
+cannot close it; parsing in a child process with a memory limit would (as
+``agents/_python_step_runner.py`` does for the python step). Not built.
 
 **What a run records.** A run's activity (the chat's tool card, and the row of
 an API-triggered run in the database) gets a fixed-form line of counts for
 these two tools (:func:`activity_summary`), never the head of the result:
-nothing from the workbook is stored in the database.
+no result of the two tools is stored. What the model itself writes from the
+data is stored as for any agent: the run's report, and the short argument
+preview run activity keeps of every later tool call (``run_activity._detail``:
+the head of a mail body, todo items, a scratchpad write, OData call arguments).
 
 Every refusal is ``{"error": {code, message, hint?}}``, never an exception,
 and nothing Graph says reaches the model: a status and a fixed text only.

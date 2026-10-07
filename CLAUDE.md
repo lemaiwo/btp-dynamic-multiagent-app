@@ -286,8 +286,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   process** (`_parse`): the two reader calls run in a worker thread and take
   turns across all toolsets, and a turn is given back when the thread has
   ended, not when a cancelled tool call stops waiting (a thread cannot be
-  cancelled); so the memory one workbook may need is needed once. **Nothing
-  from the workbook is stored in the database**: for these two tools the
+  cancelled): one parse at a time per app instance. **No result of the two
+  tools is stored**: for these two tools the
   preview a run's activity keeps (`registry._short_tool_output`, shown in the
   chat's tool card and stored in `job_runs.activity_json`) is the fixed-form
   line of `activity_summary`: `read_table: n rows, s skipped`,
@@ -295,8 +295,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   <code>` for a refusal, decided by the tool's name alone, plain or prefixed
   (`sharepoint_read_table`, `sharepoint_0_read_table`), so another server's
   tool of exactly these names gets the same line and no preview; every other
-  tool's preview is unchanged (`tests/test_sharepoint_activity.py`). The
-  agent's own answer is what the run stores as its report. **The download URL is a
+  tool's preview is unchanged (`tests/test_sharepoint_activity.py`). What
+  the model itself writes from the data is stored as for any agent: the run's
+  report, and the short argument preview run activity keeps of every later
+  tool call (`run_activity._detail`: the head of a mail body, todo items, a
+  scratchpad write, OData call arguments). **The download URL is a
   credential**: the content comes from the item's pre-authenticated URL
   through a separate client that sends no `Authorization`, follows no
   redirect, has `trust_env=False`, and is used only for an `https` URL on the
@@ -384,16 +387,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   refusal: 20 MB, 5,000 archive members, 64 MB declared uncompressed size in
   total and 16 MB (`MAX_MEMBER_BYTES`) for every member that is not a sheet
   under `xl/worksheets/` (`check_archive`, from the declared sizes, before
-  anything is inflated; sized for the 1 GB app container: only the rows of a
-  sheet are streamed, every other part is parsed whole into a tree several
-  times its size, on each of the 2 opens of a table read and the 2 per year
-  sheet, plus 2 for a lookup, of a calendar read). **The declared sizes are
+  anything is inflated: only the rows of a sheet are streamed, every other
+  part is parsed whole into a tree several times its size, on each of the 2
+  opens of a table read and the 2 per year sheet, plus 2 for a lookup, of a
+  calendar read). What holds: a part read whole is at most 16 MB, the archive
+  at most 64 MB uncompressed, one parse at a time per app instance. That is
+  no bound on memory: a hand-crafted worksheet or shared-strings part is
+  bounded by the 64 MB total only, and openpyxl's structures per row and per
+  string can cost several times that. Byte caps cannot close it; only parsing
+  in a child process with a memory limit would (as
+  `agents/_python_step_runner.py` does for the python step). Not built. **The declared sizes are
   held to**: openpyxl is given the reader's own archive (`_Archive`, through
   `ExcelReader`, which is why the openpyxl version is pinned by a test), in
   which no member is inflated beyond the size it declares (`ZipFile.read`
   alone inflates the whole stream first: 64 MB behind a declared 100 bytes)
   and a part that is read whole is capped at 16 MB wherever the package puts
-  it (a sheet part the workbook calls a chart sheet is read whole). A window
+  it (a sheet part the workbook calls a chart sheet is read whole); a
+  workbook that openpyxl did not open on that archive is refused as
+  `read_failed`, never read unguarded. A window
   of 120 days, given as exactly `YYYY-MM-DD` (a week date is refused;
   `check_window`), 5,000 rows and 200 columns of a table, 2,000 calendar
   rows (`stop_at` or 50 blank rows end them), 400 day columns. Its own codes:

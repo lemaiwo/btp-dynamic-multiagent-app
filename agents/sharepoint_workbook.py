@@ -37,6 +37,15 @@ Rules of what leaves this module:
   formula without a result, or a view in which no formula at all has a
   result, is ``no_cached_values``. Nothing is ever calculated or guessed.
 
+**What the caps bound, and what they do not.** A part that is read whole is
+at most :data:`MAX_MEMBER_BYTES`, the archive at most
+:data:`MAX_UNCOMPRESSED_BYTES` uncompressed, and the caller runs one parse at
+a time per app instance. A hand-crafted worksheet or shared-strings part is
+bounded by the total only, and openpyxl's structures per row and per string
+can cost several times those bytes. Byte caps cannot close that; only parsing
+in a child process with a memory limit would (as
+``agents/_python_step_runner.py`` does for the python step). Not built.
+
 Every refusal is a :class:`Refused` with a stable code and a fixed text.
 """
 
@@ -61,7 +70,8 @@ __all__ = [
 MAX_FILE_BYTES = 20 * 1024 * 1024
 # Declared size of all archive members together, checked before anything is
 # inflated. A planning workbook of 3 MB and some thirty sheets inflates to
-# about 25 MB; the app container has 1 GB for everything.
+# about 25 MB. A bound on what is inflated, not on the memory a parse needs
+# (see the module docstring).
 MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
 # Declared size of one member that is not a sheet. Only the rows of a sheet
 # are streamed: the workbook part, the styles, the relationships and a table
@@ -216,11 +226,21 @@ def _open(data: bytes, *, data_only: bool) -> Any:
         reader.archive.close()
         reader.archive = _Archive(io.BytesIO(data))
         reader.read()
-        return reader.wb
+        book = reader.wb
     except Refused:
         raise
     except Exception:  # noqa: BLE001 - whatever the parser says, the answer is one code
         raise Refused("not_a_workbook", "the file is not an Excel workbook") from None
+    # Fail closed: should an openpyxl change make the hand-over above do
+    # nothing, the sheets would be read from an archive that holds no member
+    # to its declared size. Not the file's fault, so not ``not_a_workbook``.
+    if not isinstance(getattr(book, "_archive", None), _Archive):
+        try:
+            book.close()
+        except Exception:  # noqa: BLE001 - refused either way
+            pass
+        raise Refused("read_failed", "the workbook could not be read")
+    return book
 
 
 def _plain(cell: Any) -> Any:

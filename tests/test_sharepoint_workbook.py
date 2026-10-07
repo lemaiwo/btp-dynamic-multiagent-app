@@ -210,7 +210,7 @@ CALENDAR_VIEW = parse_views(VIEWS)["planning"]
 YEAR = {2026: {("Ann Example", "Presence"): {"2026-01-05": "H"}}}
 
 
-def test_the_caps_are_the_ones_a_one_gigabyte_container_can_carry():
+def test_the_archive_caps_in_total_and_per_part_read_whole():
     assert workbook.MAX_UNCOMPRESSED_BYTES == 64 * 1024 * 1024
     assert workbook.MAX_MEMBER_BYTES == 16 * 1024 * 1024
 
@@ -345,3 +345,28 @@ def test_a_part_read_whole_is_capped_wherever_the_package_puts_it():
     chart = _with_member(big, "xl/_rels/workbook.xml.rels", retyped)
     check_archive(chart)
     assert _refused(read_table, chart, TEAM_VIEW).code == "too_large"
+
+
+def test_a_workbook_that_does_not_read_through_the_guarded_archive_is_refused(monkeypatch):
+    """As after a change in openpyxl that makes handing over the archive do
+    nothing: the reader refuses, it does not read unguarded."""
+    import openpyxl.reader.excel as excel
+
+    opened: list = []
+
+    class Changed(excel.ExcelReader):
+        def read(self):
+            super().read()
+            self.wb._archive = zipfile.ZipFile(io.BytesIO(DATA))
+            opened.append(self.wb._archive)
+
+    DATA = build_workbook(YEAR)
+    monkeypatch.setattr(excel, "ExcelReader", Changed)
+    for refused in (
+        _refused(read_table, DATA, TEAM_VIEW),
+        _refused(read_calendar, DATA, CALENDAR_VIEW, date(2026, 1, 5), date(2026, 1, 6),
+                 TEAM_VIEW),
+    ):
+        assert refused.code == "read_failed"
+        assert refused.message == "the workbook could not be read"
+    assert opened and all(archive.fp is None for archive in opened)  # closed, not handed on
