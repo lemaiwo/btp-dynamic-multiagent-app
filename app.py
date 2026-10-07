@@ -37,7 +37,7 @@ logger = logging.getLogger("app")
 # Import after load_dotenv so SAP AI Core & XSUAA env vars are available.
 from fastapi import FastAPI  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import literal_column, select  # noqa: E402
 
 from agents.a2a import router as a2a_router  # noqa: E402
 from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
@@ -94,8 +94,14 @@ IDE_SEED_FILE = Path(__file__).resolve().parent / "agents" / "ide" / "seed.ide.j
 DB_HEARTBEAT_SECONDS = float(os.environ.get("DB_HEARTBEAT_SECONDS", "60"))
 
 
+# ``SELECT 1`` as each database writes it: Postgres and SQLite take it as it
+# stands, SAP HANA has no SELECT without FROM and gets ``SELECT 1 FROM DUMMY``
+# from its dialect. A ``text()`` statement would be sent unchanged.
+HEARTBEAT = select(literal_column("1"))
+
+
 async def _db_heartbeat(interval: float) -> None:
-    """Touch Postgres on a timer so no user pays for the pool going cold.
+    """Touch the database on a timer so no user pays for the pool going cold.
 
     `/healthz` answers from memory and the admin UI is idle most of the day,
     so without this the pool sits untouched for hours. Measured on ACC, the
@@ -115,7 +121,7 @@ async def _db_heartbeat(interval: float) -> None:
         await asyncio.sleep(interval)
         try:
             async with SessionLocal() as session:
-                await session.execute(text("SELECT 1"))
+                await session.execute(HEARTBEAT)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001

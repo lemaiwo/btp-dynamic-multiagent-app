@@ -9,7 +9,7 @@ through ``emit(event, data)`` using the SSE vocabulary of the IDE contract
 frames is the route's job.
 
 1. **Start.** In one transaction the session row is read (``SELECT ... FOR
-   UPDATE`` on Postgres), :func:`agents.ide.stages.assert_can_run` checks
+   UPDATE`` on Postgres and SAP HANA), :func:`agents.ide.stages.assert_can_run` checks
    *that* row, and a conditional ``UPDATE ... WHERE status != 'running'``
    takes the run lock, so two concurrent starts cannot both win even on
    SQLite. The user message is saved in the same transaction. A refusal
@@ -129,7 +129,7 @@ from pydantic_ai.usage import RunUsage
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agents.db import SessionLocal
+from agents.db import SessionLocal, has_row_locks
 from agents.destination_auth import DestinationUserRequired
 from agents.ide import basecheck, diagnose, syntaxcheck
 from agents.ide.diagnose import DiagnoseRun, current_diagnose, is_non_production
@@ -246,8 +246,11 @@ class _Start:
     report: bool = False
 
 
-def _is_postgres(db: AsyncSession) -> bool:
-    return db.get_bind().dialect.name == "postgresql"
+def _locked(db: AsyncSession, stmt: Any) -> Any:
+    """``stmt`` with ``FOR UPDATE`` where the database has row locks
+    (Postgres, SAP HANA): the row a run start or a stale release decides on
+    is then the row it writes. SQLite has none and serialises writers."""
+    return stmt.with_for_update() if has_row_locks(db) else stmt
 
 
 # --- run lock liveness -----------------------------------------------------
@@ -367,9 +370,7 @@ async def release_stale(sid: str) -> bool:
     """
     async with SessionLocal() as db:
         stmt = select(IdeSession).where(IdeSession.id == sid)
-        if _is_postgres(db):
-            stmt = stmt.with_for_update()
-        row = (await db.execute(stmt)).scalar_one_or_none()
+        row = (await db.execute(_locked(db, stmt))).scalar_one_or_none()
         if row is None or not _is_stale(row):
             return False
         released = await _reclaim(db, row)
@@ -431,14 +432,13 @@ async def _start(
         stmt = select(IdeSession).where(
             IdeSession.id == sid, IdeSession.owner == owner
         )
-        if _is_postgres(db):
-            stmt = stmt.with_for_update()
-        session = (await db.execute(stmt)).scalar_one_or_none()
+        session = (await db.execute(_locked(db, stmt))).scalar_one_or_none()
         if session is None or not owner:
             raise SessionNotFound(sid)
         if _is_stale(session):
             await _reclaim(db, session)
-        # The row just read (and locked on Postgres) is what the gate checks.
+        # The row just read (and locked, where the database has row locks) is
+        # what the gate checks.
         await assert_can_run(
             db, session, revise=request_changes is not None, report=report
         )
@@ -463,7 +463,7 @@ async def _start(
                 # nothing was written yet, so the ``with`` block rolls back.
                 raise lost_flag_error()
         # The conditional UPDATE is the lock on SQLite (no FOR UPDATE there)
-        # and a no-op guard on Postgres.
+        # and a no-op guard where the row is locked (Postgres, SAP HANA).
         result = await db.execute(
             update(IdeSession)
             .where(

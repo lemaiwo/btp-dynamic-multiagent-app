@@ -124,9 +124,13 @@ def main() -> int:
         print(f"  wrote  {args.out}  (contains secrets -- delete after use)")
         return 0
 
+    from sqlalchemy.engine import make_url  # noqa: PLC0415
+
     from agents.db import DATABASE_URL  # noqa: PLC0415 - after sys.path setup
 
-    print(f"  db     {DATABASE_URL}")
+    # The URL holds the database password; this output ends up in terminals
+    # and CI logs.
+    print(f"  db     {make_url(DATABASE_URL).render_as_string(hide_password=True)}")
     asyncio.run(import_bundle(bundle))
     print("  done   restart or reload the app to pick this up")
     return 1 if missing else 0

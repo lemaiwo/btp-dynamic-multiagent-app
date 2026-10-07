@@ -57,6 +57,7 @@ from enum import StrEnum
 from sqlalchemy import exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agents.db import text_unchanged
 from agents.ide.arc1 import TRACE_EXPIRES_RE, TRACE_ID_RE
 from agents.ide.diagnose import is_non_production
 from agents.ide.models import (
@@ -530,15 +531,18 @@ async def approve(
             IdeComment.state.in_(UNRESOLVED_COMMENT_STATES),
         ))
         nxt = NEXT_STAGE[stage]
+        # In the UPDATE on Postgres and SQLite; on SAP HANA (no ``=`` on an
+        # NCLOB) compared here, under the row lock taken above.
+        pins_unchanged = await text_unchanged(
+            db, IdeSession.pins_json, current_pins, IdeSession.id == session.id
+        )
         result = await db.execute(
             update(IdeSession)
             .where(
                 IdeSession.id == session.id,
                 IdeSession.stage == stage.value,
                 IdeSession.status != "running",
-                IdeSession.pins_json.is_(None)
-                if current_pins is None
-                else IdeSession.pins_json == current_pins,
+                pins_unchanged,
                 *where,
             )
             .values(stage=nxt.value, pins_json=new_pins)

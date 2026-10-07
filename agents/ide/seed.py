@@ -48,6 +48,7 @@ from agents.db import (
     SkillConfig,
     get_agent_by_name,
     get_skill_by_name,
+    text_unchanged,
     upsert_agent,
     upsert_skill,
 )
@@ -207,11 +208,16 @@ async def _stored_texts(
 async def _refresh_text(
     session: AsyncSession, model: type, column: str, name: str, stored: str, new: str
 ) -> bool:
-    """Replace ``stored`` by ``new`` only if the row still holds ``stored``."""
+    """Replace ``stored`` by ``new`` only if the row still holds ``stored``.
+
+    One conditional UPDATE on Postgres and SQLite; on SAP HANA, which cannot
+    compare an NCLOB, the row is locked and compared first
+    (``agents.db.text_unchanged``)."""
     col = getattr(model, column)
+    unchanged = await text_unchanged(session, col, stored, model.name == name)
     result = await session.execute(
         update(model)
-        .where(model.name == name, col == stored)
+        .where(model.name == name, unchanged)
         .values({column: new})
         .execution_options(synchronize_session=False)
     )
