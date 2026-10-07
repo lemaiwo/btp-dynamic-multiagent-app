@@ -780,3 +780,161 @@ async def test_upsert_agent_alone_refuses_and_cleans_as_storage_does(client):
                 {**DEST, "views": raw, "mailbox": "a@example.com", "allow_send": True})
     assert await _rows() == {
         "sp-direct": [{"url": URL, "auth_mode": "destination", "oauth": DEST}]}
+
+
+# --- final review: the entry in a real registry build -------------------------
+
+async def _build(agents: dict[str, list[dict[str, Any]]], raw: dict[str, Any] | None = None):
+    """A registry build of ``agents`` (name -> servers). ``raw`` replaces the
+    stored block of an agent's SharePoint entry after the save, as a row
+    written by an older version or by hand would hold it."""
+    from pydantic_ai.models.test import TestModel
+    from sqlalchemy import select
+
+    from agents import registry as registry_module
+    from agents.db import AgentConfig, SessionLocal, init_db, upsert_agent
+
+    await init_db()
+    await _wipe()
+    async with SessionLocal() as s:
+        for name, servers in agents.items():
+            await upsert_agent(s, name=name, description="d", instructions="i",
+                               mcp_servers=servers)
+        await s.commit()
+        for name, block in (raw or {}).items():
+            row = (await s.execute(
+                select(AgentConfig).where(AgentConfig.name == name))).scalar_one()
+            assert row.auth_mode == "destination" and row.mcp_url == URL
+            row.oauth_json = json.dumps(block)
+        await s.commit()
+    real_get_model = registry_module.get_model
+    registry_module.get_model = lambda *a, **k: TestModel()
+    try:
+        return await registry_module.build_orchestrator()
+    finally:
+        registry_module.get_model = real_get_model
+
+
+async def _tool_names(agent) -> set[str]:
+    """The tools of the agent's servers, as a run lists them."""
+    from pydantic_ai import RunContext
+    from pydantic_ai.models.test import TestModel
+    from pydantic_ai.usage import RunUsage
+
+    from agents.ide.readonly import ReadOnlyGuard
+
+    ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
+    names: set[str] = set()
+    for toolset in getattr(agent, "_user_toolsets", ()) or ():
+        if isinstance(toolset, ReadOnlyGuard):
+            names |= set(await toolset.get_tools(ctx))
+    return names
+
+
+SHAREPOINT = {"url": URL, "auth_mode": "destination", "oauth": DEST}
+NOTES = {"url": "builtin:sapnotes", "auth_mode": "none"}
+
+
+@pytest.fixture
+def binding(monkeypatch):
+    """A destination service binding by name: without one a destination
+    entry is refused at build, whatever its block holds. Nothing is called."""
+    monkeypatch.setenv("DESTINATION_CLIENT_ID", "cid")
+    monkeypatch.setenv("DESTINATION_CLIENT_SECRET", "placeholder")
+    monkeypatch.setenv("DESTINATION_URI", "https://destination.example.com")
+    monkeypatch.setenv("DESTINATION_TOKEN_URL", "https://login.example.com/oauth/token")
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp", "binding")
+async def test_a_registry_build_gives_the_agent_the_two_tools():
+    build = await _build({"planner": [SHAREPOINT]})
+    assert await _tool_names(build.specialists["planner"]) == {"read_table", "read_calendar"}
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp", "binding")
+async def test_with_a_second_server_the_tools_carry_the_sharepoint_prefix():
+    build = await _build({"planner": [SHAREPOINT, NOTES]})
+    names = await _tool_names(build.specialists["planner"])
+    assert {"sharepoint_read_table", "sharepoint_read_calendar"} <= names
+    assert not {"read_table", "read_calendar"} & names
+    assert any(n.startswith("sapnotes_") for n in names)
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp", "binding")
+@pytest.mark.parametrize("change", [
+    {"site": " example.sharepoint.com:/sites/planning"},   # check_pins
+    {"views": {"team": {"kind": "table", "table": "TeamMembers", "columns": []}}},
+    {"views": {"Team": VIEWS["team"]}},                    # parse_views
+    {"user_context": True},
+])
+async def test_a_stored_block_that_is_refused_costs_only_that_server(change, caplog):
+    caplog.set_level(logging.INFO)
+    bad = {**DEST, **change}
+    build = await _build(
+        {"planner": [SHAREPOINT, NOTES], "broken": [SHAREPOINT], "other": [SHAREPOINT]},
+        raw={"planner": bad, "broken": bad})
+    # The agent keeps its other server and has no SharePoint tool ...
+    names = await _tool_names(build.specialists["planner"])
+    assert names and not any("read_table" in n or "read_calendar" in n for n in names)
+    # ... an agent with nothing else is left out, and the others are built.
+    assert "broken" not in build.specialists
+    assert await _tool_names(build.specialists["other"]) == {"read_table", "read_calendar"}
+    # The refusal is logged with its traceback: field and rule, never a value.
+    said = "\n".join(caplog.handler.format(r) for r in caplog.records
+                     if r.name.startswith("agents."))
+    assert said.count("Failed to create MCP server builtin:sharepoint") == 2
+    assert "example.sharepoint.com" not in said and "TeamMembers" not in said
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp", "binding")
+async def test_a_retired_build_closes_the_graph_client():
+    from agents import registry as registry_module
+
+    build = await _build({"planner": [SHAREPOINT, NOTES]})
+    clients = [c.http_client for c in build.mcp_clients
+               if "read_table" in getattr(c, "tools", {})]
+    assert len(clients) == 1 and not clients[0].is_closed
+    registry = registry_module.Registry()
+    registry._build = build
+    real_get_model = registry_module.get_model
+    from pydantic_ai.models.test import TestModel
+
+    registry_module.get_model = lambda *a, **k: TestModel()
+    try:
+        new = await registry.reload()
+    finally:
+        registry_module.get_model = real_get_model
+    assert clients[0].is_closed
+    fresh = [c.http_client for c in new.mcp_clients if "read_table" in getattr(c, "tools", {})]
+    assert len(fresh) == 1 and not fresh[0].is_closed
+    await fresh[0].aclose()
+
+
+@pytest.mark.usefixtures("real_agents_and_mcp", "binding")
+@pytest.mark.parametrize("servers, tools", [
+    ([SHAREPOINT], ("read_table", "read_calendar")),
+    ([SHAREPOINT, NOTES], ("sharepoint_read_table", "sharepoint_read_calendar")),
+])
+async def test_the_guard_of_a_built_agent_denies_the_tools_in_an_assistant_session(
+        servers, tools):
+    from pydantic_ai import ModelRetry
+
+    from agents.deep import DeepState, WorkspaceScope, current_workspace
+    from agents.ide.readonly import ReadOnlyGuard, check_call
+
+    build = await _build({"planner": servers})
+    agent = build.specialists["planner"]
+    assert set(tools) <= await _tool_names(agent)
+    token = current_workspace.set(WorkspaceScope(session_id="s-1", state=DeepState(run_id="s-1")))
+    try:
+        assert not set(tools) & await _tool_names(agent)
+        for policy in ("change", "diagnose"):
+            for tool in tools:
+                assert check_call(tool, {"view": "team"}, policy) is not None
+        guards = [t for t in agent._user_toolsets if isinstance(t, ReadOnlyGuard)]
+        for guard in guards:
+            for tool in tools:
+                with pytest.raises(ModelRetry):
+                    await guard.call_tool(tool, {"view": "team"}, None, None)
+    finally:
+        current_workspace.reset(token)
