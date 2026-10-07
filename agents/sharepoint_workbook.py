@@ -12,7 +12,10 @@ read-only mode (rows are streamed; with ``defusedxml`` installed, which
 
 Rules of what leaves this module:
 
-* **Table view**: the pinned columns of the Excel table, nothing else.
+* **Table view**: the pinned columns of the Excel table, nothing else, and
+  text only as bounded one-line text (:data:`MAX_CELL_CHARS`, no control,
+  format or line-separator character): a row with other text in a pinned
+  column is skipped and counted.
 * **Calendar view, default-deny on cell values**: a cell reaches the caller
   only as the status its code maps to. A value that is not in ``codes`` (an
   unknown code, a number, an error value) is counted as ``unmapped`` and
@@ -68,6 +71,8 @@ BLANK_ROWS_END = 50
 MAX_DAY_COLUMNS = 400
 # A member or team cell that is longer is not a name: the row is skipped.
 MAX_LABEL_CHARS = 120
+# A text cell of a pinned table column that is longer skips its row.
+MAX_CELL_CHARS = 255
 
 _MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
@@ -281,12 +286,18 @@ def read_table(data: bytes, view: TableView) -> dict[str, Any]:
     _no_results(formulas, with_result)
 
     rows = []
+    skipped = 0
     for line in grid[1:]:
         record = {c: (None if line[index[c]] is _ERROR else line[index[c]])
                   for c in view.columns}
-        if any(v is not None for v in record.values()):
+        # Text is what somebody typed: it passes only as bounded one-line
+        # text, and a row that holds other text is not returned in part.
+        if any(isinstance(v, str) and not _is_name(v, MAX_CELL_CHARS)
+               for v in record.values()):
+            skipped += 1
+        elif any(v is not None for v in record.values()):
             rows.append(record)
-    return {"columns": list(view.columns), "rows": rows}
+    return {"columns": list(view.columns), "rows": rows, "skipped_rows": skipped}
 
 
 # --- calendar view --------------------------------------------------------
@@ -308,10 +319,11 @@ def _as_date(cell: Any, epoch: Any) -> date | None:
     return None
 
 
-def _is_name(text: str) -> bool:
-    """Whether label text may pass as a member or team: bounded, one line,
-    no control or format character (categories C*, Zl, Zp)."""
-    return len(text) <= MAX_LABEL_CHARS and not any(
+def _is_name(text: str, limit: int = MAX_LABEL_CHARS) -> bool:
+    """Whether cell text may pass (a member or team; with ``limit``, a table
+    cell): bounded, one line, no control or format character (categories C*,
+    Zl, Zp)."""
+    return len(text) <= limit and not any(
         unicodedata.category(ch).startswith("C")
         or unicodedata.category(ch) in ("Zl", "Zp") for ch in text)
 

@@ -9,6 +9,7 @@ Run:  python -m pytest tests/test_sharepoint_workbook.py
 from __future__ import annotations
 
 import io
+import json
 import sys
 import zipfile
 from datetime import date
@@ -108,3 +109,48 @@ def test_the_window_is_two_iso_dates_of_at_most_120_days():
     for bad in (("2026-01-11", "2026-01-05"), ("05/01/2026", "2026-01-11"),
                 ("2026-1-5", "2026-01-11"), (None, "2026-01-11"), ("20260105", "20260111")):
         assert _refused(check_window, *bad).code == "invalid_dates"
+
+
+# --- AMENDMENT 2: bounded text in a table view --------------------------------
+
+CELL_MARK = "zz-planted-cell-text"
+
+
+@pytest.mark.parametrize("bad", [
+    "N" * 256,
+    "Ann\tExample " + CELL_MARK,
+    "Ann Example " + CELL_MARK,
+    "Ann Example " + CELL_MARK,
+    "Ann\nExample " + CELL_MARK,
+    "Ann\x7fExample " + CELL_MARK,
+    "Ann​Example " + CELL_MARK,
+])
+@pytest.mark.parametrize("column", [0, 1])
+def test_a_row_with_text_that_is_not_bounded_one_line_text_is_skipped(bad, column):
+    row = ["Row " + CELL_MARK, "Basis", 1009, "u"]
+    row[column] = bad
+    data = build_workbook(team=[("Ann Example", "Basis", 1001, "u"), tuple(row),
+                                ("Bob Sample", "Basis", 1002, "u")])
+    out = read_table(data, TEAM_VIEW)
+    assert out["skipped_rows"] == 1
+    assert [r["Name"] for r in out["rows"]] == ["Ann Example", "Bob Sample"]
+    text = json.dumps(out, ensure_ascii=False)
+    assert CELL_MARK not in text and "NNNN" not in text and "1009" not in text
+
+
+def test_bounded_text_numbers_dates_and_booleans_pass_as_before():
+    data = build_workbook(team=[("N" * 255, "Basis", 1001, "u"),
+                                ("Bob Sample", date(2026, 1, 5), 12.5, "u"),
+                                ("Cy Placeholder", True, 0, "u")])
+    out = read_table(data, TEAM_VIEW)
+    assert out["skipped_rows"] == 0
+    assert out["rows"] == [{"Name": "N" * 255, "Team": "Basis", "ID": 1001},
+                           {"Name": "Bob Sample", "Team": "2026-01-05", "ID": 12.5},
+                           {"Name": "Cy Placeholder", "Team": True, "ID": 0}]
+
+
+def test_text_in_a_column_that_is_not_pinned_does_not_skip_the_row():
+    data = build_workbook(team=[("Ann Example", "Basis", 1001, "U" * 300 + "\tx")])
+    out = read_table(data, TEAM_VIEW)
+    assert out["skipped_rows"] == 0 and len(out["rows"]) == 1
+    assert read_table(build_workbook(), TEAM_VIEW)["skipped_rows"] == 0
