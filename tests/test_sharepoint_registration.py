@@ -84,7 +84,7 @@ def test_the_factory_refuses_user_context_in_both_modes(mode, block):
 def test_storage_keeps_exactly_the_entrys_own_keys_on_a_destination():
     from agents.db import _clean_oauth
 
-    posted = {**DEST, "destination": " GRAPH ", "user_context": True, "allow_send": True,
+    posted = {**DEST, "destination": " GRAPH ", "user_context": False, "allow_send": True,
               "allow_comment": True, "allow_write": True, "services": ["s"],
               "mailbox": "a@example.com", "team": "t", "client_id": "cid",
               "client_secret": "hunter2", "theme": {"band": "#000000"},
@@ -97,7 +97,7 @@ def test_storage_on_app_only_keeps_the_credential_and_preserves_a_blank_secret()
     from agents.db import _clean_oauth
 
     stored = _clean_oauth({**APP_ONLY, "mailbox": "a@example.com", "allow_send": True,
-                           "user_context": True, "destination": "GRAPH", "team": "t",
+                           "user_context": False, "destination": "GRAPH", "team": "t",
                            "lookback": "2d", "recipients": "a@example.com"},
                           "app_only", None, url="Builtin:SharePoint/")
     assert stored == APP_ONLY
@@ -545,3 +545,238 @@ def test_the_tools_are_denied_in_an_abap_assistant_session(policy):
         assert tool not in READONLY_POLICY
         assert all(tool not in rules for rules in POLICIES.values())
         assert check_call(tool, {"view": "team"}, policy) is not None
+
+
+# --- fix round 1: storage alone, and the writers that are not the two routes --
+
+@pytest.mark.parametrize("mode, block", [("destination", DEST), ("app_only", APP_ONLY)])
+def test_storage_refuses_user_context_true_and_stores_no_false_one(mode, block):
+    """The last gate, reached without the payload by a script or a direct
+    ``upsert_agent``: "as the signed-in user" is refused, never dropped."""
+    from agents.db import _clean_oauth
+
+    with pytest.raises(ValueError) as refused:
+        _clean_oauth({**block, "user_context": True, "path": "x/" + SECRET},
+                     mode, None, url=URL)
+    assert str(refused.value).startswith("oauth.user_context:")
+    assert SECRET not in str(refused.value)
+    for absent in ({}, {"user_context": False}, {"user_context": None},
+                   {"user_context": "true"}, {"user_context": 1}):
+        # Only the JSON boolean true means "as the user" (`user_context_of`).
+        assert _clean_oauth({**block, **absent}, mode, None, url=URL) == block
+
+
+@pytest.mark.parametrize("spelling", ["builtin:sharepoint/", "Builtin:SharePoint",
+                                      " BUILTIN:SHAREPOINT// "])
+def test_storage_stores_the_url_in_the_spelling_the_registry_knows(spelling):
+    from agents.builtins import is_builtin_url
+    from agents.db import prepare_servers
+
+    primary, extras, oauth_json = prepare_servers(
+        [{"url": "https://mcp.example.com/mcp", "auth_mode": "jwt"},
+         {"url": spelling, "auth_mode": "destination", "oauth": DEST}], None)
+    (entry,) = extras
+    assert entry == {"url": URL, "auth_mode": "destination", "oauth": DEST}
+    assert is_builtin_url(entry["url"])
+    # The other built-ins keep the spelling they were given, as before.
+    primary, _, _ = prepare_servers(
+        [{"url": "Builtin:Teams/", "auth_mode": "destination",
+          "oauth": {"destination": "D", "team": "t"}}], None)
+    assert primary["url"] == "Builtin:Teams/"
+
+
+def test_a_respelled_entry_keeps_its_stored_secret_on_an_edit():
+    from agents.db import prepare_servers
+
+    class _Existing:
+        mcp_servers = [{"url": URL, "auth_mode": "app_only", "oauth": APP_ONLY}]
+
+    _, _, oauth_json = prepare_servers(
+        [{"url": "Builtin:SharePoint/", "auth_mode": "app_only",
+          "oauth": {**APP_ONLY, "client_secret": ""}}], _Existing())
+    assert json.loads(oauth_json) == APP_ONLY
+
+
+@pytest.mark.parametrize("url, mode, oauth", [
+    ("builtin:outlook", "destination", {"destination": "D", "mailbox": "a@example.com"}),
+    ("builtin:teams", "destination", {"destination": "D", "team": "t"}),
+    ("builtin:teams", "app_only", {"client_id": "c", "token_url": TOKEN_URL, "team": "t"}),
+])
+def test_a_null_pin_means_not_set_on_every_server(url, mode, oauth):
+    nulls = {"site": None, "library": None, "path": None, "views": None}
+    payload = _payload(mode, url, **oauth, **nulls)
+    assert payload.oauth.to_config() == _payload(mode, url, **oauth).oauth.to_config()
+    assert not set(nulls) & set(payload.oauth.to_config())
+    # On the entry itself a null pin is a missing pin, and still no number.
+    assert "oauth.site" in _refusal("destination", {**DEST, "site": None})
+    assert "oauth.path" in _refusal("destination", {**DEST, "path": 5})
+
+
+async def _wipe() -> None:
+    from sqlalchemy import delete
+
+    from agents.db import AgentConfig, SessionLocal, SkillConfig
+
+    async with SessionLocal() as session:
+        await session.execute(delete(AgentConfig))
+        await session.execute(delete(SkillConfig))
+        await session.commit()
+
+
+async def _rows() -> dict[str, list[dict[str, Any]]]:
+    from agents.db import SessionLocal, list_agents
+
+    async with SessionLocal() as session:
+        return {r.name: r.mcp_servers for r in await list_agents(session)}
+
+
+def _refused_agents() -> list[dict[str, Any]]:
+    """Entries no writer may store, each with SECRET in the credential, a
+    pin, a view value and a free-text field."""
+    def entry(name: str, **change: Any) -> dict[str, Any]:
+        views = copy.deepcopy(VIEWS)
+        views["team"]["columns"] = ["Name", "Team", "ID", SECRET]
+        block = {**APP_ONLY, "client_secret": SECRET, "views": views,
+                 "library": SECRET, **change}
+        agent = _agent(name, "app_only", block)
+        agent["description"] = "about " + SECRET
+        agent["instructions"] = "do " + SECRET
+        return agent
+
+    bad_views = copy.deepcopy(VIEWS)
+    bad_views["team"]["table"] = SECRET
+    return [
+        entry("sp-bad-pin", path="Team/" + SECRET + ".xlsx "),
+        entry("sp-bad-view", views=bad_views),
+        entry("sp-as-user", user_context=True),
+    ]
+
+
+async def test_an_import_refuses_the_entry_and_writes_nothing(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    await _wipe()
+    good = _agent("sp-good", "destination", DEST)
+    for bad in _refused_agents():
+        for replace in (False, True):
+            r = await client.post("/admin/api/import",
+                                  json={"agents": [good, bad], "replace": replace})
+            assert r.status_code == 422, r.text
+            assert SECRET not in r.text and SECRET not in caplog.text
+            assert "oauth" in r.text
+            # One transaction: not the refused entry, and not its neighbour.
+            assert await _rows() == {}
+    r = await client.post("/admin/api/import",
+                          json={"agents": [good, *_refused_agents()], "replace": True})
+    assert r.status_code == 422 and SECRET not in r.text and await _rows() == {}
+
+
+async def test_export_and_reimport_keep_the_entry_and_its_secret(client, caplog):
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO, logger="aiosqlite")  # driver prints bound values
+    await _wipe()
+    secret = APP_ONLY["client_secret"]
+    bundle = {"agents": [_agent("sp-app", "app_only", APP_ONLY),
+                         _agent("sp-dest", "destination", DEST)]}
+    r = await client.post("/admin/api/import", json=bundle)
+    assert r.status_code == 200, r.text
+    assert secret not in r.text
+    stored = {"sp-app": [{"url": URL, "auth_mode": "app_only", "oauth": APP_ONLY}],
+              "sp-dest": [{"url": URL, "auth_mode": "destination", "oauth": DEST}]}
+    assert await _rows() == stored
+
+    exported = await client.get("/admin/api/export")
+    assert exported.status_code == 200 and secret not in exported.text
+    by_name = {a["name"]: a for a in exported.json()["agents"]}
+    shown = by_name["sp-app"]["mcp_servers"][0]["oauth"]
+    assert shown == {**APP_ONLY, "client_secret": "", "has_client_secret": True}
+    assert by_name["sp-dest"]["mcp_servers"][0]["oauth"] == {
+        **DEST, "has_client_secret": False}
+
+    # The export, imported again on the same landscape, with and without
+    # `replace`: the blank secret keeps the stored one, nothing else moves.
+    for replace in (False, True):
+        again = {"agents": exported.json()["agents"], "replace": replace}
+        r = await client.post("/admin/api/import", json=again)
+        assert r.status_code == 200, r.text
+        assert await _rows() == stored
+    # On a landscape that holds no secret the same bundle is refused by name.
+    await _wipe()
+    r = await client.post("/admin/api/import", json={"agents": exported.json()["agents"]})
+    assert r.status_code == 422 and "client_secret" in r.text and await _rows() == {}
+    assert secret not in caplog.text
+
+
+async def test_a_seed_file_cannot_store_a_refused_entry_and_logs_no_value(
+    client, caplog, tmp_path
+):
+    from agents.admin import seed_from_file_if_empty
+
+    caplog.set_level(logging.DEBUG)
+    await _wipe()
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({
+        "skills": [{"name": "bad skill!" + SECRET, "description": SECRET, "content": SECRET}],
+        "agents": [
+            *_refused_agents(),
+            # Passes the payload, refused by storage (an unknown skill).
+            {**_agent("sp-skill", "destination", DEST), "skills": [SECRET],
+             "description": SECRET},
+            {"name": SECRET * 20, "description": SECRET},
+            SECRET,
+        ],
+        "workflows": [{"name": "wf", "steps": [{"position": SECRET}], "description": SECRET}],
+    }))
+    await seed_from_file_if_empty(seed)
+    assert await _rows() == {}
+    assert SECRET not in caplog.text
+    skipped = [r.getMessage() for r in caplog.records if "Skipping invalid seed" in r.getMessage()]
+    assert len(skipped) == 7, skipped
+    text = "\n".join(skipped)
+    # Still useful: which entry, and where it was refused.
+    for name in ("sp-bad-pin", "sp-bad-view", "sp-as-user", "sp-skill"):
+        assert name in text
+    assert "mcp_servers.0" in text and "value_error" in text and "ValueError" in text
+
+    # The same file with one good entry seeds that one and only that one.
+    data = json.loads(seed.read_text())
+    data["agents"].append(_agent("sp-good", "destination", DEST))
+    seed.write_text(json.dumps(data))
+    caplog.clear()
+    await seed_from_file_if_empty(seed)
+    assert await _rows() == {
+        "sp-good": [{"url": URL, "auth_mode": "destination", "oauth": DEST}]}
+    assert SECRET not in caplog.text
+
+
+async def test_upsert_agent_alone_refuses_and_cleans_as_storage_does(client):
+    """``scripts/import_bundle.py`` and other direct callers reach only the
+    storage cleaning: no payload has seen the entry."""
+    from agents.db import SessionLocal, upsert_agent
+
+    await _wipe()
+
+    async def write(name: str, url: str, mode: str, oauth: dict[str, Any]) -> None:
+        async with SessionLocal() as session:
+            await upsert_agent(session, name=name, description="d", instructions="i",
+                               mcp_servers=[{"url": url, "auth_mode": mode, "oauth": oauth}])
+
+    for field, block in (
+        ("oauth.path:", {**DEST, "path": PINS["path"] + " "}),
+        ("oauth.site:", {**DEST, "site": 5}),
+        ("oauth.views.team.table:", {**DEST, "views": {"team": {**VIEWS["team"],
+                                                                "table": SECRET}}}),
+        ("oauth.user_context:", {**DEST, "user_context": True}),
+    ):
+        with pytest.raises(ValueError) as refused:
+            await write("sp-direct", URL, "destination", block)
+        assert str(refused.value).startswith(field), str(refused.value)
+        assert SECRET not in str(refused.value)
+    assert await _rows() == {}
+
+    raw = copy.deepcopy(VIEWS)
+    raw["planning"]["sheet"] = " {year} "
+    raw["team"]["columns"] = ["Name ", " Team", "ID"]
+    await write("sp-direct", "Builtin:SharePoint/", "destination",
+                {**DEST, "views": raw, "mailbox": "a@example.com", "allow_send": True})
+    assert await _rows() == {
+        "sp-direct": [{"url": URL, "auth_mode": "destination", "oauth": DEST}]}

@@ -63,6 +63,7 @@ from agents.sharepoint_views import check_pins, clean_views
 from agents.slack_tools import BUILTIN_SLACK_URL
 from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
 from agents.teams_tools import BUILTIN_TEAMS_URL
+from agents.validation_errors import validation_item
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -332,6 +333,14 @@ class OAuthClientPayload(BaseModel):
         if v is None:
             return [] if info.field_name == "services" else False
         return v
+
+    @field_validator("site", "library", "path", mode="before")
+    @classmethod
+    def _null_pin_is_absent(cls, v: Any) -> Any:
+        """``null`` means "not set", as for ``services`` and ``views``: a
+        client that serialises every field must not get a 422 on an Outlook
+        entry. Nothing else is converted; a number or a list stays refused."""
+        return "" if v is None else v
 
     @field_validator("views")
     @classmethod
@@ -2540,6 +2549,37 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Seed helper (called on startup)
 # ---------------------------------------------------------------------------
+_SEED_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.\-]{0,63}")
+
+
+def _seed_entry_name(entry: Any) -> str:
+    """The name of a seed entry for a log line: repeated only when it has
+    the form of a name, else a placeholder. Never the entry itself, which
+    holds client secrets, pins and free text."""
+    name = entry.get("name") if isinstance(entry, dict) else None
+    if isinstance(name, str) and _SEED_NAME_RE.fullmatch(name):
+        return name
+    return "<unnamed>"
+
+
+def _seed_error(e: BaseException) -> str:
+    """Why a seed entry was refused, for a log line: where and which kind of
+    error, never what was typed. ``str()`` of a pydantic error carries
+    ``input_value=...``, and a storage refusal may quote a name of the entry;
+    so it is field locations and error types for the former (the reading of
+    ``agents/validation_errors.py``) and the exception class for the rest."""
+    if isinstance(e, ValidationError):
+        items = [validation_item(err) for err in e.errors(
+            include_input=False, include_context=False, include_url=False)]
+        shown = "; ".join(
+            f"{'.'.join(str(part) for part in item['loc']) or '<entry>'}: {item['type']}"
+            for item in items[:10]
+        )
+        more = f" (+{len(items) - 10} more)" if len(items) > 10 else ""
+        return f"{len(items)} validation error(s): {shown}{more}"
+    return type(e).__name__
+
+
 async def seed_from_file_if_empty(seed_path: Path) -> None:
     """Seed the DB from a JSON file if no agents exist yet."""
     async with SessionLocal() as session:
@@ -2572,7 +2612,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             try:
                 skill = SkillPayload.model_validate(entry)
             except Exception as e:
-                logger.warning("Skipping invalid seed skill %r: %s", entry, e)
+                logger.warning("Skipping invalid seed skill '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             await upsert_skill(
                 session,
@@ -2589,7 +2630,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                 # Validate via pydantic model
                 payload = AgentPayload.model_validate(entry)
             except Exception as e:
-                logger.warning("Skipping invalid seed entry %r: %s", entry, e)
+                logger.warning("Skipping invalid seed entry '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             try:
                 await upsert_agent(
@@ -2612,7 +2654,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     deep_json=_deep_json_or_keep(payload.deep),
                 )
             except ValueError as e:
-                logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
+                logger.warning("Skipping invalid seed entry '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             count += 1
 
@@ -2633,7 +2676,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             try:
                 wpayload = WorkflowPayload.model_validate(entry)
             except Exception as e:
-                logger.warning("Skipping invalid seed workflow %r: %s", entry, e)
+                logger.warning("Skipping invalid seed workflow '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             try:
                 await upsert_workflow(
@@ -2652,8 +2696,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     commit=False,
                 )
             except ValueError as e:
-                logger.warning("Skipping invalid seed workflow %r: %s",
-                               entry.get("name"), e)
+                logger.warning("Skipping invalid seed workflow '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             workflow_count += 1
         await session.commit()
