@@ -792,6 +792,7 @@ function addMcpServerRow(server) {
             <button type="button" class="small danger" title="Remove"
                     onclick="this.closest('.mcp-server-row').remove(); updateEndpointHint()">×</button>
         </div>
+        <p class="hint mcp-kept-note" role="status" style="display:none;margin:8px 0 0;color:var(--warn)"></p>
         <div class="mcp-oauth" style="display:none;margin-top:8px;padding-top:8px;border-top:1px dashed var(--border)">
             <label style="font-weight:600">
                 <input type="checkbox" class="oauth-dcr" onchange="toggleDcr(this)">
@@ -838,7 +839,28 @@ function addMcpServerRow(server) {
     row.querySelector('.mcp-url').value = server.url || '';
     row.querySelector('.mcp-url').addEventListener('input', () => syncDestinationFields(row));
     row.querySelector('.mcp-url').addEventListener('change', () => odataUrlCommitted(row));
-    row.querySelector('.mcp-auth-mode').value = server.auth_mode || 'jwt';
+    const modeSelect = row.querySelector('.mcp-auth-mode');
+    const storedMode = server.auth_mode || 'jwt';
+    if (![...modeSelect.options].some(o => o.value === storedMode)) {
+        // A stored server on an auth mode this page has no fields for (an
+        // app_only entry made in the UI5 admin). Without an option the select
+        // would go blank and a save would post no mode and no config. The mode
+        // gets an option of its own and the block is kept on the row, to be
+        // sent back as loaded while that mode stays selected. The block as the
+        // API answers it holds no secret; its read-only marker is left out.
+        const kept = Object.assign({}, oauth);
+        delete kept.has_client_secret;
+        const option = document.createElement('option');
+        option.value = storedMode;
+        option.textContent = storedMode + ' (not edited here)';
+        modeSelect.appendChild(option);
+        row.dataset.keptMode = storedMode;
+        row.dataset.keptOauth = JSON.stringify(kept);
+        row.querySelector('.mcp-kept-note').textContent =
+            'This page does not edit the auth mode "' + storedMode + '". It is saved as stored; '
+            + 'edit this server in the UI5 admin.';
+    }
+    modeSelect.value = storedMode;
     row.querySelector('.oauth-dcr').checked = !!oauth.dcr;
     row.querySelector('.oauth-uaa').value = oauth.uaa_url || '';
     row.querySelector('.oauth-client-id').value = oauth.client_id || '';
@@ -858,6 +880,8 @@ function toggleOauthFields(select) {
     const row = select.closest('.mcp-server-row');
     row.querySelector('.mcp-oauth').style.display = select.value === 'oauth2' ? 'block' : 'none';
     row.querySelector('.mcp-destination').style.display = select.value === 'destination' ? 'block' : 'none';
+    row.querySelector('.mcp-kept-note').style.display =
+        row.dataset.keptMode && select.value === row.dataset.keptMode ? '' : 'none';
     toggleDcr(row.querySelector('.oauth-dcr'));
     syncDestinationFields(row);
 }
@@ -893,7 +917,11 @@ function collectMcpServers() {
             // The server would answer 422, naming the other mode's fields.
             throw new Error('builtin:odata needs the auth mode "BTP destination".');
         }
-        if (mode === 'oauth2') {
+        if (r.dataset.keptMode && mode === r.dataset.keptMode) {
+            // A mode this page does not edit: the block as it was loaded.
+            const kept = JSON.parse(r.dataset.keptOauth || '{}');
+            if (Object.keys(kept).length) server.oauth = kept;
+        } else if (mode === 'oauth2') {
             const scope = r.querySelector('.oauth-scope').value.trim();
             if (r.querySelector('.oauth-dcr').checked) {
                 server.oauth = {dcr: true};

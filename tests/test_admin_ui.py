@@ -1704,6 +1704,10 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               "const DESTINATION_EXACT_KEYS = ['site', 'library', 'path'];" in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
+        # A stored server on an auth mode this page does not offer (app_only,
+        # made in the UI5 admin) is sent back as loaded, and the row says so.
+        check("a server on a mode the page does not edit is kept as stored",
+              "dataset.keptMode" in html and "It is saved as stored" in html)
         check("api() call discovered: GET /admin/api/odata/services",
               ("GET", "/admin/api/odata/services") in discovered)
         for opener in ("openAgentModal", "editAgent"):
@@ -1958,6 +1962,62 @@ row.querySelector('.dest-views').value = '   ';
 assert.throws(() => collectMcpServers(), /at least one view/);
 row.querySelector('.dest-views').value = '{}';
 assert.throws(() => collectMcpServers(), /at least one view/);
+// 7c. An app_only builtin:sharepoint entry (made in the UI5 admin; this page
+//     offers no such mode). Opening the agent and saving without touching the
+//     row sends the entry back as loaded: mode, credential keys, pins and
+//     views. Only the API's read-only marker is left out; the secret is
+//     blank, as the API answers it, and a blank one keeps the stored one.
+const SP_APP = { url: 'builtin:sharepoint', auth_mode: 'app_only',
+    oauth: { client_id: 'client-1', client_secret: '', has_client_secret: true,
+             token_url: 'https://login.example.com/tenant/oauth2/v2.0/token',
+             scope: 'https://graph.microsoft.com/.default',
+             site: 'example.sharepoint.com:/sites/planning', library: 'Documents',
+             path: 'Team/Planning 2026.xlsx', views: SP_VIEWS } };
+const SP_APP_SENT = JSON.parse(JSON.stringify(SP_APP));
+delete SP_APP_SENT.oauth.has_client_secret;
+({ row, out } = addAndCollect(JSON.parse(JSON.stringify(SP_APP))));
+assert.strictEqual(row.querySelector('.mcp-auth-mode').value, 'app_only',
+    'the stored mode is shown, not a blank select');
+assert.deepStrictEqual(out, SP_APP_SENT, 'sent back as loaded');
+assert.strictEqual(out.oauth.client_secret, '', 'blank: the server keeps the stored secret');
+assert.ok(!('has_client_secret' in out.oauth));
+const keptNote = row.querySelector('.mcp-kept-note');
+assert.strictEqual(keptNote.style.display, '');
+assert.strictEqual(keptNote.textContent,
+    'This page does not edit the auth mode "app_only". It is saved as stored; '
+    + 'edit this server in the UI5 admin.');
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'none');
+assert.strictEqual(row.querySelector('.mcp-oauth').style.display, 'none');
+console.log('SPAPPONLY:' + JSON.stringify(out));
+// The admin picks a mode this page edits: from then on the row is an
+// ordinary one and the note is gone (a visible, deliberate change).
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.strictEqual(keptNote.style.display, 'none');
+row.querySelector('.dest-destination').value = 'GRAPH';
+assert.deepStrictEqual(collectMcpServers()[0],
+    { url: 'builtin:sharepoint', auth_mode: 'destination', oauth: SP_OAUTH });
+// Back to the stored mode: the stored entry again.
+row.querySelector('.mcp-auth-mode').value = 'app_only';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.deepStrictEqual(collectMcpServers()[0], SP_APP_SENT);
+// Not a sharepoint rule: an app_only Outlook entry is kept the same way.
+({ row, out } = addAndCollect({ url: 'builtin:outlook', auth_mode: 'app_only',
+    oauth: { client_id: 'c', client_secret: '', has_client_secret: true,
+             uaa_url: 'https://uaa.example.com', mailbox: 'svc@example.com', lookback: '2d' } }));
+assert.deepStrictEqual(out, { url: 'builtin:outlook', auth_mode: 'app_only',
+    oauth: { client_id: 'c', client_secret: '', uaa_url: 'https://uaa.example.com',
+             mailbox: 'svc@example.com', lookback: '2d' } });
+// A mode the page offers gets no extra option and no note.
+({ row } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC' } }));
+assert.strictEqual(row.querySelectorAll('.mcp-auth-mode option').length, 5);
+assert.strictEqual(row.querySelector('.mcp-kept-note').style.display, 'none');
+// A new row likewise.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+assert.strictEqual(document.querySelector('.mcp-kept-note').style.display, 'none');
+
 // The same row made another built-in: none of the sharepoint keys is sent.
 ({ row, out } = addAndCollect({ url: 'builtin:teams', auth_mode: 'destination',
     oauth: { destination: 'G', team: 't', site: 'example.sharepoint.com:/sites/planning',
@@ -2545,6 +2605,45 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                                       r.status_code == 422, f"{r.status_code} {r.text[:200]}")
                             finally:
                                 await client.delete(f"/admin/api/agents/{sp_id}")
+                    # An app_only entry (made in the UI5 admin): what the
+                    # form sends for the untouched row is accepted, and the
+                    # stored entry, secret included, is still there.
+                    sp_app = next((json.loads(line[len("SPAPPONLY:"):])
+                                   for line in result.stdout.splitlines()
+                                   if line.startswith("SPAPPONLY:")), None)
+                    check("the form collected the app_only builtin:sharepoint entry",
+                          sp_app is not None)
+                    if sp_app is not None:
+                        app_agent = {
+                            "name": "uisharepointapp", "description": "UI test agent, app-only.",
+                            "instructions": "You are a UI test agent.", "enabled": True,
+                        }
+                        with_secret = {**sp_app, "oauth": {**sp_app["oauth"],
+                                                           "client_secret": "dummy-for-test"}}
+                        r = await client.post("/admin/api/agents",
+                                              json={**app_agent, "mcp_servers": [with_secret]})
+                        check("fixture agent with an app_only builtin:sharepoint entry created",
+                              r.status_code == 201, r.text[:300])
+                        if r.status_code == 201:
+                            app_id = r.json()["id"]
+                            try:
+                                before = (await client.get(
+                                    f"/admin/api/agents/{app_id}")).json()["mcp_servers"]
+                                r = await client.put(f"/admin/api/agents/{app_id}",
+                                                     json={**app_agent, "mcp_servers": [sp_app]})
+                                check("saving the untouched app_only entry is accepted",
+                                      r.status_code == 200, r.text[:300])
+                                after = (await client.get(
+                                    f"/admin/api/agents/{app_id}")).json()["mcp_servers"]
+                                check("open and save keeps mode, credential keys, pins and views",
+                                      after == before
+                                      and after[0]["auth_mode"] == "app_only"
+                                      and after[0]["oauth"].get("has_client_secret") is True
+                                      and after[0]["oauth"] == {**sp_app["oauth"],
+                                                                "has_client_secret": True},
+                                      str(after)[:420])
+                            finally:
+                                await client.delete(f"/admin/api/agents/{app_id}")
                     if collected is not None and odata_agent_id is not None:
                         r = await client.put(f"/admin/api/agents/{odata_agent_id}",
                                              json={**odata_agent, "mcp_servers": collected})
