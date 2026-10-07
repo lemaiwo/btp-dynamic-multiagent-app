@@ -70,6 +70,15 @@ const DESTINATION_USER_CONTEXT_URLS = ["builtin:gmail", "builtin:outlook", "buil
  */
 const MAIL_THEME_URLS = ["builtin:smtp", "builtin:outlook"];
 
+// --- sharepoint ---
+/**
+ * `builtin:sharepoint`: the one workbook and the views of it an agent may
+ * name. Mirrors `_clean_sharepoint_entry` in `agents/db.py`: these keys and
+ * the destination name or the client fields are all the entry stores.
+ */
+const SHAREPOINT_URL = "builtin:sharepoint";
+const SHAREPOINT_PIN_KEYS = ["site", "library", "path"];
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -182,6 +191,57 @@ export default {
             : "";
     },
 
+    // --- sharepoint ---
+    /** True for the one toolset that takes a `views` object. */
+    supportsViews(url: string): boolean {
+        return builtinKey(url) === SHAREPOINT_URL;
+    },
+
+    /**
+     * The "Views (JSON)" textarea as an object. Only the JSON shape is
+     * checked here; names, kinds, columns and rows are the server's
+     * `agents/sharepoint_views.py`, whose 422 names the field and the rule.
+     */
+    parseViews(text: string): { views?: Record<string, unknown>; error: string } {
+        const source = (text || "").trim();
+        if (!source) {
+            return { error: "" };
+        }
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(source);
+        } catch (e) {
+            return { error: `Views is not valid JSON: ${(e as Error).message}` };
+        }
+        if (!isPlainObject(parsed)) {
+            return { error: "Views must be a JSON object, e.g. {\"team\": {\"kind\": \"table\", ...}}." };
+        }
+        return { views: parsed, error: "" };
+    },
+
+    /** Stored views as the textarea shows them; blank when there are none. */
+    formatViews(views: unknown): string {
+        return isPlainObject(views) && Object.keys(views).length
+            ? JSON.stringify(views, null, 2)
+            : "";
+    },
+
+    /** Exactly what `_clean_sharepoint_entry` stores for this mode. */
+    cleanSharePoint(raw: Record<string, unknown>, authMode: AuthMode): Record<string, unknown> {
+        const out: Record<string, unknown> = {};
+        if (authMode === "destination") {
+            out.destination = String(raw.destination ?? "").trim();
+        } else {
+            out.client_id = String(raw.client_id ?? "").trim();
+            copyNonBlank(raw, ["client_secret", "uaa_url", "token_url", "scope"], out);
+        }
+        copyNonBlank(raw, SHAREPOINT_PIN_KEYS, out);
+        if (isPlainObject(raw.views) && Object.keys(raw.views).length) {
+            out.views = raw.views;
+        }
+        return out;
+    },
+
     /** Drops blank fields so the server sees the same shape `to_config()` builds. */
     cleanOAuth(
         raw: Record<string, unknown>, authMode: AuthMode = "oauth2", url = ""
@@ -206,6 +266,12 @@ export default {
             // as a real boolean (true only for exactly `true`); no
             // destination, no user_context, nothing left from another type.
             return odataEntry.clean(raw) as McpServer["oauth"];
+        }
+        if (key === SHAREPOINT_URL) {
+            // --- sharepoint --- Before the generic branches: an app-only
+            // block would otherwise keep a mailbox and a send switch this
+            // toolset does not have, and the server refuses the pins elsewhere.
+            return this.cleanSharePoint(raw, authMode) as McpServer["oauth"];
         }
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes

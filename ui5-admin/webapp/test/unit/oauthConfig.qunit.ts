@@ -367,3 +367,44 @@ QUnit.test("no other toolset keeps services or allow_write", function (assert) {
         assert.notOk("services" in cleaned || "allow_write" in cleaned, `${url} on ${mode}`);
     }
 });
+
+// --- sharepoint ---
+QUnit.module("oauthConfig — sharepoint");
+
+const SP_VIEWS = { team: { kind: "table", table: "TeamMembers", columns: ["Name", "ID"] } };
+const SP_PINS = { site: "example.sharepoint.com:/sites/planning", library: "Documents",
+    path: "Team/Planning 2026.xlsx" };
+
+QUnit.test("on a destination it keeps exactly the name, the pins and the views", function (assert) {
+    const out = oauthConfig.cleanOAuth(
+        fullForm({ destination: " GRAPH ", user_context: true, views: SP_VIEWS, ...SP_PINS }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual(out, { destination: "GRAPH", ...SP_PINS, views: SP_VIEWS });
+});
+
+QUnit.test("app-only keeps the client fields, the pins and the views, no mailbox or switch", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...SP_PINS }),
+        "app_only", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(out).sort(),
+        ["client_id", "client_secret", "library", "path", "scope", "site", "token_url", "uaa_url", "views"]);
+});
+
+QUnit.test("no other toolset keeps the pins or the views", function (assert) {
+    const teams = oauthConfig.cleanOAuth(fullForm({ destination: "D", views: SP_VIEWS, ...SP_PINS }),
+        "destination", "builtin:teams") as Record<string, unknown>;
+    ["site", "library", "path", "views"].forEach((k) => assert.notOk(k in teams, k));
+    const app = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...SP_PINS }),
+        "app_only", "builtin:outlook") as Record<string, unknown>;
+    ["site", "library", "path", "views"].forEach((k) => assert.notOk(k in app, k));
+});
+
+QUnit.test("parseViews reads the JSON textarea and formatViews round-trips it", function (assert) {
+    assert.deepEqual(oauthConfig.parseViews(""), { error: "" }, "blank is no views (the validator says required)");
+    assert.deepEqual(oauthConfig.parseViews(JSON.stringify(SP_VIEWS)), { views: SP_VIEWS, error: "" });
+    assert.ok(oauthConfig.parseViews("{ team: }").error.indexOf("not valid JSON") > -1);
+    assert.ok(oauthConfig.parseViews("[1]").error.indexOf("JSON object") > -1);
+    assert.deepEqual(oauthConfig.parseViews(oauthConfig.formatViews(SP_VIEWS)).views, SP_VIEWS);
+    assert.strictEqual(oauthConfig.formatViews(undefined), "");
+    assert.ok(oauthConfig.supportsViews("Builtin:SharePoint/"));
+    assert.notOk(oauthConfig.supportsViews("builtin:teams"));
+});

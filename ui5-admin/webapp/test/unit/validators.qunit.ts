@@ -595,3 +595,70 @@ QUnit.test("a second odata entry is refused with a text that points to the first
         { 2: "An agent has one OData services entry; add the services to the existing one." }
     );
 });
+
+// --- sharepoint ---
+QUnit.module("validators — sharepoint");
+
+const SP_ENTRY = {
+    destination: "GRAPH",
+    site: "example.sharepoint.com:/sites/planning",
+    library: "Documents",
+    path: "Team/Planning 2026.xlsx",
+    views: { team: { kind: "table", table: "TeamMembers", columns: ["Name", "ID"] } }
+};
+
+QUnit.test("sharepoint is a known builtin", function (assert) {
+    assert.strictEqual(validators.validateServerUrl("builtin:sharepoint", "destination"), "");
+    assert.ok(validators.isSharePoint("Builtin:SharePoint/"));
+    assert.notOk(validators.isSharePoint("builtin:teams"));
+});
+
+QUnit.test("a destination entry with the three pins and a view passes", function (assert) {
+    assert.strictEqual(validators.validateSharePoint(SP_ENTRY, "destination"), "");
+    assert.strictEqual(validators.validateOAuth(SP_ENTRY, "destination", "builtin:sharepoint"), "");
+    assert.deepEqual(validators.validateServers(
+        [{ url: "builtin:sharepoint", auth_mode: "destination", oauth: SP_ENTRY }]), {});
+});
+
+QUnit.test("sharepoint reads as the application: no user mode, no user context", function (assert) {
+    (["oauth2", "jwt"] as const).forEach((mode) => {
+        const msg = validators.validateSharePoint(SP_ENTRY, mode);
+        assert.ok(msg.indexOf("'destination' or 'app_only'") > -1, `${mode}: ${msg}`);
+        assert.strictEqual(validators.validateOAuth(SP_ENTRY, mode, "builtin:sharepoint"), msg, mode);
+    });
+    const msg = validators.validateSharePoint({ ...SP_ENTRY, user_context: true }, "destination");
+    assert.ok(msg.indexOf("no signed-in user") > -1, msg);
+    assert.strictEqual(
+        validators.validateOAuth({ ...SP_ENTRY, user_context: true }, "destination", "builtin:sharepoint"), msg);
+});
+
+QUnit.test("the three pins have a shape and the views are required", function (assert) {
+    const check = (patch: Record<string, unknown>, part: string): void => {
+        const msg = validators.validateSharePoint({ ...SP_ENTRY, ...patch }, "destination");
+        assert.ok(msg.indexOf(part) > -1, `${JSON.stringify(patch)}: ${msg}`);
+    };
+    check({ site: "https://example.sharepoint.com/sites/planning" }, "Site must be");
+    check({ site: "" }, "Site must be");
+    check({ library: "  " }, "document library");
+    check({ path: "Team/Planning 2026.xlsm" }, ".xlsx");
+    check({ path: "" }, ".xlsx");
+    check({ views: undefined }, "at least one view");
+    check({ views: {} }, "at least one view");
+    check({ views: [] }, "at least one view");
+    assert.strictEqual(
+        validators.validateSharePoint({ ...SP_ENTRY, path: "Team/PLANNING.XLSX" }, "destination"), "",
+        "the extension is not case-sensitive");
+});
+
+QUnit.test("sharepoint on app-only needs the pins and the views, not a mailbox", function (assert) {
+    const { destination: _unused, ...pins } = SP_ENTRY;
+    const appOnly = {
+        ...pins, client_id: "c", client_secret: "s",
+        token_url: "https://login.microsoftonline.com/t/oauth2/v2.0/token"
+    };
+    assert.strictEqual(validators.validateOAuth(appOnly, "app_only", "builtin:sharepoint"), "");
+    assert.ok(validators.validateOAuth({ ...appOnly, client_id: "" }, "app_only", "builtin:sharepoint")
+        .indexOf("client ID") > -1, "the app-only client rules still apply");
+    assert.ok(validators.validateOAuth({ ...appOnly, views: {} }, "app_only", "builtin:sharepoint")
+        .indexOf("at least one view") > -1);
+});

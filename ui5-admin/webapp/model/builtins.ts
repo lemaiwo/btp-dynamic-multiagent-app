@@ -79,6 +79,14 @@ export const BUILTINS: BuiltinToolset[] = [
     {
         url: "builtin:odata", titleKey: "builtinOData", descriptionKey: "builtinODataDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
+    },
+    // sharepoint_toolset reads one pinned workbook as the application: a
+    // destination's credential or client credentials, never a signed-in
+    // user -- see agents/sharepoint_tools.py and `_validate_sharepoint`
+    // in agents/admin.py.
+    {
+        url: "builtin:sharepoint", titleKey: "builtinSharePoint", descriptionKey: "builtinSharePointDesc",
+        defaultAuthMode: "destination", authModes: ["app_only", "destination"]
     }
 ];
 

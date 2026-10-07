@@ -14,6 +14,11 @@ const MAX_ODATA_ENTRY_SERVICES = 50;
  * `agents/admin.py`. */
 const DESTINATION_NAME_RE = /^[A-Za-z0-9_.-]{1,200}$/;
 
+// --- sharepoint ---
+/** The `site` pin: `<tenant>.sharepoint.com:/<1-4 path segments>`. Mirrors
+ * `check_pins` in `agents/sharepoint_views.py`, which is authoritative. */
+const SHAREPOINT_SITE_RE = /^[a-z0-9][a-z0-9-]{0,62}\.sharepoint\.com:(\/[A-Za-z0-9._-]{1,128}){1,4}$/;
+
 /**
  * Client-side mirrors of the Pydantic rules in `agents/admin.py`.
  *
@@ -77,6 +82,46 @@ export default {
                 + "signed-in user: the destination's app-level credential is an "
                 + "application token, and Graph does not allow application posts. "
                 + "Turn 'Act as signed-in user' on, or turn sending off.";
+        }
+        return "";
+    },
+
+    // --- sharepoint ---
+    /** True for `builtin:sharepoint`, whose target is one pinned workbook. */
+    isSharePoint(url: string): boolean {
+        return (url || "").trim().replace(/\/+$/, "").toLowerCase() === "builtin:sharepoint";
+    },
+
+    /**
+     * The rules of a `builtin:sharepoint` entry that can be said while the
+     * field is on screen. Mirrors `_validate_sharepoint` in `agents/admin.py`;
+     * what is inside a view is the server's alone. Returns an error message,
+     * or an empty string when the config is valid.
+     */
+    validateSharePoint(oauth: OAuthClient | undefined, authMode: AuthMode): string {
+        if (authMode !== "app_only" && authMode !== "destination") {
+            return "SharePoint requires auth mode 'destination' or 'app_only': it "
+                + "reads the pinned workbook as the application.";
+        }
+        const cfg = (oauth || {}) as Record<string, unknown>;
+        const text = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+        if (cfg.user_context === true) {
+            return "SharePoint has no signed-in user to act as; turn 'Act as "
+                + "signed-in user' off.";
+        }
+        if (!SHAREPOINT_SITE_RE.test(text(cfg.site))) {
+            return "Site must be <tenant>.sharepoint.com:/sites/<site>.";
+        }
+        if (!text(cfg.library)) {
+            return "SharePoint requires the document library's name.";
+        }
+        if (!/\.xlsx$/i.test(text(cfg.path))) {
+            return "Path must be the path of an .xlsx file below the library root.";
+        }
+        const views = cfg.views;
+        if (typeof views !== "object" || views === null || Array.isArray(views)
+            || Object.keys(views).length === 0) {
+            return "SharePoint requires at least one view.";
         }
         return "";
     },
@@ -189,6 +234,12 @@ export default {
                 return teamsError;
             }
         }
+        if (this.isSharePoint(url)) {
+            const sharePointError = this.validateSharePoint(oauth, authMode);
+            if (sharePointError) {
+                return sharePointError;
+            }
+        }
         if (authMode === "app_only") {
             if (!oauth || ("dcr" in oauth && oauth.dcr === true)) {
                 return oauth
@@ -205,7 +256,8 @@ export default {
                     + "nobody signs in).";
             }
             const isBuiltin = (url || "").trim().toLowerCase().startsWith("builtin:");
-            if (isBuiltin && !this.isTeams(url) && !(app.mailbox || "").trim()) {
+            if (isBuiltin && !this.isTeams(url) && !this.isSharePoint(url)
+                && !(app.mailbox || "").trim()) {
                 return "App-only auth requires a mailbox: the token identifies no "
                     + "user, so there is no 'me' to fall back to.";
             }
