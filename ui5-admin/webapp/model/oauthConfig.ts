@@ -74,7 +74,8 @@ const MAIL_THEME_URLS = ["builtin:smtp", "builtin:outlook"];
 /**
  * `builtin:sharepoint`: the one workbook and the views of it an agent may
  * name. Mirrors `_clean_sharepoint_entry` in `agents/db.py`: these keys and
- * the destination name or the client fields are all the entry stores.
+ * the destination name or the client fields are all the entry stores. The
+ * three pins are kept exactly as typed (`check_pins` refuses a repaired one).
  */
 const SHAREPOINT_URL = "builtin:sharepoint";
 const SHAREPOINT_PIN_KEYS = ["site", "library", "path"];
@@ -235,7 +236,15 @@ export default {
             out.client_id = String(raw.client_id ?? "").trim();
             copyNonBlank(raw, ["client_secret", "uaa_url", "token_url", "scope"], out);
         }
-        copyNonBlank(raw, SHAREPOINT_PIN_KEYS, out);
+        // As typed, not trimmed: the server stores a pin in exactly the form
+        // it checked and refuses one with edge whitespace, so the validator
+        // must see what the admin typed, and so must the server.
+        SHAREPOINT_PIN_KEYS.forEach((pin) => {
+            const value = raw[pin];
+            if (typeof value === "string" && value) {
+                out[pin] = value;
+            }
+        });
         if (isPlainObject(raw.views) && Object.keys(raw.views).length) {
             out.views = raw.views;
         }

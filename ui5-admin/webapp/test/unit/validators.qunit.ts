@@ -662,3 +662,91 @@ QUnit.test("sharepoint on app-only needs the pins and the views, not a mailbox",
     assert.ok(validators.validateOAuth({ ...appOnly, views: {} }, "app_only", "builtin:sharepoint")
         .indexOf("at least one view") > -1);
 });
+
+// --- sharepoint: amendment 1 (pinned row kinds, exact pins, run keys) ---
+const SP_CALENDAR = {
+    kind: "calendar", sheet: "{year}", date_row: 8, first_row: 10, first_date_column: "D",
+    labels: { member: "A", team: "B", kind: "C" },
+    kinds: ["Presence", "Guard"],
+    stop_at: "Summary",
+    codes: { H: "unavailable", T: "available", GDI: "GDI" },
+    lookup: { view: "team", on: "Name", add: ["ID"] },
+    conflict: { kind: "Guard", against: "Presence", when: ["unavailable"] }
+};
+
+function spWithCalendar(patch: Record<string, unknown>): Record<string, unknown> {
+    return { ...SP_ENTRY, views: { ...SP_ENTRY.views, planning: { ...SP_CALENDAR, ...patch } } };
+}
+
+QUnit.test("sharepoint: a calendar view with a kind label and its kinds passes", function (assert) {
+    assert.strictEqual(validators.validateSharePoint(spWithCalendar({}), "destination"), "");
+    assert.strictEqual(validators.validateOAuth(spWithCalendar({}), "destination", "builtin:sharepoint"), "");
+});
+
+QUnit.test("sharepoint: a calendar view with a kind label must pin its kinds", function (assert) {
+    const refused = (kinds: unknown, why: string): void => {
+        const msg = validators.validateSharePoint(spWithCalendar({ kinds }), "destination");
+        assert.ok(msg.indexOf("kinds") > -1 && msg.indexOf("1 to 10") > -1, `${why}: ${msg}`);
+    };
+    refused(undefined, "missing");
+    refused([], "empty");
+    refused("Guard", "not a list");
+    refused(["Guard", 1], "an item that is not a string");
+    refused(["Guard", "  "], "a blank item");
+    refused(["Guard", "x".repeat(61)], "an item over 60 characters");
+    refused(["Guard", "Pre\nsence"], "an item of two lines");
+    refused(Array.from({ length: 11 }, (_v, i) => `K${i}`), "eleven items");
+    const twice = validators.validateSharePoint(
+        spWithCalendar({ kinds: ["Presence", "Guard", " Guard "] }), "destination");
+    assert.ok(twice.indexOf("kinds") > -1 && twice.indexOf("repeat") > -1, twice);
+    assert.notOk(/Presence|Guard/.test(twice), "the message names the field and the rule, never a value");
+});
+
+QUnit.test("sharepoint: kinds is refused on a calendar view without a kind label", function (assert) {
+    const noKind = { labels: { member: "A", team: "B" }, conflict: undefined };
+    const msg = validators.validateSharePoint(spWithCalendar(noKind), "destination");
+    assert.ok(msg.indexOf("kinds") > -1 && msg.indexOf("labels.kind") > -1, msg);
+    const { kinds: _kinds, conflict: _conflict, ...plain } = SP_CALENDAR;
+    assert.strictEqual(validators.validateSharePoint(
+        { ...SP_ENTRY, views: { planning: { ...plain, labels: noKind.labels } } }, "destination"), "");
+});
+
+QUnit.test("sharepoint: conflict.kind and conflict.against must be members of kinds", function (assert) {
+    const kind = validators.validateSharePoint(
+        spWithCalendar({ conflict: { kind: "Standby", against: "Presence", when: ["unavailable"] } }), "destination");
+    assert.ok(kind.indexOf("conflict.kind") > -1 && kind.indexOf("kinds") > -1, kind);
+    assert.notOk(kind.indexOf("Standby") > -1, "no value in the message");
+    const against = validators.validateSharePoint(
+        spWithCalendar({ conflict: { kind: "Guard", against: "presence", when: ["unavailable"] } }), "destination");
+    assert.ok(against.indexOf("conflict.against") > -1 && against.indexOf("kinds") > -1,
+        `membership is case-sensitive: ${against}`);
+});
+
+QUnit.test("sharepoint: lookup.add may not name a run field", function (assert) {
+    ["member", "team", "kind", "status", "from", "to", "Status", " TO "].forEach((column) => {
+        const msg = validators.validateSharePoint(
+            spWithCalendar({ lookup: { view: "team", on: "Name", add: ["ID", column] } }), "destination");
+        assert.ok(msg.indexOf("lookup.add") > -1 && msg.indexOf("run field") > -1, `${column}: ${msg}`);
+    });
+});
+
+QUnit.test("sharepoint: a pin must be typed in its exact form", function (assert) {
+    const refused = (patch: Record<string, unknown>, part: string): void => {
+        const msg = validators.validateSharePoint({ ...SP_ENTRY, ...patch }, "destination");
+        assert.ok(msg.indexOf(part) > -1, `${JSON.stringify(patch)}: ${msg}`);
+    };
+    refused({ site: " example.sharepoint.com:/sites/planning" }, "Site must be");
+    refused({ site: "example.sharepoint.com:/sites/planning\n" }, "Site must be");
+    refused({ library: " Documents" }, "leading or trailing whitespace");
+    refused({ library: "Documents " }, "leading or trailing whitespace");
+    refused({ library: "Docu\u2028ments" }, "one line");
+    refused({ library: "Docu\u0007ments" }, "control characters");
+    refused({ library: "Cafe\u0301" }, "composed");
+    refused({ path: " Team/Planning 2026.xlsx" }, "leading or trailing whitespace");
+    refused({ path: "Team/Planning 2026.xlsx " }, "leading or trailing whitespace");
+    refused({ path: "Team/Plan\tning.xlsx" }, "control characters");
+    refused({ path: "Team/Cafe\u0301.xlsx" }, "composed");
+    assert.strictEqual(
+        validators.validateSharePoint({ ...SP_ENTRY, library: "Caf\u00e9", path: "Team/Caf\u00e9.xlsx" }, "destination"),
+        "", "composed characters pass");
+});

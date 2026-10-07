@@ -408,3 +408,42 @@ QUnit.test("parseViews reads the JSON textarea and formatViews round-trips it", 
     assert.ok(oauthConfig.supportsViews("Builtin:SharePoint/"));
     assert.notOk(oauthConfig.supportsViews("builtin:teams"));
 });
+
+// --- sharepoint: amendment 1 ---
+const SP_CALENDAR_VIEWS = {
+    ...SP_VIEWS,
+    planning: {
+        kind: "calendar", sheet: "{year}", date_row: 8, first_row: 10, first_date_column: "D",
+        labels: { member: "A", team: "B", kind: "C" },
+        kinds: ["Presence", "Guard"],
+        codes: { H: "unavailable", GDI: "GDI" },
+        conflict: { kind: "Guard", against: "Presence", when: ["unavailable"] }
+    }
+};
+
+QUnit.test("sharepoint: a pin is sent as it was typed, never trimmed", function (assert) {
+    const typed = { site: " example.sharepoint.com:/sites/planning", library: "Documents ",
+        path: " Team/Planning 2026.xlsx " };
+    const dest = oauthConfig.cleanOAuth(fullForm({ destination: " GRAPH ", views: SP_VIEWS, ...typed }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual(dest, { destination: "GRAPH", ...typed, views: SP_VIEWS },
+        "the destination name is trimmed as everywhere, the pins are not");
+    assert.ok(validators.validateOAuth(dest, "destination", "builtin:sharepoint")
+        .indexOf("Site must be") > -1, "so the validator sees what the server will see");
+    const app = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...typed }),
+        "app_only", "builtin:sharepoint") as Record<string, unknown>;
+    assert.strictEqual(app.library, "Documents ");
+    assert.strictEqual(app.path, " Team/Planning 2026.xlsx ");
+    const empty = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...SP_PINS, library: "", path: undefined }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.notOk("library" in empty || "path" in empty, "an empty pin is left out");
+});
+
+QUnit.test("sharepoint: a calendar view keeps its kinds through the textarea and the cleaner", function (assert) {
+    const parsed = oauthConfig.parseViews(oauthConfig.formatViews(SP_CALENDAR_VIEWS));
+    assert.deepEqual(parsed.views, SP_CALENDAR_VIEWS);
+    const out = oauthConfig.cleanOAuth(fullForm({ destination: "GRAPH", views: parsed.views, ...SP_PINS }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual((out.views as typeof SP_CALENDAR_VIEWS).planning.kinds, ["Presence", "Guard"]);
+    assert.strictEqual(validators.validateOAuth(out, "destination", "builtin:sharepoint"), "");
+});
