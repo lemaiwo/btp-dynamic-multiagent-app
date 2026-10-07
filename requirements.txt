@@ -21,3 +21,8 @@ aiosqlite==0.22.1
 sqlalchemy-hana==5.0.0
 hdbcli==2.30.27
 pyjwt[crypto]==2.15.0
+# builtin:sharepoint reads an Excel workbook (agents/sharepoint_workbook.py).
+# openpyxl picks defusedxml up by itself when it is installed and then
+# parses no DTD; tests/test_sharepoint_requirements.py asserts that it does.
+openpyxl==3.1.5
+defusedxml==0.7.1
