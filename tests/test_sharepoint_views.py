@@ -104,6 +104,7 @@ def test_a_refusal_names_the_field_and_never_a_value(views, field):
 
 def test_a_conflict_needs_the_kind_label():
     views = _views(labels={"member": "A"})
+    del views["planning"]["kinds"]
     with pytest.raises(ViewConfigError, match="needs labels.kind"):
         parse_views(views)
 
@@ -301,3 +302,66 @@ def test_views_at_their_limits_are_accepted():
     columns = [f"c{i}" for i in range(50)]
     assert parse_views({"team": {**VIEWS["team"], "columns": columns}})["team"].columns \
         == tuple(columns)
+
+
+# --- AMENDMENT 1: pinned row kinds ------------------------------------------
+
+def _without(*keys, **change):
+    views = _views(**change)
+    for key in keys:
+        del views["planning"][key]
+    return views
+
+
+def test_the_kinds_of_a_calendar_view_are_parsed_and_stored():
+    planning = parse_views(VIEWS)["planning"]
+    assert planning.kinds == ("Presence", "Guard")
+    assert clean_views(VIEWS)["planning"]["kinds"] == ["Presence", "Guard"]
+    # Stored in the checked form, as every other configured name.
+    assert clean_views(_views(kinds=[" Presence", "Guard "]))["planning"]["kinds"] \
+        == ["Presence", "Guard"]
+
+
+def test_a_view_without_a_kind_label_has_no_kinds():
+    views = _without("kinds", "conflict", labels={"member": "A", "team": "B"})
+    assert parse_views(views)["planning"].kinds == ()
+    assert "kinds" not in clean_views(views)["planning"]
+    assert clean_views(views) == views
+
+
+@pytest.mark.parametrize("views, field", [
+    (_without("kinds"), "oauth.views.planning.kinds"),
+    (_views(kinds=None), "oauth.views.planning.kinds"),
+    (_views(kinds=[]), "oauth.views.planning.kinds"),
+    (_views(kinds="Guard " + SECRET), "oauth.views.planning.kinds"),
+    (_views(kinds={"Guard": SECRET}), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", 7]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", True]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", ""]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", "Guard"]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", " Guard "]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", "x" * 61]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", SECRET + "\nline"]), "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard", SECRET + "\u2028"  + "x"]),
+     "oauth.views.planning.kinds"),
+    (_views(kinds=["Presence", "Guard"] + [f"k{i}" for i in range(9)]),
+     "oauth.views.planning.kinds"),
+    # No kind label: the list would pin nothing.
+    (_without("conflict", labels={"member": "A", "team": "B"}), "oauth.views.planning.kinds"),
+    (_without("conflict", labels={"member": "A"}, kinds=None), "oauth.views.planning.kinds"),
+    # A conflict compares two pinned kinds.
+    (_views(kinds=["Presence", SECRET]), "oauth.views.planning.conflict.kind"),
+    (_views(kinds=["Guard", SECRET]), "oauth.views.planning.conflict.against"),
+    (_views(kinds=["Presence", "guard"]), "oauth.views.planning.conflict.kind"),
+])
+def test_a_kinds_refusal_names_the_field_and_never_a_value(views, field):
+    with pytest.raises(ViewConfigError) as refused:
+        parse_views(views)
+    text = str(refused.value)
+    assert text.startswith(field + ":"), text
+    assert SECRET not in text
+
+
+def test_kinds_at_their_limits_are_accepted():
+    kinds = ["Presence", "Guard"] + [f"{i}" + "k" * 59 for i in range(8)]
+    assert parse_views(_views(kinds=kinds))["planning"].kinds == tuple(kinds)

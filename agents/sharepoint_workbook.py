@@ -17,8 +17,14 @@ Rules of what leaves this module:
   only as the status its code maps to. A value that is not in ``codes`` (an
   unknown code, a number, an error value) is counted as ``unmapped`` and
   never passed on.
+* **Calendar view, default-deny on label text**: the kind of a row passes
+  only when the view pins it (``kinds``); a member or team passes only as a
+  bounded one-line name (:data:`MAX_LABEL_CHARS`, no control, format or
+  line-separator character). A sheet is text somebody typed: without these
+  two rules a label cell would be a way to put any text before the model.
 * **Rows that cannot be used** (no member, an error value in a label cell, a
-  second row for the same member and kind) are skipped and counted.
+  kind that is not pinned, a label that is not such a name, a second row for
+  the same member and kind) are skipped and counted; their text goes nowhere.
 * **No cached values is a refusal.** Formula results are read as stored by
   the application that saved the file. ``openpyxl`` cannot tell a formula
   without a stored result from one whose result is empty, so the rule is:
@@ -41,8 +47,8 @@ from typing import Any, Iterator
 from agents.sharepoint_views import CalendarView, TableView, column_index
 
 __all__ = [
-    "MAX_FILE_BYTES", "MAX_WINDOW_DAYS", "Refused", "check_archive", "check_window",
-    "read_calendar", "read_table",
+    "MAX_FILE_BYTES", "MAX_LABEL_CHARS", "MAX_WINDOW_DAYS", "Refused", "check_archive",
+    "check_window", "read_calendar", "read_table",
 ]
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -53,17 +59,21 @@ MAX_ARCHIVE_MEMBERS = 5000
 MAX_WINDOW_DAYS = 120
 MAX_TABLE_ROWS = 5000
 MAX_TABLE_COLUMNS = 200
-# Rows of a calendar below ``first_row``; reading also ends at ``stop_at``
-# and after this many rows in a row with nothing in them.
+# Rows of a calendar from ``first_row`` on. Reading ends at ``stop_at`` or
+# after ``BLANK_ROWS_END`` rows in a row with nothing in them; a sheet that
+# has neither within the cap is refused, never cut off.
 MAX_CALENDAR_ROWS = 2000
 BLANK_ROWS_END = 50
 # A year sheet has at most 366 day columns; a few spare for layout.
 MAX_DAY_COLUMNS = 400
+# A member or team cell that is longer is not a name: the row is skipped.
+MAX_LABEL_CHARS = 120
 
 _MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 _PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
 _DOC_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _ERROR = object()  # a cell holding an Excel error value
+_YEAR = "{year}"
 
 
 class Refused(Exception):
@@ -135,6 +145,8 @@ def _plain(cell: Any) -> Any:
     if value is None or isinstance(value, bool):
         return value
     if isinstance(value, str):
+        # A cell of whitespace only is an empty cell: in a calendar it is
+        # neither a code nor counted as ``unmapped``.
         text = unicodedata.normalize("NFC", value).strip()
         return text or None
     if isinstance(value, datetime):
@@ -296,9 +308,26 @@ def _as_date(cell: Any, epoch: Any) -> date | None:
     return None
 
 
-def _read_year(data: bytes, view: CalendarView, lo: date, hi: date, state: dict[str, Any]) -> str:
-    """Adds the days ``lo``..``hi`` (one year) of the view to ``state``."""
-    title = view.sheet.replace("{year}", str(lo.year))
+def _is_name(text: str) -> bool:
+    """Whether label text may pass as a member or team: bounded, one line,
+    no control or format character (categories C*, Zl, Zp)."""
+    return len(text) <= MAX_LABEL_CHARS and not any(
+        unicodedata.category(ch).startswith("C")
+        or unicodedata.category(ch) in ("Zl", "Zp") for ch in text)
+
+
+def _dates_not_found() -> Refused:
+    return Refused(
+        "dates_not_found",
+        "the date row of the sheet does not hold every requested day exactly once",
+        "the layout of the sheet may differ from the configured view",
+    )
+
+
+def _read_sheet(
+    data: bytes, view: CalendarView, title: str, lo: date, hi: date, state: dict[str, Any]
+) -> None:
+    """Adds the days ``lo``..``hi`` of the sheet ``title`` to ``state``."""
     first_col = column_index(view.first_date_column)
     last_col = first_col + MAX_DAY_COLUMNS - 1
     label_cols = {k: column_index(c) for k, c in view.labels.items()}
@@ -307,23 +336,36 @@ def _read_year(data: bytes, view: CalendarView, lo: date, hi: date, state: dict[
     book = _open(data, data_only=True)
     try:
         if title not in book.sheetnames:
-            raise Refused("sheet_not_found", f"the workbook has no sheet for {lo.year}",
-                          "ask for a period the workbook covers")
+            if _YEAR in view.sheet:
+                raise Refused("sheet_not_found", f"the workbook has no sheet for {lo.year}",
+                              "ask for a period the workbook covers")
+            raise Refused("sheet_not_found", "the workbook has no sheet of the configured name",
+                          "an administrator must correct the view")
         ws = book[title]
         day_cols: dict[date, int] = {}
+        twice = False
         date_values: dict[int, bool] = {}
+        last_dated = 0
         for row in _rows(ws, view.date_row, view.date_row, last_col, first_col):
             for offset, cell in enumerate(row):
                 day = _as_date(cell, book.epoch)
                 date_values[first_col + offset] = cell.value is not None
+                if day is not None:
+                    last_dated = first_col + offset
                 if day in wanted:
+                    # The same day in two columns: which one is meant is a guess.
+                    twice = twice or day in day_cols
                     day_cols.setdefault(day, first_col + offset)
         max_col = max(day_cols.values(), default=first_col)
         lines: list[tuple[int, list[Any]]] = []
         blank = 0
         stop = view.stop_at.casefold() if view.stop_at else None
-        for n, row in enumerate(_rows(ws, view.first_row,
-                                      view.first_row + MAX_CALENDAR_ROWS - 1, max_col)):
+        # Up to BLANK_ROWS_END rows past the cap, so that a sheet which ends
+        # (stop marker, blank rows) right at the cap is not taken for one that
+        # goes on.
+        for n, row in enumerate(_rows(
+                ws, view.first_row,
+                view.first_row + MAX_CALENDAR_ROWS + BLANK_ROWS_END - 1, max_col)):
             values = [_plain(c) for c in row]
             values += [None] * (max_col - len(values))
             labels = [values[c - 1] for c in label_cols.values()]
@@ -334,13 +376,18 @@ def _read_year(data: bytes, view: CalendarView, lo: date, hi: date, state: dict[
                 if blank >= BLANK_ROWS_END:
                     break
                 continue
+            if n >= MAX_CALENDAR_ROWS:
+                raise Refused("too_large", "the sheet has more rows than this tool reads",
+                              "an administrator can end the rows with stop_at")
             blank = 0
             lines.append((view.first_row + n, values))
     finally:
         book.close()
 
-    # Second pass, formulas as written: which cells are formulas at all.
-    formulas = with_result = 0
+    # Second pass, formulas as written: which cells are formulas at all. The
+    # date row and the rows below it are two areas, each decided on its own:
+    # a date row with results must not hide a body that has none.
+    date_formulas = date_results = body_formulas = body_results = 0
     date_formula_without_result = False
     by_row = dict(lines)
     book = _open(data, data_only=False)
@@ -349,47 +396,52 @@ def _read_year(data: bytes, view: CalendarView, lo: date, hi: date, state: dict[
         for row in _rows(ws, view.date_row, view.date_row, last_col, first_col):
             for offset, cell in enumerate(row):
                 if cell.data_type == "f":
-                    formulas += 1
+                    date_formulas += 1
                     if date_values.get(first_col + offset):
-                        with_result += 1
-                    else:
+                        date_results += 1
+                    elif first_col + offset < last_dated:
+                        # Only a hole among the dates. A formula behind the
+                        # last date (an empty 366th day) says nothing about
+                        # the days that are missing.
                         date_formula_without_result = True
         if lines:
             for n, row in enumerate(_rows(ws, view.first_row, lines[-1][0], max_col)):
                 values = by_row.get(view.first_row + n)
                 for c, cell in enumerate(row):
                     if cell.data_type == "f":
-                        formulas += 1
-                        with_result += values is not None and values[c] is not None
+                        body_formulas += 1
+                        body_results += values is not None and values[c] is not None
     finally:
         book.close()
-    _no_results(formulas, with_result)
+    _no_results(date_formulas, date_results)
+    _no_results(body_formulas, body_results)
     if wanted - set(day_cols):
         if date_formula_without_result:
             _no_results(1, 0)
-        raise Refused(
-            "dates_not_found",
-            "the date row of the sheet does not hold every requested day",
-            "the layout of the sheet may differ from the configured view",
-        )
+        raise _dates_not_found()
+    if twice:
+        raise _dates_not_found()
 
+    has_kind, has_team = "kind" in label_cols, "team" in label_cols
     seen: set[tuple[str, str]] = set()
     for _, values in lines:
         label = {k: values[c - 1] for k, c in label_cols.items()}
-        member = label.get("member")
-        if not isinstance(member, str) or any(v is _ERROR for v in label.values()):
-            state["skipped_rows"] += 1
-            continue
-        kind = label.get("kind")
-        kind = kind if isinstance(kind, str) else ""
-        key = (member, kind.casefold())
-        if key in seen:
+        member, kind, team = label.get("member"), label.get("kind"), label.get("team")
+        usable = isinstance(member, str) and _is_name(member) \
+            and not any(v is _ERROR for v in label.values())
+        # The kind of a row is exactly one of the pinned ones, or the row is
+        # not read (``_plain`` has trimmed and composed the cell).
+        if usable and has_kind:
+            usable = isinstance(kind, str) and kind in view.kinds
+        if usable and has_team and isinstance(team, str):
+            usable = _is_name(team)
+        key = (member, kind if has_kind else "")
+        if not usable or key in seen:
             state["skipped_rows"] += 1
             continue
         seen.add(key)
-        team = label.get("team")
         row_state = state["rows"].setdefault(
-            key, {"member": member, "kind": kind,
+            key, {"member": member, "kind": key[1],
                   "team": team if isinstance(team, str) else None, "days": {}})
         for day, col in day_cols.items():
             value = values[col - 1]
@@ -401,7 +453,6 @@ def _read_year(data: bytes, view: CalendarView, lo: date, hi: date, state: dict[
                 state["unmapped"] += 1
             else:
                 row_state["days"][day] = status
-    return title
 
 
 def _runs(days: dict[date, Any]) -> Iterator[tuple[date, date, Any]]:
@@ -428,19 +479,37 @@ def read_calendar(
     """The runs of a calendar view between two dates (inclusive).
 
     ``lookup`` is the table view ``view.lookup`` names; the caller resolves
-    it from the same config.
+    it from the same config. A view with a lookup read without that table
+    view is a mistake of the caller and raises ``ValueError`` (not a
+    :class:`Refused`, which is about the file or the request): the runs would
+    silently lack the pinned columns.
+
+    The window is checked here as well as by the caller
+    (:func:`check_window`): reversed or longer than
+    :data:`MAX_WINDOW_DAYS` is refused before anything is opened.
     """
+    if type(date_from) is not date or type(date_to) is not date:
+        raise Refused("invalid_dates", "date_from and date_to must be dates as YYYY-MM-DD")
+    date_from, date_to = check_window(date_from.isoformat(), date_to.isoformat())
+    if view.lookup is not None and (lookup is None or lookup.name != view.lookup.view):
+        raise ValueError("read_calendar: the view has a lookup; pass its table view")
     check_archive(data)
     state: dict[str, Any] = {"rows": {}, "skipped_rows": 0, "unmapped": 0}
-    sheets = []
+    # One read per sheet: a sheet name without {year} is the same sheet for
+    # every year of the window and is read once, with the whole window.
+    spans: dict[str, tuple[date, date]] = {}
     for year in range(date_from.year, date_to.year + 1):
-        lo = max(date_from, date(year, 1, 1))
-        hi = min(date_to, date(year, 12, 31))
-        sheets.append(_read_year(data, view, lo, hi, state))
+        title = view.sheet.replace(_YEAR, str(year))
+        lo = max(date_from, date(year, 1, 1)) if _YEAR in view.sheet else date_from
+        hi = min(date_to, date(year, 12, 31)) if _YEAR in view.sheet else date_to
+        spans.setdefault(title, (lo, hi))
+    for title, (lo, hi) in spans.items():
+        _read_sheet(data, view, title, lo, hi, state)
+    sheets = list(spans)
 
     extra: dict[str, dict[str, Any]] = {}
     add: tuple[str, ...] = ()
-    if view.lookup is not None and lookup is not None:
+    if view.lookup is not None:
         add = view.lookup.add
         seen: dict[str, int] = {}
         table = read_table(data, lookup)["rows"]
@@ -468,10 +537,9 @@ def read_calendar(
 
     conflicts: list[dict[str, Any]] = []
     if view.conflict is not None:
-        kind, against = view.conflict.kind.casefold(), view.conflict.against.casefold()
         for (member, row_kind), row in state["rows"].items():
-            other = state["rows"].get((member, against))
-            if row_kind != kind or other is None:
+            other = state["rows"].get((member, view.conflict.against))
+            if row_kind != view.conflict.kind or other is None:
                 continue
             clash = {day: (status, other["days"][day])
                      for day, status in row["days"].items()

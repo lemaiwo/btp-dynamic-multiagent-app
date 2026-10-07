@@ -30,6 +30,7 @@ VIEWS: dict[str, Any] = {
         "kind": "calendar", "sheet": "{year}", "date_row": 8, "first_row": 10,
         "first_date_column": "D",
         "labels": {"member": "A", "team": "B", "kind": "C"},
+        "kinds": ["Presence", "Guard"],
         "stop_at": "Summary",
         "codes": {"H": "unavailable", "A": "unavailable", "I": "unavailable",
                   "½H": "half_day", "T": "available", "GDI": "GDI", "GDH": "GDH"},
@@ -51,12 +52,16 @@ def build_workbook(
     team: list[tuple[Any, ...]] | None = None,
     date_formulas: bool = False,
     extra_rows: dict[int, list[tuple[Any, ...]]] | None = None,
+    raw: dict[int, dict[str, Any]] | None = None,
+    merges: dict[int, list[str]] | None = None,
 ) -> bytes:
     """Workbook bytes. ``cells[year][(member, kind)] = {"2026-01-05": "H"}``.
 
     ``date_formulas`` writes the date row as formulas, which openpyxl stores
     without a result (see :func:`with_results`). ``extra_rows[year]`` are raw
     ``(A, B, C)`` label rows written after the members, before ``Summary``.
+    ``raw[year]`` sets single cells last (``{"E8": None}`` empties one),
+    ``merges[year]`` are ranges merged after that (``"A10:A11"``).
     """
     book = Workbook()
     sheet = book.active
@@ -93,6 +98,10 @@ def build_workbook(
         ws.cell(r + 1, 1, "Below the stop marker")
         ws.cell(r + 1, 3, "Presence")
         ws.cell(r + 1, 4, "H")
+        for ref, value in (raw or {}).get(year, {}).items():
+            ws[ref] = value
+        for ref in (merges or {}).get(year, []):
+            ws.merge_cells(ref)
     out = io.BytesIO()
     book.save(out)
     return out.getvalue()

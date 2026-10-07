@@ -14,6 +14,9 @@ Two kinds of view:
   dates from ``first_date_column`` on, the rows from ``first_row`` on hold one
   line per member, described by the ``labels`` columns (``member`` required,
   ``team`` and ``kind`` optional). ``sheet`` may contain ``{year}``.
+  A view with a ``kind`` label pins the kinds of row it reads in ``kinds``:
+  the kind cell is text somebody typed into the sheet, and only a row whose
+  kind is listed is read (the others are counted, their text goes nowhere).
   ``codes`` maps what a cell holds to the status the model gets; a value that
   is not listed never passes (see :mod:`agents.sharepoint_workbook`).
   ``stop_at`` ends the rows at a label, ``lookup`` adds pinned columns of a
@@ -41,6 +44,8 @@ __all__ = [
 MAX_VIEWS = 10
 MAX_COLUMNS = 50
 MAX_CODES = 100
+MAX_KINDS = 10
+MAX_KIND_CHARS = 60
 MAX_ROW = 1_048_576
 MAX_COLUMN = 16_384
 MAX_PATH_CHARS = 400
@@ -105,6 +110,8 @@ class CalendarView:
     stop_at: str | None = None
     lookup: Lookup | None = None
     conflict: Conflict | None = None
+    # The kinds of row this view reads; empty when there is no kind label.
+    kinds: tuple[str, ...] = ()
     kind: str = "calendar"
 
 
@@ -187,7 +194,7 @@ def _table(name: str, raw: dict[str, Any]) -> TableView:
 def _calendar(name: str, raw: dict[str, Any]) -> CalendarView:
     where = f"oauth.views.{name}"
     _only(raw, ("kind", "sheet", "date_row", "first_row", "first_date_column",
-                "labels", "stop_at", "codes", "lookup", "conflict"), where)
+                "labels", "kinds", "stop_at", "codes", "lookup", "conflict"), where)
     sheet = _text(raw.get("sheet"), f"{where}.sheet", 64)
     plain = sheet.replace(_YEAR, "", 1)
     if "{" in plain or "}" in plain or _SHEET_FORBIDDEN & set(plain) \
@@ -212,6 +219,15 @@ def _calendar(name: str, raw: dict[str, Any]) -> CalendarView:
         raise ViewConfigError(f"{where}.labels: two labels must not share a column")
     if any(column_index(c) >= column_index(first_col) for c in labels.values()):
         raise ViewConfigError(f"{where}.labels: must be left of first_date_column")
+
+    # The kind of a row is cell text: it is read only when it is one of
+    # these, so a view with a kind label must pin them, and a view without
+    # one has nothing they could apply to.
+    kinds: tuple[str, ...] = ()
+    if "kind" in labels:
+        kinds = _texts(raw.get("kinds"), f"{where}.kinds", MAX_KINDS, each=MAX_KIND_CHARS)
+    elif "kinds" in raw:
+        raise ViewConfigError(f"{where}.kinds: is only allowed with labels.kind")
 
     codes_raw = raw.get("codes")
     if not isinstance(codes_raw, dict) or not codes_raw or len(codes_raw) > MAX_CODES:
@@ -265,9 +281,12 @@ def _calendar(name: str, raw: dict[str, Any]) -> CalendarView:
                             _text(cf.get("against"), f"{where}.conflict.against", 64), when)
         if conflict.kind.casefold() == conflict.against.casefold():
             raise ViewConfigError(f"{where}.conflict: kind and against must differ")
+        for key, value in (("kind", conflict.kind), ("against", conflict.against)):
+            if value not in kinds:
+                raise ViewConfigError(f"{where}.conflict.{key}: must be one of kinds")
 
     return CalendarView(name, sheet, date_row, first_row, first_col, labels, codes,
-                        stop_at, lookup, conflict)
+                        stop_at, lookup, conflict, kinds)
 
 
 def parse_views(raw: Any) -> dict[str, TableView | CalendarView]:
@@ -316,6 +335,8 @@ def views_config(views: dict[str, TableView | CalendarView]) -> dict[str, Any]:
             "first_row": view.first_row, "first_date_column": view.first_date_column,
             "labels": dict(view.labels), "codes": dict(view.codes),
         }
+        if view.kinds:
+            body["kinds"] = list(view.kinds)
         if view.stop_at is not None:
             body["stop_at"] = view.stop_at
         if view.lookup is not None:
