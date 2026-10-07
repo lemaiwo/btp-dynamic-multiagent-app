@@ -2473,6 +2473,9 @@ const DESTINATION_FIELDS = {
     'builtin:sapnotes':      ['min_score', 'lookback'],
     'builtin:sapnotedetail': [],
     'builtin:smtp':          ['recipients', 'from', 'allow_send', 'theme'],
+    // One pinned workbook, read as the application: no user_context. The
+    // `views` object is edited as JSON (agents/sharepoint_views.py is the gate).
+    'builtin:sharepoint':    ['site', 'library', 'path', 'views'],
     // No destination name and no user_context: both belong to each catalogue
     // service (`_validate_odata_entry` in agents/admin.py refuses any key but
     // these two). Collected by `collectODataConfig`, not the generic branch.
@@ -2498,6 +2501,10 @@ function destinationFieldsFor(builtin) {
 // Text fields, in the order they appear; the two switches are checkboxes.
 const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
     'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
+// The pins of builtin:sharepoint are sent exactly as typed, never trimmed: the
+// server refuses a pin with edge whitespace instead of repairing it, so what
+// is stored is always what the admin saw.
+const DESTINATION_EXACT_KEYS = ['site', 'library', 'path'];
 
 function destinationFieldsHtml() {
     return `
@@ -2541,6 +2548,18 @@ function destinationFieldsHtml() {
                 </label>
                 <label class="dest-field-channels">Channels
                     <input type="text" class="dest-channels" placeholder="comma-separated; blank means all">
+                </label>
+                <label class="full dest-field-site">Site
+                    <input type="text" class="dest-site" placeholder="example.sharepoint.com:/sites/planning">
+                </label>
+                <label class="dest-field-library">Document library
+                    <input type="text" class="dest-library" placeholder="Documents">
+                </label>
+                <label class="dest-field-path">File path
+                    <input type="text" class="dest-path" placeholder="Planning/Planning.xlsx">
+                </label>
+                <label class="full dest-field-views">Views (JSON)
+                    <textarea class="dest-views" rows="10" placeholder='{"team": {"kind": "table", "table": "TeamMembers", "columns": ["Name", "ID"]}, "planning": {"kind": "calendar", "sheet": "{year}", "date_row": 8, "first_row": 10, "first_date_column": "D", "labels": {"member": "A", "kind": "C"}, "kinds": ["Presence", "Guard"], "codes": {"H": "unavailable"}}}'></textarea>
                 </label>
                 <label class="full dest-field-recipients">Recipients
                     <input type="text" class="dest-recipients" placeholder="team@example.com, basis@example.com">
@@ -2587,7 +2606,7 @@ function destinationBuiltinOf(row) {
 
 function fillDestinationFields(row, oauth) {
     oauth = oauth || {};
-    DESTINATION_TEXT_KEYS.forEach(k => {
+    DESTINATION_TEXT_KEYS.concat(DESTINATION_EXACT_KEYS).forEach(k => {
         const el = row.querySelector('.dest-' + k);
         if (el) el.value = oauth[k] == null ? '' : String(oauth[k]);
     });
@@ -2613,6 +2632,9 @@ function fillDestinationFields(row, oauth) {
     const theme = oauth.theme;
     row.querySelector('.dest-theme').value =
         theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
+    const views = oauth.views;
+    row.querySelector('.dest-views').value =
+        views && typeof views === 'object' && Object.keys(views).length ? JSON.stringify(views, null, 2) : '';
 }
 
 /** The user flipped the act-as-user switch: stop following the new-server default. */
@@ -2649,7 +2671,7 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sharepoint, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (isRemoteMcpUrl(builtin)) {
@@ -2657,6 +2679,8 @@ function syncDestinationFields(row) {
             + (userContext
                 ? 'Acting as the signed-in user is on by default for a new server. Its Authentication must be a user-propagating type (OAuth2UserTokenExchange, OAuth2JWTBearer, OAuth2SAMLBearerAssertion); scheduled runs cannot use it, so untick it for those.'
                 : 'It holds an app-level credential: every caller reaches the server as the destination\'s technical user.');
+    } else if (builtin === 'builtin:sharepoint') {
+        hint = 'The destination reaches Microsoft Graph with an application credential (OAuth2ClientCredentials) that is granted read on the one site. The agent can only name a view; site, file and views are pinned here. Site, library and file path are stored exactly as typed.';
     } else if (builtin === 'builtin:smtp') {
         hint = 'A destination of Type MAIL: mail.smtp.host/port, mail.user, mail.password, mail.smtp.from. The server certificate is always verified.';
     } else if (builtin === 'builtin:sapnotedetail') {
@@ -2969,6 +2993,13 @@ function collectDestinationConfig(row) {
         const v = row.querySelector('.dest-' + k).value.trim();
         if (v) oauth[k] = v;
     });
+    // As typed: no trim (see DESTINATION_EXACT_KEYS). An empty field is not
+    // sent; the server names the missing one.
+    DESTINATION_EXACT_KEYS.forEach(k => {
+        if (!wanted.includes(k)) return;
+        const v = row.querySelector('.dest-' + k).value;
+        if (v !== '') oauth[k] = v;
+    });
     const userContext = wanted.includes('user_context') && row.querySelector('.dest-user_context').checked;
     if (userContext) {
         oauth.user_context = true;
@@ -2996,6 +3027,24 @@ function collectDestinationConfig(row) {
             throw new Error('Mail theme must be a JSON object.');
         }
         if (Object.keys(theme).length) oauth.theme = theme;
+    }
+    // The views of builtin:sharepoint. Only the JSON shape is checked here;
+    // the server's 422 names the field and the rule. The refusal is a fixed
+    // text: a parser message would quote what was typed.
+    if (wanted.includes('views')) {
+        const viewsText = row.querySelector('.dest-views').value.trim();
+        if (!viewsText) throw new Error('SharePoint requires at least one view.');
+        let views;
+        try {
+            views = JSON.parse(viewsText);
+        } catch (e) {
+            throw new Error('Views is not valid JSON.');
+        }
+        if (!views || typeof views !== 'object' || Array.isArray(views)) {
+            throw new Error('Views must be a JSON object.');
+        }
+        if (!Object.keys(views).length) throw new Error('SharePoint requires at least one view.');
+        oauth.views = views;
     }
     return oauth;
 }

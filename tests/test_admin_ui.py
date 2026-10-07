@@ -1692,6 +1692,18 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               and "Opens the write operations enabled in the catalogue for these services" in html
               and "this agent can only read" in html)
         check("the hint list names builtin:odata", "builtin:sapnotedetail, builtin:odata)" in html)
+        # builtin:sharepoint: destination mode only on this page. Three pins
+        # and the views as JSON; the server gate is the authority.
+        check("sharepoint is a known destination built-in",
+              "'builtin:sharepoint':" in html and "['site', 'library', 'path', 'views']" in html)
+        check("sharepoint views field exists", 'class="dest-views"' in html)
+        check("the hint list names builtin:sharepoint", "builtin:smtp, builtin:sharepoint," in html)
+        # The server refuses a pin with edge whitespace instead of repairing
+        # it, so the page must send the three pins as typed.
+        check("the sharepoint pins are collected apart from the trimmed text keys",
+              "const DESTINATION_EXACT_KEYS = ['site', 'library', 'path'];" in html)
+        check("the views placeholder shows a calendar view with its kinds",
+              '"kinds": ["Presence", "Guard"]' in html)
         check("api() call discovered: GET /admin/api/odata/services",
               ("GET", "/admin/api/odata/services") in discovered)
         for opener in ("openAgentModal", "editAgent"):
@@ -1888,6 +1900,71 @@ assert.throws(() => collectMcpServers(), /JSON object/);
     oauth: { destination: 'JIRA', theme: { band: '#102030' } } }));
 assert.strictEqual(row.querySelector('.dest-field-theme').style.display, 'none');
 assert.ok(!('theme' in out.oauth), 'jira sends no mail, so no theme');
+
+// 7b. builtin:sharepoint: three pins and the views as JSON; bad JSON refuses.
+const SP_VIEWS = {
+    team: { kind: 'table', table: 'TeamMembers', columns: ['Name', 'Team', 'ID'] },
+    planning: { kind: 'calendar', sheet: '{year}', date_row: 8, first_row: 10,
+                first_date_column: 'D', labels: { member: 'A', team: 'B', kind: 'C' },
+                kinds: ['Presence', 'Guard'], stop_at: 'Summary',
+                codes: { H: 'unavailable', T: 'available', GDI: 'GDI' },
+                lookup: { view: 'team', on: 'Name', add: ['ID'] },
+                conflict: { kind: 'Guard', against: 'Presence', when: ['unavailable'] } },
+};
+const SP_OAUTH = { destination: 'GRAPH', site: 'example.sharepoint.com:/sites/planning',
+    library: 'Documents', path: 'Team/Planning 2026.xlsx', views: SP_VIEWS };
+// A stored user_context (the server never stores one) is neither shown nor sent.
+({ row, out } = addAndCollect({ url: 'builtin:sharepoint', auth_mode: 'destination',
+    oauth: { ...SP_OAUTH, user_context: true, allow_send: true, mailbox: 'x@example.com' } }));
+assert.strictEqual(row.querySelector('.dest-field-views').style.display, '');
+for (const k of ['site', 'library', 'path', 'destination']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+assert.strictEqual(row.querySelector('.dest-field-user_context').style.display, 'none',
+    'no signed-in-user option for sharepoint');
+assert.strictEqual(row.querySelector('.dest-field-allow_send').style.display, 'none');
+assert.deepStrictEqual(out, { url: 'builtin:sharepoint', auth_mode: 'destination', oauth: SP_OAUTH });
+assert.deepStrictEqual(Object.keys(out.oauth), ['destination', 'site', 'library', 'path', 'views']);
+assert.deepStrictEqual(JSON.parse(row.querySelector('.dest-views').value), SP_VIEWS,
+    'the stored views are shown as JSON');
+assert.ok(row.querySelector('.dest-hint').textContent.includes('Microsoft Graph'));
+console.log('SHAREPOINT:' + JSON.stringify(out));
+// The pins reach the server exactly as typed: nothing is trimmed here (the
+// server refuses edge whitespace; repairing it would hide what is stored).
+row.querySelector('.dest-site').value = ' example.sharepoint.com:/sites/planning';
+row.querySelector('.dest-library').value = 'Documents ';
+row.querySelector('.dest-path').value = '\tTeam/Planning 2026.xlsx ';
+let spOut = collectMcpServers()[0].oauth;
+assert.strictEqual(spOut.site, ' example.sharepoint.com:/sites/planning');
+assert.strictEqual(spOut.library, 'Documents ');
+assert.strictEqual(spOut.path, '\tTeam/Planning 2026.xlsx ');
+// Whitespace only is still something that was typed: sent, for the server to refuse.
+row.querySelector('.dest-library').value = ' ';
+assert.strictEqual(collectMcpServers()[0].oauth.library, ' ');
+// An empty pin is not sent (the server names the missing field).
+row.querySelector('.dest-library').value = '';
+assert.ok(!('library' in collectMcpServers()[0].oauth));
+row.querySelector('.dest-library').value = 'Documents';
+// Bad JSON: a fixed text, nothing of what was typed (a parser message quotes it).
+row.querySelector('.dest-views').value = '{ team: SECRETVALUE }';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'Views is not valid JSON.');
+    return true;
+});
+row.querySelector('.dest-views').value = '[1]';
+assert.throws(() => collectMcpServers(), /Views must be a JSON object/);
+row.querySelector('.dest-views').value = '   ';
+assert.throws(() => collectMcpServers(), /at least one view/);
+row.querySelector('.dest-views').value = '{}';
+assert.throws(() => collectMcpServers(), /at least one view/);
+// The same row made another built-in: none of the sharepoint keys is sent.
+({ row, out } = addAndCollect({ url: 'builtin:teams', auth_mode: 'destination',
+    oauth: { destination: 'G', team: 't', site: 'example.sharepoint.com:/sites/planning',
+             library: 'Documents', path: 'a.xlsx', views: SP_VIEWS } }));
+for (const k of ['site', 'library', 'path', 'views']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+    assert.ok(!(k in out.oauth), k + ' is not sent');
+}
 
 // 8. A remote MCP server through a destination: the destination names the
 //    host and holds the credential, so only {destination, user_context} is
@@ -2431,6 +2508,41 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                                       if line.startswith("ROUNDTRIP:")), None)
                     check("the form collected the stored builtin:odata entry",
                           collected == [odata_entry], str(collected))
+                    # What the form collects for builtin:sharepoint is an
+                    # entry the server gate accepts and stores unchanged.
+                    sp_entry = next((json.loads(line[len("SHAREPOINT:"):])
+                                     for line in result.stdout.splitlines()
+                                     if line.startswith("SHAREPOINT:")), None)
+                    check("the form collected a builtin:sharepoint entry", sp_entry is not None)
+                    if sp_entry is not None:
+                        sp_agent = {
+                            "name": "uisharepoint", "description": "UI test agent with a workbook.",
+                            "instructions": "You are a UI test agent.", "enabled": True,
+                            "mcp_servers": [sp_entry],
+                        }
+                        r = await client.post("/admin/api/agents", json=sp_agent)
+                        check("the API accepts the collected builtin:sharepoint entry",
+                              r.status_code == 201, r.text[:300])
+                        if r.status_code == 201:
+                            sp_id = r.json()["id"]
+                            try:
+                                r = await client.get(f"/admin/api/agents/{sp_id}")
+                                # The answer adds the API's own read-only
+                                # marker; the page never sends it back.
+                                got = r.json()["mcp_servers"]
+                                for entry in got:
+                                    entry.get("oauth", {}).pop("has_client_secret", None)
+                                check("the stored builtin:sharepoint entry is the collected one",
+                                      got == [sp_entry], str(got)[-700:])
+                                # Why the page must not trim: the server refuses.
+                                padded = {**sp_entry, "oauth": {**sp_entry["oauth"],
+                                                                "library": "Documents "}}
+                                r = await client.put(f"/admin/api/agents/{sp_id}",
+                                                     json={**sp_agent, "mcp_servers": [padded]})
+                                check("the API refuses a pin with edge whitespace with a 422",
+                                      r.status_code == 422, f"{r.status_code} {r.text[:200]}")
+                            finally:
+                                await client.delete(f"/admin/api/agents/{sp_id}")
                     if collected is not None and odata_agent_id is not None:
                         r = await client.put(f"/admin/api/agents/{odata_agent_id}",
                                              json={**odata_agent, "mcp_servers": collected})
