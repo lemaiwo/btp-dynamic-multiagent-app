@@ -1923,7 +1923,8 @@ for (const k of ['site', 'library', 'path', 'destination']) {
 assert.strictEqual(row.querySelector('.dest-field-user_context').style.display, 'none',
     'no signed-in-user option for sharepoint');
 assert.strictEqual(row.querySelector('.dest-field-allow_send').style.display, 'none');
-assert.deepStrictEqual(out, { url: 'builtin:sharepoint', auth_mode: 'destination', oauth: SP_OAUTH });
+assert.deepStrictEqual(out,
+    { url: 'builtin:sharepoint', auth_mode: 'destination', oauth: SP_OAUTH });
 assert.deepStrictEqual(Object.keys(out.oauth), ['destination', 'site', 'library', 'path', 'views']);
 assert.deepStrictEqual(JSON.parse(row.querySelector('.dest-views').value), SP_VIEWS,
     'the stored views are shown as JSON');
@@ -1962,7 +1963,8 @@ assert.throws(() => collectMcpServers(), /at least one view/);
     oauth: { destination: 'G', team: 't', site: 'example.sharepoint.com:/sites/planning',
              library: 'Documents', path: 'a.xlsx', views: SP_VIEWS } }));
 for (const k of ['site', 'library', 'path', 'views']) {
-    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none',
+        k + ' is hidden');
     assert.ok(!(k in out.oauth), k + ' is not sent');
 }
 
