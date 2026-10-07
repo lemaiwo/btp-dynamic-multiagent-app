@@ -219,6 +219,24 @@ def not_found(path: str) -> list[tuple]:
     ]
 
 
+def folder_not_found(path: str, procedure: str = "LIST") -> list[tuple]:
+    """HDI's answer to a LIST / LIST_DEPLOYED of a folder that does not
+    exist: what a container nobody deployed to says about ``src/``. Message
+    codes read off a real, never-used container; the two procedures differ
+    in two of the four."""
+    kind, read, summary = (
+        ("active", 8211563, 8214191) if procedure == "LIST_DEPLOYED"
+        else ("work", 8211562, 8214188)
+    )
+    return [
+        message("ERROR", f'The folder "{path}" could not be found', code=8212760),
+        message("ERROR", f"Could not read {kind} files", code=read),
+        message("ERROR", "Some requested files/folders could not be found", code=8212764),
+        message("ERROR", f'Reading 1 {kind} files from the container "CONTAINER_1"... failed',
+                code=summary),
+    ]
+
+
 def record(generation: int, files: dict[str, str] = FILES, *, made: bool = True) -> dict:
     return {RECORD: json.dumps({
         "generation": generation, "made": made, "digest": hana_hdi.schema_digest(files)})}
@@ -335,6 +353,10 @@ class FakeCursor:
             for (path,) in paths:
                 if path.endswith("/"):
                     found = {p: c for p, c in files.items() if p.startswith(path)}
+                    if not found:
+                        # A folder exists only through the files below it.
+                        messages.extend(folder_not_found(path, procedure))
+                        continue
                     rows.append((path, "U", None, None, "U", None, None, 0, None))
                 elif path in files:
                     found = {path: files[path]}
@@ -1096,3 +1118,25 @@ async def test_deploy_reads_the_drop_switch_from_the_environment(deploying, monk
     monkeypatch.setenv("HANA_HDI_ALLOW_DROP", "true")
     assert (await hana_hdi.deploy(CREDENTIALS, Base.metadata)).undeployed == (
         "src/zz_probe.hdbtable",)
+
+
+# -- a container nobody ever deployed to --------------------------------------
+def test_a_never_used_container_has_no_folders_and_is_read_as_empty():
+    """The first start on a new container: ``src/`` exists in neither file
+    system, so both listings answer "folder not found". That is an empty
+    container, not a failure."""
+    container = FakeContainer()
+    result = run(container)
+    assert result.changed is True
+    assert set(container.deployed) == set(FILES)
+
+
+@pytest.mark.parametrize("procedure", ["LIST_DEPLOYED", "LIST"])
+def test_a_folder_listing_that_fails_otherwise_is_not_an_empty_container(procedure):
+    """Only HDI's folder-not-found answer means "nothing there": the same
+    answer with one more error in it is a failure, and nothing is written."""
+    container = FakeContainer()
+    container.replies[procedure] = [message("ERROR", "something else", code=8250009)]
+    with pytest.raises(hana_hdi.HdiError):
+        run(container)
+    assert "WRITE" not in container.calls and "MAKE" not in container.calls

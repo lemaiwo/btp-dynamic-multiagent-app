@@ -137,6 +137,14 @@ GENERATION_FILE = "meta/generation.json"
 # means "this container has no record"; any other error is a failure.
 _FILE_NOT_FOUND = 8212757
 _NOT_FOUND_COMPANIONS = frozenset({8212757, 8212760, 8211562, 8212764, 8214188})
+# The same for a FOLDER that does not exist, which is what a container nobody
+# deployed to answers for ``src/`` in both file systems (LIST and
+# LIST_DEPLOYED differ in two of the four codes). Read off a never-used
+# container: a folder exists only through the files below it.
+_FOLDER_NOT_FOUND = 8212760
+_FOLDER_NOT_FOUND_COMPANIONS = frozenset(
+    {8212760, 8212764, 8211562, 8214188, 8211563, 8214191}
+)
 # The only value that lets a deploy undeploy a table.
 ALLOW_DROP_ENV = "HANA_HDI_ALLOW_DROP"
 # How long a deploy waits for another one that holds the container lock
@@ -535,11 +543,9 @@ def _parse_record(sets: list[_ResultSet]) -> _Record:
     )
 
 
-def _record_exists(sets: list[_ResultSet], credentials: HdiCredentials) -> bool:
-    """Whether the LIST of the record file found it. "Not there" is only
-    HDI's file-not-found answer, recognised by its message codes; any other
-    ERROR row is raised, so a failing LIST is never read as an empty
-    container."""
+def _error_codes(sets: list[_ResultSet]) -> set[int]:
+    """The message codes of the ERROR rows of an answer (-1 for a row
+    without one, which then matches no known answer)."""
     codes: set[int] = set()
     for result in sets:
         if "SEVERITY" in result.columns and "MESSAGE_CODE" in result.columns:
@@ -550,6 +556,31 @@ def _record_exists(sets: list[_ResultSet], credentials: HdiCredentials) -> bool:
                 )
                 if str(severity).upper() == "ERROR"
             )
+    return codes
+
+
+def _folder_listing(
+    step: str, sets: list[_ResultSet], credentials: HdiCredentials
+) -> dict[str, str]:
+    """``{path: sha256}`` below a folder, or ``{}`` when the folder does not
+    exist. A container nobody deployed to has no ``src/`` at all, and HDI
+    answers that with ERROR rows, not with an empty list. "Does not exist"
+    is only HDI's folder-not-found answer, recognised by its message codes
+    with nothing listed; any other ERROR row is raised, so a failing listing
+    is never read as an empty container."""
+    codes = _error_codes(sets)
+    if codes and _FOLDER_NOT_FOUND in codes and codes <= _FOLDER_NOT_FOUND_COMPANIONS:
+        if not _listing(step, sets):
+            return {}
+    return _listing(step, _checked(step, sets, credentials))
+
+
+def _record_exists(sets: list[_ResultSet], credentials: HdiCredentials) -> bool:
+    """Whether the LIST of the record file found it. "Not there" is only
+    HDI's file-not-found answer, recognised by its message codes; any other
+    ERROR row is raised, so a failing LIST is never read as an empty
+    container."""
+    codes = _error_codes(sets)
     found = GENERATION_FILE in _listing("LIST", sets)
     if not codes:
         if found:
@@ -633,6 +664,12 @@ def deploy_files(
             )
             return _checked(step, _call(cursor, statement), credentials)
 
+        def folder(step: str, arguments: str) -> dict[str, str]:
+            statement = (
+                f"CALL {api}.{step}({arguments}_SYS_DI.T_NO_PARAMETERS, {_OUT[step]})"
+            )
+            return _folder_listing(step, _call(cursor, statement), credentials)
+
         try:
             call("LOCK", f"{LOCK_WAIT_MS}, ")
         except HdiError:
@@ -649,7 +686,7 @@ def deploy_files(
         recorded: _Record | None = None
         if _record_exists(_call_raw(cursor, api, "#GENERATION_IN"), credentials):
             recorded = _parse_record(call("READ", "#GENERATION_IN, "))
-        deployed = _listing("LIST_DEPLOYED", call("LIST_DEPLOYED", "#DEPLOYED_IN, "))
+        deployed = folder("LIST_DEPLOYED", "#DEPLOYED_IN, ")
         if recorded is not None and recorded.generation > generation:
             # A newer app version's container. Run on it only when it really
             # holds that version's schema: its make finished, and what is
@@ -687,7 +724,7 @@ def deploy_files(
         # deleted. So: delete what is there and not generated (HDI refuses
         # to delete a file that is not there), undeploy what is deployed
         # and not generated.
-        work = _listing("LIST", call("LIST", "#WORK_IN, "))
+        work = folder("LIST", "#WORK_IN, ")
         leftover = sorted(path for path in work if path not in wanted)
         _fill(cursor, "#DELETED", [(path,) for path in leftover])
         digest = state_digest({p: hashlib.sha256(c).hexdigest() for p, c in wanted.items()})
