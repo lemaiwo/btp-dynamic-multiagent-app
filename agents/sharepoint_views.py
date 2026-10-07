@@ -52,6 +52,9 @@ STATUS_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,31}")
 # What the tool itself reports for a value outside ``codes``.
 RESERVED_STATUSES = frozenset({"unmapped"})
 LABEL_KEYS = ("member", "team", "kind")
+# The keys of a run as ``read_calendar`` returns it. A ``lookup`` adds its
+# columns to that same object, so it must not add one of these names.
+RUN_KEYS = ("member", "team", "kind", "status", "from", "to")
 
 _COLUMN_RE = re.compile(r"[A-Z]{1,3}")
 _TABLE_RE = re.compile(r"[A-Za-z_\\][A-Za-z0-9_.\\]{0,254}")
@@ -120,8 +123,27 @@ def _text(value: Any, where: str, limit: int) -> str:
     text = unicodedata.normalize("NFC", value).strip()
     if not text or len(text) > limit:
         raise ViewConfigError(f"{where}: must be 1 to {limit} characters")
-    if any(unicodedata.category(ch).startswith("C") for ch in text):
-        raise ViewConfigError(f"{where}: must not contain control characters")
+    # Category C is every control and format character; the line and paragraph
+    # separators (U+2028, U+2029) are category Z and end a line just the same.
+    if any(unicodedata.category(ch).startswith("C")
+           or unicodedata.category(ch) in ("Zl", "Zp") for ch in text):
+        raise ViewConfigError(
+            f"{where}: must be one line without control characters"
+        )
+    return text
+
+
+def _exact(value: Any, where: str, limit: int) -> str:
+    """:func:`_text` for a value the caller stores as it was given: refused
+    unless it already is the checked form. ``check_pins`` returns nothing, so
+    a pin that was only valid after trimming or composing would be stored and
+    sent in the form that was never checked."""
+    text = _text(value, where, limit)
+    if text != value:
+        raise ViewConfigError(
+            f"{where}: must have no leading or trailing whitespace and use "
+            "composed (NFC) characters"
+        )
     return text
 
 
@@ -220,8 +242,13 @@ def _calendar(name: str, raw: dict[str, Any]) -> CalendarView:
         target = lk.get("view")
         if not isinstance(target, str) or not VIEW_NAME_RE.fullmatch(target):
             raise ViewConfigError(f"{where}.lookup.view: must name a table view")
-        lookup = Lookup(target, _text(lk.get("on"), f"{where}.lookup.on", 255),
-                        _texts(lk.get("add"), f"{where}.lookup.add", 10))
+        add = _texts(lk.get("add"), f"{where}.lookup.add", 10)
+        if any(column.casefold() in RUN_KEYS for column in add):
+            raise ViewConfigError(
+                f"{where}.lookup.add: must not add a column named like a run field "
+                f"({', '.join(RUN_KEYS)})"
+            )
+        lookup = Lookup(target, _text(lk.get("on"), f"{where}.lookup.on", 255), add)
 
     conflict = None
     if raw.get("conflict") is not None:
@@ -320,7 +347,13 @@ def check_pins(cfg: dict[str, Any]) -> None:
     library root; the characters refused in it are those a rebuilt URL would
     read as something else (``agents.destination_auth`` rebuilds the URL from
     the decoded path).
+
+    Nothing is returned, so the caller stores the values as they were given:
+    a pin is accepted only in exactly the form that was checked (no edge
+    whitespace, one line, NFC), never after a silent repair.
     """
+    if not isinstance(cfg, dict):
+        raise ViewConfigError("oauth: must be an object")
     site = cfg.get("site")
     match = _SITE_RE.fullmatch(site) if isinstance(site, str) else None
     if match is None or any(set(part) == {"."} for part in match.group(2).split("/") if part):
@@ -328,10 +361,10 @@ def check_pins(cfg: dict[str, Any]) -> None:
             "oauth.site: must be <tenant>.sharepoint.com:/sites/<site> "
             "(lower-case host, the site's server-relative path)"
         )
-    library = _text(cfg.get("library"), "oauth.library", 128)
+    library = _exact(cfg.get("library"), "oauth.library", 128)
     if "/" in library or "\\" in library:
         raise ViewConfigError("oauth.library: must be the name of a document library")
-    path = _text(cfg.get("path"), "oauth.path", MAX_PATH_CHARS)
+    path = _exact(cfg.get("path"), "oauth.path", MAX_PATH_CHARS)
     parts = path.split("/")
     if _PATH_FORBIDDEN & set(path) or any(p.strip() != p or p in ("", ".", "..") for p in parts) \
             or not path.lower().endswith(".xlsx"):
