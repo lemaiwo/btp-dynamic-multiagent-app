@@ -123,3 +123,66 @@ def with_results(data: bytes, sheet_title: str, results: dict[str, Any]) -> byte
 
 def column_letter(day: date) -> str:
     return get_column_letter(day_column(day))
+
+
+SITE = "example.sharepoint.com:/sites/planning"
+PINS = {"site": SITE, "library": "Documents", "path": "Team/Planning 2026.xlsx"}
+DOWNLOAD_URL = (
+    "https://example.sharepoint.com/sites/planning/_layouts/15/download.aspx?tempauth=t0k"
+)
+
+
+class FakeGraph:
+    """Microsoft Graph and the SharePoint download host as mock transports.
+
+    ``requests`` are the Graph calls, ``downloads`` the requests the download
+    client sent. ``item`` overrides keys of the drive item; ``status`` maps a
+    step (``site``, ``drives``, ``item``, ``download``) to an HTTP status.
+    """
+
+    def __init__(self, data: bytes = b"", *, etag: str = '"v1"', item: dict | None = None,
+                 status: dict[str, int] | None = None) -> None:
+        import httpx
+
+        self._httpx = httpx
+        self.data = data
+        self.etag = etag
+        self.item = item or {}
+        self.status = status or {}
+        self.requests: list = []
+        self.downloads: list = []
+
+    def _graph(self, request):
+        httpx = self._httpx
+        self.requests.append(request)
+        path = request.url.path
+        if path == "/v1.0/sites/example.sharepoint.com:/sites/planning":
+            return httpx.Response(
+                self.status.get("site", 200),
+                json={"id": "example.sharepoint.com,g1,g2", "note": "graph-text"})
+        if path == "/v1.0/sites/example.sharepoint.com,g1,g2/drives":
+            return httpx.Response(self.status.get("drives", 200), json={"value": [
+                {"id": "b!drive1", "name": "Documents"}, {"id": "b!drive2", "name": "Archive"}]})
+        if path == "/v1.0/drives/b!drive1/root:/Team/Planning 2026.xlsx":
+            body = {"id": "item1", "name": "Planning 2026.xlsx", "size": len(self.data),
+                    "eTag": self.etag, "lastModifiedDateTime": "2026-01-02T08:00:00Z",
+                    "file": {"mimeType": "application/vnd.ms-excel"},
+                    "@microsoft.graph.downloadUrl": DOWNLOAD_URL, **self.item}
+            return httpx.Response(self.status.get("item", 200), json=body)
+        return httpx.Response(404, json={"error": {"message": "graph-text " + path}})
+
+    def _download(self, request):
+        self.downloads.append(request)
+        status = self.status.get("download", 200)
+        if 300 <= status < 400:
+            return self._httpx.Response(status, headers={"Location": "https://elsewhere.test/x"})
+        return self._httpx.Response(status, content=self.data)
+
+    def client(self):
+        httpx = self._httpx
+        return httpx.AsyncClient(base_url="https://graph.microsoft.com",
+                                 headers={"Authorization": "Bearer graph-token"},
+                                 transport=httpx.MockTransport(self._graph))
+
+    def download_transport(self):
+        return self._httpx.MockTransport(self._download)
