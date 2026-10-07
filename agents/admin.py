@@ -25,6 +25,7 @@ Endpoints (all require `<xsappname>.admin` XSUAA scope):
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -42,6 +43,7 @@ from pydantic import (
     Field,
     HttpUrl,
     StrictBool,
+    StrictStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -56,9 +58,12 @@ from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
+from agents.sharepoint_views import check_pins, clean_views
 from agents.slack_tools import BUILTIN_SLACK_URL
 from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
 from agents.teams_tools import BUILTIN_TEAMS_URL
+from agents.validation_errors import validation_item
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -307,6 +312,16 @@ class OAuthClientPayload(BaseModel):
     # and so open writes. See `_validate_odata_entry`.
     services: list[str] = Field(default_factory=list)
     allow_write: StrictBool = False
+    # builtin:sharepoint only. The one workbook the toolset may read (`site`
+    # is <tenant>.sharepoint.com:/sites/<site>) and the views of it an agent
+    # may name. Pinned here, never tool arguments. agents/sharepoint_views.py
+    # is the gate for all four. Strict strings, and `to_config` hands the
+    # three pins on untrimmed: a pin is accepted only in exactly the form
+    # that is stored, so nothing here may repair or convert one.
+    site: StrictStr = Field(default="", max_length=400)
+    library: StrictStr = Field(default="", max_length=128)
+    path: StrictStr = Field(default="", max_length=400)
+    views: dict[str, Any] | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -318,6 +333,26 @@ class OAuthClientPayload(BaseModel):
         if v is None:
             return [] if info.field_name == "services" else False
         return v
+
+    @field_validator("site", "library", "path", mode="before")
+    @classmethod
+    def _null_pin_is_absent(cls, v: Any) -> Any:
+        """``null`` means "not set", as for ``services`` and ``views``: a
+        client that serialises every field must not get a 422 on an Outlook
+        entry. Nothing else is converted; a number or a list stays refused."""
+        return "" if v is None else v
+
+    @field_validator("views")
+    @classmethod
+    def _validate_views(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        # Validated here so a bad view is a 422 naming the field and the
+        # rule, not a registry rebuild that drops the agent. The text never
+        # repeats a value (ViewConfigError). What is kept is the checked
+        # form (`clean_views`), a structure of its own: the posted object is
+        # not read again after this.
+        if v is None:
+            return None
+        return clean_views(v)
 
     @field_validator("theme")
     @classmethod
@@ -429,10 +464,16 @@ class OAuthClientPayload(BaseModel):
             "team": self.team.strip(),
             "channels": self.channels.strip(),
             "from": self.sender.strip(),
+            # Not trimmed, unlike every key above: see the fields.
+            "site": self.site,
+            "library": self.library,
+            "path": self.path,
         }
         config = {k: v for k, v in fields.items() if v}
         if self.theme:
             config["theme"] = dict(self.theme)
+        if self.views:
+            config["views"] = copy.deepcopy(self.views)
         if self.allow_send:
             config["allow_send"] = True
         if self.allow_comment:
@@ -525,6 +566,32 @@ class McpServerPayload(BaseModel):
                 "channel messages. Turn user_context on, or turn allow_send off"
             )
 
+    def _validate_sharepoint(self) -> None:
+        """Rules only builtin:sharepoint has, checked before the per-mode ones.
+
+        The pins and the views go through ``agents.sharepoint_views``, the
+        reading storage and the toolset use; a refusal names the field and
+        the rule, never a value. The block checked is ``to_config()``: the
+        one the route hands to storage.
+        """
+        if self.auth_mode not in (AUTH_MODE_APP_ONLY, AUTH_MODE_DESTINATION):
+            raise ValueError(
+                f"{BUILTIN_SHAREPOINT_URL} requires auth_mode=destination (the "
+                "credential held by a BTP destination) or app_only; it reads the "
+                "pinned workbook as the application and has no per-user mode"
+            )
+        if self.oauth is not None and self.oauth.user_context:
+            # In both modes, as the toolset refuses it at build: under
+            # app_only the switch would otherwise be dropped without a word.
+            raise ValueError(
+                f"oauth.user_context: {BUILTIN_SHAREPOINT_URL} has no signed-in "
+                "user to act as; it reads the pinned workbook as the "
+                "application. Turn oauth.user_context off"
+            )
+        cfg = self.oauth.to_config() if self.oauth else {}
+        check_pins(cfg)
+        clean_views(cfg.get("views"))
+
     @staticmethod
     def _validate_oauth_urls(cfg: dict[str, Any]) -> None:
         """The authorization server's endpoints get the same structural rules
@@ -572,6 +639,17 @@ class McpServerPayload(BaseModel):
             )
         if self.oauth is not None and self.oauth.theme:
             _validate_mail_theme(self.url, self.oauth.theme)
+        is_sharepoint = _server_key(self.url) == BUILTIN_SHAREPOINT_URL
+        if not is_sharepoint and self.oauth is not None and (
+            self.oauth.site or self.oauth.library or self.oauth.path
+            or self.oauth.views is not None
+        ):
+            raise ValueError(
+                "oauth.site, oauth.library, oauth.path and oauth.views belong to a "
+                f"{BUILTIN_SHAREPOINT_URL} entry only; no other server reads them"
+            )
+        if is_sharepoint:
+            self._validate_sharepoint()
         # Before the per-mode rules, because the oauth2 branch below returns
         # early for DCR.
         if (
@@ -667,7 +745,8 @@ class McpServerPayload(BaseModel):
                 )
             if (
                 is_builtin_url(self.url)
-                and str(self.url).strip().rstrip("/").lower() != BUILTIN_TEAMS_URL
+                and str(self.url).strip().rstrip("/").lower()
+                not in (BUILTIN_TEAMS_URL, BUILTIN_SHAREPOINT_URL)
                 and not cfg.get("mailbox")
             ):
                 raise ValueError(
@@ -2470,6 +2549,37 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Seed helper (called on startup)
 # ---------------------------------------------------------------------------
+_SEED_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.\-]{0,63}")
+
+
+def _seed_entry_name(entry: Any) -> str:
+    """The name of a seed entry for a log line: repeated only when it has
+    the form of a name, else a placeholder. Never the entry itself, which
+    holds client secrets, pins and free text."""
+    name = entry.get("name") if isinstance(entry, dict) else None
+    if isinstance(name, str) and _SEED_NAME_RE.fullmatch(name):
+        return name
+    return "<unnamed>"
+
+
+def _seed_error(e: BaseException) -> str:
+    """Why a seed entry was refused, for a log line: where and which kind of
+    error, never what was typed. ``str()`` of a pydantic error carries
+    ``input_value=...``, and a storage refusal may quote a name of the entry;
+    so it is field locations and error types for the former (the reading of
+    ``agents/validation_errors.py``) and the exception class for the rest."""
+    if isinstance(e, ValidationError):
+        items = [validation_item(err) for err in e.errors(
+            include_input=False, include_context=False, include_url=False)]
+        shown = "; ".join(
+            f"{'.'.join(str(part) for part in item['loc']) or '<entry>'}: {item['type']}"
+            for item in items[:10]
+        )
+        more = f" (+{len(items) - 10} more)" if len(items) > 10 else ""
+        return f"{len(items)} validation error(s): {shown}{more}"
+    return type(e).__name__
+
+
 async def seed_from_file_if_empty(seed_path: Path) -> None:
     """Seed the DB from a JSON file if no agents exist yet."""
     async with SessionLocal() as session:
@@ -2502,7 +2612,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             try:
                 skill = SkillPayload.model_validate(entry)
             except Exception as e:
-                logger.warning("Skipping invalid seed skill %r: %s", entry, e)
+                logger.warning("Skipping invalid seed skill '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             await upsert_skill(
                 session,
@@ -2519,7 +2630,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                 # Validate via pydantic model
                 payload = AgentPayload.model_validate(entry)
             except Exception as e:
-                logger.warning("Skipping invalid seed entry %r: %s", entry, e)
+                logger.warning("Skipping invalid seed entry '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             try:
                 await upsert_agent(
@@ -2542,7 +2654,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     deep_json=_deep_json_or_keep(payload.deep),
                 )
             except ValueError as e:
-                logger.warning("Skipping invalid seed entry %r: %s", entry.get("name"), e)
+                logger.warning("Skipping invalid seed entry '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             count += 1
 
@@ -2563,7 +2676,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
             try:
                 wpayload = WorkflowPayload.model_validate(entry)
             except Exception as e:
-                logger.warning("Skipping invalid seed workflow %r: %s", entry, e)
+                logger.warning("Skipping invalid seed workflow '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             try:
                 await upsert_workflow(
@@ -2582,8 +2696,8 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     commit=False,
                 )
             except ValueError as e:
-                logger.warning("Skipping invalid seed workflow %r: %s",
-                               entry.get("name"), e)
+                logger.warning("Skipping invalid seed workflow '%s': %s",
+                               _seed_entry_name(entry), _seed_error(e))
                 continue
             workflow_count += 1
         await session.commit()

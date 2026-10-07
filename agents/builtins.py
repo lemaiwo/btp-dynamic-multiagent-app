@@ -29,6 +29,7 @@ builtin:smtp       --        --        app (MAIL)    --       --
 builtin:sapnotes   --        --        app (public)  default  --
 builtin:sapnotedetail --     --        app (cookie)  --       default
 builtin:odata      --        --        user / app    --       --
+builtin:sharepoint --        app (ro)  app (ro)      --       --
 ================== ========= ========= ============= ======== ========
 
 ``destination`` reaches the API through a BTP destination. The config block's
@@ -47,6 +48,11 @@ only factory that is handed more than its entry -- the catalogue snapshot the
 registry loaded -- through ``context``; see :mod:`agents.odata.tools`. Its
 writes are recorded: the factory always gets the storing audit recorder
 (:mod:`agents.odata.audit`), without which the toolset refuses every write.
+
+``builtin:sharepoint`` reads one pinned workbook as the application and has
+no per-user mode: ``user_context`` is refused in both of its modes. Its
+config block carries the pins and a ``views`` object; see
+:mod:`agents.sharepoint_tools`.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ from agents.odata.tools import odata_toolset
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL, outlook_toolset
 from agents.sapnotes_tools import BUILTIN_SAPNOTES_URL, sapnotes_toolset
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL, sapnotedetail_toolset
+from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL, sharepoint_toolset
 from agents.slack_tools import BUILTIN_SLACK_URL, slack_toolset
 from agents.smtp_tools import BUILTIN_SMTP_URL, smtp_toolset
 from agents.teams_tools import BUILTIN_TEAMS_URL, teams_toolset
@@ -76,6 +83,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_SAPNOTES_URL: sapnotes_toolset,
     BUILTIN_SAPNOTEDETAIL_URL: sapnotedetail_toolset,
     BUILTIN_ODATA_URL: odata_toolset,
+    BUILTIN_SHAREPOINT_URL: sharepoint_toolset,
 }
 
 BUILTIN_URLS = frozenset(_FACTORIES)

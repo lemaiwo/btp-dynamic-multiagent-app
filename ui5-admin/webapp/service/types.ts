@@ -126,6 +126,31 @@ export type OAuthClient =
            * narrow `team` further; blank means every channel of the team.
            */
           channels?: string;
+          // --- sharepoint ---
+          /**
+           * `builtin:sharepoint` only. The site the workbook lives in, as
+           * `<tenant>.sharepoint.com:/sites/<site>`. Pinned, never a tool
+           * argument. Like `library` and `path` it is sent exactly as typed
+           * (no trimming). See agents/sharepoint_views.py.
+           */
+          site?: string;
+          /**
+           * `builtin:sharepoint` only. The name of the document library that
+           * holds the workbook. See agents/sharepoint_views.py.
+           */
+          library?: string;
+          /**
+           * `builtin:sharepoint` only. The path of the one .xlsx file below
+           * the library root. See agents/sharepoint_views.py.
+           */
+          path?: string;
+          /**
+           * `builtin:sharepoint` only. The named views (a table or a
+           * calendar) of the workbook an agent may read; a calendar view
+           * with a `labels.kind` column lists the row kinds it reads in
+           * `kinds`. Validated server-side. See agents/sharepoint_views.py.
+           */
+          views?: Record<string, unknown>;
           // --- destinations ---
           /**
            * `destination` only. On, the destination is resolved with the

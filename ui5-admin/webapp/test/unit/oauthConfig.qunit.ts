@@ -367,3 +367,116 @@ QUnit.test("no other toolset keeps services or allow_write", function (assert) {
         assert.notOk("services" in cleaned || "allow_write" in cleaned, `${url} on ${mode}`);
     }
 });
+
+// --- sharepoint ---
+QUnit.module("oauthConfig — sharepoint");
+
+const SP_VIEWS = { team: { kind: "table", table: "TeamMembers", columns: ["Name", "ID"] } };
+const SP_PINS = { site: "example.sharepoint.com:/sites/planning", library: "Documents",
+    path: "Team/Planning 2026.xlsx" };
+
+QUnit.test("on a destination it keeps exactly the name, the pins and the views", function (assert) {
+    const out = oauthConfig.cleanOAuth(
+        fullForm({ destination: " GRAPH ", user_context: true, views: SP_VIEWS, ...SP_PINS }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual(out, { destination: "GRAPH", ...SP_PINS, views: SP_VIEWS });
+});
+
+QUnit.test("app-only keeps the client fields, the pins and the views, no mailbox or switch", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...SP_PINS }),
+        "app_only", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(out).sort(),
+        ["client_id", "client_secret", "library", "path", "scope", "site", "token_url", "uaa_url", "views"]);
+});
+
+QUnit.test("no other toolset keeps the pins or the views", function (assert) {
+    const teams = oauthConfig.cleanOAuth(fullForm({ destination: "D", views: SP_VIEWS, ...SP_PINS }),
+        "destination", "builtin:teams") as Record<string, unknown>;
+    ["site", "library", "path", "views"].forEach((k) => assert.notOk(k in teams, k));
+    const app = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...SP_PINS }),
+        "app_only", "builtin:outlook") as Record<string, unknown>;
+    ["site", "library", "path", "views"].forEach((k) => assert.notOk(k in app, k));
+});
+
+QUnit.test("parseViews reads the JSON textarea and formatViews round-trips it", function (assert) {
+    assert.deepEqual(oauthConfig.parseViews(""), { error: "" }, "blank is no views (the validator says required)");
+    assert.deepEqual(oauthConfig.parseViews(JSON.stringify(SP_VIEWS)), { views: SP_VIEWS, error: "" });
+    assert.ok(oauthConfig.parseViews("{ team: }").error.indexOf("not valid JSON") > -1);
+    assert.ok(oauthConfig.parseViews("[1]").error.indexOf("JSON object") > -1);
+    assert.deepEqual(oauthConfig.parseViews(oauthConfig.formatViews(SP_VIEWS)).views, SP_VIEWS);
+    assert.strictEqual(oauthConfig.formatViews(undefined), "");
+    assert.ok(oauthConfig.supportsViews("Builtin:SharePoint/"));
+    assert.notOk(oauthConfig.supportsViews("builtin:teams"));
+});
+
+// --- sharepoint: amendment 1 ---
+const SP_CALENDAR_VIEWS = {
+    ...SP_VIEWS,
+    planning: {
+        kind: "calendar", sheet: "{year}", date_row: 8, first_row: 10, first_date_column: "D",
+        labels: { member: "A", team: "B", kind: "C" },
+        kinds: ["Presence", "Guard"],
+        codes: { H: "unavailable", GDI: "GDI" },
+        conflict: { kind: "Guard", against: "Presence", when: ["unavailable"] }
+    }
+};
+
+QUnit.test("sharepoint: a pin is sent as it was typed, never trimmed", function (assert) {
+    const typed = { site: " example.sharepoint.com:/sites/planning", library: "Documents ",
+        path: " Team/Planning 2026.xlsx " };
+    const dest = oauthConfig.cleanOAuth(fullForm({ destination: " GRAPH ", views: SP_VIEWS, ...typed }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual(dest, { destination: "GRAPH", ...typed, views: SP_VIEWS },
+        "the destination name is trimmed as everywhere, the pins are not");
+    assert.ok(validators.validateOAuth(dest, "destination", "builtin:sharepoint")
+        .indexOf("Site must be") > -1, "so the validator sees what the server will see");
+    const app = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...typed }),
+        "app_only", "builtin:sharepoint") as Record<string, unknown>;
+    assert.strictEqual(app.library, "Documents ");
+    assert.strictEqual(app.path, " Team/Planning 2026.xlsx ");
+    const empty = oauthConfig.cleanOAuth(fullForm({ views: SP_VIEWS, ...SP_PINS, library: "", path: undefined }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.notOk("library" in empty || "path" in empty, "an empty pin is left out");
+});
+
+QUnit.test("sharepoint: a calendar view keeps its kinds through the textarea and the cleaner", function (assert) {
+    const parsed = oauthConfig.parseViews(oauthConfig.formatViews(SP_CALENDAR_VIEWS));
+    assert.deepEqual(parsed.views, SP_CALENDAR_VIEWS);
+    const out = oauthConfig.cleanOAuth(fullForm({ destination: "GRAPH", views: parsed.views, ...SP_PINS }),
+        "destination", "builtin:sharepoint") as Record<string, unknown>;
+    assert.deepEqual((out.views as typeof SP_CALENDAR_VIEWS).planning.kinds, ["Presence", "Guard"]);
+    assert.strictEqual(validators.validateOAuth(out, "destination", "builtin:sharepoint"), "");
+});
+
+// --- sharepoint: fix round 1 ---
+QUnit.test("sharepoint: a views text that is no JSON is refused with a fixed text, never the typed text", function (assert) {
+    const refused = oauthConfig.parseViews("{ team: SECRETVALUE }");
+    assert.strictEqual(refused.error, "Views is not valid JSON.");
+    assert.strictEqual(refused.error.indexOf("SECRETVALUE"), -1, "the typed text is not echoed");
+    assert.notOk("views" in refused, "and nothing is parsed");
+});
+
+QUnit.test("sharepoint: a mail theme text that is no JSON is refused with a fixed text, never the typed text", function (assert) {
+    const refused = oauthConfig.parseMailTheme("{ band: SECRETVALUE }");
+    assert.strictEqual(refused.error, "Mail theme is not valid JSON.");
+    assert.strictEqual(refused.error.indexOf("SECRETVALUE"), -1, "the typed text is not echoed");
+});
+
+QUnit.test("sharepoint: formatViews then parseViews loses nothing of nested arrays and objects", function (assert) {
+    const views = {
+        team: { kind: "table", table: "TeamMembers", columns: ["Name", "Team", "ID"] },
+        planning: {
+            kind: "calendar", sheet: "{year}", date_row: 8, first_row: 10, first_date_column: "D",
+            labels: { member: "A", team: "B", kind: "C" }, kinds: ["Presence", "Guard"],
+            codes: { H: "unavailable", T: "available", GDI: "GDI" },
+            lookup: { view: "team", on: "Name", add: ["ID"] },
+            conflict: { kind: "Guard", against: "Presence", when: ["unavailable", "half_day"] },
+            nested: [[1, 2], [{ a: [true, null, "x"] }]]
+        }
+    };
+    const text = oauthConfig.formatViews(views);
+    const back = oauthConfig.parseViews(text);
+    assert.strictEqual(back.error, "");
+    assert.deepEqual(back.views, views, "the same object comes back");
+    assert.strictEqual(oauthConfig.formatViews(back.views), text, "and formats to the same text");
+});

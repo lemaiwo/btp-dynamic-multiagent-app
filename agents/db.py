@@ -2130,6 +2130,73 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
 _MAIL_THEME_URLS = frozenset({"builtin:smtp", "builtin:outlook"})
 
 
+# builtin:sharepoint: the one workbook (`site`, `library`, `path`) and the
+# `views` of it an agent may name, next to the destination name or the client
+# credentials. Nothing else is stored for it, whatever the block carried.
+_SHAREPOINT_URL = "builtin:sharepoint"
+_SHAREPOINT_PIN_KEYS = ("site", "library", "path")
+_SHAREPOINT_CREDENTIAL_KEYS = ("client_id", "client_secret", "uaa_url", "token_url", "scope")
+
+
+def _clean_sharepoint_entry(
+    oauth: Any, mode: str, fallback: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:sharepoint`` entry for storage.
+
+    The last gate before the row, whoever the caller is: the pins and the
+    views are checked here again (``agents.sharepoint_views``, the same
+    reading the admin gate and the toolset use), unknown view keys are a
+    ValueError rather than dropped, and only this entry's own keys are kept
+    -- no ``user_context`` (there is no per-user mode; a true one is
+    refused), no ``allow_send`` (there is nothing to send), no key of
+    another built-in.
+
+    **What is stored is what was checked.** The three pins are taken from
+    the block as they are, never through the generic cleaners (which trim
+    and ``str()`` every value): ``check_pins`` refuses a pin that is not in
+    its exact form and returns nothing, so a pin repaired here would be
+    stored in a form no gate has seen, and a number or a list would become
+    its ``str()``. The check runs on the very dict that is returned. The
+    views are stored as ``clean_views`` returns them, never the posted ones.
+    """
+    from agents.sharepoint_views import check_pins, clean_views
+
+    src = oauth if isinstance(oauth, dict) else {}
+    if mode not in (AUTH_MODE_DESTINATION, AUTH_MODE_APP_ONLY):
+        raise ValueError(f"{_SHAREPOINT_URL} requires auth_mode=destination or app_only")
+    if src.get("user_context") is True:
+        # Refused, not dropped: a script or a direct `upsert_agent` reaches
+        # this without the admin payload, and an entry that asked for "as
+        # the signed-in user" must not become an application entry without
+        # a word. `is True` as `user_context_of` reads it; anything else is
+        # "not set" and is not stored.
+        raise ValueError(
+            f"oauth.user_context: {_SHAREPOINT_URL} has no signed-in user to act "
+            "as; it reads the pinned workbook as the application"
+        )
+    cleaned: dict[str, Any] = {}
+    if mode == AUTH_MODE_DESTINATION:
+        # The name is no pin: it gets the rule every destination entry has
+        # (a non-empty string, stored trimmed). Credential keys are dropped.
+        name = src.get("destination")
+        name = name.strip() if isinstance(name, str) else ""
+        if not name:
+            raise ValueError("destination server requires a destination name")
+        cleaned["destination"] = name
+    else:
+        # The existing client-credentials rules (required keys, the stored
+        # secret kept when the edit sends a blank one); of what they return
+        # only the credential itself is kept: no mailbox, no `allow_send`.
+        credential = _clean_client_credentials(src, fallback)
+        cleaned.update(
+            (k, credential[k]) for k in _SHAREPOINT_CREDENTIAL_KEYS if k in credential
+        )
+    cleaned.update((k, src.get(k)) for k in _SHAREPOINT_PIN_KEYS)
+    check_pins(cleaned)
+    cleaned["views"] = clean_views(src.get("views"))
+    return cleaned
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
@@ -2139,8 +2206,12 @@ def _clean_oauth(
     default; an empty or all-default theme stores nothing. A bad theme is a
     ValueError, like every other malformed block.
     """
-    cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     builtin = str(url or "").strip().rstrip("/").lower()
+    if builtin == _SHAREPOINT_URL:
+        # Its own cleaner, and none of the generic ones below: they trim and
+        # stringify what they keep, and a pin is stored only as it was checked.
+        return _clean_sharepoint_entry(oauth, mode, fallback)
+    cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
         from agents.mail_render import MailTheme
 
@@ -2261,6 +2332,14 @@ def prepare_servers(
             if odata_seen:
                 raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
             odata_seen = True
+        elif url.rstrip("/").lower() == _SHAREPOINT_URL:
+            # Stored under exactly this spelling, for the reason above:
+            # `_clean_oauth` forgives case and a trailing slash, the
+            # registry's built-in lookup forgives no slash, and an entry it
+            # does not know as a built-in is built as a remote MCP server
+            # with this entry's destination. Before the lookup of the
+            # stored secret below, which is by URL.
+            url = _SHAREPOINT_URL
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:

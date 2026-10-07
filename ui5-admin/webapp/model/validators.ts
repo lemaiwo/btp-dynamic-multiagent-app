@@ -14,6 +14,50 @@ const MAX_ODATA_ENTRY_SERVICES = 50;
  * `agents/admin.py`. */
 const DESTINATION_NAME_RE = /^[A-Za-z0-9_.-]{1,200}$/;
 
+// --- sharepoint ---
+/** The `site` pin: `<tenant>.sharepoint.com:/<1-4 path segments>`. Mirrors
+ * `check_pins` in `agents/sharepoint_views.py`, which is authoritative. */
+const SHAREPOINT_SITE_RE = /^[a-z0-9][a-z0-9-]{0,62}\.sharepoint\.com:(\/[A-Za-z0-9._-]{1,128}){1,4}$/;
+/** A control or format character, or a line / paragraph separator: what
+ * `_text` in `agents/sharepoint_views.py` refuses in a one-line value. */
+const NOT_ONE_LINE_RE = /[\p{C}\p{Zl}\p{Zp}]/u;
+/** `MAX_KINDS` and `MAX_KIND_CHARS` in `agents/sharepoint_views.py`. */
+const SHAREPOINT_MAX_KINDS = 10;
+const SHAREPOINT_MAX_KIND_CHARS = 60;
+/** `RUN_KEYS` in `agents/sharepoint_views.py`: the fields of a calendar run,
+ * which a looked-up column must not be named like. */
+const SHAREPOINT_RUN_KEYS = ["member", "team", "kind", "status", "from", "to"];
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A configured name as the server reads it (`_text`: composed, trimmed), or
+ * undefined when it is no one-line string of 1 to `limit` characters. */
+function configuredName(value: unknown, limit: number): string | undefined {
+    if (typeof value !== "string") {
+        return undefined;
+    }
+    const text = value.normalize("NFC").trim();
+    return text && text.length <= limit && !NOT_ONE_LINE_RE.test(text) ? text : undefined;
+}
+
+/**
+ * A pin the server stores as it was given (`_exact`): refused unless it
+ * already is the checked form. `label` starts the message; the value is
+ * never part of it.
+ */
+function exactPinError(value: string, label: string): string {
+    if (NOT_ONE_LINE_RE.test(value)) {
+        return `${label} must be one line without control characters.`;
+    }
+    if (value.trim() !== value || value.normalize("NFC") !== value) {
+        return `${label} must have no leading or trailing whitespace and use `
+            + "composed (NFC) characters.";
+    }
+    return "";
+}
+
 /**
  * Client-side mirrors of the Pydantic rules in `agents/admin.py`.
  *
@@ -77,6 +121,109 @@ export default {
                 + "signed-in user: the destination's app-level credential is an "
                 + "application token, and Graph does not allow application posts. "
                 + "Turn 'Act as signed-in user' on, or turn sending off.";
+        }
+        return "";
+    },
+
+    // --- sharepoint ---
+    /** True for `builtin:sharepoint`, whose target is one pinned workbook. */
+    isSharePoint(url: string): boolean {
+        return (url || "").trim().replace(/\/+$/, "").toLowerCase() === "builtin:sharepoint";
+    },
+
+    /**
+     * The rules of a `builtin:sharepoint` entry that can be said while the
+     * field is on screen. Mirrors `_validate_sharepoint` in `agents/admin.py`;
+     * what is inside a view is the server's alone. Returns an error message,
+     * or an empty string when the config is valid.
+     */
+    validateSharePoint(oauth: OAuthClient | undefined, authMode: AuthMode): string {
+        if (authMode !== "app_only" && authMode !== "destination") {
+            return "SharePoint requires auth mode 'destination' or 'app_only': it "
+                + "reads the pinned workbook as the application.";
+        }
+        const cfg = (oauth || {}) as Record<string, unknown>;
+        // As typed: a pin is stored and sent in exactly the form that was
+        // checked, so nothing is trimmed here before it is looked at.
+        const text = (value: unknown): string => (typeof value === "string" ? value : "");
+        if (cfg.user_context === true) {
+            return "SharePoint has no signed-in user to act as; turn 'Act as "
+                + "signed-in user' off.";
+        }
+        if (!SHAREPOINT_SITE_RE.test(text(cfg.site))) {
+            return "Site must be <tenant>.sharepoint.com:/sites/<site>.";
+        }
+        const library = text(cfg.library);
+        if (!library.trim()) {
+            return "SharePoint requires the document library's name.";
+        }
+        const libraryError = exactPinError(library, "Library");
+        if (libraryError) {
+            return libraryError;
+        }
+        const path = text(cfg.path);
+        if (!/\.xlsx$/i.test(path.trim())) {
+            return "Path must be the path of an .xlsx file below the library root.";
+        }
+        const pathError = exactPinError(path, "Path");
+        if (pathError) {
+            return pathError;
+        }
+        const views = cfg.views;
+        if (!isPlainObject(views) || Object.keys(views).length === 0) {
+            return "SharePoint requires at least one view.";
+        }
+        return this.validateSharePointViews(views);
+    },
+
+    /**
+     * The rules of a calendar view that pin what a sheet's label text may
+     * put in a result. Mirrors `_calendar` in `agents/sharepoint_views.py`:
+     * a view with a kind label lists its `kinds`, `conflict` names two of
+     * them, and a looked-up column is not named like a run field. Every
+     * other rule of a view is the server's alone. The messages name the
+     * field and the rule, never a value or a view.
+     */
+    validateSharePointViews(views: Record<string, unknown>): string {
+        for (const view of Object.values(views)) {
+            if (!isPlainObject(view) || view.kind !== "calendar") {
+                continue;
+            }
+            let kinds: string[] = [];
+            if (isPlainObject(view.labels) && "kind" in view.labels) {
+                const raw = view.kinds;
+                const names = Array.isArray(raw)
+                    ? raw.map((item) => configuredName(item, SHAREPOINT_MAX_KIND_CHARS))
+                    : [];
+                if (names.length === 0 || names.length > SHAREPOINT_MAX_KINDS
+                    || names.some((name) => name === undefined)) {
+                    return `Views: 'kinds' of a calendar view with a kind label must be a list of 1 to `
+                        + `${SHAREPOINT_MAX_KINDS} names, each one line of at most `
+                        + `${SHAREPOINT_MAX_KIND_CHARS} characters.`;
+                }
+                kinds = names as string[];
+                if (new Set(kinds).size !== kinds.length) {
+                    return "Views: 'kinds' must not repeat a value.";
+                }
+            } else if ("kinds" in view) {
+                return "Views: 'kinds' is only allowed with labels.kind.";
+            }
+            const lookup = view.lookup;
+            if (isPlainObject(lookup) && Array.isArray(lookup.add) && lookup.add.some(
+                (column) => typeof column === "string" && SHAREPOINT_RUN_KEYS.indexOf(
+                    column.normalize("NFC").trim().toLowerCase()) > -1)) {
+                return "Views: 'lookup.add' must not add a column named like a run field "
+                    + `(${SHAREPOINT_RUN_KEYS.join(", ")}).`;
+            }
+            const conflict = view.conflict;
+            if (isPlainObject(conflict) && kinds.length) {
+                for (const key of ["kind", "against"]) {
+                    const name = configuredName(conflict[key], 64);
+                    if (name !== undefined && kinds.indexOf(name) === -1) {
+                        return `Views: 'conflict.${key}' must be one of kinds.`;
+                    }
+                }
+            }
         }
         return "";
     },
@@ -189,6 +336,12 @@ export default {
                 return teamsError;
             }
         }
+        if (this.isSharePoint(url)) {
+            const sharePointError = this.validateSharePoint(oauth, authMode);
+            if (sharePointError) {
+                return sharePointError;
+            }
+        }
         if (authMode === "app_only") {
             if (!oauth || ("dcr" in oauth && oauth.dcr === true)) {
                 return oauth
@@ -205,7 +358,8 @@ export default {
                     + "nobody signs in).";
             }
             const isBuiltin = (url || "").trim().toLowerCase().startsWith("builtin:");
-            if (isBuiltin && !this.isTeams(url) && !(app.mailbox || "").trim()) {
+            if (isBuiltin && !this.isTeams(url) && !this.isSharePoint(url)
+                && !(app.mailbox || "").trim()) {
                 return "App-only auth requires a mailbox: the token identifies no "
                     + "user, so there is no 'me' to fall back to.";
             }
