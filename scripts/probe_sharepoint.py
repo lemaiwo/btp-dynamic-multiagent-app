@@ -91,9 +91,8 @@ def graph_token(binding: Binding, destination: str, client: httpx.Client) -> str
           f"host={urlsplit(str(config.get('URL') or '')).hostname}")
     tokens = body.get("authTokens") or []
     if not tokens or not tokens[0].get("value"):
-        error = (tokens[0].get("error") if tokens else "") or "no authTokens"
-        # The token service's own text can quote the client id; keep the code.
-        raise ProbeError(f"the destination returned no token ({str(error)[:60]!r})")
+        # The token service's own text can quote the client id: fixed text only.
+        raise ProbeError("the destination returned no token (authTokens empty or errored)")
     return str(tokens[0]["value"])
 
 
@@ -141,6 +140,9 @@ def probe(site: str, library: str, path: str, token: str, client: httpx.Client) 
         return 1
 
     url = str(item.get("@microsoft.graph.downloadUrl") or "")
+    if not url:
+        print("FAIL  no download location in the item")
+        return 1
     parts = urlsplit(url)
     if parts.scheme != "https" or (parts.hostname or "").lower() != host.lower():
         print(f"FAIL  download host is {parts.hostname!r}, not the site host {host!r}: "
@@ -155,7 +157,8 @@ def probe(site: str, library: str, path: str, token: str, client: httpx.Client) 
             print(f"FAIL  download: HTTP {dl.status_code}")
             return 1
         for chunk in dl.iter_bytes():
-            head = head or chunk[:4]
+            if len(head) < 4:
+                head = (head + chunk)[:4]
             size += len(chunk)
             if size > MAX_BYTES:
                 break
@@ -183,6 +186,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except httpx.HTTPError as e:
         print(f"FAIL  network: {type(e).__name__}")
+        return 1
+    except Exception as e:  # class name only: the text may quote a URL or a token
+        print(f"FAIL  unexpected {type(e).__name__}")
         return 1
 
 
