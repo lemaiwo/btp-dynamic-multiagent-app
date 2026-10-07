@@ -93,6 +93,7 @@ async def test_read_table_returns_pinned_columns_and_the_modified_time():
     out = await _call(_toolset(FakeGraph(WORKBOOK)), "read_table", view="team")
     assert out["view"] == "team" and out["row_count"] == 3
     assert out["columns"] == ["Name", "Team", "ID"]
+    assert out["skipped_rows"] == 0
     assert out["rows"][0] == {"Name": "Ann Example", "Team": "Basis", "ID": 1001}
     assert out["last_modified"] == "2026-01-02T08:00:00Z"
 
@@ -313,7 +314,7 @@ async def test_a_result_that_does_not_fit_is_refused_not_cut_off(monkeypatch):
 async def test_a_result_at_the_cap_passes_and_one_character_more_does_not(monkeypatch):
     toolset = _toolset(FakeGraph(WORKBOOK))
     out = await _call(toolset, "read_table", view="team")
-    size = len(json.dumps(out, ensure_ascii=False, default=str))
+    size = tools._result_chars(out)
     monkeypatch.setattr(tools, "MAX_RESULT_CHARS", size)
     assert "rows" in await _call(toolset, "read_table", view="team")
     monkeypatch.setattr(tools, "MAX_RESULT_CHARS", size - 1)
@@ -414,3 +415,102 @@ def test_app_only_builds_a_client_credentials_graph_client():
 
     assert isinstance(toolset.http_client.auth, ClientCredentialsAuth)
     assert str(toolset.http_client.base_url).startswith("https://graph.microsoft.com")
+
+
+# --- follow-up after review -------------------------------------------------
+
+async def test_read_table_passes_the_readers_skipped_rows_on_and_explains_them():
+    book = build_workbook({2026: WEEK}, team=[
+        ("Ann Example", "Basis", 1001, "u-ann"),
+        ("Bob Sample", "x" * 300, 1002, "u-bob"),
+        ("Cy\nPlaceholder", "Dev", 1003, "u-cy"),
+    ])
+    toolset = _toolset(FakeGraph(book))
+    out = await _call(toolset, "read_table", view="team")
+    assert out["skipped_rows"] == 2 and out["row_count"] == 1
+    assert out["rows"] == [{"Name": "Ann Example", "Team": "Basis", "ID": 1001}]
+    assert "skipped_rows" in toolset.tools["read_table"].description
+
+
+def test_the_calendar_description_names_the_limit_that_is_enforced(monkeypatch):
+    def described() -> str:
+        tool = _toolset(FakeGraph(WORKBOOK)).tools["read_calendar"]
+        return json.dumps(tool.function_schema.json_schema) + tool.description
+
+    assert f"At most {tools.MAX_WINDOW_DAYS} days" in described()
+    assert "{max_days}" not in described()
+    monkeypatch.setattr(tools, "MAX_WINDOW_DAYS", 7)
+    assert "At most 7 days" in described()
+
+
+async def test_the_cap_counts_what_the_framework_sends_also_for_non_ascii_names(monkeypatch):
+    from pydantic_ai.messages import ToolReturnPart
+
+    names = [("Zo\u00eb \u00c9xample \u00df\u4e2d", "B\u00e2sis", 1001, "u"),
+             ("Ren\u00e9e \u00d8st", "D\u00e9v", 1002, "u")]
+    toolset = _toolset(FakeGraph(build_workbook({2026: WEEK}, team=names)))
+    out = await _call(toolset, "read_table", view="team")
+    assert out["rows"][0]["Name"] == "Zo\u00eb \u00c9xample \u00df\u4e2d"
+    sent = ToolReturnPart(tool_name="read_table", content=out,
+                          tool_call_id="c1").model_response_str()
+    # The names go out as they are, not as \uXXXX escapes ...
+    assert "Zo\u00eb" in sent and "\\u" not in sent
+    # ... so the measured size is the size of what is sent, never less.
+    size = tools._result_chars(out)
+    assert size >= len(sent)
+    assert size == len(sent)
+    monkeypatch.setattr(tools, "MAX_RESULT_CHARS", size)
+    assert "rows" in await _call(toolset, "read_table", view="team")
+    monkeypatch.setattr(tools, "MAX_RESULT_CHARS", size - 1)
+    assert (await _call(toolset, "read_table", view="team"))["error"]["code"] == \
+        "result_too_large"
+
+
+async def test_a_bound_user_token_is_never_forwarded(monkeypatch, caplog):
+    """Both tools read as the application, also inside a signed-in request."""
+    _loud(caplog)
+    from agents import auth, destination_auth
+
+    jwt = "eyJ" + MARKER + ".user.jwt"
+    graph = FakeGraph(WORKBOOK)
+    resolver = _Resolver()
+    monkeypatch.setattr(destination_auth, "resolver_for", lambda oauth, key, **kw: resolver)
+    # No ``http``: the toolset builds its client through build_http_client.
+    toolset = sharepoint_toolset(CONFIG, auth_mode="destination",
+                                 download_transport=graph.download_transport())
+    toolset.http_client._transport = httpx.MockTransport(graph._graph)
+    t1, t2 = auth.current_jwt.set(jwt), auth.current_principal.set(MARKER + "@example.com")
+    try:
+        table = await _call(toolset, "read_table", view="team")
+        runs = await _call(toolset, "read_calendar", view="planning",
+                           date_from="2026-01-05", date_to="2026-01-11")
+    finally:
+        auth.current_principal.reset(t2)
+        auth.current_jwt.reset(t1)
+    await toolset.http_client.aclose()
+    assert table["row_count"] == 3 and runs["runs"]
+    assert resolver.calls and set(resolver.calls) == {None}
+    assert graph.requests and len(graph.downloads) == 1
+    for request in graph.requests + graph.downloads:
+        seen = str(request.url) + repr(sorted(request.headers.items())) \
+            + request.content.decode("utf-8", "replace")
+        assert MARKER not in seen
+    assert {r.headers["Authorization"] for r in graph.requests} == {"Bearer dest-token"}
+    assert MARKER not in _said(table) + _said(runs) and MARKER not in caplog.text
+
+
+async def test_concurrent_calls_on_one_toolset_resolve_and_download_once():
+    graph = FakeGraph(WORKBOOK)
+    toolset = _toolset(graph)
+    calendar = {"view": "planning", "date_from": "2026-01-05", "date_to": "2026-01-11"}
+    results = await asyncio.gather(*(
+        _call(toolset, "read_table", view="team") if i % 2 else
+        _call(toolset, "read_calendar", **calendar) for i in range(8)))
+    paths = [r.url.path for r in graph.requests]
+    assert sum(p.endswith(":/sites/planning") for p in paths) == 1
+    assert sum(p.endswith("/drives") for p in paths) == 1
+    assert len(graph.downloads) == 1
+    alone = _toolset(FakeGraph(WORKBOOK))
+    assert results[1::2] == [await _call(alone, "read_table", view="team")] * 4
+    assert results[0::2] == [await _call(alone, "read_calendar", **calendar)] * 4
+    assert results[1]["row_count"] == 3 and results[0]["runs"]
