@@ -31,6 +31,7 @@ from agents.db import (
     list_skills,
     odata_entries,
 )
+from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.odata import BUILTIN_ODATA_URL
@@ -119,7 +120,10 @@ def _compute_tool_prefixes(urls: list[str]) -> list[str]:
     64-char function-name limit (the full hostname would blow past it)."""
     slugs = []
     for u in urls:
-        parsed = urlparse(u)
+        # Trimmed as `is_builtin_url` reads it: a built-in spelled with edge
+        # whitespace must get the prefix of its name (the fixed-form activity
+        # lines of the SharePoint and Bitbucket tools go by the tool's name).
+        parsed = urlparse(str(u).strip())
         # builtin: URLs carry no host -- the name lives in the path, so
         # `builtin:gmail` prefixes as `gmail` rather than collapsing to `mcp`
         # like every other hostless entry.
@@ -146,6 +150,13 @@ def _compute_tool_prefixes(urls: list[str]) -> list[str]:
 _PREVIEW_REPR = reprlib.Repr()
 _PREVIEW_REPR.maxstring = 600
 _PREVIEW_REPR.maxother = 600
+
+
+def _is_bitbucket_entry(spec: dict) -> bool:
+    """Whether a server entry is ``builtin:bitbucket`` in any spelling, by the
+    canonical server key storage counts with (trimmed, no trailing slash,
+    lower case)."""
+    return str(spec.get("url") or "").strip().rstrip("/").lower() == BUILTIN_BITBUCKET_URL
 
 
 def _short_tool_output(result) -> str:
@@ -715,7 +726,22 @@ async def build_orchestrator() -> BuildResult:
             if len(specs) > 1
             else [None] * len(specs)
         )
+        # The admin gate and storage refuse a second builtin:bitbucket entry;
+        # a row written directly in the database passes neither, and the
+        # second toolset could carry wider switches (allow_approve) than the
+        # one somebody reviewed. Fail closed: none of them is attached, not
+        # "the first", and the agent keeps its other servers.
+        no_bitbucket = sum(_is_bitbucket_entry(s) for s in specs) > 1
+        if no_bitbucket:
+            # The agent and the rule only: no URL as typed, no config value.
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:bitbucket entry; "
+                "the agent is built without the Bitbucket tools",
+                row.name,
+            )
         for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
+            if no_bitbucket and _is_bitbucket_entry(spec):
+                continue
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:
                 if is_builtin_url(spec["url"]):
