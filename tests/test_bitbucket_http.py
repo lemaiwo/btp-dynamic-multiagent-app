@@ -3,6 +3,7 @@ failure is said, and that nothing remote ends up in a message or a log."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -17,6 +18,7 @@ os.environ.pop("VCAP_APPLICATION", None)
 import httpx  # noqa: E402
 import pytest  # noqa: E402
 
+from agents import bitbucket_tools  # noqa: E402
 from agents.bitbucket_config import pins_of  # noqa: E402
 from agents.bitbucket_tools import (  # noqa: E402
     BACKOFF_SECONDS,
@@ -314,27 +316,93 @@ async def test_values_that_are_no_list_of_objects_are_not_values(values):
     assert got == ([{"slug": "r1"}] if isinstance(values, list) else [])
 
 
+async def _other_client_line(caplog) -> bool:
+    """Whether a request of a client that is not this toolset's is logged."""
+    caplog.clear()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda r: httpx.Response(200))) as other:
+        await other.get("https://other.example.test/seen")
+    return any(r.name == "httpx" and "other.example.test/seen" in r.getMessage()
+               for r in caplog.records)
+
+
 async def test_httpx_does_not_log_the_urls_of_this_client(caplog):
     # httpx logs "HTTP Request: GET <url> ..." at INFO; a redirect target and a
     # paging link are Bitbucket's text, and a later task puts file paths there.
+    # The level is set on the `httpx` logger itself: `app.py` raises it to
+    # WARNING for the whole process when a test before this one imported the
+    # app, and then httpx makes no request line at all, for any client: this
+    # test would prove nothing about the filter in its first half and fail in
+    # its second.
     caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO, logger="httpx")
+    # The control: the lines are made and reach the handler ...
+    assert await _other_client_line(caplog)
+    caplog.clear()
     fake = FakeBitbucket()
     fake.add_pr("svc-a", 7)
     client = _through_destination(fake)
     await client._get_following(PR + "/diff")
     assert len(fake.requests) == 2
+    # ... and none of this client's two requests made one.
+    assert not [r for r in caplog.records if r.name == "httpx"]
     said = "\n".join(caplog.handler.format(r) for r in caplog.records)
     assert "svc-a" not in said and "aaaaaaaaaaaa" not in said and HOST not in said
+    assert bitbucket_tools._sending.get() is False
 
-    # Another client's requests are logged as before, also after a refusal here.
+    # Another client's requests are logged as before, also after a refusal here
+    # (the context variable is reset on that way out too).
     fake.override = lambda r: httpx.Response(429)
     with pytest.raises(Refused):
         await BitbucketClient(fake.client(), PINS, sleep=_no_sleep)._send("GET", "/2.0/user")
-    caplog.clear()
-    async with httpx.AsyncClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(200))) as other:
-        await other.get("https://other.example.test/seen")
-    assert any("other.example.test/seen" in r.getMessage() for r in caplog.records)
+    assert bitbucket_tools._sending.get() is False
+    assert await _other_client_line(caplog)
+
+
+async def test_the_filter_drops_only_what_the_sending_task_logs(caplog):
+    """The rule of the filter by itself, whatever else sits on the logger
+    (``agents.sharepoint_tools`` puts its own filter there in the real app)."""
+    caplog.set_level(logging.INFO, logger="httpx")
+    log = logging.getLogger("httpx")
+    mine = [f for f in log.filters if type(f).__name__ == "_NoRequestUrl"
+            and type(f).__module__ == bitbucket_tools.__name__]
+    assert len(mine) == 1
+    bitbucket_tools._install_once()               # a second call adds none
+    assert [f for f in log.filters if type(f) is type(mine[0])] == mine
+    record = logging.LogRecord("httpx", logging.INFO, __file__, 1,
+                               "HTTP Request: GET %s", ("https://x.test/a",), None)
+    assert mine[0].filter(record) is True         # not sending: no business with it
+    token = bitbucket_tools._sending.set(True)
+    try:
+        assert mine[0].filter(record) is False
+        log.info("HTTP Request: GET %s", "https://x.test/dropped")
+        # A thread that does not carry the sending context is not silenced.
+        seen = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: mine[0].filter(record))
+        assert seen is True
+    finally:
+        bitbucket_tools._sending.reset(token)
+    log.info("HTTP Request: GET %s", "https://x.test/kept")
+    texts = [r.getMessage() for r in caplog.records]
+    assert any("x.test/kept" in t for t in texts)
+    assert not any("x.test/dropped" in t for t in texts)
+
+
+@pytest.mark.parametrize("failure", ["transport", "cancel", "auth"])
+async def test_the_sending_mark_is_gone_however_a_request_ends(failure):
+    fake = FakeBitbucket()
+
+    def broken(request):
+        if failure == "cancel":
+            raise asyncio.CancelledError
+        raise (httpx.ReadTimeout("x", request=request) if failure == "transport"
+               else RuntimeError("x"))
+
+    fake.override = broken
+    client = BitbucketClient(fake.client(), PINS, sleep=_no_sleep)
+    with pytest.raises((Refused, asyncio.CancelledError, RuntimeError)):
+        await client._send("GET", "/2.0/user")
+    assert bitbucket_tools._sending.get() is False
 
 
 async def _no_sleep(seconds):
