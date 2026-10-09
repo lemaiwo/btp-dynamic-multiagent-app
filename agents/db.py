@@ -1225,8 +1225,10 @@ class WorkflowRun(Base):
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # Indexed for agents/notifications.py, which filters and orders on it
+    # at every poll (ix_workflow_runs_finished_at).
     finished_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True), nullable=True, index=True
     )
     items_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     items_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -1364,8 +1366,10 @@ class JobRun(Base):
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+    # Indexed for agents/notifications.py, which filters and orders on it
+    # at every poll (ix_job_runs_finished_at).
     finished_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
+        DateTime(timezone=True), nullable=True, index=True
     )
     timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=1800)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -1666,6 +1670,10 @@ async def _create_and_migrate() -> None:
             conn, "uq_ide_artifacts_version", "ide_artifacts",
             ("session_id", "kind", "version"),
         )
+        await _ensure_plain_index(conn, "ix_job_runs_finished_at", "job_runs", "finished_at")
+        await _ensure_plain_index(
+            conn, "ix_workflow_runs_finished_at", "workflow_runs", "finished_at"
+        )
 
 
 async def _backfill_ide_revisions(conn) -> None:
@@ -1871,6 +1879,32 @@ async def _ensure_index(conn, name: str, table: str, column: str) -> None:
         logger.warning(
             "Could not create index %s on %s(%s); duplicate slugs may exist. "
             "Fix them in the admin UI and restart.",
+            name, table, column, exc_info=True,
+        )
+
+
+async def _ensure_plain_index(conn, name: str, table: str, column: str) -> None:
+    """Idempotently add a non-unique index on one column.
+
+    For an index a model gained after its table shipped (``index=True``
+    names it ``ix_<table>_<column>``; keep the name given here equal to
+    that, or a new database and a migrated one end up with two indexes).
+    The index only makes reads faster, so a failure is logged as a WARNING,
+    never raised. On Postgres the attempt runs in a SAVEPOINT, as in
+    :func:`_ensure_unique_index`. Not ``CONCURRENTLY`` (that cannot run in
+    this transaction): on Postgres the first start after the upgrade blocks
+    writes to the table while the index is built.
+    """
+    ddl = text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})")
+    try:
+        if conn.dialect.name == "postgresql":
+            async with conn.begin_nested():
+                await conn.execute(ddl)
+        else:
+            await conn.execute(ddl)
+    except Exception:
+        logger.warning(
+            "Could not create index %s on %s(%s); reads on it stay unindexed.",
             name, table, column, exc_info=True,
         )
 

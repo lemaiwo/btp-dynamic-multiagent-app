@@ -12,6 +12,8 @@ Run:  python -m pytest tests/test_notifications.py -q
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
 import sys
 import uuid
@@ -22,7 +24,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -39,6 +41,7 @@ from agents.db import (  # noqa: E402
     JobRun,
     SessionLocal,
     WorkflowRun,
+    engine,
     init_db,
 )
 
@@ -248,7 +251,8 @@ async def test_the_first_call_sets_the_marker_to_now(client):
     stored = await markers()
     assert stored == {"alice": parsed(body["seen_at"])}
     # A run that finishes afterwards is unread, and the marker stays.
-    later = await agent_run(now() + timedelta(milliseconds=5))
+    await asyncio.sleep(0.005)
+    later = await agent_run(now())
     again = await listing(client)
     assert again["seen_at"] == body["seen_at"]
     assert again["unread_count"] == 1
@@ -278,6 +282,32 @@ async def test_without_a_principal_the_marker_is_keyed_local(client):
     assert set(await markers()) == {"local"}
 
 
+async def test_an_over_long_principal_is_keyed_by_its_digest(client):
+    """The key column holds 255 characters; PostgreSQL and SAP HANA refuse a
+    longer value (SQLite does not), which would be a 500."""
+    one = "a" * 300
+    other = "a" * 299 + "b"
+    fits = "c" * 255
+    await agent_run(ago(hours=2))
+    await set_marker(notifications._marker_key(one), ago(hours=5))
+    assert (await listing(client, one))["unread_count"] == 1
+    assert (await listing(client, other))["unread_count"] == 0
+    assert (await listing(client, fits))["unread_count"] == 0
+    r = await call(client, "POST", SEEN, one, json={"up_to": ago(hours=1).isoformat()})
+    assert r.status_code == 200, r.text
+    assert (await listing(client, one))["unread_count"] == 0
+    stored = await markers()
+    key = "sha256:" + hashlib.sha256(one.encode()).hexdigest()
+    assert set(stored) == {
+        key, "sha256:" + hashlib.sha256(other.encode()).hexdigest(), fits,
+    }
+    assert stored[key] != stored[fits]
+    assert all(len(k) <= 255 for k in stored)
+    # A principal spelled like another one's key does not get that marker.
+    assert notifications._marker_key(key) != key
+    assert notifications._marker_key(key).startswith("sha256:")
+
+
 async def test_the_principal_is_never_taken_from_the_request(client):
     r = await call(
         client, "GET", f"{LIST}?principal=mallory", "alice",
@@ -285,6 +315,23 @@ async def test_the_principal_is_never_taken_from_the_request(client):
     )
     assert r.status_code == 200
     assert set(await markers()) == {"alice"}
+
+
+async def test_list_and_count_share_one_upper_bound(client, monkeypatch):
+    """One ``now`` per request bounds the items and the count alike, so a run
+    that finishes while the request is being answered is in both or in
+    neither."""
+    snapshot = ago(minutes=10)
+    monkeypatch.setattr(notifications, "_now", lambda: snapshot)
+    await set_marker("alice", ago(hours=5))
+    inside_a = await agent_run(snapshot - timedelta(minutes=1))
+    exactly = await workflow_run(snapshot)
+    await agent_run(snapshot + timedelta(seconds=1))
+    await workflow_run(snapshot + timedelta(minutes=5))
+    body = await listing(client)
+    assert [i["run_id"] for i in body["items"]] == [exactly, inside_a]
+    assert body["unread_count"] == 2
+    assert sum(i["unread"] for i in body["items"]) == body["unread_count"]
 
 
 async def test_a_naive_finished_at_is_answered_as_aware_utc(client):
@@ -306,6 +353,46 @@ async def test_no_other_column_of_a_run_is_answered(client):
     r = await call(client, "GET", LIST)
     assert r.status_code == 200
     assert SECRET not in r.text
+
+
+# ---------------------------------------------------------------------------
+# The indexes the statements above rely on
+# ---------------------------------------------------------------------------
+INDEXES = {
+    "ix_job_runs_finished_at": "job_runs",
+    "ix_workflow_runs_finished_at": "workflow_runs",
+}
+
+
+def test_both_run_tables_have_an_index_on_finished_at():
+    for name, model in (
+        ("ix_job_runs_finished_at", JobRun), ("ix_workflow_runs_finished_at", WorkflowRun),
+    ):
+        found = {index.name: index for index in model.__table__.indexes}
+        assert name in found, sorted(found)
+        assert [c.name for c in found[name].columns] == ["finished_at"]
+        assert not found[name].unique
+
+
+async def _indexes() -> dict[str, str]:
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'")
+        )
+        return {name: table for name, table in rows if name in INDEXES}
+
+
+async def test_init_db_adds_the_indexes_to_tables_that_exist_already():
+    """``create_all`` does not add an index to an existing table: a database
+    of an earlier version gets them from the additive chain."""
+    async with engine.begin() as conn:
+        for name in INDEXES:
+            await conn.execute(text(f"DROP INDEX IF EXISTS {name}"))
+    assert await _indexes() == {}
+    await init_db()
+    assert await _indexes() == INDEXES
+    await init_db()
+    assert await _indexes() == INDEXES
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +447,20 @@ async def test_up_to_with_another_offset_is_the_same_instant(client):
         "up_to": (instant + timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
     })
     assert r.json() == {"seen_at": (instant + timedelta(minutes=1)).isoformat()}
+
+
+@pytest.mark.parametrize("larger_first", [True, False])
+async def test_of_two_seen_calls_at_once_the_larger_up_to_wins(client, larger_first):
+    await set_marker("alice", ago(hours=9))
+    smaller, larger = ago(hours=4), ago(hours=2)
+    order = [larger, smaller] if larger_first else [smaller, larger]
+    answers = await asyncio.gather(
+        *(call(client, "POST", SEEN, json={"up_to": stamp.isoformat()}) for stamp in order)
+    )
+    assert [r.status_code for r in answers] == [200, 200]
+    assert (await markers())["alice"] == larger
+    r = await call(client, "POST", SEEN, json={"up_to": smaller.isoformat()})
+    assert parsed(r.json()["seen_at"]) == larger
 
 
 async def test_seen_without_a_marker_sets_it_to_now(client):

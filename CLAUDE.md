@@ -1097,11 +1097,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   status, trigger, created_by, finished_at, unread}`, runs with a
   `finished_at` in the last 7 days, newest first, at most 50 of both kinds
   together (one statement per table, merged in Python: no `UNION`);
-  `unread_count` covers the whole 7 days and can exceed the list. The one
+  `unread_count` covers the whole 7 days and can exceed the list. One `now`
+  per request bounds list and count alike (`finished_at <= now`), so they
+  cannot disagree about a run that finishes meanwhile. Both run tables have
+  an index on `finished_at` for these reads (`ix_job_runs_finished_at`,
+  `ix_workflow_runs_finished_at`; `init_db` adds them to an existing
+  Postgres or SQLite database, `_ensure_plain_index`). The one
   new table is the read marker, `AdminNotificationState`
   (`admin_notification_state`: `principal`, `seen_at`), one row per admin
-  keyed by `current_principal` (`local` when none is bound), never by
-  anything of the request; `unread` is `finished_at > seen_at`. A caller
+  keyed by `current_principal` (in the local app that is `local-dev`, which
+  `agents/auth.py` binds; the fixed key `local` only when no principal can
+  be derived; a principal over 255 characters is keyed by its digest,
+  `sha256:<hex>`), never by anything of the request; `unread` is
+  `finished_at > seen_at`. A caller
   without a marker gets one set to now by the first call (nothing is unread
   then; a concurrent first call reads the row the other one inserted).
   `POST /admin/api/notifications/seen` with exactly `{"up_to": <timestamp
@@ -1109,7 +1117,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (a conditional UPDATE) and answers `{seen_at}`; any other body, a larger
   one included, is a 422 with one fixed text and nothing of the input.
   Timestamps are answered as aware UTC whatever the database hands back.
-  The table is HANA schema generation 2. `tests/test_notifications.py`
+  An accepted limit: `finished_at` is stamped before the run's commit, so
+  with two app instances a run stamped earlier but committed later than a
+  run already marked read is shown as read. The table and the two indexes
+  are HANA schema generation 2. The tests are in
+  `tests/test_notifications.py`
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
@@ -1286,7 +1298,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   2.22.0 is the `builtin:sharepoint` release: no new resource and no new
   environment variable; 2.23.0 adds the finished-run notifications
   (`agents/notifications.py`): no new resource or environment variable, one
-  new table (`admin_notification_state`, HANA schema generation 2)
+  new table (`admin_notification_state`) and an index on `finished_at` of
+  both run tables (together HANA schema generation 2)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -1297,7 +1310,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   orchestrator row, `workflows` with branches and steps, `odata_services`,
   `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not job or
   workflow runs, the audit logs, IDE sessions and their children, OAuth flow
-  states. Rows are matched by natural key (integer ids are the target's own;
+  states, the notification read markers (`admin_notification_state`). Rows are matched by natural key (integer ids are the target's own;
   branches and steps follow their workflow's name); a target row of the same
   key is replaced, other target rows are left alone; a second run changes
   nothing; one transaction on the target. The target's schema must exist

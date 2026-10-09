@@ -20,12 +20,22 @@ validated token), never anything of the request. The body of ``seen`` is
 read as raw JSON and validated here, so a refusal is one fixed text and
 never echoes what was sent.
 
+One ``now`` is taken per request and bounds the list and the count alike
+(``finished_at <= now``), so the two cannot disagree about a run that
+finishes while the request is answered.
+
+An accepted limit: a runner stamps ``finished_at`` before it commits the
+row. With more than one app instance, a run stamped earlier but committed
+later than a run the admin has already marked as read lies behind the
+marker when it becomes visible, and is shown as read.
+
 This module imports ``agents.auth`` and ``agents.db`` only, never
 ``agents.admin`` (which imports it at the end of the module).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -49,6 +59,9 @@ LOCAL_PRINCIPAL = "local"
 # The `seen` request is one timestamp. Checked while reading, so an admin
 # token cannot make the worker buffer and parse a body of any size.
 SEEN_BODY_BYTES = 1024
+# AdminNotificationState.principal is String(255).
+_KEY_MAX = 255
+_DIGEST_PREFIX = "sha256:"
 _UP_TO = "up_to"
 _REFUSED = "up_to must be a timestamp with a time zone"
 
@@ -70,8 +83,19 @@ def _utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _marker_key(principal: str) -> str:
+    """The principal as the marker's key: itself, or its digest when it does
+    not fit the column (PostgreSQL and SAP HANA refuse a longer value,
+    which would be a 500). A principal that itself starts with the digest
+    prefix is hashed too, so a key of that form is always a digest and no
+    short principal can be another one's key."""
+    if len(principal) <= _KEY_MAX and not principal.startswith(_DIGEST_PREFIX):
+        return principal
+    return _DIGEST_PREFIX + hashlib.sha256(principal.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def _principal() -> str:
-    return current_principal.get() or LOCAL_PRINCIPAL
+    return _marker_key(current_principal.get() or LOCAL_PRINCIPAL)
 
 
 async def _read_marker(session: AsyncSession, principal: str) -> datetime | None:
@@ -110,8 +134,11 @@ async def _marker(session: AsyncSession, principal: str, now: datetime) -> datet
     return now
 
 
-async def _finished(session: AsyncSession, cutoff: datetime) -> list[dict[str, Any]]:
-    """The newest finished runs of both kinds, without ``unread``.
+async def _finished(
+    session: AsyncSession, cutoff: datetime, now: datetime
+) -> list[tuple[datetime, dict[str, Any]]]:
+    """The newest finished runs of both kinds, each with the instant it
+    finished at (the caller decides ``unread`` from it).
 
     One statement per table, merged here: each is cut to ``MAX_ITEMS``, so
     the newest ``MAX_ITEMS`` of both together are among them.
@@ -123,7 +150,11 @@ async def _finished(session: AsyncSession, cutoff: datetime) -> list[dict[str, A
                 model.id, name, model.status, model.trigger, model.created_by,
                 model.finished_at,
             )
-            .where(model.finished_at.is_not(None), model.finished_at >= cutoff)
+            .where(
+                model.finished_at.is_not(None),
+                model.finished_at >= cutoff,
+                model.finished_at <= now,
+            )
             .order_by(model.finished_at.desc(), model.id.desc())
             .limit(MAX_ITEMS)
         )
@@ -145,10 +176,12 @@ async def _finished(session: AsyncSession, cutoff: datetime) -> list[dict[str, A
                 )
             )
     found.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
-    return [{**item, "unread": finished} for finished, _, item in found[:MAX_ITEMS]]
+    return [(finished, item) for finished, _, item in found[:MAX_ITEMS]]
 
 
-async def _unread_count(session: AsyncSession, cutoff: datetime, seen_at: datetime) -> int:
+async def _unread_count(
+    session: AsyncSession, cutoff: datetime, now: datetime, seen_at: datetime
+) -> int:
     total = 0
     for _, model, _name in _SOURCES:
         total += (
@@ -158,6 +191,7 @@ async def _unread_count(session: AsyncSession, cutoff: datetime, seen_at: dateti
                 .where(
                     model.finished_at.is_not(None),
                     model.finished_at >= cutoff,
+                    model.finished_at <= now,
                     model.finished_at > seen_at,
                 )
             )
@@ -174,11 +208,9 @@ async def list_notifications() -> dict[str, Any]:
     cutoff = now - WINDOW
     async with SessionLocal() as session:
         seen_at = await _marker(session, principal, now)
-        items = await _finished(session, cutoff)
-        unread_count = await _unread_count(session, cutoff, seen_at)
-    for item in items:
-        # `_finished` left the instant here for this comparison.
-        item["unread"] = item["unread"] > seen_at
+        finished = await _finished(session, cutoff, now)
+        unread_count = await _unread_count(session, cutoff, now, seen_at)
+    items = [{**item, "unread": at > seen_at} for at, item in finished]
     return {"items": items, "unread_count": unread_count, "seen_at": seen_at.isoformat()}
 
 
