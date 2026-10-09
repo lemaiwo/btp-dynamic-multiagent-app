@@ -3,6 +3,7 @@ import validators from "./validators";
 import { findBuiltin } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
+import bitbucketEntry from "./bitbucketEntry";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -283,6 +284,12 @@ export default {
             // block would otherwise keep a mailbox and a send switch this
             // toolset does not have, and the server refuses the pins elsewhere.
             return this.cleanSharePoint(raw, authMode) as McpServer["oauth"];
+        }
+        if (key === bitbucketEntry.BITBUCKET_URL) {
+            // --- bitbucket --- Before the generic branches: the Jira-shaped
+            // default below would send project, status and a false
+            // allow_comment, all of which the server refuses for this entry.
+            return bitbucketEntry.clean(raw) as McpServer["oauth"];
         }
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes

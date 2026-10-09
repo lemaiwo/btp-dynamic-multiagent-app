@@ -84,6 +84,32 @@ export type OAuthClient =
            * same reason `allow_send` is.
            */
           allow_comment?: boolean;
+          // --- bitbucket ---
+          /**
+           * `builtin:bitbucket` only. The one Bitbucket workspace slug the
+           * entry is pinned to. Sent as typed: the server refuses edge
+           * whitespace instead of repairing it. See agents/bitbucket_config.py.
+           */
+          workspace?: string;
+          /**
+           * `builtin:bitbucket` only. 1 to 50 distinct repository slugs that
+           * narrow `workspace`; left out means every repository of the
+           * workspace (an empty list is refused).
+           */
+          repositories?: string[];
+          /** `builtin:bitbucket` only. The target branch of the pull requests
+           * to review; left out is the server's default, `main`. */
+          branch?: string;
+          /**
+           * `builtin:bitbucket` only. Whether the agent may approve a pull
+           * request; requires `allow_comment`. Only ever sent as `true`.
+           */
+          allow_approve?: boolean;
+          /**
+           * `builtin:bitbucket` only. Left out, an approval needs successful
+           * builds; only ever sent as `false`.
+           */
+          require_green_builds?: boolean;
           /**
            * `builtin:sapnotes` only, on `auth_mode: "none"`. The CVSS floor a
            * note must reach to be reported; 9.0 is what SAP calls HotNews.

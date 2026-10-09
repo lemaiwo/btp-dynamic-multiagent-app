@@ -2,6 +2,7 @@ import type { AuthMode, DeepConfig, McpServer, OAuthClient, WorkflowStep } from 
 import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
+import bitbucketEntry from "./bitbucketEntry";
 
 // --- odata ---
 /** `SERVICE_NAME_RE` in agents/odata/models.py: the slug of a catalogue service. */
@@ -330,6 +331,10 @@ export default {
             // entry names no destination.
             return this.validateODataEntry(oauth, authMode);
         }
+        if (bitbucketEntry.isBitbucketUrl(url)) {
+            // --- bitbucket --- Its own rules and none of the Jira ones below.
+            return bitbucketEntry.validate(oauth, authMode);
+        }
         if (this.isTeams(url)) {
             const teamsError = this.validateTeams(oauth, authMode);
             if (teamsError) {
@@ -489,9 +494,13 @@ export default {
             }
             const key = (server.url || "").trim().replace(/\/+$/, "").toLowerCase();
             if (seen.has(key)) {
-                errors[index] = key === odataEntry.ODATA_URL
-                    ? "An agent has one OData services entry; add the services to the existing one."
-                    : "This is a duplicate URL; each server may appear once.";
+                if (key === odataEntry.ODATA_URL) {
+                    errors[index] = "An agent has one OData services entry; add the services to the existing one.";
+                } else if (key === bitbucketEntry.BITBUCKET_URL) {
+                    errors[index] = "An agent has one Bitbucket entry; change the existing one.";
+                } else {
+                    errors[index] = "This is a duplicate URL; each server may appear once.";
+                }
                 return;
             }
             seen.add(key);

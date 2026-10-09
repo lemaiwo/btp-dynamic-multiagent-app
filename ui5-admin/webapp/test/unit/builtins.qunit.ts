@@ -37,6 +37,7 @@ QUnit.test("restricted built-ins offer only what the server accepts", function (
     assert.deepEqual(authModesFor("builtin:outlook"), ["oauth2", "app_only", "destination"]);
     assert.deepEqual(authModesFor("builtin:sapnotes"), ["none", "destination"]);
     assert.deepEqual(authModesFor("builtin:sharepoint"), ["app_only", "destination"]);
+    assert.deepEqual(authModesFor("builtin:bitbucket"), ["destination"]);
 });
 
 // --- destinations ---
