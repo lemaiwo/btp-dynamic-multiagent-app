@@ -249,3 +249,23 @@ def test_httpx_request_logging_is_silenced(monkeypatch, capsys, caplog):
     assert HOST not in caplog.text
     # The level is the caller's again afterwards (other suites read httpx's log).
     assert logging.getLogger("httpx").level == logging.INFO
+
+
+@pytest.mark.parametrize("url, location", [
+    (f"https://{HOST}", f"https://{HOST}:443{LOCATION_TAIL}"),
+    (f"https://{HOST}:443", LOCATION),
+    (f"https://{HOST}:443", f"https://{HOST}:443{LOCATION_TAIL}"),
+])
+def test_an_explicit_default_port_is_the_same_place(monkeypatch, capsys, url, location):
+    """Final review n10: `:443` on https is no other port than none at all."""
+    code, lines, seen = _run(monkeypatch, capsys, url=url, location=location)
+    assert code == 0, lines
+    assert "redirect stays on the host: yes" in lines[5]
+    assert _bitbucket(seen)[-1].url.raw_path == LOCATION_TAIL.encode()
+
+
+def test_the_port_rule_applies_the_default_itself():
+    """Not left to how an httpx version normalises a URL."""
+    assert probe._port(httpx.URL(f"https://{HOST}")) == 443
+    assert probe._port(httpx.URL(f"https://{HOST}:443")) == 443
+    assert probe._port(httpx.URL(f"https://{HOST}:8443")) == 8443

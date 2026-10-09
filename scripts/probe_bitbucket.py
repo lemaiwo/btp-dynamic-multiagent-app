@@ -226,6 +226,13 @@ def step_pull_requests(client: httpx.Client, target: Target, workspace: str,
     return True, f"HTTP 200, open pull requests on the first page: {len(values)}"
 
 
+def _port(url: httpx.URL) -> int | None:
+    """The port a URL means, with the scheme's default applied: an explicit
+    ``:443`` on https is the same place as no port. Said here rather than
+    left to how an httpx version normalises a URL."""
+    return url.port or {"https": 443, "http": 80}.get(url.scheme)
+
+
 def step_diff(client: httpx.Client, target: Target, workspace: str, repository: str,
               pull_request: int) -> tuple[bool, str]:
     """The diff endpoint answers with a redirect; it is followed by hand.
@@ -249,7 +256,7 @@ def step_diff(client: httpx.Client, target: Target, workspace: str, repository: 
         there = None
     asked = r.request.url
     stays = (there is not None and there.scheme == "https" and there.host == asked.host
-             and there.port == asked.port and not there.userinfo)
+             and _port(there) == _port(asked) and not there.userinfo)
     head = f"HTTP {r.status_code}, redirect stays on the host: {_yes(stays)}"
     if not stays:
         return False, head
