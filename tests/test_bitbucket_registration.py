@@ -741,6 +741,10 @@ async def test_an_import_bundle_is_held_to_the_entry_gate(client, caplog, which,
     caplog.set_level(logging.DEBUG)
     caplog.set_level(logging.INFO, logger="aiosqlite")
     refused = _past_the_form()[which]
+    # An agent that is there: a refused bundle with `replace` must not remove it.
+    r = await client.post("/admin/api/agents", json=_agent("bb-kept", FULL))
+    assert r.status_code in (200, 201), r.text
+    kept = await _stored("bb-kept")
     for bundle in ({"agents": [refused]},
                    # A good agent in the same bundle is not stored either.
                    {"agents": [_agent("bb-good", BASE), refused]},
@@ -750,7 +754,8 @@ async def test_an_import_bundle_is_held_to_the_entry_gate(client, caplog, which,
         assert said in r.text
         assert SECRET not in r.text and "zx9" not in r.text and "Zx9" not in r.text
         assert '"input"' not in r.text and '"ctx"' not in r.text
-        assert await _agent_names() == []
+        assert await _agent_names() == ["bb-kept"]
+        assert await _stored("bb-kept") == kept
     assert SECRET not in caplog.text and "zx9" not in caplog.text
 
 
