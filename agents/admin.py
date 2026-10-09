@@ -73,6 +73,7 @@ from agents.db import (
     AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
+    BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
     MAX_ODATA_ENTRY_SERVICES,
@@ -1053,6 +1054,11 @@ class AgentPayload(BaseModel):
         # that says what to do instead.
         if sum(1 for u in urls if _server_key(u) == BUILTIN_ODATA_URL) > 1:
             raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
+        # By server key, not by the string sent: the duplicate rule below
+        # compares spellings, and storage stores every spelling of this URL
+        # as the one entry (`prepare_servers`, which refuses this as well).
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_BITBUCKET_URL) > 1:
+            raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
         if len(set(urls)) != len(urls):
             raise ValueError("mcp_servers contains duplicate urls")
         return self

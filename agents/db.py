@@ -2396,6 +2396,7 @@ def prepare_servers(
 
     normalized: list[dict[str, Any]] = []
     odata_seen = False
+    bitbucket_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
         mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
@@ -2425,6 +2426,11 @@ def prepare_servers(
         elif url.rstrip("/").lower() == _BITBUCKET_URL:
             # Stored under exactly this spelling, as builtin:sharepoint is.
             url = _BITBUCKET_URL
+            # Counted after the spelling is settled: every spelling is the
+            # same entry. Storage refuses by itself, as it does the block.
+            if bitbucket_seen:
+                raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
+            bitbucket_seen = True
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
@@ -4269,6 +4275,13 @@ MAX_ODATA_ENTRY_SERVICES = 50
 ODATA_SINGLE_ENTRY_MESSAGE = (
     "an agent may have at most one builtin:odata entry; list every service "
     "in that entry's oauth.services"
+)
+# Two entries would share the server key, so their tools would carry the same
+# names and the entry with the wider switches (`allow_approve`) could not be
+# told from the other one. Public for the same reason as the message above.
+BITBUCKET_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:bitbucket entry; pin every "
+    "repository it reviews in that entry's oauth.repositories"
 )
 _ODATA_MODE_MESSAGE = (
     "builtin:odata requires auth_mode=destination: every catalogue service "

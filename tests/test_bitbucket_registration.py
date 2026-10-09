@@ -600,3 +600,116 @@ def test_the_tools_are_denied_in_an_abap_assistant_session(policy):
             assert name not in READONLY_POLICY
             assert all(name not in rules for rules in POLICIES.values())
             assert check_call(name, {"repository": "svc-a", "id": 7}, policy) is not None
+
+
+# --- one entry per agent ------------------------------------------------------
+
+ONE_ENTRY = "an agent may have at most one builtin:bitbucket entry"
+# Every pair of spellings the two gates read as the built-in, the same one
+# twice included.
+TWICE = [(URL, URL), (URL, "builtin:bitbucket/"), ("Builtin:Bitbucket", URL),
+         (" BUILTIN:BITBUCKET// ", "builtin:bitbucket/")]
+
+
+def _two(first: str, second: str) -> list[dict[str, Any]]:
+    """A reading entry, and a second one that would add the approval."""
+    return [{"url": first, "auth_mode": "destination", "oauth": dict(BASE)},
+            {"url": second, "auth_mode": "destination",
+             "oauth": {**FULL, "workspace": "other-" + "zx9"}}]
+
+
+@pytest.mark.parametrize("first, second", TWICE)
+def test_the_gate_refuses_a_second_bitbucket_entry_in_any_spelling(first, second):
+    from agents.admin import AgentPayload
+
+    with pytest.raises(ValidationError) as refused:
+        AgentPayload.model_validate({"name": "bb-two", "description": "d",
+                                     "instructions": "i",
+                                     "mcp_servers": _two(first, second)})
+    text = json.dumps(refused.value.errors(include_input=False, include_context=False,
+                                           include_url=False))
+    assert ONE_ENTRY in text and "zx9" not in text
+
+
+@pytest.mark.parametrize("first, second", TWICE)
+def test_storage_refuses_a_second_bitbucket_entry_in_any_spelling(first, second):
+    from agents.db import prepare_servers
+
+    with pytest.raises(ValueError) as refused:
+        prepare_servers(_two(first, second), None)
+    assert str(refused.value).startswith(ONE_ENTRY) and "zx9" not in str(refused.value)
+    # Also when another server stands between them.
+    with pytest.raises(ValueError, match="^" + ONE_ENTRY):
+        prepare_servers([_two(first, second)[0], NOTES, _two(first, second)[1]], None)
+
+
+def test_one_bitbucket_entry_next_to_other_servers_is_stored():
+    from agents.db import prepare_servers
+
+    primary, extras, _ = prepare_servers(
+        [NOTES, _server(FULL), {"url": "builtin:jira", "auth_mode": "destination",
+                                "oauth": {"destination": "JIRA"}}], None)
+    assert [e["url"] for e in extras] == [URL, "builtin:jira"]
+
+
+async def test_a_direct_upsert_refuses_a_second_bitbucket_entry():
+    from agents.db import SessionLocal, init_db, list_agents, upsert_agent
+
+    await init_db()
+    await _wipe()
+    async with SessionLocal() as s:
+        with pytest.raises(ValueError, match="^" + ONE_ENTRY):
+            await upsert_agent(s, name="bb-two", description="d", instructions="i",
+                               mcp_servers=_two(URL, "builtin:bitbucket/"))
+        await s.rollback()
+        assert await list_agents(s) == []
+
+
+async def test_the_api_refuses_a_second_bitbucket_entry_with_422(client):
+    body = {"name": "bb-two", "description": "d", "instructions": "i"}
+    for first, second in TWICE:
+        r = await client.post("/admin/api/agents",
+                              json={**body, "mcp_servers": _two(first, second)})
+        assert r.status_code == 422, r.text
+        assert ONE_ENTRY in r.text and "zx9" not in r.text
+    assert await _stored("bb-two") is None
+    # An agent that has one cannot be edited into two.
+    r = await client.post("/admin/api/agents", json=_agent("bb-two", BASE))
+    assert r.status_code in (200, 201), r.text
+    agent_id, servers = await _stored("bb-two")
+    r = await client.put(f"/admin/api/agents/{agent_id}",
+                         json={**body, "mcp_servers": _two(URL, "builtin:bitbucket/")})
+    assert r.status_code == 422 and ONE_ENTRY in r.text and "zx9" not in r.text
+    assert await _stored("bb-two") == (agent_id, servers)
+
+
+async def test_a_refusal_by_storage_during_a_save_is_a_422_with_fixed_text_never_a_500(
+    client, monkeypatch, caplog
+):
+    """The payload gate switched off, so that storage is the one that refuses:
+    the route answers its fixed text as a 422, for a create and for an edit."""
+    import agents.admin as admin
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO, logger="aiosqlite")
+    r = await client.post("/admin/api/agents", json=_agent("bb-kept", FULL))
+    assert r.status_code in (200, 201), r.text
+    agent_id, servers = await _stored("bb-kept")
+
+    monkeypatch.setattr(admin, "check_bitbucket_entry", lambda cfg: None)
+    for change, said in [({"workspace": "Acme " + SECRET}, "oauth.workspace:"),
+                         ({"branch": "a.." + SECRET}, "oauth.branch:"),
+                         ({"repositories": ["svc-a", "svc-a"]}, "oauth.repositories:"),
+                         ({"allow_approve": True, "allow_comment": False},
+                          "oauth.allow_approve:"),
+                         ({"user_context": True}, "user_context")]:
+        for send in (client.post("/admin/api/agents",
+                                 json=_agent("bb-refused", {**BASE, **change})),
+                     client.put(f"/admin/api/agents/{agent_id}",
+                                json=_agent("bb-kept", {**BASE, **change}))):
+            r = await send
+            assert r.status_code == 422, (r.status_code, r.text)
+            assert said in r.text and SECRET not in r.text and "Zx9" not in r.text
+    assert SECRET not in caplog.text
+    assert await _stored("bb-refused") is None
+    assert await _stored("bb-kept") == (agent_id, servers)
