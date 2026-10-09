@@ -20,6 +20,7 @@ export type StoredNotification = Omit<NotificationItem, "unread">;
 /** What the shell controller offers a journey beside its event handlers. */
 export interface ShellController {
     pollNotifications(): Promise<void>;
+    loadFragment?: (options: unknown) => Promise<unknown>;
 }
 
 /** What one entry of the list shows. */
@@ -53,7 +54,7 @@ export function iStartTheAppWithNotifications(
     });
 }
 
-function controllerOf(control: UI5Element): ShellController {
+export function controllerOf(control: UI5Element): ShellController {
     let parent: ManagedObject | null = control;
     while (parent !== null && !parent.isA("sap.ui.core.mvc.View")) {
         parent = (parent as ManagedObject).getParent();
@@ -121,4 +122,45 @@ export function iSeeTheItems(Then: Common, count: number, assert: (items: Object
 export function toastShows(text: string): boolean {
     return Array.from(document.querySelectorAll(".sapMMessageToast"))
         .some((toast) => (toast.textContent ?? "") === text);
+}
+
+/** How many times the list was asked for so far. */
+export function polls(): number {
+    return backend.requests.filter((request) => request === "GET notifications").length;
+}
+
+/** Lets `ms` pass. */
+export function iWait(When: Common, ms: number): void {
+    let start = 0;
+    When.waitFor({ success: function () { start = Date.now(); } });
+    When.waitFor({
+        check: function () { return Date.now() - start >= ms; },
+        success: function () { /* time has passed */ }
+    });
+}
+
+/** Asserts that nothing asks for the list during the next `ms`. */
+export function iSeeNoPollFor(Then: Common, ms: number, message: string): void {
+    let before = -1;
+    Then.waitFor({ success: function () { before = polls(); } });
+    iWait(Then, ms);
+    Then.waitFor({
+        success: function () { Opa5.assert.strictEqual(polls(), before, message); }
+    });
+}
+
+/** What `document.visibilityState` answers, and the event that goes with a change. */
+export function setVisibility(state: "visible" | "hidden"): void {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    document.dispatchEvent(new Event("visibilitychange"));
+}
+
+/** Takes the stub away again: the browser's own value is back. */
+export function restoreVisibility(): void {
+    delete (document as unknown as Record<string, unknown>).visibilityState;
+}
+
+/** A pointer or key input somewhere on the page. */
+export function userInput(type: "pointerdown" | "keydown"): void {
+    document.dispatchEvent(new Event(type, { bubbles: true }));
 }

@@ -95,6 +95,11 @@ export default class FakeBackend {
     /** Unread runs of the window that the capped list does not hold: added
      *  to `unread_count`, which may exceed the number of items. */
     public notificationsUnreadBeyondList = 0;
+    /** `true`: the next `GET notifications` is worked out when it is asked
+     *  but not answered until `releaseNotifications()`: an answer that was
+     *  on its way while something else happened. Only that one call. */
+    public holdNextNotifications = false;
+    private heldNotifications: (() => void)[] = [];
 
     private originalFetch?: typeof fetch;
     private nextId = 100;
@@ -139,6 +144,8 @@ export default class FakeBackend {
         this.notifications = [];
         this.notificationsSeenAt = "2026-08-24T00:00:00+00:00";
         this.notificationsUnreadBeyondList = 0;
+        this.holdNextNotifications = false;
+        this.heldNotifications = [];
         this.agents = [this.makeAgent("btp-agent"), this.makeAgent("gmail-agent")];
         // btp-agent is exposed as a job API, so its Run now button is live
         // on the list and detail pages; gmail-agent is not.
@@ -203,7 +210,7 @@ export default class FakeBackend {
                 report: { body_md: "# Report\n\n| a | b |\n|---|---|\n| 1 | 2 |" }
             },
             {
-                id: "run-2", agent_id: 100, agent_name: "btp-agent", trigger: "scheduler",
+                id: "run-2", agent_id: 100, agent_name: "btp-agent", trigger: "schedule",
                 status: "running", started_at: "2026-08-24T09:00:00",
                 finished_at: null, summary: null, error: null,
                 notified: false, created_by: "scheduler", report: null
@@ -281,7 +288,7 @@ export default class FakeBackend {
         }, {
             run: {
                 id: "wf-run-2", workflow_id: this.workflows[0].id, workflow_name: "triage-inbox",
-                trigger: "scheduler", status: "running",
+                trigger: "schedule", status: "running",
                 started_at: "2026-08-25T08:00:00", finished_at: null,
                 items_total: 0, items_succeeded: 0, items_failed: 0, items_skipped: 0,
                 summary: null, error: null, created_by: "scheduler"
@@ -294,6 +301,11 @@ export default class FakeBackend {
         this.failNext = undefined;
         this.reloadOutcome = "none";
         this.importAnswer = {};
+    }
+
+    /** Answers the `GET notifications` that `holdNextNotifications` held. */
+    public releaseNotifications(): void {
+        this.heldNotifications.splice(0).forEach((release) => release());
     }
 
     /** Flips a job run to finished, the way the runner would between two
@@ -1759,11 +1771,17 @@ export default class FakeBackend {
             const items = this.notifications.map((item) => ({
                 ...item, unread: Date.parse(item.finished_at) > seen
             }));
-            return this.json({
+            const answer = {
                 items,
                 unread_count: items.filter((item) => item.unread).length + this.notificationsUnreadBeyondList,
                 seen_at: this.notificationsSeenAt
-            });
+            };
+            if (this.holdNextNotifications) {
+                this.holdNextNotifications = false;
+                return new Promise<void>((resolve) => { this.heldNotifications.push(resolve); })
+                    .then(() => this.json(answer));
+            }
+            return this.json(answer);
         }
         if (path === "notifications/seen" && method === "POST") {
             // As strict as the server: exactly `{up_to: <timestamp with a

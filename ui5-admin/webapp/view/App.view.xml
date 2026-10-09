@@ -24,7 +24,7 @@
                     icon="sap-icon://bell"
                     type="Transparent"
                     press=".onOpenNotifications"
-                    tooltip="{i18n>notificationsTooltip}">
+                    tooltip="{appView>/notificationTooltip}">
                     <customData>
                         <BadgeCustomData
                             key="badge"

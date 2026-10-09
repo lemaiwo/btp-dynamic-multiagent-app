@@ -48,18 +48,30 @@ export default class App extends BaseController {
     public formatter = formatter;
     public notificationFormat = { statusState, statusIcon };
 
-    /** Between two polls for finished runs. Static, so a test can shorten
-     *  it; the journeys call `pollNotifications()` instead of waiting. */
+    /** Between two polls for finished runs. Static, so a test can shorten it. */
     public static notificationPollMs = 15000;
+    /**
+     * Without pointer or key input for this long, the polling stops until
+     * the next input. A poll is a request with the user's session: an
+     * unattended screen that kept asking would keep a session alive that is
+     * meant to end when nobody uses it.
+     */
+    public static notificationIdleMs = 600000;
 
     /** False once the shell is gone (and inside a host shell, where there
      *  is no bell): an answer that arrives then is dropped. */
     private notificationsActive = false;
     private notificationTimer?: ReturnType<typeof setTimeout>;
+    /** A poll of the chain is out; the next timer is armed when it answers. */
+    private chainPolling = false;
+    /** The last poll was answered 401 or 403: no timer until the next input. */
+    private pollRefused = false;
+    private lastInputAt = 0;
+    private lastPollAt = 0;
     /** Counts the polls, so that only the answer of the latest one is shown. */
     private pollSeq = 0;
-    /** The runs of the last poll; `null` before the first one, which
-     *  therefore announces nothing. */
+    /** The runs of the last poll that was answered; `null` until one is,
+     *  so the first successful poll announces nothing. */
     private knownKeys: Set<string> | null = null;
     private lastList?: NotificationList;
     /** The runs that were unread when the list was opened: they keep their
@@ -67,10 +79,28 @@ export default class App extends BaseController {
     private openUnreadKeys = new Set<string>();
     private notificationsPopover?: Promise<ResponsivePopover>;
 
+    /** A tab that is hidden does not poll; one that is shown again does at once. */
     private readonly onVisibilityChange = (): void => {
-        if (this.notificationsActive && document.visibilityState === "visible") {
-            void this.pollNotifications();
+        if (document.visibilityState === "hidden") {
+            this.clearNotificationTimer();
+        } else {
+            this.resumeNotifications();
         }
+    };
+
+    /** Pointer or key input: the page is in use, so a chain that stopped
+     *  (idle, or refused) starts again. */
+    private readonly onUserInput = (): void => {
+        const now = Date.now();
+        this.lastInputAt = now;
+        if (this.pollRefused) {
+            // Not one request per key press while the session is gone.
+            if (now - this.lastPollAt < App.notificationPollMs) {
+                return;
+            }
+            this.pollRefused = false;
+        }
+        this.resumeNotifications();
     };
 
     public onInit(): void {
@@ -91,10 +121,11 @@ export default class App extends BaseController {
             // placeholder until whoami answers (and keeps it if that call
             // fails) rather than opening onto an empty menu.
             userLabel: this.text("userUnknown"),
-            // The finished runs behind the bell and the text of its badge
-            // ("" = no badge).
+            // The finished runs behind the bell, the text of its badge
+            // ("" = no badge) and its name, which carries the count.
             notifications: [],
-            notificationBadge: ""
+            notificationBadge: "",
+            notificationTooltip: this.text("notificationsTooltip")
         });
         this.setModel(model, "appView");
 
@@ -128,11 +159,10 @@ export default class App extends BaseController {
 
     public onExit(): void {
         this.notificationsActive = false;
-        if (this.notificationTimer !== undefined) {
-            clearTimeout(this.notificationTimer);
-            this.notificationTimer = undefined;
-        }
+        this.clearNotificationTimer();
         document.removeEventListener("visibilitychange", this.onVisibilityChange);
+        document.removeEventListener("pointerdown", this.onUserInput, true);
+        document.removeEventListener("keydown", this.onUserInput, true);
     }
 
     private static isInShell(): boolean {
@@ -153,41 +183,95 @@ export default class App extends BaseController {
         }
     }
 
-    /** One poll now, then one every `notificationPollMs` while the page is
-     *  visible, and one as soon as it becomes visible again. */
+    /**
+     * One poll now, then one every `notificationPollMs` for as long as the
+     * page is visible, in use and not refused (`mayPoll`). Whatever stops
+     * the chain, `resumeNotifications` starts it again with one poll.
+     */
     private startNotifications(): void {
         this.notificationsActive = true;
+        this.lastInputAt = Date.now();
         document.addEventListener("visibilitychange", this.onVisibilityChange);
-        void this.pollNotifications();
+        // Capturing and passive: only the time of the input is noted, and a
+        // control that stops the event must not hide it.
+        document.addEventListener("pointerdown", this.onUserInput, { capture: true, passive: true });
+        document.addEventListener("keydown", this.onUserInput, { capture: true, passive: true });
+        this.resumeNotifications();
+    }
+
+    /** The one rule for "should the chain run". */
+    private mayPoll(): boolean {
+        return this.notificationsActive
+            && !this.pollRefused
+            && document.visibilityState !== "hidden"
+            && Date.now() - this.lastInputAt < App.notificationIdleMs;
+    }
+
+    /** Starts a chain that is stopped: one poll at once, then the timer.
+     *  Does nothing while a timer is armed or a chain poll is out. */
+    private resumeNotifications(): void {
+        if (this.notificationTimer !== undefined || this.chainPolling || !this.mayPoll()) {
+            return;
+        }
+        void this.pollInChain();
+    }
+
+    /** One poll of the chain; the next timer is armed only after it has
+     *  answered, so a slow backend never has two chain polls out. */
+    private async pollInChain(): Promise<void> {
+        this.chainPolling = true;
+        await this.pollNotifications();
+        this.chainPolling = false;
         this.armNotificationTimer();
     }
 
-    /** A chain of timeouts, armed after the poll has answered, so a slow
-     *  backend never has two timer polls out at once. */
+    /** Arms the next poll, or none: a stopped chain has no timer at all. */
     private armNotificationTimer(): void {
+        this.clearNotificationTimer();
+        if (!this.mayPoll()) {
+            return;
+        }
         this.notificationTimer = setTimeout(() => {
             this.notificationTimer = undefined;
-            const poll = document.visibilityState === "hidden" ? Promise.resolve() : this.pollNotifications();
-            void poll.then(() => {
-                if (this.notificationsActive) {
-                    this.armNotificationTimer();
-                }
-            });
+            // The idle limit may have passed while the timer ran.
+            if (this.mayPoll()) {
+                void this.pollInChain();
+            }
         }, App.notificationPollMs);
+    }
+
+    private clearNotificationTimer(): void {
+        if (this.notificationTimer !== undefined) {
+            clearTimeout(this.notificationTimer);
+            this.notificationTimer = undefined;
+        }
+    }
+
+    /** 401 or 403: the session is gone, or the user may not read the list.
+     *  Asking again every 15 s would change nothing, so the chain stops. */
+    private notePollFailure(error: unknown): void {
+        const status = (error as { status?: unknown } | null)?.status;
+        if (status === 401 || status === 403) {
+            this.pollRefused = true;
+            this.clearNotificationTimer();
+        }
     }
 
     /**
      * Reads the finished runs, shows them and the unread count, and
-     * announces the runs that were not in the previous poll. A poll that
-     * fails is silent: it runs in the background, the next one will do.
-     * Never rejects.
+     * announces the runs that were not in the previous answer. A poll that
+     * fails is silent: it runs in the background, and the next one will do
+     * (after a 401 or 403 there is no next one until the page is used
+     * again). Never rejects.
      */
     public async pollNotifications(): Promise<void> {
         const seq = ++this.pollSeq;
+        this.lastPollAt = Date.now();
         let list: NotificationList;
         try {
             list = await this.getAdminService().getNotifications();
-        } catch {
+        } catch (error) {
+            this.notePollFailure(error);
             return;
         }
         // A newer poll is out (or the list was just marked read, or the
@@ -215,31 +299,57 @@ export default class App extends BaseController {
         })));
         // The server's count, not the number of unread items: the list is
         // capped, the count is not.
-        model.setProperty("/notificationBadge", badgeText(list.unread_count));
+        const badge = badgeText(list.unread_count);
+        model.setProperty("/notificationBadge", badge);
+        // The badge's own count does not reliably reach a screen reader
+        // (the button is not re-described when the badge arrives after it
+        // was rendered), so the bell's name carries it.
+        model.setProperty("/notificationTooltip", badge
+            ? this.text("notificationsTooltipUnread", [badge])
+            : this.text("notificationsTooltip"));
     }
 
     /**
      * Opens the list of finished runs (or closes it when it is open).
-     * Opening is what marks the runs read: the marker moves to the newest
-     * run that is *shown*, so a run that finished since the last poll stays
-     * unread.
+     * Opening is what marks read what the list shows: it is read fresh
+     * first, so a run that finished since the last poll is in it and is
+     * marked too. A run that arrives while the list is open is not.
      */
     public async onOpenNotifications(): Promise<void> {
-        const popover = await this.getNotificationsPopover();
+        let popover: ResponsivePopover;
+        try {
+            popover = await this.getNotificationsPopover();
+        } catch {
+            // The list could not be loaded; the next press tries again.
+            return;
+        }
         if (popover.isOpen()) {
             popover.close();
             return;
         }
-        const items = (this.getModel("appView") as JSONModel).getProperty("/notifications") as NotificationItem[];
-        this.openUnreadKeys = new Set(items.filter((item) => item.unread).map(itemKey));
+        this.openUnreadKeys = new Set();
+        this.keepUnreadMarks();
         popover.openBy(this.byId("notificationBell") as Button);
 
-        const upTo = newestFinishedAt(items);
-        if (upTo !== null && this.lastList && this.lastList.unread_count > 0) {
-            await this.markNotificationsSeen(upTo);
-        } else {
-            await this.pollNotifications();
+        await this.pollNotifications();
+        // The fresh list, or the one that was already shown when the poll
+        // failed or the popover was closed again meanwhile.
+        const list = this.lastList;
+        if (!list || !popover.isOpen()) {
+            return;
         }
+        this.keepUnreadMarks();
+        const upTo = newestFinishedAt(list.items);
+        if (upTo !== null && (list.unread_count > 0 || list.items.some((item) => item.unread))) {
+            await this.markNotificationsSeen(upTo);
+        }
+    }
+
+    /** The unread runs of the list that is shown keep their mark until the
+     *  list is closed. */
+    private keepUnreadMarks(): void {
+        (this.lastList?.items ?? []).filter((item) => item.unread)
+            .forEach((item) => this.openUnreadKeys.add(itemKey(item)));
     }
 
     /** Moves the read marker, then reads the list again for the count that
@@ -250,7 +360,8 @@ export default class App extends BaseController {
         try {
             // Exactly the string the server sent: it accepts nothing else.
             await this.getAdminService().markNotificationsSeen(upTo);
-        } catch {
+        } catch (error) {
+            this.notePollFailure(error);
             return;
         }
         await this.pollNotifications();
@@ -260,9 +371,16 @@ export default class App extends BaseController {
         if (!this.notificationsPopover) {
             // loadFragment makes it a dependent of the view: it gets the
             // view's models and is destroyed with it.
-            this.notificationsPopover = this.loadFragment({
+            const loading = (this.loadFragment({
                 name: "com.agent.admin.fragment.NotificationsPopover"
-            }) as Promise<ResponsivePopover>;
+            }) as Promise<ResponsivePopover>).catch((error: unknown) => {
+                // Not kept: a failed load must not leave the bell dead.
+                if (this.notificationsPopover === loading) {
+                    this.notificationsPopover = undefined;
+                }
+                throw error;
+            });
+            this.notificationsPopover = loading;
         }
         return this.notificationsPopover;
     }
@@ -278,7 +396,11 @@ export default class App extends BaseController {
     public async onNotificationPress(event: ListBase$ItemPressEvent): Promise<void> {
         const context = event.getParameter("listItem")?.getBindingContext("appView");
         const item = context?.getObject() as NotificationItem | undefined;
-        (await this.getNotificationsPopover()).close();
+        try {
+            (await this.getNotificationsPopover()).close();
+        } catch {
+            // No list to close.
+        }
         if (!item || !(await this.getOwnerComponentTyped().canLeave())) {
             return;
         }
