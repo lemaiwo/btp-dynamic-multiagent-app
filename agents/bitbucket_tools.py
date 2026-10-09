@@ -125,6 +125,15 @@ the outcome is unknown and is said as such (``comment_outcome_unknown``,
 ``approval_outcome_unknown``, the latter with ``approved: null``), never as a
 success and never as "nothing happened", and nothing is sent again.
 
+**Pull request text is filtered by character** before the model gets it
+(``_shown_text``: title, description, author and commenter names, comment
+text): control characters, format characters (bidi overrides, zero width),
+lone surrogates and line / paragraph separators are removed, then the text is
+cut. Description and comment text keep the line feed and the tab; a title or
+a name keeps no line break at all. Diffs and file contents are NOT filtered
+(a review needs them as they are), and what counts as this account's review
+marker is decided on Bitbucket's own text, not on the filtered one.
+
 **The error codes** are a closed list (``ERROR_CODES``):
 ``bitbucket_unauthorized``, ``bitbucket_forbidden``, ``bitbucket_throttled``,
 ``bitbucket_unreachable``, ``bitbucket_error``, ``destination_error``,
@@ -529,9 +538,33 @@ def _own_approval(body: dict[str, Any], account: str) -> bool | None:
     return said.pop() if said else False
 
 
-def _cut(value: Any, limit: int) -> str:
-    text = value if isinstance(value, str) else ""
-    return text if len(text) <= limit else text[:limit] + _TRUNCATED
+# Never passed on in pull request text: control characters, format characters
+# (bidi overrides, zero width), lone surrogates, line and paragraph separators.
+_DROPPED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+def _shown_text(value: Any, limit: int, *, lines: bool = False) -> str:
+    """Text a pull request author or commenter wrote, as the model gets it.
+
+    It stands next to the tool's own words in the model's context, so it is
+    filtered by character and then cut: no control character, no format
+    character (a bidi override reorders what a person reading the run sees,
+    a zero width character hides text from them), no line or paragraph
+    separator. ``lines`` keeps the line feed and the tab, for a field that
+    has several lines (description, comment); a field of one line (title,
+    name) keeps no line break at all, so it cannot open a line of its own.
+    The cut counts what is left. Diffs and file contents do not pass here:
+    a review needs them as they are."""
+    if not isinstance(value, str):
+        return ""
+    kept: list[str] = []
+    for char in value:
+        if unicodedata.category(char) in _DROPPED_CATEGORIES and not (lines and char in "\n\t"):
+            continue
+        kept.append(char)
+        if len(kept) > limit:
+            return "".join(kept[:limit]) + _TRUNCATED
+    return "".join(kept)
 
 
 def _count(value: Any) -> int | None:
@@ -592,8 +625,8 @@ def _comment(item: dict[str, Any], account: str = "") -> dict[str, Any]:
     else:
         inline = None
     return {"id": item["id"],
-            "author": _cut(_dig(item, "user", "display_name"), MAX_NAME_CHARS),
-            "text": _cut(_dig(item, "content", "raw"), MAX_COMMENT_TEXT_CHARS),
+            "author": _shown_text(_dig(item, "user", "display_name"), MAX_NAME_CHARS),
+            "text": _shown_text(_dig(item, "content", "raw"), MAX_COMMENT_TEXT_CHARS, lines=True),
             "inline": inline,
             "own": _is_own(item, account)}
 
@@ -1020,8 +1053,8 @@ class BitbucketClient:
             return None
         updated = item.get("updated_on")
         return {"repository": repository, "id": pr_id,
-                "title": _cut(item.get("title"), MAX_TITLE_CHARS),
-                "author": _cut(_dig(item, "author", "display_name"), MAX_NAME_CHARS),
+                "title": _shown_text(item.get("title"), MAX_TITLE_CHARS),
+                "author": _shown_text(_dig(item, "author", "display_name"), MAX_NAME_CHARS),
                 "head_commit": head,
                 "draft": item.get("draft") is True,
                 "updated_on": updated if isinstance(updated, str)
@@ -1199,9 +1232,10 @@ class BitbucketClient:
         comments = [_comment(item, account) for item in items
                     if item.get("deleted") is not True and type(item.get("id")) is int]
         return {"repository": repository, "id": pr_id,
-                "title": _cut(body.get("title"), MAX_TITLE_CHARS),
-                "description": _cut(body.get("description"), MAX_DESCRIPTION_CHARS),
-                "author": _cut(_dig(body, "author", "display_name"), MAX_NAME_CHARS),
+                "title": _shown_text(body.get("title"), MAX_TITLE_CHARS),
+                "description": _shown_text(body.get("description"), MAX_DESCRIPTION_CHARS,
+                                           lines=True),
+                "author": _shown_text(_dig(body, "author", "display_name"), MAX_NAME_CHARS),
                 "head_commit": head,
                 "draft": body.get("draft") is True,
                 "builds": builds,

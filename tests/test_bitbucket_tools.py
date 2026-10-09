@@ -1103,3 +1103,59 @@ def test_the_list_tool_says_what_pending_means():
     text = " ".join(_toolset(_fake(), **APPROVER).tools["list_pull_requests"]
                     .function.__doc__.split())
     assert "`approval_pending`" in text and "complete_approval" in text
+
+
+# -- pull request text is filtered by character before the model sees it --------
+
+# Control, format (bidi, zero width) and line/paragraph separator characters.
+_ODD = "\x00\x07\x1b\x7f\x85​‎‮⁦⁩﻿  "
+
+
+async def test_pull_request_text_loses_control_and_format_characters():
+    fake = FakeBitbucket()
+    odd = "".join(f"w{c}" for c in _ODD)
+    plain = "w" * len(_ODD)
+    fake.add_pr("svc-a", 7, head=HEAD, title=f"A\r\nti\ttle{odd}", author=f"An\nn\t{odd}",
+                description=f"line 1\r\n\tline 2{odd}")
+    fake.add_comment("svc-a", 7, f"see\n\tbelow{odd}")
+    fake.comments[("svc-a", 7)][0]["user"]["display_name"] = f"Ca\nrl{odd}"
+    toolset = _toolset(fake)
+    out = await _call(toolset, "get_pull_request", repository="svc-a", id=7)
+    # One line: no line break and no tab at all.
+    assert out["title"] == "Atitle" + plain and out["author"] == "Ann" + plain
+    # Several lines: the line feed and the tab stay, nothing else.
+    assert out["description"] == "line 1\n\tline 2" + plain
+    assert out["comments"][0]["text"] == "see\n\tbelow" + plain
+    assert out["comments"][0]["author"] == "Carl" + plain
+    listed = (await _call(toolset, "list_pull_requests"))["pull_requests"]
+    assert [(p["title"], p["author"]) for p in listed] == [("Atitle" + plain, "Ann" + plain)]
+
+
+async def test_the_length_cut_counts_what_is_left_after_the_filter():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 7, head=HEAD, title="‮" * 400 + "t" * 300,
+                description="\x00" * 5000 + "d" * 4001)
+    out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
+    assert out["title"] == "t" * 300
+    assert out["description"] == "d" * 4000 + "…[truncated]"
+
+
+async def test_diff_and_file_content_are_not_filtered():
+    fake = _fake()
+    fake.diffs[("svc-a", 7)] = "+a‮b\r\n+\x0c\n"
+    fake.files[("svc-a", HEAD, "src/x.py")] = "a‮b\r\n\x0c ".encode()
+    toolset = _toolset(fake)
+    diff = await _call(toolset, "get_diff", repository="svc-a", id=7)
+    file = await _call(toolset, "get_file", repository="svc-a", id=7, path="src/x.py")
+    assert diff["diff"] == "+a‮b\r\n+\x0c\n" and file["content"] == "a‮b\r\n\x0c "
+
+
+async def test_the_review_marker_is_still_read_from_the_unfiltered_comment():
+    # The filter is for what the model reads; what counts as this account's
+    # review is decided on Bitbucket's own text, as before.
+    from agents.bitbucket_tools import review_marker
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 7, head=HEAD)
+    fake.add_comment("svc-a", 7, review_marker(HEAD).replace("review", "re​view"), own=True)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [7] and out["already_reviewed"] == 0
