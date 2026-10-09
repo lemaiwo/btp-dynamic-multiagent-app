@@ -456,7 +456,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   verdict, summary)`; with `allow_approve` as well:
   `complete_approval(repository, id)`. Without the switch the tool is not
   registered at all. The model's text is refused when empty or over its cap
-  (4,000 / 8,000 characters), never cut or rewritten.
+  (4,000 / 8,000 characters), or when it holds a control or format character
+  (a NUL, a byte order mark, zero width, a bidi mark, a lone surrogate, a
+  line / paragraph separator; line feed and tab are text: `_own_text`), never
+  cut or rewritten: such a character in front of the marker prefix would
+  hide a marker line from the check and not from a reader.
   **The review marker.** `submit_review` posts ONE top-level comment whose
   line 1 the code writes: `Automated review of commit <hash> - verdict:
   approve` (or `comment`; `review_marker`). It is how a repeated run knows a
@@ -510,12 +514,26 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   call was posted and its answer read; unless `require_green_builds` is
   exactly `false`, the builds are `green` with the statuses read strictly (a
   list that holds anything but objects, more statuses than are read, or a
-  failed read: no approval). Nothing a pull request says is part of it. Two
+  failed read: no approval). Nothing a pull request says is part of it.
+  **What the builds gate is worth**: a build status can be posted by anyone
+  with write access to the repository, so it protects against a broken
+  build, not against a hostile author (not verified against a real
+  workspace). Two
   deliberate decisions: **the approval is NOT bound to the commit the model
-  read** (a commit pushed between the read and `submit_review` is approved
-  with it), and **a draft pull request is NOT held back in code** (`draft` is
+  read**, and **a draft pull request is NOT held back in code** (`draft` is
   reported; the seed skill tells the agent to give a draft the verdict
-  `comment`). When the gate holds the approval back or Bitbucket refuses it,
+  `comment`). The first one reaches further than a commit pushed while a
+  review runs: ANY commit pushed after an approval stays approved unless
+  Bitbucket resets approvals on a source change (a repository setting, a
+  Premium feature), and a later review with verdict `comment` does not
+  withdraw it (no call here deletes an approval). The tool says so instead:
+  a `submit_review` that does not end in `approved: true` while this
+  account's own approval is on the pull request answers
+  `earlier_approval_stands: true` with a fixed `hint` (a person must
+  withdraw it in Bitbucket; the activity line says `earlier approval
+  stands`), and a verdict `approve` that passes the gate while that approval
+  is already there sends no second approve call: `approved: true` with
+  `already_approved: true`. When the gate holds the approval back or Bitbucket refuses it,
   the comment stands: `commented: true`, `approved: false` and an `error`
   (`approve_not_allowed`, `builds_not_green`). `complete_approval` sends the
   approval later and posts nothing: this account's marker for the CURRENT
@@ -592,6 +610,26 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   and a hand-written row with two gets NO Bitbucket toolset at registry build
   (one WARNING, the agent keeps its other servers): the second could carry
   wider switches than the one somebody reviewed.
+  **Who can make an approving agent run**: the scheduler run endpoint
+  (`POST /api/agents/{slug}/run`, the `jobscheduler` scope) and an admin's
+  "Run now", both with the stored run prompt. An agent whose entry has
+  `allow_approve` (`asks_to_approve`: anything but `false` / absent, so a
+  hand-written `"true"` counts) is refused chat exposure (`expose_chat` must
+  be `false`; A2A talks to the same orchestrator, so that closes it too) and
+  may not be named in any agent's `peers`: a chat user, or an agent they
+  talk to, could otherwise have the technical user approve their own pull
+  request. Refused by the `AgentPayload` gate (chat), by storage
+  (`check_bitbucket_approver_reach` in `agents/db.py`, called by
+  `upsert_agent` and the admin update route: chat, "this agent is a peer of
+  ..." and "a listed peer approves"; an import is checked in any order of
+  its agents), and closed again at registry build for rows no gate has seen:
+  a chat-exposed row with an approving entry gets NO Bitbucket toolset, and
+  no delegation tool is attached to an approving agent, each with one
+  WARNING that names the agents and the rule. The approving agent may have
+  peers of its own. Not closed in code: a workflow step may name the agent
+  (workflows are admin-authored and started by the scheduler or an admin,
+  but the step's input is the previous step's text), and the agent's own
+  deep sub-agents share its toolsets (`tests/test_bitbucket_reach.py`).
   `tests/test_bitbucket_config.py`, `tests/test_bitbucket_registration.py`
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
   bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
@@ -644,10 +682,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `auth_mode="destination"` with `{destination, user_context}` plus its pinned
   keys; `user_context=false` keeps the app-only rules (mailbox required,
   Teams read-only); `user_context` is stored for Gmail, Outlook and Teams
-  only (Jira, Slack, SMTP and the SAP-notes built-ins are app-level) and
+  only (Jira, Slack, SMTP and the SAP-notes built-ins are app-level;
+  `builtin:bitbucket` and `builtin:sharepoint` refuse `user_context: true`
+  instead of dropping it) and
   `builtin:odata` carries it per catalogue service. Storage keys per
   built-in are `_DEST_KEYS_BY_URL` in
-  `agents/db.py`; save-time rules are `_validate_destination_config` in
+  `agents/db.py` (`builtin:bitbucket` and `builtin:sharepoint` have their
+  own cleaners, `_clean_bitbucket_entry` and `_clean_sharepoint_entry`); save-time rules are `_validate_destination_config` in
   `agents/admin.py`; `GET /admin/api/credential-health` reports
   destination servers under `destinations`.
   **OnPremise destinations** (`ProxyType: OnPremise`, a virtual host behind a
@@ -699,7 +740,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   ignores the user's token for a destination with a stored credential. On
   either path such a client that acts as the signed-in user never sends a
   destination's `sap-user`, `sap-password` or `mysapsso2` header or query
-  parameter. The other destination users (Gmail, Outlook, Teams, Slack, Jira, SAP notes, MCP
+  parameter. The other destination users (Gmail, Outlook, Teams, Slack, Jira, SAP notes,
+  Bitbucket and SharePoint (both application-level only: `user_context: true`
+  is refused), MCP
   over a destination, the workflow http step) are not held to these rules. A
   401 or proxy 407 whose one retry could not be prepared is marked
   (`request_left`), so a write is audited as sent. Token endpoint failures
@@ -1336,14 +1379,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `removed_odata_service_names` and `odata_identity_changes`. The import
   does not reload the registry for agents, skills or workflows, but it does
   when it created, changed or removed a catalogue service that is in use,
-  or changed what an agent's `builtin:odata` entry allows (the entry
+  or changed what an agent's `builtin:odata` or `builtin:bitbucket` entry
+  allows (the entry
   changed, added or gone, the agent removed by `replace`, disabled or
   enabled) (answer keys `reloaded`, `reload_failed`, as for the catalogue
   routes).
   An agent create, update or delete that changes that agent's
-  `builtin:odata` entry (services, `allow_write`, the entry itself), or
+  `builtin:odata` entry (services, `allow_write`, the entry itself) or its
+  `builtin:bitbucket` entry (the stored block: Commenting, Approving, the
+  builds rule, repositories, branch, workspace, destination; the entry
+  itself), or
   disables or enables an agent that has one, reloads
-  the same way after the commit; create and update always answer `reloaded`
+  the same way after the commit (`_entry_signature`,
+  `_reload_for_changed_entry`: a run takes its specialist, and so the pins,
+  from the running build, so an unticked Approving must not wait for
+  somebody to press Reload; `tests/test_bitbucket_reload.py`); create and update always answer `reloaded`
   and `reload_failed` (both `false` for any other save, which does not
   reload), the 204 of a delete carries the two `X-OData-*` headers.
   `GET /admin/api/credential-health` lists a
@@ -1377,7 +1427,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   comma-separated field (blank = the key is absent), three checkboxes (Allow
   commenting, Allow approving, which needs the first, and "Approve only when
   all builds are successful", sent only as `false`); two such rows are
-  refused before the save. It asks no question when approving is switched on
+  refused before the save. Workspace and branch are filled for a bitbucket
+  row only, and a URL edit that changes the row's built-in type unticks
+  "Allow commenting" (one checkbox for `builtin:jira` and
+  `builtin:bitbucket`) and "Allow approving". An approving agent that is
+  still exposed to chat is refused by the server (422, fixed text). It asks
+  no question when approving is switched on
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
@@ -1390,8 +1445,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `agents/bitbucket_config.py` for `builtin:bitbucket` and adds no rule:
   `clean` builds the block from nothing (its own keys, pins as typed, a
   switch only as the boolean that is stored), `validate` answers fixed texts
-  that never quote a value, `newlyApproves` names the workspaces whose entry
-  approves after a save and did not before. The **OData services** area
+  that never quote a value, `approvalsToAsk` names what the agent's Save asks
+  about: an entry that approves after the save and did not before, or one
+  whose approval the save widens. The **OData services** area
   (nav entry between Skills and Runs; `view/ODataServices` = list with Used by,
   Write tag, import of a service file; `view/ODataServiceDetail` = identity
   ("Runs as" signed-in or technical user, destination field), purpose / not
@@ -1467,7 +1523,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   it): the agent ships **disabled and read-only** (a `builtin:bitbucket`
   entry with placeholder destination and workspace and no switch), so it
   posts nothing and, with no marker, reviews every listed pull request again
-  on each run until `allow_comment` is set (`tests/test_bitbucket_seed.py`)
+  on each run until `allow_comment` is set. It has `expose_chat: false` and
+  a run endpoint (`expose_api`, slug `pr-reviewer`): it is the scheduler's
+  agent, and an entry that approves is refused chat exposure, so an admin
+  who turns Approving on does not have to change anything else
+  (`tests/test_bitbucket_seed.py`)
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
   AI Core resource group the `aicore-resource-group` parameter (override
