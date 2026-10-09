@@ -9,6 +9,8 @@ import { AdminError } from "../service/AdminService";
 import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import odataEntry from "../model/odataEntry";
+import bitbucketEntry from "../model/bitbucketEntry";
+import type { BitbucketApprovalAsk } from "../model/bitbucketEntry";
 import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -289,6 +291,12 @@ export default class AgentDetail extends BaseController {
         // so that every stored name has its item from the start.
         const isOData = odataEntry.isODataUrl(server.url);
         const stored = odataEntry.clean(isOData ? server.oauth as Record<string, unknown> : undefined);
+        // --- bitbucket --- As for OData: the entry's own state is kept apart
+        // from `oauth`, and an entry stored in another spelling is held in the
+        // one the fragment's bindings test for.
+        const isBitbucket = bitbucketEntry.isBitbucketUrl(server.url);
+        const pins = ((isBitbucket ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
+        const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false };
         const opening = ++this.odataOpening;
         this.odataCatalogue = null;
         this.odataDefinitions = {};
@@ -301,13 +309,27 @@ export default class AgentDetail extends BaseController {
             // exactly `builtin:odata`: an entry stored in another spelling
             // (`Builtin:OData`) is held in that one, or OK would write back
             // an `allow_write` the admin never saw.
-            url: isOData ? odataEntry.ODATA_URL : server.url,
+            url: isOData ? odataEntry.ODATA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL : server.url,
             auth_mode: server.auth_mode,
             odata: {
                 services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
                 options: [], rows: [], noData: "", duplicate: "", missing: "", disabled: "", warning: "", writeText: ""
             },
-            oauth: isOData || !server.oauth ? { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false } : server.oauth,
+            oauth: isOData || !server.oauth ? blankOAuth
+                : isBitbucket ? { ...blankOAuth, destination: typeof pins.destination === "string" ? pins.destination : "" }
+                    : server.oauth,
+            // --- bitbucket --- Workspace and branch as stored (never
+            // trimmed); the switches as real booleans. No stored
+            // `require_green_builds` means the builds must be successful:
+            // the box is ticked.
+            bitbucket: {
+                workspace: typeof pins.workspace === "string" ? pins.workspace : "",
+                repositoriesText: bitbucketEntry.formatRepositories(pins.repositories),
+                branch: typeof pins.branch === "string" ? pins.branch : "",
+                allowComment: pins.allow_comment === true,
+                allowApprove: pins.allow_comment === true && pins.allow_approve === true,
+                requireGreenBuilds: pins.require_green_builds !== false
+            },
             // "mcp" for a remote server, otherwise the built-in's url.
             kind: findBuiltin(server.url)?.url ?? "mcp",
             kinds: [{ key: "mcp", text: this.text("toolsetRemoteMcp") }].concat(
@@ -371,6 +393,25 @@ export default class AgentDetail extends BaseController {
             // The spelling the fragment's bindings test for.
             serverModel.setProperty("/url", odataEntry.ODATA_URL);
             void this.enterODataEntry();
+        } else if (bitbucketEntry.isBitbucketUrl(url)) {
+            serverModel.setProperty("/url", bitbucketEntry.BITBUCKET_URL);
+        }
+    }
+
+    /**
+     * --- bitbucket --- Approving needs commenting: switching Commenting off
+     * switches Approving off (its box is disabled then, and a tick nobody can
+     * reach must not stay). The build requirement only matters while
+     * approving, so it goes back to its default, required, when Approving
+     * goes off: approving switched on again never starts without it.
+     */
+    public onBitbucketSwitch(): void {
+        const serverModel = this.getModel("server") as JSONModel;
+        if (serverModel.getProperty("/bitbucket/allowComment") !== true) {
+            serverModel.setProperty("/bitbucket/allowApprove", false);
+        }
+        if (serverModel.getProperty("/bitbucket/allowApprove") !== true) {
+            serverModel.setProperty("/bitbucket/requireGreenBuilds", true);
         }
     }
 
@@ -712,6 +753,28 @@ export default class AgentDetail extends BaseController {
         delete oauthRaw.theme;
         // --- sharepoint --- As the theme: only what the text area holds now counts.
         delete oauthRaw.views;
+        // --- bitbucket --- These three keys are refused by the server on
+        // every other toolset, so they never ride along from a stored block.
+        delete oauthRaw.repositories;
+        delete oauthRaw.allow_approve;
+        delete oauthRaw.require_green_builds;
+        if (bitbucketEntry.isBitbucketUrl(url)) {
+            // Only the entry's own values reach cleanOAuth: the destination
+            // name and what the Bitbucket fields hold now. Workspace and
+            // branch go on exactly as typed; the server refuses edge
+            // whitespace instead of repairing it, and so does the validator.
+            const destination = oauthRaw.destination;
+            const form = serverModel.getProperty("/bitbucket") as Record<string, unknown>;
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.destination = destination;
+            oauthRaw.workspace = form.workspace;
+            oauthRaw.repositories = bitbucketEntry.parseRepositories(form.repositoriesText as string);
+            oauthRaw.branch = form.branch;
+            oauthRaw.allow_comment = form.allowComment === true;
+            // The Approving box is disabled without Commenting; a stale tick is not sent.
+            oauthRaw.allow_approve = form.allowComment === true && form.allowApprove === true;
+            oauthRaw.require_green_builds = form.requireGreenBuilds !== false;
+        }
         if (odataEntry.isODataUrl(url)) {
             // --- odata --- Only the entry's own two values reach cleanOAuth.
             if (!this.confirmODataEntry()) {
@@ -864,13 +927,23 @@ export default class AgentDetail extends BaseController {
         if (this.agentId !== agentId || !this.saving) {
             return; // another agent was opened meanwhile
         }
-        if (!question) {
+        // --- bitbucket --- A second reason to ask: this save lets the agent
+        // approve pull requests unattended, or approve more than it did.
+        // Decided from the stored servers and the object that is sent (the
+        // same snapshot the PUT carries), never from a read.
+        const approvals = bitbucketEntry.approvalsToAsk(this.storedServers, toSave.mcp_servers);
+        const asked = (question ? [question] : []).concat(
+            approvals.map((ask) => this.bitbucketSaveQuestion(toSave.name, ask)));
+        if (asked.length === 0) {
             await this.saveAgent(toSave);
             return;
         }
+        const titleKey = question ? "odataEntrySaveTitle"
+            : approvals.some((ask) => ask.reason === "approve") ? "bitbucketApproveSaveTitle"
+                : "bitbucketWidenSaveTitle";
         const save = this.text("save");
-        MessageBox.warning(question, {
-            title: this.text("odataEntrySaveTitle"),
+        MessageBox.warning(asked.join("\n\n"), {
+            title: this.text(titleKey),
             actions: [save, MessageBox.Action.CANCEL],
             emphasizedAction: save,
             initialFocus: MessageBox.Action.CANCEL,
@@ -882,6 +955,36 @@ export default class AgentDetail extends BaseController {
                 }
             }
         });
+    }
+
+    /**
+     * --- bitbucket --- One ask in plain words. A new approval names all it
+     * opens (branch, workspace, repositories, whether builds count); a
+     * widened one names only what is new.
+     */
+    private bitbucketSaveQuestion(agentName: string, ask: BitbucketApprovalAsk): string {
+        if (ask.reason === "approve") {
+            const repositories = ask.repositories.length > 0
+                ? this.text("bitbucketSomeRepositories", [AgentDetail.quoted(ask.repositories)])
+                : this.text("bitbucketAllRepositories");
+            return this.text(
+                ask.requireGreenBuilds ? "bitbucketApproveSaveQuestion" : "bitbucketApproveSaveQuestionNoBuilds",
+                [agentName, ask.branch, ask.workspace, repositories]);
+        }
+        const lines = [this.text("bitbucketWidenSaveQuestion", [agentName, ask.workspace])];
+        if (ask.branchBefore) {
+            lines.push(this.text("bitbucketWidenBranch", [ask.branch, ask.branchBefore]));
+        }
+        if (ask.wholeWorkspace) {
+            lines.push(this.text("bitbucketWidenRepositoriesAll"));
+        }
+        if (ask.repositoriesAdded.length > 0) {
+            lines.push(this.text("bitbucketWidenRepositoriesAdded", [AgentDetail.quoted(ask.repositoriesAdded)]));
+        }
+        if (ask.buildsDropped) {
+            lines.push(this.text("bitbucketWidenBuilds"));
+        }
+        return lines.join("\n");
     }
 
     private async saveAgent(data: AgentInput): Promise<void> {

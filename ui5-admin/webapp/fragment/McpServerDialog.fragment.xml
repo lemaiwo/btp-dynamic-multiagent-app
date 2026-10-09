@@ -184,6 +184,71 @@
                 valueStateText="{server>/errors/views}"
                 visible="{= ${server>/url} === 'builtin:sharepoint' }" />
 
+            <!-- bitbucket: the agent's one pull request review entry. Its state
+                 lives under server>/bitbucket, apart from server>/oauth (only the
+                 destination name is shared), so that nothing of it reaches another
+                 toolset's block and no other toolset's tick arrives here. Workspace
+                 and branch are sent as typed (not trimmed). Approving needs
+                 commenting; the build requirement only matters while approving. -->
+            <Label text="{i18n>bitbucketWorkspaceLabel}" required="true" labelFor="oauthBitbucketWorkspace"
+                   visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <Input
+                id="oauthBitbucketWorkspace"
+                value="{server>/bitbucket/workspace}"
+                placeholder="{i18n>bitbucketWorkspaceHint}"
+                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+
+            <Label text="{i18n>bitbucketRepositoriesLabel}" labelFor="oauthBitbucketRepositories"
+                   visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <Input
+                id="oauthBitbucketRepositories"
+                value="{server>/bitbucket/repositoriesText}"
+                placeholder="{i18n>bitbucketRepositoriesPlaceholder}"
+                ariaDescribedBy="oauthBitbucketRepositoriesHint"
+                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <Label text="" visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <Text id="oauthBitbucketRepositoriesHint" text="{i18n>bitbucketRepositoriesHint}"
+                  visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+
+            <Label text="{i18n>bitbucketBranchLabel}" labelFor="oauthBitbucketBranch"
+                   visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <Input
+                id="oauthBitbucketBranch"
+                value="{server>/bitbucket/branch}"
+                placeholder="{i18n>bitbucketBranchHint}"
+                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+
+            <Label text="{i18n>bitbucketAllowCommentLabel}" labelFor="oauthBitbucketAllowComment"
+                   visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <CheckBox
+                id="oauthBitbucketAllowComment"
+                selected="{server>/bitbucket/allowComment}"
+                select=".onBitbucketSwitch"
+                text="{i18n>bitbucketAllowCommentHint}"
+                wrapping="true"
+                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+
+            <Label text="{i18n>bitbucketAllowApproveLabel}" labelFor="oauthBitbucketAllowApprove"
+                   visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <CheckBox
+                id="oauthBitbucketAllowApprove"
+                selected="{server>/bitbucket/allowApprove}"
+                enabled="{= ${server>/bitbucket/allowComment} === true }"
+                select=".onBitbucketSwitch"
+                text="{i18n>bitbucketAllowApproveHint}"
+                wrapping="true"
+                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+
+            <Label text="{i18n>bitbucketGreenBuildsLabel}" labelFor="oauthBitbucketGreenBuilds"
+                   visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <CheckBox
+                id="oauthBitbucketGreenBuilds"
+                selected="{server>/bitbucket/requireGreenBuilds}"
+                enabled="{= ${server>/bitbucket/allowApprove} === true }"
+                text="{i18n>bitbucketGreenBuildsHint}"
+                wrapping="true"
+                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+
             <Label text="{i18n>channelsLabel}"
                    visible="{= ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:slack' }" />
             <Input
@@ -224,12 +289,12 @@
                 valueStateText="{server>/errors/theme}"
                 visible="{= (${server>/url} === 'builtin:outlook' &amp;&amp; (${server>/auth_mode} === 'oauth2' || ${server>/auth_mode} === 'app_only' || ${server>/auth_mode} === 'destination')) || (${server>/url} === 'builtin:smtp' &amp;&amp; ${server>/auth_mode} === 'destination') }" />
 
-            <Label text="{i18n>lookback}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+            <Label text="{i18n>lookback}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:sharepoint' &amp;&amp; ${server>/url} !== 'builtin:bitbucket') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
             <Input
                 id="oauthLookback"
                 value="{server>/oauth/lookback}"
                 placeholder="{i18n>lookbackHint}"
-                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
+                visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'destination' &amp;&amp; ${server>/kind} !== 'mcp' &amp;&amp; ${server>/url} !== 'builtin:gmail' &amp;&amp; ${server>/url} !== 'builtin:sapnotedetail' &amp;&amp; ${server>/url} !== 'builtin:smtp' &amp;&amp; ${server>/url} !== 'builtin:odata' &amp;&amp; ${server>/url} !== 'builtin:sharepoint' &amp;&amp; ${server>/url} !== 'builtin:bitbucket') || ${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' }" />
 
             <Label text="{i18n>allowSend}" visible="{= (${server>/auth_mode} === 'app_only' &amp;&amp; ${server>/url} !== 'builtin:teams' &amp;&amp; ${server>/url} !== 'builtin:sharepoint') || (${server>/auth_mode} === 'oauth2' &amp;&amp; (${server>/url} === 'builtin:teams' || ${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:gmail')) || ${server>/url} === 'builtin:slack' || (${server>/auth_mode} === 'destination' &amp;&amp; (${server>/url} === 'builtin:outlook' || ${server>/url} === 'builtin:smtp' || (${server>/url} === 'builtin:teams' &amp;&amp; ${server>/oauth/user_context} === true))) }" />
             <CheckBox
@@ -252,7 +317,7 @@
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
-                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
+                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/url} === 'builtin:bitbucket' ? 'MY_BITBUCKET_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
                 visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' }" />
 
             <!-- destinations: whose credential the destination hands back.

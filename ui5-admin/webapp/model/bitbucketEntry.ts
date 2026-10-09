@@ -14,6 +14,8 @@ const WORKSPACE_RE = /^[a-z0-9][a-z0-9_-]{0,61}$/;
 const REPOSITORY_RE = /^[a-z0-9_][a-z0-9._-]{0,61}$/;
 const BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const MAX_REPOSITORIES = 50;
+/** `DEFAULT_BRANCH` of `agents/bitbucket_config.py`: the branch of an entry that names none. */
+const DEFAULT_BRANCH = "main";
 const SWITCHES = ["allow_comment", "allow_approve", "require_green_builds"];
 
 function isUrl(url: string | undefined | null): boolean {
@@ -32,6 +34,39 @@ function approving(servers: McpServer[] | undefined): string[] {
     return (servers || [])
         .filter((s) => isUrl(s.url) && block(s).allow_approve === true)
         .map((s) => String(block(s).workspace ?? ""));
+}
+
+function branchOf(cfg: Record<string, unknown>): string {
+    return typeof cfg.branch === "string" && cfg.branch ? cfg.branch : DEFAULT_BRANCH;
+}
+
+/** The pinned repositories; an empty list is the whole workspace. */
+function repositoriesOf(cfg: Record<string, unknown>): string[] {
+    return Array.isArray(cfg.repositories) ? cfg.repositories.map((item) => String(item)) : [];
+}
+
+/**
+ * One thing the agent's Save has to ask about: an entry that approves after
+ * the save and either did not before (`approve`: everything it opens is its
+ * own values) or did, for less (`widened`: the four last fields say exactly
+ * what is new; a narrowing is in none of them).
+ */
+export interface BitbucketApprovalAsk {
+    reason: "approve" | "widened";
+    workspace: string;
+    /** The branch after the save (the server's default when none is pinned). */
+    branch: string;
+    /** The repositories after the save; empty = the whole workspace. */
+    repositories: string[];
+    requireGreenBuilds: boolean;
+    /** The branch it approved to before, when that changes; else "". */
+    branchBefore: string;
+    /** Repositories it did not approve in before. */
+    repositoriesAdded: string[];
+    /** A list replaced by the whole workspace. */
+    wholeWorkspace: boolean;
+    /** Builds had to be successful before and no longer have to. */
+    buildsDropped: boolean;
 }
 
 export default {
@@ -138,5 +173,57 @@ export default {
     newlyApproves(stored: McpServer[] | undefined, toSave: McpServer[] | undefined): string[] {
         const before = approving(stored);
         return approving(toSave).filter((workspace) => before.indexOf(workspace) === -1);
+    },
+
+    /**
+     * What the agent's Save asks about: every entry that approves after the
+     * save (exactly `allow_approve: true`) and opens something by it. An
+     * entry is the same one when its workspace is (an agent has one entry;
+     * another workspace is a new approval, said in full). Removing the
+     * entry, switching approving off, removing a repository, cutting the
+     * whole workspace down to a list and requiring the builds again ask
+     * nothing.
+     */
+    approvalsToAsk(stored: McpServer[] | undefined, toSave: McpServer[] | undefined): BitbucketApprovalAsk[] {
+        const approvingBefore = (stored || [])
+            .filter((s) => isUrl(s.url) && block(s).allow_approve === true).map(block);
+        const asks: BitbucketApprovalAsk[] = [];
+        (toSave || []).forEach((server) => {
+            const cfg = block(server);
+            if (!isUrl(server.url) || cfg.allow_approve !== true) {
+                return;
+            }
+            const workspace = String(cfg.workspace ?? "");
+            const ask: BitbucketApprovalAsk = {
+                reason: "approve",
+                workspace,
+                branch: branchOf(cfg),
+                repositories: repositoriesOf(cfg),
+                requireGreenBuilds: cfg.require_green_builds !== false,
+                branchBefore: "",
+                repositoriesAdded: [],
+                wholeWorkspace: false,
+                buildsDropped: false
+            };
+            const before = approvingBefore.filter((b) => String(b.workspace ?? "") === workspace)[0];
+            if (!before) {
+                asks.push(ask);
+                return;
+            }
+            const listedBefore = repositoriesOf(before);
+            if (branchOf(before) !== ask.branch) {
+                ask.branchBefore = branchOf(before);
+            }
+            if (listedBefore.length > 0) {
+                ask.wholeWorkspace = ask.repositories.length === 0;
+                ask.repositoriesAdded = ask.repositories.filter((name) => listedBefore.indexOf(name) === -1);
+            }
+            ask.buildsDropped = before.require_green_builds !== false && !ask.requireGreenBuilds;
+            if (ask.branchBefore || ask.wholeWorkspace || ask.repositoriesAdded.length > 0 || ask.buildsDropped) {
+                ask.reason = "widened";
+                asks.push(ask);
+            }
+        });
+        return asks;
     }
 };
