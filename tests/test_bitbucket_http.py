@@ -377,3 +377,34 @@ async def test_an_absolute_url_on_the_destinations_https_origin_is_sent(dest_url
     await client._send("GET", url)
     assert len(fake.requests) == 1 and fake.requests[0].headers["authorization"] == TOKEN
     assert fake.requests[0].url.raw_path == b"/2.0/user"
+
+
+# --- an answer over its cap ---------------------------------------------------
+
+async def test_an_answer_over_its_cap_is_a_refusal_not_an_empty_success():
+    # A caller that reads `.content` of what `_send` returns must never see an
+    # empty 200 where the answer was too long to keep.
+    fake = FakeBitbucket()
+    fake.override = lambda r: httpx.Response(200, content=b"x" * 2000)
+    client, _ = _client(fake)
+    with pytest.raises(Refused) as refused:
+        await client._send("GET", "/2.0/user", cap=1000)
+    assert refused.value.code == "result_too_large"
+    assert refused.value.message == "Bitbucket's answer is too large to read"
+
+
+async def test_only_a_caller_that_asks_for_it_gets_the_over_cap_answer_and_it_is_empty():
+    fake = FakeBitbucket()
+    fake.override = lambda r: httpx.Response(200, content=b"x" * 2000)
+    client, _ = _client(fake)
+    response = await client._send("GET", "/2.0/user", cap=1000, allow_over_cap=True)
+    assert response.extensions.get("bitbucket_over_cap") is True and response.content == b""
+    with pytest.raises(TypeError):
+        await client._send("GET", "/2.0/user", None, None, 1000, True)   # keyword only
+
+
+async def test_an_answer_at_its_cap_is_read():
+    fake = FakeBitbucket()
+    fake.override = lambda r: httpx.Response(200, content=b"x" * 1000)
+    client, _ = _client(fake)
+    assert (await client._send("GET", "/2.0/user", cap=1000)).content == b"x" * 1000

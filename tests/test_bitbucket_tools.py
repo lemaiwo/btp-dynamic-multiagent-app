@@ -68,7 +68,8 @@ async def test_get_pull_request_returns_the_review_facts():
     assert out["title"] == "Fix the parser" and out["author"] == "Ann Author"
     assert out["builds"] == {"state": "green", "total": 2}
     assert out["comments"] == [{"id": 100, "author": "Carl Commenter", "text": "Looks odd",
-                                "inline": {"path": "src/x.py", "line": 3}, "own": False}]
+                                "inline": {"path": "src/x.py", "line": 3, "side": "new"},
+                                "own": False}]
 
 
 @pytest.mark.parametrize("states, expected", [
@@ -279,7 +280,8 @@ async def test_an_oversized_json_answer_is_refused_while_reading():
     body = _Endless(b'{"a": "' + b"x" * 65_536)
     fake.override = lambda r: httpx.Response(200, stream=body)
     out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
-    assert out["error"]["code"] == "bitbucket_error"
+    assert out == {"error": {"code": "result_too_large",
+                             "message": "Bitbucket's answer is too large to read"}}
     assert body.taken <= MAX_JSON_BYTES + 2 * 65_600 and body.closed
 
 
@@ -360,7 +362,20 @@ async def test_odd_comment_and_pull_request_fields_do_not_break_the_answer():
     assert len(out["comments"]) == 1
     only = out["comments"][0]
     assert only["id"] == 1 and only["author"] == "" and only["text"].endswith("…[truncated]")
-    assert only["inline"] == {"path": None, "line": 9}
+    assert only["inline"] == {"path": None, "line": 9, "side": "old"}
+
+
+@pytest.mark.parametrize("anchor, line, side", [
+    ({"to": 3}, 3, "new"), ({"from": 9}, 9, "old"),
+    ({"from": 9, "to": 3}, 3, "new"),               # a changed line: the new file's
+    ({"to": None, "from": 9}, 9, "old"), ({"to": True, "from": "9"}, None, None), ({}, None, None),
+])
+async def test_an_inline_comment_says_its_side_in_the_words_of_add_inline_comment(
+        anchor, line, side):
+    fake = _fake()
+    fake.add_comment("svc-a", 7, "Looks odd", inline={"path": "src/x.py", **anchor})
+    out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
+    assert out["comments"][0]["inline"] == {"path": "src/x.py", "line": line, "side": side}
 
 
 async def test_more_statuses_than_were_read_are_not_green():

@@ -317,9 +317,13 @@ def _diffstat_entry(item: dict[str, Any]) -> dict[str, Any]:
 def _comment(item: dict[str, Any], account: str = "") -> dict[str, Any]:
     inline = item.get("inline")
     if isinstance(inline, dict):
-        line = inline.get("to") if type(inline.get("to")) is int else inline.get("from")
+        # The words of add_inline_comment: `new` is a line of the new file
+        # (Bitbucket's `to`), `old` a line only the old file has (`from`).
+        side = next((name for key, name in (("to", "new"), ("from", "old"))
+                     if type(inline.get(key)) is int), None)
         inline = {"path": _shown_path(inline.get("path")),
-                  "line": line if type(line) is int else None}
+                  "line": inline.get("to" if side == "new" else "from") if side else None,
+                  "side": side}
     else:
         inline = None
     return {"id": item["id"],
@@ -445,12 +449,19 @@ class BitbucketClient:
             await live.aclose()
 
     async def _send(self, method: str, url: Any, *, params: Any = None,
-                    json: Any = None, cap: int = MAX_JSON_BYTES) -> httpx.Response:
+                    json: Any = None, cap: int = MAX_JSON_BYTES,
+                    allow_over_cap: bool = False) -> httpx.Response:
         """One request; a 429 is repeated after each of ``BACKOFF_SECONDS``.
 
         Nothing of a failure but its class reaches the log, and nothing at
         all the caller: the text of an exception may hold a URL or what the
         other side said.
+
+        An answer longer than ``cap`` is a refusal (``result_too_large``):
+        what comes back for it has a 2xx status and an empty body, and a
+        caller that reads the body without looking for the ``_OVER_CAP`` mark
+        would take it for an empty success. Only a caller that handles the
+        mark itself passes ``allow_over_cap=True``.
         """
         async with self._turn:
             for wait in (*BACKOFF_SECONDS, None):
@@ -476,6 +487,9 @@ class BitbucketClient:
                 finally:
                     _sending.reset(quiet)
                 if response.status_code != 429:
+                    if response.extensions.get(_OVER_CAP) and not allow_over_cap:
+                        raise Refused("result_too_large",
+                                      "Bitbucket's answer is too large to read")
                     return response
                 if wait is not None:
                     await self._sleep(wait)
@@ -484,8 +498,8 @@ class BitbucketClient:
     def _json(self, response: httpx.Response, *, ok: tuple[int, ...] = (200,)) -> dict[str, Any]:
         if response.status_code not in ok:
             raise _status_refusal(response.status_code)
-        if response.extensions.get(_OVER_CAP):
-            raise Refused("bitbucket_error", "Bitbucket's answer is too large to read")
+        if response.extensions.get(_OVER_CAP):      # a caller that allowed it and did not look
+            raise Refused("result_too_large", "Bitbucket's answer is too large to read")
         try:
             body = response.json()
         except ValueError:
@@ -495,19 +509,21 @@ class BitbucketClient:
         return body
 
     async def _get_following(self, url: Any, params: Any = None, *,
-                             cap: int = MAX_JSON_BYTES) -> httpx.Response:
+                             cap: int = MAX_JSON_BYTES,
+                             allow_over_cap: bool = False) -> httpx.Response:
         """A GET that follows ONE redirect, on the host the request went to.
 
         Bitbucket answers the diff of a pull request with a 302 to the same
         host. The client itself follows nothing: a redirect elsewhere would
         get the destination's credential.
         """
-        response = await self._send("GET", url, params=params, cap=cap)
+        response = await self._send("GET", url, params=params, cap=cap,
+                                    allow_over_cap=allow_over_cap)
         if response.status_code not in _REDIRECTS:
             return response
         target = _same_host_target(response.headers.get("location"), response.request.url)
         if target is not None:
-            response = await self._send("GET", target, cap=cap)
+            response = await self._send("GET", target, cap=cap, allow_over_cap=allow_over_cap)
         if target is None or response.status_code in _REDIRECTS:
             raise Refused("bitbucket_error",
                           "Bitbucket redirected to a place this tool does not follow")
@@ -749,7 +765,8 @@ class BitbucketClient:
         if path != "":
             path = _confined(path)
         response = await self._get_following(
-            f"{base}/diff", {"path": path} if path else None, cap=MAX_DIFF_BYTES)
+            f"{base}/diff", {"path": path} if path else None, cap=MAX_DIFF_BYTES,
+            allow_over_cap=True)         # over the cap is said with the diffstat, below
         text = ""
         # 555 is Bitbucket's "too large to render".
         too_large = response.status_code == 555 or bool(response.extensions.get(_OVER_CAP))
@@ -792,7 +809,7 @@ class BitbucketClient:
         if type(size) is not int or not 0 <= size <= MAX_FILE_BYTES:
             raise Refused(*_FILE_TOO_LARGE)
         # The meta data is a statement, the cap of the read is the limit.
-        response = await self._send("GET", url, cap=MAX_FILE_BYTES)
+        response = await self._send("GET", url, cap=MAX_FILE_BYTES, allow_over_cap=True)
         if 300 <= response.status_code < 400:
             raise Refused(*_BINARY)
         if response.status_code != 200:
