@@ -50,15 +50,27 @@ from pydantic import (
 )
 
 from agents.auth import current_base_url, current_principal, require_admin
+from agents.chat_app import dynamic_chat_app
+from agents.builtins import BUILTIN_URLS, is_builtin_url
+from agents.jira_tools import BUILTIN_JIRA_URL
+from agents.mail_render import MailTheme
+from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+from agents.outlook_tools import BUILTIN_OUTLOOK_URL
+from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_config import check_entry as check_bitbucket_entry
-from agents.builtins import BUILTIN_URLS, is_builtin_url
-from agents.chat_app import dynamic_chat_app
+from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
+from agents.sharepoint_views import check_pins, clean_views
+from agents.slack_tools import BUILTIN_SLACK_URL
+from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
+from agents.teams_tools import BUILTIN_TEAMS_URL
+from agents.validation_errors import validation_item
 from agents.db import (
-    AUTH_MODE_APP_ONLY,
-    AUTH_MODE_DESTINATION,
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
+    AUTH_MODE_APP_ONLY,
+    AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
     BUILTIN_PUBLIC_KEYS,
@@ -72,12 +84,12 @@ from agents.db import (
     agent_referrers,
     agent_where_used,
     check_delegation_name_collision,
-    check_odata_services,
-    create_odata_service,
     delete_agent,
-    delete_odata_service,
     delete_skill,
     delete_workflow,
+    check_odata_services,
+    create_odata_service,
+    delete_odata_service,
     describe_referrers,
     get_active_model_name,
     get_agent,
@@ -99,8 +111,8 @@ from agents.db import (
     normalize_skills_json,
     odata_entries,
     odata_service_columns,
-    odata_service_referrers,
     odata_service_unchanged,
+    odata_service_referrers,
     prepare_servers,
     prepared_server_list,
     rename_agent_references,
@@ -114,25 +126,12 @@ from agents.db import (
     validate_api_slug,
     validate_odata_service,
 )
-
-# --- deep agents ---
-from agents.deep import DeepConfig, dump_deep_config
-from agents.jira_tools import BUILTIN_JIRA_URL
-from agents.mail_render import MailTheme
-from agents.odata import BUILTIN_ODATA_URL
-from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
-from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.registry import registry
-from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.shared import available_models, default_model_name
-from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
-from agents.sharepoint_views import check_pins, clean_views
-from agents.slack_tools import BUILTIN_SLACK_URL
-from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
-from agents.teams_tools import BUILTIN_TEAMS_URL
-from agents.validation_errors import validation_item
 from agents.workflow_runner import RunRefused as WorkflowRunRefused
 from agents.workflow_runner import start_workflow_run
+# --- deep agents ---
+from agents.deep import DeepConfig, dump_deep_config
 
 logger = logging.getLogger(__name__)
 
