@@ -183,7 +183,8 @@ def test_every_code_the_texts_name_is_one_the_toolset_answers():
               "repositories_failed", "beyond_reach", "reviewed_filter", "head_commit",
               "comments_truncated", "diffstat", "diffstat_truncated",
               # An answer key of submit_review, and the example of a prefixed tool.
-              "earlier_approval_stands", "bitbucket_submit_review"}
+              "earlier_approval_stands", "earlier_approval_unknown",
+              "bitbucket_submit_review"}
     fields |= set(TOOLS)
     assert quoted - fields <= ERROR_CODES, quoted - fields - ERROR_CODES
     for code in ("result_too_large", "already_reviewed", "already_commented",
@@ -297,6 +298,32 @@ def test_a_standing_approval_is_reported():
     assert said in _agent()["instructions"]
     section = _skill()["content"].split("## 5.", 1)[1]
     assert "`earlier_approval_stands`" in section and "`already_approved: true`" in section
+
+
+def test_a_withdrawn_approval_and_an_unknown_one_are_reported():
+    """The code withdraws this account's earlier approval when a review of a
+    newer commit has verdict comment. The texts only say what to report."""
+    rules = _agent()["instructions"]
+    assert ("- If it answers `approval_withdrawn: true`, say in the report for that pull "
+            "request that your approval of an earlier commit was withdrawn.") in rules
+    assert ("- With code `withdrawal_outcome_unknown` the earlier approval may still stand, "
+            "and with `earlier_approval_unknown` it could not be read whether there is one: "
+            "say so in the report for that pull request, a person must look.") in rules
+    section = _skill()["content"].split("## 5.", 1)[1]
+    for word in ("`approval_withdrawn: true`", "`earlier_approval_stands`",
+                 "`withdrawal_outcome_unknown`", "`approval_withdrawn: null`",
+                 "`earlier_approval_unknown`"):
+        assert word in section, word
+    assert "Nothing withdraws it" not in section
+
+
+def test_no_text_tells_the_agent_to_withdraw_an_approval_itself():
+    text = _texts()
+    assert "You never withdraw an approval yourself: the tool does it" in _agent()["instructions"]
+    low = text.lower()
+    for phrase in ("withdraw the approval", "withdraw your approval", "remove the approval",
+                   "remove your approval", "unapprove", "delete the approval"):
+        assert phrase not in low, phrase
 
 
 def test_a_pull_request_that_cannot_be_posted_on_is_reported_with_its_findings():
