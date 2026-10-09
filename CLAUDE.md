@@ -204,7 +204,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `create_mcp_server` returns a `PerRunMCPServer`: the registry shares one
   server object across all users, so each agent run must open its own MCP
   session, or overlapping runs send requests with whichever user opened the
-  shared session (`tests/test_mcp_user_isolation.py`). A remote MCP URL can be
+  shared session (`tests/test_mcp_user_isolation.py`). The OpenAI-family
+  model client retries a refused request (429, 5xx, connection errors)
+  `AICORE_MAX_RETRIES` times (default 8, about 40 s of backoff, so a
+  per-minute rate limit can clear; `0` switches retries off; read when a
+  model is built, and models are cached per name, so a change needs a
+  restart; `tests/test_model_retries.py`). A remote MCP URL can be
   reached through a BTP destination (`auth_mode="destination"`,
   `_destination_mcp_server`): the destination names the host and holds the
   credential, as the signed-in user when `user_context` is true; no JWT bound

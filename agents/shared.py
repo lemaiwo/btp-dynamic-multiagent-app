@@ -529,12 +529,47 @@ def _is_anthropic(name: str) -> bool:
     return name.startswith("anthropic") or "claude" in name.lower()
 
 
+# Retries of one model request by the openai SDK (429, 408, 409, 5xx and
+# connection errors). The SDK's own default is 2, about 1.5 s of backoff in
+# total, which a rate limit counted per minute outlasts: a deep agent's
+# parallel sub-agents share one deployment and then fail the whole run. The
+# backoff doubles from 0.5 s and is capped at 8 s, so 8 retries wait about
+# 40 s (less jitter), or as long as a Retry-After of at most 60 s asks.
+AICORE_MAX_RETRIES_DEFAULT = 8
+
+
+def _max_retries() -> int:
+    """``AICORE_MAX_RETRIES``, read when a model is built; 0 means no retries.
+
+    A value that is not a non-negative integer is the default, with a warning
+    that names the variable but not its value: a typo must not keep a model
+    from being built (the same rule as ``agents.ide.store.env_int``, which
+    this module cannot import).
+    """
+    raw = (os.environ.get("AICORE_MAX_RETRIES") or "").strip()
+    if not raw:
+        return AICORE_MAX_RETRIES_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        logger.warning(
+            "AICORE_MAX_RETRIES is not a non-negative integer; using the default %d",
+            AICORE_MAX_RETRIES_DEFAULT,
+        )
+        return AICORE_MAX_RETRIES_DEFAULT
+    return value
+
+
 def _build_openai_model(name: str) -> SAPAICoreModel:
     from gen_ai_hub.proxy import get_proxy_client
     from gen_ai_hub.proxy.native.openai import AsyncOpenAI
 
     proxy_client = get_proxy_client("gen-ai-hub")
-    sap_openai_client = AsyncOpenAI(proxy_client=proxy_client)
+    sap_openai_client = AsyncOpenAI(
+        proxy_client=proxy_client, max_retries=_max_retries()
+    )
 
     return SAPAICoreModel(
         name,
