@@ -1,6 +1,6 @@
 import type {
     Agent, CredentialStatus, JobRunDetail, ODataDefinition, ODataEntityOp, ODataEntitySet, ODataField,
-    ODataDestination, ODataDestinationList, ODataMetadataPreview, ODataPreviewEntitySet, ODataPreviewOperation, ODataService,
+    NotificationItem, ODataDestination, ODataDestinationList, ODataMetadataPreview, ODataPreviewEntitySet, ODataPreviewOperation, ODataService,
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
@@ -84,6 +84,17 @@ export default class FakeBackend {
     public bodies: Record<string, Record<string, unknown> | undefined> = {};
     /** The paths of the POST .../run calls, in order. */
     public runNowCalls: string[] = [];
+    /**
+     * The finished runs `GET notifications` lists, newest first, without
+     * `unread`: the route works that out from `notificationsSeenAt`, as the
+     * server does. Empty after `reset()`, so no other journey sees a badge.
+     */
+    public notifications: Omit<NotificationItem, "unread">[] = [];
+    /** The caller's read marker; `POST notifications/seen` only moves it forward. */
+    public notificationsSeenAt = "2026-08-24T00:00:00+00:00";
+    /** Unread runs of the window that the capped list does not hold: added
+     *  to `unread_count`, which may exceed the number of items. */
+    public notificationsUnreadBeyondList = 0;
 
     private originalFetch?: typeof fetch;
     private nextId = 100;
@@ -125,6 +136,9 @@ export default class FakeBackend {
         this.requests = [];
         this.bodies = {};
         this.runNowCalls = [];
+        this.notifications = [];
+        this.notificationsSeenAt = "2026-08-24T00:00:00+00:00";
+        this.notificationsUnreadBeyondList = 0;
         this.agents = [this.makeAgent("btp-agent"), this.makeAgent("gmail-agent")];
         // btp-agent is exposed as a job API, so its Run now button is live
         // on the list and detail pages; gmail-agent is not.
@@ -1739,6 +1753,33 @@ export default class FakeBackend {
         if (/^workflow-runs\/[^/]+$/.test(path)) {
             const id = path.split("/")[1];
             return this.json(this.workflowRuns.find((r) => r.run.id === id) ?? this.workflowRuns[0]);
+        }
+        if (path === "notifications" && method === "GET") {
+            const seen = Date.parse(this.notificationsSeenAt);
+            const items = this.notifications.map((item) => ({
+                ...item, unread: Date.parse(item.finished_at) > seen
+            }));
+            return this.json({
+                items,
+                unread_count: items.filter((item) => item.unread).length + this.notificationsUnreadBeyondList,
+                seen_at: this.notificationsSeenAt
+            });
+        }
+        if (path === "notifications/seen" && method === "POST") {
+            // As strict as the server: exactly `{up_to: <timestamp with a
+            // zone>}`, anything else is refused. (The server also caps the
+            // marker at its own clock; the fixtures have fixed dates, so the
+            // fake does not.)
+            const upTo = body?.up_to;
+            const keys = Object.keys(body ?? {});
+            if (keys.length !== 1 || typeof upTo !== "string"
+                || !/(Z|[+-]\d\d:\d\d)$/.test(upTo) || isNaN(Date.parse(upTo))) {
+                return this.json({ detail: "up_to must be a timestamp with a time zone" }, 422);
+            }
+            if (Date.parse(upTo) > Date.parse(this.notificationsSeenAt)) {
+                this.notificationsSeenAt = upTo;
+            }
+            return this.json({ seen_at: this.notificationsSeenAt });
         }
         if (path === "reload" || path === "restart") {
             return this.json({ status: "ok" });

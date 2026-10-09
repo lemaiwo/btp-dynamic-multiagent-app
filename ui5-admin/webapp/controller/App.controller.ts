@@ -1,5 +1,14 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
+import MessageToast from "sap/m/MessageToast";
 import BaseController from "./BaseController";
+import formatter from "../model/formatter";
+import {
+    badgeText, itemKey, newestFinishedAt, newlyFinished, statusIcon, statusState, toastKey
+} from "../model/notifications";
+import type { NotificationItem, NotificationList } from "../service/types";
+import type Button from "sap/m/Button";
+import type ResponsivePopover from "sap/m/ResponsivePopover";
+import type { ListBase$ItemPressEvent } from "sap/m/ListBase";
 import type NavigationListItem from "sap/tnt/NavigationListItem";
 import type { Router$RouteMatchedEvent, Router$BypassedEvent } from "sap/ui/core/routing/Router";
 import type SideNavigation from "sap/tnt/SideNavigation";
@@ -35,6 +44,35 @@ export default class App extends BaseController {
      *  whatever item was pressed, before anyone agreed to leave. */
     private shownKey = "";
 
+    /** For the bindings of the notification list. */
+    public formatter = formatter;
+    public notificationFormat = { statusState, statusIcon };
+
+    /** Between two polls for finished runs. Static, so a test can shorten
+     *  it; the journeys call `pollNotifications()` instead of waiting. */
+    public static notificationPollMs = 15000;
+
+    /** False once the shell is gone (and inside a host shell, where there
+     *  is no bell): an answer that arrives then is dropped. */
+    private notificationsActive = false;
+    private notificationTimer?: ReturnType<typeof setTimeout>;
+    /** Counts the polls, so that only the answer of the latest one is shown. */
+    private pollSeq = 0;
+    /** The runs of the last poll; `null` before the first one, which
+     *  therefore announces nothing. */
+    private knownKeys: Set<string> | null = null;
+    private lastList?: NotificationList;
+    /** The runs that were unread when the list was opened: they keep their
+     *  mark while it is open, although opening it marked them read. */
+    private openUnreadKeys = new Set<string>();
+    private notificationsPopover?: Promise<ResponsivePopover>;
+
+    private readonly onVisibilityChange = (): void => {
+        if (this.notificationsActive && document.visibilityState === "visible") {
+            void this.pollNotifications();
+        }
+    };
+
     public onInit(): void {
         const model = new JSONModel({
             sideExpanded: true,
@@ -52,7 +90,11 @@ export default class App extends BaseController {
             // The header's user menu always has this one entry, so it carries a
             // placeholder until whoami answers (and keeps it if that call
             // fails) rather than opening onto an empty menu.
-            userLabel: this.text("userUnknown")
+            userLabel: this.text("userUnknown"),
+            // The finished runs behind the bell and the text of its badge
+            // ("" = no badge).
+            notifications: [],
+            notificationBadge: ""
         });
         this.setModel(model, "appView");
 
@@ -76,6 +118,21 @@ export default class App extends BaseController {
         });
 
         void this.loadUser();
+
+        // The bell is part of the header: without one there is nothing to
+        // show a count on and no list to mark read.
+        if (model.getProperty("/showHeader")) {
+            this.startNotifications();
+        }
+    }
+
+    public onExit(): void {
+        this.notificationsActive = false;
+        if (this.notificationTimer !== undefined) {
+            clearTimeout(this.notificationTimer);
+            this.notificationTimer = undefined;
+        }
+        document.removeEventListener("visibilitychange", this.onVisibilityChange);
     }
 
     private static isInShell(): boolean {
@@ -94,6 +151,138 @@ export default class App extends BaseController {
             const label = who.label || who.principal || this.text("userUnknown");
             (this.getModel("appView") as JSONModel).setProperty("/userLabel", label);
         }
+    }
+
+    /** One poll now, then one every `notificationPollMs` while the page is
+     *  visible, and one as soon as it becomes visible again. */
+    private startNotifications(): void {
+        this.notificationsActive = true;
+        document.addEventListener("visibilitychange", this.onVisibilityChange);
+        void this.pollNotifications();
+        this.armNotificationTimer();
+    }
+
+    /** A chain of timeouts, armed after the poll has answered, so a slow
+     *  backend never has two timer polls out at once. */
+    private armNotificationTimer(): void {
+        this.notificationTimer = setTimeout(() => {
+            this.notificationTimer = undefined;
+            const poll = document.visibilityState === "hidden" ? Promise.resolve() : this.pollNotifications();
+            void poll.then(() => {
+                if (this.notificationsActive) {
+                    this.armNotificationTimer();
+                }
+            });
+        }, App.notificationPollMs);
+    }
+
+    /**
+     * Reads the finished runs, shows them and the unread count, and
+     * announces the runs that were not in the previous poll. A poll that
+     * fails is silent: it runs in the background, the next one will do.
+     * Never rejects.
+     */
+    public async pollNotifications(): Promise<void> {
+        const seq = ++this.pollSeq;
+        let list: NotificationList;
+        try {
+            list = await this.getAdminService().getNotifications();
+        } catch {
+            return;
+        }
+        // A newer poll is out (or the list was just marked read, or the
+        // shell is gone): this answer is older than what will be shown.
+        if (seq !== this.pollSeq || !this.notificationsActive) {
+            return;
+        }
+        const toast = toastKey(newlyFinished(this.knownKeys, list.items));
+        this.knownKeys = new Set(list.items.map(itemKey));
+        this.lastList = list;
+        this.showNotifications();
+        if (toast) {
+            MessageToast.show(this.text(toast.key, toast.args), { closeOnBrowserNavigation: false });
+        }
+    }
+
+    private showNotifications(): void {
+        const list = this.lastList;
+        if (!list) {
+            return;
+        }
+        const model = this.getModel("appView") as JSONModel;
+        model.setProperty("/notifications", list.items.map((item) => ({
+            ...item, unread: item.unread || this.openUnreadKeys.has(itemKey(item))
+        })));
+        // The server's count, not the number of unread items: the list is
+        // capped, the count is not.
+        model.setProperty("/notificationBadge", badgeText(list.unread_count));
+    }
+
+    /**
+     * Opens the list of finished runs (or closes it when it is open).
+     * Opening is what marks the runs read: the marker moves to the newest
+     * run that is *shown*, so a run that finished since the last poll stays
+     * unread.
+     */
+    public async onOpenNotifications(): Promise<void> {
+        const popover = await this.getNotificationsPopover();
+        if (popover.isOpen()) {
+            popover.close();
+            return;
+        }
+        const items = (this.getModel("appView") as JSONModel).getProperty("/notifications") as NotificationItem[];
+        this.openUnreadKeys = new Set(items.filter((item) => item.unread).map(itemKey));
+        popover.openBy(this.byId("notificationBell") as Button);
+
+        const upTo = newestFinishedAt(items);
+        if (upTo !== null && this.lastList && this.lastList.unread_count > 0) {
+            await this.markNotificationsSeen(upTo);
+        } else {
+            await this.pollNotifications();
+        }
+    }
+
+    /** Moves the read marker, then reads the list again for the count that
+     *  is left. Silent on failure, as a poll is: the badge then stays. */
+    private async markNotificationsSeen(upTo: string): Promise<void> {
+        // An answer that is on its way was made before the marker moved.
+        this.pollSeq++;
+        try {
+            // Exactly the string the server sent: it accepts nothing else.
+            await this.getAdminService().markNotificationsSeen(upTo);
+        } catch {
+            return;
+        }
+        await this.pollNotifications();
+    }
+
+    private getNotificationsPopover(): Promise<ResponsivePopover> {
+        if (!this.notificationsPopover) {
+            // loadFragment makes it a dependent of the view: it gets the
+            // view's models and is destroyed with it.
+            this.notificationsPopover = this.loadFragment({
+                name: "com.agent.admin.fragment.NotificationsPopover"
+            }) as Promise<ResponsivePopover>;
+        }
+        return this.notificationsPopover;
+    }
+
+    /** The list is closed: what was new when it opened no longer is. */
+    public onNotificationsClosed(): void {
+        this.openUnreadKeys = new Set();
+        this.showNotifications();
+    }
+
+    /** Opens the detail page of the pressed run, unless the page that is
+     *  shown objects (unsaved changes), as for the side navigation. */
+    public async onNotificationPress(event: ListBase$ItemPressEvent): Promise<void> {
+        const context = event.getParameter("listItem")?.getBindingContext("appView");
+        const item = context?.getObject() as NotificationItem | undefined;
+        (await this.getNotificationsPopover()).close();
+        if (!item || !(await this.getOwnerComponentTyped().canLeave())) {
+            return;
+        }
+        this.getRouter().navTo(item.kind === "workflow" ? "workflowRunDetail" : "runDetail", { runId: item.run_id });
     }
 
     public onToggleSideNav(): void {

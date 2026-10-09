@@ -1246,6 +1246,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     ("Saved, but not active yet": press Reload in Settings), through
     `BaseController.warnIfNotLive`; the two outcome keys are never sent back
     in a body
+  - Notifications: a bell with the unread count and a toast in the app shell
+    (`view/App.view.xml`, `fragment/NotificationsPopover`) for finished agent
+    and workflow runs, polled from `GET notifications` every 15 s while the
+    page is visible (and once when it becomes visible again; not inside a
+    host shell, where the header is hidden), with the logic in
+    `model/notifications.ts`. Opening the list marks read what it shows
+    (`POST notifications/seen` with the newest shown `finished_at`,
+    unchanged); a failed poll is silent and the first poll shows no toast.
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the

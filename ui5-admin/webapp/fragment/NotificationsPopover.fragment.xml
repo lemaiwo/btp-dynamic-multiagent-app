@@ -1,0 +1,39 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core">
+    <!-- The finished runs behind the bell in the app header. Opening it is
+         what marks them read; the entries that were new stay highlighted
+         until it closes, so the list still says what the badge counted. -->
+    <ResponsivePopover
+        id="notificationsPopover"
+        title="{i18n>notificationsTitle}"
+        placement="Bottom"
+        contentWidth="24rem"
+        afterClose=".onNotificationsClosed">
+        <List
+            id="notificationsList"
+            items="{ path: 'appView>/notifications', templateShareable: false }"
+            noDataText="{i18n>notificationsEmpty}"
+            itemPress=".onNotificationPress">
+            <ObjectListItem
+                title="{appView>name}"
+                type="Navigation"
+                highlight="{= ${appView>unread} ? 'Information' : 'None' }"
+                highlightText="{= ${appView>unread} ? ${i18n>notificationUnread} : '' }">
+                <attributes>
+                    <ObjectAttribute
+                        text="{= ${appView>kind} === 'workflow' ? ${i18n>notificationKindWorkflow} : ${i18n>notificationKindAgent} }" />
+                    <ObjectAttribute title="{i18n>colTrigger}" text="{appView>trigger}" />
+                    <ObjectAttribute
+                        text="{ path: 'appView>finished_at', formatter: '.formatter.timestamp' }" />
+                </attributes>
+                <firstStatus>
+                    <ObjectStatus
+                        text="{appView>status}"
+                        state="{ path: 'appView>status', formatter: '.notificationFormat.statusState' }"
+                        icon="{ path: 'appView>status', formatter: '.notificationFormat.statusIcon' }" />
+                </firstStatus>
+            </ObjectListItem>
+        </List>
+    </ResponsivePopover>
+</core:FragmentDefinition>

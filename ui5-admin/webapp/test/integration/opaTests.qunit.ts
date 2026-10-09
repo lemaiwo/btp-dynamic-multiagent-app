@@ -29,3 +29,4 @@ import "./WorkflowJourney";
 import "./WorkflowDetailJourney";
 import "./WorkflowRunJourney";
 import "./UserMenuJourney";
+import "./NotificationJourney";
