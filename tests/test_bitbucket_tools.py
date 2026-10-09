@@ -26,6 +26,11 @@ HEAD = "aaaaaaaaaaaa"
 SOURCE_MARK = "PLANTED_SOURCE_LINE_zq7"
 
 
+BEYOND_NOTE = ("beyond_reach: true: there are more repositories or open pull requests than "
+               "this tool reads, and a later run does not reach them either; report it, a "
+               "person has to look")
+
+
 async def _noop_sleep(_):
     return None
 
@@ -481,6 +486,7 @@ async def test_the_list_holds_open_pull_requests_to_the_pinned_branch_only():
     assert out["reviewed_filter"] == "active" and out["already_reviewed"] == 0
     assert out["repositories"] == 2 and out["repositories_failed"] == 0
     assert out["more"] is False and "note" not in out and out["pull_requests_unchecked"] == 0
+    assert out["beyond_reach"] is False
     assert 'destination.branch.name="main" AND state="OPEN"' in [
         r.url.params.get("q") for r in fake.requests]
 
@@ -730,6 +736,8 @@ async def test_a_second_page_of_open_pull_requests_is_not_read_but_said():
         fake.add_pr("svc-a", i)
     out = await _call(_toolset(fake, repositories=["svc-a"]), "list_pull_requests")
     assert [p["id"] for p in out["pull_requests"]] == [1, 2] and out["more"] is True
+    # The rotation never gets behind page 1: no promise of a later run.
+    assert out["beyond_reach"] is True and out["note"] == BEYOND_NOTE
     assert sum(p.split("?")[0].endswith("/pullrequests") for p in fake.paths()) == 1
 
 
@@ -742,6 +750,7 @@ async def test_at_most_max_checked_pull_requests_have_their_comments_read():
     out = await _call(toolset, "list_pull_requests")
     assert out["pull_requests"] == [] and out["already_reviewed"] == MAX_CHECKED
     assert out["more"] is True and "later run" in out["note"]
+    assert out["beyond_reach"] is False and "a person has to look" not in out["note"]
     assert sum(p.split("?")[0].endswith("/comments") for p in fake.paths()) == MAX_CHECKED
 
 
@@ -847,6 +856,7 @@ async def test_the_workspace_listing_keeps_slugs_only_and_stops_at_its_cap():
     out = await _call(_toolset(fake), "list_pull_requests")
     assert [p["id"] for p in out["pull_requests"]] == [1]
     assert out["repositories"] == MAX_REPOSITORIES_SCANNED and out["more"] is True
+    assert out["beyond_reach"] is True and out["note"] == BEYOND_NOTE
     assert not any("Not" in p or ".." in p for p in fake.paths())
     listing = [r for r in fake.requests if r.url.path == f"/2.0/repositories/{WS}"]
     assert len(listing) == 1 and listing[0].url.params.get("pagelen") == "100"
@@ -860,6 +870,7 @@ async def test_a_workspace_listing_with_a_next_page_says_more():
     out = await _call(_toolset(fake), "list_pull_requests")
     assert out["repositories"] == 1 and out["more"] is True
     assert sum(p.split("?")[0].endswith(f"/repositories/{WS}") for p in fake.paths()) == 1
+    assert out["beyond_reach"] is True and out["note"] == BEYOND_NOTE
 
 
 async def test_a_workspace_that_cannot_be_listed_is_the_calls_error():
@@ -957,6 +968,7 @@ def test_the_list_tool_says_what_its_answer_means():
     assert "`more: true`" in text and "`reviewed_filter: unavailable`" in text
     assert "get_pull_request" in text and "`pull_requests_unchecked`" in text
     assert "later run" in " ".join(text.split())
+    assert "`beyond_reach: true`" in text and "a person has to look" in " ".join(text.split())
     read = " ".join(_toolset(_fake()).tools["get_pull_request"].function.__doc__.split())
     assert "top-level comment" in read and "first line" in read and "at most 100" in read
 
@@ -1042,6 +1054,49 @@ async def test_a_pending_pull_request_that_cannot_be_read_again_is_unchecked_not
     out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
     assert out["approval_pending"] == [] and out["pull_requests_unchecked"] == 1
     assert [p["id"] for p in out["pull_requests"]] == [3]
+
+
+@pytest.mark.parametrize("change", [
+    {"state": "MERGED"}, {"state": "DECLINED"}, {"destination": {"branch": {"name": "develop"}}},
+    {"source": {"commit": {"hash": "cccccccccccc"}}}])
+async def test_a_pull_request_that_closed_or_moved_since_the_listing_is_dropped(change):
+    fake = _pending_fake()
+    answer = httpx.Response(200, json={**fake.prs[("svc-a", 1)], **change})
+    fake.override = lambda r: answer if r.url.path.endswith("/svc-a/pullrequests/1") else None
+    out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
+    assert out["approval_pending"] == [] and out["pull_requests_unchecked"] == 0
+    assert [p["id"] for p in out["pull_requests"]] == [3] and out["already_reviewed"] == 1
+    assert "note" not in out
+
+
+async def test_both_limits_are_said_each_with_its_own_note():
+    fake = FakeBitbucket()
+    fake.page_size = MAX_LISTED + 1
+    for i in range(1, MAX_LISTED + 3):
+        fake.add_pr("svc-a", i)
+    out = await _call(_toolset(fake, repositories=["svc-a"]), "list_pull_requests")
+    assert out["more"] is True and out["beyond_reach"] is True
+    assert out["note"] == "more: true: a limit was reached; the rest comes in a later run; " \
+        + BEYOND_NOTE
+
+
+async def test_approve_is_not_answered_from_a_partial_read_but_comment_is():
+    fake = FakeBitbucket()
+    fake.page_size = 2
+    fake.add_pr("svc-a", 1)
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "approve"), own=True)
+    for i in range(6):
+        fake.add_comment("svc-a", 1, f"c{i}")
+    client = _toolset(fake).client
+    base = f"/2.0/repositories/{WS}/svc-a/pullrequests/1"
+    with pytest.raises(Refused) as refused:
+        await client.reviewed(base, HEAD, OWN_UUID)
+    assert refused.value.code == "review_state_unknown"
+    fake.comments[("svc-a", 1)][1] = {**fake.comments[("svc-a", 1)][0], "id": 999,
+                                      "content": {"raw": review_marker(HEAD, "comment")}}
+    assert await client.reviewed(base, HEAD, OWN_UUID) == "comment"
+    fake.comments[("svc-a", 1)] = fake.comments[("svc-a", 1)][:1]         # all of them read
+    assert await client.reviewed(base, HEAD, OWN_UUID) == "approve"
 
 
 def test_the_list_tool_says_what_pending_means():

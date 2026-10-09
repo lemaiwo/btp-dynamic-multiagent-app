@@ -67,9 +67,26 @@ not in a log line.
 own review) and the guard. Their text is the model's own: it is refused when
 empty or over its cap, never cut or rewritten (edge whitespace aside).
 ``submit_review`` posts ONE top-level comment whose first line is the marker,
-written by the code; a summary whose own first line looks like the marker is
-refused, and a second review of the same head commit is ``already_reviewed``
-(nothing posted, nothing approved; a new commit allows a new review).
+written by the code; a summary or an inline comment whose own first line
+looks like the marker is refused (Bitbucket may store an inline comment
+without its anchor, and it would then read as a review), and a second review
+of the same head commit is ``already_reviewed`` (nothing posted, nothing
+approved; a new commit allows a new review). The marker says ``approve`` only
+when the entry's ``allow_approve`` is exactly ``true`` at that moment; a
+review by an entry that may not approve is marked ``comment`` whatever the
+model asked, so turning the switch on later approves no older review.
+
+**Inline comments are not repeated.** ``add_inline_comment`` posts nothing on
+a head commit that has its review (``already_reviewed``), nothing on a line
+that already has a comment of this account, same path, side and line
+(``already_commented``: a run that ended before its summary would otherwise
+post its comments again on every later run), and nothing once fewer than
+``WINDOW_RESERVE`` of the ``COMMENT_WINDOW`` comments that are read remain
+(``comment_window_full``: the summary with the marker must still be inside
+what a later run reads). It remembers one complete read per pull request and
+head commit for ten minutes (``BitbucketClient._inline_state``) and counts
+what it posted since; ``submit_review`` and ``complete_approval`` never use
+that memo.
 
 **The approval gate** (``BitbucketClient.submit_review``). An approval is sent
 only when ALL of this holds, and nothing a pull request says is part of it:
@@ -116,7 +133,7 @@ success and never as "nothing happened", and nothing is sent again.
 ``invalid_argument``, ``account_unknown``, ``already_reviewed``,
 ``approve_not_allowed``, ``builds_not_green``, ``comment_outcome_unknown``,
 ``approval_outcome_unknown``, ``review_state_unknown``, ``not_reviewed``,
-``already_approved``.
+``already_approved``, ``already_commented``, ``comment_window_full``.
 """
 
 from __future__ import annotations
@@ -125,7 +142,9 @@ import asyncio
 import contextvars
 import logging
 import re
+import time
 import unicodedata
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
@@ -180,6 +199,11 @@ _OVER_CAP = "bitbucket_over_cap"
 MARKER_PREFIX = "Automated review of commit "
 MAX_LISTED, MAX_CHECKED, MAX_REPOSITORIES_SCANNED = 20, 40, 50
 MAX_LISTED_PER_REPOSITORY, MAX_MARKER_PAGES = 50, 3
+# What the "already reviewed" read sees of a pull request's comments, and how
+# much of it add_inline_comment leaves free for the summary that must follow.
+COMMENT_WINDOW, WINDOW_RESERVE = MAX_MARKER_PAGES * 100, 20
+# The memo of add_inline_comment: entries and seconds an entry is used.
+MEMO_ENTRIES, MEMO_SECONDS = 64, 600.0
 _UUID_RE = re.compile(r"\{[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}")
 _UPDATED_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,15}(Z|[+-][0-9]{2}:[0-9]{2})")
 # Codes that end a listing instead of being counted per repository: they are
@@ -199,6 +223,12 @@ _UNCHECKED_NOTE = (
     "(their comments could not be read, or there are more than this tool reads): "
     "report them, a person has to look at them")
 _MORE_NOTE = "more: true: a limit was reached; the rest comes in a later run"
+# Not the same thing: what lies behind the one page that is read of a
+# listing is never reached, whatever run comes later.
+_BEYOND_NOTE = (
+    "beyond_reach: true: there are more repositories or open pull requests than this "
+    "tool reads, and a later run does not reach them either; report it, a person has "
+    "to look")
 # The model's own text: over the cap it is refused, never cut.
 MAX_INLINE_CHARS, MAX_SUMMARY_CHARS = 4000, 8000
 MAX_LINE = 1_000_000
@@ -208,7 +238,8 @@ ERROR_CODES = frozenset({
     "repository_not_allowed", "not_open", "wrong_branch", "invalid_path", "binary_file",
     "result_too_large", "invalid_line", "invalid_argument", "account_unknown",
     "already_reviewed", "approve_not_allowed", "builds_not_green", "comment_outcome_unknown",
-    "approval_outcome_unknown", "review_state_unknown", "not_reviewed", "already_approved"})
+    "approval_outcome_unknown", "review_state_unknown", "not_reviewed", "already_approved",
+    "already_commented", "comment_window_full"})
 # Failures of a request that say it never left: no connection was made. After
 # any other failure a write may have been processed.
 _NEVER_LEFT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
@@ -299,6 +330,14 @@ def _review_unknown() -> Refused:
         "do not review this pull request; report that a person has to look at it")
 
 
+def _already_reviewed(extra: str = "") -> Refused:
+    return Refused(
+        "already_reviewed",
+        "this account already reviewed the pull request at its current commit; "
+        "nothing was posted",
+        extra + "a new commit on the pull request allows a new review")
+
+
 def _approval_unknown_alone() -> Refused:
     return Refused(
         "approval_outcome_unknown",
@@ -316,6 +355,17 @@ def _own_text(value: Any, limit: int, what: str) -> str:
         raise Refused("invalid_argument", f"the {what} is too long",
                       f"at most {limit} characters")
     return text
+
+
+def _no_marker_opening(text: str, what: str, hint: str) -> None:
+    """Refuses a text of the model's whose first line opens like the review
+    marker, for every comment this toolset posts: that line is the code's,
+    and only as line 1 of a summary. Looser than the reading (``_marked``) on
+    purpose: any case, any indentation, whatever follows the prefix."""
+    opening = text.split("\n", 1)[0].strip().casefold()
+    if opening.startswith(MARKER_PREFIX.strip().casefold()):
+        raise Refused("invalid_argument",
+                      f"the {what} must not start with the review marker line", hint)
 
 
 def _status_refusal(status: int) -> Refused:
@@ -421,6 +471,39 @@ def _marks(comment: dict[str, Any], head: str, account: str) -> str | None:
     if marked is None or marked[0][:MARKER_HASH_CHARS] != head[:MARKER_HASH_CHARS]:
         return None
     return marked[1]
+
+
+def _own_anchors(comment: dict[str, Any], account: str) -> set[tuple[str, str, int]]:
+    """Where an inline comment of ``account`` that is not deleted stands, as
+    ``(path, side, line)`` in the words of ``add_inline_comment``. Bitbucket
+    may report both sides of a line (``to`` and ``from``): both are taken, so
+    the same finding is recognised whichever side it was posted on."""
+    if comment.get("deleted", False) is not False or not _is_own(comment, account):
+        return set()
+    inline = comment.get("inline")
+    if not isinstance(inline, dict) or not isinstance(inline.get("path"), str):
+        return set()
+    return {(inline["path"], side, inline[key])
+            for key, side in (("to", "new"), ("from", "old")) if type(inline.get(key)) is int}
+
+
+@dataclass
+class _CommentsRead:
+    """One read of a pull request's comments, as far as the window goes."""
+    verdicts: set[str]                       # of this account's markers for the head
+    more: bool                               # comments exist behind the window
+    read: int                                # how many were read
+    anchors: set[tuple[str, str, int]]       # this account's live inline comments
+
+
+@dataclass
+class _Memo:
+    """What ``add_inline_comment`` remembers of one pull request at one head
+    commit: a complete read without a marker, and what it posted since."""
+    at: float
+    read: int
+    anchors: set[tuple[str, str, int]]
+    posted: int = 0
 
 
 def _own_approval(body: dict[str, Any], account: str) -> bool | None:
@@ -588,14 +671,21 @@ class BitbucketClient:
     """The requests of one toolset: sequential, with fixed-text failures."""
 
     def __init__(self, http: httpx.AsyncClient, pins: Pins, *,
-                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
-        self._http, self.pins, self._sleep = http, pins, sleep
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._http, self.pins, self._sleep, self._clock = http, pins, sleep, clock
         self._turn = asyncio.Lock()      # the calls of one toolset are sequential
         # The uuid of the account behind the destination, once it is known.
         self._account: str | None = None
         # One review at a time: the "already reviewed" read and the post of
         # the summary are one step for the runs of this toolset.
+        # An inline comment takes the same lock: its read, its checks and
+        # its post are one step too, and none runs between a review's read
+        # and the post of its marker.
         self._reviewing = asyncio.Lock()
+        # add_inline_comment's memo, ``(repository, id, head[:12]) -> _Memo``:
+        # see ``_inline_state``. Nothing else reads it.
+        self._memo: dict[tuple[Any, Any, str], _Memo] = {}
         # Where the last listing stopped checking, ``(repository, id)``: the
         # next one goes on after it, so that the pull requests behind a limit
         # get their turn. In memory, per toolset; ``None`` starts at the top.
@@ -842,6 +932,27 @@ class BitbucketClient:
             self._account = uuid
         return self._account
 
+    async def _comments_read(self, base: str, head: Any, account: str) -> _CommentsRead:
+        """The one read behind ``reviewed`` and ``add_inline_comment``: the
+        first ``MAX_MARKER_PAGES`` pages of 100 comments (``COMMENT_WINDOW``)
+        and what they hold of this account. It refuses what cannot be
+        answered: no account (``account_unknown``), a head that is not a hash
+        of at least ``MARKER_HASH_CHARS`` characters. A ``Refused`` of the
+        read itself is the caller's to decide about."""
+        if not account:
+            raise _account_unknown()
+        if not isinstance(head, str) or not _MARKED_HASH_RE.fullmatch(head):
+            raise _review_unknown()
+        comments, more = await self._pages(f"{base}/comments", {"pagelen": "100"},
+                                           max_pages=MAX_MARKER_PAGES)
+        anchors: set[tuple[str, str, int]] = set()
+        for comment in comments:
+            anchors |= _own_anchors(comment, account)
+        return _CommentsRead(
+            verdicts={verdict for verdict in (_marks(comment, head, account)
+                                              for comment in comments) if verdict},
+            more=more, read=len(comments), anchors=anchors)
+
     async def reviewed(self, base: str, head: Any, account: str) -> str | None:
         """The verdict (``approve`` or ``comment``) of ``account``'s review
         marker for the commit ``head`` among the comments of the pull request
@@ -854,21 +965,29 @@ class BitbucketClient:
         comments that were read while more exist is ``review_state_unknown``,
         never "not reviewed": whoever can comment could otherwise push the
         marker out of sight and have the pull request reviewed again on every
-        run. The helper itself refuses what it cannot answer: no account
+        run. ``approve`` is said only when every comment was read as well:
+        "every marker says approve" cannot be known from a part, and an
+        approval follows from this answer. ``comment`` stands on a part: one
+        marker that says so decides it, and nothing is approved on it.
+
+        The window is the first ``COMMENT_WINDOW`` comments in the order
+        Bitbucket returns them. No order is asked for and none is pinned by
+        this code or its tests: a marker in sight is found wherever it
+        stands, and what is out of sight is never taken for "none". Because
+        a new comment may be the one that falls out of the window,
+        ``add_inline_comment`` stops ``WINDOW_RESERVE`` comments before it is
+        full, so that the summary with the marker still lands inside.
+
+        The helper refuses what it cannot answer: no account
         (``account_unknown``), a head that is not a hash of at least
         ``MARKER_HASH_CHARS`` characters. A ``Refused`` of the read is the
         caller's to decide about."""
-        if not account:
-            raise _account_unknown()
-        if not isinstance(head, str) or not _MARKED_HASH_RE.fullmatch(head):
-            raise _review_unknown()
-        comments, more = await self._pages(f"{base}/comments", {"pagelen": "100"},
-                                           max_pages=MAX_MARKER_PAGES)
-        verdicts = {verdict for verdict in (_marks(comment, head, account)
-                                            for comment in comments) if verdict}
-        if verdicts:
-            return "approve" if verdicts == {"approve"} else "comment"
-        if more:
+        state = await self._comments_read(base, head, account)
+        if state.verdicts == {"approve"} and not state.more:
+            return "approve"
+        if state.verdicts - {"approve"}:
+            return "comment"
+        if state.more:               # no marker in sight, or only approve ones
             raise _review_unknown()
         return None
 
@@ -912,9 +1031,11 @@ class BitbucketClient:
         """What the listing does with one open pull request: ``new`` (list
         it), ``reviewed`` (leave it out), ``pending`` (reviewed at its head
         with verdict approve by an entry that may approve, and not approved
-        by this account yet) or ``unchecked`` (leave it out and count it: it
-        may have been reviewed). A failure that is about this pull request
-        costs this pull request only."""
+        by this account yet), ``unchecked`` (leave it out and count it: it
+        may have been reviewed) or ``dropped`` (it closed, was retargeted or
+        got a new commit since the listing: nothing to look at in this run,
+        the next listing has it as it is then). A failure that is about this
+        pull request costs this pull request only."""
         base = f"{self._repo(repository)}/pullrequests/{entry['id']}"
         try:
             verdict = await self.reviewed(base, entry["head_commit"], account)
@@ -923,9 +1044,16 @@ class BitbucketClient:
             if verdict != "approve" or self.pins.allow_approve is not True:
                 return "reviewed"
             # The participants are in the answer for one pull request only.
-            _, body, head = await self.pull_request(repository, entry["id"])
+            try:
+                _, body, head = await self.pull_request(repository, entry["id"])
+            except Refused as gone:
+                if gone.code in ("not_open", "wrong_branch"):
+                    return "dropped"
+                raise
+            if head != entry["head_commit"]:
+                return "dropped"
             approved = _own_approval(body, account)
-            if approved is None or head != entry["head_commit"]:
+            if approved is None:
                 return "unchecked"
             return "reviewed" if approved else "pending"
         except Refused as refused:
@@ -955,9 +1083,15 @@ class BitbucketClient:
         A call that reaches a cap remembers where it stopped and the next one
         goes on from there, round and round: pull requests that are reviewed
         already use up the check budget of a call, and without the turn the
-        ones behind them would never be reached."""
+        ones behind them would never be reached.
+
+        The turn goes over what a call can see: the repositories of one page
+        of the workspace (or the pinned list) and one page of open pull
+        requests of each. What lies behind those pages is never reached and
+        is said as ``beyond_reach``, not as "a later run"."""
         account = await self.whoami()
-        repositories, more = await self._repositories()
+        repositories, beyond = await self._repositories()
+        more = False                 # a cap the next call goes on behind
         # The branch has passed the config module's pattern: it holds no quote.
         params = {"q": f'destination.branch.name="{self.pins.branch}" AND state="OPEN"',
                   "pagelen": str(MAX_LISTED_PER_REPOSITORY)}
@@ -983,7 +1117,7 @@ class BitbucketClient:
                         raise
                     failed.add(repository)       # this repository only
                     continue
-                more = more or further
+                beyond = beyond or further
                 open_in[repository] = [entry for entry in (self._listed(repository, item)
                                                            for item in items) if entry]
             entries = open_in[repository]
@@ -1003,6 +1137,8 @@ class BitbucketClient:
                     outcome = await self._check(repository, entry, account)
                     if outcome == "reviewed":
                         already += 1
+                        continue
+                    if outcome == "dropped":
                         continue
                     if outcome == "unchecked":
                         # Not listed: it may have been reviewed.
@@ -1025,12 +1161,14 @@ class BitbucketClient:
             "pull_requests_unchecked": unchecked,
             "repositories": len(open_in),
             "repositories_failed": len(failed),
-            "more": more}
+            "more": more or beyond,
+            "beyond_reach": beyond}
         if self.pins.allow_approve is True:
             # Reviewed with verdict approve, the approval still to be sent.
             result["approval_pending"] = pending
         notes = [text for said, text in ((not account, _UNFILTERED_NOTE),
-                                         (unchecked, _UNCHECKED_NOTE), (more, _MORE_NOTE))
+                                         (unchecked, _UNCHECKED_NOTE), (more, _MORE_NOTE),
+                                         (beyond, _BEYOND_NOTE))
                  if said]
         if notes:
             result["note"] = "; ".join(notes)
@@ -1168,30 +1306,88 @@ class BitbucketClient:
             raise _account_unknown()
         return account
 
+    async def _inline_state(self, key: tuple[Any, Any, str], base: str, head: str,
+                            account: str) -> _Memo:
+        """What ``add_inline_comment`` needs to know of the pull request's
+        comments, from its memo or from a read.
+
+        Remembered is only a read that returned, saw every comment and found
+        NO marker of this account for the head: a refusal, an unknown state
+        and "already reviewed" are read again by the next call. An entry is
+        used for ``MEMO_SECONDS`` from its read, at most ``MEMO_ENTRIES`` are
+        kept (the oldest goes), and ``submit_review`` drops the entry of the
+        pull request it reviews. What another app instance posts meanwhile
+        is not seen until the entry is over."""
+        now = self._clock()
+        entry = self._memo.get(key)
+        if entry is not None and now - entry.at < MEMO_SECONDS:
+            return entry
+        self._memo.pop(key, None)
+        state = await self._comments_read(base, head, account)
+        if state.verdicts:           # a marker in sight is certain, whatever lies behind
+            raise _already_reviewed()
+        if state.more:
+            raise _review_unknown()
+        for old in [k for k, kept in self._memo.items() if now - kept.at >= MEMO_SECONDS]:
+            del self._memo[old]
+        while len(self._memo) >= MEMO_ENTRIES:
+            del self._memo[next(iter(self._memo))]
+        entry = self._memo[key] = _Memo(at=now, read=state.read, anchors=state.anchors)
+        return entry
+
     async def add_inline_comment(self, repository: Any, pr_id: Any, path: Any, line: Any,
                                  text: Any, side: Any) -> dict[str, Any]:
+        """One inline comment, unless the pull request's review state says
+        no: unknown (``review_state_unknown``), reviewed at this head already
+        (``already_reviewed``), this account's comment already on that line
+        (``already_commented``: a run that ended before its summary does not
+        repeat itself), or the comment window nearly full
+        (``comment_window_full``: the summary must still fit)."""
         account = await self._writer()
-        base, _, head = await self.pull_request(repository, pr_id)
-        path = _confined(path)
-        if type(line) is not int or not 1 <= line <= MAX_LINE:
-            raise Refused("invalid_line", "the line is not a line number")
-        if not isinstance(side, str) or side not in ("new", "old"):
-            raise Refused("invalid_argument", "side must be new or old")
-        text = _own_text(text, MAX_INLINE_CHARS, "comment text")
-        # Only its refusals matter here: no comment on a pull request whose
-        # review state is unknown (comments unreadable, or more than are read).
-        await self.reviewed(base, head, account)
-        posted = await self._write(
-            f"{base}/comments",
-            {"content": {"raw": text},
-             "inline": {"path": path, "to" if side == "new" else "from": line}},
-            unsure=_comment_unknown, ok=(200, 201),
-            bad_request=Refused("invalid_line", "Bitbucket refused the line anchor (HTTP 400)",
-                                "comment only on a line that is part of the diff"))
-        return {"repository": repository, "id": pr_id, "path": path, "line": line, "side": side,
-                "comment_id": posted.get("id") if type(posted.get("id")) is int else None,
-                # Not confirmed how an anchor outside the diff is answered.
-                "anchored": isinstance(posted.get("inline"), dict)}
+        async with self._reviewing:
+            # The guard runs on every call, memo or not: it gives the head.
+            base, _, head = await self.pull_request(repository, pr_id)
+            path = _confined(path)
+            if type(line) is not int or not 1 <= line <= MAX_LINE:
+                raise Refused("invalid_line", "the line is not a line number")
+            if not isinstance(side, str) or side not in ("new", "old"):
+                raise Refused("invalid_argument", "side must be new or old")
+            text = _own_text(text, MAX_INLINE_CHARS, "comment text")
+            # Bitbucket may store the comment without its anchor: as a
+            # top-level comment its first line would read as a marker.
+            _no_marker_opening(text, "comment text", "start with your own words")
+            key = (repository, pr_id, head[:MARKER_HASH_CHARS])
+            known = await self._inline_state(key, base, head, account)
+            anchor = (path, side, line)
+            if anchor in known.anchors:
+                raise Refused("already_commented",
+                              "this account already commented on this line; nothing was posted",
+                              "go on with the next finding or submit the review")
+            if COMMENT_WINDOW - known.read - known.posted < WINDOW_RESERVE:
+                raise Refused("comment_window_full",
+                              "the pull request has nearly as many comments as this tool "
+                              "reads; nothing was posted",
+                              "post no further inline comment; submit the review now")
+            try:
+                posted = await self._write(
+                    f"{base}/comments",
+                    {"content": {"raw": text},
+                     "inline": {"path": path, "to" if side == "new" else "from": line}},
+                    unsure=_comment_unknown, ok=(200, 201),
+                    bad_request=Refused("invalid_line",
+                                        "Bitbucket refused the line anchor (HTTP 400)",
+                                        "comment only on a line that is part of the diff"))
+            except Refused as refused:
+                if refused.code == "comment_outcome_unknown":
+                    self._memo.pop(key, None)        # it may be there: read again
+                raise
+            known.anchors.add(anchor)
+            known.posted += 1
+            return {"repository": repository, "id": pr_id, "path": path, "line": line,
+                    "side": side,
+                    "comment_id": posted.get("id") if type(posted.get("id")) is int else None,
+                    # Not confirmed how an anchor outside the diff is answered.
+                    "anchored": isinstance(posted.get("inline"), dict)}
 
     async def submit_review(self, repository: Any, pr_id: Any, verdict: Any,
                             summary: Any) -> dict[str, Any]:
@@ -1207,28 +1403,31 @@ class BitbucketClient:
         # Line 1 of the comment is the code's whatever the summary starts
         # with; a summary that opens like the marker is refused all the same,
         # so that no comment of this account holds two such lines.
-        opening = text.split("\n", 1)[0].strip().casefold()
-        if opening.startswith(MARKER_PREFIX.strip().casefold()):
-            raise Refused("invalid_argument",
-                          "the summary must not start with the review marker line",
-                          "start with your own words; the marker line is added for you")
+        _no_marker_opening(text, "summary",
+                           "start with your own words; the marker line is added for you")
         account = await self._writer()
         async with self._reviewing:
             base, _, head = await self.pull_request(repository, pr_id)
+            # Never the memo of add_inline_comment: a fresh read, and the
+            # entry goes, so that no inline comment follows the marker on
+            # what was known before it.
+            self._memo.pop((repository, pr_id, head[:MARKER_HASH_CHARS]), None)
             # A read that fails raises: without it nothing is posted.
             earlier = await self.reviewed(base, head, account)
             if earlier is not None:
-                again = "a new commit on the pull request allows a new review"
                 if earlier == "approve" and self.pins.allow_approve is True:
-                    again = ("that review has verdict approve: use complete_approval to send "
-                             "an approval that is still missing; " + again)
-                raise Refused(
-                    "already_reviewed",
-                    "this account already reviewed the pull request at its current commit; "
-                    "nothing was posted", again)
+                    raise _already_reviewed(
+                        "that review has verdict approve: use complete_approval to send "
+                        "an approval that is still missing; ")
+                raise _already_reviewed()
             # One top-level comment (no `inline`, no `parent`): line 1 is the
-            # marker a later run looks for, with the verdict of this review.
-            raw = f"{review_marker(head, verdict)}\n\nVerdict: {verdict}\n\n{text}"
+            # marker a later run looks for. It says approve only when this
+            # entry may approve: complete_approval acts on that word later,
+            # and a review made while approving was not allowed must not
+            # become an approval the day the switch is turned on. The line
+            # below it and the answer say what the model asked for.
+            marked = verdict if self.pins.allow_approve is True else "comment"
+            raw = f"{review_marker(head, marked)}\n\nVerdict: {verdict}\n\n{text}"
             # Refused or unknown raises: nothing below runs, nothing is approved.
             posted = await self._write(f"{base}/comments", {"content": {"raw": raw}},
                                        unsure=_comment_unknown, ok=(200, 201))
@@ -1285,12 +1484,15 @@ class BitbucketClient:
         account = await self._writer()
         async with self._reviewing:
             base, body, head = await self.pull_request(repository, pr_id)
-            if await self.reviewed(base, head, account) != "approve":
+            earlier = await self.reviewed(base, head, account)       # a fresh read, no memo
+            if earlier != "approve":
                 raise Refused(
                     "not_reviewed",
                     "this account has no review with verdict approve of the pull request's "
                     "current commit; nothing was sent",
-                    "review the pull request and call submit_review")
+                    "review the pull request and call submit_review" if earlier is None else
+                    "that commit was reviewed with findings: there is nothing to approve "
+                    "until a new commit is pushed")
             approved = _own_approval(body, account)
             if approved is None:
                 raise _review_unknown()
@@ -1361,6 +1563,9 @@ def bitbucket_toolset(
 
         `more: true` means a limit was reached: handle this list, the rest
         comes in a later run (each call goes on where the last one stopped).
+        `beyond_reach: true` is the exception: there are more repositories
+        or open pull requests than this tool reads and no later run reaches
+        them: report it, a person has to look.
         `reviewed_filter: unavailable` means the list was NOT filtered (see
         `note`): check the comments of each pull request with
         get_pull_request before reviewing it. `pull_requests_unchecked`
@@ -1434,7 +1639,12 @@ def bitbucket_toolset(
         `anchored: false` means the comment was posted but Bitbucket did not
         attach it to the line. An `error` with code `comment_outcome_unknown`
         means the comment MAY have been posted: do not call again, check with
-        get_pull_request. Any other `error` means nothing was posted.
+        get_pull_request. Any other `error` means nothing was posted:
+        `already_commented` means this account's comment is already on that
+        line (go on with the next finding), `already_reviewed` that this
+        commit has its review (post nothing more), `comment_window_full`
+        that the pull request has nearly as many comments as this tool
+        reads (post no further inline comment, call submit_review now).
 
         {untrusted_write}
 
@@ -1493,7 +1703,8 @@ def bitbucket_toolset(
         `error` means not yet (`builds_not_green`: try again in a later run).
         `approved: null` means it MAY be approved: do not call again, report
         it. `not_reviewed` means there is no review of yours with verdict
-        approve for the current commit: review it with submit_review.
+        approve for the current commit: the `hint` says whether to review it
+        with submit_review or to leave it until a new commit.
 
         {untrusted_write}
 
