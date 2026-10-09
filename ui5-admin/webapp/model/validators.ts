@@ -87,6 +87,14 @@ const BUILTIN_URLS: readonly string[] = BUILTINS.map((b) => b.url);
  */
 const BUILTIN_PUBLIC_KEYS = ["min_score", "lookback"] as const;
 
+/** Why an agent that approves pull requests cannot be saved as it is:
+ *  it is in chat, other agents name it as a peer (`names`), or it names
+ *  approving agents as its peers (`names`). */
+export interface ApproverProblem {
+    rule: "chat" | "peerOf" | "peers";
+    names: string[];
+}
+
 export default {
 
     BUILTIN_URLS,
@@ -466,6 +474,34 @@ export default {
         return hasUaa || hasBoth
             ? ""
             : "Provide a UAA URL, or both an authorize URL and a token URL.";
+    },
+
+    /**
+     * --- bitbucket --- An agent that approves pull requests must not be
+     * reachable by a chat user, who could otherwise direct an approval: it
+     * is not exposed in chat (`expose_chat` exactly `false`) and it is no
+     * peer of another agent. The server refuses the same; this only says it
+     * before the call. `others` are the other agents as the page has them;
+     * without them the two peer rules are left to the server.
+     */
+    approverProblem(
+        agent: { name?: string; expose_chat?: unknown; mcp_servers?: McpServer[]; peers?: string[] },
+        others?: { name: string; mcp_servers?: McpServer[]; peers?: string[] }[]
+    ): ApproverProblem | null {
+        const rest = Array.isArray(others) ? others : [];
+        if (bitbucketEntry.approves(agent.mcp_servers)) {
+            if (agent.expose_chat !== false) {
+                return { rule: "chat", names: [] };
+            }
+            const namedBy = rest.filter((other) => !!agent.name && (other.peers || []).indexOf(agent.name) > -1)
+                .map((other) => other.name);
+            if (namedBy.length > 0) {
+                return { rule: "peerOf", names: namedBy };
+            }
+        }
+        const approvers = (agent.peers || []).filter((peer) => rest.some(
+            (other) => other.name === peer && bitbucketEntry.approves(other.mcp_servers)));
+        return approvers.length > 0 ? { rule: "peers", names: approvers } : null;
     },
 
     /**

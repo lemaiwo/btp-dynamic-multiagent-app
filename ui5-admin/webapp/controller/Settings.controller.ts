@@ -6,6 +6,7 @@ import type Dialog from "sap/m/Dialog";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
 import importBundle, { type BundleOpens } from "../model/importBundle";
+import bitbucketEntry from "../model/bitbucketEntry";
 import type { ImportPayload, ImportResult } from "../service/types";
 
 /** How an import names the fields of `odata_identity_changes`. */
@@ -201,7 +202,7 @@ export default class Settings extends BaseController {
      * When that cannot be read from the bundle the question is asked all the
      * same, in general words: never an import of this kind unseen.
      */
-    public onConfirmImport(): void {
+    public async onConfirmImport(): Promise<void> {
         if (this.importing) {
             return;
         }
@@ -223,7 +224,20 @@ export default class Settings extends BaseController {
         const payload = parsed as ImportPayload;
         payload.replace = importModel.getProperty("/replace") === true;
 
-        const found = importBundle.opens(payload);
+        // --- bitbucket --- An agent of the bundle may get to approve pull
+        // requests unattended, or to approve more than it does now. What it
+        // does now is the stored agent list; when that cannot be read there
+        // is no baseline and every approval of the bundle is asked about.
+        this.importing = true;
+        let stored: unknown;
+        try {
+            stored = await this.getAdminService().listAgents();
+        } catch {
+            stored = undefined;
+        } finally {
+            this.importing = false;
+        }
+        const found = importBundle.opens(payload, stored);
         const question = !found
             ? this.text("importAskUnknown")
             : importBundle.mustAsk(found, payload.replace) ? this.importQuestion(found, payload.replace) : "";
@@ -234,7 +248,7 @@ export default class Settings extends BaseController {
         const go = this.text("importConfig");
         this.importing = true;
         MessageBox.warning(question, {
-            title: this.text("importAskTitle"),
+            title: this.text(found && found.approvals.length > 0 ? "importAskUnattendedTitle" : "importAskTitle"),
             actions: [go, MessageBox.Action.CANCEL],
             emphasizedAction: go,
             initialFocus: MessageBox.Action.CANCEL,
@@ -249,7 +263,8 @@ export default class Settings extends BaseController {
 
     /** What the import brings, service by service and agent by agent. */
     private importQuestion(found: BundleOpens, replace: boolean): string {
-        const parts: string[] = [this.text("importAskIntro")];
+        const odata = found.services.length > 0 || found.writers.length > 0 || (replace && found.hasCatalogue);
+        const parts: string[] = odata ? [this.text("importAskIntro")] : [];
         if (found.services.length) {
             parts.push([this.text("importAskServices")].concat(found.services.map((service) => this.text(
                 service.writes.length ? "importAskService" : "importAskServiceNoWrites", [
@@ -266,6 +281,19 @@ export default class Settings extends BaseController {
         }
         if (replace && found.hasCatalogue) {
             parts.push(this.text("importAskReplace"));
+        }
+        if (found.approvals.length) {
+            // --- bitbucket --- The same words as the agent page's Save.
+            const lines = [this.text("importAskApprovers")];
+            found.approvals.forEach((approval) => {
+                approval.asks.forEach((ask) => {
+                    lines.push(bitbucketEntry.question(approval.agent, ask, (key, args) => this.text(key, args)));
+                });
+            });
+            if (found.approvals.some((approval) => approval.asks.some((ask) => ask.reason === "approve"))) {
+                lines.push(this.text("bitbucketApprovalStays"));
+            }
+            parts.push(lines.join("\n\n"));
         }
         return parts.join("\n\n");
     }

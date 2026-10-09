@@ -200,15 +200,15 @@
 
             <Label text="{i18n>bitbucketRepositoriesLabel}" labelFor="oauthBitbucketRepositories"
                    visible="{= ${server>/url} === 'builtin:bitbucket' }" />
-            <Input
-                id="oauthBitbucketRepositories"
-                value="{server>/bitbucket/repositoriesText}"
-                placeholder="{i18n>bitbucketRepositoriesPlaceholder}"
-                ariaDescribedBy="oauthBitbucketRepositoriesHint"
-                visible="{= ${server>/url} === 'builtin:bitbucket' }" />
-            <Label text="" visible="{= ${server>/url} === 'builtin:bitbucket' }" />
-            <Text id="oauthBitbucketRepositoriesHint" text="{i18n>bitbucketRepositoriesHint}"
-                  visible="{= ${server>/url} === 'builtin:bitbucket' }" />
+            <VBox visible="{= ${server>/url} === 'builtin:bitbucket' }">
+                <Input
+                    id="oauthBitbucketRepositories"
+                    value="{server>/bitbucket/repositoriesText}"
+                    placeholder="{i18n>bitbucketRepositoriesPlaceholder}"
+                    ariaDescribedBy="oauthBitbucketRepositoriesHint" />
+                <Text id="oauthBitbucketRepositoriesHint" text="{i18n>bitbucketRepositoriesHint}"
+                      class="sapUiTinyMarginTop" />
+            </VBox>
 
             <Label text="{i18n>bitbucketBranchLabel}" labelFor="oauthBitbucketBranch"
                    visible="{= ${server>/url} === 'builtin:bitbucket' }" />

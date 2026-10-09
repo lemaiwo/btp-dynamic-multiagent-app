@@ -42,7 +42,7 @@ QUnit.test("opens: each service with identity, destination and its writes by the
             },
             { name: "read-only", title: "read-only", userContext: true, destination: "S4_ODATA_TECH", writes: [] }
         ],
-        writers: []
+        writers: [], approvals: []
     });
 });
 
@@ -59,7 +59,8 @@ QUnit.test("opens: the agents whose OData entry has Allow writes as the JSON boo
     });
     assert.deepEqual(found, {
         hasCatalogue: false, services: [],
-        writers: [{ agent: "writer", services: ["a", "b"] }, { agent: "other spelling", services: ["a", "b"] }]
+        writers: [{ agent: "writer", services: ["a", "b"] }, { agent: "other spelling", services: ["a", "b"] }],
+        approvals: []
     });
 });
 
@@ -116,4 +117,57 @@ QUnit.test("otherWarnings: the server's lines, without the two the lists already
     assert.deepEqual(importBundle.otherWarnings({ status: "imported", warnings: [removed, identity, model] }),
         [removed, identity, model], "without the lists nothing is left out");
     assert.deepEqual(importBundle.otherWarnings({ status: "imported" }), []);
+});
+
+// --- bitbucket: approvals a bundle opens -----------------------------------
+
+function reviewer(name: string, oauth: Record<string, unknown>, url = "builtin:bitbucket"): Record<string, unknown> {
+    return agent(name, [{ url, auth_mode: "destination", oauth: Object.assign({ destination: "B", workspace: "acme-ws" }, oauth) }]);
+}
+const APPROVES = { allow_comment: true, allow_approve: true };
+
+QUnit.test("opens: an agent that gets to approve pull requests is listed, against what is stored", function (assert) {
+    const bundle = { agents: [reviewer("rev", APPROVES, "Builtin:Bitbucket/"), reviewer("reader", { allow_comment: true })] };
+    const fresh = importBundle.opens(bundle, []);
+    assert.deepEqual(fresh?.approvals.map((a) => [a.agent, a.asks.map((ask) => ask.reason)]), [["rev", ["approve"]]]);
+    assert.strictEqual(fresh?.approvals[0].asks[0].workspace, "acme-ws");
+    assert.strictEqual(importBundle.mustAsk(fresh!, false), true, "asked, also without any OData part");
+
+    const same = importBundle.opens(bundle, [reviewer("rev", APPROVES), reviewer("other", APPROVES)] as never);
+    assert.deepEqual(same?.approvals, [], "stored exactly so: nothing new");
+    assert.strictEqual(importBundle.mustAsk(same!, false), false);
+
+    const otherAgent = importBundle.opens(bundle, [reviewer("other", APPROVES)] as never);
+    assert.deepEqual(otherAgent?.approvals.map((a) => a.agent), ["rev"], "another agent's entry is no baseline");
+
+    const widened = importBundle.opens(
+        { agents: [reviewer("rev", Object.assign({ require_green_builds: false, branch: "develop" }, APPROVES))] },
+        [reviewer("rev", Object.assign({ repositories: ["svc-a"] }, APPROVES))] as never);
+    assert.deepEqual(widened?.approvals[0].asks.map((ask) => [
+        ask.reason, ask.buildsDropped, ask.wholeWorkspace, ask.branchBefore
+    ]), [["widened", true, true, "main"]], "an import can widen an entry that approves");
+    assert.strictEqual(importBundle.mustAsk(widened!, true), true);
+
+    const narrowed = importBundle.opens(
+        { agents: [reviewer("rev", Object.assign({ repositories: ["svc-a"] }, APPROVES))] },
+        [reviewer("rev", APPROVES)] as never);
+    assert.deepEqual(narrowed?.approvals, [], "a narrowing is not asked about");
+});
+
+QUnit.test("opens: stored agents that are absent or unreadable are no baseline, so everything is asked", function (assert) {
+    const bundle = { agents: [reviewer("rev", APPROVES)] };
+    [undefined, null, "agents", [7], [{ name: "rev", mcp_servers: "x" }]].forEach((stored) => {
+        const found = importBundle.opens(bundle, stored as never);
+        assert.deepEqual(found?.approvals.map((a) => a.asks[0].reason), ["approve"], JSON.stringify(stored));
+    });
+});
+
+QUnit.test("opens: the texts of an approving entry are cut to one line", function (assert) {
+    const found = importBundle.opens({
+        agents: [reviewer("rev\nSave", Object.assign({ branch: "main\nx", repositories: ["a\nb"] }, APPROVES, { workspace: "acme\nws" }))]
+    }, []);
+    const ask = found!.approvals[0].asks[0];
+    [found!.approvals[0].agent, ask.workspace, ask.branch, ask.repositories[0]].forEach((value) => {
+        assert.strictEqual(value.indexOf("\n"), -1, value);
+    });
 });

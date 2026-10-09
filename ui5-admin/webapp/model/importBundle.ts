@@ -1,6 +1,8 @@
 import odataCatalog from "./odataCatalog";
 import odataEntry from "./odataEntry";
-import type { ImportResult, ODataDefinition } from "../service/types";
+import bitbucketEntry from "./bitbucketEntry";
+import type { BitbucketApprovalAsk } from "./bitbucketEntry";
+import type { ImportResult, McpServer, ODataDefinition } from "../service/types";
 
 /**
  * What a configuration bundle (the text pasted into Settings > Import) opens
@@ -31,12 +33,21 @@ export interface BundleWriter {
     services: string[];
 }
 
+/** An agent of a bundle that gets to approve Bitbucket pull requests, or to
+ *  approve more than its stored entry does (`bitbucketEntry.approvalsToAsk`). */
+export interface BundleApproval {
+    agent: string;
+    asks: BitbucketApprovalAsk[];
+}
+
 export interface BundleOpens {
     /** The bundle has an `odata_services` section: only then does "replace"
      *  delete catalogue services that are not in it. */
     hasCatalogue: boolean;
     services: BundleService[];
     writers: BundleWriter[];
+    /** --- bitbucket --- Unattended approvals the import opens or widens. */
+    approvals: BundleApproval[];
 }
 
 class Unreadable extends Error {}
@@ -101,24 +112,59 @@ function writersOf(agent: Record<string, unknown>): BundleWriter[] {
 }
 
 /**
+ * --- bitbucket --- The stored servers of the agent of that name, the
+ * baseline an import is compared with. Stored agents that are absent or do
+ * not have the expected form are no baseline: everything is asked then.
+ */
+function storedServers(stored: unknown, name: unknown): McpServer[] {
+    if (!Array.isArray(stored)) {
+        return [];
+    }
+    const match = stored.filter((agent) => isObject(agent) && agent.name === name)[0] as
+        Record<string, unknown> | undefined;
+    const servers = match?.mcp_servers;
+    return Array.isArray(servers) && servers.every(isObject) ? servers as unknown as McpServer[] : [];
+}
+
+function approvalsOf(agent: Record<string, unknown>, stored: unknown): BundleApproval[] {
+    const asks = bitbucketEntry.approvalsToAsk(
+        storedServers(stored, agent.name), objects(agent.mcp_servers) as unknown as McpServer[]
+    ).map((ask) => Object.assign({}, ask, {
+        workspace: label(ask.workspace),
+        branch: label(ask.branch),
+        branchBefore: label(ask.branchBefore),
+        repositories: ask.repositories.map(label),
+        repositoriesAdded: ask.repositoriesAdded.map(label)
+    }));
+    return asks.length ? [{ agent: label(agent.name), asks }] : [];
+}
+
+/**
  * What `bundle` (the parsed text) opens, or `null` when that cannot be read
  * from it: it is no object, or its OData services or agents do not have the
  * form the rules need. `null` never means "nothing": the caller asks then.
+ *
+ * `storedAgents` is the agent list as the server has it now (only the
+ * Bitbucket approvals are compared with it: an entry that approves already,
+ * for the same or for more, is not asked about again).
  */
-function opens(bundle: unknown): BundleOpens | null {
+function opens(bundle: unknown, storedAgents?: unknown): BundleOpens | null {
     try {
         if (!isObject(bundle)) {
             return null;
         }
         const catalogue = bundle.odata_services;
         const writers: BundleWriter[] = [];
+        const approvals: BundleApproval[] = [];
         objects(bundle.agents).forEach((agent) => {
             writers.push(...writersOf(agent));
+            approvals.push(...approvalsOf(agent, storedAgents));
         });
         return {
             hasCatalogue: catalogue !== undefined && catalogue !== null,
             services: objects(catalogue).map(serviceOf),
-            writers
+            writers,
+            approvals
         };
     } catch {
         return null;
@@ -126,10 +172,12 @@ function opens(bundle: unknown): BundleOpens | null {
 }
 
 /** Whether importing has to be asked about first: it brings catalogue
- *  services, gives an agent writes, or (with `replace`) deletes the
- *  catalogue services the bundle does not name. */
+ *  services, gives an agent writes, lets an agent approve pull requests (or
+ *  approve more), or (with `replace`) deletes the catalogue services the
+ *  bundle does not name. */
 function mustAsk(found: BundleOpens, replace: boolean): boolean {
-    return found.services.length > 0 || found.writers.length > 0 || (found.hasCatalogue && replace);
+    return found.services.length > 0 || found.writers.length > 0 || found.approvals.length > 0
+        || (found.hasCatalogue && replace);
 }
 
 /** The server's own lines for what `removed_odata_service_names` and

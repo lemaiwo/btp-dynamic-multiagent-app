@@ -10,7 +10,6 @@ import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import odataEntry from "../model/odataEntry";
 import bitbucketEntry from "../model/bitbucketEntry";
-import type { BitbucketApprovalAsk } from "../model/bitbucketEntry";
 import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -892,6 +891,19 @@ export default class AgentDetail extends BaseController {
             return;
         }
 
+        // --- bitbucket --- An agent that approves pull requests is not in
+        // chat and nobody's peer (the server refuses it too). The text says
+        // which of the two to switch off.
+        const approver = validators.approverProblem(
+            data, model.getProperty("/availableAgents") as Agent[] | undefined);
+        if (approver) {
+            const names = AgentDetail.quoted(approver.names);
+            MessageBox.error(approver.rule === "chat" ? this.text("bitbucketApproveChatRefused")
+                : approver.rule === "peerOf" ? this.text("bitbucketApprovePeerOfRefused", [names])
+                    : this.text("bitbucketApprovePeerRefused", [names]));
+            return;
+        }
+
         // --- deep agents --- range errors land on their StepInput.
         const deepErrors = validateDeep(data.deep);
         const deepKeys = Object.keys(deepErrors);
@@ -933,12 +945,17 @@ export default class AgentDetail extends BaseController {
         // same snapshot the PUT carries), never from a read.
         const approvals = bitbucketEntry.approvalsToAsk(this.storedServers, toSave.mcp_servers);
         const asked = (question ? [question] : []).concat(
-            approvals.map((ask) => this.bitbucketSaveQuestion(toSave.name, ask)));
+            approvals.map((ask) => bitbucketEntry.question(
+                toSave.name, ask, (key, args) => this.text(key, args))));
+        if (approvals.some((ask) => ask.reason === "approve")) {
+            asked.push(this.text("bitbucketApprovalStays"));
+        }
         if (asked.length === 0) {
             await this.saveAgent(toSave);
             return;
         }
-        const titleKey = question ? "odataEntrySaveTitle"
+        const titleKey = question && approvals.length > 0 ? "bitbucketUnattendedSaveTitle"
+            : question ? "odataEntrySaveTitle"
             : approvals.some((ask) => ask.reason === "approve") ? "bitbucketApproveSaveTitle"
                 : "bitbucketWidenSaveTitle";
         const save = this.text("save");
@@ -955,36 +972,6 @@ export default class AgentDetail extends BaseController {
                 }
             }
         });
-    }
-
-    /**
-     * --- bitbucket --- One ask in plain words. A new approval names all it
-     * opens (branch, workspace, repositories, whether builds count); a
-     * widened one names only what is new.
-     */
-    private bitbucketSaveQuestion(agentName: string, ask: BitbucketApprovalAsk): string {
-        if (ask.reason === "approve") {
-            const repositories = ask.repositories.length > 0
-                ? this.text("bitbucketSomeRepositories", [AgentDetail.quoted(ask.repositories)])
-                : this.text("bitbucketAllRepositories");
-            return this.text(
-                ask.requireGreenBuilds ? "bitbucketApproveSaveQuestion" : "bitbucketApproveSaveQuestionNoBuilds",
-                [agentName, ask.branch, ask.workspace, repositories]);
-        }
-        const lines = [this.text("bitbucketWidenSaveQuestion", [agentName, ask.workspace])];
-        if (ask.branchBefore) {
-            lines.push(this.text("bitbucketWidenBranch", [ask.branch, ask.branchBefore]));
-        }
-        if (ask.wholeWorkspace) {
-            lines.push(this.text("bitbucketWidenRepositoriesAll"));
-        }
-        if (ask.repositoriesAdded.length > 0) {
-            lines.push(this.text("bitbucketWidenRepositoriesAdded", [AgentDetail.quoted(ask.repositoriesAdded)]));
-        }
-        if (ask.buildsDropped) {
-            lines.push(this.text("bitbucketWidenBuilds"));
-        }
-        return lines.join("\n");
     }
 
     private async saveAgent(data: AgentInput): Promise<void> {

@@ -90,24 +90,17 @@ QUnit.test("the validator names the field, mirrors the server and never quotes t
     });
 });
 
-QUnit.test("newlyApproves names the workspaces whose approving is switched on by this save", function (assert) {
-    const entry = (workspace: string, approve: boolean): McpServer => ({
-        url: URL, auth_mode: "destination",
-        oauth: Object.assign({ destination: "B", workspace, allow_comment: true },
-            approve ? { allow_approve: true } : {})
+QUnit.test("approves: only an entry of this toolset with exactly allow_approve true", function (assert) {
+    const entry = (oauth: Record<string, unknown>, url = URL): McpServer => ({
+        url, auth_mode: "destination", oauth: Object.assign({ destination: "B", workspace: "ws-a" }, oauth)
     } as McpServer);
-    const jira = { url: "builtin:jira", auth_mode: "destination",
-        oauth: { destination: "J", allow_approve: true } } as unknown as McpServer;
-    assert.deepEqual(bitbucketEntry.newlyApproves([], [entry("ws-a", true)]), ["ws-a"]);
-    assert.deepEqual(bitbucketEntry.newlyApproves([entry("ws-a", false)], [entry("ws-a", true)]), ["ws-a"]);
-    assert.deepEqual(bitbucketEntry.newlyApproves([entry("ws-a", true)], [entry("ws-a", true)]), []);
-    assert.deepEqual(bitbucketEntry.newlyApproves([entry("ws-a", true)], [entry("ws-b", true)]), ["ws-b"]);
-    assert.deepEqual(bitbucketEntry.newlyApproves([entry("ws-a", true)], [entry("ws-a", false)]), []);
-    assert.deepEqual(bitbucketEntry.newlyApproves([], [jira]), [], "only a bitbucket entry counts");
-    assert.deepEqual(bitbucketEntry.newlyApproves(undefined, undefined), []);
-    const truthy = entry("ws-a", false);
-    (truthy.oauth as Record<string, unknown>).allow_approve = "true";
-    assert.deepEqual(bitbucketEntry.newlyApproves([], [truthy]), [], "only the boolean true approves");
+    assert.strictEqual(bitbucketEntry.approves([entry({ allow_comment: true, allow_approve: true })]), true);
+    assert.strictEqual(bitbucketEntry.approves([entry({ allow_approve: true }, "Builtin:Bitbucket/")]), true);
+    assert.strictEqual(bitbucketEntry.approves([entry({ allow_comment: true })]), false);
+    assert.strictEqual(bitbucketEntry.approves([entry({ allow_approve: "true" })]), false);
+    assert.strictEqual(bitbucketEntry.approves([entry({ allow_approve: true }, "builtin:jira")]), false);
+    assert.strictEqual(bitbucketEntry.approves([]), false);
+    assert.strictEqual(bitbucketEntry.approves(undefined), false);
 });
 
 QUnit.test("the pins are sent as typed, never repaired", function (assert) {
@@ -177,6 +170,41 @@ QUnit.test("a save that newly approves is asked about, with what it opens", func
     assert.deepEqual(bitbucketEntry.approvalsToAsk([on()], [on({ workspace: "other-ws" })]), [expected({
         reason: "approve", workspace: "other-ws", branch: "main", repositories: [], requireGreenBuilds: true
     })], "another workspace is newly approved, and said in full");
+});
+
+QUnit.test("another destination is another account: asked as a new approval", function (assert) {
+    const other = (destination: string, more: Record<string, unknown> = {}): McpServer => ({
+        url: URL, auth_mode: "destination", oauth: Object.assign({ destination }, ON, more)
+    } as McpServer);
+    assert.deepEqual(bitbucketEntry.approvalsToAsk([on()], [other("OTHER_ACCOUNT", { repositories: ["svc-a"] })]),
+        [expected({
+            reason: "approve", workspace: "acme-ws", branch: "main", repositories: ["svc-a"],
+            requireGreenBuilds: true
+        })]);
+    assert.deepEqual(bitbucketEntry.approvalsToAsk([on()], [other(" B ")]), [],
+        "the name as the cleaner stores it: blanks around it are no other destination");
+    assert.deepEqual(bitbucketEntry.approvalsToAsk([on()], [other("B")]), []);
+});
+
+QUnit.test("question: a new approval says all it opens, a widened one only what is new", function (assert) {
+    const text = (key: string, args?: (string | number)[]): string => `${key}(${(args || []).join("|")})`;
+    const ask = expected({
+        reason: "approve", workspace: "acme-ws", branch: "main", repositories: [], requireGreenBuilds: true
+    });
+    assert.strictEqual(bitbucketEntry.question("rev", ask, text),
+        "bitbucketApproveSaveQuestion(rev|main|acme-ws|bitbucketAllRepositories())");
+    assert.strictEqual(bitbucketEntry.question("rev", Object.assign({}, ask, {
+        repositories: ["svc-a", "svc-b"], requireGreenBuilds: false
+    }), text), "bitbucketApproveSaveQuestionNoBuilds(rev|main|acme-ws|bitbucketSomeRepositories(\"svc-a\", \"svc-b\"))");
+    assert.strictEqual(bitbucketEntry.question("rev", Object.assign({}, ask, {
+        reason: "widened", branch: "develop", branchBefore: "main", repositoriesAdded: ["svc-c"], buildsDropped: true
+    }), text), [
+        "bitbucketWidenSaveQuestion(rev|acme-ws)", "bitbucketWidenBranch(develop|main)",
+        "bitbucketWidenRepositoriesAdded(\"svc-c\")", "bitbucketWidenBuilds()"
+    ].join("\n"));
+    assert.strictEqual(bitbucketEntry.question("rev", Object.assign({}, ask, {
+        reason: "widened", wholeWorkspace: true
+    }), text), "bitbucketWidenSaveQuestion(rev|acme-ws)\nbitbucketWidenRepositoriesAll()");
 });
 
 QUnit.test("a save that changes nothing about approving, or narrows it, asks nothing", function (assert) {
@@ -266,7 +294,9 @@ const BITBUCKET_I18N_KEYS = [
     "bitbucketGreenBuildsHint", "bitbucketApproveSaveTitle", "bitbucketApproveSaveQuestion",
     "bitbucketApproveSaveQuestionNoBuilds", "bitbucketAllRepositories", "bitbucketSomeRepositories",
     "bitbucketWidenSaveTitle", "bitbucketWidenSaveQuestion", "bitbucketWidenBranch",
-    "bitbucketWidenRepositoriesAll", "bitbucketWidenRepositoriesAdded", "bitbucketWidenBuilds"
+    "bitbucketWidenRepositoriesAll", "bitbucketWidenRepositoriesAdded", "bitbucketWidenBuilds",
+    "bitbucketApprovalStays", "bitbucketUnattendedSaveTitle", "bitbucketApproveChatRefused",
+    "bitbucketApprovePeerRefused", "bitbucketApprovePeerOfRefused", "importAskApprovers", "importAskUnattendedTitle"
 ];
 
 async function source(resource: string): Promise<string> {
@@ -292,12 +322,16 @@ QUnit.test("every text of the bitbucket entry exists", async function (assert) {
     }) as ResourceBundle;
     const fragment = keysIn(
         await source("com/agent/admin/fragment/McpServerDialog.fragment.xml"), /i18n>(bitbucket\w+)/g);
-    // Every string literal of the controller that has the form of a bitbucket text key.
-    const controller = keysIn(
-        await source("com/agent/admin/controller/AgentDetail.controller.js"), /["'`](bitbucket[A-Z]\w*)["'`]/g);
+    // Every string literal of the code that has the form of a bitbucket text key.
+    const literal = /["'`](bitbucket[A-Z]\w*)["'`]/g;
+    const controller = keysIn(await source("com/agent/admin/controller/AgentDetail.controller.js"), literal);
+    const model = keysIn(await source("com/agent/admin/model/bitbucketEntry.js"), literal);
+    const settings = keysIn(await source("com/agent/admin/controller/Settings.controller.js"), literal);
     assert.ok(fragment.length >= 12, `the fragment's keys were read (${fragment.length})`);
-    assert.ok(controller.length >= 7, `the controller's keys were read (${controller.length})`);
-    BITBUCKET_I18N_KEYS.concat(fragment, controller).forEach((key) => {
+    assert.ok(controller.length >= 6, `the agent page's keys were read (${controller.length})`);
+    assert.ok(model.length >= 8, `the model's keys were read (${model.length})`);
+    assert.ok(settings.length >= 1, `the import's keys were read (${settings.length})`);
+    BITBUCKET_I18N_KEYS.concat(fragment, controller, model, settings).forEach((key) => {
         assert.ok(bundle.hasText(key), key);
     });
     const args = ["agent-x", "release/2.x", "ws-a", "all of them"];
@@ -314,4 +348,11 @@ QUnit.test("every text of the bitbucket entry exists", async function (assert) {
     named("bitbucketWidenBranch", ["release/2.x", "develop"]);
     named("bitbucketWidenRepositoriesAdded", ["\"svc-a\""]);
     named("bitbucketSomeRepositories", ["\"svc-a\""]);
+    named("bitbucketApprovePeerRefused", ["\"rev\""]);
+    named("bitbucketApprovePeerOfRefused", ["\"rev\""]);
+    ["bitbucketApproveSaveQuestion", "bitbucketGreenBuildsHint"].forEach((key) => {
+        assert.ok((bundle.getText(key) || "").indexOf("at least one build") > -1,
+            `${key}: one build status at least, as the server requires`);
+    });
+    assert.strictEqual((bundle.getText("bitbucketApproveSaveQuestion") || "").indexOf("while a review runs"), -1);
 });

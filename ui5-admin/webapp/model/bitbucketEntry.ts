@@ -30,10 +30,13 @@ function block(server: McpServer): Record<string, unknown> {
     return (server.oauth || {}) as Record<string, unknown>;
 }
 
-function approving(servers: McpServer[] | undefined): string[] {
-    return (servers || [])
-        .filter((s) => isUrl(s.url) && block(s).allow_approve === true)
-        .map((s) => String(block(s).workspace ?? ""));
+/** The destination name as `clean` stores it. */
+function destinationOf(cfg: Record<string, unknown>): string {
+    return String(cfg.destination ?? "").trim();
+}
+
+function quoted(names: string[]): string {
+    return names.map((name) => `"${name}"`).join(", ");
 }
 
 function branchOf(cfg: Record<string, unknown>): string {
@@ -168,18 +171,19 @@ export default {
         return "";
     },
 
-    /** Workspaces whose entry approves after this save and did not before
-     * (only exactly `allow_approve: true` approves). */
-    newlyApproves(stored: McpServer[] | undefined, toSave: McpServer[] | undefined): string[] {
-        const before = approving(stored);
-        return approving(toSave).filter((workspace) => before.indexOf(workspace) === -1);
+    /** Whether an agent with these servers approves pull requests (only
+     * exactly `allow_approve: true` on an entry of this toolset does). */
+    approves(servers: McpServer[] | undefined | null): boolean {
+        return (servers || []).some((s) => isUrl(s.url) && block(s).allow_approve === true);
     },
 
     /**
      * What the agent's Save asks about: every entry that approves after the
      * save (exactly `allow_approve: true`) and opens something by it. An
-     * entry is the same one when its workspace is (an agent has one entry;
-     * another workspace is a new approval, said in full). Removing the
+     * entry is the same one when its workspace and its destination are (an
+     * agent has one entry). Another workspace is a new approval, said in
+     * full, and so is another destination: it decides which technical
+     * account approves and which repositories that account sees. Removing the
      * entry, switching approving off, removing a repository, cutting the
      * whole workspace down to a list and requiring the builds again ask
      * nothing.
@@ -205,7 +209,9 @@ export default {
                 wholeWorkspace: false,
                 buildsDropped: false
             };
-            const before = approvingBefore.filter((b) => String(b.workspace ?? "") === workspace)[0];
+            const destination = destinationOf(cfg);
+            const before = approvingBefore.filter((b) => String(b.workspace ?? "") === workspace
+                && destinationOf(b) === destination)[0];
             if (!before) {
                 asks.push(ask);
                 return;
@@ -225,5 +231,39 @@ export default {
             }
         });
         return asks;
+    },
+
+    /**
+     * One ask in plain words, from the texts of the resource bundle (`text`
+     * is the controller's lookup). A new approval names all it opens
+     * (branch, workspace, repositories, whether builds count); a widened one
+     * names only what is new. The agent page's Save and the import use it,
+     * so both say the same.
+     */
+    question(
+        agentName: string, ask: BitbucketApprovalAsk, text: (key: string, args?: (string | number)[]) => string
+    ): string {
+        if (ask.reason === "approve") {
+            const repositories = ask.repositories.length > 0
+                ? text("bitbucketSomeRepositories", [quoted(ask.repositories)])
+                : text("bitbucketAllRepositories");
+            return text(
+                ask.requireGreenBuilds ? "bitbucketApproveSaveQuestion" : "bitbucketApproveSaveQuestionNoBuilds",
+                [agentName, ask.branch, ask.workspace, repositories]);
+        }
+        const lines = [text("bitbucketWidenSaveQuestion", [agentName, ask.workspace])];
+        if (ask.branchBefore) {
+            lines.push(text("bitbucketWidenBranch", [ask.branch, ask.branchBefore]));
+        }
+        if (ask.wholeWorkspace) {
+            lines.push(text("bitbucketWidenRepositoriesAll"));
+        }
+        if (ask.repositoriesAdded.length > 0) {
+            lines.push(text("bitbucketWidenRepositoriesAdded", [quoted(ask.repositoriesAdded)]));
+        }
+        if (ask.buildsDropped) {
+            lines.push(text("bitbucketWidenBuilds"));
+        }
+        return lines.join("\n");
     }
 };
