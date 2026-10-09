@@ -2248,6 +2248,33 @@ def _clean_sharepoint_entry(
     return cleaned
 
 
+# builtin:bitbucket: the workspace, the optional repository list, the branch
+# and the capability switches, next to the destination name. Nothing else is
+# stored for it, whatever the block carried.
+_BITBUCKET_URL = "builtin:bitbucket"
+
+
+def _clean_bitbucket_entry(oauth: Any, mode: str) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:bitbucket`` entry for storage.
+
+    The last gate before the row, whoever the caller is. The block is read by
+    ``agents.bitbucket_config`` (the reading the admin gate and the toolset
+    use): a value is stored only in the form that was checked, an unknown key
+    and ``user_context: true`` are a ValueError rather than dropped, and the
+    two switches that let an agent write (``allow_comment``,
+    ``allow_approve``) are stored only for the JSON boolean ``true``.
+
+    There is no fallback to the row being replaced: the block holds no
+    secret to keep (the destination holds the credential), so a switch an
+    edit leaves out is gone, never carried over from the stored entry.
+    """
+    from agents.bitbucket_config import clean_entry
+
+    if mode != AUTH_MODE_DESTINATION:
+        raise ValueError(f"{_BITBUCKET_URL} requires auth_mode=destination")
+    return clean_entry(oauth)
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
@@ -2262,6 +2289,10 @@ def _clean_oauth(
         # Its own cleaner, and none of the generic ones below: they trim and
         # stringify what they keep, and a pin is stored only as it was checked.
         return _clean_sharepoint_entry(oauth, mode, fallback)
+    if builtin == _BITBUCKET_URL:
+        # Its own cleaner for the same reason: the generic destination code
+        # would keep Jira's keys and read `allow_comment` with bool().
+        return _clean_bitbucket_entry(oauth, mode)
     cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
         from agents.mail_render import MailTheme
@@ -2391,6 +2422,9 @@ def prepare_servers(
             # with this entry's destination. Before the lookup of the
             # stored secret below, which is by URL.
             url = _SHAREPOINT_URL
+        elif url.rstrip("/").lower() == _BITBUCKET_URL:
+            # Stored under exactly this spelling, as builtin:sharepoint is.
+            url = _BITBUCKET_URL
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
