@@ -750,3 +750,69 @@ QUnit.test("sharepoint: a pin must be typed in its exact form", function (assert
         validators.validateSharePoint({ ...SP_ENTRY, library: "Caf\u00e9", path: "Team/Caf\u00e9.xlsx" }, "destination"),
         "", "composed characters pass");
 });
+
+// --- bitbucket: an agent that approves is reachable by no chat user -------
+
+QUnit.module("validators.approverProblem");
+
+QUnit.test("an agent that approves pull requests is not in chat and nobody's peer", function (assert) {
+    const entry = (approve: boolean) => [{
+        url: "Builtin:Bitbucket/", auth_mode: "destination",
+        oauth: Object.assign({ destination: "B", workspace: "acme-ws", allow_comment: true },
+            approve ? { allow_approve: true } : {})
+    }] as never;
+    const me = (over: Record<string, unknown> = {}) => Object.assign(
+        { name: "rev", expose_chat: false, mcp_servers: entry(true), peers: [] as string[] }, over);
+    const other = (name: string, approve: boolean, peers: string[] = []) => (
+        { name, expose_chat: false, mcp_servers: entry(approve), peers });
+
+    assert.strictEqual(validators.approverProblem(me(), []), null);
+    assert.deepEqual(validators.approverProblem(me({ expose_chat: true }), []), { rule: "chat", names: [] });
+    assert.deepEqual(validators.approverProblem(me({ expose_chat: undefined }), []), { rule: "chat", names: [] },
+        "only exactly false is not exposed");
+    assert.strictEqual(validators.approverProblem(me({ expose_chat: true, mcp_servers: entry(false) }), []), null,
+        "an agent that does not approve may be in chat");
+
+    assert.deepEqual(
+        validators.approverProblem(me(), [other("a", false, ["rev"]), other("b", false), other("c", false, ["x", "rev"])]),
+        { rule: "peerOf", names: ["a", "c"] }, "other agents name it as their peer");
+    assert.deepEqual(
+        validators.approverProblem(me({ mcp_servers: entry(false), peers: ["a", "b", "gone"] }),
+            [other("a", true), other("b", false)]),
+        { rule: "peers", names: ["a"] }, "it names an agent that approves as its peer");
+    assert.strictEqual(validators.approverProblem(me({ mcp_servers: entry(false), peers: ["b"] }), [other("b", false)]), null);
+    assert.strictEqual(validators.approverProblem(me({ mcp_servers: entry(false), peers: ["a"] }), undefined), null,
+        "without the other agents on the page the peer rule is the server's");
+    assert.deepEqual(validators.approverProblem(me({ expose_chat: true }), undefined), { rule: "chat", names: [] });
+});
+
+QUnit.test("the rule reads approving and names as the server does", function (assert) {
+    const asks = (value: unknown) => [{
+        url: "builtin:bitbucket", auth_mode: "destination",
+        oauth: { destination: "B", workspace: "acme-ws", allow_approve: value }
+    }] as never;
+    const me = (over: Record<string, unknown> = {}) => Object.assign(
+        { name: "rev", expose_chat: true, mcp_servers: asks(true), peers: [] as string[] }, over);
+    // `asks_to_approve`: anything but false / nothing asks for approving,
+    // also a value the toolset itself would not run with.
+    ["true", 1, "false", {}].forEach((value) => {
+        assert.deepEqual(validators.approverProblem(me({ mcp_servers: asks(value) }), []),
+            { rule: "chat", names: [] }, JSON.stringify(value));
+    });
+    [false, null, undefined].forEach((value) => {
+        assert.strictEqual(validators.approverProblem(me({ mcp_servers: asks(value) }), []), null, String(value));
+    });
+    assert.deepEqual(validators.approverProblem(
+        me({ expose_chat: false, mcp_servers: asks(false), peers: ["hand"] }),
+        [{ name: "hand", mcp_servers: asks("true"), peers: [] }]), { rule: "peers", names: ["hand"] });
+
+    // A rename: the other agents' peer lists still hold the stored name.
+    const lister = [{ name: "a", mcp_servers: asks(false), peers: ["old-rev"] }];
+    assert.strictEqual(validators.approverProblem(me({ expose_chat: false }), lister), null);
+    assert.deepEqual(validators.approverProblem(me({ expose_chat: false }), lister, "old-rev"),
+        { rule: "peerOf", names: ["a"] });
+    // Its own names are no peer of itself, and no lister of itself.
+    assert.strictEqual(validators.approverProblem(
+        me({ expose_chat: false, peers: ["rev", "old-rev"] }),
+        [{ name: "old-rev", mcp_servers: asks(true), peers: ["rev"] }], "old-rev"), null);
+});

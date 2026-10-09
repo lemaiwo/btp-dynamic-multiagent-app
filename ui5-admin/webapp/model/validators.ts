@@ -2,6 +2,7 @@ import type { AuthMode, DeepConfig, McpServer, OAuthClient, WorkflowStep } from 
 import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
+import bitbucketEntry from "./bitbucketEntry";
 
 // --- odata ---
 /** `SERVICE_NAME_RE` in agents/odata/models.py: the slug of a catalogue service. */
@@ -85,6 +86,14 @@ const BUILTIN_URLS: readonly string[] = BUILTINS.map((b) => b.url);
  * settings on any server.
  */
 const BUILTIN_PUBLIC_KEYS = ["min_score", "lookback"] as const;
+
+/** Why an agent that approves pull requests cannot be saved as it is:
+ *  it is in chat, other agents name it as a peer (`names`), or it names
+ *  approving agents as its peers (`names`). */
+export interface ApproverProblem {
+    rule: "chat" | "peerOf" | "peers";
+    names: string[];
+}
 
 export default {
 
@@ -330,6 +339,10 @@ export default {
             // entry names no destination.
             return this.validateODataEntry(oauth, authMode);
         }
+        if (bitbucketEntry.isBitbucketUrl(url)) {
+            // --- bitbucket --- Its own rules and none of the Jira ones below.
+            return bitbucketEntry.validate(oauth, authMode);
+        }
         if (this.isTeams(url)) {
             const teamsError = this.validateTeams(oauth, authMode);
             if (teamsError) {
@@ -464,6 +477,41 @@ export default {
     },
 
     /**
+     * --- bitbucket --- An agent that approves pull requests must not be
+     * reachable by a chat user, who could otherwise direct an approval.
+     * Exactly the three refusals of `check_bitbucket_approver_reach` in
+     * `agents/db.py`, in its order: the agent asks for approving
+     * (`bitbucketEntry.asksToApprove`) and is exposed to chat (anything but
+     * `expose_chat: false`); it asks for approving and another agent,
+     * enabled or not, lists it as a peer under the name it is saved with or
+     * the name it is stored with (`storedName`, on a rename); or one of its
+     * own peers is another agent that asks for approving. `others` are the
+     * other agents as the page has them; without them the two peer rules
+     * are left to the server.
+     */
+    approverProblem(
+        agent: { name?: string; expose_chat?: unknown; mcp_servers?: McpServer[]; peers?: string[] },
+        others?: { name: string; mcp_servers?: McpServer[]; peers?: string[] }[],
+        storedName?: string
+    ): ApproverProblem | null {
+        const own = [agent.name, storedName || agent.name].filter((name): name is string => !!name);
+        const rest = (Array.isArray(others) ? others : []).filter((other) => own.indexOf(other.name) === -1);
+        if (bitbucketEntry.asksToApprove(agent.mcp_servers)) {
+            if (agent.expose_chat !== false) {
+                return { rule: "chat", names: [] };
+            }
+            const listers = rest.filter((other) => (other.peers || []).some((peer) => own.indexOf(peer) > -1))
+                .map((other) => other.name);
+            if (listers.length > 0) {
+                return { rule: "peerOf", names: listers };
+            }
+        }
+        const approvers = (agent.peers || []).filter((peer) => rest.some(
+            (other) => other.name === peer && bitbucketEntry.asksToApprove(other.mcp_servers)));
+        return approvers.length > 0 ? { rule: "peers", names: approvers } : null;
+    },
+
+    /**
      * Validates a whole server list.
      *
      * Keyed by index; the pseudo-index -1 carries list-level errors so a form
@@ -489,9 +537,13 @@ export default {
             }
             const key = (server.url || "").trim().replace(/\/+$/, "").toLowerCase();
             if (seen.has(key)) {
-                errors[index] = key === odataEntry.ODATA_URL
-                    ? "An agent has one OData services entry; add the services to the existing one."
-                    : "This is a duplicate URL; each server may appear once.";
+                if (key === odataEntry.ODATA_URL) {
+                    errors[index] = "An agent has one OData services entry; add the services to the existing one.";
+                } else if (key === bitbucketEntry.BITBUCKET_URL) {
+                    errors[index] = "An agent has one Bitbucket entry; change the existing one.";
+                } else {
+                    errors[index] = "This is a duplicate URL; each server may appear once.";
+                }
                 return;
             }
             seen.add(key);

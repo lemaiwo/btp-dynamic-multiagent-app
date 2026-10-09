@@ -31,6 +31,8 @@ from agents.db import (
     list_skills,
     odata_entries,
 )
+from agents.bitbucket_config import BUILTIN_BITBUCKET_URL, asks_to_approve
+from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.tools import NoUsableServiceError, attached_services
@@ -118,7 +120,10 @@ def _compute_tool_prefixes(urls: list[str]) -> list[str]:
     64-char function-name limit (the full hostname would blow past it)."""
     slugs = []
     for u in urls:
-        parsed = urlparse(u)
+        # Trimmed as `is_builtin_url` reads it: a built-in spelled with edge
+        # whitespace must get the prefix of its name (the fixed-form activity
+        # lines of the SharePoint and Bitbucket tools go by the tool's name).
+        parsed = urlparse(str(u).strip())
         # builtin: URLs carry no host -- the name lives in the path, so
         # `builtin:gmail` prefixes as `gmail` rather than collapsing to `mcp`
         # like every other hostless entry.
@@ -147,6 +152,23 @@ _PREVIEW_REPR.maxstring = 600
 _PREVIEW_REPR.maxother = 600
 
 
+def _is_bitbucket_entry(spec: dict) -> bool:
+    """Whether a server entry is ``builtin:bitbucket`` in any spelling, by the
+    canonical server key storage counts with (trimmed, no trailing slash,
+    lower case)."""
+    return str(spec.get("url") or "").strip().rstrip("/").lower() == BUILTIN_BITBUCKET_URL
+
+
+def _approves(specs: list) -> bool:
+    """Whether an agent's row holds a ``builtin:bitbucket`` entry that asks
+    for approving, read as widely as `asks_to_approve` reads a block: the
+    rows judged here may have passed no gate."""
+    return any(
+        isinstance(s, dict) and _is_bitbucket_entry(s) and asks_to_approve(s.get("oauth"))
+        for s in specs
+    )
+
+
 def _short_tool_output(result) -> str:
     """A compact, single-blob preview of a specialist tool's return value.
 
@@ -157,6 +179,13 @@ def _short_tool_output(result) -> str:
         # The SharePoint tools return what people typed into a workbook, and
         # this preview is stored with an API-triggered run: counts only.
         fixed = sharepoint_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The Bitbucket tools return source code and what pull request
+        # authors wrote: sizes, counts and codes only.
+        fixed = bitbucket_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:
@@ -707,7 +736,36 @@ async def build_orchestrator() -> BuildResult:
             if len(specs) > 1
             else [None] * len(specs)
         )
+        # The admin gate and storage refuse a second builtin:bitbucket entry;
+        # a row written directly in the database passes neither, and the
+        # second toolset could carry wider switches (allow_approve) than the
+        # one somebody reviewed. Fail closed: none of them is attached, not
+        # "the first", and the agent keeps its other servers.
+        no_bitbucket = sum(_is_bitbucket_entry(s) for s in specs) > 1
+        if no_bitbucket:
+            # The agent and the rule only: no URL as typed, no config value.
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:bitbucket entry; "
+                "the agent is built without the Bitbucket tools",
+                row.name,
+            )
+        # An approving agent runs only from the scheduler run endpoint and
+        # Run now (the stored run prompt). Chat, and A2A through the same
+        # orchestrator, hand it a user's prompt: that user could have the
+        # technical user approve their own pull request. The save gate and
+        # storage refuse the combination; a row written by hand passes
+        # neither, so it is closed here as well, on the side that cannot
+        # approve: the row stays chat-exposed and loses the Bitbucket tools.
+        if row.expose_chat and _approves(specs):
+            no_bitbucket = True
+            logger.warning(
+                "Agent '%s' is exposed to chat and its builtin:bitbucket entry "
+                "approves; the agent is built without the Bitbucket tools",
+                row.name,
+            )
         for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
+            if no_bitbucket and _is_bitbucket_entry(spec):
+                continue
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:
                 if is_builtin_url(spec["url"]):
@@ -853,6 +911,17 @@ async def build_orchestrator() -> BuildResult:
                 logger.warning(
                     "Agent %s references unknown or unbuilt peer %r; skipping it",
                     row.name, peer_name,
+                )
+                continue
+            # Nobody delegates to an approving agent, whoever lists it: the
+            # delegating agent's prompt would be the approver's. Refused at
+            # the save gate and by storage; fail closed for a row that passed
+            # neither (rows are written in any order, and by hand).
+            if _approves(peer_row.mcp_servers):
+                logger.warning(
+                    "Agent '%s' lists the peer '%s', whose builtin:bitbucket entry "
+                    "approves; no delegation tool is attached",
+                    row.name, peer_row.name,
                 )
                 continue
             _attach_delegation_tool(parent, peer_specialist, peer_row, counter=in_flight)

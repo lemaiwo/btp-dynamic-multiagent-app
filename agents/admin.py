@@ -58,6 +58,9 @@ from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
 from agents.outlook_tools import BUILTIN_OUTLOOK_URL
 from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
+from agents.bitbucket_config import check_entry as check_bitbucket_entry
+from agents.bitbucket_config import clean_entry as clean_bitbucket_entry
 from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
 from agents.sharepoint_views import check_pins, clean_views
 from agents.slack_tools import BUILTIN_SLACK_URL
@@ -71,6 +74,8 @@ from agents.db import (
     AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
+    BITBUCKET_APPROVER_CHAT_MESSAGE,
+    BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
     MAX_ODATA_ENTRY_SERVICES,
@@ -81,6 +86,8 @@ from agents.db import (
     SessionLocal,
     agent_referrers,
     agent_where_used,
+    bitbucket_approves,
+    check_bitbucket_approver_reach,
     check_delegation_name_collision,
     delete_agent,
     delete_skill,
@@ -322,10 +329,20 @@ class OAuthClientPayload(BaseModel):
     library: StrictStr = Field(default="", max_length=128)
     path: StrictStr = Field(default="", max_length=400)
     views: dict[str, Any] | None = None
+    # builtin:bitbucket only. One workspace, optionally a list of its
+    # repositories, the target branch, and the switches that let the agent
+    # approve and that require green builds for it. Pinned here, never tool
+    # arguments; agents/bitbucket_config.py is the gate. Strict, and handed
+    # on untrimmed: a value is accepted only in the form that is stored.
+    workspace: StrictStr = Field(default="", max_length=64)
+    repositories: list[StrictStr] | None = None
+    branch: StrictStr = Field(default="", max_length=200)
+    allow_approve: StrictBool = False
+    require_green_builds: StrictBool | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("services", "allow_write", mode="before")
+    @field_validator("services", "allow_write", "allow_approve", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
@@ -334,7 +351,7 @@ class OAuthClientPayload(BaseModel):
             return [] if info.field_name == "services" else False
         return v
 
-    @field_validator("site", "library", "path", mode="before")
+    @field_validator("site", "library", "path", "workspace", "branch", mode="before")
     @classmethod
     def _null_pin_is_absent(cls, v: Any) -> Any:
         """``null`` means "not set", as for ``services`` and ``views``: a
@@ -468,6 +485,8 @@ class OAuthClientPayload(BaseModel):
             "site": self.site,
             "library": self.library,
             "path": self.path,
+            "workspace": self.workspace,
+            "branch": self.branch,
         }
         config = {k: v for k, v in fields.items() if v}
         if self.theme:
@@ -484,6 +503,12 @@ class OAuthClientPayload(BaseModel):
             config["services"] = list(self.services)
         if self.allow_write:
             config["allow_write"] = True
+        if self.repositories is not None:
+            config["repositories"] = list(self.repositories)
+        if self.allow_approve:
+            config["allow_approve"] = True
+        if self.require_green_builds is False:
+            config["require_green_builds"] = False
         return config
 
 
@@ -619,6 +644,31 @@ class McpServerPayload(BaseModel):
                 _validate_odata_entry(oauth)
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_bitbucket_entry(cls, data: Any) -> Any:
+        """The ``builtin:bitbucket`` block as the client sent it.
+
+        Checked before it becomes an `OAuthClientPayload`: that model ignores
+        a key it does not know and reads ``allow_comment`` as a lax boolean,
+        so afterwards a stray key or the string "true" can no longer be told
+        from an entry that was sent correctly. The mode is checked first, so
+        a block of another mode is not judged by this entry's keys.
+        """
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_BITBUCKET_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(
+                    f"{BUILTIN_BITBUCKET_URL} requires auth_mode=destination: it "
+                    "holds no credential of its own and reaches Bitbucket only "
+                    "through the BTP destination named in oauth.destination"
+                )
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            check_bitbucket_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         if _server_key(self.url) == BUILTIN_ODATA_URL:
@@ -650,6 +700,19 @@ class McpServerPayload(BaseModel):
             )
         if is_sharepoint:
             self._validate_sharepoint()
+        is_bitbucket = _server_key(self.url) == BUILTIN_BITBUCKET_URL
+        if not is_bitbucket and self.oauth is not None and (
+            self.oauth.workspace or self.oauth.repositories is not None or self.oauth.branch
+            or self.oauth.allow_approve or self.oauth.require_green_builds is not None
+        ):
+            raise ValueError(
+                "oauth.workspace, oauth.repositories, oauth.branch, oauth.allow_approve "
+                f"and oauth.require_green_builds belong to a {BUILTIN_BITBUCKET_URL} "
+                "entry only; no other server reads them"
+            )
+        if is_bitbucket:
+            # Again on the block the route hands to storage.
+            check_bitbucket_entry(self.oauth.to_config() if self.oauth else None)
         # Before the per-mode rules, because the oauth2 branch below returns
         # early for DCR.
         if (
@@ -995,8 +1058,27 @@ class AgentPayload(BaseModel):
         # that says what to do instead.
         if sum(1 for u in urls if _server_key(u) == BUILTIN_ODATA_URL) > 1:
             raise ValueError(ODATA_SINGLE_ENTRY_MESSAGE)
+        # By server key, not by the string sent: the duplicate rule below
+        # compares spellings, and storage stores every spelling of this URL
+        # as the one entry (`prepare_servers`, which refuses this as well).
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_BITBUCKET_URL) > 1:
+            raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
         if len(set(urls)) != len(urls):
             raise ValueError("mcp_servers contains duplicate urls")
+        return self
+
+    @model_validator(mode="after")
+    def _approver_is_not_chat_exposed(self) -> "AgentPayload":
+        """An agent whose ``builtin:bitbucket`` entry approves is never
+        exposed to chat (and so not to A2A, which talks to the same
+        orchestrator): a user there chooses the prompt, and the approval is a
+        technical user's that counts for merging. The scheduler run endpoint
+        (``expose_api`` + ``api_slug``) and Run now use the stored run prompt
+        and stay allowed. Create, update, import and the seed all validate
+        this model; storage checks again and adds the peer rule, which needs
+        the database (`agents.db.check_bitbucket_approver_reach`)."""
+        if self.expose_chat is not False and bitbucket_approves(self.to_servers_list()):
+            raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
         return self
 
     def to_servers_list(self) -> list[dict[str, Any]]:
@@ -1192,13 +1274,13 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
     """Create an agent (or replace the one of that name: ``upsert_agent``).
 
     The answer is the agent plus ``reloaded`` and ``reload_failed``, both
-    always present: see `_reload_for_odata_entry`.
+    always present: see `_reload_for_changed_entry`.
     """
     async with SessionLocal() as session:
         from agents.db import get_agent_by_name
 
         known = await get_agent_by_name(session, payload.name)
-        before = _odata_entry_signature(
+        before = _entry_signature(
             known.mcp_servers if known is not None else [], known is None or known.enabled
         )
         try:
@@ -1224,59 +1306,84 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=str(e)) from e
         _unknown_model_note(payload.name, payload.model_name)
         answer = row.to_dict()
-        after = _odata_entry_signature(row.mcp_servers, row.enabled)
-    answer.update(await _reload_for_odata_entry(before, after, f"agent '{payload.name}' saved"))
+        after = _entry_signature(row.mcp_servers, row.enabled)
+    answer.update(await _reload_for_changed_entry(before, after, f"agent '{payload.name}' saved"))
     return answer
 
 
-def _odata_entry_signature(
-    servers: Any, enabled: Any = True
-) -> list[tuple[tuple[str, ...], bool]]:
-    """What an agent's ``builtin:odata`` entries let it do: per entry the
-    attached services (sorted) and whether it may write. Order-free, so a
-    save that only reorders is no change; ``[]`` for an agent without one.
+def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
+    """What an agent's ``builtin:odata`` and ``builtin:bitbucket`` entries
+    let it do: the part of an agent row whose change must reach the running
+    build at once. ``[]`` for an agent with neither entry.
+
+    Per OData entry the attached services (sorted) and whether it may write;
+    order-free, so a save that only reorders is no change. Per Bitbucket
+    entry the block as it is stored (`agents.bitbucket_config.clean_entry`:
+    destination, workspace, repositories, branch and the three switches), so
+    a block that only says its defaults out loud is no change either. A
+    stored block the toolset would refuse (a row no gate has seen) gives no
+    tool; it is compared as it stands, so repairing it reloads.
 
     Also ``[]`` for an agent that is not ``enabled``: the registry builds no
-    such agent, so switching it off closes its OData access like removing
-    the entry does (and switching it on opens it), and the save reloads."""
+    such agent, so switching it off closes its access like removing the
+    entry does (and switching it on opens it), and the save reloads."""
     if not enabled:
         return []
-    out = []
-    for block in odata_entries(servers if isinstance(servers, list) else []):
+    servers = servers if isinstance(servers, list) else []
+    odata = []
+    for block in odata_entries(servers):
         services = block.get("services")
         names = sorted({n for n in services if isinstance(n, str)}) if isinstance(
             services, list
         ) else []
-        out.append((tuple(names), block.get("allow_write") is True))
-    return sorted(out)
+        odata.append((tuple(names), block.get("allow_write") is True))
+    bitbucket = []
+    for server in servers:
+        if not isinstance(server, dict) or _server_key(server.get("url")) != BUILTIN_BITBUCKET_URL:
+            continue
+        block = server.get("oauth")
+        try:
+            if server.get("auth_mode") != AUTH_MODE_DESTINATION:
+                raise ValueError("not a destination entry")
+            stored = clean_bitbucket_entry(block)
+        except ValueError:
+            stored = {"refused": [server.get("auth_mode"), block]}
+        bitbucket.append(
+            (BUILTIN_BITBUCKET_URL, json.dumps(stored, sort_keys=True, default=str))
+        )
+    return sorted(odata) + sorted(bitbucket)
 
 
-async def _reload_for_odata_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
+async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:
     """``{reloaded, reload_failed}`` of an agent save, create or delete.
 
-    The running build answers from the entry it was built with. So a save
-    that changes the agent's ``builtin:odata`` entry -- a service added or
-    removed, Allow writes switched, the entry itself added or removed, or
-    an agent that has one disabled or enabled (`_odata_entry_signature`) --
-    rebuilds the registry and the chat app after the commit: a closed write
-    must not stay open, and a write the admin was just asked about must not
-    need a second step. Any other agent save behaves as it always did (no
-    reload; the admin UIs call reload) and answers both keys ``false``.
+    The running build answers from the entries it was built with, and a run
+    takes its specialist from that build. So a save that changes the agent's
+    ``builtin:odata`` entry (a service added or removed, Allow writes
+    switched) or its ``builtin:bitbucket`` entry (Commenting or Approving
+    switched, a repository, the branch, the builds rule, the workspace or
+    the destination changed), adds or removes such an entry, or disables or
+    enables an agent that has one (`_entry_signature`) rebuilds the registry
+    and the chat app after the commit: a closed write or approval must not
+    stay open until somebody presses Reload, and one the admin was just
+    asked about must not need a second step. Any other agent save behaves
+    as it always did (no reload; the admin UIs call reload) and answers both
+    keys ``false``.
 
     Never a 500 for a rebuild that fails after the commit
     (`agents.odata.admin_routes.reload_running_agents`).
     """
     if before == after:
         return dict(NOT_RELOADED)
-    return await reload_running_agents(f"{what} with a changed OData entry")
+    return await reload_running_agents(f"{what} with a changed OData or Bitbucket entry")
 
 
-def _odata_signatures(rows: Any) -> dict[str, Any]:
-    """``{agent name: _odata_entry_signature}`` of the agents that have
-    OData access at all: what an import compares before and after."""
+def _entry_signatures(rows: Any) -> dict[str, Any]:
+    """``{agent name: _entry_signature}`` of the agents that have OData or
+    Bitbucket access at all: what an import compares before and after."""
     out: dict[str, Any] = {}
     for row in rows:
-        signature = _odata_entry_signature(row.mcp_servers, row.enabled)
+        signature = _entry_signature(row.mcp_servers, row.enabled)
         if signature:
             out[row.name] = signature
     return out
@@ -1299,7 +1406,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             raise HTTPException(status_code=404, detail="Agent not found")
         old_name = row.name
         renamed = old_name != payload.name
-        odata_before = _odata_entry_signature(row.mcp_servers, row.enabled)
+        odata_before = _entry_signature(row.mcp_servers, row.enabled)
         if renamed:
             # Check uniqueness of new name
             from agents.db import get_agent_by_name
@@ -1319,6 +1426,16 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             # down, not a second reading of the payload.
             await check_odata_services(
                 session, prepared_server_list(primary, extras, primary_oauth_json)
+            )
+            # As `upsert_agent` does. The other agents' peer lists still hold
+            # the old name here: the rename below rewrites them.
+            await check_bitbucket_approver_reach(
+                session,
+                name=payload.name,
+                stored_name=old_name,
+                servers=prepared_server_list(primary, extras, primary_oauth_json),
+                expose_chat=payload.expose_chat,
+                peers=list(row.peers) if payload.peers is None else payload.peers,
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
@@ -1379,10 +1496,10 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         await session.refresh(row)
         _unknown_model_note(payload.name, payload.model_name)
         answer = row.to_dict()
-        odata_after = _odata_entry_signature(row.mcp_servers, row.enabled)
-    # `reloaded` / `reload_failed`, always present: `_reload_for_odata_entry`.
+        odata_after = _entry_signature(row.mcp_servers, row.enabled)
+    # `reloaded` / `reload_failed`, always present: `_reload_for_changed_entry`.
     answer.update(
-        await _reload_for_odata_entry(
+        await _reload_for_changed_entry(
             odata_before, odata_after, f"agent '{payload.name}' saved"
         )
     )
@@ -1412,8 +1529,9 @@ async def api_delete_agent(
     transaction; a workflow step is never edited behind the operator's back,
     so it has to be changed first.
 
-    An agent that had a ``builtin:odata`` entry is taken out of the running
-    build at once (`_reload_for_odata_entry`). The 204 has no body: the
+    An agent that had a ``builtin:odata`` or ``builtin:bitbucket`` entry is
+    taken out of the running
+    build at once (`_reload_for_changed_entry`). The 204 has no body: the
     outcome is in the headers ``X-OData-Reloaded`` and
     ``X-OData-Reload-Failed`` (``true`` / ``false``), always present.
     """
@@ -1436,10 +1554,10 @@ async def api_delete_agent(
         # Strip stale peer entries (including those on disabled agents) in
         # the same transaction as the delete; delete_agent commits.
         name = row.name
-        odata_before = _odata_entry_signature(row.mcp_servers, row.enabled)
+        odata_before = _entry_signature(row.mcp_servers, row.enabled)
         await rename_agent_references(session, row.name, None)
         await delete_agent(session, agent_id)
-    outcome = await _reload_for_odata_entry(odata_before, [], f"agent '{name}' deleted")
+    outcome = await _reload_for_changed_entry(odata_before, [], f"agent '{name}' deleted")
     response.headers["X-OData-Reloaded"] = str(outcome["reloaded"]).lower()
     response.headers["X-OData-Reload-Failed"] = str(outcome["reload_failed"]).lower()
 
@@ -2292,9 +2410,10 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     service that is in use -- attached by an agent as the import leaves it,
     or held by the running build
     (`agents.odata.admin_routes.reload_after_catalogue_change`) -- or when
-    it changed what an agent's ``builtin:odata`` entry allows (the entry
+    it changed what an agent's ``builtin:odata`` or ``builtin:bitbucket``
+    entry allows (the entry
     changed, added or gone; the agent removed by replace, disabled or
-    enabled: `_odata_signatures`): a change that closes something must not
+    enabled: `_entry_signatures`): a change that closes something must not
     wait for somebody to press Reload. The answer says ``reloaded`` /
     ``reload_failed``; a rebuild that fails after the commit is logged and
     answered as ``reload_failed: true``, not as a 500.
@@ -2314,7 +2433,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
         try:
             existing_agents = {r.name: r for r in await list_agents(session)}
             # Taken now: the rows are changed in place by the loop below.
-            odata_before = _odata_signatures(existing_agents.values())
+            odata_before = _entry_signatures(existing_agents.values())
             imported_names = {a.name for a in payload.agents}
             # Agents a replace import removes: they neither count as
             # delegation-tool collisions nor as referrers of what remains.
@@ -2342,7 +2461,15 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 session, payload.odata_services, errors
             )
 
+            # Agents this bundle still writes: their stored peer lists are
+            # about to be replaced, so they do not decide whether an agent
+            # written before them may approve; their own write is checked
+            # when its turn comes (`check_bitbucket_approver_reach`). A
+            # bundle entry without a `peers` key keeps the stored list and
+            # stays out of this set.
+            rewrites_peers = {a.name for a in payload.agents if a.peers is not None}
             for agent in payload.agents:
+                rewrites_peers.discard(agent.name)
                 secret_errors = _missing_secret_errors(agent, existing_agents.get(agent.name))
                 if secret_errors:
                     errors.extend(secret_errors)
@@ -2373,6 +2500,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         commit=False,
                         ignore_collisions_with=doomed,
                         deep_json=_deep_json_or_keep(agent.deep),
+                        ignore_peer_lists_of=doomed | rewrites_peers,
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
@@ -2509,15 +2637,16 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
             touched, referrers, f"import changed {len(touched)} service(s)"
         )
     if not (reload_outcome["reloaded"] or reload_outcome["reload_failed"]):
-        # The other way an import closes OData access: an agent's own
-        # `builtin:odata` entry changed or went, or the agent was removed or
-        # disabled, with no catalogue service in use touched. Same rule as an
-        # agent save (`_reload_for_odata_entry`); one rebuild at most.
+        # The other way an import closes access: an agent's own
+        # `builtin:odata` or `builtin:bitbucket` entry changed or went, or
+        # the agent was removed or disabled, with no catalogue service in
+        # use touched. Same rule as an
+        # agent save (`_reload_for_changed_entry`); one rebuild at most.
         async with SessionLocal() as session:
-            odata_after = _odata_signatures(await list_agents(session))
+            odata_after = _entry_signatures(await list_agents(session))
         if odata_after != odata_before:
             reload_outcome = await reload_running_agents(
-                "import with a changed OData entry of an agent"
+                "import with a changed OData or Bitbucket entry of an agent"
             )
 
     return {

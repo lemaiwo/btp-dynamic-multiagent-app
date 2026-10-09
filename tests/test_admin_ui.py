@@ -1701,7 +1701,17 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         # The server refuses a pin with edge whitespace instead of repairing
         # it, so the page must send the three pins as typed.
         check("the sharepoint pins are collected apart from the trimmed text keys",
-              "const DESTINATION_EXACT_KEYS = ['site', 'library', 'path'];" in html)
+              "const DESTINATION_EXACT_KEYS = ['site', 'library', 'path', 'workspace', 'branch'];" in html)
+        # builtin:bitbucket: destination mode only, as a technical user. The
+        # server refuses every other key and edge whitespace in a pin.
+        check("bitbucket is a known destination built-in",
+              "'builtin:bitbucket':" in html
+              and "['workspace', 'repositories', 'branch', 'allow_comment', 'allow_approve', "
+                  "'require_green_builds']" in html)
+        check("bitbucket has its fields",
+              all(f'class="dest-{k}"' in html for k in
+                  ("workspace", "repositories", "branch", "allow_approve", "require_green_builds")))
+        check("the hint list names builtin:bitbucket", "builtin:sharepoint, builtin:bitbucket," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
         # A stored server on an auth mode this page does not offer (app_only,
@@ -2027,6 +2037,101 @@ for (const k of ['site', 'library', 'path', 'views']) {
         k + ' is hidden');
     assert.ok(!(k in out.oauth), k + ' is not sent');
 }
+
+// 7d. builtin:bitbucket: workspace, repository list, branch and three switches.
+const BB_OAUTH = { destination: 'BITBUCKET', workspace: 'acme-ws', repositories: ['svc-a', 'svc-b'],
+    branch: 'release/2.x', allow_comment: true, allow_approve: true, require_green_builds: false };
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: { ...BB_OAUTH, user_context: true, project: 'ABC', lookback: '2d', allow_send: true } }));
+for (const k of ['destination', 'workspace', 'repositories', 'branch', 'allow_comment',
+                 'allow_approve', 'require_green_builds']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+for (const k of ['user_context', 'project', 'lookback', 'allow_send', 'status', 'labels', 'api_base']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+}
+assert.strictEqual(row.querySelector('.dest-repositories').value, 'svc-a, svc-b');
+assert.deepStrictEqual(out, { url: 'builtin:bitbucket', auth_mode: 'destination', oauth: BB_OAUTH });
+assert.ok(row.querySelector('.dest-hint').textContent.includes('technical user'));
+console.log('BITBUCKET:' + JSON.stringify(out));
+// Workspace and branch reach the server exactly as typed: nothing is trimmed
+// here (the server refuses edge whitespace; repairing it would hide what is
+// stored). Empty is not sent.
+row.querySelector('.dest-workspace').value = ' acme-ws';
+row.querySelector('.dest-branch').value = 'release/2.x ';
+let bbOut = collectMcpServers()[0].oauth;
+assert.strictEqual(bbOut.workspace, ' acme-ws');
+assert.strictEqual(bbOut.branch, 'release/2.x ');
+row.querySelector('.dest-branch').value = '';
+assert.ok(!('branch' in collectMcpServers()[0].oauth));
+// The minimal entry: no list, default branch, read-only, green builds required.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: { destination: 'BITBUCKET', workspace: 'acme-ws' } }));
+assert.strictEqual(row.querySelector('.dest-require_green_builds').checked, true);
+assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
+assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
+// A switch stored as anything but the JSON boolean is not loaded as that switch.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: { destination: 'BITBUCKET', workspace: 'acme-ws', allow_comment: 'true',
+             allow_approve: 'true', require_green_builds: 'false' } }));
+assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
+// Approving without commenting is refused in the form, with a fixed text.
+row.querySelector('.dest-allow_approve').checked = true;
+assert.throws(() => collectDestinationConfig(row), /Approving requires commenting/);
+// A blank list entry is a typing artefact, not a repository.
+row.querySelector('.dest-allow_approve').checked = false;
+row.querySelector('.dest-repositories').value = ' svc-a, ,svc-b ,';
+assert.deepStrictEqual(collectDestinationConfig(row).repositories, ['svc-a', 'svc-b']);
+// Nothing but separators is no list: the key is absent (the whole workspace),
+// never an empty list, which the server refuses.
+row.querySelector('.dest-repositories').value = ' , ';
+assert.ok(!('repositories' in collectDestinationConfig(row)));
+// An agent takes one bitbucket entry: two rows are refused here, not posted.
+addMcpServerRow({ url: 'Builtin:Bitbucket/', auth_mode: 'destination',
+    oauth: { destination: 'BITBUCKET', workspace: 'other-ws' } });
+assert.throws(() => collectMcpServers(), /Two builtin:bitbucket rows/);
+// A Jira row loads none of the bitbucket switches from a stored block.
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', allow_approve: true, workspace: 'x',
+             require_green_builds: false } }));
+assert.deepStrictEqual(out.oauth, { destination: 'JIRA', project: 'ABC' });
+assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
+assert.strictEqual(row.querySelector('.dest-require_green_builds').checked, true);
+// ... nor its workspace and branch: they are filled for a bitbucket row only.
+assert.strictEqual(row.querySelector('.dest-workspace').value, '');
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', branch: 'main', workspace: 'x' } }));
+assert.strictEqual(row.querySelector('.dest-workspace').value, '');
+assert.strictEqual(row.querySelector('.dest-branch').value, '');
+// The URL of a bitbucket row edited into a jira row: "Allow commenting" is one
+// checkbox for both types, and what was ticked for the review must not
+// arrive as Jira's allow_comment without anyone ticking it there.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: BB_OAUTH }));
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true);
+row.querySelector('.mcp-url').value = 'builtin:jira';
+row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, false,
+    'the shared checkbox is reset when the type changes');
+row.querySelector('.dest-project').value = 'ABC';
+assert.deepStrictEqual(collectMcpServers()[0],
+    { url: 'builtin:jira', auth_mode: 'destination',
+      oauth: { destination: 'BITBUCKET', project: 'ABC' } });
+// And the other way round: a jira row that may comment, made a bitbucket row.
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', allow_comment: true } }));
+assert.strictEqual(out.oauth.allow_comment, true);
+row.querySelector('.mcp-url').value = 'builtin:bitbucket';
+row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+row.querySelector('.dest-workspace').value = 'acme-ws';
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { destination: 'JIRA', workspace: 'acme-ws' });
+// Another spelling of the same type is no change: the tick stays.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: BB_OAUTH }));
+row.querySelector('.mcp-url').value = 'Builtin:Bitbucket/';
+row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true);
+assert.strictEqual(row.querySelector('.dest-allow_approve').checked, true);
 
 // 8. A remote MCP server through a destination: the destination names the
 //    host and holds the credential, so only {destination, user_context} is
@@ -2605,6 +2710,44 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                                       r.status_code == 422, f"{r.status_code} {r.text[:200]}")
                             finally:
                                 await client.delete(f"/admin/api/agents/{sp_id}")
+                    # What the form collects for builtin:bitbucket is an
+                    # entry the server gate accepts and stores unchanged.
+                    bb_entry = next((json.loads(line[len("BITBUCKET:"):])
+                                     for line in result.stdout.splitlines()
+                                     if line.startswith("BITBUCKET:")), None)
+                    check("the form collected a builtin:bitbucket entry", bb_entry is not None)
+                    if bb_entry is not None:
+                        bb_agent = {
+                            "name": "uibitbucket", "description": "UI test agent with Bitbucket.",
+                            "instructions": "You are a UI test agent.", "enabled": True,
+                            # The collected entry approves: such an agent is
+                            # refused chat exposure (final review M3).
+                            "expose_chat": False,
+                            "mcp_servers": [bb_entry],
+                        }
+                        r = await client.post("/admin/api/agents", json=bb_agent)
+                        check("the API accepts the collected builtin:bitbucket entry",
+                              r.status_code == 201, r.text[:300])
+                        if r.status_code == 201:
+                            bb_id = r.json()["id"]
+                            try:
+                                r = await client.get(f"/admin/api/agents/{bb_id}")
+                                got = r.json()["mcp_servers"]
+                                for entry in got:
+                                    entry.get("oauth", {}).pop("has_client_secret", None)
+                                check("the stored builtin:bitbucket entry is the collected one",
+                                      got == [bb_entry], str(got)[-700:])
+                                # Why the page must not trim: the server refuses.
+                                for pin, padded_value in (("workspace", " acme-ws"),
+                                                          ("branch", "release/2.x ")):
+                                    padded = {**bb_entry, "oauth": {**bb_entry["oauth"],
+                                                                    pin: padded_value}}
+                                    r = await client.put(f"/admin/api/agents/{bb_id}",
+                                                         json={**bb_agent, "mcp_servers": [padded]})
+                                    check(f"the API refuses a bitbucket {pin} with edge whitespace",
+                                          r.status_code == 422, f"{r.status_code} {r.text[:200]}")
+                            finally:
+                                await client.delete(f"/admin/api/agents/{bb_id}")
                     # An app_only entry (made in the UI5 admin): what the
                     # form sends for the untouched row is accepted, and the
                     # stored entry, secret included, is still there.

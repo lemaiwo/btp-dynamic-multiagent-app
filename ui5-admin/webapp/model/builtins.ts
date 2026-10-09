@@ -87,6 +87,14 @@ export const BUILTINS: BuiltinToolset[] = [
     {
         url: "builtin:sharepoint", titleKey: "builtinSharePoint", descriptionKey: "builtinSharePointDesc",
         defaultAuthMode: "destination", authModes: ["app_only", "destination"]
+    },
+    // bitbucket_toolset reviews pull requests as the technical user of a
+    // destination and has no other way to authenticate -- see
+    // agents/bitbucket_tools.py and `_validate_raw_bitbucket_entry` in
+    // agents/admin.py.
+    {
+        url: "builtin:bitbucket", titleKey: "builtinBitbucket", descriptionKey: "builtinBitbucketDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
     }
 ];
 

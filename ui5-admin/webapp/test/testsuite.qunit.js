@@ -21,6 +21,7 @@ sap.ui.define(function () {
             "unit/odataImport": { title: "Unit: odataCatalog, import from $metadata" },
             "unit/oauthConfig": { title: "Unit: oauthConfig" },
             "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
+            "unit/bitbucketEntry": { title: "Unit: bitbucketEntry" },
             "unit/importBundle": { title: "Unit: importBundle, what a configuration import opens" },
             "unit/ReportRenderer": { title: "Unit: ReportRenderer" },
             "unit/processFlowGraph": { title: "Unit: processFlowGraph" },
