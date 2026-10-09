@@ -34,10 +34,12 @@ cap, while it is read) and how a failure is said. And the tools:
   diff over ``MAX_DIFF_CHARS`` is refused with the list of changed files,
   never cut: a diff that ends early would read as complete.
 * ``get_file(repository, id, path)``: one text file at the head commit.
-* ``add_inline_comment(repository, id, path, line, text, side="new")`` and
-  ``submit_review(repository, id, verdict, summary)``: the only two tools
-  that change anything. They are not registered at all unless the entry has
-  ``allow_comment`` exactly ``true``.
+* ``add_inline_comment(repository, id, path, line, text, side="new")``,
+  ``submit_review(repository, id, verdict, summary)`` and
+  ``complete_approval(repository, id)``: the only tools that change
+  anything. They are not registered at all unless the entry has
+  ``allow_comment`` exactly ``true`` (``complete_approval``: and
+  ``allow_approve``).
 
 Every per-pull-request tool first runs one guard
 (``BitbucketClient.pull_request``): the repository is one the entry allows,
@@ -45,7 +47,9 @@ the pull request is open and targets the pinned branch; the listing checks
 the same three things on every item it keeps.
 
 **The review marker.** A review's summary comment starts with one line the
-code writes, ``Automated review of commit <hash>`` (``review_marker``). It is
+code writes, ``Automated review of commit <hash> - verdict: approve`` (or
+``comment``; ``review_marker``; a marker of the first form, without the
+verdict part, reads as ``comment``). It is
 how a repeated run knows a commit was reviewed, so it is read as strictly as
 it is written (``_marks``): only in a comment of the account behind the
 destination, only a top-level one (no inline comment, no reply), only as the
@@ -83,10 +87,23 @@ draft is not held back. When the gate holds the approval back, or Bitbucket
 refuses it, the comment stands: the answer has ``commented: true``,
 ``approved: false`` and an ``error`` that says why. Nothing is deleted.
 
+**An approval that was held back stays reachable.** The marker line records
+the verdict, so a review with verdict ``approve`` whose approval was not sent
+(builds not green yet) is found again: ``list_pull_requests`` lists it under
+``approval_pending`` (only for an entry with ``allow_approve``, only while
+this account's own entry in the pull request's ``participants`` does not say
+approved; what cannot be read is counted as unchecked), and
+``complete_approval(repository, id)`` (registered only with ``allow_comment``
+AND ``allow_approve``) sends it: this account's marker for the CURRENT head
+must say ``approve`` (``not_reviewed``), the account must not have approved
+yet (``already_approved``), then conditions 2 and 4 of the gate and the same
+approve call. It posts nothing and takes no text from the model.
+
 **A write is sent once.** Only a 429 is repeated (it says the request was not
 processed; a 401 is asked again once by the destination auth, for the same
 reason). A timeout or a lost connection after the request may have left, an
-answer over its cap, a 2xx that is not the JSON object Bitbucket documents:
+answer over its cap, a 2xx that is not the JSON object Bitbucket documents,
+any 5xx (it can follow a processed request; a read keeps ``bitbucket_error``):
 the outcome is unknown and is said as such (``comment_outcome_unknown``,
 ``approval_outcome_unknown``, the latter with ``approved: null``), never as a
 success and never as "nothing happened", and nothing is sent again.
@@ -98,7 +115,8 @@ success and never as "nothing happened", and nothing is sent again.
 ``invalid_path``, ``binary_file``, ``result_too_large``, ``invalid_line``,
 ``invalid_argument``, ``account_unknown``, ``already_reviewed``,
 ``approve_not_allowed``, ``builds_not_green``, ``comment_outcome_unknown``,
-``approval_outcome_unknown``, ``review_state_unknown``.
+``approval_outcome_unknown``, ``review_state_unknown``, ``not_reviewed``,
+``already_approved``.
 """
 
 from __future__ import annotations
@@ -190,7 +208,7 @@ ERROR_CODES = frozenset({
     "repository_not_allowed", "not_open", "wrong_branch", "invalid_path", "binary_file",
     "result_too_large", "invalid_line", "invalid_argument", "account_unknown",
     "already_reviewed", "approve_not_allowed", "builds_not_green", "comment_outcome_unknown",
-    "approval_outcome_unknown", "review_state_unknown"})
+    "approval_outcome_unknown", "review_state_unknown", "not_reviewed", "already_approved"})
 # Failures of a request that say it never left: no connection was made. After
 # any other failure a write may have been processed.
 _NEVER_LEFT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
@@ -281,6 +299,13 @@ def _review_unknown() -> Refused:
         "do not review this pull request; report that a person has to look at it")
 
 
+def _approval_unknown_alone() -> Refused:
+    return Refused(
+        "approval_outcome_unknown",
+        "the approval may have been recorded: Bitbucket's answer could not be read",
+        "do not call again; report that the approval has to be checked on the pull request")
+
+
 def _own_text(value: Any, limit: int, what: str) -> str:
     """The model's text for a comment, or a refusal that holds none of it.
     Edge whitespace is dropped; nothing else is changed, nothing is cut."""
@@ -342,20 +367,32 @@ def _same_host_target(value: Any, sent: httpx.URL) -> httpx.URL | None:
     return target
 
 
-def review_marker(head: str) -> str:
-    """The first line of a review's summary comment. Written by the code."""
-    return MARKER_PREFIX + head
+_VERDICTS = ("approve", "comment")
+# The marker line as the code writes it; the group for the verdict is missing
+# in a marker of the first form (before the verdict was recorded).
+_MARKER_RE = re.compile(
+    re.escape(MARKER_PREFIX) + r"([0-9a-f]{12,40})(?: - verdict: (approve|comment))?")
 
 
-def _marked_commit(raw: Any) -> str | None:
-    """The commit a comment's first line marks as reviewed, if that line is a
-    marker: the prefix and a hash and nothing else. Only what a server may add
-    at the end of a line (blanks, a carriage return) is tolerated; a marker
-    that is indented, quoted or followed by text is not the line the code
-    writes."""
+def review_marker(head: str, verdict: str = "comment") -> str:
+    """The first line of a review's summary comment. Written by the code:
+    the reviewed commit and the review's verdict, in one fixed form."""
+    if not isinstance(verdict, str) or verdict not in _VERDICTS:
+        raise ValueError("verdict must be approve or comment")
+    return f"{MARKER_PREFIX}{head} - verdict: {verdict}"
+
+
+def _marked(raw: Any) -> tuple[str, str] | None:
+    """The commit and the verdict a comment's first line marks, if that line
+    is a marker: the prefix, a hash, the verdict part and nothing else. Only
+    what a server may add at the end of a line (blanks, a carriage return) is
+    tolerated; a marker that is indented, quoted or followed by text is not
+    the line the code writes. A marker without the verdict part (the first
+    form) is a review with verdict ``comment``: it can never lead to an
+    approval."""
     first = raw.split("\n", 1)[0].rstrip(" \t\r") if isinstance(raw, str) else ""
-    commit = first[len(MARKER_PREFIX):] if first.startswith(MARKER_PREFIX) else ""
-    return commit if _MARKED_HASH_RE.fullmatch(commit) else None
+    match = _MARKER_RE.fullmatch(first)
+    return (match[1], match[2] or "comment") if match else None
 
 
 def _is_own(comment: dict[str, Any], account: str) -> bool:
@@ -364,8 +401,9 @@ def _is_own(comment: dict[str, Any], account: str) -> bool:
     return bool(account) and _dig(comment, "user", "uuid") == account
 
 
-def _marks(comment: dict[str, Any], head: str, account: str) -> bool:
-    """Whether a comment is this account's review marker for ``head``.
+def _marks(comment: dict[str, Any], head: str, account: str) -> str | None:
+    """The verdict of this account's review marker for ``head``, if the
+    comment is one; ``None`` otherwise.
 
     Default-deny: a deleted comment, somebody else's, an inline comment or a
     reply (their text is the model's, a summary's first line is the code's)
@@ -374,13 +412,38 @@ def _marks(comment: dict[str, Any], head: str, account: str) -> bool:
     pull request and 40 elsewhere); ``head`` is checked by the caller.
     """
     if comment.get("deleted", False) is not False:      # anything but a plain "no"
-        return False
+        return None
     if not _is_own(comment, account):
-        return False
+        return None
     if comment.get("inline") is not None or comment.get("parent") is not None:
-        return False
-    marked = _marked_commit(_dig(comment, "content", "raw"))
-    return marked is not None and marked[:MARKER_HASH_CHARS] == head[:MARKER_HASH_CHARS]
+        return None
+    marked = _marked(_dig(comment, "content", "raw"))
+    if marked is None or marked[0][:MARKER_HASH_CHARS] != head[:MARKER_HASH_CHARS]:
+        return None
+    return marked[1]
+
+
+def _own_approval(body: dict[str, Any], account: str) -> bool | None:
+    """Whether ``account`` has approved the pull request ``body`` (the answer
+    for ONE pull request: a listing carries no participants), or ``None`` when
+    that cannot be read: no list, an entry that is no object, an own entry
+    whose ``approved`` is not a boolean, two own entries that disagree. An
+    account that is no participant has not approved."""
+    participants = body.get("participants")
+    if not account or not isinstance(participants, list):
+        return None
+    said: set[bool] = set()
+    for participant in participants:
+        if not isinstance(participant, dict):
+            return None
+        if _dig(participant, "user", "uuid") == account:
+            approved = participant.get("approved")
+            if approved is not True and approved is not False:
+                return None
+            said.add(approved)
+    if len(said) > 1:
+        return None
+    return said.pop() if said else False
 
 
 def _cut(value: Any, limit: int) -> str:
@@ -654,9 +717,9 @@ class BitbucketClient:
 
         Three outcomes and no fourth: the JSON object of an ``ok`` status
         (done); a refusal by status (Bitbucket said no: not done); ``unsure``
-        (it may be done: no answer, an answer that could not be read, or a
-        2xx that is not the answer Bitbucket documents). A success is only
-        what was read as one.
+        (it may be done: no answer, an answer that could not be read, a 2xx
+        that is not the answer Bitbucket documents, or any 5xx). A success is
+        only what was read as one.
         """
         response = await self._send("POST", url, json=body, unsure=unsure())
         status = response.status_code
@@ -667,8 +730,10 @@ class BitbucketClient:
                 pass
         elif status == 400 and bad_request is not None:
             raise bad_request
-        elif not 200 <= status < 300:
+        elif status < 500 and not 200 <= status < 300:
             raise _status_refusal(status)
+        # Also every 5xx: a gateway's 502 or 504, or a 500, can follow a
+        # request that was processed.
         logger.warning("%s: the answer to a write could not be read (HTTP %s)",
                        BUILTIN_BITBUCKET_URL, int(status))
         raise unsure()
@@ -777,10 +842,13 @@ class BitbucketClient:
             self._account = uuid
         return self._account
 
-    async def reviewed(self, base: str, head: Any, account: str) -> bool:
-        """Whether ``account``'s review marker for the commit ``head`` is among
-        the comments of the pull request at ``base`` (the path the guard
-        returns). The first ``MAX_MARKER_PAGES`` pages of 100 are read.
+    async def reviewed(self, base: str, head: Any, account: str) -> str | None:
+        """The verdict (``approve`` or ``comment``) of ``account``'s review
+        marker for the commit ``head`` among the comments of the pull request
+        at ``base`` (the path the guard returns), or ``None`` when there is no
+        such marker. The first ``MAX_MARKER_PAGES`` pages of 100 are read. Of
+        several markers for the commit, ``approve`` is the answer only when
+        every one says so.
 
         "No" is said only when every comment was read. No marker among the
         comments that were read while more exist is ``review_state_unknown``,
@@ -796,11 +864,13 @@ class BitbucketClient:
             raise _review_unknown()
         comments, more = await self._pages(f"{base}/comments", {"pagelen": "100"},
                                            max_pages=MAX_MARKER_PAGES)
-        if any(_marks(comment, head, account) for comment in comments):
-            return True
+        verdicts = {verdict for verdict in (_marks(comment, head, account)
+                                            for comment in comments) if verdict}
+        if verdicts:
+            return "approve" if verdicts == {"approve"} else "comment"
         if more:
             raise _review_unknown()
-        return False
+        return None
 
     # -- the listing -----------------------------------------------------------
     async def _repositories(self) -> tuple[list[str], bool]:
@@ -840,13 +910,24 @@ class BitbucketClient:
 
     async def _check(self, repository: str, entry: dict[str, Any], account: str) -> str:
         """What the listing does with one open pull request: ``new`` (list
-        it), ``reviewed`` (leave it out) or ``unchecked`` (leave it out and
-        count it: it may have been reviewed). A failure that is about this
-        pull request costs this pull request only."""
+        it), ``reviewed`` (leave it out), ``pending`` (reviewed at its head
+        with verdict approve by an entry that may approve, and not approved
+        by this account yet) or ``unchecked`` (leave it out and count it: it
+        may have been reviewed). A failure that is about this pull request
+        costs this pull request only."""
         base = f"{self._repo(repository)}/pullrequests/{entry['id']}"
         try:
-            return "reviewed" if await self.reviewed(base, entry["head_commit"], account) \
-                else "new"
+            verdict = await self.reviewed(base, entry["head_commit"], account)
+            if verdict is None:
+                return "new"
+            if verdict != "approve" or self.pins.allow_approve is not True:
+                return "reviewed"
+            # The participants are in the answer for one pull request only.
+            _, body, head = await self.pull_request(repository, entry["id"])
+            approved = _own_approval(body, account)
+            if approved is None or head != entry["head_commit"]:
+                return "unchecked"
+            return "reviewed" if approved else "pending"
         except Refused as refused:
             if refused.code in _FATAL:
                 raise                # nothing partial: a short list would read as complete
@@ -881,6 +962,7 @@ class BitbucketClient:
         params = {"q": f'destination.branch.name="{self.pins.branch}" AND state="OPEN"',
                   "pagelen": str(MAX_LISTED_PER_REPOSITORY)}
         listed: list[dict[str, Any]] = []
+        pending: list[dict[str, Any]] = []
         already = checked = unchecked = 0
         open_in: dict[str, list[dict[str, Any]]] = {}
         failed: set[str] = set()
@@ -926,6 +1008,12 @@ class BitbucketClient:
                         # Not listed: it may have been reviewed.
                         unchecked += 1
                         continue
+                    if outcome == "pending":
+                        if len(pending) < MAX_LISTED:
+                            pending.append(entry)
+                        else:
+                            more = True
+                        continue
                 listed.append(entry)
             full = full or len(listed) >= MAX_LISTED or bool(account and checked >= MAX_CHECKED)
         # Everything had its turn: the next call starts at the top again.
@@ -938,6 +1026,9 @@ class BitbucketClient:
             "repositories": len(open_in),
             "repositories_failed": len(failed),
             "more": more}
+        if self.pins.allow_approve is True:
+            # Reviewed with verdict approve, the approval still to be sent.
+            result["approval_pending"] = pending
         notes = [text for said, text in ((not account, _UNFILTERED_NOTE),
                                          (unchecked, _UNCHECKED_NOTE), (more, _MORE_NOTE))
                  if said]
@@ -1125,15 +1216,19 @@ class BitbucketClient:
         async with self._reviewing:
             base, _, head = await self.pull_request(repository, pr_id)
             # A read that fails raises: without it nothing is posted.
-            if await self.reviewed(base, head, account):
+            earlier = await self.reviewed(base, head, account)
+            if earlier is not None:
+                again = "a new commit on the pull request allows a new review"
+                if earlier == "approve" and self.pins.allow_approve is True:
+                    again = ("that review has verdict approve: use complete_approval to send "
+                             "an approval that is still missing; " + again)
                 raise Refused(
                     "already_reviewed",
                     "this account already reviewed the pull request at its current commit; "
-                    "nothing was posted",
-                    "a new commit on the pull request allows a new review")
+                    "nothing was posted", again)
             # One top-level comment (no `inline`, no `parent`): line 1 is the
-            # marker a later run looks for.
-            raw = f"{review_marker(head)}\n\nVerdict: {verdict}\n\n{text}"
+            # marker a later run looks for, with the verdict of this review.
+            raw = f"{review_marker(head, verdict)}\n\nVerdict: {verdict}\n\n{text}"
             # Refused or unknown raises: nothing below runs, nothing is approved.
             posted = await self._write(f"{base}/comments", {"content": {"raw": raw}},
                                        unsure=_comment_unknown, ok=(200, 201))
@@ -1146,24 +1241,65 @@ class BitbucketClient:
                 return result
             # From here on the comment stands whatever happens: a held-back
             # or refused approval is said next to `commented: true`.
-            try:
-                if self.pins.allow_approve is not True:
-                    raise Refused("approve_not_allowed",
-                                  "this agent may not approve; the review comment was posted")
-                if self.pins.require_green_builds is not False:
-                    state = (await self.builds(base, strict=True))["state"]
-                    if state != "green":
-                        raise Refused(
-                            "builds_not_green",
-                            "the builds of the pull request are not all successful; the "
-                            "review comment was posted, the approval was not sent",
-                            f"builds: {state}")
-                await self._write(f"{base}/approve", None, unsure=_approval_unknown, ok=(200,))
-                result["approved"] = True
-            except Refused as held:
-                if held.code == "approval_outcome_unknown":
-                    result["approved"] = None        # neither yes nor no
-                result["error"] = held.as_error()["error"]
+            await self._approve_behind_the_gate(base, result, after_comment=True)
+            return result
+
+    async def _approve_behind_the_gate(self, base: str, result: dict[str, Any], *,
+                                       after_comment: bool) -> None:
+        """The entry's switch, the builds, then the ONE place that sends an
+        approval; the outcome goes into ``result`` (``approved`` and, unless
+        it was approved, ``error``). ``submit_review`` and
+        ``complete_approval`` both end here, after their own conditions."""
+        try:
+            if self.pins.allow_approve is not True:
+                raise Refused("approve_not_allowed",
+                              "this agent may not approve; the review comment was posted"
+                              if after_comment else "this agent may not approve")
+            if self.pins.require_green_builds is not False:
+                state = (await self.builds(base, strict=True))["state"]
+                if state != "green":
+                    raise Refused(
+                        "builds_not_green",
+                        "the builds of the pull request are not all successful; "
+                        + ("the review comment was posted, " if after_comment else "")
+                        + "the approval was not sent",
+                        f"builds: {state}")
+            await self._write(
+                f"{base}/approve", None, ok=(200,),
+                unsure=_approval_unknown if after_comment else _approval_unknown_alone)
+            result["approved"] = True
+        except Refused as held:
+            if held.code == "approval_outcome_unknown":
+                result["approved"] = None        # neither yes nor no
+            result["error"] = held.as_error()["error"]
+
+    async def complete_approval(self, repository: Any, pr_id: Any) -> dict[str, Any]:
+        """The approval that a review with verdict approve still lacks (its
+        builds were not green when it was submitted). No comment, no text.
+
+        The verdict is not taken from this call: it is the one in the marker
+        line of this account's review of the pull request's CURRENT head
+        commit, which the code wrote when the model said approve. Then the
+        same gate and the same approve call as ``submit_review``.
+        """
+        account = await self._writer()
+        async with self._reviewing:
+            base, body, head = await self.pull_request(repository, pr_id)
+            if await self.reviewed(base, head, account) != "approve":
+                raise Refused(
+                    "not_reviewed",
+                    "this account has no review with verdict approve of the pull request's "
+                    "current commit; nothing was sent",
+                    "review the pull request and call submit_review")
+            approved = _own_approval(body, account)
+            if approved is None:
+                raise _review_unknown()
+            if approved:
+                raise Refused("already_approved",
+                              "this account already approved the pull request")
+            result: dict[str, Any] = {"repository": repository, "id": pr_id, "commit": head,
+                                      "approved": False}
+            await self._approve_behind_the_gate(base, result, after_comment=False)
             return result
 
 
@@ -1216,7 +1352,11 @@ def bitbucket_toolset(
         """List the open pull requests that wait for a review: those that
         target the configured branch and that this account has not reviewed
         at their current head commit (`already_reviewed` counts the ones left
-        out; a new commit brings a pull request back). Each has `repository`,
+        out; a new commit brings a pull request back). When this agent may
+        approve, `approval_pending` lists the pull requests it reviewed with
+        verdict approve at their current commit without the approval having
+        been sent (the builds were not green yet): do not review them again,
+        call complete_approval for each. Each has `repository`,
         `id`, `title`, `author`, `head_commit`, `draft` and `updated_on`.
 
         `more: true` means a limit was reached: handle this list, the rest
@@ -1326,6 +1466,8 @@ def bitbucket_toolset(
         do not call again. An `error` alone means nothing was posted, except
         code `comment_outcome_unknown`: the comment MAY have been posted, do
         not call again. `already_reviewed` means this commit has its review.
+        `builds_not_green` next to `commented: true` means the approval can
+        follow later with complete_approval.
 
         The verdict is your own judgement of the diff.
 
@@ -1341,11 +1483,34 @@ def bitbucket_toolset(
         """
         return await _answer(lambda: client.submit_review(repository, id, verdict, summary))
 
+    async def complete_approval(repository: str, id: int) -> dict[str, Any]:
+        """Send the approval that an earlier review of yours still lacks.
+        Only for a pull request from `approval_pending` of list_pull_requests
+        (or after submit_review answered `builds_not_green`): it posts no
+        comment and approves when the builds are green now.
+
+        `approved: true` means it is approved. `approved: false` with an
+        `error` means not yet (`builds_not_green`: try again in a later run).
+        `approved: null` means it MAY be approved: do not call again, report
+        it. `not_reviewed` means there is no review of yours with verdict
+        approve for the current commit: review it with submit_review.
+
+        {untrusted_write}
+
+        Args:
+            repository: The repository slug.
+            id: The number of the pull request.
+        """
+        return await _answer(lambda: client.complete_approval(repository, id))
+
     tools = [list_pull_requests, get_pull_request, get_diff, get_file]
     # The two tools that change something do not exist for an agent whose
     # entry does not say `allow_comment: true` (exactly; see `pins_of`).
     if pins.allow_comment is True:
         tools += [add_inline_comment, submit_review]
+        # And the one that only approves, when the entry may approve at all.
+        if pins.allow_approve is True:
+            tools.append(complete_approval)
     for tool in tools:
         tool.__doc__ = ((tool.__doc__ or "").replace("{untrusted}", _UNTRUSTED)
                         .replace("{untrusted_write}", _UNTRUSTED_WRITE))

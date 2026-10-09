@@ -138,6 +138,8 @@ class FakeBitbucket:
                     f"https://{request.url.host}/2.0/repositories/{WS}/{m['repo']}{rest}/{spec}{query}"})
             if rest == "/approve" and method == "POST":
                 self.approved.append(key)
+                pr["participants"].append({"user": {"uuid": OWN_UUID}, "approved": True,
+                                           "role": "PARTICIPANT"})
                 return httpx.Response(200, json={"approved": True, "user": {"uuid": OWN_UUID}})
         m = re.fullmatch(_REPO + r"/(?P<kind>diff|diffstat)/.+", path)
         if m:

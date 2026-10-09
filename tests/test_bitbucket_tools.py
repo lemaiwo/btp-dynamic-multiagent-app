@@ -424,8 +424,46 @@ from tests.bitbucket_helpers import OTHER_UUID, OWN_UUID  # noqa: E402
 
 
 def test_the_marker_is_one_fixed_line():
-    assert review_marker(HEAD) == f"Automated review of commit {HEAD}"
+    assert review_marker(HEAD, "approve") == f"Automated review of commit {HEAD} - verdict: approve"
+    assert review_marker(HEAD, "comment") == f"Automated review of commit {HEAD} - verdict: comment"
+    assert review_marker(HEAD) == review_marker(HEAD, "comment")
     assert review_marker(HEAD).startswith(MARKER_PREFIX)
+    for verdict in ("merge", "APPROVE", None, "approve\nx", ""):
+        with pytest.raises(ValueError):
+            review_marker(HEAD, verdict)
+
+
+@pytest.mark.parametrize("line, verdict", [
+    ("Automated review of commit aaaaaaaaaaaa - verdict: approve", "approve"),
+    ("Automated review of commit aaaaaaaaaaaa - verdict: comment", "comment"),
+    ("Automated review of commit aaaaaaaaaaaa", "comment"),             # the old form
+    ("Automated review of commit aaaaaaaaaaaa - verdict: approve  \r", "approve"),
+    ("Automated review of commit aaaaaaaaaaaa - verdict: approved", None),
+    ("Automated review of commit aaaaaaaaaaaa - verdict: Approve", None),
+    ("Automated review of commit aaaaaaaaaaaa - verdict:approve", None),
+    ("Automated review of commit aaaaaaaaaaaa -  verdict: approve", None),
+    ("Automated review of commit aaaaaaaaaaaa - verdict: approve - verdict: comment", None),
+    ("Automated review of commit aaaaaaaaaaaa - verdict: ", None),
+    ("Automated review of commit bbbbbbbbbbbb - verdict: approve", None),   # another commit
+])
+async def test_the_marker_line_says_the_verdict_in_one_fixed_form(line, verdict):
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_comment("svc-a", 1, line + "\n\nVerdict: approve", own=True)
+    client = _toolset(fake).client
+    base = f"/2.0/repositories/{WS}/svc-a/pullrequests/1"
+    assert await client.reviewed(base, "aaaaaaaaaaaa", await client.whoami()) == verdict
+
+
+async def test_two_markers_for_one_commit_are_an_approve_only_when_both_say_so():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "approve"), own=True)
+    client = _toolset(fake).client
+    base = f"/2.0/repositories/{WS}/svc-a/pullrequests/1"
+    assert await client.reviewed(base, HEAD, OWN_UUID) == "approve"
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "comment"), own=True)
+    assert await client.reviewed(base, HEAD, OWN_UUID) == "comment"
 
 
 async def test_the_list_holds_open_pull_requests_to_the_pinned_branch_only():
@@ -628,8 +666,8 @@ async def test_the_two_helpers_the_write_tools_need():
     account = await client.whoami()
     assert account == OWN_UUID
     base = f"/2.0/repositories/{WS}/svc-a/pullrequests/1"
-    assert await client.reviewed(base, "aaaaaaaaaaaa", account) is True
-    assert await client.reviewed(base, "bbbbbbbbbbbb", account) is False
+    assert await client.reviewed(base, "aaaaaaaaaaaa", account) == "comment"
+    assert await client.reviewed(base, "bbbbbbbbbbbb", account) is None
     # Without an account, or without a head commit of 12 hex characters, the
     # helper refuses instead of answering "not reviewed"; nothing is asked.
     asked = len(fake.requests)
@@ -921,3 +959,92 @@ def test_the_list_tool_says_what_its_answer_means():
     assert "later run" in " ".join(text.split())
     read = " ".join(_toolset(_fake()).tools["get_pull_request"].function.__doc__.split())
     assert "top-level comment" in read and "first line" in read and "at most 100" in read
+
+
+# --- a review with verdict approve whose approval is still to come ------------
+
+APPROVER = {"allow_comment": True, "allow_approve": True}
+
+
+def _pending_fake() -> FakeBitbucket:
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_pr("svc-a", 2)
+    fake.add_pr("svc-a", 3)
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "approve") + "\n\nok", own=True)
+    fake.add_comment("svc-a", 2, review_marker(HEAD, "comment") + "\n\nissues", own=True)
+    return fake
+
+
+async def test_an_approve_review_without_its_approval_is_listed_as_pending():
+    fake = _pending_fake()
+    out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [3] and out["already_reviewed"] == 1
+    assert out["approval_pending"] == [{
+        "repository": "svc-a", "id": 1, "title": "A change", "author": "Ann Author",
+        "head_commit": HEAD, "draft": False, "updated_on": "2026-10-09T08:00:00.000000+00:00"}]
+    assert out["pull_requests_unchecked"] == 0
+
+
+@pytest.mark.parametrize("cfg", [{}, {"allow_comment": True}])
+async def test_without_allow_approve_nothing_is_pending(cfg):
+    fake = _pending_fake()
+    out = await _call(_toolset(fake, **cfg), "list_pull_requests")
+    assert "approval_pending" not in out and out["already_reviewed"] == 2
+    assert [p["id"] for p in out["pull_requests"]] == [3]
+    assert fake.paths().count(f"GET /2.0/repositories/{WS}/svc-a/pullrequests/1") == 0
+
+
+@pytest.mark.parametrize("participants, where", [
+    ([{"user": {"uuid": OWN_UUID}, "approved": True}], "already_reviewed"),
+    ([{"user": {"uuid": OTHER_UUID}, "approved": True}], "approval_pending"),
+    ([{"user": {"uuid": OWN_UUID}, "approved": False}], "approval_pending"),
+    ([], "approval_pending"),
+    (None, "pull_requests_unchecked"), ("none", "pull_requests_unchecked"),
+    (["text"], "pull_requests_unchecked"),
+    ([{"user": {"uuid": OWN_UUID}, "approved": "false"}], "pull_requests_unchecked"),
+    ([{"user": {"uuid": OWN_UUID}}], "pull_requests_unchecked"),
+    ([{"user": {"uuid": OWN_UUID}, "approved": False},
+      {"user": {"uuid": OWN_UUID}, "approved": True}], "pull_requests_unchecked"),
+])
+async def test_pending_is_decided_by_this_accounts_own_participant_entry(participants, where):
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)["participants"] = participants
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "approve"), own=True)
+    out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
+    assert out["pull_requests"] == []
+    assert len(out["approval_pending"]) == (1 if where == "approval_pending" else 0)
+    assert out["already_reviewed"] == (1 if where == "already_reviewed" else 0)
+    assert out["pull_requests_unchecked"] == (1 if where == "pull_requests_unchecked" else 0)
+
+
+async def test_a_pull_request_without_participants_in_its_answer_is_unchecked():
+    fake = FakeBitbucket()
+    del fake.add_pr("svc-a", 1)["participants"]
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "approve"), own=True)
+    out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
+    assert out["approval_pending"] == [] and out["pull_requests_unchecked"] == 1
+
+
+async def test_somebody_elses_approve_marker_makes_nothing_pending():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_comment("svc-a", 1, review_marker(HEAD, "approve"))               # the author
+    fake.add_comment("svc-a", 1, "x\n" + review_marker(HEAD, "approve"), own=True)
+    out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
+    assert out["approval_pending"] == [] and [p["id"] for p in out["pull_requests"]] == [1]
+
+
+async def test_a_pending_pull_request_that_cannot_be_read_again_is_unchecked_not_dropped():
+    fake = _pending_fake()
+    fake.override = lambda r: (httpx.Response(500, text="PLANTED-ERROR-BODY")
+                               if r.url.path.endswith("/svc-a/pullrequests/1") else None)
+    out = await _call(_toolset(fake, **APPROVER), "list_pull_requests")
+    assert out["approval_pending"] == [] and out["pull_requests_unchecked"] == 1
+    assert [p["id"] for p in out["pull_requests"]] == [3]
+
+
+def test_the_list_tool_says_what_pending_means():
+    text = " ".join(_toolset(_fake(), **APPROVER).tools["list_pull_requests"]
+                    .function.__doc__.split())
+    assert "`approval_pending`" in text and "complete_approval" in text

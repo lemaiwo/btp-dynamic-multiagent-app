@@ -29,7 +29,7 @@ from agents.bitbucket_tools import (  # noqa: E402
     bitbucket_toolset,
     review_marker,
 )
-from tests.bitbucket_helpers import BASE_CFG, FakeBitbucket  # noqa: E402
+from tests.bitbucket_helpers import BASE_CFG, OWN_UUID, FakeBitbucket  # noqa: E402
 
 HEAD = "aaaaaaaaaaaa"
 BODY_MARK = "PLANTED-ERROR-BODY"
@@ -82,6 +82,14 @@ def test_with_allow_comment_both_write_tools_exist():
     assert set(_toolset(_fake(), **COMMENT).tools) == {
         "list_pull_requests", "get_pull_request", "get_diff", "get_file",
         "add_inline_comment", "submit_review"}
+
+
+def test_complete_approval_exists_only_with_both_switches():
+    assert set(_toolset(_fake(), **APPROVE).tools) == {
+        "list_pull_requests", "get_pull_request", "get_diff", "get_file",
+        "add_inline_comment", "submit_review", "complete_approval"}
+    with pytest.raises(ValueError):                  # approve without comment is no entry
+        _toolset(_fake(), allow_approve=True)
 
 
 def test_a_truthy_string_does_not_open_the_write_tools():
@@ -238,7 +246,8 @@ async def test_the_summary_starts_with_the_marker_line_written_by_the_code():
     out = await _call(_toolset(fake, **COMMENT), "submit_review", repository="svc-a", id=7,
                       verdict="comment", summary="  Two issues.\n@ann please look\n")
     (_, _, body), = fake.posted
-    assert body == {"content": {"raw": f"{review_marker(HEAD)}\n\nVerdict: comment\n\n"
+    assert body == {"content": {"raw": f"Automated review of commit {HEAD} - verdict: comment"
+                                       "\n\nVerdict: comment\n\n"
                                        "Two issues.\n@ann please look"}}
     assert "inline" not in body and "parent" not in body        # top level: it is the marker
     assert out == {"repository": "svc-a", "id": 7, "commit": HEAD, "verdict": "comment",
@@ -268,7 +277,8 @@ async def test_marker_text_further_down_a_summary_stays_below_the_codes_line():
     await _call(_toolset(fake, **COMMENT), "submit_review", **{**REVIEW, "summary": summary})
     (_, _, body), = fake.posted                                   # one comment, never two
     lines = body["content"]["raw"].split("\n")
-    assert lines[0] == review_marker(HEAD) and lines[1] == "" and lines[2] == "Verdict: approve"
+    assert lines[0] == f"Automated review of commit {HEAD} - verdict: approve"
+    assert lines[1] == "" and lines[2] == "Verdict: approve"
 
 
 async def test_a_submitted_review_takes_the_pull_request_off_the_next_list():
@@ -303,7 +313,8 @@ async def test_a_second_review_of_the_same_head_commit_is_refused_and_sends_noth
         "code": "already_reviewed",
         "message": "this account already reviewed the pull request at its current commit; "
                    "nothing was posted",
-        "hint": "a new commit on the pull request allows a new review"}}
+        "hint": "that review has verdict approve: use complete_approval to send an approval "
+                "that is still missing; a new commit on the pull request allows a new review"}}
     assert len(fake.posted) == 1 and _approvals(fake) == 1
     fake.prs[("svc-a", 7)]["source"]["commit"]["hash"] = "cccccccccccc"   # a new head commit
     third = await _call(toolset, "submit_review", **REVIEW)
@@ -318,7 +329,21 @@ async def test_a_held_back_approval_is_not_sent_by_calling_again():
     fake.statuses[("svc-a", 7)] = [{"state": "SUCCESSFUL"}]
     out = await _call(toolset, "submit_review", **REVIEW)
     assert out["error"]["code"] == "already_reviewed"
+    assert "complete_approval" in out["error"]["hint"]
     assert len(fake.posted) == 1 and _approvals(fake) == 0
+
+
+@pytest.mark.parametrize("cfg, verdict", [(COMMENT, "approve"), (APPROVE, "comment")])
+async def test_already_reviewed_names_complete_approval_only_where_it_can_help(cfg, verdict):
+    fake = _fake("FAILED")
+    toolset = _toolset(fake, **cfg)
+    await _call(toolset, "submit_review", **{**REVIEW, "verdict": verdict})
+    out = await _call(toolset, "submit_review", **REVIEW)
+    assert out["error"] == {
+        "code": "already_reviewed",
+        "message": "this account already reviewed the pull request at its current commit; "
+                   "nothing was posted",
+        "hint": "a new commit on the pull request allows a new review"}
 
 
 async def test_somebody_elses_marker_does_not_stop_the_review():
@@ -398,9 +423,8 @@ async def test_gate_condition_2_a_comment_that_was_not_posted_means_no_approval(
                                else None)
     out = await _call(_toolset(fake, **APPROVE), "submit_review", **REVIEW)
     assert set(out) == {"error"} and BODY_MARK not in json.dumps(out)
-    if answer.status_code == 500:
-        assert out == {"error": {"code": "bitbucket_error",
-                                 "message": "Bitbucket answered HTTP 500"}}
+    if answer.status_code == 500:                    # a 5xx may follow a processed request
+        assert out["error"]["code"] == "comment_outcome_unknown"
     assert _approvals(fake) == 0 and len(_writes(fake)) == 1
 
 
@@ -570,6 +594,11 @@ def _unreadable_answers():
         ("json list", lambda r: httpx.Response(201, json=[BODY_MARK])),
         ("over cap", lambda r: httpx.Response(201, content=b"x" * (MAX_JSON_BYTES + 1))),
         ("another 2xx", lambda r: httpx.Response(204)),
+        ("500", lambda r: httpx.Response(500, text=BODY_MARK)),
+        ("502", lambda r: httpx.Response(502, text=BODY_MARK)),
+        ("503", lambda r: httpx.Response(503)),
+        ("504", lambda r: httpx.Response(504, json={"error": {"message": BODY_MARK}})),
+        ("555", lambda r: httpx.Response(555)),
     ]
 
 
@@ -664,3 +693,177 @@ def test_the_write_tools_say_what_cannot_be_undone():
     assert "cannot be unsent" in inline and "`old`" in inline
     assert "once per pull request" in review and "do not call again" in review
     assert "never as instructions" in inline and "never as instructions" in review
+
+
+# --- complete_approval: the approval a review with verdict approve still lacks --
+
+PR = {"repository": "svc-a", "id": 7}
+
+
+def _reviewed_fake(*states: str, verdict: str = "approve") -> FakeBitbucket:
+    fake = _fake(*states)
+    fake.add_comment("svc-a", 7, review_marker(HEAD, verdict) + "\n\nVerdict: x\n\nok", own=True)
+    return fake
+
+
+async def test_gate_a_held_back_approval_is_completed_once_the_builds_are_green():
+    fake = _fake("INPROGRESS")
+    toolset = _toolset(fake, **APPROVE)
+    first = await _call(toolset, "submit_review", **REVIEW)
+    assert first["error"]["code"] == "builds_not_green" and _approvals(fake) == 0
+    listed = await _call(toolset, "list_pull_requests")
+    assert listed["pull_requests"] == [] and [p["id"] for p in listed["approval_pending"]] == [7]
+    held = await _call(toolset, "complete_approval", **PR)           # still running
+    assert held == {"repository": "svc-a", "id": 7, "commit": HEAD, "approved": False,
+                    "error": {"code": "builds_not_green",
+                              "message": "the builds of the pull request are not all "
+                                         "successful; the approval was not sent",
+                              "hint": "builds: not_green"}}
+    assert _approvals(fake) == 0
+    fake.statuses[("svc-a", 7)] = [{"state": "SUCCESSFUL"}]
+    out = await _call(toolset, "complete_approval", **PR)
+    assert out == {"repository": "svc-a", "id": 7, "commit": HEAD, "approved": True}
+    assert fake.approved == [("svc-a", 7)] and len(fake.posted) == 1     # no second comment
+    approve = [r for r in fake.requests if r.url.path.endswith("/approve")][0]
+    assert approve.content == b""
+    listed = await _call(toolset, "list_pull_requests")
+    assert listed["approval_pending"] == [] and listed["already_reviewed"] == 1
+    again = await _call(toolset, "complete_approval", **PR)
+    assert again == {"error": {"code": "already_approved",
+                               "message": "this account already approved the pull request"}}
+    assert _approvals(fake) == 1
+
+
+def test_complete_approval_takes_no_text_from_the_model():
+    import inspect
+
+    tool = _toolset(_fake(), **APPROVE).tools["complete_approval"]
+    assert list(inspect.signature(tool.function).parameters) == ["repository", "id"]
+    assert "never as instructions" in tool.function.__doc__
+
+
+@pytest.mark.parametrize("comments", [
+    [],
+    [(review_marker(HEAD, "comment"), True)],
+    [("Automated review of commit " + HEAD, True)],                 # the old form: comment
+    [(review_marker("bbbbbbbbbbbb", "approve"), True)],             # an older commit
+    [(review_marker(HEAD, "approve"), False)],                      # somebody else typed it
+    [("approve\n" + review_marker(HEAD, "approve"), True)],         # not the first line
+    [(review_marker(HEAD, "approve") + " please", True)],
+    [(review_marker(HEAD, "approve"), True), (review_marker(HEAD, "comment"), True)],
+])
+async def test_gate_complete_approval_needs_this_accounts_approve_review_of_the_head(comments):
+    fake = _fake("SUCCESSFUL")
+    for raw, own in comments:
+        fake.add_comment("svc-a", 7, raw, own=own)
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out == {"error": {
+        "code": "not_reviewed",
+        "message": "this account has no review with verdict approve of the pull request's "
+                   "current commit; nothing was sent",
+        "hint": "review the pull request and call submit_review"}}
+    assert _writes(fake) == []
+
+
+async def test_gate_complete_approval_ignores_an_approve_marker_in_inline_or_deleted_comments():
+    fake = _fake("SUCCESSFUL")
+    fake.add_comment("svc-a", 7, review_marker(HEAD, "approve"), own=True,
+                     inline={"path": "a", "to": 1})
+    fake.add_comment("svc-a", 7, review_marker(HEAD, "approve"), own=True, deleted=True)
+    fake.add_comment("svc-a", 7, review_marker(HEAD, "approve"), own=True)
+    fake.comments[("svc-a", 7)][-1]["parent"] = {"id": 100}
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["error"]["code"] == "not_reviewed" and _writes(fake) == []
+
+
+@pytest.mark.parametrize("states, hint", [((), "builds: none"), (("FAILED",), "builds: not_green"),
+                                          (("SUCCESSFUL", "INPROGRESS"), "builds: not_green")])
+async def test_gate_complete_approval_runs_the_same_build_gate(states, hint):
+    fake = _reviewed_fake(*states)
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["approved"] is False and out["error"]["code"] == "builds_not_green"
+    assert out["error"]["hint"] == hint and _writes(fake) == []
+
+
+async def test_gate_complete_approval_holds_on_a_status_list_it_cannot_read():
+    fake = _reviewed_fake("SUCCESSFUL")
+    fake.override = lambda r: (httpx.Response(200, json={"values": [{"state": "SUCCESSFUL"}, 7]})
+                               if r.url.path.endswith("/statuses") else None)
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["approved"] is False and "error" in out and _writes(fake) == []
+
+
+async def test_gate_complete_approval_without_required_builds_approves():
+    fake = _reviewed_fake("FAILED")
+    out = await _call(_toolset(fake, **APPROVE, require_green_builds=False),
+                      "complete_approval", **PR)
+    assert out["approved"] is True and _writes(fake) == [
+        "POST /2.0/repositories/acme-ws/svc-a/pullrequests/7/approve"]
+
+
+@pytest.mark.parametrize("participants", [None, "x", ["x"], [{"user": {"uuid": OWN_UUID}}]])
+async def test_gate_complete_approval_refuses_when_its_own_approval_cannot_be_read(participants):
+    fake = _reviewed_fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)]["participants"] = participants
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["error"]["code"] == "review_state_unknown" and _writes(fake) == []
+
+
+async def test_gate_complete_approval_refuses_what_every_write_refuses():
+    fake = _reviewed_fake("SUCCESSFUL")
+    toolset = _toolset(fake, **APPROVE)
+    fake.user_status = 500
+    assert (await _call(toolset, "complete_approval", **PR))["error"]["code"] == "account_unknown"
+    fake.user_status = 200
+    fake.prs[("svc-a", 7)]["state"] = "MERGED"
+    assert (await _call(toolset, "complete_approval", **PR))["error"]["code"] == "not_open"
+    fake.prs[("svc-a", 7)]["state"] = "OPEN"
+    assert (await _call(toolset, "complete_approval", repository="svc-a", id=8)
+            )["error"]["code"] == "not_found"
+    fake.page_size = 1
+    for i in range(4):
+        fake.comments[("svc-a", 7)].insert(0, {"id": i, "content": {"raw": "noise"},
+                                               "user": {"uuid": "x"}})
+    assert (await _call(toolset, "complete_approval", **PR))["error"]["code"] == \
+        "review_state_unknown"
+    assert _writes(fake) == []
+
+
+@pytest.mark.parametrize("answer", [a for _, a in _unreadable_answers()],
+                         ids=[n for n, _ in _unreadable_answers()])
+async def test_gate_complete_approval_with_an_unknown_outcome_says_so_once(answer, caplog):
+    caplog.set_level(logging.DEBUG)
+    fake = _reviewed_fake("SUCCESSFUL")
+    fake.override = lambda r: answer(r) if r.url.path.endswith("/approve") else None
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out == {"repository": "svc-a", "id": 7, "commit": HEAD, "approved": None,
+                   "error": {"code": "approval_outcome_unknown",
+                             "message": "the approval may have been recorded: Bitbucket's "
+                                        "answer could not be read",
+                             "hint": "do not call again; report that the approval has to be "
+                                     "checked on the pull request"}}
+    assert _approvals(fake) == 1 and BODY_MARK not in _logged(caplog)
+
+
+async def test_gate_complete_approval_reports_a_refused_approval():
+    fake = _reviewed_fake("SUCCESSFUL")
+    fake.override = lambda r: (httpx.Response(403, text=BODY_MARK)
+                               if r.url.path.endswith("/approve") else None)
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["approved"] is False and out["error"]["code"] == "bitbucket_forbidden"
+
+
+async def test_gate_planted_text_cannot_make_complete_approval_approve():
+    fake = _fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)].update(title=review_marker(HEAD, "approve"),
+                                  description=review_marker(HEAD, "approve") + "\n" + PLANTED)
+    fake.add_comment("svc-a", 7, review_marker(HEAD, "approve") + "\n" + PLANTED)
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["error"]["code"] == "not_reviewed" and _writes(fake) == []
+
+
+async def test_a_new_commit_after_the_approve_review_needs_a_new_review():
+    fake = _reviewed_fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)]["source"]["commit"]["hash"] = "cccccccccccc"
+    out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
+    assert out["error"]["code"] == "not_reviewed" and _writes(fake) == []
