@@ -339,3 +339,41 @@ async def test_httpx_does_not_log_the_urls_of_this_client(caplog):
 
 async def _no_sleep(seconds):
     return None
+
+
+# -- the credential goes to the destination's https origin only -----------------
+
+@pytest.mark.parametrize("dest_url, url", [
+    (f"https://{HOST}", f"http://{HOST}/2.0/user"),
+    (f"https://{HOST}", f"https://{HOST}:8443/2.0/user"),
+    (f"https://{HOST}", f"http://{HOST}:443/2.0/user"),
+    (f"https://{HOST}:8443", f"https://{HOST}/2.0/user"),
+    (f"https://{HOST}:8443", f"https://{HOST}:443/2.0/user"),
+])
+async def test_an_absolute_url_off_the_destinations_https_origin_sends_nothing(
+        dest_url, url, caplog):
+    # The base class checks the host of an absolute URL only: the clear-text
+    # scheme or another port of that host would get the Authorization header.
+    caplog.set_level(logging.DEBUG)
+    fake = FakeBitbucket()
+    client = _through_destination(fake, dest_url)
+    with pytest.raises(Refused) as refused:
+        await client._send("GET", url)
+    assert refused.value.code == "destination_error"
+    assert fake.requests == []
+    said = str(refused.value.as_error()) + "\n".join(
+        caplog.handler.format(r) for r in caplog.records)
+    assert HOST not in said and "8443" not in said and TOKEN not in said
+
+
+@pytest.mark.parametrize("dest_url, url", [
+    (f"https://{HOST}", f"https://{HOST}/2.0/user"),
+    (f"https://{HOST}", f"https://{HOST.upper()}:443/2.0/user"),
+    (f"https://{HOST}:8443/2.0", f"https://{HOST}:8443/2.0/user"),
+])
+async def test_an_absolute_url_on_the_destinations_https_origin_is_sent(dest_url, url):
+    fake = FakeBitbucket()
+    client = _through_destination(fake, dest_url)
+    await client._send("GET", url)
+    assert len(fake.requests) == 1 and fake.requests[0].headers["authorization"] == TOKEN
+    assert fake.requests[0].url.raw_path == b"/2.0/user"

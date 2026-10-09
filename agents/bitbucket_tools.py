@@ -169,11 +169,22 @@ class BitbucketAuth(DestinationAuth):
     """
 
     def send_through(self, request: httpx.Request, destination: Destination) -> None:
-        if (request.url.host or "").lower() == PLACEHOLDER_HOST:
-            try:
-                dest_url = httpx.URL(destination.url)
-            except (httpx.InvalidURL, ValueError, TypeError):
-                dest_url = None
+        try:
+            dest_url = httpx.URL(destination.url)
+        except (httpx.InvalidURL, ValueError, TypeError):
+            dest_url = None
+        if (request.url.host or "").lower() != PLACEHOLDER_HOST:
+            # An absolute URL (a redirect target, a paging link, a retry of a
+            # request that was moved before). The base class asks only whether
+            # it names the destination's host: over http, or on another port
+            # of that host, the destination's Authorization would go out in
+            # clear text or to another service. Nothing of either URL is said.
+            if (dest_url is None or request.url.scheme != "https"
+                    or (request.url.port or 443) != (dest_url.port or 443)):
+                raise DestinationError(
+                    f"{self.server_key}: the request does not go to the destination's "
+                    "https address; refusing to send")
+        else:
             # Anything but https with a host is the base class's to refuse.
             if dest_url is not None and dest_url.scheme == "https" and dest_url.host:
                 prefix = dest_url.raw_path.partition(b"?")[0].rstrip(b"/")
