@@ -181,7 +181,9 @@ def test_every_code_the_texts_name_is_one_the_toolset_answers():
     quoted = set(re.findall(r"`([a-z]+(?:_[a-z]+)+)`", text))
     fields = {"approval_pending", "pull_requests", "pull_requests_unchecked",
               "repositories_failed", "beyond_reach", "reviewed_filter", "head_commit",
-              "comments_truncated", "diffstat", "diffstat_truncated"}
+              "comments_truncated", "diffstat", "diffstat_truncated",
+              # An answer key of submit_review, and the example of a prefixed tool.
+              "earlier_approval_stands", "bitbucket_submit_review"}
     fields |= set(TOOLS)
     assert quoted - fields <= ERROR_CODES, quoted - fields - ERROR_CODES
     for code in ("result_too_large", "already_reviewed", "already_commented",
@@ -261,15 +263,59 @@ def test_a_secret_is_named_never_quoted():
     assert "Never write the value of a secret" in _agent()["instructions"]
 
 
-def test_a_finding_an_interrupted_run_posted_still_counts():
+def test_an_earlier_comment_counts_only_while_the_problem_is_still_there():
     """A run that died before its summary left inline comments and no review:
-    the next run must not approve past them."""
+    the next run must not approve past them. But the tool does not say which
+    commit a comment belongs to (final review M4): the text used to say
+    "on this head commit ... count them", which made a fixed finding block
+    for ever. So: check the current diff, then count."""
     content = _skill()["content"]
-    assert ("`already_commented`: an earlier run of yours already posted this finding. It "
-            "still counts: include it in section 3 and name it in the summary.") in content
-    assert ("Inline comments with `own: true` on this head commit are findings from an "
-            "earlier run; count them.") in content.split("## 2.", 1)[0]
+    assert ("An `own: true` inline comment is a finding of this review only if the problem "
+            "is still in the current diff at that place; check before counting it."
+            ) in content.split("## 2.", 1)[0]
+    assert ("- `already_commented`: this line already has a comment of yours; if the problem "
+            "is still there, name the finding in the summary. Go on with the next finding."
+            ) in content
+    assert "on this head commit are findings from an earlier run" not in content
+    assert "an earlier run of yours already posted this finding" not in content
     assert "your comment is already on that line. Go on" not in content
+
+
+def test_the_texts_say_that_a_tool_name_may_carry_the_prefix():
+    said = ("The tools may carry a `bitbucket_` prefix (for example "
+            "`bitbucket_submit_review`) when the agent has more than one server; use the "
+            "names as they are offered.")
+    assert said in _agent()["instructions"] and said in _skill()["content"]
+
+
+def test_a_standing_approval_is_reported():
+    """Final review M2: a negative review does not withdraw an approval of an
+    earlier commit, and nothing in the tools does. The report must say it."""
+    said = ("If `submit_review` answers `earlier_approval_stands`, say so in the report for "
+            "that pull request: an approval of an earlier commit is still on it and a person "
+            "must withdraw it.")
+    assert said in _agent()["instructions"]
+    section = _skill()["content"].split("## 5.", 1)[1]
+    assert "`earlier_approval_stands`" in section and "`already_approved: true`" in section
+
+
+def test_a_pull_request_that_cannot_be_posted_on_is_reported_with_its_findings():
+    content = _skill()["content"]
+    assert ("Stop with this pull request and report it with the findings you already "
+            "have.") in content
+    assert "Stop with this pull request and report it.\n" not in content
+    assert content.rstrip().endswith(
+        "Without submit_review you only read: give the verdict and the findings in the run "
+        "report; name earlier `own: true` findings there as well.")
+
+
+def test_the_reviewer_is_not_exposed_to_chat_and_opens_no_write():
+    """Final review M3: the save gate refuses chat exposure for an approving
+    entry, so the seed agent must already be the scheduler-only kind."""
+    agent = _agent()
+    assert agent["enabled"] is False and agent["expose_chat"] is False
+    (server,) = agent["mcp_servers"]
+    assert "allow_comment" not in server["oauth"] and "allow_approve" not in server["oauth"]
 
 
 def test_every_other_refusal_of_a_comment_is_reported_and_not_retried():
