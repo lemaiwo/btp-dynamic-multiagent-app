@@ -1068,3 +1068,28 @@ export interface ODataDestinationList {
     /** Not empty: the list is partial. */
     warnings: ODataDestinationWarning[];
 }
+
+// --- Notifications (`/admin/api/notifications`) ---------------------------
+
+/** One finished run, agent or workflow, as the bell lists it. */
+export interface NotificationItem {
+    kind: "agent" | "workflow";
+    run_id: string;
+    /** The agent or workflow name. */
+    name: string;
+    status: string;
+    trigger: string;
+    created_by: string | null;
+    /** Aware UTC ISO 8601. */
+    finished_at: string;
+    /** `finished_at` is later than the caller's marker. */
+    unread: boolean;
+}
+
+export interface NotificationList {
+    /** Last 7 days, newest first, at most 50. */
+    items: NotificationItem[];
+    /** Counts the whole window, so it may exceed `items.length`. */
+    unread_count: number;
+    seen_at: string;
+}

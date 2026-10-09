@@ -3148,3 +3148,8 @@ from agents.odata.admin_routes import (  # noqa: E402
 from agents.odata.admin_routes import router as _odata_router  # noqa: E402
 
 router.include_router(_odata_router)
+
+# Finished-run notifications (/admin/api/notifications), included the same way.
+from agents.notifications import router as _notifications_router  # noqa: E402
+
+router.include_router(_notifications_router)

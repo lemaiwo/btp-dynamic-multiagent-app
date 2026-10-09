@@ -1092,6 +1092,41 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `npm run test:e2e:stream` (`playwright.stream.config.ts`, `ui5-stream.yaml`)
   runs `e2e/real-stream.spec.ts` with no mocked routes against
   `tests/e2e/ide_stream_server.py` (see Dependencies)
+- `agents/notifications.py` — finished-run notifications for the admin UI,
+  included by `agents/admin.py` like the OData router, each route with its
+  own `require_admin`. **Derived, not stored**: the runners write nothing
+  for it; the list is read from `job_runs` and `workflow_runs` when asked
+  (only the columns of the answer, never a summary, report, error or
+  activity). `GET /admin/api/notifications` answers `{items, unread_count,
+  seen_at}`: an item is `{kind` (`agent` | `workflow`)`, run_id, name,
+  status, trigger, created_by, finished_at, unread}`, runs with a
+  `finished_at` in the last 7 days, newest first, at most 50 of both kinds
+  together (one statement per table, merged in Python: no `UNION`);
+  `unread_count` covers the whole 7 days and can exceed the list. One `now`
+  per request bounds list and count alike (`finished_at <= now`), so they
+  cannot disagree about a run that finishes meanwhile. Both run tables have
+  an index on `finished_at` for these reads (`ix_job_runs_finished_at`,
+  `ix_workflow_runs_finished_at`; `init_db` adds them to an existing
+  Postgres or SQLite database, `_ensure_plain_index`). The one
+  new table is the read marker, `AdminNotificationState`
+  (`admin_notification_state`: `principal`, `seen_at`), one row per admin
+  keyed by `current_principal` (in the local app that is `local-dev`, which
+  `agents/auth.py` binds; the fixed key `local` only when no principal can
+  be derived; a principal over 255 characters is keyed by its digest,
+  `sha256:<hex>`), never by anything of the request; `unread` is
+  `finished_at > seen_at`. A caller
+  without a marker gets one set to now by the first call (nothing is unread
+  then; a concurrent first call reads the row the other one inserted).
+  `POST /admin/api/notifications/seen` with exactly `{"up_to": <timestamp
+  with a time zone>}` moves the marker to `min(up_to, now)` and only forward
+  (a conditional UPDATE) and answers `{seen_at}`; any other body, a larger
+  one included, is a 422 with one fixed text and nothing of the input.
+  Timestamps are answered as aware UTC whatever the database hands back.
+  An accepted limit: `finished_at` is stamped before the run's commit, so
+  with two app instances a run stamped earlier but committed later than a
+  run already marked read is shown as read. The table and the two indexes
+  are HANA schema generation 2. The tests are in
+  `tests/test_notifications.py`
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
@@ -1228,6 +1263,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     ("Saved, but not active yet": press Reload in Settings), through
     `BaseController.warnIfNotLive`; the two outcome keys are never sent back
     in a body
+  - Notifications: a bell with the unread count (also in its tooltip, for
+    screen readers) and a toast in the app shell for finished agent and
+    workflow runs, logic in `model/notifications.ts`. `GET notifications` is
+    polled every 15 s only while the page is visible, had pointer or key input
+    in the last 10 minutes (`App.notificationIdleMs`, so an unattended screen
+    does not keep the session alive) and the last poll was not answered 401 or
+    403; a stopped chain has no timer and starts again with one poll on the
+    next input or when the tab becomes visible. Opening the list reads it
+    fresh and marks read what it shows (`POST notifications/seen` with the
+    newest shown `finished_at`, unchanged); failures are silent, the first
+    answered poll shows no toast, and inside a host shell that hides the
+    header there is no bell, poll or toast. `e2e/notifications.spec.ts` checks
+    it against the real backend.
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
@@ -1258,7 +1306,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `scripts/copy_registry_config.py`). `HANA_HDI_ALLOW_DROP` is not in the
   descriptor (an `.mtaext` sets it for the one deploy that may drop a table);
   2.22.0 is the `builtin:sharepoint` release: no new resource and no new
-  environment variable
+  environment variable; 2.23.0 adds the finished-run notifications
+  (`agents/notifications.py`): no new resource or environment variable, one
+  new table (`admin_notification_state`) and an index on `finished_at` of
+  both run tables (together HANA schema generation 2)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -1269,7 +1320,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   orchestrator row, `workflows` with branches and steps, `odata_services`,
   `ide_conventions`, `mcp_oauth_clients`, `mcp_oauth_tokens`; not job or
   workflow runs, the audit logs, IDE sessions and their children, OAuth flow
-  states. Rows are matched by natural key (integer ids are the target's own;
+  states, the notification read markers (`admin_notification_state`). Rows are matched by natural key (integer ids are the target's own;
   branches and steps follow their workflow's name); a target row of the same
   key is replaced, other target rows are left alone; a second run changes
   nothing; one transaction on the target. The target's schema must exist

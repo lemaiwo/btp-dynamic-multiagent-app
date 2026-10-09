@@ -16,6 +16,22 @@
                 <ToolbarSpacer />
                 <Title text="{i18n>appTitle}" level="H1" />
                 <ToolbarSpacer />
+                <!-- Finished agent and workflow runs. The badge is the
+                     server's unread count; without one there is no badge
+                     rather than a "0". -->
+                <Button
+                    id="notificationBell"
+                    icon="sap-icon://bell"
+                    type="Transparent"
+                    press=".onOpenNotifications"
+                    tooltip="{appView>/notificationTooltip}">
+                    <customData>
+                        <BadgeCustomData
+                            key="badge"
+                            value="{appView>/notificationBadge}"
+                            visible="{= ${appView>/notificationBadge} !== '' }" />
+                    </customData>
+                </Button>
                 <!-- The signed-in user sits behind this icon rather than on the
                      header itself: an XSUAA label is an email address, which is
                      both long enough to crowd the title on a narrow window and

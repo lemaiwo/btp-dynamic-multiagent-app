@@ -29,6 +29,7 @@ sap.ui.define(function () {
             "unit/textStats": { title: "Unit: textStats" },
             "unit/runsPanel": { title: "Unit: runsPanel" },
             "unit/autoRefresh": { title: "Unit: autoRefresh" },
+            "unit/notifications": { title: "Unit: notifications" },
             "unit/NullableKey": { title: "Unit: NullableKey binding type" },
             "integration/opaTests": { title: "Integration: OPA5 journeys" }
         }

@@ -1047,3 +1047,38 @@ QUnit.test("the destinations route takes no query parameter", async function (as
     assert.strictEqual(response.status, 422);
     assert.deepEqual(await response.json(), { detail: "query: this route takes no parameters" });
 });
+
+QUnit.test("getNotifications GETs the relative notifications path", async function (assert) {
+    const calls: string[][] = [];
+    const body = { items: [], unread_count: 0, seen_at: "2026-10-09T11:00:00+00:00" };
+    stubFetch(200, body, calls);
+
+    const list = await new AdminService().getNotifications();
+
+    assert.strictEqual(calls[0][0], "backend/notifications");
+    assert.strictEqual(calls[0][1], "GET");
+    assert.deepEqual(list, body, "returns the parsed body");
+});
+
+QUnit.test("markNotificationsSeen POSTs up_to and returns the marker", async function (assert) {
+    const calls: string[][] = [];
+    stubFetch(200, { seen_at: "2026-10-09T12:00:00+00:00" }, calls);
+
+    const out = await new AdminService().markNotificationsSeen("2026-10-09T12:00:00+00:00");
+
+    assert.strictEqual(calls[0][0], "backend/notifications/seen");
+    assert.strictEqual(calls[0][1], "POST");
+    assert.deepEqual(JSON.parse(calls[0][2]), { up_to: "2026-10-09T12:00:00+00:00" });
+    assert.strictEqual(out.seen_at, "2026-10-09T12:00:00+00:00");
+});
+
+QUnit.test("markNotificationsSeen rejects with the fixed 422 text", async function (assert) {
+    stubFetch(422, { detail: "up_to must be a timestamp with a time zone" }, []);
+    try {
+        await new AdminService().markNotificationsSeen("x");
+        assert.ok(false, "should reject");
+    } catch (e) {
+        assert.strictEqual((e as AdminError).status, 422);
+        assert.strictEqual((e as AdminError).detail, "up_to must be a timestamp with a time zone");
+    }
+});
