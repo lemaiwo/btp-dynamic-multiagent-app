@@ -398,5 +398,28 @@ def test_a_standing_approval_is_said_in_fixed_words():
     for value in (MARK, 1, "true", None):
         said = activity_summary("submit_review", {
             "commented": True, "approved": False, "earlier_approval_stands": value,
-            "already_approved": value})
+            "already_approved": value, "earlier_approval_unknown": value})
         assert said == "submit_review: commented yes, approved no"
+
+
+def test_a_withdrawal_is_said_in_fixed_words():
+    from agents.bitbucket_tools import activity_summary
+
+    base = {"commented": True, "approved": False, "hint": MARK}
+    assert activity_summary("submit_review", {**base, "approval_withdrawn": True}) == (
+        "submit_review: commented yes, approved no, earlier approval withdrawn")
+    unknown = {**base, "approval_withdrawn": None,
+               "error": {"code": "withdrawal_outcome_unknown", "message": MARK}}
+    assert activity_summary("bitbucket_0_submit_review", unknown) == (
+        "submit_review: commented yes, approved no, withdrawal unknown, "
+        "error withdrawal_outcome_unknown")
+    refused = {**base, "approval_withdrawn": False, "earlier_approval_stands": True,
+               "error": {"code": "bitbucket_forbidden", "message": MARK}}
+    assert activity_summary("submit_review", refused) == (
+        "submit_review: commented yes, approved no, earlier approval stands, "
+        "error bitbucket_forbidden")
+    assert activity_summary("submit_review", {**base, "earlier_approval_unknown": True}) == (
+        "submit_review: commented yes, approved no, earlier approval unknown")
+    for value in (MARK, 1, "true", 0, ""):
+        assert activity_summary("submit_review", {**base, "approval_withdrawn": value}) == (
+            "submit_review: commented yes, approved no")

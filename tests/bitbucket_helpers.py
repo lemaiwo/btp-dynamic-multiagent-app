@@ -53,6 +53,7 @@ class FakeBitbucket:
         self.meta: dict[tuple[str, str, str], dict[str, Any]] = {}
         self.posted: list[tuple[str, int, dict[str, Any]]] = []
         self.approved: list[tuple[str, int]] = []
+        self.withdrawn: list[tuple[str, int]] = []
         self.page_size = 50
         # A test's own answer for a request; None falls through to the fake.
         self.override: Callable[[httpx.Request], httpx.Response | None] | None = None
@@ -136,6 +137,12 @@ class FakeBitbucket:
                     query += "&path=" + request.url.params["path"]
                 return httpx.Response(302, headers={"Location":
                     f"https://{request.url.host}/2.0/repositories/{WS}/{m['repo']}{rest}/{spec}{query}"})
+            if rest == "/approve" and method == "DELETE":
+                self.withdrawn.append(key)
+                pr["participants"] = [
+                    p for p in pr["participants"]
+                    if not (isinstance(p, dict) and (p.get("user") or {}).get("uuid") == OWN_UUID)]
+                return httpx.Response(204)
             if rest == "/approve" and method == "POST":
                 self.approved.append(key)
                 pr["participants"].append({"user": {"uuid": OWN_UUID}, "approved": True,

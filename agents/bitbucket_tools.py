@@ -69,7 +69,7 @@ own review) and the guard. Their text is the model's own: it is refused when
 empty or over its cap, or when it holds a control or format character (a NUL,
 a byte order mark, zero width, a bidi mark, a lone surrogate, a line or
 paragraph separator; line feed and tab are text), never cut or rewritten
-(edge whitespace aside).
+(edge whitespace aside, and a carriage return is made a line feed).
 ``submit_review`` posts ONE top-level comment whose first line is the marker,
 written by the code; a summary or an inline comment whose own first line
 looks like the marker is refused (Bitbucket may store an inline comment
@@ -107,16 +107,36 @@ By decision the approval is not bound to the commit that was reviewed, and a
 draft is not held back. What that means is wider than a commit pushed while
 a review runs: ANY commit pushed after an approval stays approved unless
 Bitbucket resets approvals on a source change (a repository setting, a
-Premium feature), and a later review with verdict ``comment`` does not
-withdraw it: no call here deletes an approval. The tool says so instead:
-when a ``submit_review`` does not end in ``approved: true`` and this account's
-own approval is on the pull request (the guard's read of it), the answer has
-``earlier_approval_stands: true`` and a fixed ``hint`` (a person must withdraw
-it in Bitbucket). When verdict ``approve`` passes the gate and that approval
-is already there, no second approve call is sent: ``approved: true`` with
-``already_approved: true``. When the gate holds the approval back, or
-Bitbucket refuses it, the comment stands: the answer has ``commented: true``,
-``approved: false`` and an ``error`` that says why. Nothing is deleted.
+Premium feature) or this account reviews the newer commit with verdict
+``comment`` (the withdrawal, below); a new push alone withdraws nothing.
+When verdict ``approve`` passes the gate and this account's approval is
+already there, no second approve call is sent: ``approved: true`` with
+``already_approved: true``; a verdict ``approve`` that is held back answers
+``earlier_approval_stands: true`` with a fixed ``hint``. When the gate holds
+the approval back, or Bitbucket refuses it, the comment stands: the answer
+has ``commented: true``, ``approved: false`` and an ``error`` that says why.
+No comment is ever deleted.
+
+**The withdrawal** (``BitbucketClient._withdraw_own_approval``, the one place
+that deletes an approval; decided by the user). ``submit_review`` withdraws
+this account's OWN approval of an earlier commit when ALL of this holds: the
+verdict of this call is exactly ``comment``; the summary comment of this very
+call was posted and its answer was read; and the guard's read of the pull
+request shows this account's approval (``_own_approval`` readable and
+``true``). Not behind ``allow_approve`` or the builds: taking an approval
+away is the safe direction, for every entry that can post a review. Never by
+``add_inline_comment`` or ``complete_approval``, never without the posted
+comment, never on a state that was not read (``earlier_approval_unknown:
+true`` then, with a fixed ``hint``). The answer: ``approval_withdrawn: true``
+for Bitbucket's 204 and for nothing else; ``approval_withdrawn: false`` with
+``earlier_approval_stands: true`` and the refusal when Bitbucket said no;
+``approval_withdrawn: null`` with ``withdrawal_outcome_unknown`` when the
+request may or may not have been processed (never sent again; a person must
+look). The gate for approving is unchanged, and a later clean commit is
+approved again by the normal path. So an approval of an earlier commit
+stands until this account's next review with verdict ``comment`` has run,
+and for good where nothing reviews the newer commit and Bitbucket does not
+reset approvals itself.
 
 **An approval that was held back stays reachable.** The marker line records
 the verdict, so a review with verdict ``approve`` whose approval was not sent
@@ -156,7 +176,8 @@ marker is decided on Bitbucket's own text, not on the filtered one.
 ``invalid_argument``, ``account_unknown``, ``already_reviewed``,
 ``approve_not_allowed``, ``builds_not_green``, ``comment_outcome_unknown``,
 ``approval_outcome_unknown``, ``review_state_unknown``, ``not_reviewed``,
-``already_approved``, ``already_commented``, ``comment_window_full``.
+``already_approved``, ``already_commented``, ``comment_window_full``,
+``withdrawal_outcome_unknown``.
 """
 
 from __future__ import annotations
@@ -262,7 +283,7 @@ ERROR_CODES = frozenset({
     "result_too_large", "invalid_line", "invalid_argument", "account_unknown",
     "already_reviewed", "approve_not_allowed", "builds_not_green", "comment_outcome_unknown",
     "approval_outcome_unknown", "review_state_unknown", "not_reviewed", "already_approved",
-    "already_commented", "comment_window_full"})
+    "already_commented", "comment_window_full", "withdrawal_outcome_unknown"})
 # Failures of a request that say it never left: no connection was made. After
 # any other failure a write may have been processed.
 _NEVER_LEFT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
@@ -363,8 +384,20 @@ def _already_reviewed(extra: str = "") -> Refused:
 
 # Fixed text: nothing of the pull request is in it.
 _STANDS_HINT = ("this account approved an earlier commit of this pull request and that "
-                "approval still stands: say so in the summary's report line and in the run "
-                "report; a person must withdraw it in Bitbucket")
+                "approval still stands: say so in the run report; a person must withdraw it "
+                "in Bitbucket")
+_STANDS_UNKNOWN_HINT = ("whether this account approved an earlier commit of this pull request "
+                        "could not be read: say so in the run report; a person must look at "
+                        "the approvals of the pull request")
+
+
+def _withdrawal_unknown() -> Refused:
+    return Refused(
+        "withdrawal_outcome_unknown",
+        "the review comment was posted; this account's approval of an earlier commit may "
+        "still stand: Bitbucket's answer to its withdrawal could not be read",
+        "do not call again; report that the approvals of the pull request have to be "
+        "checked by a person")
 
 
 def _approval_unknown_alone() -> Refused:
@@ -383,10 +416,15 @@ _PLAIN_HINT = "plain text only: no control, zero-width or direction characters"
 
 def _own_text(value: Any, limit: int, what: str) -> str:
     """The model's text for a comment, or a refusal that holds none of it.
-    Edge whitespace is dropped; nothing else is changed, nothing is cut. A
+    Edge whitespace is dropped and a carriage return (alone or before a line
+    feed) becomes a line feed; nothing else is changed, nothing is cut. A
     control or format character anywhere in it is a refusal (``_NOT_PLAIN``;
     a line feed and a tab are text)."""
-    text = value.strip() if isinstance(value, str) else ""
+    # A carriage return is a line end as some writers spell it: made a line
+    # feed before anything is judged, so every check below sees the lines a
+    # reader sees.
+    text = (value.replace("\r\n", "\n").replace("\r", "\n").strip()
+            if isinstance(value, str) else "")
     if not text:
         raise Refused("invalid_argument", f"the {what} is empty")
     if len(text) > limit:
@@ -878,18 +916,22 @@ class BitbucketClient:
 
     async def _write(self, url: str, body: Any, *, unsure: Callable[[], Refused],
                      ok: tuple[int, ...],
-                     bad_request: Refused | None = None) -> dict[str, Any]:
-        """One POST that changes something, sent once, and its answer.
+                     bad_request: Refused | None = None,
+                     method: str = "POST") -> dict[str, Any]:
+        """One request that changes something, sent once, and its answer.
 
         Three outcomes and no fourth: the JSON object of an ``ok`` status
         (done); a refusal by status (Bitbucket said no: not done); ``unsure``
         (it may be done: no answer, an answer that could not be read, a 2xx
         that is not the answer Bitbucket documents, or any 5xx). A success is
-        only what was read as one.
+        only what was read as one: the JSON object of an ``ok`` status, or an
+        ``ok`` 204, which has no body (``{}``).
         """
-        response = await self._send("POST", url, json=body, unsure=unsure())
+        response = await self._send(method, url, json=body, unsure=unsure())
         status = response.status_code
         if status in ok:
+            if status == 204:
+                return {}
             try:
                 return self._json(response, ok=ok)
             except Refused:
@@ -1518,21 +1560,57 @@ class BitbucketClient:
             # This account's approval of an EARLIER commit, as the guard's
             # read of the pull request showed it (the marker above says this
             # head has no review of ours yet, so an approval that is on the
-            # pull request was given for another commit). Only a readable
-            # `true` counts.
-            standing = _own_approval(body, account) is True
+            # pull request was given for another commit). `True`, `False`, or
+            # `None` when the pull request's participants cannot be read.
+            own = _own_approval(body, account)
+            standing = own is True
+            # From here on the comment stands whatever happens: what follows
+            # is said next to `commented: true`.
             if verdict == "approve":
-                # From here on the comment stands whatever happens: a held-back
-                # or refused approval is said next to `commented: true`.
                 await self._approve_behind_the_gate(base, result, after_comment=True,
                                                     standing=standing)
-            if standing and result["approved"] is not True:
-                # A review that does not approve leaves that approval where it
-                # is: nothing here withdraws one (a new write, not decided).
-                # So it is said, for the summary's reader and the run report.
+                if standing and result["approved"] is not True:
+                    # A held-back verdict approve is no finding against the
+                    # new commit: the earlier approval is said, not removed.
+                    result["earlier_approval_stands"] = True
+                    result["hint"] = _STANDS_HINT
+            elif standing:
+                # Verdict comment on a newer commit: the approval this
+                # account gave an earlier one no longer says what it thinks.
+                await self._withdraw_own_approval(base, result)
+            elif own is None:
+                # Not read: nothing is deleted on a guess, and a possibly
+                # standing approval is not passed over in silence.
+                result["earlier_approval_unknown"] = True
+                result["hint"] = _STANDS_UNKNOWN_HINT
+            return result
+
+    async def _withdraw_own_approval(self, base: str, result: dict[str, Any]) -> None:
+        """The ONE place that deletes an approval: this account's own, of an
+        earlier commit, after its review of the current head was posted with
+        verdict ``comment`` (``submit_review`` is the only caller and has
+        checked all of that; nothing a pull request says is part of it).
+
+        Not behind ``allow_approve`` or the builds: taking this account's
+        approval away is the safe direction for every entry that can post a
+        review. Sent once. The outcome goes into ``result``:
+        ``approval_withdrawn: true`` only for Bitbucket's 204;
+        ``false`` with ``earlier_approval_stands`` and the refusal when
+        Bitbucket said no (or the request never left); ``null`` with
+        ``withdrawal_outcome_unknown`` when it may or may not have been
+        processed. The summary comment stands in every case."""
+        try:
+            await self._write(f"{base}/approve", None, ok=(204,), method="DELETE",
+                              unsure=_withdrawal_unknown)
+            result["approval_withdrawn"] = True
+        except Refused as held:
+            if held.code == "withdrawal_outcome_unknown":
+                result["approval_withdrawn"] = None      # neither yes nor no
+            else:
+                result["approval_withdrawn"] = False
                 result["earlier_approval_stands"] = True
                 result["hint"] = _STANDS_HINT
-            return result
+            result["error"] = held.as_error()["error"]
 
     async def _approve_behind_the_gate(self, base: str, result: dict[str, Any], *,
                                        after_comment: bool, standing: bool = False) -> None:
@@ -1664,8 +1742,14 @@ def activity_summary(tool_name: Any, result: Any) -> str | None:
         # the same name says nothing).
         if result.get("already_approved") is True:
             said.append("already approved")
+        if result.get("approval_withdrawn") is True:
+            said.append("earlier approval withdrawn")
+        elif "approval_withdrawn" in result and result["approval_withdrawn"] is None:
+            said.append("withdrawal unknown")
         if result.get("earlier_approval_stands") is True:
             said.append("earlier approval stands")
+        if result.get("earlier_approval_unknown") is True:
+            said.append("earlier approval unknown")
         if failed:
             said.append(f"error {code}" if code else "error")
         return f"{tool}: " + ", ".join(said)
@@ -1867,10 +1951,16 @@ def bitbucket_toolset(
         `builds_not_green` next to `commented: true` means the approval can
         follow later with complete_approval. `already_approved: true` means
         your approval was already on the pull request and none was sent.
-        `earlier_approval_stands: true` means this review did not approve but
-        an approval of yours for an earlier commit is still on the pull
-        request: nothing withdraws it, so say so in your report; a person
-        must withdraw it in Bitbucket.
+        With verdict `comment`, an approval you gave an earlier commit of
+        this pull request is withdrawn for you: `approval_withdrawn: true`.
+        `approval_withdrawn: null` with code `withdrawal_outcome_unknown`
+        means it MAY still stand: do not call again, report it.
+        `earlier_approval_stands: true` means such an approval is still on
+        the pull request (the withdrawal was refused, or your verdict was
+        approve and the approval was held back) and
+        `earlier_approval_unknown: true` means it could not be read whether
+        there is one: say so in your report, a person must look. You never
+        withdraw anything yourself.
 
         The verdict is your own judgement of the diff.
 
