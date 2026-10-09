@@ -2668,6 +2668,11 @@ function fillDestinationFields(row, oauth) {
     // loaded: making such a row a bitbucket row later must not start with
     // approving on or the build check off.
     const isBitbucket = destinationBuiltinOf(row) === BITBUCKET_BUILTIN;
+    // Nor its workspace and branch: they are pins of a bitbucket row only.
+    if (!isBitbucket) {
+        row.querySelector('.dest-workspace').value = '';
+        row.querySelector('.dest-branch').value = '';
+    }
     row.querySelector('.dest-repositories').value =
         isBitbucket && Array.isArray(oauth.repositories) ? oauth.repositories.join(', ') : '';
     row.querySelector('.dest-allow_approve').checked = isBitbucket && oauth.allow_approve === true;
@@ -2707,6 +2712,17 @@ function syncDestinationFields(row) {
     const box = row.querySelector('.mcp-destination');
     if (!box) return;
     const builtin = destinationBuiltinOf(row);
+    // "Allow commenting" is ONE checkbox for builtin:jira and
+    // builtin:bitbucket. When the URL is edited into another type, a tick
+    // that was set for the old one must not be sent for the new one; and
+    // Approving, which needs it, goes with it. Another spelling of the same
+    // type is no change, and the first call (the row being loaded) resets
+    // nothing.
+    if (row.dataset.destBuiltin !== undefined && row.dataset.destBuiltin !== builtin) {
+        row.querySelector('.dest-allow_comment').checked = false;
+        row.querySelector('.dest-allow_approve').checked = false;
+    }
+    row.dataset.destBuiltin = builtin;
     const fields = destinationFieldsFor(builtin);
     const known = fields !== null;
     const wanted = fields || [];

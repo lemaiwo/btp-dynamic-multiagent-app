@@ -2097,6 +2097,41 @@ assert.throws(() => collectMcpServers(), /Two builtin:bitbucket rows/);
 assert.deepStrictEqual(out.oauth, { destination: 'JIRA', project: 'ABC' });
 assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
 assert.strictEqual(row.querySelector('.dest-require_green_builds').checked, true);
+// ... nor its workspace and branch: they are filled for a bitbucket row only.
+assert.strictEqual(row.querySelector('.dest-workspace').value, '');
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', branch: 'main', workspace: 'x' } }));
+assert.strictEqual(row.querySelector('.dest-workspace').value, '');
+assert.strictEqual(row.querySelector('.dest-branch').value, '');
+// The URL of a bitbucket row edited into a jira row: "Allow commenting" is one
+// checkbox for both types, and what was ticked for the review must not
+// arrive as Jira's allow_comment without anyone ticking it there.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: BB_OAUTH }));
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true);
+row.querySelector('.mcp-url').value = 'builtin:jira';
+row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, false,
+    'the shared checkbox is reset when the type changes');
+row.querySelector('.dest-project').value = 'ABC';
+assert.deepStrictEqual(collectMcpServers()[0],
+    { url: 'builtin:jira', auth_mode: 'destination',
+      oauth: { destination: 'BITBUCKET', project: 'ABC' } });
+// And the other way round: a jira row that may comment, made a bitbucket row.
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', allow_comment: true } }));
+assert.strictEqual(out.oauth.allow_comment, true);
+row.querySelector('.mcp-url').value = 'builtin:bitbucket';
+row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+row.querySelector('.dest-workspace').value = 'acme-ws';
+assert.deepStrictEqual(collectMcpServers()[0].oauth, { destination: 'JIRA', workspace: 'acme-ws' });
+// Another spelling of the same type is no change: the tick stays.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: BB_OAUTH }));
+row.querySelector('.mcp-url').value = 'Builtin:Bitbucket/';
+row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true);
+assert.strictEqual(row.querySelector('.dest-allow_approve').checked, true);
 
 // 8. A remote MCP server through a destination: the destination names the
 //    host and holds the credential, so only {destination, user_context} is
@@ -2685,6 +2720,9 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                         bb_agent = {
                             "name": "uibitbucket", "description": "UI test agent with Bitbucket.",
                             "instructions": "You are a UI test agent.", "enabled": True,
+                            # The collected entry approves: such an agent is
+                            # refused chat exposure (final review M3).
+                            "expose_chat": False,
                             "mcp_servers": [bb_entry],
                         }
                         r = await client.post("/admin/api/agents", json=bb_agent)
