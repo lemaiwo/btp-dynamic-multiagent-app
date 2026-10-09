@@ -135,3 +135,13 @@ def test_a_path_that_could_leave_the_file_endpoint_is_refused(path):
     with pytest.raises(ValueError) as refused:
         confine_path(path)
     assert str(refused.value) == "the path is not a file path below the repository root"
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, False), (False, False), (True, True), ("true", True), (1, True),
+    (0, True), (0.0, True), ("", True),
+])
+def test_asks_to_approve_uses_identity_not_equality(value, expected):
+    """0 and 0.0 equal False but are not it: they ask (the entry check refuses them)."""
+    from agents.bitbucket_config import asks_to_approve
+    assert asks_to_approve({"allow_approve": value}) is expected

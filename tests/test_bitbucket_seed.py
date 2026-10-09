@@ -183,7 +183,7 @@ def test_every_code_the_texts_name_is_one_the_toolset_answers():
               "repositories_failed", "beyond_reach", "reviewed_filter", "head_commit",
               "comments_truncated", "diffstat", "diffstat_truncated",
               # An answer key of submit_review, and the example of a prefixed tool.
-              "earlier_approval_stands", "earlier_approval_unknown",
+              "earlier_approval_stands", "earlier_approval_unknown", "approval_withdrawn",
               "bitbucket_submit_review"}
     fields |= set(TOOLS)
     assert quoted - fields <= ERROR_CODES, quoted - fields - ERROR_CODES

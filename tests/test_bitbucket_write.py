@@ -1222,9 +1222,9 @@ def test_the_inline_tool_names_its_new_refusals():
 
 # --- final review M2: an approval of an earlier commit that still stands -------
 
-STANDS_HINT = ("this account approved an earlier commit of this pull request and that "
-               "approval still stands: say so in the run report; a person must withdraw it "
-               "in Bitbucket")
+STANDS_HINT = ("This account's approval of an earlier commit is still on this pull request. "
+               "Say so in the run report. If this review found problems, a person must "
+               "withdraw it in Bitbucket.")
 UNKNOWN_HINT = ("whether this account approved an earlier commit of this pull request could "
                 "not be read: say so in the run report; a person must look at the approvals "
                 "of the pull request")

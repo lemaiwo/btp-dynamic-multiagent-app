@@ -559,9 +559,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the same switch, builds check and approve call.
   **A write is sent once.** Only a 429 is repeated (and a 401 once by the
   destination auth). A timeout or lost connection after the request may have
-  left, an answer over its cap, a 2xx that is not a JSON object, any 5xx: the
+  left, an answer over its cap, a 2xx that is not a JSON object (the
+  withdrawal's success is exactly a 204 without a body), any 5xx: the
   outcome is unknown and said as such (`comment_outcome_unknown`,
-  `approval_outcome_unknown` with `approved: null`), never as a success or
+  `approval_outcome_unknown` with `approved: null`,
+  `withdrawal_outcome_unknown` with `approval_withdrawn: null`), never as a success or
   as "nothing happened", and nothing is sent again.
   **The HTTP core.** The credential goes only to the destination's own
   `https` host and port (no expected host is configured; an absolute URL on
@@ -600,7 +602,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   answers: how Bitbucket answers an inline anchor outside the diff (the code
   reports `anchored` and maps a 400 to `invalid_line`), the order in which
   comments are returned (none is asked for or pinned), the shape of
-  `participants`, and the two write calls. Setup in brief (module docstring):
+  `participants`, and the three write calls (the comment POST, the approve POST, and the approval withdrawal: the DELETE, its bodiless 204, and its answer when no approval is there). Setup in brief (module docstring):
   an HTTP destination with `BasicAuthentication` (the technical user's e-mail
   address and an API token with the scopes `read:repository:bitbucket`,
   `read:pullrequest:bitbucket`, `write:pullrequest:bitbucket`,
@@ -1411,7 +1413,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the same way after the commit (`_entry_signature`,
   `_reload_for_changed_entry`: a run takes its specialist, and so the pins,
   from the running build, so an unticked Approving must not wait for
-  somebody to press Reload; `tests/test_bitbucket_reload.py`); create and update always answer `reloaded`
+  somebody to press Reload; `tests/test_bitbucket_reload.py`; the reload reaches only the app instance
+  that served the request: run one instance, or restart all instances after
+  an edit that closes approving or commenting); create and update always answer `reloaded`
   and `reload_failed` (both `false` for any other save, which does not
   reload), the 204 of a delete carries the two `X-OData-*` headers.
   `GET /admin/api/credential-health` lists a

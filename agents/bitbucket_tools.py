@@ -153,11 +153,13 @@ approve call. It posts nothing and takes no text from the model.
 **A write is sent once.** Only a 429 is repeated (it says the request was not
 processed; a 401 is asked again once by the destination auth, for the same
 reason). A timeout or a lost connection after the request may have left, an
-answer over its cap, a 2xx that is not the JSON object Bitbucket documents,
+answer over its cap, a 2xx that is not the JSON object Bitbucket documents
+(the withdrawal's success is exactly a 204 without a body),
 any 5xx (it can follow a processed request; a read keeps ``bitbucket_error``):
 the outcome is unknown and is said as such (``comment_outcome_unknown``,
-``approval_outcome_unknown``, the latter with ``approved: null``), never as a
-success and never as "nothing happened", and nothing is sent again.
+``approval_outcome_unknown``, the latter with ``approved: null``, and
+``withdrawal_outcome_unknown``), never as a success and never as "nothing
+happened", and nothing is sent again.
 
 **Pull request text is filtered by character** before the model gets it
 (``_shown_text``: title, description, author and commenter names, comment
@@ -383,9 +385,9 @@ def _already_reviewed(extra: str = "") -> Refused:
 
 
 # Fixed text: nothing of the pull request is in it.
-_STANDS_HINT = ("this account approved an earlier commit of this pull request and that "
-                "approval still stands: say so in the run report; a person must withdraw it "
-                "in Bitbucket")
+_STANDS_HINT = ("This account's approval of an earlier commit is still on this pull request. "
+                "Say so in the run report. If this review found problems, a person must "
+                "withdraw it in Bitbucket.")
 _STANDS_UNKNOWN_HINT = ("whether this account approved an earlier commit of this pull request "
                         "could not be read: say so in the run report; a person must look at "
                         "the approvals of the pull request")
@@ -1943,11 +1945,12 @@ def bitbucket_toolset(
 
         The answer has `commented`, `comment_id`, `approved` and `commit`
         (the head commit that is now marked as reviewed). An `error` next to
-        `commented: true` means the comment is there and the approval is not
-        (`approved: null`: it may be, check on the pull request): report it,
-        do not call again. An `error` alone means nothing was posted, except
-        code `comment_outcome_unknown`: the comment MAY have been posted, do
-        not call again. `already_reviewed` means this commit has its review.
+        `commented: true` means the comment is there; read `approved`,
+        `approval_withdrawn` and `earlier_approval_stands` to see what the
+        approval's state is: report it, do not call again. An `error` alone
+        means nothing was posted, except code `comment_outcome_unknown`: the
+        comment MAY have been posted, do not call again. `already_reviewed` means
+        this commit has its review.
         `builds_not_green` next to `commented: true` means the approval can
         follow later with complete_approval. `already_approved: true` means
         your approval was already on the pull request and none was sent.

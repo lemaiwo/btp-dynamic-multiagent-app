@@ -122,7 +122,9 @@ def asks_to_approve(cfg: Any) -> bool:
     never a peer), which also judge rows no gate has seen. Wider than
     :func:`pins_of` on purpose: a hand-written ``"true"`` gives no toolset at
     all, and still must not read as "does not approve" to those rules."""
-    return isinstance(cfg, dict) and cfg.get("allow_approve") not in (None, False)
+    return isinstance(cfg, dict) and (
+        cfg.get("allow_approve") is not None and cfg.get("allow_approve") is not False
+    )
 
 
 def clean_entry(cfg: Any) -> dict[str, Any]:
