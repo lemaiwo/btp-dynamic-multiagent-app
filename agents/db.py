@@ -2532,6 +2532,7 @@ async def upsert_agent(
     # --- deep agents --- JSON from agents.deep.dump_deep_config; None clears,
     # KEEP (not sent) preserves what is stored, like model_name/peers.
     deep_json: str | None | _Keep = KEEP,
+    ignore_peer_lists_of: set[str] | None = None,
 ) -> AgentConfig:
     """Create or update the agent named ``name``.
 
@@ -2539,6 +2540,9 @@ async def upsert_agent(
     keep every row in one transaction and commit (or roll back) once.
     ``ignore_collisions_with`` names agents that same caller is about to
     delete, so they do not count as delegation-tool collisions.
+    ``ignore_peer_lists_of`` names agents whose stored peer lists that caller
+    removes or replaces later in the same transaction
+    (`check_bitbucket_approver_reach`).
     """
     name = name.strip()
     existing = await get_agent_by_name(session, name)
@@ -2565,6 +2569,19 @@ async def upsert_agent(
                 seen.add(p)
                 cleaned_peers.append(p)
         peers_json = json.dumps(cleaned_peers) if cleaned_peers else None
+    # Here for the same reason as the OData check above: the last gate for an
+    # approving agent, on the entries and the peer list the row will hold.
+    await check_bitbucket_approver_reach(
+        session,
+        name=name,
+        servers=prepared_server_list(primary, extras, primary_oauth_json),
+        expose_chat=bool(expose_chat),
+        peers=(
+            (list(existing.peers) if existing is not None else [])
+            if isinstance(peers, _Keep) else cleaned_peers
+        ),
+        ignore_names=ignore_peer_lists_of,
+    )
 
     slug = validate_api_slug(api_slug)
     if slug:
@@ -4272,6 +4289,102 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
 # boundary (the reason `BUILTIN_PUBLIC_KEYS` is public).
 ODATA_ENTRY_KEYS = ("services", "allow_write")
 MAX_ODATA_ENTRY_SERVICES = 50
+def bitbucket_approves(servers: Any) -> bool:
+    """Whether a server list holds a ``builtin:bitbucket`` entry (any
+    spelling of the URL) that asks for approving
+    (`agents.bitbucket_config.asks_to_approve`)."""
+    from agents.bitbucket_config import asks_to_approve
+
+    for server in servers if isinstance(servers, list) else []:
+        if not isinstance(server, dict):
+            continue
+        url = str(server.get("url") or "").strip().rstrip("/").lower()
+        if url == _BITBUCKET_URL and asks_to_approve(server.get("oauth")):
+            return True
+    return False
+
+
+# An approving agent approves as a technical user whose approval counts for
+# merging. It runs only where nobody chooses its prompt (the scheduler run
+# endpoint and an admin's Run now, both with the stored run prompt): a chat or
+# A2A user, or an agent they talk to, could otherwise have it approve their
+# own pull request. Fixed texts; public for the admin gate and the tests.
+BITBUCKET_APPROVER_CHAT_MESSAGE = (
+    "expose_chat: must be false for an agent whose builtin:bitbucket entry has "
+    "allow_approve; an approving agent runs only from the scheduler run endpoint "
+    "or an admin's Run now, never from chat or A2A"
+)
+_BITBUCKET_APPROVER_PEER_RULE = (
+    "an approving agent may not be a peer: no agent may delegate to an agent "
+    "whose builtin:bitbucket entry has allow_approve"
+)
+
+
+def _agent_names(names: list[str]) -> str:
+    """Stored agent names for a refusal; one that does not have the form of
+    a name (a row written by hand) is not repeated."""
+    return ", ".join(
+        repr(n) if re.fullmatch(r"[a-zA-Z0-9_\- ]{1,64}", n) else "(unnamed)" for n in names
+    )
+
+
+async def check_bitbucket_approver_reach(
+    session: AsyncSession,
+    *,
+    name: str,
+    servers: list[dict[str, Any]],
+    expose_chat: Any,
+    peers: list[str],
+    stored_name: str | None = None,
+    ignore_names: set[str] | None = None,
+) -> None:
+    """Refuse an agent write that would make an approving agent reachable.
+
+    ``ValueError`` with a fixed text when, as the row is about to be stored:
+    the agent approves (`bitbucket_approves`) and is exposed to chat; it
+    approves and another agent lists it as a peer (any other row, enabled or
+    not: enabling that one later would touch neither); or one of its own
+    ``peers`` is an agent that approves. Called by every write of an agent
+    (`upsert_agent`, and the admin update route beside its own
+    `prepare_servers`) on `prepared_server_list(...)` and on the peer list the
+    row will hold, in the session that then writes the row.
+
+    ``stored_name``: the name the row has now, when the write renames it (the
+    other agents' peer lists still hold that one). ``ignore_names``: agents
+    whose rows the same transaction removes or writes later (an import), so
+    their stored peer lists do not count; the later write is checked itself.
+
+    The registry build closes the same two doors again for rows no gate has
+    seen (`agents.registry.build_orchestrator`).
+    """
+    ignore = ignore_names or set()
+    own = {name, stored_name or name}
+    if bitbucket_approves(servers):
+        if expose_chat:
+            raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
+        listers = [
+            r.name for r in await list_agents(session)
+            if r.name not in own and r.name not in ignore and own & set(r.peers)
+        ]
+        if listers:
+            raise ValueError(
+                f"oauth.allow_approve: this agent is a peer of agent(s) "
+                f"{_agent_names(listers)}; {_BITBUCKET_APPROVER_PEER_RULE}. Remove it "
+                "from their peers first."
+            )
+    approvers = []
+    for peer in peers:
+        if peer in own:
+            continue
+        row = await get_agent_by_name(session, peer)
+        if row is not None and bitbucket_approves(row.mcp_servers):
+            approvers.append(row.name)
+    if approvers:
+        raise ValueError(
+            f"peers: {_agent_names(approvers)}: {_BITBUCKET_APPROVER_PEER_RULE}"
+        )
+
+
 ODATA_SINGLE_ENTRY_MESSAGE = (
     "an agent may have at most one builtin:odata entry; list every service "
     "in that entry's oauth.services"

@@ -56,8 +56,10 @@ async def _build(agents: dict[str, list[dict[str, Any]]],
         await s.execute(delete(AgentConfig))
         await s.execute(delete(SkillConfig))
         for name, servers in agents.items():
+            # Not exposed to chat: an entry that approves may not be (final
+            # review M3, tests/test_bitbucket_reach.py).
             await upsert_agent(s, name=name, description="d", instructions="i",
-                               mcp_servers=servers)
+                               mcp_servers=servers, expose_chat=False)
         await s.commit()
         for name, servers in extra.items():
             row = (await s.execute(

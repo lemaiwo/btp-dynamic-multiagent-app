@@ -114,6 +114,17 @@ def check_entry(cfg: Any) -> None:
             "sent after the review comment was posted")
 
 
+def asks_to_approve(cfg: Any) -> bool:
+    """Whether a block asks for approving, checked or not: ``allow_approve``
+    holds anything but ``false`` / nothing.
+
+    For the rules about who may reach an approving agent (no chat exposure,
+    never a peer), which also judge rows no gate has seen. Wider than
+    :func:`pins_of` on purpose: a hand-written ``"true"`` gives no toolset at
+    all, and still must not read as "does not approve" to those rules."""
+    return isinstance(cfg, dict) and cfg.get("allow_approve") not in (None, False)
+
+
 def clean_entry(cfg: Any) -> dict[str, Any]:
     """The block as it is stored: checked, its own keys only, fixed order."""
     check_entry(cfg)

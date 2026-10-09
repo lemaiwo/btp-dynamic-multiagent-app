@@ -191,7 +191,8 @@ async def test_a_direct_upsert_stores_the_checked_block_or_nothing():
         await upsert_agent(
             s, name="reviewer", description="d", instructions="i",
             mcp_servers=[{"url": "Builtin:Bitbucket/", "auth_mode": "destination",
-                          "oauth": {**FULL, "user_context": False}}])
+                          "oauth": {**FULL, "user_context": False}}],
+            expose_chat=False)          # an approving entry: never chat (M3)
         await s.commit()
         (row,) = await list_agents(s)
         assert row.mcp_servers == [{"url": URL, "auth_mode": "destination", "oauth": FULL}]
@@ -224,8 +225,10 @@ async def _build(agents: dict[str, list[dict[str, Any]]], raw: dict[str, Any] | 
     await _wipe()
     async with SessionLocal() as s:
         for name, servers in agents.items():
+            # Not exposed to chat: an entry that approves may not be (final
+            # review M3, tests/test_bitbucket_reach.py).
             await upsert_agent(s, name=name, description="d", instructions="i",
-                               mcp_servers=servers)
+                               mcp_servers=servers, expose_chat=False)
         await s.commit()
         for name, block in (raw or {}).items():
             row = (await s.execute(
@@ -472,7 +475,9 @@ async def client():
 
 
 def _agent(name: str, oauth: dict[str, Any], mode: str = "destination") -> dict[str, Any]:
-    return {"name": name, "description": "d", "instructions": "i",
+    # Not exposed to chat: an agent whose entry approves may not be (final
+    # review M3; the refusals of that rule are in tests/test_bitbucket_reach.py).
+    return {"name": name, "description": "d", "instructions": "i", "expose_chat": False,
             "mcp_servers": [{"url": URL, "auth_mode": mode, "oauth": oauth}]}
 
 

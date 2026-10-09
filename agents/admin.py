@@ -74,6 +74,7 @@ from agents.db import (
     AUTH_MODE_DESTINATION,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
+    BITBUCKET_APPROVER_CHAT_MESSAGE,
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
@@ -85,6 +86,8 @@ from agents.db import (
     SessionLocal,
     agent_referrers,
     agent_where_used,
+    bitbucket_approves,
+    check_bitbucket_approver_reach,
     check_delegation_name_collision,
     delete_agent,
     delete_skill,
@@ -1064,6 +1067,20 @@ class AgentPayload(BaseModel):
             raise ValueError("mcp_servers contains duplicate urls")
         return self
 
+    @model_validator(mode="after")
+    def _approver_is_not_chat_exposed(self) -> "AgentPayload":
+        """An agent whose ``builtin:bitbucket`` entry approves is never
+        exposed to chat (and so not to A2A, which talks to the same
+        orchestrator): a user there chooses the prompt, and the approval is a
+        technical user's that counts for merging. The scheduler run endpoint
+        (``expose_api`` + ``api_slug``) and Run now use the stored run prompt
+        and stay allowed. Create, update, import and the seed all validate
+        this model; storage checks again and adds the peer rule, which needs
+        the database (`agents.db.check_bitbucket_approver_reach`)."""
+        if self.expose_chat is not False and bitbucket_approves(self.to_servers_list()):
+            raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
+        return self
+
     def to_servers_list(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         for s in self.mcp_servers:
@@ -1409,6 +1426,16 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
             # down, not a second reading of the payload.
             await check_odata_services(
                 session, prepared_server_list(primary, extras, primary_oauth_json)
+            )
+            # As `upsert_agent` does. The other agents' peer lists still hold
+            # the old name here: the rename below rewrites them.
+            await check_bitbucket_approver_reach(
+                session,
+                name=payload.name,
+                stored_name=old_name,
+                servers=prepared_server_list(primary, extras, primary_oauth_json),
+                expose_chat=payload.expose_chat,
+                peers=list(row.peers) if payload.peers is None else payload.peers,
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
@@ -2434,7 +2461,15 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 session, payload.odata_services, errors
             )
 
+            # Agents this bundle still writes: their stored peer lists are
+            # about to be replaced, so they do not decide whether an agent
+            # written before them may approve; their own write is checked
+            # when its turn comes (`check_bitbucket_approver_reach`). A
+            # bundle entry without a `peers` key keeps the stored list and
+            # stays out of this set.
+            rewrites_peers = {a.name for a in payload.agents if a.peers is not None}
             for agent in payload.agents:
+                rewrites_peers.discard(agent.name)
                 secret_errors = _missing_secret_errors(agent, existing_agents.get(agent.name))
                 if secret_errors:
                     errors.extend(secret_errors)
@@ -2465,6 +2500,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         commit=False,
                         ignore_collisions_with=doomed,
                         deep_json=_deep_json_or_keep(agent.deep),
+                        ignore_peer_lists_of=doomed | rewrites_peers,
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
