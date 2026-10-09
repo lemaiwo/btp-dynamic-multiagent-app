@@ -393,3 +393,391 @@ def test_the_client_is_the_one_the_registry_closes():
     http = fake.client()
     toolset = bitbucket_toolset(BASE_CFG, http=http, auth_mode="destination")
     assert toolset.http_client is http and toolset.client.pins.workspace == WS
+
+
+# --- list_pull_requests -------------------------------------------------------
+
+from agents.bitbucket_tools import (  # noqa: E402
+    MARKER_PREFIX,
+    MAX_CHECKED,
+    MAX_LISTED,
+    MAX_REPOSITORIES_SCANNED,
+    review_marker,
+)
+from tests.bitbucket_helpers import OTHER_UUID, OWN_UUID  # noqa: E402
+
+
+def test_the_marker_is_one_fixed_line():
+    assert review_marker(HEAD) == f"Automated review of commit {HEAD}"
+    assert review_marker(HEAD).startswith(MARKER_PREFIX)
+
+
+async def test_the_list_holds_open_pull_requests_to_the_pinned_branch_only():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, title="One")
+    fake.add_pr("svc-a", 2, branch="develop")
+    fake.add_pr("svc-a", 3, state="MERGED")
+    fake.add_pr("svc-b", 4, draft=True, author="Bob Builder")
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [(p["repository"], p["id"]) for p in out["pull_requests"]] == [
+        ("svc-a", 1), ("svc-b", 4)]
+    assert out["pull_requests"][1] == {
+        "repository": "svc-b", "id": 4, "title": "A change", "author": "Bob Builder",
+        "head_commit": HEAD, "draft": True, "updated_on": "2026-10-09T08:00:00.000000+00:00"}
+    assert out["reviewed_filter"] == "active" and out["already_reviewed"] == 0
+    assert out["repositories"] == 2 and out["repositories_failed"] == 0
+    assert out["more"] is False and "note" not in out
+    assert 'destination.branch.name="main" AND state="OPEN"' in [
+        r.url.params.get("q") for r in fake.requests]
+
+
+async def test_a_pinned_list_is_the_only_thing_that_is_read():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_pr("svc-z", 9)
+    out = await _call(_toolset(fake, repositories=["svc-a"]), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1]
+    assert not any("svc-z" in p or p.endswith(f"/repositories/{WS}") for p in fake.paths())
+
+
+async def test_a_branch_pin_is_used_in_the_query_and_checked_again_on_the_answer():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, branch="release/2.x")
+    fake.add_pr("svc-a", 2)
+    # A server that ignores the query must not widen the list.
+    fake.override = lambda r: (httpx.Response(200, json={"values": [
+        fake.prs[("svc-a", 1)], fake.prs[("svc-a", 2)]]})
+        if r.url.path.endswith("/pullrequests") else None)
+    out = await _call(_toolset(fake, branch="release/2.x"), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1]
+    assert 'destination.branch.name="release/2.x" AND state="OPEN"' in [
+        r.url.params.get("q") for r in fake.requests]
+
+
+async def test_an_item_that_is_no_open_pull_request_with_a_head_is_dropped_silently():
+    fake = FakeBitbucket()
+    good = fake.add_pr("svc-a", 1)
+    fake.add_pr("svc-a", 5)
+    odd = [{**good, "id": True}, {**good, "id": 0}, {**good, "id": "2"},
+           {**good, "state": "MERGED"}, {**good, "source": {"commit": {"hash": "../x"}}},
+           {**good, "source": None}, {**good, "destination": "main"},
+           {**good, "id": 5, "title": ["x"], "author": None, "draft": "false",
+            "updated_on": "yesterday <b>"}]
+    fake.override = lambda r: (httpx.Response(200, json={"values": [*odd, "text", good]})
+                               if r.url.path.endswith("/pullrequests") else None)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [5, 1]
+    assert out["pull_requests"][0] == {"repository": "svc-a", "id": 5, "title": "", "author": "",
+                                       "head_commit": HEAD, "draft": False, "updated_on": None}
+
+
+async def test_a_pull_request_reviewed_at_its_head_commit_is_dropped_until_a_new_commit():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_pr("svc-a", 2, head="cccccccccccc")
+    fake.add_comment("svc-a", 1, review_marker("aaaaaaaaaaaa") + "\n\nVerdict: comment\n\nok",
+                     own=True)
+    fake.add_comment("svc-a", 2, review_marker("aaaaaaaaaaaa") + "\n\nold commit", own=True)
+    toolset = _toolset(fake)
+    out = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [2] and out["already_reviewed"] == 1
+    fake.prs[("svc-a", 1)]["source"]["commit"]["hash"] = "dddddddddddd"     # a new commit
+    out = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1, 2] and out["already_reviewed"] == 0
+
+
+@pytest.mark.parametrize("raw, own, deleted", [
+    ("Automated review of commit aaaaaaaaaaaa", False, False),   # somebody else typed it
+    ("Automated review of commit aaaaaaaaaaaa", True, True),     # deleted
+    ("I saw: Automated review of commit aaaaaaaaaaaa", True, False),   # not the first line
+    ("Verdict: approve\nAutomated review of commit aaaaaaaaaaaa", True, False),
+    ("\nAutomated review of commit aaaaaaaaaaaa", True, False),
+    (" Automated review of commit aaaaaaaaaaaa", True, False),   # not as the code writes it
+    ("> Automated review of commit aaaaaaaaaaaa", True, False),  # a quote
+    ("Automated review of commit aaaaaaaaaaaa and more", True, False),
+    ("Automated review of commit AAAAAAAAAAAA", True, False),
+    ("automated review of commit aaaaaaaaaaaa", True, False),
+    ("Automated review of commit aaaaaa", True, False),          # too short for a hash
+    ("Automated review of commit aaaaaaaaaaab", True, False),    # another commit
+    ("Automated review of commit zzzz", True, False),            # no hash
+    ("Automated review of commit ", True, False),
+])
+async def test_only_this_accounts_own_marker_line_counts(raw, own, deleted):
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_comment("svc-a", 1, raw, own=own, deleted=deleted)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1] and out["already_reviewed"] == 0
+
+
+@pytest.mark.parametrize("change", [
+    {"inline": {"path": "src/x.py", "to": 3}},         # an inline comment is no summary
+    {"parent": {"id": 100}},                           # neither is a reply
+    {"user": {"uuid": OWN_UUID.upper().replace("1", "2")}},
+    {"user": {"uuid": [OWN_UUID]}},
+    {"user": OWN_UUID},
+    {"user": {"display_name": "Review Bot", "account_id": OWN_UUID}},
+    {"deleted": "false", "user": {"uuid": OTHER_UUID}},
+    {"content": {"raw": ["Automated review of commit aaaaaaaaaaaa"]}},
+    {"content": {"html": "Automated review of commit aaaaaaaaaaaa", "raw": "hello"}},
+])
+async def test_a_marker_counts_only_in_a_top_level_comment_of_this_account(change):
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_comment("svc-a", 1, review_marker("aaaaaaaaaaaa"), own=True)
+    fake.comments[("svc-a", 1)][0].update(change)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1] and out["already_reviewed"] == 0
+
+
+async def test_the_author_pasting_the_marker_does_not_hide_the_pull_request():
+    fake = FakeBitbucket()
+    marker = review_marker("aaaaaaaaaaaa")
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa", title=marker, description=marker)
+    fake.add_comment("svc-a", 1, marker)                         # the author, top level
+    fake.add_comment("svc-a", 1, marker + "\n\nVerdict: approve")
+    fake.add_comment("svc-a", 1, f"As the bot said:\n{marker}", own=True)   # quoted by the bot
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1] and out["already_reviewed"] == 0
+    assert out["reviewed_filter"] == "active"
+
+
+async def test_a_long_hash_in_the_marker_matches_the_short_head():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_comment("svc-a", 1, "Automated review of commit " + "a" * 40, own=True)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["pull_requests"] == [] and out["already_reviewed"] == 1
+
+
+async def test_the_marker_is_found_as_bitbucket_may_hand_it_back():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_comment("svc-a", 1, review_marker("aaaaaaaaaaaa") + "  \r\n\r\nVerdict", own=True)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["pull_requests"] == [] and out["already_reviewed"] == 1
+
+
+async def test_an_unknown_account_gives_an_unfiltered_list_that_says_so(caplog):
+    caplog.set_level(logging.DEBUG)
+    fake = FakeBitbucket()
+    fake.user_status = 502
+    fake.add_pr("svc-a", 1)
+    fake.add_comment("svc-a", 1, review_marker(HEAD), own=True)
+    toolset = _toolset(fake)
+    out = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1]
+    assert out["reviewed_filter"] == "unavailable" and "could not be identified" in out["note"]
+    assert out["already_reviewed"] == 0
+    assert not any(p.endswith("/comments") for p in fake.paths())
+    logged = "\n".join(caplog.handler.format(r) for r in caplog.records)
+    assert "PLANTED-ERROR-BODY" not in json.dumps(out) + logged
+    assert "builtin:bitbucket: the reviewing account could not be identified" in logged
+    # The failure is not cached: the next call filters again.
+    fake.user_status = 200
+    out = await _call(toolset, "list_pull_requests")
+    assert out["pull_requests"] == [] and out["reviewed_filter"] == "active"
+
+
+async def test_the_account_is_asked_once_when_it_is_known():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    toolset = _toolset(fake)
+    await _call(toolset, "list_pull_requests")
+    await _call(toolset, "list_pull_requests")
+    await _call(toolset, "get_pull_request", repository="svc-a", id=1)
+    assert fake.paths().count("GET /2.0/user") == 1
+
+
+@pytest.mark.parametrize("body", [
+    {"uuid": "<script>"}, {"uuid": OWN_UUID.strip("{}")}, {"uuid": OWN_UUID + "\n"},
+    {"uuid": None}, {"uuid": [OWN_UUID]}, {"account_id": "acc-1"}, [OWN_UUID]])
+async def test_a_uuid_that_has_not_the_form_of_one_is_no_account(body):
+    fake = FakeBitbucket()
+    fake.override = lambda r: (httpx.Response(200, json=body)
+                               if r.url.path == "/2.0/user" else None)
+    fake.add_pr("svc-a", 1)
+    toolset = _toolset(fake)
+    out = await _call(toolset, "list_pull_requests")
+    assert out["reviewed_filter"] == "unavailable"
+    assert await toolset.client.whoami() == ""
+
+
+async def test_the_two_helpers_the_write_tools_need():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaaaaaaa")
+    fake.add_comment("svc-a", 1, review_marker("aaaaaaaaaaaa"), own=True)
+    client = _toolset(fake).client
+    account = await client.whoami()
+    assert account == OWN_UUID
+    base = f"/2.0/repositories/{WS}/svc-a/pullrequests/1"
+    assert await client.reviewed(base, "aaaaaaaaaaaa", account) is True
+    assert await client.reviewed(base, "bbbbbbbbbbbb", account) is False
+    # Without an account nothing is anybody's marker, and nothing is asked.
+    asked = len(fake.requests)
+    assert await client.reviewed(base, "aaaaaaaaaaaa", "") is False
+    assert len(fake.requests) == asked
+
+
+async def test_the_list_is_capped_and_says_that_more_exist():
+    fake = FakeBitbucket()
+    for i in range(1, MAX_LISTED + 6):
+        fake.add_pr("svc-a", i)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert len(out["pull_requests"]) == MAX_LISTED and out["more"] is True
+
+
+async def test_a_full_list_stops_reading_and_says_more_while_repositories_are_unread():
+    fake = FakeBitbucket()
+    for i in range(1, MAX_LISTED + 1):
+        fake.add_pr("svc-a", i)
+    fake.add_pr("svc-b", 99)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert len(out["pull_requests"]) == MAX_LISTED and out["more"] is True
+    assert out["repositories"] == 1 and not any("/svc-b/" in p for p in fake.paths())
+
+
+async def test_a_second_page_of_open_pull_requests_is_not_read_but_said():
+    fake = FakeBitbucket()
+    fake.page_size = 2
+    for i in range(1, 4):
+        fake.add_pr("svc-a", i)
+    out = await _call(_toolset(fake, repositories=["svc-a"]), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1, 2] and out["more"] is True
+    assert sum(p.split("?")[0].endswith("/pullrequests") for p in fake.paths()) == 1
+
+
+async def test_at_most_max_checked_pull_requests_have_their_comments_read():
+    fake = FakeBitbucket()
+    for i in range(1, MAX_CHECKED + 6):
+        fake.add_pr("svc-a", i)
+        fake.add_comment("svc-a", i, review_marker(HEAD), own=True)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["pull_requests"] == [] and out["already_reviewed"] == MAX_CHECKED
+    assert out["more"] is True
+    assert sum(p.split("?")[0].endswith("/comments") for p in fake.paths()) == MAX_CHECKED
+
+
+async def test_the_comments_of_a_candidate_are_read_three_pages_deep():
+    fake = FakeBitbucket()
+    fake.page_size = 2
+    fake.add_pr("svc-a", 1)
+    for i in range(5):
+        fake.add_comment("svc-a", 1, f"c{i}")
+    fake.add_comment("svc-a", 1, review_marker(HEAD), own=True)       # on the third page
+    fake.add_pr("svc-a", 2)
+    for i in range(6):
+        fake.add_comment("svc-a", 2, f"c{i}")
+    fake.add_comment("svc-a", 2, review_marker(HEAD), own=True)       # on the fourth
+    out = await _call(_toolset(fake, repositories=["svc-a"]), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [2] and out["already_reviewed"] == 1
+    assert sum("/pullrequests/2/comments" in p for p in fake.paths()) == 3
+
+
+async def test_the_workspace_listing_keeps_slugs_only_and_stops_at_its_cap():
+    fake = FakeBitbucket()
+    fake.page_size = 100
+    fake.repos = ["svc-a", "Not A Slug", "../x"] + [
+        f"r{i}" for i in range(MAX_REPOSITORIES_SCANNED)]
+    fake.add_pr("svc-a", 1)
+
+    def answer(request):
+        if request.url.path == f"/2.0/repositories/{WS}":
+            return httpx.Response(200, json={"values": [
+                *({"slug": r} for r in fake.repos), {"slug": 7}, "text", {"name": "x"}]})
+        return None
+
+    fake.override = answer
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1]
+    assert out["repositories"] == MAX_REPOSITORIES_SCANNED and out["more"] is True
+    assert not any("Not" in p or ".." in p for p in fake.paths())
+    listing = [r for r in fake.requests if r.url.path == f"/2.0/repositories/{WS}"]
+    assert len(listing) == 1 and listing[0].url.params.get("pagelen") == "100"
+
+
+async def test_a_workspace_listing_with_a_next_page_says_more():
+    fake = FakeBitbucket()
+    fake.page_size = 1
+    fake.add_pr("svc-a", 1)
+    fake.repos.append("svc-b")
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["repositories"] == 1 and out["more"] is True
+    assert sum(p.split("?")[0].endswith(f"/repositories/{WS}") for p in fake.paths()) == 1
+
+
+async def test_a_workspace_that_cannot_be_listed_is_the_calls_error():
+    fake = FakeBitbucket()
+    fake.override = lambda r: (httpx.Response(403, text="PLANTED-ERROR-BODY")
+                               if r.url.path == f"/2.0/repositories/{WS}" else None)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["error"]["code"] == "bitbucket_forbidden" and "PLANTED" not in json.dumps(out)
+
+
+async def test_a_repository_that_is_refused_costs_only_itself():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_pr("svc-b", 2)
+    fake.override = lambda r: (httpx.Response(403, text="PLANTED-ERROR-BODY")
+                               if "/svc-a/pullrequests" in r.url.path else None)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [2] and out["repositories_failed"] == 1
+    assert out["repositories"] == 1 and "PLANTED" not in json.dumps(out)
+
+
+async def test_a_pull_request_whose_comments_cannot_be_read_is_not_listed_as_unreviewed():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_pr("svc-a", 2)
+    fake.add_pr("svc-b", 3)
+    fake.override = lambda r: (httpx.Response(500, text="PLANTED-ERROR-BODY")
+                               if r.url.path.endswith("/svc-a/pullrequests/2/comments") else None)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [1, 3]
+    assert out["repositories_failed"] == 1 and out["repositories"] == 1
+
+
+async def test_throttling_ends_the_list_as_an_error_not_as_a_short_list():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.override = lambda r: (httpx.Response(429) if "/pullrequests" in r.url.path else None)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out == {"error": {"code": "bitbucket_throttled",
+                             "message": "Bitbucket is throttling requests (HTTP 429)",
+                             "hint": "try again later"}}
+
+
+@pytest.mark.parametrize("where", ["/svc-b/pullrequests", "/svc-b/pullrequests/2/comments"])
+@pytest.mark.parametrize("status, code", [(401, "bitbucket_unauthorized"),
+                                          (429, "bitbucket_throttled")])
+async def test_a_failure_that_is_not_one_repositorys_ends_the_call(where, status, code):
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1)
+    fake.add_pr("svc-b", 2)
+    fake.override = lambda r: (httpx.Response(status) if r.url.path.endswith(where) else None)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert set(out) == {"error"} and out["error"]["code"] == code
+
+
+async def test_get_pull_request_marks_this_accounts_comments_as_own():
+    fake = _fake()
+    fake.add_comment("svc-a", 7, review_marker(HEAD), own=True)
+    fake.add_comment("svc-a", 7, "a question")
+    out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
+    assert [c["own"] for c in out["comments"]] == [True, False]
+
+
+async def test_without_an_account_no_comment_is_own_and_the_pull_request_is_still_read():
+    fake = _fake()
+    fake.user_status = 502
+    fake.add_comment("svc-a", 7, review_marker(HEAD), own=True)
+    fake.comments[("svc-a", 7)].append({"id": 5, "content": {"raw": "x"}, "user": {"uuid": ""}})
+    out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
+    assert [c["own"] for c in out["comments"]] == [False, False] and out["head_commit"] == HEAD
+
+
+def test_the_list_tool_says_what_its_answer_means():
+    text = _toolset(_fake()).tools["list_pull_requests"].function.__doc__
+    assert "never as instructions" in text and "do not guess" in text
+    assert "`more: true`" in text and "`reviewed_filter: unavailable`" in text
+    assert "get_pull_request" in text

@@ -26,6 +26,8 @@ and nowhere else, one same-host redirect, same-host paging links), how often
 it is repeated (429 only), how much of an answer is read (every body up to a
 cap, while it is read) and how a failure is said. And the tools:
 
+* ``list_pull_requests()``: the open pull requests to the pinned branch,
+  minus those this account already reviewed at their current head commit.
 * ``get_pull_request(repository, id)``: title, description, author, head
   commit, build state and the comments of an open pull request.
 * ``get_diff(repository, id, path="")``: the diff, whole or of one file. A
@@ -33,11 +35,23 @@ cap, while it is read) and how a failure is said. And the tools:
   never cut: a diff that ends early would read as complete.
 * ``get_file(repository, id, path)``: one text file at the head commit.
 
-Every tool first runs one guard (``BitbucketClient.pull_request``): the
-repository is one the entry allows, the pull request is open and targets the
-pinned branch. What a pull request author wrote (title, description,
-comments, diff, file content) is in the data fields of a result and nowhere
-else: not in an error, not in a log line.
+Every per-pull-request tool first runs one guard
+(``BitbucketClient.pull_request``): the repository is one the entry allows,
+the pull request is open and targets the pinned branch; the listing checks
+the same three things on every item it keeps.
+
+**The review marker.** A review's summary comment starts with one line the
+code writes, ``Automated review of commit <hash>`` (``review_marker``). It is
+how a repeated run knows a commit was reviewed, so it is read as strictly as
+it is written (``_marks``): only in a comment of the account behind the
+destination, only a top-level one (no inline comment, no reply), only as the
+whole first line, only for a hash that matches the current head. The same
+text typed by anybody else, quoted, or further down a comment is no marker: a
+pull request author could otherwise make the agent skip their pull request.
+
+What a pull request author wrote (title, description, comments, diff, file
+content) is in the data fields of a result and nowhere else: not in an error,
+not in a log line.
 """
 
 from __future__ import annotations
@@ -93,6 +107,19 @@ _STATUS_WORD_RE = re.compile(r"[a-z ]{1,20}")
 # Marks, in ``Response.extensions``, an answer whose body was longer than the
 # cap it was read with; nothing of that body is kept.
 _OVER_CAP = "bitbucket_over_cap"
+MARKER_PREFIX = "Automated review of commit "
+MAX_LISTED, MAX_CHECKED, MAX_REPOSITORIES_SCANNED = 20, 40, 50
+MAX_LISTED_PER_REPOSITORY, MAX_MARKER_PAGES = 50, 3
+_UUID_RE = re.compile(r"\{[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}")
+_UPDATED_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]{8,15}(Z|[+-][0-9]{2}:[0-9]{2})")
+# Codes that end a listing instead of being counted per repository: they are
+# about the account or the connection, the next repository would fail too.
+_FATAL = frozenset({"bitbucket_throttled", "bitbucket_unreachable", "destination_error",
+                    "bitbucket_unauthorized"})
+_UNFILTERED_NOTE = (
+    "the reviewing account could not be identified: this list may include pull "
+    "requests that were already reviewed at their current commit; check the "
+    "comments with get_pull_request before reviewing")
 _BINARY = ("binary_file", "the file is binary or stored outside the repository; not read")
 _INVALID_PATH = ("invalid_path", "the path is not a file path below the repository root")
 _FILE_TOO_LARGE = ("result_too_large", "the file does not fit a tool answer")
@@ -197,6 +224,46 @@ def _same_host_target(value: Any, sent: httpx.URL) -> httpx.URL | None:
     return target
 
 
+def review_marker(head: str) -> str:
+    """The first line of a review's summary comment. Written by the code."""
+    return MARKER_PREFIX + head
+
+
+def _marked_commit(raw: Any) -> str | None:
+    """The commit a comment's first line marks as reviewed, if that line is a
+    marker: the prefix and a hash and nothing else. Only what a server may add
+    at the end of a line (blanks, a carriage return) is tolerated; a marker
+    that is indented, quoted or followed by text is not the line the code
+    writes."""
+    first = raw.split("\n", 1)[0].rstrip(" \t\r") if isinstance(raw, str) else ""
+    commit = first[len(MARKER_PREFIX):] if first.startswith(MARKER_PREFIX) else ""
+    return commit if _HASH_RE.fullmatch(commit) else None
+
+
+def _is_own(comment: dict[str, Any], account: str) -> bool:
+    """Whether a comment was written by ``account`` (a uuid in Bitbucket's own
+    form; the empty string, an unknown account, owns nothing)."""
+    return bool(account) and _dig(comment, "user", "uuid") == account
+
+
+def _marks(comment: dict[str, Any], head: str, account: str) -> bool:
+    """Whether a comment is this account's review marker for ``head``.
+
+    Default-deny: a deleted comment, somebody else's, an inline comment or a
+    reply (their text is the model's, a summary's first line is the code's)
+    never counts. The two hashes match when one is a prefix of the other
+    (Bitbucket hands out 12 characters in a list and 40 elsewhere).
+    """
+    if comment.get("deleted", False) is not False:      # anything but a plain "no"
+        return False
+    if not _is_own(comment, account):
+        return False
+    if comment.get("inline") is not None or comment.get("parent") is not None:
+        return False
+    marked = _marked_commit(_dig(comment, "content", "raw"))
+    return marked is not None and (marked.startswith(head) or head.startswith(marked))
+
+
 def _cut(value: Any, limit: int) -> str:
     text = value if isinstance(value, str) else ""
     return text if len(text) <= limit else text[:limit] + _TRUNCATED
@@ -247,7 +314,7 @@ def _diffstat_entry(item: dict[str, Any]) -> dict[str, Any]:
             "lines_removed": _count(item.get("lines_removed"))}
 
 
-def _comment(item: dict[str, Any]) -> dict[str, Any]:
+def _comment(item: dict[str, Any], account: str = "") -> dict[str, Any]:
     inline = item.get("inline")
     if isinstance(inline, dict):
         line = inline.get("to") if type(inline.get("to")) is int else inline.get("from")
@@ -259,7 +326,7 @@ def _comment(item: dict[str, Any]) -> dict[str, Any]:
             "author": _cut(_dig(item, "user", "display_name"), MAX_NAME_CHARS),
             "text": _cut(_dig(item, "content", "raw"), MAX_COMMENT_TEXT_CHARS),
             "inline": inline,
-            "own": False}
+            "own": _is_own(item, account)}
 
 
 class BitbucketAuth(DestinationAuth):
@@ -338,6 +405,8 @@ class BitbucketClient:
                  sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
         self._http, self.pins, self._sleep = http, pins, sleep
         self._turn = asyncio.Lock()      # the calls of one toolset are sequential
+        # The uuid of the account behind the destination, once it is known.
+        self._account: str | None = None
 
     async def _exchange(self, method: str, url: Any, params: Any, json: Any,
                         cap: int) -> httpx.Response:
@@ -497,6 +566,132 @@ class BitbucketClient:
             raise Refused("bitbucket_error", "Bitbucket answered without a head commit")
         return base, body, head
 
+    # -- the reviewing account and its marker ----------------------------------
+    async def whoami(self) -> str:
+        """The uuid of the account behind the destination, or ``""`` while it
+        is unknown. Fetched once: the destination is application-level, so the
+        account is the same for every run of this toolset.
+
+        A failure is not cached: ``""`` for this call only. The toolset lives
+        until the next registry reload; a cached failure would turn one bad
+        answer into a filter that stays off (see ``JiraClient.whoami``). The
+        uuid is compared with what comments carry, so only a value in
+        Bitbucket's own form is an account.
+        """
+        if self._account is None:
+            try:
+                uuid = self._json(await self._send("GET", f"{API_ROOT}/user")).get("uuid")
+            except Refused:
+                uuid = None
+            if not isinstance(uuid, str) or not _UUID_RE.fullmatch(uuid):
+                logger.warning("%s: the reviewing account could not be identified",
+                               BUILTIN_BITBUCKET_URL)
+                return ""
+            self._account = uuid
+        return self._account
+
+    async def reviewed(self, base: str, head: str, account: str) -> bool:
+        """Whether ``account``'s review marker for the commit ``head`` is among
+        the comments of the pull request at ``base`` (the path the guard
+        returns). The first ``MAX_MARKER_PAGES`` pages of 100 are read; without
+        an account nothing is read and the answer is no. A ``Refused`` of the
+        read is the caller's to decide about."""
+        if not account:
+            return False
+        comments, _ = await self._pages(f"{base}/comments", {"pagelen": "100"},
+                                        max_pages=MAX_MARKER_PAGES)
+        return any(_marks(comment, head, account) for comment in comments)
+
+    # -- the listing -----------------------------------------------------------
+    async def _repositories(self) -> tuple[list[str], bool]:
+        """The repositories a listing reads and whether there may be more:
+        the pinned list in its order, else one page of the workspace."""
+        if self.pins.repositories is not None:
+            return list(self.pins.repositories), False
+        items, more = await self._pages(f"{API_ROOT}/repositories/{self.pins.workspace}",
+                                        {"pagelen": "100"}, max_pages=1)
+        slugs: list[str] = []
+        for item in items:
+            slug = item.get("slug")
+            # The slug goes into a URL path: only what has the form of one.
+            if repository_allowed(self.pins, slug) and slug not in slugs:
+                slugs.append(slug)
+        return (slugs[:MAX_REPOSITORIES_SCANNED],
+                more or len(slugs) > MAX_REPOSITORIES_SCANNED)
+
+    def _listed(self, repository: str, item: dict[str, Any]) -> dict[str, Any] | None:
+        """One item of a repository's listing as the tool returns it, or
+        ``None``: the query is a request, this is the check. The id and the
+        head commit go into URL paths later."""
+        pr_id, head = item.get("id"), _dig(item, "source", "commit", "hash")
+        if (item.get("state") != "OPEN"
+                or _dig(item, "destination", "branch", "name") != self.pins.branch
+                or type(pr_id) is not int or not 0 < pr_id < 1_000_000_000
+                or not isinstance(head, str) or not _HASH_RE.fullmatch(head)):
+            return None
+        updated = item.get("updated_on")
+        return {"repository": repository, "id": pr_id,
+                "title": _cut(item.get("title"), MAX_TITLE_CHARS),
+                "author": _cut(_dig(item, "author", "display_name"), MAX_NAME_CHARS),
+                "head_commit": head,
+                "draft": item.get("draft") is True,
+                "updated_on": updated if isinstance(updated, str)
+                and _UPDATED_RE.fullmatch(updated) else None}
+
+    async def list_pull_requests(self) -> dict[str, Any]:
+        """The open pull requests to the pinned branch that this account has
+        not reviewed at their current head commit, within the caps (Bitbucket
+        allows about 1,000 calls an hour per account)."""
+        account = await self.whoami()
+        repositories, more = await self._repositories()
+        # The branch has passed the config module's pattern: it holds no quote.
+        params = {"q": f'destination.branch.name="{self.pins.branch}" AND state="OPEN"',
+                  "pagelen": str(MAX_LISTED_PER_REPOSITORY)}
+        listed: list[dict[str, Any]] = []
+        already = checked = read = failed = 0
+        full = False
+        for repository in repositories:
+            if full:
+                more = True          # a cap was reached with repositories unread
+                break
+            try:
+                items, further = await self._pages(f"{self._repo(repository)}/pullrequests",
+                                                   params, max_pages=1)
+                more = more or further
+                for item in items:
+                    entry = self._listed(repository, item)
+                    if entry is None:
+                        continue
+                    if len(listed) >= MAX_LISTED or (account and checked >= MAX_CHECKED):
+                        more = full = True
+                        break
+                    if account:
+                        checked += 1
+                        base = f"{self._repo(repository)}/pullrequests/{entry['id']}"
+                        if await self.reviewed(base, entry["head_commit"], account):
+                            already += 1
+                            continue
+                    listed.append(entry)
+            except Refused as refused:
+                if refused.code in _FATAL:
+                    raise                # nothing partial: a short list would read as complete
+                # This repository only. A pull request whose comments could
+                # not be read is not listed: it may have been reviewed.
+                failed += 1
+                continue
+            read += 1
+            full = full or len(listed) >= MAX_LISTED or bool(account and checked >= MAX_CHECKED)
+        result: dict[str, Any] = {
+            "pull_requests": listed,
+            "reviewed_filter": "active" if account else "unavailable",
+            "already_reviewed": already,
+            "repositories": read,
+            "repositories_failed": failed,
+            "more": more}
+        if not account:
+            result["note"] = _UNFILTERED_NOTE
+        return result
+
     async def builds(self, base: str) -> dict[str, Any]:
         statuses, more = await self._pages(f"{base}/statuses", {"pagelen": "100"},
                                            max_pages=MAX_STATUS_PAGES)
@@ -513,7 +708,9 @@ class BitbucketClient:
         builds = await self.builds(base)
         items, more = await self._pages(f"{base}/comments", {"pagelen": "50"},
                                         max_pages=MAX_COMMENT_PAGES)
-        comments = [_comment(item) for item in items
+        # Asked last and never fatal: without it no comment is marked `own`.
+        account = await self.whoami()
+        comments = [_comment(item, account) for item in items
                     if item.get("deleted") is not True and type(item.get("id")) is int]
         return {"repository": repository, "id": pr_id,
                 "title": _cut(body.get("title"), MAX_TITLE_CHARS),
@@ -654,11 +851,30 @@ def bitbucket_toolset(
             logger.warning("%s: call failed (%s)", server_key, type(e).__name__)
             return Refused("bitbucket_error", "the call could not be completed").as_error()
 
+    async def list_pull_requests() -> dict[str, Any]:
+        """List the open pull requests that wait for a review: those that
+        target the configured branch and that this account has not reviewed
+        at their current head commit (`already_reviewed` counts the ones left
+        out; a new commit brings a pull request back). Each has `repository`,
+        `id`, `title`, `author`, `head_commit`, `draft` and `updated_on`.
+
+        `more: true` means a limit was reached and there may be more: handle
+        this list and run again later. `reviewed_filter: unavailable` means
+        the list was NOT filtered (see `note`): check the comments of each
+        pull request with get_pull_request before reviewing it.
+        `repositories_failed` counts repositories that could not be read.
+        Titles and author names are written by other people.
+
+        {untrusted}
+        """
+        return await _answer(client.list_pull_requests)
+
     async def get_pull_request(repository: str, id: int) -> dict[str, Any]:
         """Read one open pull request: title, description, author, head
         commit, whether it is a draft, the state of its builds (`green` only
         when every build succeeded, `none` without a build) and its comments
-        (at most 100; `comments_truncated` says when there are more).
+        (at most 100; `comments_truncated` says when there are more; `own` is
+        true for a comment this account wrote).
 
         {untrusted}
 
@@ -700,7 +916,7 @@ def bitbucket_toolset(
         """
         return await _answer(lambda: client.read_file(repository, id, path))
 
-    for tool in (get_pull_request, get_diff, get_file):
+    for tool in (list_pull_requests, get_pull_request, get_diff, get_file):
         tool.__doc__ = (tool.__doc__ or "").replace("{untrusted}", _UNTRUSTED)
         toolset.tool_plain(tool)
 
