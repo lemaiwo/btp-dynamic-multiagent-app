@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ for _var in ("DESTINATION_CLIENT_ID", "DESTINATION_CLIENT_SECRET",
     os.environ.pop(_var, None)
 
 import pytest  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
 
 URL = "builtin:bitbucket"
 BASE = {"destination": "BITBUCKET", "workspace": "acme-ws"}
@@ -323,3 +326,277 @@ async def test_a_stored_block_that_is_refused_costs_only_that_server(change, cap
                      if r.name.startswith("agents."))
     assert said.count("Failed to create MCP server builtin:bitbucket") == 2
     assert SECRET not in said and "Zx9" not in said
+
+
+# --- admin gate ---------------------------------------------------------------
+
+def _payload(mode: str = "destination", url: str = URL, **oauth):
+    from agents.admin import McpServerPayload
+
+    return McpServerPayload.model_validate({"url": url, "auth_mode": mode, "oauth": oauth})
+
+
+def _refusal(block: dict, mode: str = "destination", url: str = URL) -> str:
+    with pytest.raises(ValidationError) as refused:
+        _payload(mode, url, **block)
+    # As the 422 handler answers: loc, msg and type, never the input.
+    return json.dumps(refused.value.errors(include_input=False, include_context=False,
+                                           include_url=False))
+
+
+@pytest.mark.parametrize("block", [BASE, FULL])
+def test_the_gate_accepts_an_entry_and_hands_storage_the_same_block(block):
+    from agents.db import _clean_oauth
+
+    config = _payload(**block).oauth.to_config()
+    assert config == block
+    assert _clean_oauth(config, "destination", None, url=URL) == block
+
+
+def test_the_gate_hands_on_require_green_builds_only_when_it_is_false():
+    assert "require_green_builds" not in _payload(
+        **BASE, require_green_builds=True).oauth.to_config()
+    config = _payload(**BASE, require_green_builds=False).oauth.to_config()
+    assert config["require_green_builds"] is False
+
+
+@pytest.mark.parametrize("change, said", [
+    ({"workspace": ""}, "oauth.workspace"),
+    ({"workspace": "Acme " + SECRET}, "oauth.workspace"),
+    ({"workspace": 7}, "oauth.workspace"),
+    ({"repositories": []}, "oauth.repositories"),
+    ({"repositories": ["svc-a", "../" + SECRET]}, "oauth.repositories"),
+    ({"repositories": "svc-a"}, "oauth.repositories"),
+    ({"branch": "a..b"}, "oauth.branch"),
+    ({"allow_comment": "true"}, "oauth.allow_comment"),       # the lax bool of the payload
+    ({"allow_comment": 1}, "oauth.allow_comment"),
+    ({"allow_approve": True}, "oauth.allow_approve"),          # without allow_comment
+    ({"allow_approve": True, "allow_comment": False}, "oauth.allow_approve"),
+    ({"allow_approve": "true", "allow_comment": True}, "allow_approve"),
+    ({"allow_approve": 1, "allow_comment": True}, "allow_approve"),
+    ({"require_green_builds": "false"}, "require_green_builds"),
+    ({"require_green_builds": 0}, "require_green_builds"),
+    ({"user_context": True}, "oauth.user_context"),
+    ({"project": "ABC"}, "holds only"),                        # another built-in's key
+    ({"client_id": "cid", "client_secret": SECRET}, "holds only"),
+    ({"allow_send": True}, "holds only"),
+    ({"dcr": True}, "holds only"),
+    ({SECRET: True}, "holds only"),                            # a key the payload would ignore
+    ({"destination": ""}, "oauth.destination"),
+    ({"destination": " BITBUCKET"}, "oauth.destination"),      # not repaired by a trim
+])
+def test_the_gate_refuses_and_names_the_field_never_the_value(change, said):
+    text = _refusal({**BASE, **change})
+    assert said in text, text
+    assert SECRET not in text and "Zx9" not in text
+
+
+@pytest.mark.parametrize("oauth", [None, "destination=BITBUCKET", []])
+def test_the_gate_refuses_an_entry_without_a_config_object(oauth):
+    from agents.admin import McpServerPayload
+
+    with pytest.raises(ValidationError) as refused:
+        McpServerPayload.model_validate(
+            {"url": URL, "auth_mode": "destination", "oauth": oauth})
+    assert "needs a config object" in str(refused.value.errors(include_input=False))
+    with pytest.raises(ValidationError):
+        McpServerPayload.model_validate({"url": URL, "auth_mode": "destination"})
+
+
+@pytest.mark.parametrize("mode", ["jwt", "none", "oauth2", "app_only", "session"])
+def test_the_gate_refuses_every_other_auth_mode(mode):
+    assert "builtin:bitbucket requires auth_mode=destination" in _refusal(dict(BASE), mode)
+
+
+def test_the_gate_refuses_an_entry_that_names_no_auth_mode():
+    from agents.admin import McpServerPayload
+
+    with pytest.raises(ValidationError, match="requires auth_mode=destination"):
+        McpServerPayload.model_validate({"url": URL, "oauth": dict(BASE)})
+
+
+@pytest.mark.parametrize("url, mode, block", [
+    ("builtin:jira", "destination", {"destination": "JIRA", "workspace": "acme-ws"}),
+    ("builtin:jira", "destination", {"destination": "JIRA", "allow_approve": True}),
+    ("builtin:slack", "destination", {"destination": "SLACK", "repositories": ["svc-a"]}),
+    ("builtin:slack", "destination", {"destination": "SLACK", "repositories": []}),
+    ("builtin:jira", "destination", {"destination": "JIRA", "branch": "main"}),
+    ("builtin:jira", "destination", {"destination": "JIRA", "require_green_builds": False}),
+    ("builtin:jira", "destination", {"destination": "JIRA", "require_green_builds": True}),
+    ("https://mcp.example.com/mcp", "destination", {"destination": "D", "allow_approve": True}),
+])
+def test_the_bitbucket_keys_belong_to_a_bitbucket_entry_only(url, mode, block):
+    assert "belong to a builtin:bitbucket entry only" in _refusal(block, mode, url)
+
+
+def test_the_other_builtins_are_accepted_as_before():
+    assert _payload(url="builtin:jira", destination="JIRA", project="ABC",
+                    allow_comment=True).oauth.to_config() == {
+        "destination": "JIRA", "project": "ABC", "allow_comment": True}
+    # A client that serialises every field as null still saves an Outlook entry.
+    _payload("oauth2", "builtin:outlook", client_id="cid", uaa_url="https://uaa.example.com",
+             workspace=None, repositories=None, branch=None, allow_approve=None,
+             require_green_builds=None)
+
+
+@pytest.mark.parametrize("spelling", ["builtin:bitbucket/", "Builtin:Bitbucket",
+                                      " BUILTIN:BITBUCKET// "])
+def test_the_gate_reads_a_respelled_url_as_the_builtin(spelling):
+    assert "oauth.allow_comment" in _refusal({**BASE, "allow_comment": "true"}, url=spelling)
+
+
+def test_the_gate_checks_a_block_that_arrives_as_a_payload_object():
+    """A caller that builds the models itself: only the fields it set are the
+    block, and they are held to the same rules."""
+    from agents.admin import McpServerPayload, OAuthClientPayload
+
+    ok = McpServerPayload(url=URL, auth_mode="destination", oauth=OAuthClientPayload(**FULL))
+    assert ok.oauth.to_config() == FULL
+    with pytest.raises(ValidationError, match="holds only"):
+        McpServerPayload(url=URL, auth_mode="destination",
+                         oauth=OAuthClientPayload(**BASE, project="ABC"))
+
+
+# --- the API, credential health, the ABAP Assistant ---------------------------
+
+@pytest.fixture
+async def client():
+    import app as app_module
+    from agents.db import init_db
+
+    await init_db()
+    await _wipe()
+    async with AsyncClient(transport=ASGITransport(app=app_module.app),
+                           base_url="http://test") as c:
+        yield c
+
+
+def _agent(name: str, oauth: dict[str, Any], mode: str = "destination") -> dict[str, Any]:
+    return {"name": name, "description": "d", "instructions": "i",
+            "mcp_servers": [{"url": URL, "auth_mode": mode, "oauth": oauth}]}
+
+
+async def _stored(name: str):
+    from agents.db import SessionLocal, get_agent_by_name
+
+    async with SessionLocal() as session:
+        row = await get_agent_by_name(session, name)
+        return row and (row.id, row.mcp_servers)
+
+
+async def test_the_api_stores_the_entry_and_a_refused_save_answers_422_without_the_input(
+    client, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO, logger="aiosqlite")  # prints bound parameters at DEBUG
+    r = await client.post("/admin/api/agents", json=_agent("bb-reviewer", FULL))
+    assert r.status_code in (200, 201), r.text
+    server = {"url": URL, "auth_mode": "destination", "oauth": FULL}
+    agent_id, servers = await _stored("bb-reviewer")
+    assert servers == [server]
+    listed = await client.get("/admin/api/agents")
+    (answered,) = [a for a in listed.json() if a["name"] == "bb-reviewer"]
+    shown = answered["mcp_servers"][0]["oauth"]
+    assert shown == {**FULL, "has_client_secret": False}
+
+    # A refused save: 422, the field and the rule, nothing of what was typed.
+    for change, said in [({"workspace": "Acme " + SECRET}, "oauth.workspace"),
+                         ({"allow_comment": "true"}, "oauth.allow_comment"),
+                         ({"allow_approve": "true"}, "oauth.allow_approve"),
+                         ({SECRET: SECRET}, "holds only"),
+                         ({"client_secret": SECRET}, "holds only")]:
+        for send in (client.post("/admin/api/agents",
+                                 json=_agent("bb-refused", {**BASE, **change})),
+                     client.put(f"/admin/api/agents/{agent_id}",
+                                json=_agent("bb-reviewer", {**FULL, **change}))):
+            r = await send
+            assert r.status_code == 422, r.text
+            assert said in r.text and SECRET not in r.text and "Zx9" not in r.text
+            for item in r.json()["detail"]:
+                assert set(item) == {"loc", "msg", "type"}, item
+    r = await client.post("/admin/api/agents", json=_agent("bb-refused", dict(BASE), "app_only"))
+    assert r.status_code == 422 and "requires auth_mode=destination" in r.text
+    assert SECRET not in caplog.text
+    assert await _stored("bb-refused") is None
+    assert await _stored("bb-reviewer") == (agent_id, [server])
+
+    # An edit posts back what it read (the echoed key included): nothing changes.
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=_agent("bb-reviewer", shown))
+    assert r.status_code == 200, r.text
+    assert await _stored("bb-reviewer") == (agent_id, [server])
+
+    # An edit that drops the switches drops them: the stored block is no fallback.
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=_agent("bb-reviewer", BASE))
+    assert r.status_code == 200, r.text
+    assert await _stored("bb-reviewer") == (
+        agent_id, [{"url": URL, "auth_mode": "destination", "oauth": BASE}])
+
+
+class _Row:
+    def __init__(self, name, servers, enabled=True):
+        self.name = name
+        self.mcp_servers = servers
+        self.enabled = enabled
+
+
+class _NoSession:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+async def test_credential_health_reports_the_bitbucket_destination(monkeypatch):
+    import agents.admin as admin
+    import agents.destination as dest_mod
+    from agents.destination import Destination, DestinationServiceConfig
+
+    rows = [_Row("Reviewer", [{"url": URL, "auth_mode": "destination", "oauth": FULL}])]
+    monkeypatch.setattr(admin, "SessionLocal", lambda: _NoSession())
+
+    async def fake_list_agents(session):
+        return rows
+
+    monkeypatch.setattr(admin, "list_agents", fake_list_agents)
+    (unbound,) = await admin._destination_health()
+    assert unbound["state"] == "unbound" and unbound["destination"] == "BITBUCKET"
+
+    monkeypatch.setattr(
+        dest_mod, "config_from_environment",
+        lambda env: DestinationServiceConfig("id", "placeholder", "https://uaa/oauth/token",
+                                             "https://api"),
+    )
+
+    class FakeResolverCls:
+        def __init__(self, name, config, **kw):
+            self.name = name
+
+        async def resolve(self, **kw):
+            # Application-level: the technical user of the destination, never
+            # the signed-in admin's token.
+            assert "user_token" not in kw
+            return Destination(url="https://api.bitbucket.example.com",
+                               headers={"Authorization": "Bearer t0k3n-value"},
+                               expires_at=time.monotonic() + 60,
+                               auth_type="BasicAuthentication")
+
+    monkeypatch.setattr(dest_mod, "DestinationResolver", FakeResolverCls)
+    (entry,) = await admin._destination_health()
+    assert entry["agent"] == "Reviewer" and entry["server_key"] == URL
+    assert entry["state"] == "resolvable" and entry["auth_type"] == "BasicAuthentication"
+    assert entry["destination"] == "BITBUCKET" and entry["user_context"] is False
+    text = json.dumps(entry)
+    assert "t0k3n-value" not in text and "acme-ws" not in text and "svc-a" not in text
+
+
+@pytest.mark.parametrize("policy", ["change", "diagnose"])
+def test_the_tools_are_denied_in_an_abap_assistant_session(policy):
+    from agents.ide.readonly import POLICIES, READONLY_POLICY, check_call
+
+    assert len(READ_TOOLS | WRITE_TOOLS) == 7
+    for tool in sorted(READ_TOOLS | WRITE_TOOLS):
+        for name in (tool, "bitbucket_" + tool, "bitbucket_0_" + tool):
+            assert name not in READONLY_POLICY
+            assert all(name not in rules for rules in POLICIES.values())
+            assert check_call(name, {"repository": "svc-a", "id": 7}, policy) is not None

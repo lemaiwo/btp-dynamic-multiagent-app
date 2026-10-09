@@ -50,25 +50,15 @@ from pydantic import (
 )
 
 from agents.auth import current_base_url, current_principal, require_admin
-from agents.chat_app import dynamic_chat_app
+from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
+from agents.bitbucket_config import check_entry as check_bitbucket_entry
 from agents.builtins import BUILTIN_URLS, is_builtin_url
-from agents.jira_tools import BUILTIN_JIRA_URL
-from agents.mail_render import MailTheme
-from agents.odata import BUILTIN_ODATA_URL
-from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
-from agents.outlook_tools import BUILTIN_OUTLOOK_URL
-from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
-from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
-from agents.sharepoint_views import check_pins, clean_views
-from agents.slack_tools import BUILTIN_SLACK_URL
-from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
-from agents.teams_tools import BUILTIN_TEAMS_URL
-from agents.validation_errors import validation_item
+from agents.chat_app import dynamic_chat_app
 from agents.db import (
-    AUTH_MODE_JWT,
-    AUTH_MODE_NONE,
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
+    AUTH_MODE_JWT,
+    AUTH_MODE_NONE,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
     BUILTIN_PUBLIC_KEYS,
@@ -82,12 +72,12 @@ from agents.db import (
     agent_referrers,
     agent_where_used,
     check_delegation_name_collision,
-    delete_agent,
-    delete_skill,
-    delete_workflow,
     check_odata_services,
     create_odata_service,
+    delete_agent,
     delete_odata_service,
+    delete_skill,
+    delete_workflow,
     describe_referrers,
     get_active_model_name,
     get_agent,
@@ -109,8 +99,8 @@ from agents.db import (
     normalize_skills_json,
     odata_entries,
     odata_service_columns,
-    odata_service_unchanged,
     odata_service_referrers,
+    odata_service_unchanged,
     prepare_servers,
     prepared_server_list,
     rename_agent_references,
@@ -124,12 +114,25 @@ from agents.db import (
     validate_api_slug,
     validate_odata_service,
 )
-from agents.registry import registry
-from agents.shared import available_models, default_model_name
-from agents.workflow_runner import RunRefused as WorkflowRunRefused
-from agents.workflow_runner import start_workflow_run
+
 # --- deep agents ---
 from agents.deep import DeepConfig, dump_deep_config
+from agents.jira_tools import BUILTIN_JIRA_URL
+from agents.mail_render import MailTheme
+from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+from agents.outlook_tools import BUILTIN_OUTLOOK_URL
+from agents.registry import registry
+from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.shared import available_models, default_model_name
+from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
+from agents.sharepoint_views import check_pins, clean_views
+from agents.slack_tools import BUILTIN_SLACK_URL
+from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
+from agents.teams_tools import BUILTIN_TEAMS_URL
+from agents.validation_errors import validation_item
+from agents.workflow_runner import RunRefused as WorkflowRunRefused
+from agents.workflow_runner import start_workflow_run
 
 logger = logging.getLogger(__name__)
 
@@ -322,10 +325,20 @@ class OAuthClientPayload(BaseModel):
     library: StrictStr = Field(default="", max_length=128)
     path: StrictStr = Field(default="", max_length=400)
     views: dict[str, Any] | None = None
+    # builtin:bitbucket only. One workspace, optionally a list of its
+    # repositories, the target branch, and the switches that let the agent
+    # approve and that require green builds for it. Pinned here, never tool
+    # arguments; agents/bitbucket_config.py is the gate. Strict, and handed
+    # on untrimmed: a value is accepted only in the form that is stored.
+    workspace: StrictStr = Field(default="", max_length=64)
+    repositories: list[StrictStr] | None = None
+    branch: StrictStr = Field(default="", max_length=200)
+    allow_approve: StrictBool = False
+    require_green_builds: StrictBool | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("services", "allow_write", mode="before")
+    @field_validator("services", "allow_write", "allow_approve", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
@@ -334,7 +347,7 @@ class OAuthClientPayload(BaseModel):
             return [] if info.field_name == "services" else False
         return v
 
-    @field_validator("site", "library", "path", mode="before")
+    @field_validator("site", "library", "path", "workspace", "branch", mode="before")
     @classmethod
     def _null_pin_is_absent(cls, v: Any) -> Any:
         """``null`` means "not set", as for ``services`` and ``views``: a
@@ -468,6 +481,8 @@ class OAuthClientPayload(BaseModel):
             "site": self.site,
             "library": self.library,
             "path": self.path,
+            "workspace": self.workspace,
+            "branch": self.branch,
         }
         config = {k: v for k, v in fields.items() if v}
         if self.theme:
@@ -484,6 +499,12 @@ class OAuthClientPayload(BaseModel):
             config["services"] = list(self.services)
         if self.allow_write:
             config["allow_write"] = True
+        if self.repositories is not None:
+            config["repositories"] = list(self.repositories)
+        if self.allow_approve:
+            config["allow_approve"] = True
+        if self.require_green_builds is False:
+            config["require_green_builds"] = False
         return config
 
 
@@ -619,6 +640,31 @@ class McpServerPayload(BaseModel):
                 _validate_odata_entry(oauth)
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_bitbucket_entry(cls, data: Any) -> Any:
+        """The ``builtin:bitbucket`` block as the client sent it.
+
+        Checked before it becomes an `OAuthClientPayload`: that model ignores
+        a key it does not know and reads ``allow_comment`` as a lax boolean,
+        so afterwards a stray key or the string "true" can no longer be told
+        from an entry that was sent correctly. The mode is checked first, so
+        a block of another mode is not judged by this entry's keys.
+        """
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_BITBUCKET_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(
+                    f"{BUILTIN_BITBUCKET_URL} requires auth_mode=destination: it "
+                    "holds no credential of its own and reaches Bitbucket only "
+                    "through the BTP destination named in oauth.destination"
+                )
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            check_bitbucket_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         if _server_key(self.url) == BUILTIN_ODATA_URL:
@@ -650,6 +696,19 @@ class McpServerPayload(BaseModel):
             )
         if is_sharepoint:
             self._validate_sharepoint()
+        is_bitbucket = _server_key(self.url) == BUILTIN_BITBUCKET_URL
+        if not is_bitbucket and self.oauth is not None and (
+            self.oauth.workspace or self.oauth.repositories is not None or self.oauth.branch
+            or self.oauth.allow_approve or self.oauth.require_green_builds is not None
+        ):
+            raise ValueError(
+                "oauth.workspace, oauth.repositories, oauth.branch, oauth.allow_approve "
+                f"and oauth.require_green_builds belong to a {BUILTIN_BITBUCKET_URL} "
+                "entry only; no other server reads them"
+            )
+        if is_bitbucket:
+            # Again on the block the route hands to storage.
+            check_bitbucket_entry(self.oauth.to_config() if self.oauth else None)
         # Before the per-mode rules, because the oauth2 branch below returns
         # early for DCR.
         if (
