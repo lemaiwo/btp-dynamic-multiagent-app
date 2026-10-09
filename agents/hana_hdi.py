@@ -122,7 +122,7 @@ _MAX_MESSAGE_CHARS = 500
 # every change of the models (or of the generator) that changes an artifact,
 # then run scripts/hana_schema_history.py to pin the new digest. Never reuse
 # or lower a number: a container remembers the highest one it was given.
-HANA_SCHEMA_GENERATION = 1
+HANA_SCHEMA_GENERATION = 2
 HISTORY_FILE = Path(__file__).with_name("hana_schema_history.json")
 # Where a container keeps the generation it holds: a file in its design-time
 # file system, outside the made folder, so it needs no build plugin. It is

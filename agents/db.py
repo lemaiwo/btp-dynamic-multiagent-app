@@ -1421,6 +1421,23 @@ class JobRun(Base):
         }
 
 
+class AdminNotificationState(Base):
+    """Up to when an admin has read the finished-run notifications.
+
+    The notifications themselves are not stored: ``agents/notifications.py``
+    derives them from ``job_runs`` and ``workflow_runs``. One row per admin,
+    keyed by the principal of the validated token; ``seen_at`` only moves
+    forward (a conditional UPDATE there).
+    """
+
+    __tablename__ = "admin_notification_state"
+
+    principal: Mapped[str] = mapped_column(String(255), primary_key=True)
+    seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class McpOAuthToken(Base):
     """Per-user OAuth2 tokens for an MCP server (auth_mode="oauth2").
 

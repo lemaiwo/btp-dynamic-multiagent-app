@@ -1087,6 +1087,29 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `npm run test:e2e:stream` (`playwright.stream.config.ts`, `ui5-stream.yaml`)
   runs `e2e/real-stream.spec.ts` with no mocked routes against
   `tests/e2e/ide_stream_server.py` (see Dependencies)
+- `agents/notifications.py` — finished-run notifications for the admin UI,
+  included by `agents/admin.py` like the OData router, each route with its
+  own `require_admin`. **Derived, not stored**: the runners write nothing
+  for it; the list is read from `job_runs` and `workflow_runs` when asked
+  (only the columns of the answer, never a summary, report, error or
+  activity). `GET /admin/api/notifications` answers `{items, unread_count,
+  seen_at}`: an item is `{kind` (`agent` | `workflow`)`, run_id, name,
+  status, trigger, created_by, finished_at, unread}`, runs with a
+  `finished_at` in the last 7 days, newest first, at most 50 of both kinds
+  together (one statement per table, merged in Python: no `UNION`);
+  `unread_count` covers the whole 7 days and can exceed the list. The one
+  new table is the read marker, `AdminNotificationState`
+  (`admin_notification_state`: `principal`, `seen_at`), one row per admin
+  keyed by `current_principal` (`local` when none is bound), never by
+  anything of the request; `unread` is `finished_at > seen_at`. A caller
+  without a marker gets one set to now by the first call (nothing is unread
+  then; a concurrent first call reads the row the other one inserted).
+  `POST /admin/api/notifications/seen` with exactly `{"up_to": <timestamp
+  with a time zone>}` moves the marker to `min(up_to, now)` and only forward
+  (a conditional UPDATE) and answers `{seen_at}`; any other body, a larger
+  one included, is a 422 with one fixed text and nothing of the input.
+  Timestamps are answered as aware UTC whatever the database hands back.
+  The table is HANA schema generation 2. `tests/test_notifications.py`
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
@@ -1253,7 +1276,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `scripts/copy_registry_config.py`). `HANA_HDI_ALLOW_DROP` is not in the
   descriptor (an `.mtaext` sets it for the one deploy that may drop a table);
   2.22.0 is the `builtin:sharepoint` release: no new resource and no new
-  environment variable
+  environment variable; 2.23.0 adds the finished-run notifications
+  (`agents/notifications.py`): no new resource or environment variable, one
+  new table (`admin_notification_state`, HANA schema generation 2)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
