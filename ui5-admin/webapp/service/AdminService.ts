@@ -1,7 +1,7 @@
 import type {
     ImportResult,
     Agent, AgentInput, AgentSaved, AgentWhereUsed, AdminConfig, CredentialHealth, CredentialStatus, ImportPayload,
-    JobRun, JobRunDetail, ModelInfo, ODataDestinationList, ODataDuplicateRequest, ODataMetadataPreview,
+    JobRun, JobRunDetail, ModelInfo, NotificationList, ODataDestinationList, ODataDuplicateRequest, ODataMetadataPreview,
     ODataMetadataRequest, ODataService, ODataServiceInput, ODataServiceSummary, ODataServiceUpdate, ODataTestResult,
     OrchestratorInfo, ReloadOutcome, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
@@ -229,6 +229,19 @@ export default class AdminService {
 
     public getConfig(): Promise<AdminConfig> {
         return this.request<AdminConfig>("config");
+    }
+
+    // --- Notifications ---------------------------------------------------
+    /** Runs finished in the last 7 days; the first call also sets the caller's marker. */
+    public getNotifications(): Promise<NotificationList> {
+        return this.request<NotificationList>("notifications");
+    }
+
+    /** Moves the caller's marker forward to `upTo` (a `finished_at` string). */
+    public markNotificationsSeen(upTo: string): Promise<{ seen_at: string }> {
+        return this.request<{ seen_at: string }>("notifications/seen", {
+            method: "POST", ...AdminService.json({ up_to: upTo })
+        });
     }
 
     // --- Workflows ---------------------------------------------------------
