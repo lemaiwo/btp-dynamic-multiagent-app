@@ -1258,14 +1258,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     ("Saved, but not active yet": press Reload in Settings), through
     `BaseController.warnIfNotLive`; the two outcome keys are never sent back
     in a body
-  - Notifications: a bell with the unread count and a toast in the app shell
-    (`view/App.view.xml`, `fragment/NotificationsPopover`) for finished agent
-    and workflow runs, polled from `GET notifications` every 15 s while the
-    page is visible (and once when it becomes visible again; not inside a
-    host shell, where the header is hidden), with the logic in
-    `model/notifications.ts`. Opening the list marks read what it shows
-    (`POST notifications/seen` with the newest shown `finished_at`,
-    unchanged); a failed poll is silent and the first poll shows no toast.
+  - Notifications: a bell with the unread count (also in its tooltip, for
+    screen readers) and a toast in the app shell for finished agent and
+    workflow runs, logic in `model/notifications.ts`. `GET notifications` is
+    polled every 15 s only while the page is visible, had pointer or key input
+    in the last 10 minutes (`App.notificationIdleMs`, so an unattended screen
+    does not keep the session alive) and the last poll was not answered 401 or
+    403; a stopped chain has no timer and starts again with one poll on the
+    next input or when the tab becomes visible. Opening the list reads it
+    fresh and marks read what it shows (`POST notifications/seen` with the
+    newest shown `finished_at`, unchanged); failures are silent, the first
+    answered poll shows no toast, and inside a host shell that hides the
+    header there is no bell, poll or toast. `e2e/notifications.spec.ts` checks
+    it against the real backend.
 - `agents.seed.json` — Initial config imported when DB is empty
 - `mta.yaml` — adds `postgresql-db` resource; version 2.1.0 adds
   A2A env vars (`A2A_PUBLIC_URL`, `A2A_AGENT_NAME`, …); 2.7.0 makes the
