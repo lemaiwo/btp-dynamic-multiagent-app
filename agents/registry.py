@@ -31,6 +31,7 @@ from agents.db import (
     list_skills,
     odata_entries,
 )
+from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.tools import NoUsableServiceError, attached_services
@@ -157,6 +158,13 @@ def _short_tool_output(result) -> str:
         # The SharePoint tools return what people typed into a workbook, and
         # this preview is stored with an API-triggered run: counts only.
         fixed = sharepoint_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The Bitbucket tools return source code and what pull request
+        # authors wrote: sizes, counts and codes only.
+        fixed = bitbucket_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:
