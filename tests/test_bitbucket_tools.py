@@ -1159,3 +1159,16 @@ async def test_the_review_marker_is_still_read_from_the_unfiltered_comment():
     fake.add_comment("svc-a", 7, review_marker(HEAD).replace("review", "re​view"), own=True)
     out = await _call(_toolset(fake), "list_pull_requests")
     assert [p["id"] for p in out["pull_requests"]] == [7] and out["already_reviewed"] == 0
+
+
+async def test_a_too_large_diff_of_one_file_does_not_ask_for_one_file_again():
+    """Final review n9: with `path` set the hint "ask for one file with path"
+    sent the model round in a circle."""
+    fake = _fake()
+    fake.diffs[("svc-a", 7)] = "x" * (MAX_DIFF_CHARS + 1)
+    fake.diffstats[("svc-a", 7)] = [
+        {"status": "modified", "lines_added": 1, "lines_removed": 0, "new": {"path": "src/x.py"}}]
+    out = await _call(_toolset(fake), "get_diff", repository="svc-a", id=7, path="src/x.py")
+    assert out["error"] == {"code": "result_too_large",
+                            "message": "the diff does not fit a tool answer",
+                            "hint": "this file's diff is too large to return"}

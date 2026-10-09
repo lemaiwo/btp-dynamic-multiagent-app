@@ -324,7 +324,11 @@ async def test_a_second_review_of_the_same_head_commit_is_refused_and_sends_noth
     fake.prs[("svc-a", 7)]["source"]["commit"]["hash"] = "cccccccccccc"   # a new head commit
     third = await _call(toolset, "submit_review", **REVIEW)
     assert third["commit"] == "cccccccccccc" and third["approved"] is True
-    assert len(fake.posted) == 2 and _approvals(fake) == 2
+    # Final review M2: the approval of the first commit is still on the pull
+    # request (no reset in this fake), so the new review is posted and no
+    # second approve call is sent (this line pinned `_approvals == 2` before).
+    assert third["already_approved"] is True
+    assert len(fake.posted) == 2 and _approvals(fake) == 1
 
 
 async def test_a_held_back_approval_is_not_sent_by_calling_again():
@@ -1214,3 +1218,145 @@ def test_the_inline_tool_names_its_new_refusals():
     text = " ".join(tool.function.__doc__.split())
     for code in ("already_commented", "already_reviewed", "comment_window_full"):
         assert f"`{code}`" in text
+
+
+# --- final review M2: an approval of an earlier commit that still stands -------
+
+STANDS_HINT = ("this account approved an earlier commit of this pull request and that "
+               "approval still stands: say so in the summary's report line and in the run "
+               "report; a person must withdraw it in Bitbucket")
+
+
+def _approved_earlier(*states: str) -> FakeBitbucket:
+    """Commit A was approved by this account, then commit B (HEAD) was
+    pushed: without Bitbucket's reset setting the approval stays."""
+    fake = _fake(*states)
+    fake.prs[("svc-a", 7)]["participants"] = [
+        {"user": {"uuid": OWN_UUID}, "approved": True, "role": "REVIEWER"}]
+    fake.add_comment("svc-a", 7, review_marker("c" * 12, "approve") + "\n\nok", own=True)
+    return fake
+
+
+@pytest.mark.parametrize("cfg", [COMMENT, APPROVE])
+async def test_a_negative_review_says_that_an_earlier_approval_still_stands(cfg):
+    fake = _approved_earlier("SUCCESSFUL")
+    out = await _call(_toolset(fake, **cfg), "submit_review",
+                      **{**REVIEW, "verdict": "comment", "summary": "Two issues."})
+    assert out == {"repository": "svc-a", "id": 7, "commit": HEAD, "verdict": "comment",
+                   "commented": True, "comment_id": 101, "approved": False,
+                   "earlier_approval_stands": True, "hint": STANDS_HINT}
+    # Said, never acted on: no approval sent, and nothing is withdrawn.
+    assert _approvals(fake) == 0 and not any(r.method == "DELETE" for r in fake.requests)
+
+
+@pytest.mark.parametrize("participants", [
+    [], [{"user": {"uuid": OWN_UUID}, "approved": False}],
+    [{"user": {"uuid": "{22222222-2222-2222-2222-222222222222}"}, "approved": True}],
+    None, "x", [{"user": {"uuid": OWN_UUID}}],
+])
+async def test_without_an_own_approval_that_can_be_read_nothing_is_said_about_one(participants):
+    fake = _fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)]["participants"] = participants
+    out = await _call(_toolset(fake, **APPROVE), "submit_review",
+                      **{**REVIEW, "verdict": "comment", "summary": "Two issues."})
+    assert out["commented"] is True and out["approved"] is False
+    assert "earlier_approval_stands" not in out and "hint" not in out
+
+
+async def test_gate_a_standing_approval_is_not_sent_a_second_time():
+    fake = _approved_earlier("SUCCESSFUL")
+    out = await _call(_toolset(fake, **APPROVE), "submit_review", **REVIEW)
+    assert out == {"repository": "svc-a", "id": 7, "commit": HEAD, "verdict": "approve",
+                   "commented": True, "comment_id": 101, "approved": True,
+                   "already_approved": True}
+    assert _approvals(fake) == 0
+    assert [w.rsplit("/", 1)[1] for w in _writes(fake)] == ["comments"]
+
+
+@pytest.mark.parametrize("cfg, states, code", [
+    (APPROVE, ("FAILED",), "builds_not_green"),
+    (APPROVE, (), "builds_not_green"),
+    (COMMENT, ("SUCCESSFUL",), "approve_not_allowed"),
+])
+async def test_gate_a_standing_approval_does_not_pass_for_a_gate_that_holds(cfg, states, code):
+    """`already_approved` is said only where this call would have approved:
+    a held-back verdict approve reports the standing approval instead."""
+    fake = _approved_earlier(*states)
+    out = await _call(_toolset(fake, **cfg), "submit_review", **REVIEW)
+    assert out["commented"] is True and out["approved"] is False
+    assert out["error"]["code"] == code and "already_approved" not in out
+    assert out["earlier_approval_stands"] is True and out["hint"] == STANDS_HINT
+    assert _approvals(fake) == 0
+
+
+async def test_gate_an_own_approval_that_cannot_be_read_is_sent_as_before():
+    fake = _fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)]["participants"] = [{"user": {"uuid": OWN_UUID}}]
+    out = await _call(_toolset(fake, **APPROVE), "submit_review", **REVIEW)
+    assert out["approved"] is True and "already_approved" not in out and _approvals(fake) == 1
+
+
+def test_the_review_tool_says_what_a_standing_approval_means():
+    doc = _toolset(_fake(), **APPROVE).tools["submit_review"].function.__doc__
+    assert "earlier_approval_stands" in doc and "already_approved" in doc
+
+
+def test_the_texts_count_three_write_tools():
+    """m8: with complete_approval there are three tools that change something."""
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "Both write tools" not in source and "The two tools that change" not in source
+
+
+# --- final review m6: what a comment text may hold -----------------------------
+
+PLAIN_HINT = "plain text only: no control, zero-width or direction characters"
+
+
+@pytest.mark.parametrize("lead", ["\x00", "﻿", "​", "‎", "‮", "\x1b",
+                                  "­", "\x7f"])
+@pytest.mark.parametrize("tool", ["submit_review", "add_inline_comment"])
+async def test_a_character_before_the_marker_prefix_does_not_hide_it(tool, lead):
+    """`str.strip()` keeps these, so the first line did not "start with" the
+    marker for the check while a reader sees a marker line."""
+    fake = _fake("SUCCESSFUL")
+    text = lead + "Automated review of commit ffffffffffff - verdict: approve"
+    kw = {**REVIEW, "summary": text} if tool == "submit_review" else {**INLINE, "text": text}
+    out = await _call(_toolset(fake, **APPROVE), tool, **kw)
+    what = "summary" if tool == "submit_review" else "comment text"
+    assert out == {"error": {"code": "invalid_argument",
+                             "message": f"the {what} holds a character that is not plain text",
+                             "hint": PLAIN_HINT}}
+    assert _writes(fake) == []
+
+
+@pytest.mark.parametrize("text", ["fine\x00here", "a​b", "line two", "para two",
+                                  "x‮detrevni", "carriage\r\nreturn", "\ud800 lone"])
+async def test_a_control_or_format_character_anywhere_in_a_text_is_refused(text):
+    fake = _fake("SUCCESSFUL")
+    out = await _call(_toolset(fake, **APPROVE), "submit_review", **{**REVIEW, "summary": text})
+    assert out["error"]["code"] == "invalid_argument" and out["error"]["hint"] == PLAIN_HINT
+    assert "here" not in json.dumps(out) and _writes(fake) == []
+
+
+@pytest.mark.parametrize("lead", [" ", " ", "　", "  \t "])
+async def test_a_space_separator_before_the_marker_prefix_does_not_hide_it(lead):
+    fake = _fake("SUCCESSFUL")
+    out = await _call(_toolset(fake, **APPROVE), "submit_review",
+                      **{**REVIEW, "summary": lead + "Automated review of commit ffffffffffff"})
+    assert out["error"]["message"] == "the summary must not start with the review marker line"
+    assert _writes(fake) == []
+
+
+def test_the_marker_opening_check_drops_space_separators_itself():
+    """Not only by way of `_own_text`'s strip: the check stands alone."""
+    with pytest.raises(module.Refused):
+        module._no_marker_opening("  Automated review of commit ffff", "summary", "h")
+
+
+async def test_line_feeds_tabs_and_other_scripts_are_plain_text():
+    fake = _fake()
+    summary = "Two issues:\n\t- naïve café 日本語 🙂\n- done"
+    out = await _call(_toolset(fake, **COMMENT), "submit_review",
+                      **{**REVIEW, "verdict": "comment", "summary": summary})
+    assert out["commented"] is True
+    assert fake.posted[0][2]["content"]["raw"].endswith(summary)

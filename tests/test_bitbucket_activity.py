@@ -377,3 +377,26 @@ async def test_without_the_comment_switch_injected_text_finds_no_tool_that_write
     await _reads(toolset)
     assert set(toolset.tools) == set(READS)
     assert all(r.method == "GET" for r in fake.requests)
+
+
+def test_a_standing_approval_is_said_in_fixed_words():
+    """Final review M2: the two answers about an approval that was already on
+    the pull request. Words of the code, and only for exactly ``true``."""
+    from agents.bitbucket_tools import activity_summary
+
+    stands = {"commented": True, "approved": False, "earlier_approval_stands": True,
+              "hint": MARK}
+    assert activity_summary("submit_review", stands) == (
+        "submit_review: commented yes, approved no, earlier approval stands")
+    held = {**stands, "error": {"code": "builds_not_green", "message": MARK}}
+    assert activity_summary("bitbucket_submit_review", held) == (
+        "submit_review: commented yes, approved no, earlier approval stands, "
+        "error builds_not_green")
+    already = {"commented": True, "approved": True, "already_approved": True}
+    assert activity_summary("submit_review", already) == (
+        "submit_review: commented yes, approved yes, already approved")
+    for value in (MARK, 1, "true", None):
+        said = activity_summary("submit_review", {
+            "commented": True, "approved": False, "earlier_approval_stands": value,
+            "already_approved": value})
+        assert said == "submit_review: commented yes, approved no"

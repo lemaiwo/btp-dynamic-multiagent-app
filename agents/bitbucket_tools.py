@@ -62,10 +62,14 @@ What a pull request author wrote (title, description, comments, diff, file
 content) is in the data fields of a result and nowhere else: not in an error,
 not in a log line.
 
-**The writes.** Both write tools first need the reviewing account
+**The writes.** All three write tools (``add_inline_comment``,
+``submit_review``, ``complete_approval``) first need the reviewing account
 (``account_unknown`` otherwise: without it a repeated run could not know its
 own review) and the guard. Their text is the model's own: it is refused when
-empty or over its cap, never cut or rewritten (edge whitespace aside).
+empty or over its cap, or when it holds a control or format character (a NUL,
+a byte order mark, zero width, a bidi mark, a lone surrogate, a line or
+paragraph separator; line feed and tab are text), never cut or rewritten
+(edge whitespace aside).
 ``submit_review`` posts ONE top-level comment whose first line is the marker,
 written by the code; a summary or an inline comment whose own first line
 looks like the marker is refused (Bitbucket may store an inline comment
@@ -100,8 +104,18 @@ only when ALL of this holds, and nothing a pull request says is part of it:
    that holds anything but objects, or a read that failed: no approval).
 
 By decision the approval is not bound to the commit that was reviewed, and a
-draft is not held back. When the gate holds the approval back, or Bitbucket
-refuses it, the comment stands: the answer has ``commented: true``,
+draft is not held back. What that means is wider than a commit pushed while
+a review runs: ANY commit pushed after an approval stays approved unless
+Bitbucket resets approvals on a source change (a repository setting, a
+Premium feature), and a later review with verdict ``comment`` does not
+withdraw it: no call here deletes an approval. The tool says so instead:
+when a ``submit_review`` does not end in ``approved: true`` and this account's
+own approval is on the pull request (the guard's read of it), the answer has
+``earlier_approval_stands: true`` and a fixed ``hint`` (a person must withdraw
+it in Bitbucket). When verdict ``approve`` passes the gate and that approval
+is already there, no second approve call is sent: ``approved: true`` with
+``already_approved: true``. When the gate holds the approval back, or
+Bitbucket refuses it, the comment stands: the answer has ``commented: true``,
 ``approved: false`` and an ``error`` that says why. Nothing is deleted.
 
 **An approval that was held back stays reachable.** The marker line records
@@ -347,6 +361,12 @@ def _already_reviewed(extra: str = "") -> Refused:
         extra + "a new commit on the pull request allows a new review")
 
 
+# Fixed text: nothing of the pull request is in it.
+_STANDS_HINT = ("this account approved an earlier commit of this pull request and that "
+                "approval still stands: say so in the summary's report line and in the run "
+                "report; a person must withdraw it in Bitbucket")
+
+
 def _approval_unknown_alone() -> Refused:
     return Refused(
         "approval_outcome_unknown",
@@ -354,15 +374,31 @@ def _approval_unknown_alone() -> Refused:
         "do not call again; report that the approval has to be checked on the pull request")
 
 
+# Control characters (line feed and tab aside), format characters (zero
+# width, bidi marks and overrides, the byte order mark, the soft hyphen), lone
+# surrogates and the line / paragraph separators.
+_NOT_PLAIN = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_PLAIN_HINT = "plain text only: no control, zero-width or direction characters"
+
+
 def _own_text(value: Any, limit: int, what: str) -> str:
     """The model's text for a comment, or a refusal that holds none of it.
-    Edge whitespace is dropped; nothing else is changed, nothing is cut."""
+    Edge whitespace is dropped; nothing else is changed, nothing is cut. A
+    control or format character anywhere in it is a refusal (``_NOT_PLAIN``;
+    a line feed and a tab are text)."""
     text = value.strip() if isinstance(value, str) else ""
     if not text:
         raise Refused("invalid_argument", f"the {what} is empty")
     if len(text) > limit:
         raise Refused("invalid_argument", f"the {what} is too long",
                       f"at most {limit} characters")
+    # Refused, not removed: the text is the model's own and is never
+    # rewritten. A NUL, a byte order mark or a zero-width character in front
+    # of the marker prefix is invisible to a reader and was kept by
+    # `str.strip()`, so `_no_marker_opening` did not see a marker line.
+    if any(c not in "\n\t" and unicodedata.category(c) in _NOT_PLAIN for c in text):
+        raise Refused("invalid_argument",
+                      f"the {what} holds a character that is not plain text", _PLAIN_HINT)
     return text
 
 
@@ -370,8 +406,15 @@ def _no_marker_opening(text: str, what: str, hint: str) -> None:
     """Refuses a text of the model's whose first line opens like the review
     marker, for every comment this toolset posts: that line is the code's,
     and only as line 1 of a summary. Looser than the reading (``_marked``) on
-    purpose: any case, any indentation, whatever follows the prefix."""
-    opening = text.split("\n", 1)[0].strip().casefold()
+    purpose: any case, any indentation (space separators included), whatever
+    follows the prefix. Invisible characters in front of it never get here:
+    ``_own_text`` refuses them."""
+    opening = text.lstrip().split("\n", 1)[0]
+    # Every space separator (no-break, em, ideographic), whatever a Python
+    # version's `str.strip()` counts as white space.
+    while opening and (opening[0].isspace() or unicodedata.category(opening[0]) == "Zs"):
+        opening = opening[1:]
+    opening = opening.casefold()
     if opening.startswith(MARKER_PREFIX.strip().casefold()):
         raise Refused("invalid_argument",
                       f"the {what} must not start with the review marker line", hint)
@@ -1285,7 +1328,9 @@ class BitbucketClient:
                     "diff": text, "chars": len(text)}
         # Refused, never cut: a diff that ends early would read as complete.
         refusal = Refused("result_too_large", "the diff does not fit a tool answer",
-                          "ask for one file with path").as_error()
+                          # With `path` there is no smaller question to ask.
+                          "this file's diff is too large to return" if path
+                          else "ask for one file with path").as_error()
         try:
             entries, more = await self._diffstat(base)
         except Refused:
@@ -1441,7 +1486,7 @@ class BitbucketClient:
                            "start with your own words; the marker line is added for you")
         account = await self._writer()
         async with self._reviewing:
-            base, _, head = await self.pull_request(repository, pr_id)
+            base, body, head = await self.pull_request(repository, pr_id)
             # Never the memo of add_inline_comment: a fresh read, and the
             # entry goes, so that no inline comment follows the marker on
             # what was known before it.
@@ -1470,19 +1515,36 @@ class BitbucketClient:
                 "commented": True,
                 "comment_id": posted.get("id") if type(posted.get("id")) is int else None,
                 "approved": False}
-            if verdict != "approve":
-                return result
-            # From here on the comment stands whatever happens: a held-back
-            # or refused approval is said next to `commented: true`.
-            await self._approve_behind_the_gate(base, result, after_comment=True)
+            # This account's approval of an EARLIER commit, as the guard's
+            # read of the pull request showed it (the marker above says this
+            # head has no review of ours yet, so an approval that is on the
+            # pull request was given for another commit). Only a readable
+            # `true` counts.
+            standing = _own_approval(body, account) is True
+            if verdict == "approve":
+                # From here on the comment stands whatever happens: a held-back
+                # or refused approval is said next to `commented: true`.
+                await self._approve_behind_the_gate(base, result, after_comment=True,
+                                                    standing=standing)
+            if standing and result["approved"] is not True:
+                # A review that does not approve leaves that approval where it
+                # is: nothing here withdraws one (a new write, not decided).
+                # So it is said, for the summary's reader and the run report.
+                result["earlier_approval_stands"] = True
+                result["hint"] = _STANDS_HINT
             return result
 
     async def _approve_behind_the_gate(self, base: str, result: dict[str, Any], *,
-                                       after_comment: bool) -> None:
+                                       after_comment: bool, standing: bool = False) -> None:
         """The entry's switch, the builds, then the ONE place that sends an
         approval; the outcome goes into ``result`` (``approved`` and, unless
         it was approved, ``error``). ``submit_review`` and
-        ``complete_approval`` both end here, after their own conditions."""
+        ``complete_approval`` both end here, after their own conditions.
+
+        ``standing``: this account's approval is already on the pull request.
+        The gate is the same, and when it passes nothing is sent: the answer
+        is ``approved: true`` with ``already_approved: true`` (a second
+        approve call is probably answered 409 and would read as a failure)."""
         try:
             if self.pins.allow_approve is not True:
                 raise Refused("approve_not_allowed",
@@ -1497,6 +1559,10 @@ class BitbucketClient:
                         + ("the review comment was posted, " if after_comment else "")
                         + "the approval was not sent",
                         f"builds: {state}")
+            if standing:
+                result["approved"] = True
+                result["already_approved"] = True
+                return
             await self._write(
                 f"{base}/approve", None, ok=(200,),
                 unsure=_approval_unknown if after_comment else _approval_unknown_alone)
@@ -1593,6 +1659,13 @@ def activity_summary(tool_name: Any, result: Any) -> str | None:
         # both are said, the error by its code.
         said = [f"commented {_yes_no(result.get('commented'))}"] if tool == "submit_review" else []
         said.append(f"approved {_yes_no(result.get('approved'), unknown=True)}")
+        # Fixed words for the two answers about an approval that was already
+        # on the pull request (`is True`: a key of another server's tool of
+        # the same name says nothing).
+        if result.get("already_approved") is True:
+            said.append("already approved")
+        if result.get("earlier_approval_stands") is True:
+            said.append("earlier approval stands")
         if failed:
             said.append(f"error {code}" if code else "error")
         return f"{tool}: " + ", ".join(said)
@@ -1792,7 +1865,12 @@ def bitbucket_toolset(
         code `comment_outcome_unknown`: the comment MAY have been posted, do
         not call again. `already_reviewed` means this commit has its review.
         `builds_not_green` next to `commented: true` means the approval can
-        follow later with complete_approval.
+        follow later with complete_approval. `already_approved: true` means
+        your approval was already on the pull request and none was sent.
+        `earlier_approval_stands: true` means this review did not approve but
+        an approval of yours for an earlier commit is still on the pull
+        request: nothing withdraws it, so say so in your report; a person
+        must withdraw it in Bitbucket.
 
         The verdict is your own judgement of the diff.
 
@@ -1830,7 +1908,7 @@ def bitbucket_toolset(
         return await _answer(lambda: client.complete_approval(repository, id))
 
     tools = [list_pull_requests, get_pull_request, get_diff, get_file]
-    # The two tools that change something do not exist for an agent whose
+    # The three tools that change something do not exist for an agent whose
     # entry does not say `allow_comment: true` (exactly; see `pins_of`).
     if pins.allow_comment is True:
         tools += [add_inline_comment, submit_review]
