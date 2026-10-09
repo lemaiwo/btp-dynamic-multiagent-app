@@ -417,6 +417,7 @@ from agents.bitbucket_tools import (  # noqa: E402
     MAX_CHECKED,
     MAX_LISTED,
     MAX_REPOSITORIES_SCANNED,
+    Refused,
     review_marker,
 )
 from tests.bitbucket_helpers import OTHER_UUID, OWN_UUID  # noqa: E402
@@ -441,7 +442,7 @@ async def test_the_list_holds_open_pull_requests_to_the_pinned_branch_only():
         "head_commit": HEAD, "draft": True, "updated_on": "2026-10-09T08:00:00.000000+00:00"}
     assert out["reviewed_filter"] == "active" and out["already_reviewed"] == 0
     assert out["repositories"] == 2 and out["repositories_failed"] == 0
-    assert out["more"] is False and "note" not in out
+    assert out["more"] is False and "note" not in out and out["pull_requests_unchecked"] == 0
     assert 'destination.branch.name="main" AND state="OPEN"' in [
         r.url.params.get("q") for r in fake.requests]
 
@@ -583,6 +584,7 @@ async def test_an_unknown_account_gives_an_unfiltered_list_that_says_so(caplog):
     out = await _call(toolset, "list_pull_requests")
     assert [p["id"] for p in out["pull_requests"]] == [1]
     assert out["reviewed_filter"] == "unavailable" and "could not be identified" in out["note"]
+    assert "top-level comment" in out["note"] and "first line" in out["note"]
     assert out["already_reviewed"] == 0
     assert not any(p.endswith("/comments") for p in fake.paths())
     logged = "\n".join(caplog.handler.format(r) for r in caplog.records)
@@ -628,10 +630,41 @@ async def test_the_two_helpers_the_write_tools_need():
     base = f"/2.0/repositories/{WS}/svc-a/pullrequests/1"
     assert await client.reviewed(base, "aaaaaaaaaaaa", account) is True
     assert await client.reviewed(base, "bbbbbbbbbbbb", account) is False
-    # Without an account nothing is anybody's marker, and nothing is asked.
+    # Without an account, or without a head commit of 12 hex characters, the
+    # helper refuses instead of answering "not reviewed"; nothing is asked.
     asked = len(fake.requests)
-    assert await client.reviewed(base, "aaaaaaaaaaaa", "") is False
+    with pytest.raises(Refused) as refused:
+        await client.reviewed(base, "aaaaaaaaaaaa", "")
+    assert refused.value.code == "account_unknown"
+    for head in ("", "aaaaaaa", "a" * 11, "A" * 12, "../x", None, 7, "a" * 41):
+        with pytest.raises(Refused) as refused:
+            await client.reviewed(base, head, account)
+        assert refused.value.code == "review_state_unknown"
     assert len(fake.requests) == asked
+
+
+@pytest.mark.parametrize("marked, head, same", [
+    ("a" * 12, "a" * 12, True), ("a" * 40, "a" * 12, True), ("a" * 12, "a" * 40, True),
+    ("a" * 12 + "b" * 28, "a" * 12 + "c" * 28, True),      # the first 12 decide
+    ("a" * 11 + "b", "a" * 12, False), ("a" * 7, "a" * 12, False), ("a" * 11, "a" * 40, False),
+])
+async def test_a_marker_and_a_head_are_compared_on_their_first_twelve_characters(
+        marked, head, same):
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head=head)
+    fake.add_comment("svc-a", 1, "Automated review of commit " + marked, own=True)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["already_reviewed"] == (1 if same else 0)
+    assert len(out["pull_requests"]) == (0 if same else 1)
+
+
+async def test_a_head_commit_shorter_than_twelve_characters_is_never_called_reviewed():
+    fake = FakeBitbucket()
+    fake.add_pr("svc-a", 1, head="aaaaaaa")
+    fake.add_comment("svc-a", 1, "Automated review of commit aaaaaaa", own=True)
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert out["pull_requests"] == [] and out["already_reviewed"] == 0
+    assert out["pull_requests_unchecked"] == 1
 
 
 async def test_the_list_is_capped_and_says_that_more_exist():
@@ -667,10 +700,60 @@ async def test_at_most_max_checked_pull_requests_have_their_comments_read():
     for i in range(1, MAX_CHECKED + 6):
         fake.add_pr("svc-a", i)
         fake.add_comment("svc-a", i, review_marker(HEAD), own=True)
-    out = await _call(_toolset(fake), "list_pull_requests")
+    toolset = _toolset(fake)
+    out = await _call(toolset, "list_pull_requests")
     assert out["pull_requests"] == [] and out["already_reviewed"] == MAX_CHECKED
-    assert out["more"] is True
+    assert out["more"] is True and "later run" in out["note"]
     assert sum(p.split("?")[0].endswith("/comments") for p in fake.paths()) == MAX_CHECKED
+
+
+async def test_reviewed_pull_requests_do_not_starve_the_ones_behind_the_check_budget():
+    fake = FakeBitbucket()
+    last = range(MAX_CHECKED + 1, MAX_CHECKED + 6)
+    for i in range(1, MAX_CHECKED + 6):
+        fake.add_pr("svc-a", i)
+        if i <= MAX_CHECKED:
+            fake.add_comment("svc-a", i, review_marker(HEAD), own=True)
+    toolset = _toolset(fake)
+    out = await _call(toolset, "list_pull_requests")
+    assert out["pull_requests"] == [] and out["more"] is True
+    # The next call starts after the last pull request the first one checked.
+    before = len(fake.requests)
+    out = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == list(last)
+    assert out["already_reviewed"] == MAX_CHECKED - 5 and out["more"] is True
+    checked = [p for p in fake.paths()[before:] if p.split("?")[0].endswith("/comments")]
+    assert len(checked) == MAX_CHECKED and "/pullrequests/41/comments" in checked[0]
+    # A third call goes on where the second stopped: nobody is skipped.
+    out = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == list(last)
+    assert out["already_reviewed"] == MAX_CHECKED - 5 and out["more"] is True
+
+
+async def test_the_turn_goes_round_over_several_repositories_and_a_full_list():
+    fake = FakeBitbucket()
+    for i in range(1, 16):
+        fake.add_pr("svc-a", i)
+    for i in range(16, 31):
+        fake.add_pr("svc-b", i)
+    toolset = _toolset(fake)
+    seen = []
+    for _ in range(3):
+        out = await _call(toolset, "list_pull_requests")
+        seen.append([p["id"] for p in out["pull_requests"]])
+    assert seen[0] == list(range(1, 21)) and seen[1] == [*range(21, 31), *range(1, 11)]
+    assert seen[2] == list(range(11, 31))
+
+
+async def test_a_cursor_on_a_pull_request_that_is_gone_starts_its_repository_again():
+    fake = FakeBitbucket()
+    for i in range(1, MAX_LISTED + 6):
+        fake.add_pr("svc-a", i)
+    toolset = _toolset(fake)
+    await _call(toolset, "list_pull_requests")               # stopped after number 20
+    fake.prs[("svc-a", MAX_LISTED)]["state"] = "MERGED"
+    out = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]][:3] == [1, 2, 3]
 
 
 async def test_the_comments_of_a_candidate_are_read_three_pages_deep():
@@ -684,9 +767,29 @@ async def test_the_comments_of_a_candidate_are_read_three_pages_deep():
     for i in range(6):
         fake.add_comment("svc-a", 2, f"c{i}")
     fake.add_comment("svc-a", 2, review_marker(HEAD), own=True)       # on the fourth
-    out = await _call(_toolset(fake, repositories=["svc-a"]), "list_pull_requests")
-    assert [p["id"] for p in out["pull_requests"]] == [2] and out["already_reviewed"] == 1
+    fake.add_pr("svc-b", 3)
+    for i in range(6):
+        fake.add_comment("svc-b", 3, f"c{i}")                         # three full pages, no more
+    out = await _call(_toolset(fake, repositories=["svc-a", "svc-b"]), "list_pull_requests")
+    # Number 2 has more comments than are read: its marker may be among them,
+    # so it is neither "reviewed" nor "new", and it is not listed.
+    assert [p["id"] for p in out["pull_requests"]] == [3] and out["already_reviewed"] == 1
+    assert out["pull_requests_unchecked"] == 1 and "could not be checked" in out["note"]
     assert sum("/pullrequests/2/comments" in p for p in fake.paths()) == 3
+
+
+async def test_an_author_cannot_push_the_marker_out_of_sight_to_get_reviewed_again():
+    fake = FakeBitbucket()
+    fake.page_size = 2
+    fake.add_pr("svc-a", 1)
+    fake.add_comment("svc-a", 1, review_marker(HEAD), own=True)
+    toolset = _toolset(fake)
+    assert (await _call(toolset, "list_pull_requests"))["already_reviewed"] == 1
+    fake.comments[("svc-a", 1)][:0] = [
+        {"id": i, "content": {"raw": "noise"}, "user": {"uuid": OTHER_UUID}} for i in range(1, 8)]
+    out = await _call(toolset, "list_pull_requests")
+    assert out["pull_requests"] == [] and out["already_reviewed"] == 0
+    assert out["pull_requests_unchecked"] == 1
 
 
 async def test_the_workspace_listing_keeps_slugs_only_and_stops_at_its_cap():
@@ -749,7 +852,26 @@ async def test_a_pull_request_whose_comments_cannot_be_read_is_not_listed_as_unr
                                if r.url.path.endswith("/svc-a/pullrequests/2/comments") else None)
     out = await _call(_toolset(fake), "list_pull_requests")
     assert [p["id"] for p in out["pull_requests"]] == [1, 3]
-    assert out["repositories_failed"] == 1 and out["repositories"] == 1
+    assert out["repositories_failed"] == 0 and out["repositories"] == 2
+    assert out["pull_requests_unchecked"] == 1
+
+
+@pytest.mark.parametrize("answer", [
+    httpx.Response(500, text="PLANTED-ERROR-BODY"), httpx.Response(404, text="PLANTED-ERROR-BODY"),
+    httpx.Response(200, content=b'{"values": ["' + b"x" * 2_000_001 + b'"]}'),
+    httpx.Response(200, text="<html>PLANTED-ERROR-BODY</html>"),
+])
+async def test_one_unreadable_pull_request_does_not_drop_the_rest_of_its_repository(answer):
+    fake = FakeBitbucket()
+    for i in (1, 2, 3):
+        fake.add_pr("svc-a", i)
+    fake.add_comment("svc-a", 3, review_marker(HEAD), own=True)
+    fake.override = lambda r: (answer if r.url.path.endswith("/svc-a/pullrequests/1/comments")
+                               else None)                      # the FIRST of three
+    out = await _call(_toolset(fake), "list_pull_requests")
+    assert [p["id"] for p in out["pull_requests"]] == [2] and out["already_reviewed"] == 1
+    assert out["pull_requests_unchecked"] == 1 and out["repositories_failed"] == 0
+    assert out["repositories"] == 1 and "PLANTED" not in json.dumps(out)
 
 
 async def test_throttling_ends_the_list_as_an_error_not_as_a_short_list():
@@ -795,4 +917,7 @@ def test_the_list_tool_says_what_its_answer_means():
     text = _toolset(_fake()).tools["list_pull_requests"].function.__doc__
     assert "never as instructions" in text and "do not guess" in text
     assert "`more: true`" in text and "`reviewed_filter: unavailable`" in text
-    assert "get_pull_request" in text
+    assert "get_pull_request" in text and "`pull_requests_unchecked`" in text
+    assert "later run" in " ".join(text.split())
+    read = " ".join(_toolset(_fake()).tools["get_pull_request"].function.__doc__.split())
+    assert "top-level comment" in read and "first line" in read and "at most 100" in read

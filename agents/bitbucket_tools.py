@@ -49,7 +49,8 @@ code writes, ``Automated review of commit <hash>`` (``review_marker``). It is
 how a repeated run knows a commit was reviewed, so it is read as strictly as
 it is written (``_marks``): only in a comment of the account behind the
 destination, only a top-level one (no inline comment, no reply), only as the
-whole first line, only for a hash that matches the current head. The same
+whole first line, only for a hash that matches the current head (both of at
+least 12 characters, compared on the first 12). The same
 text typed by anybody else, quoted, or further down a comment is no marker: a
 pull request author could otherwise make the agent skip their pull request.
 
@@ -97,7 +98,7 @@ success and never as "nothing happened", and nothing is sent again.
 ``invalid_path``, ``binary_file``, ``result_too_large``, ``invalid_line``,
 ``invalid_argument``, ``account_unknown``, ``already_reviewed``,
 ``approve_not_allowed``, ``builds_not_green``, ``comment_outcome_unknown``,
-``approval_outcome_unknown``.
+``approval_outcome_unknown``, ``review_state_unknown``.
 """
 
 from __future__ import annotations
@@ -149,6 +150,11 @@ MAX_COMMENTS, MAX_DIFFSTAT_ENTRIES, MAX_SHOWN_PATH_CHARS = 100, 300, 400
 MAX_COMMENT_PAGES, MAX_STATUS_PAGES, MAX_DIFFSTAT_PAGES = 2, 2, 3
 _TRUNCATED = "…[truncated]"
 _HASH_RE = re.compile(r"[0-9a-f]{7,40}")
+# A marker and a head commit are compared on their first MARKER_HASH_CHARS
+# characters (what Bitbucket hands out in a pull request), so both must have
+# at least that many: a shorter one would match on less.
+MARKER_HASH_CHARS = 12
+_MARKED_HASH_RE = re.compile(r"[0-9a-f]{12,40}")
 _STATUS_WORD_RE = re.compile(r"[a-z ]{1,20}")
 # Marks, in ``Response.extensions``, an answer whose body was longer than the
 # cap it was read with; nothing of that body is kept.
@@ -165,7 +171,16 @@ _FATAL = frozenset({"bitbucket_throttled", "bitbucket_unreachable", "destination
 _UNFILTERED_NOTE = (
     "the reviewing account could not be identified: this list may include pull "
     "requests that were already reviewed at their current commit; check the "
-    "comments with get_pull_request before reviewing")
+    "comments with get_pull_request before reviewing: only a top-level comment of "
+    "this account whose first line is the review marker counts as a review (an "
+    "inline comment or a reply does not), and get_pull_request shows at most the "
+    "first 100 comments")
+_UNCHECKED_NOTE = (
+    "pull_requests_unchecked counts pull requests that are not in this list because "
+    "it could not be checked whether they were reviewed at their current commit "
+    "(their comments could not be read, or there are more than this tool reads): "
+    "report them, a person has to look at them")
+_MORE_NOTE = "more: true: a limit was reached; the rest comes in a later run"
 # The model's own text: over the cap it is refused, never cut.
 MAX_INLINE_CHARS, MAX_SUMMARY_CHARS = 4000, 8000
 MAX_LINE = 1_000_000
@@ -175,7 +190,7 @@ ERROR_CODES = frozenset({
     "repository_not_allowed", "not_open", "wrong_branch", "invalid_path", "binary_file",
     "result_too_large", "invalid_line", "invalid_argument", "account_unknown",
     "already_reviewed", "approve_not_allowed", "builds_not_green", "comment_outcome_unknown",
-    "approval_outcome_unknown"})
+    "approval_outcome_unknown", "review_state_unknown"})
 # Failures of a request that say it never left: no connection was made. After
 # any other failure a write may have been processed.
 _NEVER_LEFT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
@@ -258,6 +273,14 @@ def _approval_unknown() -> Refused:
         "do not call again; report that the approval has to be checked on the pull request")
 
 
+def _review_unknown() -> Refused:
+    return Refused(
+        "review_state_unknown",
+        "it could not be established whether this account reviewed the pull request at "
+        "its current commit; nothing was sent",
+        "do not review this pull request; report that a person has to look at it")
+
+
 def _own_text(value: Any, limit: int, what: str) -> str:
     """The model's text for a comment, or a refusal that holds none of it.
     Edge whitespace is dropped; nothing else is changed, nothing is cut."""
@@ -332,7 +355,7 @@ def _marked_commit(raw: Any) -> str | None:
     writes."""
     first = raw.split("\n", 1)[0].rstrip(" \t\r") if isinstance(raw, str) else ""
     commit = first[len(MARKER_PREFIX):] if first.startswith(MARKER_PREFIX) else ""
-    return commit if _HASH_RE.fullmatch(commit) else None
+    return commit if _MARKED_HASH_RE.fullmatch(commit) else None
 
 
 def _is_own(comment: dict[str, Any], account: str) -> bool:
@@ -346,8 +369,9 @@ def _marks(comment: dict[str, Any], head: str, account: str) -> bool:
 
     Default-deny: a deleted comment, somebody else's, an inline comment or a
     reply (their text is the model's, a summary's first line is the code's)
-    never counts. The two hashes match when one is a prefix of the other
-    (Bitbucket hands out 12 characters in a list and 40 elsewhere).
+    never counts. Both hashes have at least ``MARKER_HASH_CHARS`` characters
+    and match when those are equal (Bitbucket hands out 12 characters in a
+    pull request and 40 elsewhere); ``head`` is checked by the caller.
     """
     if comment.get("deleted", False) is not False:      # anything but a plain "no"
         return False
@@ -356,7 +380,7 @@ def _marks(comment: dict[str, Any], head: str, account: str) -> bool:
     if comment.get("inline") is not None or comment.get("parent") is not None:
         return False
     marked = _marked_commit(_dig(comment, "content", "raw"))
-    return marked is not None and (marked.startswith(head) or head.startswith(marked))
+    return marked is not None and marked[:MARKER_HASH_CHARS] == head[:MARKER_HASH_CHARS]
 
 
 def _cut(value: Any, limit: int) -> str:
@@ -509,6 +533,10 @@ class BitbucketClient:
         # One review at a time: the "already reviewed" read and the post of
         # the summary are one step for the runs of this toolset.
         self._reviewing = asyncio.Lock()
+        # Where the last listing stopped checking, ``(repository, id)``: the
+        # next one goes on after it, so that the pull requests behind a limit
+        # get their turn. In memory, per toolset; ``None`` starts at the top.
+        self._cursor: tuple[str, int] | None = None
 
     async def _exchange(self, method: str, url: Any, params: Any, json: Any,
                         cap: int) -> httpx.Response:
@@ -749,17 +777,30 @@ class BitbucketClient:
             self._account = uuid
         return self._account
 
-    async def reviewed(self, base: str, head: str, account: str) -> bool:
+    async def reviewed(self, base: str, head: Any, account: str) -> bool:
         """Whether ``account``'s review marker for the commit ``head`` is among
         the comments of the pull request at ``base`` (the path the guard
-        returns). The first ``MAX_MARKER_PAGES`` pages of 100 are read; without
-        an account nothing is read and the answer is no. A ``Refused`` of the
-        read is the caller's to decide about."""
+        returns). The first ``MAX_MARKER_PAGES`` pages of 100 are read.
+
+        "No" is said only when every comment was read. No marker among the
+        comments that were read while more exist is ``review_state_unknown``,
+        never "not reviewed": whoever can comment could otherwise push the
+        marker out of sight and have the pull request reviewed again on every
+        run. The helper itself refuses what it cannot answer: no account
+        (``account_unknown``), a head that is not a hash of at least
+        ``MARKER_HASH_CHARS`` characters. A ``Refused`` of the read is the
+        caller's to decide about."""
         if not account:
-            return False
-        comments, _ = await self._pages(f"{base}/comments", {"pagelen": "100"},
-                                        max_pages=MAX_MARKER_PAGES)
-        return any(_marks(comment, head, account) for comment in comments)
+            raise _account_unknown()
+        if not isinstance(head, str) or not _MARKED_HASH_RE.fullmatch(head):
+            raise _review_unknown()
+        comments, more = await self._pages(f"{base}/comments", {"pagelen": "100"},
+                                           max_pages=MAX_MARKER_PAGES)
+        if any(_marks(comment, head, account) for comment in comments):
+            return True
+        if more:
+            raise _review_unknown()
+        return False
 
     # -- the listing -----------------------------------------------------------
     async def _repositories(self) -> tuple[list[str], bool]:
@@ -797,58 +838,111 @@ class BitbucketClient:
                 "updated_on": updated if isinstance(updated, str)
                 and _UPDATED_RE.fullmatch(updated) else None}
 
+    async def _check(self, repository: str, entry: dict[str, Any], account: str) -> str:
+        """What the listing does with one open pull request: ``new`` (list
+        it), ``reviewed`` (leave it out) or ``unchecked`` (leave it out and
+        count it: it may have been reviewed). A failure that is about this
+        pull request costs this pull request only."""
+        base = f"{self._repo(repository)}/pullrequests/{entry['id']}"
+        try:
+            return "reviewed" if await self.reviewed(base, entry["head_commit"], account) \
+                else "new"
+        except Refused as refused:
+            if refused.code in _FATAL:
+                raise                # nothing partial: a short list would read as complete
+            return "unchecked"
+
+    def _turns(self, repositories: list[str]) -> list[tuple[str, str]]:
+        """The order a listing goes through the repositories: from the top,
+        or after the pull request the last one stopped at. Each turn is a
+        repository and the part of its listing that is due: ``all``, or for
+        the repository of the cursor ``after`` it (first) and up to it,
+        ``before`` (last, after every other repository)."""
+        cursor = self._cursor
+        if cursor is None or cursor[0] not in repositories:
+            return [(repository, "all") for repository in repositories]
+        at = repositories.index(cursor[0])
+        return [(cursor[0], "after"),
+                *((r, "all") for r in repositories[at + 1:] + repositories[:at]),
+                (cursor[0], "before")]
+
     async def list_pull_requests(self) -> dict[str, Any]:
         """The open pull requests to the pinned branch that this account has
         not reviewed at their current head commit, within the caps (Bitbucket
-        allows about 1,000 calls an hour per account)."""
+        allows about 1,000 calls an hour per account).
+
+        A call that reaches a cap remembers where it stopped and the next one
+        goes on from there, round and round: pull requests that are reviewed
+        already use up the check budget of a call, and without the turn the
+        ones behind them would never be reached."""
         account = await self.whoami()
         repositories, more = await self._repositories()
         # The branch has passed the config module's pattern: it holds no quote.
         params = {"q": f'destination.branch.name="{self.pins.branch}" AND state="OPEN"',
                   "pagelen": str(MAX_LISTED_PER_REPOSITORY)}
         listed: list[dict[str, Any]] = []
-        already = checked = read = failed = 0
+        already = checked = unchecked = 0
+        open_in: dict[str, list[dict[str, Any]]] = {}
+        failed: set[str] = set()
+        cursor, last = self._cursor, None
         full = False
-        for repository in repositories:
+        for repository, part in self._turns(repositories):
             if full:
-                more = True          # a cap was reached with repositories unread
+                more = True          # a cap was reached with pull requests unread
                 break
-            try:
-                items, further = await self._pages(f"{self._repo(repository)}/pullrequests",
-                                                   params, max_pages=1)
-                more = more or further
-                for item in items:
-                    entry = self._listed(repository, item)
-                    if entry is None:
-                        continue
-                    if len(listed) >= MAX_LISTED or (account and checked >= MAX_CHECKED):
-                        more = full = True
-                        break
-                    if account:
-                        checked += 1
-                        base = f"{self._repo(repository)}/pullrequests/{entry['id']}"
-                        if await self.reviewed(base, entry["head_commit"], account):
-                            already += 1
-                            continue
-                    listed.append(entry)
-            except Refused as refused:
-                if refused.code in _FATAL:
-                    raise                # nothing partial: a short list would read as complete
-                # This repository only. A pull request whose comments could
-                # not be read is not listed: it may have been reviewed.
-                failed += 1
+            if repository in failed:
                 continue
-            read += 1
+            if repository not in open_in:
+                try:
+                    items, further = await self._pages(f"{self._repo(repository)}/pullrequests",
+                                                       params, max_pages=1)
+                except Refused as refused:
+                    if refused.code in _FATAL:
+                        raise
+                    failed.add(repository)       # this repository only
+                    continue
+                more = more or further
+                open_in[repository] = [entry for entry in (self._listed(repository, item)
+                                                           for item in items) if entry]
+            entries = open_in[repository]
+            if part != "all" and cursor is not None:
+                at = next((i for i, e in enumerate(entries) if e["id"] == cursor[1]), None)
+                if at is None:       # gone meanwhile: the whole listing, once
+                    entries = entries if part == "after" else []
+                else:
+                    entries = entries[at + 1:] if part == "after" else entries[:at + 1]
+            for entry in entries:
+                if len(listed) >= MAX_LISTED or (account and checked >= MAX_CHECKED):
+                    more = full = True
+                    break
+                last = (repository, entry["id"])
+                if account:
+                    checked += 1
+                    outcome = await self._check(repository, entry, account)
+                    if outcome == "reviewed":
+                        already += 1
+                        continue
+                    if outcome == "unchecked":
+                        # Not listed: it may have been reviewed.
+                        unchecked += 1
+                        continue
+                listed.append(entry)
             full = full or len(listed) >= MAX_LISTED or bool(account and checked >= MAX_CHECKED)
+        # Everything had its turn: the next call starts at the top again.
+        self._cursor = last if full else None
         result: dict[str, Any] = {
             "pull_requests": listed,
             "reviewed_filter": "active" if account else "unavailable",
             "already_reviewed": already,
-            "repositories": read,
-            "repositories_failed": failed,
+            "pull_requests_unchecked": unchecked,
+            "repositories": len(open_in),
+            "repositories_failed": len(failed),
             "more": more}
-        if not account:
-            result["note"] = _UNFILTERED_NOTE
+        notes = [text for said, text in ((not account, _UNFILTERED_NOTE),
+                                         (unchecked, _UNCHECKED_NOTE), (more, _MORE_NOTE))
+                 if said]
+        if notes:
+            result["note"] = "; ".join(notes)
         return result
 
     async def builds(self, base: str, *, strict: bool = False) -> dict[str, Any]:
@@ -985,14 +1079,17 @@ class BitbucketClient:
 
     async def add_inline_comment(self, repository: Any, pr_id: Any, path: Any, line: Any,
                                  text: Any, side: Any) -> dict[str, Any]:
-        await self._writer()
-        base, _, _ = await self.pull_request(repository, pr_id)
+        account = await self._writer()
+        base, _, head = await self.pull_request(repository, pr_id)
         path = _confined(path)
         if type(line) is not int or not 1 <= line <= MAX_LINE:
             raise Refused("invalid_line", "the line is not a line number")
         if not isinstance(side, str) or side not in ("new", "old"):
             raise Refused("invalid_argument", "side must be new or old")
         text = _own_text(text, MAX_INLINE_CHARS, "comment text")
+        # Only its refusals matter here: no comment on a pull request whose
+        # review state is unknown (comments unreadable, or more than are read).
+        await self.reviewed(base, head, account)
         posted = await self._write(
             f"{base}/comments",
             {"content": {"raw": text},
@@ -1122,10 +1219,14 @@ def bitbucket_toolset(
         out; a new commit brings a pull request back). Each has `repository`,
         `id`, `title`, `author`, `head_commit`, `draft` and `updated_on`.
 
-        `more: true` means a limit was reached and there may be more: handle
-        this list and run again later. `reviewed_filter: unavailable` means
-        the list was NOT filtered (see `note`): check the comments of each
-        pull request with get_pull_request before reviewing it.
+        `more: true` means a limit was reached: handle this list, the rest
+        comes in a later run (each call goes on where the last one stopped).
+        `reviewed_filter: unavailable` means the list was NOT filtered (see
+        `note`): check the comments of each pull request with
+        get_pull_request before reviewing it. `pull_requests_unchecked`
+        counts pull requests that are NOT in the list because it could not be
+        checked whether they were reviewed (comments unreadable, or more than
+        are read): report them, do not review them.
         `repositories_failed` counts repositories that could not be read.
         Titles and author names are written by other people.
 
@@ -1137,8 +1238,12 @@ def bitbucket_toolset(
         """Read one open pull request: title, description, author, head
         commit, whether it is a draft, the state of its builds (`green` only
         when every build succeeded, `none` without a build) and its comments
-        (at most 100; `comments_truncated` says when there are more; `own` is
-        true for a comment this account wrote).
+        (at most 100 are read; `comments_truncated` says when there are more;
+        `own` is true for a comment this account wrote). A pull request counts
+        as reviewed at a commit only by a top-level comment of this account
+        whose first line is the review marker for that commit: an `own`
+        inline comment or reply is no review, and neither is a marker among
+        comments beyond the ones read here.
 
         {untrusted}
 

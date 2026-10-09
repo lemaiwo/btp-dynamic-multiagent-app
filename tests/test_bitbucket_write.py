@@ -340,6 +340,22 @@ async def test_comments_that_cannot_be_read_mean_no_review_is_posted():
     assert _writes(fake) == []
 
 
+@pytest.mark.parametrize("tool, kw", [("add_inline_comment", INLINE), ("submit_review", REVIEW)])
+async def test_no_write_while_it_is_unknown_whether_the_commit_was_reviewed(tool, kw):
+    fake = _fake("SUCCESSFUL")
+    fake.page_size = 2
+    for i in range(7):                               # more than three pages of two
+        fake.add_comment("svc-a", 7, f"noise {i}")
+    fake.add_comment("svc-a", 7, review_marker(HEAD), own=True)      # out of sight
+    out = await _call(_toolset(fake, **APPROVE), tool, **kw)
+    assert out == {"error": {
+        "code": "review_state_unknown",
+        "message": "it could not be established whether this account reviewed the pull "
+                   "request at its current commit; nothing was sent",
+        "hint": "do not review this pull request; report that a person has to look at it"}}
+    assert _writes(fake) == []
+
+
 async def test_inline_comments_do_not_count_as_the_review():
     fake = _fake()
     toolset = _toolset(fake, **COMMENT)
