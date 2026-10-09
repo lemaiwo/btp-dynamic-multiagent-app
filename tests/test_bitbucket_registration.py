@@ -713,3 +713,76 @@ async def test_a_refusal_by_storage_during_a_save_is_a_422_with_fixed_text_never
     assert SECRET not in caplog.text
     assert await _stored("bb-refused") is None
     assert await _stored("bb-kept") == (agent_id, servers)
+
+
+# --- the two routes that reach storage without the admin form -----------------
+
+def _past_the_form() -> list[dict[str, Any]]:
+    """The two entries a bundle or a seed file may carry and no form sends:
+    a switch as a string, and two entries in different spellings. Each agent
+    carries ``SECRET`` in its free text, the second one a typed workspace."""
+    return [
+        {**_agent("bb-string-switch", {**BASE, "allow_comment": "true"}),
+         "description": SECRET},
+        {"name": "bb-two-spellings", "description": SECRET, "instructions": "i",
+         "mcp_servers": _two(URL, "Builtin:Bitbucket/")},
+    ]
+
+
+async def _agent_names() -> list[str]:
+    from agents.db import SessionLocal, list_agents
+
+    async with SessionLocal() as session:
+        return sorted(row.name for row in await list_agents(session))
+
+
+@pytest.mark.parametrize("which, said", [(0, "oauth.allow_comment"), (1, ONE_ENTRY)])
+async def test_an_import_bundle_is_held_to_the_entry_gate(client, caplog, which, said):
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO, logger="aiosqlite")
+    refused = _past_the_form()[which]
+    for bundle in ({"agents": [refused]},
+                   # A good agent in the same bundle is not stored either.
+                   {"agents": [_agent("bb-good", BASE), refused]},
+                   {"agents": [refused], "replace": True}):
+        r = await client.post("/admin/api/import", json=bundle)
+        assert r.status_code == 422, r.text
+        assert said in r.text
+        assert SECRET not in r.text and "zx9" not in r.text and "Zx9" not in r.text
+        assert '"input"' not in r.text and '"ctx"' not in r.text
+        assert await _agent_names() == []
+    assert SECRET not in caplog.text and "zx9" not in caplog.text
+
+
+async def test_a_seed_file_is_held_to_the_entry_gate_and_logs_no_value(
+    client, caplog, tmp_path
+):
+    from agents.admin import seed_from_file_if_empty
+
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.INFO, logger="aiosqlite")
+    seed = tmp_path / "seed.json"
+    seed.write_text(json.dumps({"agents": _past_the_form()}))
+    await seed_from_file_if_empty(seed)
+    assert await _agent_names() == []
+    skipped = [r.getMessage() for r in caplog.records
+               if "Skipping invalid seed" in r.getMessage()]
+    assert len(skipped) == 2, skipped
+    # Which entry and where, never what was typed.
+    assert "'bb-string-switch'" in skipped[0] and "'bb-two-spellings'" in skipped[1]
+    # The switch is refused at its server, the pair by the agent as a whole.
+    assert skipped[0].endswith("1 validation error(s): mcp_servers.0: value_error")
+    assert skipped[1].endswith("1 validation error(s): <entry>: value_error")
+    assert SECRET not in caplog.text and "zx9" not in caplog.text
+    assert "other-" not in caplog.text and "acme-ws" not in "\n".join(skipped)
+
+    # Next to a good entry only the good one is stored.
+    seed.write_text(json.dumps({"agents": [*_past_the_form(), _agent("bb-good", BASE)]}))
+    caplog.clear()
+    await seed_from_file_if_empty(seed)
+    assert await _agent_names() == ["bb-good"]
+    assert await _stored("bb-string-switch") is None
+    assert await _stored("bb-two-spellings") is None
+    assert (await _stored("bb-good"))[1] == [
+        {"url": URL, "auth_mode": "destination", "oauth": BASE}]
+    assert SECRET not in caplog.text and "zx9" not in caplog.text
