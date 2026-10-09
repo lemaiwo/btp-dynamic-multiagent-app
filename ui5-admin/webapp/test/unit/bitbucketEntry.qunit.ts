@@ -355,4 +355,12 @@ QUnit.test("every text of the bitbucket entry exists", async function (assert) {
             `${key}: one build status at least, as the server requires`);
     });
     assert.strictEqual((bundle.getText("bitbucketApproveSaveQuestion") || "").indexOf("while a review runs"), -1);
+    // What an approval covers, as the server behaves: the next review
+    // withdraws it when it finds problems.
+    const stays = bundle.getText("bitbucketApprovalStays") || "";
+    assert.ok(stays.indexOf("withdraws") > -1, stays);
+    assert.ok(stays.indexOf("resets approvals") > -1, "names the repository setting");
+    assert.strictEqual(stays.indexOf("does not"), -1, "no longer says a later review leaves the approval");
+    assert.ok((bundle.getText("bitbucketApproveChatRefused") || "").indexOf(bundle.getText("exposeChat") || "?") > -1,
+        "the refusal names the switch by its label");
 });

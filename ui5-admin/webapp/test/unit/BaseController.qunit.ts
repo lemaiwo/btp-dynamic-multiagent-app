@@ -1,4 +1,5 @@
 import BaseController from "com/agent/admin/controller/BaseController";
+import MessageBox from "sap/m/MessageBox";
 import type View from "sap/ui/core/mvc/View";
 
 /** Records what `withBusy` does to the view, without needing a real one. */
@@ -30,6 +31,14 @@ class TestController extends BaseController {
 
     public busyRun<T>(work: () => Promise<T>): Promise<T> {
         return this.withBusy(work);
+    }
+
+    public notLive(outcome: unknown): boolean {
+        return this.warnIfNotLive(outcome as never, "reloadFailedAgentSaved");
+    }
+
+    protected text(key: string, args?: (string | number)[]): string {
+        return `${key}(${(args || []).join("|")})`;
     }
 }
 
@@ -99,4 +108,35 @@ QUnit.test("a short delay is applied so fast loads do not flash the indicator", 
 
     assert.ok(controller.view.delay > 0, "a delay is set");
     assert.ok(controller.view.delay <= 500, "but a short one, so a slow load shows up promptly");
+});
+
+const shown: { text: string; options: Record<string, unknown> }[] = [];
+const realWarning = MessageBox.warning;
+
+QUnit.module("BaseController.warnIfNotLive", {
+    beforeEach: function () {
+        shown.length = 0;
+        (MessageBox as unknown as { warning: unknown }).warning = (text: string, options: Record<string, unknown>) => {
+            shown.push({ text, options });
+        };
+    },
+    afterEach: function () {
+        (MessageBox as unknown as { warning: unknown }).warning = realWarning;
+    }
+});
+
+QUnit.test("a save whose answer says reload_failed shows a warning that stays", function (assert) {
+    const controller = new TestController("warnIfNotLiveTest");
+    // What an agent save answers when its Bitbucket (or OData) entry changed
+    // and the rebuild failed after the commit.
+    assert.strictEqual(controller.notLive({ id: 1, name: "rev", reloaded: false, reload_failed: true }), true);
+    assert.strictEqual(shown.length, 1);
+    assert.strictEqual(shown[0].text, "reloadFailedText(reloadFailedAgentSaved())");
+    assert.strictEqual(shown[0].options.closeOnNavigation, false, "it outlives the navigation after a save");
+    [{ reloaded: true, reload_failed: false }, { reloaded: false }, {}, undefined, null,
+        { reload_failed: "true" }].forEach((outcome) => {
+        assert.strictEqual(controller.notLive(outcome), false, JSON.stringify(outcome));
+    });
+    assert.strictEqual(shown.length, 1, "no other answer warns");
+    controller.destroy();
 });

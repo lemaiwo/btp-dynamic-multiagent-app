@@ -178,6 +178,22 @@ export default {
     },
 
     /**
+     * Whether an agent with these servers ASKS for approving, as the rules
+     * about who may reach such an agent read it (`asks_to_approve` in
+     * `agents/bitbucket_config.py`): `allow_approve` holds anything but
+     * `false` or nothing. Wider than `approves` on purpose, as on the
+     * server: a hand-written `"true"` gives no toolset at all and still
+     * must not read as "does not approve" there.
+     */
+    asksToApprove(servers: McpServer[] | undefined | null): boolean {
+        return (servers || []).some((s) => {
+            const allow = isUrl(s.url) && s.oauth !== null && typeof s.oauth === "object"
+                ? block(s).allow_approve : undefined;
+            return allow !== undefined && allow !== null && allow !== false;
+        });
+    },
+
+    /**
      * What the agent's Save asks about: every entry that approves after the
      * save (exactly `allow_approve: true`) and opens something by it. An
      * entry is the same one when its workspace and its destination are (an

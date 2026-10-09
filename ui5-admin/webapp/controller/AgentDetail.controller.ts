@@ -72,6 +72,9 @@ export default class AgentDetail extends BaseController {
     /** The agent's servers as the server has them ([] for a new agent): what
      *  Save compares with to tell whether it newly gives writes. */
     private storedServers: McpServer[] = [];
+    /** The name the agent is stored with (none for a new one): the other
+     *  agents' peer lists hold this name until a rename is saved. */
+    private storedName: string | undefined;
     /** The catalogue as read for the open server dialog; null while it is
      *  not read or could not be read. */
     private odataCatalogue: ODataServiceSummary[] | null = null;
@@ -118,6 +121,7 @@ export default class AgentDetail extends BaseController {
             this.clearRunRefreshTimers();
             this.snapshot = undefined;
             this.storedServers = [];
+            this.storedName = undefined;
             this.saving = false;
 
             // Issued together, not one after another: none of the three reads
@@ -213,6 +217,7 @@ export default class AgentDetail extends BaseController {
             model.setProperty("/title", agent.name);
             // A copy: the form edits its own list, never this one.
             this.storedServers = JSON.parse(JSON.stringify(agent.mcp_servers ?? [])) as McpServer[];
+            this.storedName = agent.name;
             this.snapshot = canonical(model.getProperty("/data"));
             model.setProperty("/canRun", AgentDetail.isRunnable(agent));
             // An agent must never be offered itself as a peer.
@@ -895,7 +900,7 @@ export default class AgentDetail extends BaseController {
         // chat and nobody's peer (the server refuses it too). The text says
         // which of the two to switch off.
         const approver = validators.approverProblem(
-            data, model.getProperty("/availableAgents") as Agent[] | undefined);
+            data, model.getProperty("/availableAgents") as Agent[] | undefined, this.storedName);
         if (approver) {
             const names = AgentDetail.quoted(approver.names);
             MessageBox.error(approver.rule === "chat" ? this.text("bitbucketApproveChatRefused")

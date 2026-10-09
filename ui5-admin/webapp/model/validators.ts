@@ -478,29 +478,36 @@ export default {
 
     /**
      * --- bitbucket --- An agent that approves pull requests must not be
-     * reachable by a chat user, who could otherwise direct an approval: it
-     * is not exposed in chat (`expose_chat` exactly `false`) and it is no
-     * peer of another agent. The server refuses the same; this only says it
-     * before the call. `others` are the other agents as the page has them;
-     * without them the two peer rules are left to the server.
+     * reachable by a chat user, who could otherwise direct an approval.
+     * Exactly the three refusals of `check_bitbucket_approver_reach` in
+     * `agents/db.py`, in its order: the agent asks for approving
+     * (`bitbucketEntry.asksToApprove`) and is exposed to chat (anything but
+     * `expose_chat: false`); it asks for approving and another agent,
+     * enabled or not, lists it as a peer under the name it is saved with or
+     * the name it is stored with (`storedName`, on a rename); or one of its
+     * own peers is another agent that asks for approving. `others` are the
+     * other agents as the page has them; without them the two peer rules
+     * are left to the server.
      */
     approverProblem(
         agent: { name?: string; expose_chat?: unknown; mcp_servers?: McpServer[]; peers?: string[] },
-        others?: { name: string; mcp_servers?: McpServer[]; peers?: string[] }[]
+        others?: { name: string; mcp_servers?: McpServer[]; peers?: string[] }[],
+        storedName?: string
     ): ApproverProblem | null {
-        const rest = Array.isArray(others) ? others : [];
-        if (bitbucketEntry.approves(agent.mcp_servers)) {
+        const own = [agent.name, storedName || agent.name].filter((name): name is string => !!name);
+        const rest = (Array.isArray(others) ? others : []).filter((other) => own.indexOf(other.name) === -1);
+        if (bitbucketEntry.asksToApprove(agent.mcp_servers)) {
             if (agent.expose_chat !== false) {
                 return { rule: "chat", names: [] };
             }
-            const namedBy = rest.filter((other) => !!agent.name && (other.peers || []).indexOf(agent.name) > -1)
+            const listers = rest.filter((other) => (other.peers || []).some((peer) => own.indexOf(peer) > -1))
                 .map((other) => other.name);
-            if (namedBy.length > 0) {
-                return { rule: "peerOf", names: namedBy };
+            if (listers.length > 0) {
+                return { rule: "peerOf", names: listers };
             }
         }
         const approvers = (agent.peers || []).filter((peer) => rest.some(
-            (other) => other.name === peer && bitbucketEntry.approves(other.mcp_servers)));
+            (other) => other.name === peer && bitbucketEntry.asksToApprove(other.mcp_servers)));
         return approvers.length > 0 ? { rule: "peers", names: approvers } : null;
     },
 

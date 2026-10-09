@@ -785,3 +785,34 @@ QUnit.test("an agent that approves pull requests is not in chat and nobody's pee
         "without the other agents on the page the peer rule is the server's");
     assert.deepEqual(validators.approverProblem(me({ expose_chat: true }), undefined), { rule: "chat", names: [] });
 });
+
+QUnit.test("the rule reads approving and names as the server does", function (assert) {
+    const asks = (value: unknown) => [{
+        url: "builtin:bitbucket", auth_mode: "destination",
+        oauth: { destination: "B", workspace: "acme-ws", allow_approve: value }
+    }] as never;
+    const me = (over: Record<string, unknown> = {}) => Object.assign(
+        { name: "rev", expose_chat: true, mcp_servers: asks(true), peers: [] as string[] }, over);
+    // `asks_to_approve`: anything but false / nothing asks for approving,
+    // also a value the toolset itself would not run with.
+    ["true", 1, "false", {}].forEach((value) => {
+        assert.deepEqual(validators.approverProblem(me({ mcp_servers: asks(value) }), []),
+            { rule: "chat", names: [] }, JSON.stringify(value));
+    });
+    [false, null, undefined].forEach((value) => {
+        assert.strictEqual(validators.approverProblem(me({ mcp_servers: asks(value) }), []), null, String(value));
+    });
+    assert.deepEqual(validators.approverProblem(
+        me({ expose_chat: false, mcp_servers: asks(false), peers: ["hand"] }),
+        [{ name: "hand", mcp_servers: asks("true"), peers: [] }]), { rule: "peers", names: ["hand"] });
+
+    // A rename: the other agents' peer lists still hold the stored name.
+    const lister = [{ name: "a", mcp_servers: asks(false), peers: ["old-rev"] }];
+    assert.strictEqual(validators.approverProblem(me({ expose_chat: false }), lister), null);
+    assert.deepEqual(validators.approverProblem(me({ expose_chat: false }), lister, "old-rev"),
+        { rule: "peerOf", names: ["a"] });
+    // Its own names are no peer of itself, and no lister of itself.
+    assert.strictEqual(validators.approverProblem(
+        me({ expose_chat: false, peers: ["rev", "old-rev"] }),
+        [{ name: "old-rev", mcp_servers: asks(true), peers: ["rev"] }], "old-rev"), null);
+});
