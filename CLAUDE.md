@@ -458,8 +458,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   registered at all. The model's text is refused when empty or over its cap
   (4,000 / 8,000 characters), or when it holds a control or format character
   (a NUL, a byte order mark, zero width, a bidi mark, a lone surrogate, a
-  line / paragraph separator; line feed and tab are text: `_own_text`), never
-  cut or rewritten: such a character in front of the marker prefix would
+  line / paragraph separator; line feed and tab are text, and a carriage
+  return is made a line feed first: `_own_text`), never cut or otherwise
+  rewritten: such a character in front of the marker prefix would
   hide a marker line from the check and not from a reader.
   **The review marker.** `submit_review` posts ONE top-level comment whose
   line 1 the code writes: `Automated review of commit <hash> - verdict:
@@ -523,17 +524,33 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   read**, and **a draft pull request is NOT held back in code** (`draft` is
   reported; the seed skill tells the agent to give a draft the verdict
   `comment`). The first one reaches further than a commit pushed while a
-  review runs: ANY commit pushed after an approval stays approved unless
-  Bitbucket resets approvals on a source change (a repository setting, a
-  Premium feature), and a later review with verdict `comment` does not
-  withdraw it (no call here deletes an approval). The tool says so instead:
-  a `submit_review` that does not end in `approved: true` while this
-  account's own approval is on the pull request answers
-  `earlier_approval_stands: true` with a fixed `hint` (a person must
-  withdraw it in Bitbucket; the activity line says `earlier approval
-  stands`), and a verdict `approve` that passes the gate while that approval
-  is already there sends no second approve call: `approved: true` with
-  `already_approved: true`. When the gate holds the approval back or Bitbucket refuses it,
+  review runs: an approval of an earlier commit is withdrawn by this
+  account's next review with verdict `comment`; until that review runs, or
+  when Bitbucket does not reset approvals on a source change (a repository
+  setting, a Premium feature) and nothing reviews the newer commit, the
+  earlier approval stands. A verdict `approve` that passes the gate while
+  this account's approval is already there sends no second approve call
+  (`approved: true` with `already_approved: true`); one that is held back
+  answers `earlier_approval_stands: true` with a fixed `hint`.
+  **The withdrawal** (`_withdraw_own_approval`, the one place that sends
+  `DELETE .../approve`; decided by the user). `submit_review`, and only it,
+  withdraws this account's OWN approval when all of this holds: the verdict
+  of this call is exactly `comment`; the summary comment of this very call
+  was posted and its answer read; the guard's read of the pull request shows
+  this account's approval (`_own_approval` readable and `true`). Not behind
+  `allow_approve` or the builds: taking an approval away is the safe
+  direction, for every entry that can post a review. Never without the
+  posted comment, never by `add_inline_comment` or `complete_approval`,
+  never on a state that was not read (`earlier_approval_unknown: true` with
+  a fixed `hint` then). Sent once: `approval_withdrawn: true` for
+  Bitbucket's 204 and nothing else; `approval_withdrawn: false` with
+  `earlier_approval_stands: true` and the refusal's code when Bitbucket said
+  no; `approval_withdrawn: null` with `withdrawal_outcome_unknown` when the
+  request may or may not have been processed (a person must look). The
+  activity line has fixed words for each (`earlier approval withdrawn`,
+  `withdrawal unknown`, `earlier approval stands`, `earlier approval
+  unknown`). The gate for approving is unchanged; a later clean commit is
+  approved again by the normal path. When the gate holds the approval back or Bitbucket refuses it,
   the comment stands: `commented: true`, `approved: false` and an `error`
   (`approve_not_allowed`, `builds_not_green`). `complete_approval` sends the
   approval later and posts nothing: this account's marker for the CURRENT
@@ -626,9 +643,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   a chat-exposed row with an approving entry gets NO Bitbucket toolset, and
   no delegation tool is attached to an approving agent, each with one
   WARNING that names the agents and the rule. The approving agent may have
-  peers of its own. Not closed in code: a workflow step may name the agent
-  (workflows are admin-authored and started by the scheduler or an admin,
-  but the step's input is the previous step's text), and the agent's own
+  peers of its own. **The chat / peer refusal does not cover workflows**: a
+  workflow step may name an approving agent (workflows are admin-authored
+  and started by the scheduler or an admin, but the step's input is the
+  previous step's text). Likewise not closed: the agent's own
   deep sub-agents share its toolsets (`tests/test_bitbucket_reach.py`).
   `tests/test_bitbucket_config.py`, `tests/test_bitbucket_registration.py`
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
