@@ -899,6 +899,9 @@ function collectMcpServers() {
     if (rows.filter(r => destinationBuiltinOf(r) === ODATA_BUILTIN).length > 1) {
         throw new Error('Two builtin:odata rows: an agent takes one. Keep one, with all its services, and remove the other.');
     }
+    if (rows.filter(r => destinationBuiltinOf(r) === BITBUCKET_BUILTIN).length > 1) {
+        throw new Error('Two builtin:bitbucket rows: an agent takes one. Keep one and remove the other.');
+    }
     rows.forEach(r => {
         const url = r.querySelector('.mcp-url').value.trim();
         if (!url) {
@@ -2504,12 +2507,16 @@ const DESTINATION_FIELDS = {
     // One pinned workbook, read as the application: no user_context. The
     // `views` object is edited as JSON (agents/sharepoint_views.py is the gate).
     'builtin:sharepoint':    ['site', 'library', 'path', 'views'],
+    // Reviews pull requests as the destination's technical user: no
+    // user_context. The server refuses any other key (agents/bitbucket_config.py).
+    'builtin:bitbucket':     ['workspace', 'repositories', 'branch', 'allow_comment', 'allow_approve', 'require_green_builds'],
     // No destination name and no user_context: both belong to each catalogue
     // service (`_validate_odata_entry` in agents/admin.py refuses any key but
     // these two). Collected by `collectODataConfig`, not the generic branch.
     'builtin:odata':         ['services', 'allow_write'],
 };
 const ODATA_BUILTIN = 'builtin:odata';
+const BITBUCKET_BUILTIN = 'builtin:bitbucket';
 // A remote MCP server (an http(s) url) through a destination: the destination
 // names the host and holds the credential, so its name and `user_context` are
 // all that is stored (the remote branch of `_clean_destination`). Dropping
@@ -2529,10 +2536,11 @@ function destinationFieldsFor(builtin) {
 // Text fields, in the order they appear; the two switches are checkboxes.
 const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
     'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
-// The pins of builtin:sharepoint are sent exactly as typed, never trimmed: the
-// server refuses a pin with edge whitespace instead of repairing it, so what
-// is stored is always what the admin saw.
-const DESTINATION_EXACT_KEYS = ['site', 'library', 'path'];
+// The pins of builtin:sharepoint, and the workspace and branch of
+// builtin:bitbucket, are sent exactly as typed, never trimmed: the server
+// refuses a pin with edge whitespace instead of repairing it, so what is
+// stored is always what the admin saw.
+const DESTINATION_EXACT_KEYS = ['site', 'library', 'path', 'workspace', 'branch'];
 
 function destinationFieldsHtml() {
     return `
@@ -2619,8 +2627,23 @@ function destinationFieldsHtml() {
                 <label class="full dest-field-theme">Mail theme (JSON)
                     <textarea class="dest-theme" rows="4" placeholder='{"band": "#1f3348", "accent": "#e0a010", "logo_url": "https://example.com/logo.png", "org_name": "Example"}'></textarea>
                 </label>
+                <label class="dest-field-workspace">Workspace
+                    <input type="text" class="dest-workspace" placeholder="my-workspace">
+                </label>
+                <label class="dest-field-repositories">Repositories
+                    <input type="text" class="dest-repositories" placeholder="comma-separated slugs; blank = every repository of the workspace">
+                </label>
+                <label class="dest-field-branch">Target branch
+                    <input type="text" class="dest-branch" placeholder="main">
+                </label>
                 <label class="full dest-field-allow_comment">
                     <input type="checkbox" class="dest-allow_comment"> Allow commenting
+                </label>
+                <label class="full dest-field-allow_approve">
+                    <input type="checkbox" class="dest-allow_approve"> Allow approving (only after the review comment was posted)
+                </label>
+                <label class="full dest-field-require_green_builds">
+                    <input type="checkbox" class="dest-require_green_builds" checked> Approve only when all builds are successful
                 </label>
             </div>
             <p class="hint dest-hint" style="margin:8px 0 0"></p>
@@ -2641,6 +2664,14 @@ function fillDestinationFields(row, oauth) {
     row.querySelector('.dest-user_context').checked = oauth.user_context === true;
     row.querySelector('.dest-allow_send').checked = oauth.allow_send === true;
     row.querySelector('.dest-allow_comment').checked = oauth.allow_comment === true;
+    // builtin:bitbucket. The two switches of ANOTHER type's block are never
+    // loaded: making such a row a bitbucket row later must not start with
+    // approving on or the build check off.
+    const isBitbucket = destinationBuiltinOf(row) === BITBUCKET_BUILTIN;
+    row.querySelector('.dest-repositories').value =
+        isBitbucket && Array.isArray(oauth.repositories) ? oauth.repositories.join(', ') : '';
+    row.querySelector('.dest-allow_approve').checked = isBitbucket && oauth.allow_approve === true;
+    row.querySelector('.dest-require_green_builds').checked = !(isBitbucket && oauth.require_green_builds === false);
     // builtin:odata. What a stored block of ANOTHER type holds under these
     // two keys is never loaded: making such a row an odata row later must not
     // start with writes on or with services nobody picked here.
@@ -2699,7 +2730,7 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sharepoint, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (isRemoteMcpUrl(builtin)) {
@@ -2709,6 +2740,8 @@ function syncDestinationFields(row) {
                 : 'It holds an app-level credential: every caller reaches the server as the destination\'s technical user.');
     } else if (builtin === 'builtin:sharepoint') {
         hint = 'The destination reaches Microsoft Graph with an application credential (OAuth2ClientCredentials) that is granted read on the one site. The agent can only name a view; site, file and views are pinned here. Site, library and file path are stored exactly as typed.';
+    } else if (builtin === BITBUCKET_BUILTIN) {
+        hint = 'The destination reaches Bitbucket Cloud as a technical user (BasicAuthentication: e-mail and API token). The agent reviews open pull requests to the target branch of this workspace; it can only name a repository and a pull request. Commenting and approving are separate switches; an approval is sent only after the review comment, and only with successful builds unless that check is switched off. Workspace and target branch are stored exactly as typed.';
     } else if (builtin === 'builtin:smtp') {
         hint = 'A destination of Type MAIL: mail.smtp.host/port, mail.user, mail.password, mail.smtp.from. The server certificate is always verified.';
     } else if (builtin === 'builtin:sapnotedetail') {
@@ -3040,6 +3073,20 @@ function collectDestinationConfig(row) {
     }
     if (wanted.includes('allow_comment') && row.querySelector('.dest-allow_comment').checked) {
         oauth.allow_comment = true;
+    }
+    if (builtin === BITBUCKET_BUILTIN) {
+        // Split on commas, so the blank around a name is the separator's and
+        // not part of a slug. No name left means the key is absent (the
+        // whole workspace): the server refuses an empty list.
+        const repositories = row.querySelector('.dest-repositories').value
+            .split(',').map(s => s.trim()).filter(Boolean);
+        if (repositories.length) oauth.repositories = repositories;
+        if (row.querySelector('.dest-allow_approve').checked) {
+            if (oauth.allow_comment !== true) throw new Error('Approving requires commenting: tick "Allow commenting" as well.');
+            oauth.allow_approve = true;
+        }
+        // Only ever sent as false: absent means the builds must be successful.
+        if (!row.querySelector('.dest-require_green_builds').checked) oauth.require_green_builds = false;
     }
     // The look of originated mail (MailTheme in agents/mail_render.py). Only
     // the JSON shape is checked here; the server's 422 names a bad key.
