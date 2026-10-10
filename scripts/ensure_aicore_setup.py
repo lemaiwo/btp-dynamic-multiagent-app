@@ -21,6 +21,7 @@ Run:  python scripts/ensure_aicore_setup.py
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -44,6 +45,32 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+DEFAULT_TIMEOUT_S = 300.0
+
+
+def _timeout_s() -> float:
+    """``AICORE_ENSURE_TIMEOUT`` in seconds, or the default.
+
+    A value that is not a finite, non-negative number is a typo in an
+    ``.mtaext``: the hook goes on with the default and says so, instead of
+    failing the deploy with a traceback. The value itself is not repeated.
+    """
+    raw = os.environ.get("AICORE_ENSURE_TIMEOUT")
+    if raw is None or not raw.strip():
+        return DEFAULT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or value < 0:
+        print(
+            "Warning: AICORE_ENSURE_TIMEOUT is not a number of seconds; "
+            f"using {DEFAULT_TIMEOUT_S:.0f}."
+        )
+        return DEFAULT_TIMEOUT_S
+    return value
 
 
 def _status_of(resource_group) -> str:
@@ -108,7 +135,7 @@ def ensure_resource_group(
 def main() -> int:
     group_id = (os.environ.get("AICORE_RESOURCE_GROUP") or DEFAULT_GROUP).strip()
     strict = _env_bool("AICORE_ENSURE_STRICT", True)
-    timeout_s = float(os.environ.get("AICORE_ENSURE_TIMEOUT", "300"))
+    timeout_s = _timeout_s()
 
     if group_id == DEFAULT_GROUP:
         print(
@@ -133,8 +160,10 @@ def main() -> int:
         # calls are not made under a group that is precisely what we are about
         # to create. Keyword arguments win over AICORE_RESOURCE_GROUP here.
         client = AICoreV2Client.from_env(resource_group=DEFAULT_GROUP)
-    except Exception as exc:  # noqa: BLE001 - the message is the whole point
-        print(f"Could not build an AI Core client: {exc}")
+    except Exception as exc:  # noqa: BLE001 - reported by class, then policy decides
+        # The class only: the SDK's text can hold the URL or a response body,
+        # and this lands in the deploy log.
+        print(f"Could not build an AI Core client ({type(exc).__name__}).")
         print(
             "Expected AICORE_* environment variables or a bound 'aicore' service "
             "in VCAP_SERVICES."
@@ -146,7 +175,8 @@ def main() -> int:
     try:
         ok = ensure_resource_group(client, group_id, timeout_s=timeout_s)
     except Exception as exc:  # noqa: BLE001 - reported, then policy decides
-        print(f"Could not ensure resource group '{group_id}': {exc}")
+        # The class only, as above.
+        print(f"Could not ensure resource group '{group_id}' ({type(exc).__name__}).")
         print(
             "Creating a resource group needs an aicore service key with admin "
             "scope. If this key is restricted, create the group once in the AI "

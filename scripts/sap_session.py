@@ -29,6 +29,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -226,6 +227,33 @@ async def fetch_detail_raw(cookie: str, note: str) -> tuple[int, str, bytes]:
     return r.status_code, r.headers.get("content-type", ""), r.content
 
 
+# Hosts the session may be sent to over plain http: the app on this machine.
+LOCAL_HOSTS = ("127.0.0.1", "localhost")
+
+
+def check_base_url(base_url: str) -> None:
+    """Refuse a ``--base-url`` the cookie and the admin token must not go to.
+
+    Both travel in the request (the SAP session cookie in the body, the
+    bearer token in a header), so the URL is https, or http to the local app
+    only; no userinfo either way. The message never repeats the URL.
+    """
+    parts = urlsplit(base_url or "")
+    try:
+        host = (parts.hostname or "").lower()
+        parts.port  # noqa: B018 -- raises for a port that is not a number
+    except ValueError:
+        host = ""
+    local = parts.scheme == "http" and host in LOCAL_HOSTS
+    if not host or parts.username is not None or parts.password is not None \
+            or not (parts.scheme == "https" or local):
+        raise SystemExit(
+            "--base-url must be an https:// URL of the app (or http://127.0.0.1 / "
+            "http://localhost for a local app), without a user name: the session "
+            "cookie and the admin token are sent to it"
+        )
+
+
 async def refresh(
     base_url: str,
     token: str,
@@ -249,6 +277,8 @@ async def refresh(
     the session, which is exactly the failure this parameter exists to let
     an operator correct.
     """
+    # Before the login: a refused URL must not cost the operator an MFA round.
+    check_base_url(base_url)
     user = os.environ.get("SAP_DIALOG_USER", "").strip()
     pwd = os.environ.get("SAP_DIALOG_PWD", "").strip()
     if not user or not pwd:

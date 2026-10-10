@@ -84,6 +84,12 @@ modules:
       disk-quota: 2G
       buildpack: python_buildpack
       command: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
+      # The timeout of the ensure-aicore-resource-group hook below: a hook is
+      # a CF task, and a module's tasks end at its task-execution-timeout
+      # (seconds; the deploy service's default is 12 h). Above the script's
+      # 300 s wait (AICORE_ENSURE_TIMEOUT) plus the task's own start; a
+      # landscape that raises that wait raises this in its .mtaext too.
+      task-execution-timeout: 900
     properties:
       AICORE_RESOURCE_GROUP: "${aicore-resource-group}"
       # Optional: restrict the set of MCP URLs admins can register.
