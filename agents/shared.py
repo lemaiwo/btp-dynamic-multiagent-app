@@ -32,6 +32,7 @@ from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from agents.auth import current_jwt
+from agents.errors import describe_exception, mask_text
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +224,7 @@ async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
             name, ctx.max_retries,
         )
         return (
-            f"Tool {name!r} failed after {ctx.retry + 1} attempts: {e.message} "
+            f"Tool {name!r} failed after {ctx.retry + 1} attempts: {mask_text(e.message)} "
             f"Treat this source as unavailable, record it as not checked with "
             f"this reason, and continue with the other sources."
         )
@@ -237,7 +238,10 @@ async def _resilient_tool_call(ctx, call_tool, name: str, args, metadata=None):
             raise
         logger.warning("MCP tool %s failed: %s", name, e, exc_info=True)
         return (
-            f"Tool {name!r} failed: {type(e).__name__}: {e} "
+            # The text goes to the model, the tool card and the stored run
+            # activity: an httpx error embeds the URL as sent, credentials in
+            # its query included, so it is masked (agents/errors.py).
+            f"Tool {name!r} failed: {describe_exception(e)} "
             f"Treat this source as unavailable, record it as not checked with "
             f"this reason, and continue with the other sources."
         )

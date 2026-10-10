@@ -20,6 +20,7 @@ from agents.db import (
     sweep_stale_runs,
 )
 from agents.db import DEFAULT_RUN_PROMPT, get_agent_by_name
+from agents.errors import describe_exception
 from agents.registry import _MAX_DELEGATION_DEPTH, _make_progress_handler, registry
 from agents.reports import RunReport
 from agents.run_activity import final_activity, recording
@@ -418,4 +419,4 @@ async def _execute_run(run_id: str, agent_id: int) -> None:
             "Run %s of agent %s failed",
             run_id, agent.name if agent is not None else agent_id,
         )
-        await _finalize(run_id, status="failed", error=f"{type(e).__name__}: {e}")
+        await _finalize(run_id, status="failed", error=describe_exception(e))
