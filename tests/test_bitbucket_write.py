@@ -823,6 +823,14 @@ async def test_gate_complete_approval_refuses_when_its_own_approval_cannot_be_re
     fake.prs[("svc-a", 7)]["participants"] = participants
     out = await _call(_toolset(fake, **APPROVE), "complete_approval", **PR)
     assert out["error"]["code"] == "review_state_unknown" and _writes(fake) == []
+    # Review B-bb-4: the review was read; it is the approval state that was
+    # not. The text says so and does not tell the model to drop the review.
+    assert out == {"error": {
+        "code": "review_state_unknown",
+        "message": "whether this account already approved the pull request could not be "
+                   "read; nothing was sent",
+        "hint": "do not call again; a later run may list the pull request under "
+                "approval_pending"}}
 
 
 async def test_gate_complete_approval_refuses_what_every_write_refuses():

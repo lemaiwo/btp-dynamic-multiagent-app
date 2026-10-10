@@ -2132,6 +2132,41 @@ row.querySelector('.mcp-url').value = 'Builtin:Bitbucket/';
 row.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
 assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true);
 assert.strictEqual(row.querySelector('.dest-allow_approve').checked, true);
+// Review B-bb-6: editing the URL keystroke by keystroke passes through
+// strings that are no built-in at all. Only arriving at ANOTHER commenting
+// type resets the switches; a typo corrected back to the same type keeps them.
+const typeIntoUrl = (r, v) => {
+    r.querySelector('.mcp-url').value = v;
+    r.querySelector('.mcp-url').dispatchEvent(new window.Event('input', { bubbles: true }));
+};
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: BB_OAUTH }));
+typeIntoUrl(row, 'builtin:bitbucke');
+typeIntoUrl(row, 'builtin:bitbuckett');
+typeIntoUrl(row, '');
+typeIntoUrl(row, 'builtin:gmail');
+typeIntoUrl(row, 'builtin:bitbucket');
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true,
+    'a URL edited back to the same type keeps "Allow commenting"');
+assert.strictEqual(row.querySelector('.dest-allow_approve').checked, true,
+    'a URL edited back to the same type keeps "Allow approving"');
+// ... and arriving at the other commenting type through such strings still resets.
+typeIntoUrl(row, 'builtin:ji');
+typeIntoUrl(row, 'builtin:jira');
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, false);
+assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
+// A row loaded as another type and edited into a commenting type starts unticked,
+// whatever the stored block said.
+({ row, out } = addAndCollect({ url: 'builtin:gmail', auth_mode: 'destination',
+    oauth: { destination: 'GMAIL', allow_comment: true } }));
+typeIntoUrl(row, 'builtin:jira');
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, false);
+// A jira tick survives a typo too.
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC', allow_comment: true } }));
+typeIntoUrl(row, 'builtin:jir');
+typeIntoUrl(row, 'builtin:jira');
+assert.strictEqual(row.querySelector('.dest-allow_comment').checked, true);
 
 // 8. A remote MCP server through a destination: the destination names the
 //    host and holds the credential, so only {destination, user_context} is

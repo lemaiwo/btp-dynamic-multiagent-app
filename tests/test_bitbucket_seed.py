@@ -216,6 +216,14 @@ def test_the_agent_reports_what_no_run_reaches_and_what_it_could_not_post():
     assert "run report" in text.lower()
 
 
+def test_a_held_back_approval_next_to_a_posted_comment_is_not_called_unposted():
+    """Review B-bb-5: from submit_review, `review_state_unknown` next to
+    `commented: true` means the comment stands and only the approval waits."""
+    text = _agent()["instructions"]
+    assert ("when submit_review answers `review_state_unknown` next to `commented: true`, "
+            "the review comment IS posted and only the approval was held back") in text
+
+
 def test_the_skill_leaves_the_approval_to_the_tool():
     content = _skill()["content"].lower()
     assert "draft" in content and "result_too_large" in content
