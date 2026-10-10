@@ -81,8 +81,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `sslValidateCertificate` and `sslHostNameInCertificate` in a URL is dropped
   (the driver reads its options in any case) before the fixed values are
   set, with one WARNING when the URL asked for less; there is no insecure
-  switch as `PG_SSL_INSECURE` is for Postgres; the binding's `certificate` is
-  the trust store, passed in memory. `_target_from_url` and `bound_target`
+  switch at all for HANA. For Postgres (`_build_ssl_context`) the binding's
+  `certificate` is the trust store when it is there; without a usable CA the
+  certificate is checked against the system trust store, with one WARNING;
+  `PG_SSL_INSECURE=1` (exactly) is the explicit opt-out that turns chain and
+  host-name checks off and is logged as a WARNING every time (the default is
+  `0`; nothing in the descriptor sets it). For HANA the binding's `certificate`
+  is the trust store, passed in memory. `_target_from_url` and `bound_target`
   build a target outside the app's own choice (for
   `scripts/copy_registry_config.py`).
   `init_db` has two schema steps: `_create_and_migrate` (Postgres, SQLite:
@@ -230,7 +235,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/oauth_routes.py` — `GET /oauth/callback` completes the flow
 - `agents/builtins.py` — registry of `builtin:` pseudo-URLs and the factory
   that turns one into a toolset. The set is closed; an unknown `builtin:` URL
-  is rejected at admin validation. `builtin:odata` is the one whose entry
+  is rejected at admin validation and again in storage (`prepare_servers`,
+  reached without the payload by `scripts/import_bundle.py` and direct
+  `upsert_agent` callers; a known one is stored lower-cased without a trailing
+  slash, so the registry never builds a `builtin` spelling as a remote MCP
+  server). Storage also repeats the payload's URL rules for every other
+  server URL (https except on `auth_mode=none`, no userinfo or fragment, a
+  host and a valid port) and for `oauth.uaa_url` / `authorize_url` /
+  `token_url` (https, no userinfo or fragment); the host allow-list
+  (`MCP_URL_ALLOWLIST`) stays the payload's, so storage is never stricter
+  than the gate (`tests/test_db_storage_gate.py` holds the two together). The
+  write switches Jira `allow_comment` and the `allow_send` of oauth2 and
+  app_only Outlook/Teams/Gmail are stored true only for the JSON boolean
+  `true` (`is True`, never `bool()`: the string `"false"` is truthy).
+  `builtin:odata` is the one whose entry
   names no destination and the one factory that also receives the catalogue
   snapshot the registry loaded; it is always built with the storing audit
   recorder (`stored_recorder()`), so no caller can build it with writes that
@@ -493,7 +511,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   unfiltered list and says so (`reviewed_filter: unavailable`). Caps per
   call: 20 listed, 40 checked, 50 repositories (one page of the workspace,
   or the pinned list), 50 open pull requests per repository (one page). A
-  call that reaches a cap sets `more` and remembers where it stopped; the
+  call that reaches a cap (20 listed, 20 `approval_pending`, 40 checked) sets
+  `more` and remembers where it stopped (on the last entry it kept or used:
+  the one that overflowed is the first of the next call); the
   next goes on from there, round and round (the cursor is in memory, per
   toolset: gone at a registry reload, not shared between app instances).
   What lies behind the one page of repositories or of a repository's pull
@@ -531,7 +551,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   earlier approval stands. A verdict `approve` that passes the gate while
   this account's approval is already there sends no second approve call
   (`approved: true` with `already_approved: true`); one that is held back
-  answers `earlier_approval_stands: true` with a fixed `hint`.
+  answers `earlier_approval_stands: true` with a fixed `hint`. When this
+  account's entry in `participants` cannot be read, a verdict `approve` sends
+  NO approve call (one sent blind could be answered 409 while an approval
+  stands and read as "not approved"): the comment is posted, then
+  `approved: false`, `earlier_approval_unknown: true` with a fixed `hint` and
+  the error `review_state_unknown`; the marker still says `approve`, so
+  `approval_pending` offers it to `complete_approval` once the state can be
+  read.
   **The withdrawal** (`_withdraw_own_approval`, the one place that sends
   `DELETE .../approve`; decided by the user). `submit_review`, and only it,
   withdraws this account's OWN approval when all of this holds: the verdict
@@ -695,8 +722,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `PLACEHOLDER_BASE` (`https://destination.invalid`), the auth resolves the
   destination per request (as the signed-in user when `user_context`),
   rewrites the URL onto the destination's, sets its headers, retries once on
-  401, and refuses to send the credential to a host the destination did not
-  name. `DestinationUserRequired` (a `DestinationError`, deliberately not
+  401, and refuses to send the credential anywhere but the destination's own
+  scheme, host and port: an absolute URL (a paging link out of an answer this
+  app does not control) passes only when `(scheme, host, port)` equals the
+  destination URL's, or is `https` on the default port of an expected API
+  host (`expected_hosts`); the same host over `http://` or another port is
+  refused before any header is added (on the OnPremise route `_shape` holds
+  the request to the destination's `http://` host and port instead).
+  `DestinationUserRequired` (a `DestinationError`, deliberately not
   `OAuthAuthorizationRequired`) is raised when `user_context` is on and no
   JWT is bound -- scheduled runs. Every built-in accepts
   `auth_mode="destination"` with `{destination, user_context}` plus its pinned
@@ -715,7 +748,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   Cloud Connector) are reached only by a client built for it
   (`routed_auth` / `destination_http_client(..., connectivity=...)`, today
   the OData toolset, its `$metadata` preview and its test call; every other
-  built-in refuses one): the request keeps the destination's `http://` URL
+  built-in and the workflow `http` step refuse one): the request keeps the destination's `http://` URL
   (an `https://` OnPremise URL is refused: a CONNECT tunnel would hand the
   proxy token to the target) and goes to the connectivity proxy in HTTP
   forward mode with a per-request `Proxy-Authorization`, through
@@ -984,8 +1017,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `job_runs.activity_json` when the run ends. The sink sets
   `interactive = False` (`progress.is_interactive`), so a run that needs
   sign-in still fails fast instead of waiting for a click. Every run site
-  passes `shared.run_usage_limits()` (`AGENT_REQUEST_LIMIT`, default 200,
-  instead of pydantic-ai's 50 that deep sub-agents share with their parent)
+  (chat, jobs, workflows, IDE, A2A) passes `shared.run_usage_limits()`
+  (`AGENT_REQUEST_LIMIT`, default 200, instead of pydantic-ai's 50 that deep
+  sub-agents share with their parent; `tests/test_run_finalize_retry.py` pins
+  the A2A site). A job or workflow start (scheduler or Run now) first marks
+  `running` rows older than their timeout `interrupted` (the age-based
+  `sweep_stale_runs` / `sweep_stale_workflow_runs`, every agent's or
+  workflow's rows; a failed sweep is logged and the start goes on), then
+  checks for an active run; at startup every `running` row is swept. The
+  runners' `_finalize` writes the outcome in up to three attempts
+  (`FINALIZE_RETRY_DELAYS`, 0.5 s and 1 s apart) and never raises; a cancel
+  during the wait ends the retries and the sweep closes the row
 - `agents/ide/` — the backend of the **ABAP Assistant** (the UI's name; the
   code, `/ide/api`, the `developer` scope and the role collection
   `ABAP IDE Developer` keep the old naming): a staged chat that analyses,
@@ -1080,7 +1122,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     performance, authorization trace) with `user`/`traceUser` filters
     refused; `trace_start`/`trace_cancel` are never forwarded, the guard
     turns them into a stored proposal; `set_sql_trace_state` stays refused.
-    Diagnose rights apply to the session target's ARC-1 server only
+    Diagnose rights apply to the session target's ARC-1 server only, and only
+    when it acts as the signed-in user
   - `diagnose.py` — `is_non_production(conventions)`, the ONE switch for
     diagnose: only a target whose conventions row holds `non_production`
     exactly `True` may be diagnosed (missing or unreadable conventions, or
@@ -1090,7 +1133,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `DiagnoseRun` is bound on the `current_diagnose` contextvar by the run
     task (set and reset there); a diagnose call without a binding for that
     session is refused; `is_target_server` limits diagnose rights to the
-    session target's ARC-1 server
+    session target's ARC-1 server, recognised by the target's destination AND
+    `user_context: true` on that entry (`DestinationAuth.user_context is
+    True`): an ARC-1 entry on a technical credential gets the change policy
+    instead, so the diagnose data actions are refused (its reads would reach
+    SAP as the technical user while `Arc1Client` runs as the developer), and
+    `registry.build_orchestrator` logs one WARNING per build for each MCP
+    entry on an IDE target's destination (the conventions rows) without
+    `user_context`; a diagnose run that reaches no such server ends with the
+    `no_diagnose_server` error event
   - `shapes.py` — recognises `SAPDiagnose` result shapes (by tool,
     `action`, `id` and the keys a payload carries) for `findings.py`
   - `findings.py` — turns data results into `IdeFinding` metadata (kind,
@@ -1319,7 +1370,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   All HTTP goes through `service/IdeService.ts`, which sends the
   approuter's CSRF token on every non-GET call (fetched with `X-CSRF-Token:
   Fetch` on `GET me`, one retry on a `Required` 403, then `csrf_failed`;
-  nothing is sent locally). Tests: `npm test` (tsc + karma QUnit/OPA5 on
+  nothing is sent locally) and `X-Requested-With: XMLHttpRequest` on every
+  call, GET included (the approuter answers an expired session with 401 only
+  for a non-GET or AJAX-marked request; a plain GET gets a 302 to XSUAA that
+  `fetch` cannot follow). Tests: `npm test` (tsc + karma QUnit/OPA5 on
   `test/integration/FakeBackend.ts`); `test/unit/contract.qunit.ts` drives
   the real `IdeService` against the fake and validates every request and
   answer against `test/contract/ide-api.schema.json`, and the fake's route
@@ -1369,8 +1423,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   the current `Agent.to_web()` and is rebuilt on reload
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
   fan-out step returning `WorkItem`s, and per-item branches the fan-out step
-  selects. Mirrors `job_runner.py` (task set, start lock, never-raising
-  `_finalize`, shutdown cancel). Steps hand plain text to each other; the join
+  selects. Mirrors `job_runner.py` (task set, start lock, the stale sweep at
+  every start, never-raising `_finalize` with its three attempts, shutdown
+  cancel). Steps hand plain text to each other; the join
   step sees one `## From` block per branch taken. See
   `docs/superpowers/specs/2026-08-31-agent-workflows-design.md`
 - `agents/step_kinds.py` — the deterministic step kinds a `WorkflowStep.kind`
@@ -1385,6 +1440,22 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   admin). Pydantic config models double as the save-time gate
   (`validate_step_config`, called from `validate_workflow_parts`); the
   runner calls `execute_step` and hands the output on as `<kind>#<position>`.
+  **Regexes never run on the event loop**: `re` holds the GIL for the whole
+  match, so a thread would not help either; every `condition`
+  `matches`/`not_matches` and every `transform` `regex` runs in a
+  `python -I -S -E` child with the python step's limits and environment,
+  fed over stdin, killed after `REGEX_TIMEOUT_SECONDS` (5 s), on at most
+  `REGEX_OPERAND_CAP` (64 KiB) of text and with a result of at most four
+  times that (either over is a `StepFailed`, refused, not cut: a cut operand
+  could take the other branch); a pattern that does not compile is refused
+  at save, naming the field, never the pattern (`run_condition`,
+  `run_transform` and `evaluate_rule` are async for this). **The `http` step**
+  streams at most `HTTP_STEP_RESPONSE_CAP` (64 KiB, the python step's output
+  cap) of the response and refuses a longer body (not cut: a cut JSON body
+  would reach the next step as if whole), refuses an OnPremise destination
+  before anything is sent (it does not route through the connectivity proxy),
+  and sends the destination's `URL.queries.*` with every request, the step's
+  own `query` winning.
   Templates know `{{text}}`, `{{item.x}}`, `{{json.x}}`, `{{source.NAME}}`
   and are substituted, never evaluated. Mirrored in the UI by
   `ui5-admin/webapp/model/stepKinds.ts` and the step editors in both admins
@@ -1457,8 +1528,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   no question when approving is switched on
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
-  `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`; see
-  `docs/UI5_ADMIN.md`. The server dialog's toolset dropdown comes from
+  `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`, which sends
+  `X-Requested-With: XMLHttpRequest` on every call, GET included (so the
+  approuter answers an expired session with 401 and the notification poll
+  stops, instead of a redirect `fetch` cannot follow); see
+  `docs/UI5_ADMIN.md`. Errors go through `webapp/service/ErrorHandler.ts`: a
+  409 is a toast ("a run is already in flight") only for the two Run now
+  triggers (`agents/{id}/run`, `workflows/{id}/run`, `AdminError.runTrigger`);
+  every other 409 (a duplicate name, an agent still referenced by a workflow
+  step, a rename clash) is a `MessageBox.error` with the server's `detail`.
+  `classify()` still answers `conflict` for every 409, which the OData pages
+  branch on. The server dialog's toolset dropdown comes from
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
   auth modes the server accepts per built-in. For `builtin:sharepoint`
   (`app_only` or `destination`) the dialog edits the views as JSON and sends
@@ -1584,7 +1664,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   new table (`admin_notification_state`) and an index on `finished_at` of
   both run tables (together HANA schema generation 2); 2.24.0 is the
   `builtin:bitbucket` release: no new resource, no new environment variable,
-  no new table or column (HANA schema generation unchanged)
+  no new table or column (HANA schema generation unchanged); 2.24.1 is the
+  fix release of the full code review of 2026-10-10 (the A findings): no new
+  resource, table or column, but one changed default: `PG_SSL_INSECURE` is
+  now `0`, so a Postgres binding without a CA is verified against the system
+  trust store (check the binding on dev before deploying; `PG_SSL_INSECURE: 1`
+  in the landscape's `.mtaext` is the stop-gap, logged as a WARNING), and
+  both UIs send `X-Requested-With: XMLHttpRequest` on every request so the
+  approuter answers an expired session with 401 instead of a redirect
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

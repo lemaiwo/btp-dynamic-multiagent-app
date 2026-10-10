@@ -93,10 +93,15 @@ def is_target_server(toolset: Any, run: DiagnoseRun) -> bool:
     """True when ``toolset`` is the MCP server of the run's target.
 
     With a destination on the target's conventions: an MCP server whose
-    requests go through that destination. Without one (local development):
-    the server at ``IDE_ARC1_URL_<TARGET>``. Wrappers (the guard, a prefix)
-    are looked through. Anything that cannot be recognised is not the
-    target's server.
+    requests go through that destination **as the signed-in user**
+    (``DestinationAuth.user_context is True``). Without that, every MCP read
+    of the run (dumps, traces, SAPRead, ATC) would reach SAP as the
+    destination's technical user while the app's own ARC-1 calls (open,
+    base and syntax check, trace arming) run as the developer; such a
+    server gets the change policy instead (the registry build warns about
+    it). Without a destination (local development): the server at
+    ``IDE_ARC1_URL_<TARGET>``. Wrappers (the guard, a prefix) are looked
+    through. Anything that cannot be recognised is not the target's server.
     """
     server = toolset
     for _ in range(_MAX_UNWRAP):
@@ -110,6 +115,7 @@ def is_target_server(toolset: Any, run: DiagnoseRun) -> bool:
         auth = getattr(getattr(server, "http_client", None), "auth", None)
         return (
             isinstance(auth, DestinationAuth)
+            and auth.user_context is True
             and auth.destination_name == run.destination
         )
     from agents.ide.arc1 import env_url_name

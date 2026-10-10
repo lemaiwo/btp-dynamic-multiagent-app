@@ -184,10 +184,22 @@ export default class IdeService {
         });
     }
 
-    /** fetch, a network failure as an IdeError (status 0); an abort rethrown as it is. */
+    /**
+     * fetch, a network failure as an IdeError (status 0); an abort rethrown as it is.
+     *
+     * Every request, GET and the token fetch included, carries
+     * `X-Requested-With: XMLHttpRequest`: the approuter answers an expired
+     * session with 401 only for a request it recognises as AJAX (or a
+     * non-GET); a plain GET gets a 302 to the identity provider instead.
+     * The manual-redirect check in {@link check} stays as the fallback.
+     */
     private static async raw(path: string, init: RequestInit): Promise<Response> {
+        const headers = {
+            ...(init.headers as Record<string, string> | undefined),
+            "X-Requested-With": "XMLHttpRequest"
+        };
         try {
-            return await fetch(IdeService.PREFIX + path, { ...init, credentials: "same-origin", redirect: "manual" });
+            return await fetch(IdeService.PREFIX + path, { ...init, headers, credentials: "same-origin", redirect: "manual" });
         } catch (e) {
             if (init.signal?.aborted) {
                 throw e;

@@ -33,6 +33,13 @@ function thenADialogTitled(Then: Common, title: string): void {
 }
 
 opaTest("a 401 loading the agent list shows the session-expired dialog", function (Given: Common, When: Common, Then: Common) {
+    // A 401 on a GET is what the approuter sends for an expired session only
+    // because AdminService marks every request `X-Requested-With:
+    // XMLHttpRequest` (asserted in test/unit/AdminService.qunit.ts); a GET
+    // without it would get a 302 to the identity provider instead, which
+    // fetch follows cross-origin and fails as "Failed to fetch". The fake
+    // backend does not check the header, so this journey covers the dialog,
+    // the unit test the header.
     Given.iStartTheApp("agents", { path: "agents", status: 401, body: { detail: "no token" } });
     thenADialogTitled(Then, "Session expired");
     Then.iStopTheApp();

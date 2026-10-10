@@ -1467,6 +1467,52 @@ async def test_gate_a_standing_approval_is_not_sent_a_second_time():
     assert [w.rsplit("/", 1)[1] for w in _writes(fake)] == ["comments"]
 
 
+UNREADABLE_PARTICIPANTS = [
+    None, "x", ["x"], [{"user": {"uuid": OWN_UUID}}],
+    [{"user": {"uuid": OWN_UUID}, "approved": "true"}],
+    [{"user": {"uuid": OWN_UUID}, "approved": True},
+     {"user": {"uuid": OWN_UUID}, "approved": False}],
+]
+
+
+@pytest.mark.parametrize("participants", UNREADABLE_PARTICIPANTS)
+async def test_gate_an_approve_verdict_on_an_unread_approval_state_is_held_back(participants):
+    """Review A10: whether this account's approval is already on the pull
+    request could not be read. No approve is sent blind (a 409 for "already
+    approved" would read as "not approved" while one stands): the comment
+    stands, the approval is held back and the unknown state is said."""
+    fake = _fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)]["participants"] = participants
+    out = await _call(_toolset(fake, **APPROVE), "submit_review", **REVIEW)
+    assert out == {
+        "repository": "svc-a", "id": 7, "commit": HEAD, "verdict": "approve",
+        "commented": True, "comment_id": 100, "approved": False,
+        "earlier_approval_unknown": True, "hint": UNKNOWN_HINT,
+        "error": {
+            "code": "review_state_unknown",
+            "message": "the review comment was posted; whether this account already "
+                       "approved the pull request could not be read, so the approval was "
+                       "not sent",
+            "hint": "do not call again; once its approvals can be read, a later run lists "
+                    "the pull request under approval_pending for complete_approval"}}
+    assert _approvals(fake) == 0 and _deletes(fake) == []
+    assert [w.rsplit("/", 1)[1] for w in _writes(fake)] == ["comments"]
+    # The marker still says what the entry may do: complete_approval acts on it.
+    assert fake.posted[0][2]["content"]["raw"].splitlines()[0] == review_marker(HEAD, "approve")
+    assert module.activity_summary("submit_review", out) == (
+        "submit_review: commented yes, approved no, earlier approval unknown, "
+        "error review_state_unknown")
+
+
+async def test_gate_an_unread_approval_state_without_allow_approve_says_both():
+    fake = _fake("SUCCESSFUL")
+    fake.prs[("svc-a", 7)]["participants"] = None
+    out = await _call(_toolset(fake, **COMMENT), "submit_review", **REVIEW)
+    assert out["approved"] is False and out["error"]["code"] == "approve_not_allowed"
+    assert out["earlier_approval_unknown"] is True and out["hint"] == UNKNOWN_HINT
+    assert _approvals(fake) == 0
+
+
 @pytest.mark.parametrize("cfg, states, code", [
     (APPROVE, ("FAILED",), "builds_not_green"),
     (APPROVE, (), "builds_not_green"),
@@ -1481,13 +1527,6 @@ async def test_gate_a_standing_approval_does_not_pass_for_a_gate_that_holds(cfg,
     assert out["error"]["code"] == code and "already_approved" not in out
     assert out["earlier_approval_stands"] is True and out["hint"] == STANDS_HINT
     assert _approvals(fake) == 0 and "approval_withdrawn" not in out
-
-
-async def test_gate_an_own_approval_that_cannot_be_read_is_sent_as_before():
-    fake = _fake("SUCCESSFUL")
-    fake.prs[("svc-a", 7)]["participants"] = [{"user": {"uuid": OWN_UUID}}]
-    out = await _call(_toolset(fake, **APPROVE), "submit_review", **REVIEW)
-    assert out["approved"] is True and "already_approved" not in out and _approvals(fake) == 1
 
 
 def test_the_review_tool_says_what_a_standing_approval_means():

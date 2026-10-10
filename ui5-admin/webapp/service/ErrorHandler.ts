@@ -11,9 +11,13 @@ export type ErrorKind = "session" | "forbidden" | "conflict" | "error";
  * that is the only offered action. A 403 is a different thing: the user is
  * signed in but lacks the admin scope, and reloading would only sign them in
  * again to the same answer, so it is explained and left alone. A 409 from a
- * run trigger means a run is already in flight — informational, not a
- * failure. Everything else is shown with the server's own `detail`, never
- * swallowed.
+ * run trigger ("Run now" of an agent or a workflow, `AdminError.runTrigger`)
+ * means a run is already in flight — informational, a toast. Every other
+ * 409 (a name already taken, an agent a workflow step still runs, a rename
+ * clash) is something the admin must act on, so it is shown like any other
+ * failure: a MessageBox with the server's own `detail`, never swallowed.
+ * `classify` still answers "conflict" for every 409: callers that handle a
+ * 409 themselves (the OData pages) branch on it.
  */
 export default {
 
@@ -71,10 +75,12 @@ export default {
             );
             return;
         }
-        if (kind === "conflict") {
+        if (kind === "conflict" && error instanceof AdminError && error.runTrigger) {
             MessageToast.show(message);
             return;
         }
+        // The text goes in as plain text (MessageBox renders it in a Text
+        // control, no formatted HTML), so the server's detail is never markup.
         MessageBox.error(message);
     }
 };
