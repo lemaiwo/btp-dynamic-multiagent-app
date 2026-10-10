@@ -1052,7 +1052,7 @@ export default class AgentDetail extends BaseController {
         );
         if (who) {
             (this.getModel("agent") as JSONModel).setProperty("/data/run_as_principal", who.principal);
-            MessageToast.show(this.text("principalFilled").replace("{0}", who.label));
+            MessageToast.show(this.text("principalFilled", [who.label]));
             void this.loadCredentials();
         }
     }
@@ -1225,7 +1225,7 @@ export default class AgentDetail extends BaseController {
             if (!started) {
                 return;
             }
-            MessageToast.show(this.text("runStarted").replace("{0}", started.run_id));
+            MessageToast.show(this.text("runStarted", [started.run_id]));
             this.clearRunRefreshTimers();
             RUN_REFRESH_DELAYS_MS.forEach((delay) => {
                 this.runRefreshTimers.push(setTimeout(() => {

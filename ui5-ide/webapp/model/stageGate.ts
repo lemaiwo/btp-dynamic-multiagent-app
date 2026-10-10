@@ -212,7 +212,7 @@ function latestVersion(artifacts: Doc[], kind: ArtifactKind): number | undefined
 const DOC_STAGES: Partial<Record<Stage, { key: PrimaryKey; kind: ArtifactKind; text: string; noVersion: string; need: string }>> = {
     design: { key: "approveDesign", kind: "design", text: "primaryApproveDesign", noVersion: "primaryApproveDesignNoVersion", need: "gateNeedsDesign" },
     plan: { key: "approvePlan", kind: "plan", text: "primaryApprovePlan", noVersion: "primaryApprovePlanNoVersion", need: "gateNeedsPlan" },
-    review: { key: "finish", kind: "review", text: "primaryFinish", noVersion: "primaryFinish", need: "gateNeedsReview" }
+    review: { key: "finish", kind: "review", text: "primaryFinishVersion", noVersion: "primaryFinish", need: "gateNeedsReview" }
 };
 
 export function primaryAction(session: PrimarySession, artifacts: Doc[], files: ObjFile[] = []): PrimaryAction {
@@ -246,7 +246,7 @@ export function primaryAction(session: PrimarySession, artifacts: Doc[], files: 
     if (doc) {
         action = version === undefined
             ? { key: doc.key, textKey: doc.noVersion, textArgs: [] }
-            : { key: doc.key, textKey: doc.text, textArgs: doc.key === "finish" ? [] : [version], version };
+            : { key: doc.key, textKey: doc.text, textArgs: [version], version };
     } else if (session.stage === "propose") {
         action = { key: "approveChanges", textKey: "primaryApproveChanges", textArgs: [] };
     } else {

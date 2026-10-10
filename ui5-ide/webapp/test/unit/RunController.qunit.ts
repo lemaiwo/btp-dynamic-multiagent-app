@@ -99,6 +99,10 @@ class Recorder implements RunCallbacks {
         this.log.push(`finished:${sid}`);
         return this.finishAnswer();
     }
+
+    public onWatchFailed(sid: string, e: unknown): void {
+        this.log.push(`gaveUp:${sid}:${(e as Error).message}`);
+    }
 }
 
 /** Lets promise chains settle (fake timers do not touch microtasks). */
@@ -339,6 +343,48 @@ QUnit.test("a failed onFinished re-arms the watch, so the next poll retries", as
     assert.deepEqual(this.service.sessions, ["s-1"], "the watch polled after the failure");
     assert.deepEqual(this.calls.log.filter((l) => l.startsWith("finished")), ["finished:s-1", "finished:s-1"],
         "the poll ran the clean-up again");
+});
+
+QUnit.test("a reload after a run that fails as signed out is reported at once, not watched", async function (this: Ctx, assert) {
+    const signedOut = Object.assign(new Error("expired"), { status: 401, isAuth: true });
+    this.calls.finishAnswer = () => Promise.reject(signedOut);
+    const started = this.runs.start("s-1", "message", "hi");
+    await settle();
+    this.service.streams[0].emit(run());
+    this.service.streams[0].end();
+    await started;
+    assert.deepEqual(this.calls.log.filter((l) => !l.startsWith("event") && l !== "render"),
+        ["finished:s-1", "gaveUp:s-1:expired"], "the page is told at once");
+    this.clock.tick(RunWatch.intervalMs * 3);
+    await settle();
+    assert.deepEqual(this.service.sessions, [], "no poll: a signed-out poll would fail the same way");
+});
+
+QUnit.test("a watched run whose reload keeps failing is given up after RunWatch.maxFailures polls", async function (this: Ctx, assert) {
+    this.calls.finishAnswer = () => Promise.reject(new Error("reload failed"));
+    this.service.status = "idle";
+    const started = this.runs.start("s-1", "message", "hi");
+    await settle();
+    this.service.streams[0].emit(run());
+    this.service.streams[0].end();
+    await started;
+    for (let i = 0; i < RunWatch.maxFailures + 3; i++) {
+        this.clock.tick(RunWatch.intervalMs);
+        await settle();
+    }
+    assert.strictEqual(this.service.sessions.length, RunWatch.maxFailures, "polled maxFailures times, then stopped");
+    assert.deepEqual(this.calls.log.filter((l) => l.startsWith("gaveUp")), ["gaveUp:s-1:reload failed"],
+        "the page is told once");
+});
+
+QUnit.test("a watched session whose poll answers 401 is given up at once", async function (this: Ctx, assert) {
+    const signedOut = Object.assign(new Error("expired"), { status: 401, isAuth: true });
+    this.service.getSession = (sid: string) => { this.service.sessions.push(sid); return Promise.reject(signedOut); };
+    this.runs.watch({ id: "s-3", status: "running" } as SessionDetail);
+    this.clock.tick(RunWatch.intervalMs * 4);
+    await settle();
+    assert.deepEqual(this.service.sessions, ["s-3"], "one poll");
+    assert.deepEqual(this.calls.log, ["gaveUp:s-3:expired"]);
 });
 
 // --- U3 review follow-ups (Task U7) -----------------------------------------

@@ -14,6 +14,7 @@ import type Link from "sap/m/Link";
 import type List from "sap/m/List";
 import type JSONModel from "sap/ui/model/json/JSONModel";
 import type MultiComboBox from "sap/m/MultiComboBox";
+import type MessageStrip from "sap/m/MessageStrip";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type Panel from "sap/m/Panel";
 import type Select from "sap/m/Select";
@@ -1032,6 +1033,35 @@ opaTest("editing a stored app-only SharePoint server shows pins and views unchan
                 views: SHAREPOINT_VIEWS
             }, "everything else is posted as stored, with the changed path");
         }
+    });
+    Then.iStopTheApp();
+});
+
+opaTest("a credential that scheduled runs depend on and that has expired is named in a strip above the list", function (Given: Common, When: Common, Then: Common) {
+    Given.waitFor({
+        success: function () {
+            backend.reset();
+            backend.credentialProblems = [{
+                agent: "btp-agent", server_key: "https://mcp.example.test/mcp", principal: "uuid-1234",
+                token_state: "expired", expires_at: "2026-08-20T08:00:00+00:00"
+            }];
+            backend.install();
+        }
+    });
+    Given.iStartMyUIComponent({ componentConfig: { name: "com.agent.admin", async: true }, hash: "agents" });
+    Then.waitFor({
+        id: "credentialAlert",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) {
+            return (element as MessageStrip).getVisible();
+        },
+        success: function (strip: UI5Element) {
+            const text = (strip as MessageStrip).getText();
+            Opa5.assert.ok(text.indexOf("\"btp-agent\"") !== -1, "the strip names the agent");
+            Opa5.assert.ok(text.indexOf("has expired") !== -1, "and says the credential has expired");
+            Opa5.assert.ok(backend.requests.indexOf("GET credential-health") !== -1, "read from credential-health");
+        },
+        errorMessage: "The credential strip did not show the expired credential"
     });
     Then.iStopTheApp();
 });

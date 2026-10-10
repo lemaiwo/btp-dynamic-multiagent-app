@@ -397,11 +397,13 @@ async def test_cancel_only_for_a_trace_this_session_armed(fake, jwt):
     other = await _session()
     await _armed(other, "REQ-OTHER")
     # A proposal for an id this session never armed is refused ...
+    await _hold(sid, "run-1")
     async with SessionLocal() as db:
         for rid in ("REQ-OTHER", "REQ-UNKNOWN"):
             with pytest.raises(ApprovalError) as e:
                 await approvals.request(db, _run(sid), "trace_cancel", {"id": rid}, None)
             assert (e.value.code, e.value.status) == ("unknown_trace_request", 409)
+    await _hold(sid, None)
     # ... and so is the approval of a row that got in some other way.
     aid = await _pending(sid, action="trace_cancel", params={"id": "REQ-OTHER"})
     await _refused(sid, aid, "unknown_trace_request", 409)
@@ -708,6 +710,7 @@ def _run(sid, events=None, target=TARGET) -> DiagnoseRun:
 
 async def test_request_stores_normalised_params_and_emits(fake):
     sid = await _session()
+    await _hold(sid, "run-1")
     events: list = []
     run = _run(sid, events)
     async with SessionLocal() as db:
@@ -729,6 +732,7 @@ async def test_request_stores_normalised_params_and_emits(fake):
 
 async def test_request_refused_on_bad_args_or_production_target(fake):
     sid = await _session()
+    await _hold(sid, "run-1")
     async with SessionLocal() as db:
         with pytest.raises(ApprovalError) as e:
             await approvals.request(db, _run(sid), "trace_start",
@@ -761,6 +765,7 @@ async def test_request_refused_outside_a_diagnose_session(fake):
 
 async def test_request_caps_pending_approvals(fake):
     sid = await _session()
+    await _hold(sid, "run-1")
     async with SessionLocal() as db:
         for _ in range(approvals.MAX_PENDING):
             await approvals.request(db, _run(sid), "trace_start", TRACE, None)
@@ -778,9 +783,43 @@ async def test_request_survives_a_failing_emit(fake):
     run = _run(sid)
     run.emit = _boom
     await _armed(sid, "REQ-1")
+    await _hold(sid, "run-1")
     async with SessionLocal() as db:
         row = await approvals.request(db, run, "trace_cancel", {"id": "REQ-1"}, None)
     assert row.status == "pending"
+
+
+async def _hold(sid: str, run_id: str | None) -> None:
+    """Give the session's run lock to ``run_id`` (``None``: nobody holds it)."""
+    async with SessionLocal() as db:
+        await db.execute(update(IdeSession).where(IdeSession.id == sid).values(
+            status="running" if run_id else "idle", run_id=run_id))
+        await db.commit()
+
+
+@pytest.mark.parametrize("holder", ["newer-run", None])
+async def test_request_refused_when_the_run_no_longer_holds_the_session(fake, holder):
+    """Review B-ide-2: a run whose lock was reaped or taken by a newer run
+    may not leave a pending approval behind (as the session tools refuse)."""
+    sid = await _session()
+    await _hold(sid, holder)
+    events: list = []
+    run = _run(sid, events)
+    async with SessionLocal() as db:
+        with pytest.raises(ApprovalError) as e:
+            await approvals.request(db, run, "trace_start", TRACE, None)
+        assert (e.value.code, e.value.status) == ("run_superseded", 409)
+        rows = (await db.execute(select(IdeApproval))).scalars().all()
+    assert list(rows) == [] and events == [] and run.approvals == []
+
+
+async def test_superseded_proposal_is_tool_text_not_an_exception(fake):
+    sid = await _session()
+    await _hold(sid, "newer-run")
+    text = await readonly.propose(_run(sid), {"action": "trace_start", **TRACE}, None)
+    assert text.startswith(readonly.PROPOSAL_REFUSED_PREFIX + " (run_superseded)")
+    async with SessionLocal() as db:
+        assert list((await db.execute(select(IdeApproval))).scalars().all()) == []
 
 
 # --- Arc1Client ----------------------------------------------------------------------

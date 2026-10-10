@@ -241,7 +241,7 @@ test.describe("real-stream", () => {
         // Review -> done.
         const review = await sendMessage(page, "Review the changes.");
         expect(review.find((f) => f.event === "artifact")?.data).toMatchObject({ kind: "review", version: 1 });
-        await expect(byId(page, "primaryAction")).toHaveText("Finish session");
+        await expect(byId(page, "primaryAction")).toHaveText("Finish session (review v1)");
         await expect(byId(page, "primaryAction")).toBeEnabled();
         await clickWhenSettled(byId(page, "primaryAction"));
         await expect.poll(async () => (await sessionOf(page, sid)).stage).toBe("done");

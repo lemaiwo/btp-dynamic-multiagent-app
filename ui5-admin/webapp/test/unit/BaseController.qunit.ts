@@ -1,6 +1,8 @@
 import BaseController from "com/agent/admin/controller/BaseController";
 import MessageBox from "sap/m/MessageBox";
 import type View from "sap/ui/core/mvc/View";
+import ResourceModel from "sap/ui/model/resource/ResourceModel";
+import type Component from "com/agent/admin/Component";
 
 /** Records what `withBusy` does to the view, without needing a real one. */
 class ViewStub {
@@ -138,5 +140,40 @@ QUnit.test("a save whose answer says reload_failed shows a warning that stays", 
         assert.strictEqual(controller.notLive(outcome), false, JSON.stringify(outcome));
     });
     assert.strictEqual(shown.length, 1, "no other answer warns");
+    controller.destroy();
+});
+
+/** BaseController's own `text`, on the app's real i18n bundle. */
+class RealTextController extends BaseController {
+    private readonly i18n = new ResourceModel({
+        bundleName: "com.agent.admin.i18n.i18n",
+        supportedLocales: [""],
+        fallbackLocale: ""
+    });
+
+    public getOwnerComponentTyped(): Component {
+        return { getModel: () => this.i18n } as unknown as Component;
+    }
+
+    public t(key: string, args?: (string | number)[]): string {
+        return this.text(key, args);
+    }
+}
+
+QUnit.module("BaseController.text");
+
+QUnit.test("a name with $ patterns is placed as typed, not read as a replacement pattern", function (assert) {
+    // String.prototype.replace reads $&, $', $` and $1 in its replacement:
+    // "Delete the agent "{0}"?".replace("{0}", "a$&b") would put "{0}" back
+    // into the confirmation. The bundle's own formatting does not.
+    const controller = new RealTextController("realTextTest");
+    const name = "a$&b$'c$`d$1e$$f";
+    assert.strictEqual(controller.t("deleteAgentConfirm", [name]),
+        `Delete the agent "${name}"? This cannot be undone.`);
+    assert.strictEqual(controller.t("deleteWorkflowConfirm", [name]),
+        `Delete the workflow "${name}"? This cannot be undone.`);
+    assert.strictEqual(controller.t("deleteSkillConfirm", [name]),
+        `Delete the skill "${name}"? It will be detached from every agent that uses it.`);
+    assert.strictEqual(controller.t("runStarted", ["r$&1"]), "Run r$&1 started.");
     controller.destroy();
 });

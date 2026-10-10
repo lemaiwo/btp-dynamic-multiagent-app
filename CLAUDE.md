@@ -34,7 +34,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 
 ## Key files
 - `app.py` — FastAPI entry; middleware binds JWT; lifespan initializes
-  DB, seeds from `agents.seed.json`, builds the initial registry
+  DB, seeds from `agents.seed.json`, builds the initial registry. The same
+  middleware is the admin CSRF defence (the approuter has `csrfProtection`
+  off for `/admin`): a state-changing request under `/admin` whose
+  `Sec-Fetch-Site` is not `same-origin`/`none` and whose `Origin` is not this
+  app (its base URL, the public base URL or the forwarded origin) is refused
+  403 with a fixed text; server-to-server callers send no `Origin` and are
+  not affected. At startup every `running` job and workflow run is marked
+  `interrupted`: the startup sweep, like `init_db`, assumes ONE app instance
+  (with `instances > 1` or a rolling restart the newcomer would release a
+  sibling's live run lock)
 - `agents/db.py` — SQLAlchemy models (`AgentConfig`, `SkillConfig`,
   `OrchestratorConfig`), `init_db`, CRUD helpers, VCAP/ENV postgres URL
   resolver. `AgentConfig.auth_mode` is one of `jwt`, `none`, `oauth2`,
@@ -196,7 +205,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/auth.py` — `current_jwt`/`current_principal`/`current_base_url`
   contextvars, `principal_from_token`, `XsuaaValidator`,
   `require_user`/`require_admin`/`require_developer` FastAPI dependencies
-  (`require_developer` = the `$XSAPPNAME.developer` scope, for the ABAP Assistant)
+  (`require_developer` = the `$XSAPPNAME.developer` scope, for the ABAP Assistant),
+  `require_a2a` (the `a2a` scope, on `/a2a`) and `require_jobscheduler` (the
+  `JOBSCHEDULER` scope, on the two scheduler run endpoints), and `run_as`, the
+  context manager a "Run now" job uses to run under the agent's principal
+- `agents/errors.py` — `describe_exception` / `mask_text` /
+  `exception_class`: the one way exception text leaves the log (to the
+  model, a tool card, a `job_runs` / `workflow_runs` row). It keeps the
+  class and the message, replaces every URL with `[url]`, a query string
+  with `?[masked]` and credential values (Authorization/Bearer, JWTs,
+  `token=`/`password=` pairs, userinfo) with `[masked]`, and cuts the
+  message at 400 characters; an `ExceptionGroup` is unwrapped into its
+  members. An httpx error embeds the URL as sent, a destination's
+  `URL.queries.*` included, which is why `str(e)` never leaves the log:
+  `_resilient_tool_call`, the delegation tool's `_format_error` and both run
+  runners use it. A host with a port alone or a time (`10:25`) is not a URL
 - `agents/validation_errors.py` — the answer to a refused request
   (`RequestValidationError`) on every route of the FastAPI app: 422 with
   `detail[]` of `loc`/`msg`/`type` only, never `input`/`ctx`/`url`
@@ -227,7 +250,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/oauth2.py` — per-user OAuth2 authorization_code for
   `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
   refreshes the user's token, raises `OAuthAuthorizationRequired`),
-  `begin_authorization`/`complete_authorization` (PKCE + state),
+  `begin_authorization`/`complete_authorization` (PKCE + state; a token
+  endpoint failure is reported, on the sign-in page and in the log, as the
+  status plus the OAuth `error` code or the exception class, never the body
+  or the exception text, as `agents/destination.py` does; the refresh lock is
+  per process, so with two instances and a rotating refresh token the loser
+  keeps a dead one, a known gap),
   `resolve_config`/`_discover_and_register` (RFC 8414/9728/7591 discovery +
   Dynamic Client Registration when the server `oauth` is `{dcr: true}`).
   Tokens in `mcp_oauth_tokens`, flow state in `mcp_oauth_states`, registered
@@ -270,7 +298,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
 - `agents/outlook_tools.py` — the same idea over Microsoft Graph
   (`builtin:outlook`), with an Inbox subfolder as the queue instead of a
   label. `build_http_client` picks per-user, app-only or destination auth;
-  `teams_tools` reuses it. Built and unit-tested but **never run against a
+  `teams_tools` reuses it. The mailbox is one percent-encoded path segment
+  (`@` kept); in destination mode `DestinationAuth` rebuilds the URL from the
+  decoded path, so that encoding is undone there (a `?` fails closed with
+  `InvalidURL`), a known gap. Built and unit-tested but **never run against a
   real mailbox**: `docs/OUTLOOK_SETUP.md` and `scripts/probe_outlook.py`
   cover the tenant gates that have to clear first
 - `agents/mail_render.py` — markdown subset → Outlook-safe HTML for the mail
@@ -308,7 +339,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   with the entry); `user_context` is refused in both modes, at the gate, in
   storage and at build, never silently ignored. `SharePointFile` resolves the
   file with three Graph reads (site, the site's libraries matched by name,
-  the item), cached: the library id 900 s, the bytes per eTag 300 s (no eTag,
+  read in pages of 200 following Graph's `@odata.nextLink` only back to
+  https `graph.microsoft.com` `/v1.0`, at most `MAX_DRIVE_PAGES` = 10 pages,
+  a name not found there is `library_not_found`; the item), cached: the library id 900 s, the bytes per eTag 300 s (no eTag,
   no cache), so the calls of one run download once. The cached bytes are the
   whole workbook, whatever the views pin, so they are dropped when the 300 s
   are over (a timer set for that entry, not the next call), when a newer
@@ -461,7 +494,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `get_pull_request(repository, id)` answers title, description, author,
   `head_commit`, `draft`, `builds` (`green` only with at least one build
   status, every one exactly `SUCCESSFUL` and all of them read; `none`;
-  `not_green`) and at most 100 comments (`own` marks this account's,
+  `not_green`; `unknown` when the statuses could not be read: the pull
+  request is still answered, while the approval gate's strict read approves
+  nothing on an unreadable list) and at most 100 comments (`own` marks this account's,
   `comments_truncated`); `get_diff(repository, id, path="")` the diff, whole
   or of one file: over `MAX_DIFF_CHARS` (60,000) it is refused as
   `result_too_large` with the `diffstat` (at most 300 changed files), never
@@ -740,8 +775,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   instead of dropping it) and
   `builtin:odata` carries it per catalogue service. Storage keys per
   built-in are `_DEST_KEYS_BY_URL` in
-  `agents/db.py` (`builtin:bitbucket` and `builtin:sharepoint` have their
-  own cleaners, `_clean_bitbucket_entry` and `_clean_sharepoint_entry`); save-time rules are `_validate_destination_config` in
+  `agents/db.py`, except Jira and Slack, whose keys are `_DEST_KEYS` /
+  `_SLACK_DEST_KEYS` inside `_clean_destination` (`builtin:bitbucket` and
+  `builtin:sharepoint` have their own cleaners, `_clean_bitbucket_entry` and
+  `_clean_sharepoint_entry`); save-time rules are `_validate_destination_config` in
   `agents/admin.py`; `GET /admin/api/credential-health` reports
   destination servers under `destinations`.
   **OnPremise destinations** (`ProxyType: OnPremise`, a virtual host behind a
@@ -850,7 +887,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     request, is repeated only after a refusal that says it was not
     processed (one repeat after a 403 `Required`), never after a failure
     (`write_outcome_unknown`; `ODataError.sent` says whether the change left
-    the app), and success is recognised positively (a sign-in page at 200 is
+    the app; a write answered 401 or 407 whose one retry by the auth layer
+    fails, also before it connects, is `destination_error` with `sent=True`
+    and audited `refused` / `write`: a modifying request did leave, SAP
+    refused it, nothing changed), and success is recognised positively (a sign-in page at 200 is
     not a success). A 5xx on a modifying request is `sap_error` ("SAP
     refused") only when it carries an OData error envelope, read strictly
     for this one decision (`common.is_error_envelope`: a string `code` plus
@@ -921,7 +961,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     refusal never echoes input. Catalogue CRUD (`GET`/`POST /services`,
     `GET`/`PUT`/`DELETE /services/{name}`, `POST /services/{name}/duplicate`);
     a `PUT` takes `expected_updated_at` and answers 409 when the stored row
-    moved (lock, compare, write in one transaction); `DELETE` answers 409 while
+    moved (lock, compare, write in one transaction); without it (absent or
+    `null`) the `PUT` replaces unconditionally, as API clients and scripts
+    may, and each such save is one WARNING line naming the service and the
+    caller's principal, never the body (both UIs always send it); `DELETE` answers 409 while
     any agent, enabled or not, attaches the service. After the commit, a
     `PUT` or `DELETE` of a service that is in use (an agent row attaches it,
     or the running build still holds a copy of it) rebuilds the registry and
@@ -954,7 +997,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
   account already commented on are skipped, so runs are repeatable.
-  `add_comment` is registered only when `allow_comment` is set.
+  `project` is required at the admin gate (`_validate_destination_config`,
+  on every save of the agent); a row stored without it (before that rule)
+  still builds, with one WARNING, and reaches every project the destination's
+  credential can see (`confine_key` skips the project check with no pin).
+  Neither UI marks the field required yet (the server's 422 reaches them).
+  `add_comment` is registered only when `allow_comment` is exactly `true`.
   See `docs/JIRA_SETUP.md`
 - `agents/lookback.py` — the shared `parse_lookback` window parser
 - `agents/sapnotes_tools.py` — SAP security notes discovered through the
@@ -1066,7 +1114,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     text is not its path's latest revision (`_resync_ide_revisions`,
     additive, idempotent)
   - `store.py` — owner-scoped persistence; a session that is not the
-    caller's answers 404; `list_all_sessions_meta` is metadata only
+    caller's answers 404; `list_all_sessions_meta`, `set_pin` and
+    `set_file_pins` have no caller outside the tests (`GET /admin/sessions`
+    and the approve path use other store functions)
   - `paths.py` — abapGit-style paths `src/<TYPE>/<name>.<ext>`; any other
     path is a scratch note
   - `workspace.py` — loads the session's files and plan into a `DeepState`
@@ -1169,9 +1219,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `version_changed`) in one conditional UPDATE, and is refused while a
     comment is `open` or `sent` (`open_comments`); later stages read the
     pinned documents. In `propose`, `ApproveBody.revisions` (`path ->
-    revision` of the proposals the developer saw) must equal the current
-    revisions of every proposed object file, else 409 `version_changed`;
-    sent in any other stage it is 409 `stage_changed`. The approve holds the
+    revision` of the proposals the developer saw), when sent, must equal the
+    current revisions of every proposed object file, else 409
+    `version_changed`; sent in any other stage it is 409 `stage_changed`. An
+    approve without `revisions` (or without `version`) pins the current ones:
+    the check holds only when the client sends what it showed, which the UI
+    always does. The approve holds the
     session row lock (`store.lock_session_row`) and re-reads the revisions
     after its UPDATE; open, refresh and a finding's open (the only writers of
     a file's `state` outside a run) take the same lock after their ARC-1 read
@@ -1366,7 +1419,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `non_production` flag behind a confirmation that names what diagnose
     sends and how long it is kept (`diagnose_retention_days`); others read.
   `model/RunController.ts` owns a run's lifecycle (start, stream, stop,
-  watch a run the page does not stream; typed callbacks, no `sap.m`).
+  watch a run the page does not stream; typed callbacks, no `sap.m`). A
+  watched run whose post-run reload fails is given up at once on an auth
+  error (`isAuth`, or status 401/403) and after `RunWatch.maxFailures` = 5
+  failed polls in a row (`onGiveUp` / `onWatchFailed`); the page then clears
+  "working" and shows the session-expired box or the `runRefreshFailed`
+  strip, instead of re-arming every 3 s forever. "Finish session" names the
+  review version it pins (`primaryFinishVersion`), and an `open_comments`
+  409 on approve shows the server's sentence before the reload.
   All HTTP goes through `service/IdeService.ts`, which sends the
   approuter's CSRF token on every non-GET call (fetched with `X-CSRF-Token:
   Fetch` on `GET me`, one retry on a `Required` 403, then `csrf_failed`;
@@ -1492,16 +1552,27 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `GET /admin/api/credential-health` lists a
   `builtin:odata` entry once per attached service (`service`,
   `service_enabled`, `destination`, `user_context`, `state`: `resolvable` |
-  `error` | `unbound` | `missing`); its `error` for a failed resolve is a
-  fixed text ending in a code (`agents.odata.destinations.destination_failure`),
-  the resolver's own text goes to the log. The seed loop
+  `error` | `unbound` | `missing`); the `error` of every destination entry
+  (OData and the other built-ins alike) for a failed resolve is a fixed text
+  ending in a code (`agents.odata.destinations.destination_failure`), any
+  other failure "the destination could not be checked (<Class>)"; the
+  resolver's own text goes to the log with URLs masked. The seed loop
   (`seed_from_file_if_empty`) logs a refused entry of any type (skill, agent,
   workflow) by its name (only when it has the form of a name) and the field
   locations and error types of the refusal, or the exception class: never
   the entry or the text of the error, which hold secrets, pins and input
 - `agents/a2a.py` — A2A (Agent-to-Agent) protocol server: agent card at
   `/.well-known/agent-card.json`, JSON-RPC at `/a2a` (`message/send`,
-  `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule.
+  `message/stream`, `tasks/get`, `tasks/cancel`). Used by SAP Joule. The
+  anonymous card publishes every enabled agent's name and description plus
+  `documentationUrl: <base>/admin` (Joule reads the skills list; an opt-in
+  per agent would be a design change). A failed run answers the exception
+  class and a fixed sentence, never its text. Each run is its own asyncio
+  task by task id: `tasks/cancel` cancels it, and a `message/stream` whose
+  client disconnects (polled every second: Starlette does not notice a
+  disconnect while nothing is sent) or whose response is cancelled cancels
+  the run and leaves the task `canceled`, not `working` until the TTL; per
+  process, like the task store.
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
 - `templates/admin.html` — Admin UI (single-page, vanilla JS); attaches
   catalogue services to an agent (checkbox list and Allow writes), the
@@ -1521,9 +1592,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   commenting, Allow approving, which needs the first, and "Approve only when
   all builds are successful", sent only as `false`); two such rows are
   refused before the save. Workspace and branch are filled for a bitbucket
-  row only, and a URL edit that changes the row's built-in type unticks
-  "Allow commenting" (one checkbox for `builtin:jira` and
-  `builtin:bitbucket`) and "Allow approving". An approving agent that is
+  row only, and a URL edit that makes a jira row a bitbucket row or the
+  other way round unticks "Allow commenting" (one checkbox for
+  `builtin:jira` and `builtin:bitbucket`) and "Allow approving"; what the
+  URL passes through while it is typed (a half-typed name, another type)
+  unticks nothing. An approving agent that is
   still exposed to chat is refused by the server (422, fixed text). It asks
   no question when approving is switched on
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
@@ -1538,15 +1611,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   every other 409 (a duplicate name, an agent still referenced by a workflow
   step, a rename clash) is a `MessageBox.error` with the server's `detail`.
   `classify()` still answers `conflict` for every 409, which the OData pages
-  branch on. The server dialog's toolset dropdown comes from
+  branch on. Its session-expired and access-denied texts come from the i18n
+  bundle (`Component.ts` hands it over; English fallbacks for a host without
+  a component). Texts with a value use `text(key, [value])`, never
+  `String.replace("{0}", value)` (a `$&` in a name would be interpreted).
+  The server dialog's toolset dropdown comes from
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
   auth modes the server accepts per built-in. For `builtin:sharepoint`
   (`app_only` or `destination`) the dialog edits the views as JSON and sends
   the three pins as typed, never trimmed (the server refuses edge whitespace
   instead of repairing it). `model/bitbucketEntry.ts` mirrors
   `agents/bitbucket_config.py` for `builtin:bitbucket` and adds no rule:
-  `clean` builds the block from nothing (its own keys, pins as typed, a
-  switch only as the boolean that is stored), `validate` answers fixed texts
+  `clean` builds the block from nothing (its own keys, pins AND the
+  destination as typed, never trimmed; a switch only as the boolean that is
+  stored; `odataEntry` sends service names as typed likewise, so the
+  server's refusal of edge whitespace reaches the admin), `validate` answers fixed texts
   that never quote a value, `approvalsToAsk` names what the agent's Save asks
   about: an entry that approves after the save and did not before, or one
   whose approval the save widens. The **OData services** area
@@ -1671,7 +1750,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   trust store (check the binding on dev before deploying; `PG_SSL_INSECURE: 1`
   in the landscape's `.mtaext` is the stop-gap, logged as a WARNING), and
   both UIs send `X-Requested-With: XMLHttpRequest` on every request so the
-  approuter answers an expired session with 401 instead of a redirect
+  approuter answers an expired session with 401 instead of a redirect. The
+  same release carries the section B fixes: the app module sets
+  `task-execution-timeout: 900` (seconds; MTA hooks are CF tasks and have no
+  timeout of their own, so this bounds the `before-start` hook, whose script
+  waits up to 300 s; an `AICORE_ENSURE_TIMEOUT` above about 800 s needs a
+  higher value in the `.mtaext`), and a `builtin:jira` entry needs a
+  `project` at every save (an existing row without one keeps running, with a
+  WARNING, until an admin sets it)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -1712,8 +1798,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   must be restarted (or reloaded) afterwards; user tokens are copied as
   they are at that moment, so one that either side refreshes later makes the
   other side's copy stale and a second run overwrites the target's. A
-  failure after the target's commit (closing the source) is reported as
-  "written", never as "nothing was written"
+  failure after the target's commit (closing the source or the target
+  connection; the committed flag is set right after `commit()`) is reported
+  as "written", never as "nothing was written"
 - `scripts/hana_schema_history.py` — pins the digest of the current HANA
   artifact set for `HANA_SCHEMA_GENERATION` in
   `agents/hana_schema_history.json`; only ever adds a generation
@@ -1750,7 +1837,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `docs/AICORE_RESOURCE_GROUP.md`
 - `xs-security.json` — `admin`, `user`, `a2a` and `developer` scopes with
   matching role templates and role collections (the `developer` one is
-  still named `ABAP IDE Developer`; its descriptions say ABAP Assistant)
+  still named `ABAP IDE Developer`; its descriptions say ABAP Assistant),
+  plus the `JOBSCHEDULER` scope granted as authority to the
+  `agent-jobscheduler` instance (no role). Its `redirect-uris` are
+  landscape-wide wildcards (`https://*.cfapps.<region>.hana.ondemand.com/**`);
+  a landscape should pin them to its approuter route(s) in the `.mtaext`
 - `approuter/xs-app.json` — `/admin` requires admin scope, `/a2a`
   requires `a2a` scope, `/ui5ide` and `/ide/api` require `developer`,
   `/.well-known/agent-card.json` is anonymous. The two IDE backend routes

@@ -24,6 +24,7 @@ import asyncio
 import base64
 import hashlib
 import logging
+import re
 import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -202,6 +203,27 @@ def _is_invalid_client(resp: Any) -> bool:
         return (resp.json() or {}).get("error") == "invalid_client"
     except Exception:  # noqa: BLE001 — non-JSON error body
         return "invalid_client" in (resp.text or "")
+
+
+# The form of an OAuth error code (RFC 6749 section 5.2), as in
+# agents/destination.py: the only part of a token endpoint's error answer
+# that is repeated anywhere.
+_OAUTH_ERROR_CODE = re.compile(r"[a-z_]{1,40}")
+
+
+def _token_refusal(resp: httpx.Response) -> str:
+    """``<status>`` plus `` (<code>)`` when the JSON body carries an OAuth
+    ``error`` of that form. Never the body or ``error_description``: a token
+    endpoint's answer can name the client, the zone or what was sent, and
+    this text is logged and shown on the sign-in page."""
+    try:
+        answer = resp.json()
+    except Exception:  # noqa: BLE001 — non-JSON error body
+        answer = None
+    error = answer.get("error") if isinstance(answer, dict) else None
+    if isinstance(error, str) and _OAUTH_ERROR_CODE.fullmatch(error):
+        return f"{resp.status_code} ({error})"
+    return str(resp.status_code)
 
 
 async def _forget_registered_client(server_key: str, spec_oauth: dict[str, Any] | None) -> bool:
@@ -472,13 +494,16 @@ class PerUserOAuth2Auth(httpx.Auth):
                     config,
                     {"grant_type": "refresh_token", "refresh_token": refresh_token},
                 )
-            except Exception:
-                logger.warning("Token refresh request failed for %s", self.server_key, exc_info=True)
+            except Exception as exc:  # noqa: BLE001
+                # The class only: an httpx error's text names the token URL.
+                logger.warning(
+                    "Token refresh request failed for %s: %s",
+                    self.server_key, type(exc).__name__,
+                )
                 return None, "Bearer"
             if resp.status_code >= 400:
                 logger.info(
-                    "Refresh rejected (%s) for %s: %s",
-                    resp.status_code, self.server_key, resp.text[:200],
+                    "Refresh rejected (%s) for %s", _token_refusal(resp), self.server_key,
                 )
                 # An invalid_client here is about our *registration*, not the
                 # user's token. Evict it so the sign-in link the caller is
@@ -844,7 +869,12 @@ async def complete_authorization(*, code: str, state: str, principal: str | None
             },
         )
     except Exception as e:
-        raise ValueError(f"Token endpoint request failed: {e}") from e
+        # Shown on the sign-in page: the class only, never the text (it names
+        # the token URL as sent).
+        logger.warning(
+            "Token exchange request failed for %s: %s", flow.server_key, type(e).__name__
+        )
+        raise ValueError(f"Token endpoint request failed ({type(e).__name__}).") from e
 
     if resp.status_code >= 400:
         # invalid_client means our registration is dead, not that the user did
@@ -858,7 +888,9 @@ async def complete_authorization(*, code: str, state: str, principal: str | None
                 "This app's registration with the target was no longer accepted. "
                 "It has been renewed — please retry the sign-in."
             )
-        raise ValueError(f"Token exchange failed ({resp.status_code}): {resp.text[:300]}")
+        refusal = _token_refusal(resp)
+        logger.info("Token exchange rejected (%s) for %s", refusal, flow.server_key)
+        raise ValueError(f"Token exchange failed: the token endpoint answered {refusal}.")
 
     payload = resp.json()
     access = payload.get("access_token")

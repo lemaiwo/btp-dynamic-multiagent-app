@@ -72,6 +72,10 @@ def plain_float(value: float) -> str | None:
     if not _PLAIN_DECIMAL.fullmatch(text):
         return None
     digits = text.lstrip("-").removesuffix(".0").replace(".", "").lstrip("0")
+    # The trailing zeros of a whole number are not significant (`1e15` is one
+    # digit, not 16). `repr` never ends a fraction in 0, so only a whole
+    # number loses anything here.
+    digits = digits.rstrip("0")
     return text if len(digits) <= MAX_FLOAT_DIGITS else None
 
 

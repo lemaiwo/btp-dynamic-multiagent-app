@@ -649,3 +649,128 @@ async def test_forget_drops_the_bytes_and_the_timer_and_no_etag_keeps_nothing():
     source = _file(bare)
     await source.fetch()
     assert source._file is None and source._expiry is None
+
+
+# --- The archive check runs off the event loop --------------------------------
+
+
+async def test_the_archive_check_runs_in_a_worker_thread_before_the_bytes_are_cached(
+        monkeypatch):
+    import threading
+
+    seen: list[int] = []
+    real = tools.check_archive
+
+    def recording(data: bytes) -> None:
+        seen.append(threading.get_ident())
+        real(data)
+
+    monkeypatch.setattr(tools, "check_archive", recording)
+    await _file(FakeGraph(WORKBOOK)).fetch()
+    assert len(seen) == 1 and seen[0] != threading.get_ident()
+    # A refusal of the check still comes before anything is cached.
+    graph = FakeGraph(b"<html>sign in</html>")
+    source = _file(graph)
+    with pytest.raises(Refused) as refused:
+        await source.fetch()
+    assert refused.value.code == "not_a_workbook"
+    assert source._file is None and source._expiry is None
+
+
+# --- The libraries of a site: Graph's paging link is followed -----------------
+
+DRIVES_PATH = "/v1.0/sites/example.sharepoint.com,g1,g2/drives"
+NEXT = "https://graph.microsoft.com/v1.0/sites/example.sharepoint.com,g1,g2/drives"
+
+
+class PagedGraph(FakeGraph):
+    """The drives come in ``pages``; each page but the last has a nextLink.
+
+    ``links`` overrides the nextLink a page (by index) answers with."""
+
+    def __init__(self, pages: list[list[dict]], links: dict[int, str] | None = None) -> None:
+        super().__init__(WORKBOOK)
+        self.pages = pages
+        self.links = links or {}
+
+    def _graph(self, request):
+        if request.url.path != DRIVES_PATH:
+            return super()._graph(request)
+        self.requests.append(request)
+        token = request.url.params.get("$skiptoken")
+        index = int(token) if token else 0
+        body: dict = {"value": self.pages[index]}
+        if index in self.links:
+            body["@odata.nextLink"] = self.links[index]
+        elif index + 1 < len(self.pages):
+            body["@odata.nextLink"] = f"{NEXT}?$select=id,name&$top=200&$skiptoken={index + 1}"
+        return httpx.Response(200, json=body)
+
+
+def _filler(n: int, page: int) -> list[dict]:
+    return [{"id": f"b!x{page}-{i}", "name": f"Library {page}-{i}"} for i in range(n)]
+
+
+def _drive_requests(graph: FakeGraph) -> list:
+    return [r for r in graph.requests if r.url.path == DRIVES_PATH]
+
+
+async def test_a_library_on_a_later_page_of_drives_is_found():
+    graph = PagedGraph([_filler(200, 0), _filler(200, 1),
+                        [{"id": "b!drive1", "name": "Documents"}]])
+    data, _ = await _file(graph).fetch()
+    assert data == WORKBOOK
+    drives = _drive_requests(graph)
+    assert len(drives) == 3
+    assert [r.url.params.get("$skiptoken") for r in drives] == [None, "1", "2"]
+    assert all(r.url.host == "graph.microsoft.com" and r.url.scheme == "https" for r in drives)
+
+
+async def test_the_first_page_still_wins_without_reading_further():
+    graph = PagedGraph([[{"id": "b!drive1", "name": "Documents"}], _filler(3, 1)])
+    await _file(graph).fetch()
+    assert len(_drive_requests(graph)) == 1
+
+
+@pytest.mark.parametrize("link", [
+    "http://graph.microsoft.com/v1.0/sites/x/drives?$skiptoken=1",
+    "https://graph.microsoft.com:8443/v1.0/sites/x/drives?$skiptoken=1",
+    "https://user@graph.microsoft.com/v1.0/sites/x/drives?$skiptoken=1",
+    "https://graph.microsoft.com.evil.test/v1.0/sites/x/drives?$skiptoken=1",
+    "https://evil.test/v1.0/sites/x/drives?$skiptoken=1",
+    "/v1.0/sites/x/drives?$skiptoken=1",
+    "not a url at all",
+    17,
+])
+async def test_a_paging_link_off_graph_is_never_followed(link, caplog):
+    graph = PagedGraph([_filler(2, 0), [{"id": "b!drive1", "name": "Documents"}]],
+                       links={0: link})
+    refused = await _refused(graph)
+    assert refused.code == "library_not_found"
+    assert len(_drive_requests(graph)) == 1
+    assert all(r.url.host == "graph.microsoft.com" for r in graph.requests)
+    assert "evil" not in caplog.text and "skiptoken" not in caplog.text
+
+
+async def test_the_drive_pages_are_capped_and_the_cap_is_logged(caplog):
+    caplog.set_level(logging.WARNING, logger="agents.sharepoint_tools")
+    pages = [_filler(1, i) for i in range(tools.MAX_DRIVE_PAGES + 1)]
+    pages.append([{"id": "b!drive1", "name": "Documents"}])
+    graph = PagedGraph(pages)
+    refused = await _refused(graph)
+    assert refused.code == "library_not_found"
+    assert len(_drive_requests(graph)) == tools.MAX_DRIVE_PAGES
+    assert "pages" in caplog.text and "skiptoken" not in caplog.text
+
+
+async def test_a_failing_later_page_is_the_same_refusal_as_the_first():
+    class FailingSecond(PagedGraph):
+        def _graph(self, request):
+            if request.url.params.get("$skiptoken") == "1":
+                self.requests.append(request)
+                return httpx.Response(403, json={"error": {"message": "graph-text"}})
+            return super()._graph(request)
+
+    refused = await _refused(FailingSecond([_filler(2, 0), _filler(2, 1)]))
+    assert refused.code == "graph_forbidden"
+    assert "graph-text" not in refused.message

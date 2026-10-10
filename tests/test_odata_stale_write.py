@@ -244,6 +244,23 @@ async def test_null_means_not_checked(client, created):
     assert r.status_code == 200 and r.json()["destination"] == "S4_ODATA_TECH"
 
 
+@pytest.mark.parametrize("given", ["absent", None])
+async def test_an_unchecked_replace_is_said_once_at_warning(client, created, caplog, given):
+    """Opt-in stays (a script may leave the field out), but an unconditional
+    replace is said at WARNING -- once, not also at INFO -- with no body value."""
+    caplog.set_level(logging.INFO, logger="agents.odata.admin_routes")
+    body = other_identity() if given == "absent" else other_identity(**{FIELD: given})
+    r = await client.put(ONE, json=body)
+    assert r.status_code == 200
+    lines = [
+        rec for rec in caplog.records
+        if rec.name == "agents.odata.admin_routes" and FIELD in rec.getMessage()
+    ]
+    assert [rec.levelno for rec in lines] == [logging.WARNING]
+    message = lines[0].getMessage()
+    assert "'stock-levels'" in message and "S4_ODATA_TECH" not in message
+
+
 # --- the order of the answers: payload 422, field 422, 404, name 422, 409 ----------
 
 
@@ -524,7 +541,8 @@ def _unchecked(caplog) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.name == "agents.odata.admin_routes" and r.levelno == logging.INFO
+        # A WARNING: a replace that can overwrite a concurrent edit (B-odata-3).
+        if r.name == "agents.odata.admin_routes" and r.levelno == logging.WARNING
     ]
 
 

@@ -2713,14 +2713,22 @@ function syncDestinationFields(row) {
     if (!box) return;
     const builtin = destinationBuiltinOf(row);
     // "Allow commenting" is ONE checkbox for builtin:jira and
-    // builtin:bitbucket. When the URL is edited into another type, a tick
-    // that was set for the old one must not be sent for the new one; and
-    // Approving, which needs it, goes with it. Another spelling of the same
-    // type is no change, and the first call (the row being loaded) resets
-    // nothing.
-    if (row.dataset.destBuiltin !== undefined && row.dataset.destBuiltin !== builtin) {
+    // builtin:bitbucket. When the URL is edited into the OTHER of the two, a
+    // tick that was set for the old one must not be sent for the new one; and
+    // Approving, which needs it, goes with it. What the URL passes through on
+    // the way (a half-typed name, an empty field, another type) changes
+    // nothing: those types send neither switch, and a typo corrected back to
+    // the same type keeps both. A row loaded as any other type starts from ''
+    // and so is reset when it becomes a commenting type. Another spelling of
+    // the same type is no change, and the first call (the row being loaded)
+    // resets nothing.
+    const commentType = (builtin === 'builtin:jira' || builtin === BITBUCKET_BUILTIN) ? builtin : '';
+    if (row.dataset.commentType === undefined) {
+        row.dataset.commentType = commentType;
+    } else if (commentType && row.dataset.commentType !== commentType) {
         row.querySelector('.dest-allow_comment').checked = false;
         row.querySelector('.dest-allow_approve').checked = false;
+        row.dataset.commentType = commentType;
     }
     row.dataset.destBuiltin = builtin;
     const fields = destinationFieldsFor(builtin);

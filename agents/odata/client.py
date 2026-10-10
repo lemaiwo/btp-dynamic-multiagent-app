@@ -286,6 +286,38 @@ def call_changes_data(operation: OperationDef) -> bool:
 
 # Raised before a connection exists: nothing left this app.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
+
+class _AnsweredWatch(httpx.Auth):
+    """The client's own auth, run unchanged, noting whether an attempt of
+    this request was answered before the auth flow sent it again.
+
+    ``DestinationAuth`` repeats a request once after a 401 (or a proxy 407).
+    When that repeat fails before SAP's status line arrives -- also with an
+    error that means "no connection was made" -- the first attempt still
+    LEFT and was answered: a modifying request reached the server and was
+    refused unprocessed. Without this note ``_modify`` could only see the
+    last attempt's error and would report "nothing left". Per request, never
+    shared: a new watch for every send.
+    """
+
+    def __init__(self, inner: httpx.Auth) -> None:
+        self._inner = inner
+        self.answered = False
+
+    async def async_auth_flow(self, request: httpx.Request):  # type: ignore[override]
+        flow = self._inner.async_auth_flow(request)
+        try:
+            outgoing = await flow.__anext__()
+            while True:
+                response = yield outgoing
+                self.answered = True
+                try:
+                    outgoing = await flow.asend(response)
+                except StopAsyncIteration:
+                    return
+        finally:
+            await flow.aclose()
 _STATUS_HINTS = {
     401: "the destination's credential was not accepted by the back end",
     403: "the SAP user is not authorised for this service or entity",
@@ -933,7 +965,12 @@ class ODataClient:
                         "unknown_field",
                         f"entity set {entity_set.name!r} has no field {_shown(name)}",
                     )
-                if not definition.writable:
+                if not definition.writable and not (
+                    operation == "update" and self._echoes_key(entity_set, body, key, name)
+                ):
+                    # A key field that only repeats the key's own value is
+                    # allowed even when it is not writable: step 7 leaves it
+                    # out of the request. Any other value stays refused here.
                     raise ODataError(
                         "field_not_writable", f"field {definition.name!r} cannot be written"
                     )
@@ -980,6 +1017,23 @@ class ODataClient:
                     "'*' is never accepted",
                 )
         return WritePlan(operation, path, entity_set, tuple(names), encoded, etag)
+
+    def _echoes_key(self, entity_set: EntitySetDef, body: dict, key: Any, name: str) -> bool:
+        """Whether body field ``name`` is a key field carrying the key's own
+        value, by the same literal comparison as step 7 of ``check_write``.
+        A value that cannot be written as a literal is no echo."""
+        if not isinstance(key, dict):
+            return False
+        for definition in entity_set.keys:
+            if definition.name != name or name not in key:
+                continue
+            try:
+                return self._dialect.literal(definition.type, body[name]) == self._dialect.literal(
+                    definition.type, key[name]
+                )
+            except ODataError:
+                return False
+        return False
 
     def check_call(
         self,
@@ -1512,7 +1566,9 @@ class ODataClient:
           request went out, was answered 401 (or 407 by the connectivity
           proxy) and its one retry could not be prepared. Nothing was
           changed, but a modifying request left: ``destination_error`` with
-          ``sent=True``;
+          ``sent=True``. The same when that retry was prepared but failed
+          to connect (``_AnsweredWatch`` saw the earlier answer): it is the
+          repeat that sent nothing, not the call;
         * any other failure before SAP's status line arrived -- an httpx
           error, a transport's own exception, an inner timeout -- leaves the
           outcome open: ``write_outcome_unknown`` with ``sent=True``;
@@ -1526,6 +1582,9 @@ class ODataClient:
         status: int | None = None
         proxied = False
         answer = httpx.Headers()
+        inner_auth = self._http.auth
+        watch = _AnsweredWatch(inner_auth) if isinstance(inner_auth, httpx.Auth) else None
+        extra: dict[str, Any] = {} if watch is None else {"auth": watch}
         try:
             async with self._http.stream(
                 method,
@@ -1534,6 +1593,7 @@ class ODataClient:
                 headers=headers,
                 content=content,
                 follow_redirects=False,
+                **extra,
             ) as response:
                 status = response.status_code
                 answer = response.headers
@@ -1545,7 +1605,7 @@ class ODataClient:
                         break
         except DestinationError as exc:
             if status is None:
-                if request_left(exc):
+                if request_left(exc) or (watch is not None and watch.answered):
                     # The request was sent and refused unprocessed (a 401, or
                     # a 407 of the connectivity proxy), and the auth layer
                     # could not prepare its one retry. The text can name the
@@ -1570,6 +1630,17 @@ class ODataClient:
                 status if status is not None else "unknown",
             )
             if status is None:
+                if isinstance(exc, _NOT_SENT) and watch is not None and watch.answered:
+                    # An earlier attempt left and was answered 401 (or 407):
+                    # refused unprocessed, then the auth layer's one repeat
+                    # could not connect. Nothing was changed, but a modifying
+                    # request did leave this app.
+                    raise ODataError(
+                        "destination_error",
+                        "the change was refused before SAP processed it and could not "
+                        "be sent again; nothing was changed",
+                        sent=True,
+                    ) from None
                 if isinstance(exc, _NOT_SENT):
                     raise ODataError(
                         "destination_error",

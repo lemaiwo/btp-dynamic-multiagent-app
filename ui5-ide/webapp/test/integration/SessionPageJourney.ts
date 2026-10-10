@@ -9,6 +9,7 @@ import type ObjectStatus from "sap/m/ObjectStatus";
 import type List from "sap/m/List";
 import type Common from "./pages/Common";
 import { backend } from "./pages/Common";
+import { closeMessageBox } from "./pages/Shared";
 import { OPTS as WOPTS, iSeeRows, theHashIs } from "./pages/Worklist";
 import {
     SOPTS, designSession, iPress, iSend, longConversation, openComment, scroller, theReasonIs, thePrimaryActionIs
@@ -174,6 +175,16 @@ opaTest("a 409 open_comments from the server shows the same reason and reloads",
         }
     });
     iPress(When, "primaryAction");
+    Then.waitFor({
+        controlType: "sap.m.Text",
+        searchOpenDialogs: true,
+        matchers: new PropertyStrictEquals({ name: "text", value: "Resolve or dismiss the open review comments first." }),
+        success: function () {
+            Opa5.assert.ok(true, "the server's refusal is shown when it arrives, not only after the reload");
+        },
+        errorMessage: "The open_comments refusal was swallowed"
+    });
+    closeMessageBox(When);
     theReasonIs(Then, "Resolve or dismiss the 1 open review comment first.", "the server's refusal shows the gate reason");
     thePrimaryActionIs(Then, "Approve design (v1) and plan", false, "and the reloaded session keeps it disabled");
     Then.iStopTheApp();

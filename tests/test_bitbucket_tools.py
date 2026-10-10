@@ -88,6 +88,35 @@ async def test_only_successful_builds_are_green(states, expected):
     assert out["builds"]["state"] == expected
 
 
+@pytest.mark.parametrize("answer", [
+    httpx.Response(403, text=SOURCE_MARK), httpx.Response(404, text=SOURCE_MARK),
+    httpx.Response(500, text=SOURCE_MARK), httpx.Response(503, text=SOURCE_MARK),
+    httpx.Response(200, text="not json " + SOURCE_MARK)])
+async def test_builds_that_cannot_be_read_are_unknown_and_the_pull_request_still_reads(answer):
+    """Review B-bb-1: a read-only review needs the pull request, not its builds.
+    The strict read of the approval gate is not this one (test_bitbucket_write)."""
+    fake = _fake()
+    fake.add_comment("svc-a", 7, "Looks odd")
+    fake.override = lambda r: answer if r.url.path.endswith("/statuses") else None
+    out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
+    assert "error" not in out
+    assert out["builds"] == {"state": "unknown", "total": None}
+    assert out["head_commit"] == HEAD and out["title"] == "Fix the parser"
+    assert [c["text"] for c in out["comments"]] == ["Looks odd"]
+    assert "PLANTED" not in json.dumps(out["builds"])
+
+
+@pytest.mark.parametrize("status, code", [(401, "bitbucket_unauthorized"),
+                                          (429, "bitbucket_throttled")])
+async def test_builds_refused_for_the_account_or_the_connection_still_end_the_read(status, code):
+    # The same codes that end a listing: the next request would fail as well.
+    fake = _fake()
+    fake.override = lambda r: (httpx.Response(status) if r.url.path.endswith("/statuses")
+                               else None)
+    out = await _call(_toolset(fake), "get_pull_request", repository="svc-a", id=7)
+    assert out["error"]["code"] == code
+
+
 async def test_long_text_is_truncated_and_says_so():
     fake = _fake()
     fake.prs[("svc-a", 7)]["description"] = "d" * 5000
@@ -100,8 +129,8 @@ async def test_long_text_is_truncated_and_says_so():
 @pytest.mark.parametrize("change, kw, code", [
     ({}, {"repository": "svc-b", "id": 7}, "not_found"),
     ({}, {"repository": "svc-a", "id": 8}, "not_found"),
-    ({}, {"repository": "svc-a", "id": 0}, "not_found"),
-    ({}, {"repository": "svc-a", "id": True}, "not_found"),
+    ({}, {"repository": "svc-a", "id": 0}, "invalid_argument"),
+    ({}, {"repository": "svc-a", "id": True}, "invalid_argument"),
     ({}, {"repository": "../other-ws/secret", "id": 7}, "repository_not_allowed"),
     ({}, {"repository": "SVC-A", "id": 7}, "repository_not_allowed"),
     ({"state": "MERGED"}, {"repository": "svc-a", "id": 7}, "not_open"),
@@ -116,6 +145,19 @@ async def test_every_tool_runs_the_pull_request_guard(tool, extra, change, kw, c
     out = await _call(_toolset(fake), tool, **kw, **extra)
     assert out["error"]["code"] == code
     assert set(out) == {"error"} and SOURCE_MARK not in json.dumps(out)
+
+
+@pytest.mark.parametrize("tool, extra", [("get_pull_request", {}), ("get_diff", {}),
+                                         ("get_file", {"path": "src/x.py"})])
+@pytest.mark.parametrize("pr_id", [0, -1, True, False, "7", 7.0, None, [7], 1_000_000_000])
+async def test_a_malformed_pull_request_id_is_an_invalid_argument_and_nothing_is_sent(
+        tool, extra, pr_id):
+    """Review B-bb-3: not Bitbucket's 404, which nobody was asked for."""
+    fake = _fake()
+    out = await _call(_toolset(fake), tool, repository="svc-a", id=pr_id, **extra)
+    assert out == {"error": {"code": "invalid_argument",
+                             "message": "the pull request id must be a positive integer"}}
+    assert not any("/pullrequests" in p for p in fake.paths())
 
 
 async def test_a_pinned_list_confines_the_repository_and_never_echoes_the_argument():
@@ -803,6 +845,60 @@ async def test_a_cursor_on_a_pull_request_that_is_gone_starts_its_repository_aga
     assert [p["id"] for p in out["pull_requests"]][:3] == [1, 2, 3]
 
 
+def _comment_reads(fake, since: int = 0) -> list[int]:
+    """The pull request ids whose comments were read, in order."""
+    return [int(p.split("/pullrequests/")[1].split("/")[0]) for p in fake.paths()[since:]
+            if p.split("?")[0].endswith("/comments")]
+
+
+async def test_the_cursor_pull_request_is_not_checked_again_at_the_end_of_the_turn():
+    """Review B-bb-2: the `before` turn ends BEFORE the cursor entry. The
+    cursor sits on the last entry the previous call used; checking it again
+    at the end of the next call costs a check and lists it twice in a round."""
+    fake = FakeBitbucket()
+    for i in range(1, MAX_LISTED + 2):
+        fake.add_pr("svc-a", i)
+    toolset = _toolset(fake)
+    first = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in first["pull_requests"]] == list(range(1, MAX_LISTED + 1))
+    assert first["more"] is True and _comment_reads(fake) == list(range(1, MAX_LISTED + 1))
+    # Meanwhile all of them but the last got their review.
+    for i in range(1, MAX_LISTED + 1):
+        fake.add_comment("svc-a", i, review_marker(HEAD), own=True)
+    since = len(fake.requests)
+    second = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in second["pull_requests"]] == [MAX_LISTED + 1]
+    # The round is over: number 20 (the cursor) was checked by the first call only.
+    assert _comment_reads(fake, since) == [MAX_LISTED + 1, *range(1, MAX_LISTED)]
+    assert second["already_reviewed"] == MAX_LISTED - 1 and second["more"] is False
+    # The next call starts at the top again.
+    since = len(fake.requests)
+    third = await _call(toolset, "list_pull_requests")
+    assert _comment_reads(fake, since) == list(range(1, MAX_LISTED + 2))
+    assert [p["id"] for p in third["pull_requests"]] == [MAX_LISTED + 1]
+
+
+async def test_a_full_round_over_two_repositories_checks_every_pull_request_once():
+    fake = FakeBitbucket()
+    for i in range(1, 16):
+        fake.add_pr("svc-a", i)
+    for i in range(16, 26):
+        fake.add_pr("svc-b", i)
+    toolset = _toolset(fake)
+    first = await _call(toolset, "list_pull_requests")             # cursor on svc-b 20
+    assert [p["id"] for p in first["pull_requests"]] == list(range(1, 21))
+    for i in range(1, 21):
+        fake.add_comment("svc-a" if i < 16 else "svc-b", i, review_marker(HEAD), own=True)
+    since = len(fake.requests)
+    second = await _call(toolset, "list_pull_requests")
+    reads = _comment_reads(fake, since)
+    # After the cursor in svc-b, all of svc-a, then svc-b up to BEFORE the cursor.
+    assert reads == [*range(21, 26), *range(1, 16), *range(16, 20)]
+    assert len(reads) == len(set(reads)) and 20 not in reads
+    assert [p["id"] for p in second["pull_requests"]] == list(range(21, 26))
+    assert second["already_reviewed"] == 19 and second["more"] is False
+
+
 async def test_the_comments_of_a_candidate_are_read_three_pages_deep():
     fake = FakeBitbucket()
     fake.page_size = 2
@@ -1044,9 +1140,12 @@ async def test_pending_approvals_over_the_cap_are_reached_by_the_next_call():
     second = await _call(toolset, "list_pull_requests")
     ids = [p["id"] for p in second["approval_pending"]]
     assert ids[0] == MAX_LISTED + 1 and len(ids) == MAX_LISTED
-    assert ids == [MAX_LISTED + 1, *range(1, MAX_LISTED)] and second["more"] is True
+    # Review B-bb-2: the turn ends before the cursor (number 20, which the
+    # first call kept): every pull request had its turn, nothing is left.
+    assert ids == [MAX_LISTED + 1, *range(1, MAX_LISTED)] and second["more"] is False
     third = await _call(toolset, "list_pull_requests")
-    assert [p["id"] for p in third["approval_pending"]][0] == MAX_LISTED
+    assert [p["id"] for p in third["approval_pending"]] == list(range(1, MAX_LISTED + 1))
+    assert third["more"] is True
 
 
 async def test_a_pull_request_without_participants_in_its_answer_is_unchecked():

@@ -45,7 +45,7 @@ export default class Skills extends BaseController {
         const skill = (event.getSource() as Control)
             .getBindingContext("skills")?.getObject() as Skill;
 
-        MessageBox.confirm(this.text("deleteSkillConfirm").replace("{0}", skill.name), {
+        MessageBox.confirm(this.text("deleteSkillConfirm", [skill.name]), {
             title: this.text("delete"),
             emphasizedAction: MessageBox.Action.OK,
             onClose: (action: string) => {

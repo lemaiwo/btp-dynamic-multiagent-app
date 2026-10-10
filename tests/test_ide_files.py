@@ -871,6 +871,59 @@ async def test_run_started_during_the_read_is_409_and_nothing_written(
     assert row.origin_source == "* source of ZCL_X"
 
 
+# --- review B-ide-3: a lint is not stored while a run holds the workspace ----
+#
+# A run rewrites the proposals; a lint stored meanwhile would describe a
+# source the file no longer holds. Same rule as open/refresh: refused before
+# the ARC-1 call, and checked again under the session row lock after it.
+
+
+async def _stored_lint(sid):
+    async with SessionLocal() as db:
+        return (await db.execute(IdeWorkspaceFile.__table__.select())).one().lint_json
+
+
+async def test_lint_while_running_is_409_and_not_called(client, fake, sid):
+    await _open(client, sid)
+    calls = len(fake.calls)
+    before = await _stored_lint(sid)
+    await _set_running(sid)
+    fake.answers["SAPLint"] = [CANNED_LINT]
+    r = await client.post(f"/ide/api/sessions/{sid}/file/lint",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "run_in_progress"
+    assert len(fake.calls) == calls
+    assert await _stored_lint(sid) == before
+
+
+async def test_run_started_during_the_lint_is_409_and_nothing_stored(
+        client, fake, sid, monkeypatch):
+    await _open(client, sid)
+    before = await _stored_lint(sid)
+    inner = fake.factory
+
+    def factory(target, destination="", **kw):
+        client_ = inner(target, destination, **kw)
+        real_call = client_.call
+
+        async def call(tool, args):
+            if tool == "SAPLint":
+                await _set_running(sid)
+            return await real_call(tool, args)
+
+        client_.call = call
+        return client_
+
+    monkeypatch.setattr(arc1, "get_arc1_client", factory)
+    fake.answers["SAPLint"] = [CANNED_LINT]
+    r = await client.post(f"/ide/api/sessions/{sid}/file/lint",
+                          params={"path": PATH}, headers=_as("alice"))
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "run_in_progress"
+    assert await _stored_lint(sid) == before
+
+
 # --- final fix round: refusals carry their own code on every route (FIX-10) ---
 
 
