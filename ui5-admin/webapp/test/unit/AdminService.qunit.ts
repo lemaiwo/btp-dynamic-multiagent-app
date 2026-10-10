@@ -38,6 +38,47 @@ QUnit.test("listAgents calls the relative backend path", async function (assert)
     assert.strictEqual(agents.length, 1, "returns the parsed body");
 });
 
+QUnit.test("every request, a GET included, is marked as AJAX for the approuter", async function (assert) {
+    // The approuter answers an expired session with 401 only for an AJAX
+    // request (or a non-GET); a plain GET gets a 302 to the identity
+    // provider, which fetch follows cross-origin into "Failed to fetch".
+    const seen: Record<string, string>[] = [];
+    window.fetch = ((_url: string, init?: RequestInit) => {
+        seen.push({ ...(init?.headers as Record<string, string>) });
+        return Promise.resolve(new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    await new AdminService().listAgents();
+    await new AdminService().getNotifications();
+    await new AdminService().upsertAgent({ name: "a" } as never, 7);
+
+    seen.forEach((headers, i) => {
+        assert.strictEqual(headers["X-Requested-With"], "XMLHttpRequest", `call ${i} carries X-Requested-With`);
+        assert.strictEqual(headers.Accept, "application/json", `call ${i} keeps Accept`);
+    });
+    assert.strictEqual(seen[2]["Content-Type"], "application/json", "a body keeps its Content-Type");
+    assert.strictEqual(seen.length, 3, "three calls");
+});
+
+QUnit.test("only a Run now trigger marks its error as runTrigger", async function (assert) {
+    stubFetch(409, { detail: "conflict" }, []);
+    const errorOf = async (call: () => Promise<unknown>): Promise<AdminError> => {
+        try {
+            await call();
+        } catch (e) {
+            return e as AdminError;
+        }
+        throw new Error("should have thrown");
+    };
+    const service = new AdminService();
+
+    assert.strictEqual((await errorOf(() => service.runNow(3))).runTrigger, true, "agent run");
+    assert.strictEqual((await errorOf(() => service.runWorkflowNow(9))).runTrigger, true, "workflow run");
+    assert.strictEqual((await errorOf(() => service.upsertAgent({ name: "a" } as never))).runTrigger, false, "agent save");
+    assert.strictEqual((await errorOf(() => service.deleteAgent(3))).runTrigger, false, "agent delete");
+    assert.strictEqual((await errorOf(() => service.upsertWorkflow({ name: "w" } as never, 9))).runTrigger, false, "workflow rename");
+});
+
 QUnit.test("upsertAgent PUTs to the id path when the agent has one", async function (assert) {
     const calls: string[][] = [];
     stubFetch(200, { id: 7, name: "a" }, calls);

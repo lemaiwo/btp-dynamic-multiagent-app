@@ -116,6 +116,31 @@ QUnit.test("getMe calls the relative backend path", async function (this: Ctx, a
     assert.deepEqual(me.targets, ["dev"], "returns the parsed body");
 });
 
+QUnit.test("every request, a GET and the token fetch included, is marked as AJAX for the approuter", async function (assert) {
+    // The approuter answers an expired session with 401 only for an AJAX
+    // request (or a non-GET); a plain GET gets a 302 to the identity provider.
+    const seen: { tokenFetch: boolean; headers: Record<string, string> }[] = [];
+    const fake = sinon.stub(window, "fetch").callsFake((_url: string, init?: RequestInit) => {
+        seen.push({ tokenFetch: isTokenFetch(init), headers: { ...(init?.headers as Record<string, string>) } });
+        return Promise.resolve(jsonResponse(200, { id: "s1", title: "t", target: "dev", stage: "chat", status: "idle" }));
+    });
+    try {
+        const service = new IdeService();
+        await service.listSessions();
+        await service.createSession("t", "dev");
+    } finally {
+        fake.restore();
+    }
+
+    assert.strictEqual(seen.length, 3, "the GET, the token fetch and the POST");
+    assert.strictEqual(seen[1].tokenFetch, true, "the second call is the token fetch");
+    seen.forEach((call, i) => {
+        assert.strictEqual(call.headers["X-Requested-With"], "XMLHttpRequest", `call ${i} carries X-Requested-With`);
+    });
+    assert.strictEqual(seen[0].headers.Accept, "application/json", "the GET keeps Accept");
+    assert.strictEqual(seen[2].headers["Content-Type"], "application/json", "the POST keeps its Content-Type");
+});
+
 QUnit.test("createSession POSTs title and target as JSON", async function (this: Ctx, assert) {
     const stub = stubFetch(this, jsonResponse(201, { id: "s1", title: "t", target: "dev", stage: "chat", status: "idle" }));
 
