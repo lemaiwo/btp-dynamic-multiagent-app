@@ -689,6 +689,39 @@ async def test_handover_refusals(client):
     assert await _count(IdeArtifact) == 3
 
 
+async def test_handover_reads_the_run_lock_under_the_session_row_lock(
+        client, monkeypatch):
+    """Review B-ide-4: the ``run_in_progress`` check is read under the
+    session row lock, in the transaction that writes the new session, not
+    from the row as ``_owned`` loaded it: a report run that took the lock in
+    between is seen."""
+    from sqlalchemy import update
+
+    from agents.ide import store as store_module
+
+    await _flag()
+    d = await _diagnose(client)
+    async with SessionLocal() as db:
+        await add_artifact(db, d["id"], stage="investigate", kind="report", content="R")
+    before = await _count(IdeSession)
+    real_lock = store_module.lock_session_row
+
+    async def lock(db, session_id):
+        # A run takes the session's lock just before the handover gets its
+        # row lock.
+        async with SessionLocal() as other:
+            await other.execute(update(IdeSession).where(IdeSession.id == session_id)
+                                .values(status="running", run_id="r-new"))
+            await other.commit()
+        await real_lock(db, session_id)
+
+    monkeypatch.setattr(store_module, "lock_session_row", lock)
+    r = await client.post(f"/ide/api/sessions/{d['id']}/handover", headers=_as("alice"))
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "run_in_progress"
+    assert await _count(IdeSession) == before
+
+
 async def test_handover_refused_when_target_lost_non_production(client):
     """The report of a raw run must not move into a change session on a
     target that is now treated as production."""
