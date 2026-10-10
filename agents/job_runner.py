@@ -17,6 +17,7 @@ from agents.db import (
     active_job_run,
     create_job_run,
     finish_job_run,
+    sweep_stale_runs,
 )
 from agents.db import DEFAULT_RUN_PROMPT, get_agent_by_name
 from agents.registry import _MAX_DELEGATION_DEPTH, _make_progress_handler, registry
@@ -38,6 +39,12 @@ _tasks: set[asyncio.Task] = set()
 # realistic one; a cross-instance race (multiple app instances) would need a
 # DB-level constraint and is deliberately deferred to a later increment.
 _start_locks: dict[int, asyncio.Lock] = {}
+
+# Seconds to wait before the 2nd and 3rd attempt to record a run's outcome.
+# One DB hiccup at the end of a run must not leave the row `running` (it is
+# the overlap lock); three attempts within a few seconds ride out a dropped
+# connection or a pool momentarily exhausted. Patched to zeros in tests.
+FINALIZE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
 
 
 def _lock_for(agent_id: int) -> asyncio.Lock:
@@ -209,6 +216,7 @@ async def start_run(
     # Hold the per-agent lock across the check-and-create so two concurrent
     # callers can't both see "no active run" and both start one.
     async with _lock_for(agent.id):
+        await _sweep_stale()
         async with SessionLocal() as session:
             if await active_job_run(session, agent.id) is not None:
                 raise RunRefused(
@@ -224,25 +232,65 @@ async def start_run(
     return run.id
 
 
+async def _sweep_stale() -> None:
+    """Close `running` rows older than their timeout before an overlap check.
+
+    Without this the age-based sweep had no caller: a row left `running` by a
+    finalize that never landed answered every later trigger 409 until the
+    next app restart. Sweeping here hands that row's lock back to the next
+    trigger instead. Never blocks the start: a failure is logged and the
+    overlap check runs on whatever is stored.
+    """
+    try:
+        async with SessionLocal() as session:
+            swept = await sweep_stale_runs(session)
+        if swept:
+            logger.warning("Marked %d stale job run(s) interrupted", swept)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Stale job run sweep failed (%s); starting anyway",
+                       type(exc).__name__)
+
+
 async def _finalize(run_id: str, **kwargs) -> None:
-    """Best-effort finish_job_run: never raises.
+    """Best-effort finish_job_run, retried: never raises (but cancellation).
 
     execute_run runs detached with nobody awaiting it, so if recording the
     outcome itself fails (DB hiccup, pool exhaustion, engine tearing down at
-    shutdown), the row would otherwise stay 'running' forever — which wedges
-    the overlap lock — AND the exception would surface only as an "exception
-    was never retrieved" warning at GC time. Log and swallow instead.
+    shutdown), the row would otherwise stay 'running' — which wedges the
+    overlap lock — AND the exception would surface only as an "exception was
+    never retrieved" warning at GC time. So the write is tried
+    ``len(FINALIZE_RETRY_DELAYS) + 1`` times (it is idempotent: one commit
+    that sets the final columns), then logged and swallowed; the stale sweep
+    at the next start or restart closes what is still left. A cancel during
+    the backoff (shutdown) propagates and ends the retries.
     """
-    try:
-        kwargs.setdefault("activity", final_activity(run_id))
-        async with SessionLocal() as session:
-            await finish_job_run(session, run_id, **kwargs)
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to finalize run %s (status=%s); its row may be stuck "
-            "'running' until the next stale-run sweep.",
-            run_id, kwargs.get("status"),
-        )
+    if "activity" not in kwargs:
+        try:
+            kwargs["activity"] = final_activity(run_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Run %s: activity not stored (%s)",
+                           run_id, type(exc).__name__)
+            kwargs["activity"] = None
+    delays = tuple(FINALIZE_RETRY_DELAYS)
+    for attempt in range(len(delays) + 1):
+        if attempt:
+            await asyncio.sleep(delays[attempt - 1])
+        try:
+            async with SessionLocal() as session:
+                await finish_job_run(session, run_id, **kwargs)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt < len(delays):
+                logger.warning(
+                    "Finalizing run %s failed (%s), attempt %d; retrying",
+                    run_id, type(exc).__name__, attempt + 1,
+                )
+                continue
+            logger.exception(
+                "Failed to finalize run %s (status=%s) after %d attempts; its "
+                "row may be stuck 'running' until the next stale-run sweep.",
+                run_id, kwargs.get("status"), attempt + 1,
+            )
 
 
 async def execute_run(run_id: str, agent_id: int) -> None:

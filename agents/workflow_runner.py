@@ -36,6 +36,7 @@ from agents.db import (
     get_workflow,
     get_workflow_parts,
     item_succeeded_before,
+    sweep_stale_workflow_runs,
 )
 from agents.registry import registry
 from agents.shared import run_usage_limits
@@ -58,6 +59,10 @@ _tasks: set[asyncio.Task] = set()
 # both observe "no active run" and both start one. Same pattern as
 # job_runner._start_locks; closes the in-process race only.
 _start_locks: dict[int, asyncio.Lock] = {}
+
+# Seconds before the 2nd and 3rd attempt to record a run's outcome; see
+# job_runner.FINALIZE_RETRY_DELAYS. Patched to zeros in tests.
+FINALIZE_RETRY_DELAYS: tuple[float, ...] = (0.5, 1.0)
 
 
 class RunRefused(Exception):
@@ -234,6 +239,7 @@ async def start_workflow_run(
     if not workflow.enabled:
         raise RunRefused(f"Workflow {workflow.name!r} is disabled.")
     async with _lock_for(workflow.id):
+        await _sweep_stale()
         async with SessionLocal() as session:
             if await active_workflow_run(session, workflow.id) is not None:
                 raise RunRefused(
@@ -249,23 +255,53 @@ async def start_workflow_run(
     return run.id
 
 
-async def _finalize(run_id: str, **kwargs) -> None:
-    """Best-effort finish_workflow_run: never raises.
-
-    execute_workflow_run runs detached with nobody awaiting it, so a failure to
-    record the outcome would otherwise leave the row 'running' forever — which
-    wedges the overlap lock — and surface only as an "exception was never
-    retrieved" warning at GC time.
-    """
+async def _sweep_stale() -> None:
+    """Close `running` workflow rows older than their workflow's timeout
+    before an overlap check, so a row a failed finalize left behind is
+    closed by the next trigger instead of at restart. Never blocks the
+    start (see job_runner._sweep_stale)."""
     try:
         async with SessionLocal() as session:
-            await finish_workflow_run(session, run_id, **kwargs)
-    except Exception:  # noqa: BLE001
-        logger.exception(
-            "Failed to finalize workflow run %s (status=%s); its row may be "
-            "stuck 'running' until the next stale-run sweep.",
-            run_id, kwargs.get("status"),
-        )
+            swept = await sweep_stale_workflow_runs(session)
+        if swept:
+            logger.warning("Marked %d stale workflow run(s) interrupted", swept)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Stale workflow run sweep failed (%s); starting anyway",
+                       type(exc).__name__)
+
+
+async def _finalize(run_id: str, **kwargs) -> None:
+    """Best-effort finish_workflow_run, retried: never raises (but cancellation).
+
+    execute_workflow_run runs detached with nobody awaiting it, so a failure to
+    record the outcome would otherwise leave the row 'running' — which wedges
+    the overlap lock — and surface only as an "exception was never retrieved"
+    warning at GC time. Tried ``len(FINALIZE_RETRY_DELAYS) + 1`` times (one
+    idempotent commit), then logged and swallowed; the stale sweep at the
+    next start or restart closes what is left. A cancel during the backoff
+    propagates and ends the retries.
+    """
+    delays = tuple(FINALIZE_RETRY_DELAYS)
+    for attempt in range(len(delays) + 1):
+        if attempt:
+            await asyncio.sleep(delays[attempt - 1])
+        try:
+            async with SessionLocal() as session:
+                await finish_workflow_run(session, run_id, **kwargs)
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt < len(delays):
+                logger.warning(
+                    "Finalizing workflow run %s failed (%s), attempt %d; retrying",
+                    run_id, type(exc).__name__, attempt + 1,
+                )
+                continue
+            logger.exception(
+                "Failed to finalize workflow run %s (status=%s) after %d "
+                "attempts; its row may be stuck 'running' until the next "
+                "stale-run sweep.",
+                run_id, kwargs.get("status"), attempt + 1,
+            )
 
 
 class _WorkflowError(Exception):
