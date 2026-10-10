@@ -170,13 +170,18 @@ _UNKNOWN_CALL_HINT = (
 # What is cut out of a text before a model reads it, in this order: a URL,
 # a scheme-less `//host/...`, an absolute `/sap/...` path (the ICF tree; a
 # message code such as `/IWBEP/CM_MGW_RT/022` is not one) and `host:port`
-# together with the path or query that hangs on it.
+# together with the path or query that hangs on it. A host holds a letter or
+# a dot (`localhost`, `s4.internal`, `10.0.0.7`): digits alone before the
+# colon are a time of day (`10:25`, `12:30:00`), which SAP's text may name.
 _SCRUB: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*"), "[url]"),
     (re.compile(r"(?<![:\w])//\S+"), "[url]"),
     (re.compile(r"(?<![\w/])/sap/\S*", re.IGNORECASE), "[path]"),
     (
-        re.compile(r"(?<![\w.-])[A-Za-z0-9][A-Za-z0-9.-]*:\d{2,5}(?!\d)(?:[/?#]\S*)?"),
+        re.compile(
+            r"(?<![\w.-])(?=[A-Za-z0-9.-]*[A-Za-z.])[A-Za-z0-9][A-Za-z0-9.-]*:\d{2,5}(?!\d)"
+            r"(?:[/?#]\S*)?"
+        ),
         "[host]",
     ),
 )
