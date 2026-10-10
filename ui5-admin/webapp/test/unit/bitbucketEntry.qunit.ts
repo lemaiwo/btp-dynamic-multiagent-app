@@ -13,7 +13,7 @@ function form(overrides: Record<string, unknown> = {}): Record<string, unknown> 
         dcr: false, client_id: "cid", client_secret: "sec", mailbox: "x@example.com",
         allow_send: true, lookback: "2d", project: "ABC", status: "Open", api_base: "/api/2",
         labels: "l1", user_context: true, has_client_secret: true,
-        destination: " BITBUCKET ", workspace: "acme-ws", repositories: ["svc-a", "svc-b"],
+        destination: "BITBUCKET", workspace: "acme-ws", repositories: ["svc-a", "svc-b"],
         branch: "release/2.x", allow_comment: true, allow_approve: true, require_green_builds: false
     }, overrides);
 }
@@ -35,6 +35,12 @@ QUnit.test("cleanOAuth sends exactly the keys the server stores", function (asse
         destination: "BITBUCKET", workspace: "acme-ws", repositories: ["svc-a", "svc-b"],
         branch: "release/2.x", allow_comment: true, allow_approve: true, require_green_builds: false
     });
+});
+
+QUnit.test("the destination name is sent as typed, edge whitespace included, for the server to refuse", function (assert) {
+    const out = oauthConfig.cleanOAuth(form({ destination: " BITBUCKET " }), "destination", URL) as Record<string, unknown>;
+    assert.strictEqual(out.destination, " BITBUCKET ", "not trimmed");
+    assert.ok(bitbucketEntry.validate(out, "destination"), "and refused before the save, as the server would");
 });
 
 QUnit.test("defaults and blanks are left out, nothing of another toolset is kept", function (assert) {
@@ -181,8 +187,12 @@ QUnit.test("another destination is another account: asked as a new approval", fu
             reason: "approve", workspace: "acme-ws", branch: "main", repositories: ["svc-a"],
             requireGreenBuilds: true
         })]);
-    assert.deepEqual(bitbucketEntry.approvalsToAsk([on()], [other(" B ")]), [],
-        "the name as the cleaner stores it: blanks around it are no other destination");
+    // The name is sent as typed (the server refuses edge blanks instead of
+    // repairing them), so " B " is not silently taken for "B": the save asks,
+    // and validate / the server then refuse the name.
+    assert.strictEqual(bitbucketEntry.approvalsToAsk([on()], [other(" B ")]).length, 1,
+        "a name with edge blanks is not the stored destination");
+    assert.ok(bitbucketEntry.validate(other(" B ").oauth, "destination"), "and it is refused before the save");
     assert.deepEqual(bitbucketEntry.approvalsToAsk([on()], [other("B")]), []);
 });
 

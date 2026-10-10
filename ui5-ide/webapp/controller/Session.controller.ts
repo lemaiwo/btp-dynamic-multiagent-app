@@ -18,6 +18,7 @@ import type List from "sap/m/List";
 import BaseController from "./BaseController";
 import RunController, { type RunKind } from "../model/RunController";
 import StickyScroll from "../model/stickyScroll";
+import { isAuthFailure } from "../model/runWatch";
 import { isProposal, primaryAction, stageTokens } from "../model/stageGate";
 import { activeTool, isRunNote, toChatItem, type RunState } from "../model/chatRun";
 import { eventRows, isLongOutput, todoView, visibleRows } from "../model/activity";
@@ -390,6 +391,7 @@ export default class Session extends BaseController {
             onRefused: (e, kind, text) => this.onRunRefused(e, kind, text),
             onStreamBroken: (e) => this.showError(e),
             onFinished: (sid) => this.afterRun(sid),
+            onWatchFailed: (sid, e) => this.onRunRefreshFailed(sid, e),
             onBeforeStream: () => ensureMarkdown()
         });
         // When a press of the primary action started: one that began before the cards appeared approves nothing.
@@ -1094,9 +1096,15 @@ export default class Session extends BaseController {
                     [this.stageText(this.nextStage(detail.stage))]));
             }
         } catch (e) {
-            // open_comments and the other gate refusals: the reloaded session shows the reason in the header.
-            if (!gone() && !(e instanceof IdeError && e.status === 409 && e.code === "open_comments")) {
-                this.showGateError(e);
+            if (!gone()) {
+                if (e instanceof IdeError && e.status === 409 && e.code === "open_comments") {
+                    // A comment written meanwhile (another tab): the server's own sentence, as plain text
+                    // (MessageBox renders it in a Text control). The reload below then shows it in the header,
+                    // and when it shows none (resolved meanwhile) the press still did not pass unnoticed.
+                    MessageBox.error(e.detail || this.text("gateOpenCommentsNoCount"));
+                } else {
+                    this.showGateError(e);
+                }
             }
         } finally {
             if (!gone()) {
@@ -1753,6 +1761,26 @@ export default class Session extends BaseController {
         this.announceEnd();
     }
 
+    /**
+     * The reload after a run failed for good (RunController.onWatchFailed):
+     * the conversation stops saying the assistant is working, and the user is
+     * told: signed out is the session-expired message, anything else a strip
+     * asking for a reload of the page.
+     */
+    private onRunRefreshFailed(sid: string, e: unknown): void {
+        if (sid !== this.sid) {
+            return;
+        }
+        this.streaming = false;
+        this.streamStatus = "";
+        this.renderConversation();
+        if (isAuthFailure(e)) {
+            this.showError(e);
+            return;
+        }
+        this.s().setProperty("/runError", { text: this.text("runRefreshFailed"), type: "Error" });
+    }
+
     // --- Trace approvals (diagnose) ----------------------------------------------
 
     /** An API timestamp as the user's date and time; the raw value when it is none. */
@@ -1828,6 +1856,8 @@ export default class Session extends BaseController {
             } else {
                 const key = approvalErrorKey(code);
                 MessageBox.error(key ? this.text(key) : gateErrorText(e, t));
+                // A 403 target_not_non_production: the banner and the other cards follow the lost flag.
+                this.afterLostFlag(e);
             }
         } finally {
             this.deciding.delete(aid);
