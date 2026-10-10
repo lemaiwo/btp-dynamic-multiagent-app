@@ -1419,7 +1419,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `non_production` flag behind a confirmation that names what diagnose
     sends and how long it is kept (`diagnose_retention_days`); others read.
   `model/RunController.ts` owns a run's lifecycle (start, stream, stop,
-  watch a run the page does not stream; typed callbacks, no `sap.m`).
+  watch a run the page does not stream; typed callbacks, no `sap.m`). A
+  watched run whose post-run reload fails is given up at once on an auth
+  error (`isAuth`, or status 401/403) and after `RunWatch.maxFailures` = 5
+  failed polls in a row (`onGiveUp` / `onWatchFailed`); the page then clears
+  "working" and shows the session-expired box or the `runRefreshFailed`
+  strip, instead of re-arming every 3 s forever. "Finish session" names the
+  review version it pins (`primaryFinishVersion`), and an `open_comments`
+  409 on approve shows the server's sentence before the reload.
   All HTTP goes through `service/IdeService.ts`, which sends the
   approuter's CSRF token on every non-GET call (fetched with `X-CSRF-Token:
   Fetch` on `GET me`, one retry on a `Required` 403, then `csrf_failed`;
@@ -1604,15 +1611,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   every other 409 (a duplicate name, an agent still referenced by a workflow
   step, a rename clash) is a `MessageBox.error` with the server's `detail`.
   `classify()` still answers `conflict` for every 409, which the OData pages
-  branch on. The server dialog's toolset dropdown comes from
+  branch on. Its session-expired and access-denied texts come from the i18n
+  bundle (`Component.ts` hands it over; English fallbacks for a host without
+  a component). Texts with a value use `text(key, [value])`, never
+  `String.replace("{0}", value)` (a `$&` in a name would be interpreted).
+  The server dialog's toolset dropdown comes from
   `webapp/model/builtins.ts`, which mirrors `agents/builtins.py` and lists the
   auth modes the server accepts per built-in. For `builtin:sharepoint`
   (`app_only` or `destination`) the dialog edits the views as JSON and sends
   the three pins as typed, never trimmed (the server refuses edge whitespace
   instead of repairing it). `model/bitbucketEntry.ts` mirrors
   `agents/bitbucket_config.py` for `builtin:bitbucket` and adds no rule:
-  `clean` builds the block from nothing (its own keys, pins as typed, a
-  switch only as the boolean that is stored), `validate` answers fixed texts
+  `clean` builds the block from nothing (its own keys, pins AND the
+  destination as typed, never trimmed; a switch only as the boolean that is
+  stored; `odataEntry` sends service names as typed likewise, so the
+  server's refusal of edge whitespace reaches the admin), `validate` answers fixed texts
   that never quote a value, `approvalsToAsk` names what the agent's Save asks
   about: an entry that approves after the save and did not before, or one
   whose approval the save widens. The **OData services** area
