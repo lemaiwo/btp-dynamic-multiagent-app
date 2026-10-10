@@ -578,11 +578,13 @@ def test_storage_stores_the_url_in_the_spelling_the_registry_knows(spelling):
     (entry,) = extras
     assert entry == {"url": URL, "auth_mode": "destination", "oauth": DEST}
     assert is_builtin_url(entry["url"])
-    # The other built-ins keep the spelling they were given, as before.
+    # Every built-in is stored canonical, as the admin payload stores it: a
+    # spelling the registry does not know as a built-in would be built as a
+    # remote MCP server with this entry's destination.
     primary, _, _ = prepare_servers(
         [{"url": "Builtin:Teams/", "auth_mode": "destination",
           "oauth": {"destination": "D", "team": "t"}}], None)
-    assert primary["url"] == "Builtin:Teams/"
+    assert primary["url"] == "builtin:teams"
 
 
 def test_a_respelled_entry_keeps_its_stored_secret_on_an_edit():
