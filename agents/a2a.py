@@ -42,6 +42,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from agents.auth import current_principal, require_a2a
 from agents.registry import registry
+from agents.shared import run_usage_limits
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +356,12 @@ async def _run_orchestrator(text: str, context_id: str) -> str:
     history = await store.get_history(principal, context_id)
     agent = registry.orchestrator
     try:
-        result = await agent.run(text, message_history=history or None)
+        # The app's request limit, as at every other run site: pydantic-ai's
+        # default of 50 is shared with delegated peers and deep sub-agents.
+        result = await agent.run(
+            text, message_history=history or None,
+            usage_limits=run_usage_limits(),
+        )
     except asyncio.CancelledError:
         # The client disconnected or the app is shutting down: let it unwind
         # so the run actually stops instead of being recorded as a failure

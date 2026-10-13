@@ -1030,6 +1030,25 @@ async def test_pending_is_decided_by_this_accounts_own_participant_entry(partici
     assert out["pull_requests_unchecked"] == (1 if where == "pull_requests_unchecked" else 0)
 
 
+async def test_pending_approvals_over_the_cap_are_reached_by_the_next_call():
+    """Review A11: an overflow of `approval_pending` sets `more` AND moves the
+    cursor, so the next call goes on behind it instead of from the top."""
+    fake = FakeBitbucket()
+    for i in range(1, MAX_LISTED + 2):
+        fake.add_pr("svc-a", i)
+        fake.add_comment("svc-a", i, review_marker(HEAD, "approve"), own=True)
+    toolset = _toolset(fake, **APPROVER)
+    first = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in first["approval_pending"]] == list(range(1, MAX_LISTED + 1))
+    assert first["more"] is True and first["pull_requests"] == []
+    second = await _call(toolset, "list_pull_requests")
+    ids = [p["id"] for p in second["approval_pending"]]
+    assert ids[0] == MAX_LISTED + 1 and len(ids) == MAX_LISTED
+    assert ids == [MAX_LISTED + 1, *range(1, MAX_LISTED)] and second["more"] is True
+    third = await _call(toolset, "list_pull_requests")
+    assert [p["id"] for p in third["approval_pending"]][0] == MAX_LISTED
+
+
 async def test_a_pull_request_without_participants_in_its_answer_is_unchecked():
     fake = FakeBitbucket()
     del fake.add_pr("svc-a", 1)["participants"]

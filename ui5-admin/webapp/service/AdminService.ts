@@ -20,14 +20,19 @@ export class AdminError extends Error {
     /** The stable code of a refusal, from the `X-OData-Error` header of the
      *  OData routes (`busy`, `user_token_required`, ...); "" without one. */
     public readonly code: string;
+    /** True when the refused call was a "Run now" trigger (agent or
+     *  workflow), where a 409 only says a run is already in flight. */
+    public readonly runTrigger: boolean;
 
-    public constructor(status: number, detail: string, fieldErrors: Record<string, string> = {}, code = "") {
+    public constructor(status: number, detail: string, fieldErrors: Record<string, string> = {}, code = "",
+        runTrigger = false) {
         super(detail || `Request failed with status ${status}`);
         this.name = "AdminError";
         this.status = status;
         this.detail = detail;
         this.fieldErrors = fieldErrors;
         this.code = code;
+        this.runTrigger = runTrigger;
     }
 }
 
@@ -44,19 +49,33 @@ export default class AdminService {
 
     private static readonly PREFIX = "backend/";
 
-    /** The answer of a call that worked; a non-2xx one rejects. */
+    /** The "Run now" triggers of an agent and of a workflow: a 409 there
+     *  only means a run is already in flight (see `AdminError.runTrigger`). */
+    private static readonly RUN_TRIGGER = /^(agents|workflows)\/\d+\/run$/;
+
+    /**
+     * The answer of a call that worked; a non-2xx one rejects.
+     *
+     * Every request, GET included, carries `X-Requested-With: XMLHttpRequest`.
+     * The approuter answers an expired session with 401 only for a request
+     * it recognises as AJAX (or a non-GET); a plain GET gets a 302 to the
+     * identity provider, which fetch follows cross-origin and fails as an
+     * opaque "Failed to fetch", so the session-expired dialog would never
+     * show for a read (or for the notification poll).
+     */
     private async send(path: string, init?: RequestInit): Promise<Response> {
         const response = await fetch(AdminService.PREFIX + path, {
             ...init,
             headers: {
                 Accept: "application/json",
                 ...(init?.body ? { "Content-Type": "application/json" } : {}),
-                ...(init?.headers ?? {})
+                ...(init?.headers ?? {}),
+                "X-Requested-With": "XMLHttpRequest"
             }
         });
 
         if (!response.ok) {
-            throw await AdminService.toError(response);
+            throw await AdminService.toError(response, AdminService.RUN_TRIGGER.test(path));
         }
         return response;
     }
@@ -69,7 +88,7 @@ export default class AdminService {
         return await response.json() as T;
     }
 
-    private static async toError(response: Response): Promise<AdminError> {
+    private static async toError(response: Response, runTrigger = false): Promise<AdminError> {
         let detail = "";
         const fieldErrors: Record<string, string> = {};
         try {
@@ -91,7 +110,9 @@ export default class AdminService {
         } catch {
             detail = response.statusText;
         }
-        return new AdminError(response.status, detail, fieldErrors, response.headers?.get("X-OData-Error") ?? "");
+        return new AdminError(
+            response.status, detail, fieldErrors, response.headers?.get("X-OData-Error") ?? "", runTrigger
+        );
     }
 
     /**

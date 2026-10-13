@@ -34,7 +34,7 @@ def test_ide_env_vars_are_quoted_strings():
 
 def test_mta_version_is_2_24_0():
     mta = yaml.safe_load((ROOT / "mta.yaml").read_text())
-    assert mta["version"] == "2.24.0"
+    assert mta["version"] == "2.24.1"
 
 
 def test_every_ide_and_odata_property_is_read_by_the_app():

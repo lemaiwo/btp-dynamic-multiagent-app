@@ -15,7 +15,7 @@ import reprlib
 import unicodedata
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from pydantic_ai import Agent, ModelRetry, RunContext
@@ -612,6 +612,59 @@ def _model_for(row: AgentConfig, *, default_model, default_name: str, cache: dic
     return model
 
 
+async def _ide_target_destinations(session: Any) -> frozenset[str]:
+    """The ARC-1 destinations of the ABAP Assistant's targets (conventions).
+
+    Only feeds a warning: a failed read is logged and answers "none", it
+    never stops a build.
+    """
+    from sqlalchemy import select
+
+    from agents.ide.models import IdeConventions
+
+    try:
+        result = await session.execute(select(IdeConventions.destination))
+        return frozenset(
+            name.strip() for name in result.scalars() if isinstance(name, str) and name.strip()
+        )
+    except Exception as exc:  # noqa: BLE001 -- a warning's input only
+        logger.warning(
+            "Could not read the IDE target destinations (%s); no user_context "
+            "check at this build", type(exc).__name__,
+        )
+        return frozenset()
+
+
+def _warn_technical_ide_target(
+    agent: str, server: str, spec: dict, ide_destinations: frozenset[str]
+) -> None:
+    """One WARNING for an MCP entry on an IDE target's destination that does
+    not act as the signed-in user.
+
+    ``diagnose.is_target_server`` does not count such a server as the
+    target's (its reads would run in SAP as the technical user while the
+    app's own ARC-1 calls run as the developer), so a diagnose run gets no
+    diagnose data from it. Said here, once per build, so the admin sees why.
+    """
+    from agents.destination_auth import user_context_of
+
+    if str(spec.get("auth_mode") or "") != "destination":
+        return
+    oauth = spec.get("oauth")
+    if not isinstance(oauth, dict):
+        return
+    destination = str(oauth.get("destination") or "").strip()
+    if destination not in ide_destinations or user_context_of(oauth):
+        return
+    logger.warning(
+        "Agent '%s': MCP server '%s' uses destination '%s' of an ABAP Assistant "
+        "target without user_context: true; it would reach SAP as the "
+        "destination's technical user, so diagnose sessions do not treat it as "
+        "the target's server",
+        agent, server, destination,
+    )
+
+
 async def build_orchestrator() -> BuildResult:
     """Build a fresh orchestrator + specialists from the current DB state."""
     async with SessionLocal() as session:
@@ -643,6 +696,7 @@ async def build_orchestrator() -> BuildResult:
             if odata_wanted
             else {}
         )
+        ide_destinations = await _ide_target_destinations(session)
 
     model_name = active_model or default_model_name()
     try:
@@ -793,6 +847,7 @@ async def build_orchestrator() -> BuildResult:
                             )
                         )
                     continue
+                _warn_technical_ide_target(row.name, server_name, spec, ide_destinations)
                 server = create_mcp_server(
                     server_name,
                     spec["url"],

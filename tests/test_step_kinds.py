@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,43 +109,45 @@ def test_context_from_sources_joins_several_sources():
     ("not_empty", "", "x", True),
     ("not_empty", "", "", False),
 ])
-def test_condition_ops_on_text(op, value, text, expected):
+async def test_condition_ops_on_text(op, value, text, expected):
     when = sk.ConditionWhen(source="text", op=op, value=value)
-    assert sk.evaluate_rule(when, ctx(text)) is expected
+    assert await sk.evaluate_rule(when, ctx(text)) is expected
 
 
-def test_condition_case_sensitive_flag():
-    assert sk.evaluate_rule(
+async def test_condition_case_sensitive_flag():
+    assert await sk.evaluate_rule(
         sk.ConditionWhen(op="contains", value="Dump", case_sensitive=True), ctx("a dump")
     ) is False
-    assert sk.evaluate_rule(
+    assert await sk.evaluate_rule(
         sk.ConditionWhen(op="matches", value="^A", case_sensitive=True), ctx("abc")
     ) is False
 
 
-def test_condition_item_and_json_paths():
+async def test_condition_item_and_json_paths():
+    W = sk.ConditionWhen
     c = ctx('{"issue": {"priority": "High", "labels": ["sap", "urgent"]}, "count": 3}',
             item={"id": "m1", "branches": ["abap"], "title": ""})
-    assert sk.evaluate_rule(sk.ConditionWhen(source="item", field="id", op="equals", value="m1"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="item", field="branches", op="contains", value="abap"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="item", field="title", op="is_empty"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="item", field="missing", op="is_empty"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="issue.priority", op="equals", value="high"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="issue.labels", op="contains", value="URGENT"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="issue.labels[1]", op="equals", value="urgent"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="count", op="gt", value="2"), c)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="count", op="lt", value="2"), c) is False
+    assert await sk.evaluate_rule(W(source="item", field="id", op="equals", value="m1"), c)
+    assert await sk.evaluate_rule(W(source="item", field="branches", op="contains", value="abap"), c)
+    assert await sk.evaluate_rule(W(source="item", field="title", op="is_empty"), c)
+    assert await sk.evaluate_rule(W(source="item", field="missing", op="is_empty"), c)
+    assert await sk.evaluate_rule(W(source="json", field="issue.priority", op="equals", value="high"), c)
+    assert await sk.evaluate_rule(W(source="json", field="issue.labels", op="contains", value="URGENT"), c)
+    assert await sk.evaluate_rule(W(source="json", field="issue.labels[1]", op="equals", value="urgent"), c)
+    assert await sk.evaluate_rule(W(source="json", field="count", op="gt", value="2"), c)
+    assert await sk.evaluate_rule(W(source="json", field="count", op="lt", value="2"), c) is False
 
 
-def test_condition_missing_operands_are_false():
+async def test_condition_missing_operands_are_false():
     # No item outside a branch; text that is not JSON.
+    W = sk.ConditionWhen
     c = ctx("plain text", item=None)
-    assert sk.evaluate_rule(sk.ConditionWhen(source="item", field="id", op="not_empty"), c) is False
-    assert sk.evaluate_rule(sk.ConditionWhen(source="item", field="id", op="equals", value=""), c) is False
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="a", op="not_empty"), c) is False
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="a", op="equals", value="x"), c) is False
+    assert await sk.evaluate_rule(W(source="item", field="id", op="not_empty"), c) is False
+    assert await sk.evaluate_rule(W(source="item", field="id", op="equals", value=""), c) is False
+    assert await sk.evaluate_rule(W(source="json", field="a", op="not_empty"), c) is False
+    assert await sk.evaluate_rule(W(source="json", field="a", op="equals", value="x"), c) is False
     # is_empty on a missing operand is true: "nothing there" is empty.
-    assert sk.evaluate_rule(sk.ConditionWhen(source="json", field="a", op="is_empty"), c) is True
+    assert await sk.evaluate_rule(W(source="json", field="a", op="is_empty"), c) is True
 
 
 async def test_condition_first_matching_rule_wins_and_renders_output():
@@ -228,6 +231,117 @@ def test_transform_config_validation():
         sk.parse_step_config("transform", {"regex": {"pattern": "a", "flags": "q"}})
     with pytest.raises(ValueError, match="truncate"):
         sk.parse_step_config("transform", {"truncate": 0})
+
+
+# ---------------------------------------------------------------------------
+# regular expressions: off the event loop, bounded, checked at save
+# ---------------------------------------------------------------------------
+# Exponential backtracking: about 0.3 s at 22 characters, doubling with each
+# one more (28 characters measured 18.7 s). `re` holds the GIL while it
+# matches, so a thread would not help: the event loop must not run it.
+SLOW_PATTERN = "(a+)+$"
+
+
+def slow_text(n: int) -> str:
+    return "a" * n + "b"
+
+
+async def ticks_while(coro) -> tuple[int, object]:
+    """How often a 10 ms ticker ran while ``coro`` was awaited."""
+    ticks: list[float] = []
+
+    async def ticker():
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)
+    start = time.monotonic()
+    try:
+        result = await coro
+    finally:
+        end = time.monotonic()
+        task.cancel()
+    return sum(1 for t in ticks if start < t < end), result
+
+
+async def test_condition_regex_leaves_the_event_loop_free():
+    config = {"rules": [rule({"op": "matches", "value": SLOW_PATTERN})]}
+    during, out = await ticks_while(run("condition", config, ctx(slow_text(22))))
+    assert out.detail == "else"
+    assert during >= 3
+
+
+async def test_transform_regex_leaves_the_event_loop_free():
+    config = {"regex": {"pattern": SLOW_PATTERN, "replace": "x"}}
+    during, out = await ticks_while(run("transform", config, ctx(slow_text(22))))
+    assert out.output == slow_text(22)
+    assert during >= 3
+
+
+@pytest.mark.parametrize("kind,config", [
+    ("condition", {"rules": [rule({"op": "matches", "value": SLOW_PATTERN})]}),
+    ("transform", {"regex": {"pattern": SLOW_PATTERN, "replace": "x"}}),
+])
+async def test_runaway_regex_is_stopped_with_a_fixed_text(monkeypatch, kind, config):
+    monkeypatch.setattr(sk, "REGEX_TIMEOUT_SECONDS", 0.5)
+    start = time.monotonic()
+    with pytest.raises(sk.StepFailed) as e:
+        await run(kind, config, ctx(slow_text(40)))
+    assert time.monotonic() - start < 5
+    assert "regular expression" in str(e.value) and "stopped" in str(e.value)
+    assert SLOW_PATTERN not in str(e.value)
+
+
+async def test_step_timeout_cancels_a_running_regex_promptly():
+    config = {"rules": [rule({"op": "matches", "value": SLOW_PATTERN})]}
+    start = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(run("condition", config, ctx(slow_text(40))), 0.3)
+    assert time.monotonic() - start < 3
+
+
+@pytest.mark.parametrize("kind,config", [
+    ("condition", {"rules": [rule({"op": "matches", "value": "z"})]}),
+    ("condition", {"rules": [rule({"op": "not_matches", "value": "z"})]}),
+    ("transform", {"regex": {"pattern": "z", "replace": "y"}}),
+])
+async def test_regex_operand_over_the_cap_is_refused_not_cut(kind, config):
+    text = "secret-" + "a" * sk.REGEX_OPERAND_CAP
+    with pytest.raises(sk.StepFailed) as e:
+        await run(kind, config, ctx(text))
+    msg = str(e.value)
+    assert "refused" in msg and str(sk.REGEX_OPERAND_CAP) in msg
+    assert "secret" not in msg
+
+
+async def test_regex_operand_at_the_cap_still_runs():
+    text = "a" * (sk.REGEX_OPERAND_CAP - 1) + "z"
+    out = await run("condition", {"rules": [rule({"op": "matches", "value": "z$"},
+                                                 {"action": "stop"})]}, ctx(text))
+    assert out.action == "stop"
+
+
+async def test_transform_result_over_its_cap_is_refused():
+    text = "a" * 1000
+    config = {"regex": {"pattern": "a", "replace": "\\g<0>" * 300}}
+    with pytest.raises(sk.StepFailed, match="refused"):
+        await run("transform", config, ctx(text))
+
+
+@pytest.mark.parametrize("op", ["matches", "not_matches"])
+def test_condition_regex_is_compiled_at_save(op):
+    bad = "(?P<tok_SECRET>"
+    with pytest.raises(ValueError) as e:
+        sk.validate_step_config("condition", {"rules": [rule({"op": op, "value": bad})]})
+    msg = str(e.value)
+    assert "rules.0.when" in msg and "value" in msg and "regular expression" in msg
+    assert "SECRET" not in msg and bad not in msg
+
+
+def test_condition_non_regex_ops_take_any_value():
+    sk.validate_step_config("condition", {"rules": [rule({"op": "contains", "value": "("})]})
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +469,114 @@ async def test_http_without_binding_fails_clearly(monkeypatch):
     sk._resolvers.clear()
     with pytest.raises(sk.StepFailed, match="destination 'nope'"):
         await run("http", {"destination": "nope", "path": "/x"}, ctx())
+
+
+class DestinationResolver(FakeResolver):
+    """A resolver double whose destination carries the newer fields."""
+
+    def __init__(self, *, proxy_type="Internet", queries=None, url="https://api.example.com/base"):
+        super().__init__(url=url)
+        self.proxy_type = proxy_type
+        self.queries = queries or {}
+
+    async def resolve(self, *, force=False):
+        self.resolves += 1
+        return SimpleNamespace(
+            url=self.url, headers={"Authorization": self.token}, expires_at=1e12,
+            proxy_type=self.proxy_type, queries=dict(self.queries),
+        )
+
+
+async def test_http_response_over_the_cap_is_refused_not_cut():
+    big = "x" * (sk.HTTP_STEP_RESPONSE_CAP + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=big)
+
+    with pytest.raises(sk.StepFailed) as e:
+        await run("http", {"destination": "d", "path": "/x"}, ctx(),
+                  http_resolver=FakeResolver(), http_transport=transport(handler))
+    msg = str(e.value)
+    assert "refused" in msg and "xxxx" not in msg and len(msg) < 400
+
+
+async def test_http_response_at_the_cap_is_handed_on():
+    body = "x" * sk.HTTP_STEP_RESPONSE_CAP
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body)
+
+    out = await run("http", {"destination": "d", "path": "/x"}, ctx(),
+                    http_resolver=FakeResolver(), http_transport=transport(handler))
+    assert out.output == body
+
+
+async def test_http_response_cap_is_enforced_while_streaming():
+    """The body is never buffered whole: reading stops after the cap."""
+    sent = []
+
+    class Endless(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(10_000):
+                sent.append(1)
+                yield b"y" * 4096
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Endless())
+
+    with pytest.raises(sk.StepFailed, match="refused"):
+        await run("http", {"destination": "d", "path": "/x"}, ctx(),
+                  http_resolver=FakeResolver(), http_transport=transport(handler))
+    assert len(sent) * 4096 <= sk.HTTP_STEP_RESPONSE_CAP + 2 * 4096
+
+
+async def test_http_error_status_with_a_large_body_still_shows_an_excerpt():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom " * 100_000)
+
+    with pytest.raises(sk.StepFailed) as e:
+        await run("http", {"destination": "d", "path": "/x"}, ctx(),
+                  http_resolver=FakeResolver(), http_transport=transport(handler))
+    assert "HTTP 500" in str(e.value) and "boom" in str(e.value) and len(str(e.value)) < 800
+
+
+@pytest.mark.parametrize("proxy_type", ["OnPremise", "onpremise"])
+async def test_http_refuses_an_onpremise_destination_before_sending(proxy_type):
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        raise AssertionError("must not be called")
+
+    resolver = DestinationResolver(proxy_type=proxy_type, url="http://s4-virtual:44300")
+    with pytest.raises(sk.StepFailed) as e:
+        await run("http", {"destination": "d", "path": "/x"}, ctx(),
+                  http_resolver=resolver, http_transport=transport(handler))
+    msg = str(e.value)
+    assert "OnPremise" in msg and "s4-virtual" not in msg
+
+
+async def test_http_sends_the_destination_queries_and_the_step_query_wins():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, text="ok")
+
+    resolver = DestinationResolver(queries={"sap-client": "100", "lang": "EN"})
+    await run("http", {"destination": "d", "path": "/x", "query": {"lang": "{{text}}"}},
+              ctx("NL"), http_resolver=resolver, http_transport=transport(handler))
+    assert seen["params"] == {"sap-client": "100", "lang": "NL"}
+
+
+async def test_http_queries_are_sent_again_after_the_401_retry():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        return httpx.Response(401 if len(seen) == 1 else 200, text="ok")
+
+    resolver = DestinationResolver(queries={"sap-client": "100"})
+    await run("http", {"destination": "d", "path": "/x"}, ctx(),
+              http_resolver=resolver, http_transport=transport(handler))
+    assert seen == [{"sap-client": "100"}, {"sap-client": "100"}]
 
 
 # ---------------------------------------------------------------------------

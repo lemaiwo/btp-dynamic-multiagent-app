@@ -379,6 +379,15 @@ def _host_of(url: str) -> str:
     return (httpx.URL(url).host or "").lower()
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _port_of(url: httpx.URL) -> int | None:
+    """The port a request to ``url`` really goes to: httpx reports the
+    scheme's default port as ``None``, so ``:443`` and no port compare equal."""
+    return url.port if url.port is not None else _DEFAULT_PORTS.get(url.scheme)
+
+
 class DestinationAuth(httpx.Auth):
     """Resolve a destination per request and send the request through it.
 
@@ -459,11 +468,14 @@ class DestinationAuth(httpx.Auth):
         """Where the request goes once the destination is known.
 
         A placeholder URL is rewritten onto the destination; an absolute one
-        is allowed only when it already names the destination's host or one
-        of the expected API hosts (a paging link), and refused otherwise.
+        (a paging link) is allowed only on the destination's own scheme, host
+        and port, or over https on the default port of an expected API host,
+        and refused otherwise. On the OnPremise route the host is checked here
+        and scheme and port in ``_shape``.
         """
         dest_url = httpx.URL(destination.url)
-        if not self._through_proxy(destination) and dest_url.scheme != "https":
+        through_proxy = self._through_proxy(destination)
+        if not through_proxy and dest_url.scheme != "https":
             raise DestinationError(
                 f"destination {self.destination_name!r} must use https://, "
                 f"not {dest_url.scheme!r}: its credential travels with every request"
@@ -488,8 +500,26 @@ class DestinationAuth(httpx.Auth):
                 port=dest_url.port,
                 path=f"{prefix}{path}" if prefix else path,
             )
-        if host == dest_host or host in self.expected_hosts:
-            return request.url
+        if through_proxy:
+            # The OnPremise route: `_shape` holds the request to the
+            # destination's own http:// scheme, host and port.
+            if host == dest_host or host in self.expected_hosts:
+                return request.url
+        else:
+            # A host alone is not enough: a link (from an answer this app does
+            # not control) to the same host over http:// or on another port
+            # would carry the credential in the clear or to another listener.
+            where = (request.url.scheme, host, _port_of(request.url))
+            if where == (dest_url.scheme, dest_host, _port_of(dest_url)):
+                return request.url
+            if host in self.expected_hosts and where == ("https", host, 443):
+                return request.url
+            if host == dest_host or host in self.expected_hosts:
+                raise DestinationError(
+                    f"{self.server_key}: refusing to send destination "
+                    f"{self.destination_name!r}'s credential to {host!r} over another "
+                    f"scheme or port than the destination names"
+                )
         raise DestinationError(
             f"{self.server_key}: refusing to send destination {self.destination_name!r}'s "
             f"credential to {host!r}; the destination names {dest_host!r}"

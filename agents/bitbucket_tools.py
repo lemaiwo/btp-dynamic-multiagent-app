@@ -112,7 +112,13 @@ Premium feature) or this account reviews the newer commit with verdict
 When verdict ``approve`` passes the gate and this account's approval is
 already there, no second approve call is sent: ``approved: true`` with
 ``already_approved: true``; a verdict ``approve`` that is held back answers
-``earlier_approval_stands: true`` with a fixed ``hint``. When the gate holds
+``earlier_approval_stands: true`` with a fixed ``hint``. When this account's
+entry in the pull request's ``participants`` cannot be read, verdict
+``approve`` sends no approve call (one sent blind could be answered 409
+while an approval stands): ``approved: false``, ``earlier_approval_unknown:
+true`` with a fixed ``hint`` and the error ``review_state_unknown``; the
+marker still says ``approve``, so ``approval_pending`` offers it once the
+state can be read. When the gate holds
 the approval back, or Bitbucket refuses it, the comment stands: the answer
 has ``commented: true``, ``approved: false`` and an ``error`` that says why.
 No comment is ever deleted.
@@ -374,6 +380,18 @@ def _review_unknown() -> Refused:
         "it could not be established whether this account reviewed the pull request at "
         "its current commit; nothing was sent",
         "do not review this pull request; report that a person has to look at it")
+
+
+def _approval_state_unknown() -> Refused:
+    """``submit_review`` with verdict approve when this account's entry in the
+    pull request's participants cannot be read: the comment stands, the
+    approval is held back (never sent on a state that was not read)."""
+    return Refused(
+        "review_state_unknown",
+        "the review comment was posted; whether this account already approved the pull "
+        "request could not be read, so the approval was not sent",
+        "do not call again; once its approvals can be read, a later run lists the pull "
+        "request under approval_pending for complete_approval")
 
 
 def _already_reviewed(extra: str = "") -> Refused:
@@ -1251,7 +1269,7 @@ class BitbucketClient:
                 if len(listed) >= MAX_LISTED or (account and checked >= MAX_CHECKED):
                     more = full = True
                     break
-                last = (repository, entry["id"])
+                before, last = last, (repository, entry["id"])
                 if account:
                     checked += 1
                     outcome = await self._check(repository, entry, account)
@@ -1265,10 +1283,14 @@ class BitbucketClient:
                         unchecked += 1
                         continue
                     if outcome == "pending":
-                        if len(pending) < MAX_LISTED:
-                            pending.append(entry)
-                        else:
-                            more = True
+                        if len(pending) >= MAX_LISTED:
+                            # Full like the listed cap: this one is not kept,
+                            # so the cursor stays on the one before it and the
+                            # next call starts with this one.
+                            last = before
+                            more = full = True
+                            break
+                        pending.append(entry)
                         continue
                 listed.append(entry)
             full = full or len(listed) >= MAX_LISTED or bool(account and checked >= MAX_CHECKED)
@@ -1569,13 +1591,23 @@ class BitbucketClient:
             # From here on the comment stands whatever happens: what follows
             # is said next to `commented: true`.
             if verdict == "approve":
-                await self._approve_behind_the_gate(base, result, after_comment=True,
-                                                    standing=standing)
+                if own is None and self.pins.allow_approve is True:
+                    # Not read: no approve is sent blind. Bitbucket's 409 for
+                    # "already approved" would read as "not approved" while an
+                    # approval stands. The marker says approve, so the listing
+                    # offers it under approval_pending once the state is read.
+                    result["error"] = _approval_state_unknown().as_error()["error"]
+                else:
+                    await self._approve_behind_the_gate(base, result, after_comment=True,
+                                                        standing=standing)
                 if standing and result["approved"] is not True:
                     # A held-back verdict approve is no finding against the
                     # new commit: the earlier approval is said, not removed.
                     result["earlier_approval_stands"] = True
                     result["hint"] = _STANDS_HINT
+                elif own is None:
+                    result["earlier_approval_unknown"] = True
+                    result["hint"] = _STANDS_UNKNOWN_HINT
             elif standing:
                 # Verdict comment on a newer commit: the approval this
                 # account gave an earlier one no longer says what it thinks.
@@ -1962,8 +1994,10 @@ def bitbucket_toolset(
         the pull request (the withdrawal was refused, or your verdict was
         approve and the approval was held back) and
         `earlier_approval_unknown: true` means it could not be read whether
-        there is one: say so in your report, a person must look. You never
-        withdraw anything yourself.
+        there is one: say so in your report, a person must look. With
+        verdict `approve` it comes with code `review_state_unknown` and no
+        approval was sent: do not call again, a later run offers it under
+        `approval_pending`. You never withdraw anything yourself.
 
         The verdict is your own judgement of the diff.
 

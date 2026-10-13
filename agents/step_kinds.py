@@ -53,7 +53,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from agents.loc_fields import loc_field
 
@@ -75,7 +82,42 @@ PYTHON_STEP_PASSTHROUGH: tuple[str, ...] = ("LD_LIBRARY_PATH",)
 PYTHON_STEP_MEMORY_BYTES = 256 * 1024 * 1024
 PYTHON_STEP_OUTPUT_CAP = 64 * 1024
 HTTP_BODY_EXCERPT = 500
+# The most bytes of a response body an http step reads and hands on. Larger is
+# refused, not cut: a JSON document that ends early is not one, and the next
+# step would read a part as the whole (the rule of `builtin:sharepoint` and
+# `builtin:bitbucket`). The same size the python step hands on.
+HTTP_STEP_RESPONSE_CAP = PYTHON_STEP_OUTPUT_CAP
 _TRUNCATED = "…[truncated]"
+
+# Regular expressions are admin-authored and run on text a previous step (an
+# agent, an http response) produced. `re` backtracks exponentially on patterns
+# such as `(a+)+$` and holds the GIL while it matches, so neither the event
+# loop nor a worker thread is safe: a thread stalls every request just the
+# same, and `asyncio.wait_for` cannot interrupt it. Every match therefore runs
+# in a child process (the python step's sandbox: isolated interpreter, minimal
+# environment, memory cap) that is killed after REGEX_TIMEOUT_SECONDS.
+REGEX_TIMEOUT_SECONDS: float = 5
+# The longest text a regex is applied to, in characters. Longer is refused,
+# not cut: a condition over a cut text could take the other branch, and a
+# replace would silently drop the tail.
+REGEX_OPERAND_CAP = 64 * 1024
+# The longest text a regex replace may produce (a replacement can repeat the
+# match): four times the operand cap.
+REGEX_RESULT_CAP = 4 * REGEX_OPERAND_CAP
+_REGEX_CHILD = (
+    "import json,re,sys\n"
+    "d=json.loads(sys.stdin.buffer.read())\n"
+    "try:\n"
+    " p=re.compile(d['pattern'],d['flags'])\n"
+    " if d['mode']=='search':\n"
+    "  o={'ok':True,'hit':p.search(d['text']) is not None}\n"
+    " else:\n"
+    "  t=p.sub(d['replace'],d['text'])\n"
+    "  o={'ok':True,'text':t} if len(t)<=d['cap'] else {'ok':False,'error':'too_large'}\n"
+    "except re.error as e:\n"
+    " o={'ok':False,'error':'re','message':str(e)}\n"
+    "sys.stdout.write(json.dumps(o))\n"
+)
 
 
 class StepFailed(Exception):
@@ -95,6 +137,21 @@ _OPS = (
 )
 
 
+def _check_compiles(pattern: str, field_name: str) -> None:
+    """ValueError naming ``field_name`` when ``pattern`` is no regex.
+
+    Neither the pattern nor `re`'s text, which quotes parts of it (a group
+    name, an escape): this is the answer to a refused save.
+    """
+    try:
+        re.compile(pattern)
+    except re.error as e:
+        where = f" at position {e.pos}" if e.pos is not None else ""
+        raise ValueError(
+            f"{field_name} is not a valid regular expression{where}"
+        ) from None
+
+
 class ConditionWhen(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -111,6 +168,14 @@ class ConditionWhen(BaseModel):
     def _value_to_str(cls, v: Any) -> Any:
         # A number typed into a UI arrives as a number; compare as text.
         return "" if v is None else (v if isinstance(v, str) else str(v))
+
+    @model_validator(mode="after")
+    def _regex_compiles(self) -> ConditionWhen:
+        # A `matches` value that does not compile used to be "no match" at run
+        # time, silently taking the other branch; refuse it at save instead.
+        if self.op in ("matches", "not_matches"):
+            _check_compiles(self.value, "value")
+        return self
 
 
 class ConditionAction(BaseModel):
@@ -156,13 +221,7 @@ class RegexSpec(BaseModel):
     @field_validator("pattern")
     @classmethod
     def _compiles(cls, v: str) -> str:
-        try:
-            re.compile(v)
-        except re.error as e:
-            # Neither the pattern nor `re`'s text, which quotes parts of it
-            # (a group name, an escape).
-            where = f" at position {e.pos}" if e.pos is not None else ""
-            raise ValueError(f"pattern is not a valid regular expression{where}") from None
+        _check_compiles(v, "pattern")
         return v
 
 
@@ -528,7 +587,79 @@ def _number(value: Any) -> float | None:
         return None
 
 
-def evaluate_rule(when: ConditionWhen, ctx: StepContext) -> bool:
+async def _run_regex(request: dict[str, Any]) -> dict[str, Any]:
+    """Run one regex search or replace in a killed-on-timeout child process.
+
+    ``request`` is ``{mode: "search" | "sub", pattern, flags, text, replace?}``.
+    Raises StepFailed with a fixed text (never the pattern or the text) when
+    the operand is over REGEX_OPERAND_CAP, the match takes longer than
+    REGEX_TIMEOUT_SECONDS or the child gives no result. A cancellation (the
+    step's own timeout, shutdown) kills the child before it propagates.
+    """
+    text = request["text"]
+    if len(text) > REGEX_OPERAND_CAP:
+        raise StepFailed(
+            f"the text a regular expression is applied to is {len(text)} "
+            f"characters, over the limit of {REGEX_OPERAND_CAP}; refused, not cut"
+        )
+    payload = json.dumps(
+        {**request, "cap": REGEX_RESULT_CAP}, ensure_ascii=False,
+    ).encode("utf-8")
+    limit = REGEX_TIMEOUT_SECONDS
+    kwargs: dict[str, Any] = dict(
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        env=python_step_env(),
+    )
+    if sys.platform != "win32":
+        kwargs["preexec_fn"] = _limits(max(1, int(limit)))
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", "-S", "-E", "-c", _REGEX_CHILD, **kwargs,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise StepFailed(
+            f"could not start the regular expression check: {type(e).__name__}"
+        ) from None
+    deadline = asyncio.timeout(limit)
+    try:
+        async with deadline:
+            stdout, _ = await proc.communicate(payload)
+    except TimeoutError:
+        await _kill(proc)
+        if deadline.expired():
+            raise StepFailed(
+                f"a regular expression took longer than {limit:g}s and was "
+                "stopped; simplify the pattern (a nested quantifier such as "
+                "(x+)+ backtracks exponentially)"
+            ) from None
+        raise
+    except asyncio.CancelledError:
+        await _kill(proc)
+        raise
+    try:
+        result = json.loads(stdout.decode("utf-8", "replace")) if stdout.strip() else None
+    except json.JSONDecodeError:
+        result = None
+    if not isinstance(result, dict):
+        raise StepFailed(
+            "a regular expression ended without a result "
+            f"(exit code {proc.returncode})"
+        )
+    return result
+
+
+async def _regex_hit(pattern: str, text: str, flags: int) -> bool:
+    result = await _run_regex(
+        {"mode": "search", "pattern": pattern, "flags": flags, "text": text},
+    )
+    # A pattern that does not compile is refused at save; one stored before
+    # that check keeps its old meaning, "no match".
+    return bool(result.get("ok") and result.get("hit"))
+
+
+async def evaluate_rule(when: ConditionWhen, ctx: StepContext) -> bool:
     """One rule's truth. Missing operands (no item, unparseable JSON) are false."""
     found, actual = _operand(when, ctx)
     op = when.op
@@ -554,11 +685,8 @@ def evaluate_rule(when: ConditionWhen, ctx: StepContext) -> bool:
         hit = fold(_to_text(actual)) == fold(expected)
         return hit if op == "equals" else not hit
     if op in ("matches", "not_matches"):
-        flags = 0 if when.case_sensitive else re.IGNORECASE
-        try:
-            hit = re.search(expected, _to_text(actual), flags) is not None
-        except re.error:
-            hit = False
+        flags = 0 if when.case_sensitive else int(re.IGNORECASE)
+        hit = await _regex_hit(expected, _to_text(actual), flags)
         return hit if op == "matches" else not hit
     if op in ("gt", "lt"):
         a, b = _number(actual), _number(expected)
@@ -570,9 +698,13 @@ def evaluate_rule(when: ConditionWhen, ctx: StepContext) -> bool:
     return False
 
 
-def run_condition(cfg: ConditionConfig, ctx: StepContext) -> StepOutcome:
+async def run_condition(cfg: ConditionConfig, ctx: StepContext) -> StepOutcome:
     for index, rule in enumerate(cfg.rules, start=1):
-        if evaluate_rule(rule.when, ctx):
+        try:
+            fired = await evaluate_rule(rule.when, ctx)
+        except StepFailed as e:
+            raise StepFailed(f"rule {index}: {e}") from None
+        if fired:
             chosen, detail = rule.then, f"rule {index}"
             break
     else:
@@ -587,7 +719,7 @@ def run_condition(cfg: ConditionConfig, ctx: StepContext) -> StepOutcome:
 _RE_FLAGS = {"i": re.IGNORECASE, "m": re.MULTILINE, "s": re.DOTALL, "x": re.VERBOSE}
 
 
-def run_transform(cfg: TransformConfig, ctx: StepContext) -> StepOutcome:
+async def run_transform(cfg: TransformConfig, ctx: StepContext) -> StepOutcome:
     text = ctx.text
     if cfg.extract_json:
         if not ctx.json_ok():
@@ -605,11 +737,21 @@ def run_transform(cfg: TransformConfig, ctx: StepContext) -> StepOutcome:
     if cfg.regex is not None:
         flags = 0
         for c in cfg.regex.flags:
-            flags |= _RE_FLAGS[c]
-        try:
-            text = re.sub(cfg.regex.pattern, cfg.regex.replace, text, flags=flags)
-        except re.error as e:
-            raise StepFailed(f"regex replace failed: {e}") from None
+            flags |= int(_RE_FLAGS[c])
+        result = await _run_regex({
+            "mode": "sub", "pattern": cfg.regex.pattern, "flags": flags,
+            "text": text, "replace": cfg.regex.replace,
+        })
+        if result.get("ok"):
+            text = str(result.get("text", ""))
+        elif result.get("error") == "too_large":
+            raise StepFailed(
+                "regex replace produced more than "
+                f"{REGEX_RESULT_CAP} characters; refused, not cut"
+            )
+        else:
+            # A bad group reference in `replace` (not checked at save).
+            raise StepFailed(f"regex replace failed: {result.get('message', 'error')}")
     if cfg.template:
         text = render_template(cfg.template, ctx, text=text)
     if cfg.truncate is not None and len(text) > cfg.truncate:
@@ -712,28 +854,58 @@ async def run_http(
 
     async def send(http: httpx.AsyncClient) -> httpx.Response:
         destination = await resolver.resolve()
+        if str(getattr(destination, "proxy_type", "") or "").casefold() == "onpremise":
+            # An OnPremise URL is a virtual host behind the Cloud Connector,
+            # reachable only through the connectivity proxy, which this step
+            # does not speak; sent directly, the destination's credential
+            # would go to whatever public DNS answers for that name.
+            raise StepFailed(
+                f"destination {cfg.destination!r} is an OnPremise destination; "
+                "the http step reaches Internet destinations only"
+            )
         headers = {**destination.headers, **cfg.headers}
         content = None
         if body and cfg.method != "GET":
             headers.setdefault("Content-Type", cfg.content_type)
             content = body.encode("utf-8")
-        return await http.request(
+        # The destination's `URL.queries.*` (sap-client, ...) go with every
+        # request; a parameter the step names itself wins.
+        params = {**(getattr(destination, "queries", None) or {}), **query}
+        request = http.build_request(
             cfg.method,
             f"{destination.url.rstrip('/')}{path}",
-            params=query or None,
+            params=params or None,
             headers=headers,
             content=content,
         )
+        return await http.send(request, stream=True)
+
+    async def read_capped(response: httpx.Response) -> tuple[bytes, bool]:
+        """At most HTTP_STEP_RESPONSE_CAP bytes, and whether there was more."""
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > HTTP_STEP_RESPONSE_CAP:
+                chunks.append(chunk[: len(chunk) - (size - HTTP_STEP_RESPONSE_CAP)])
+                return b"".join(chunks), True
+            chunks.append(chunk)
+        return b"".join(chunks), False
 
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(float(cfg.timeout_seconds)), transport=transport,
         ) as http:
             response = await send(http)
-            if response.status_code == 401 and hasattr(resolver, "invalidate"):
-                # The destination's cached token aged out; refresh once.
-                resolver.invalidate()
-                response = await send(http)
+            try:
+                if response.status_code == 401 and hasattr(resolver, "invalidate"):
+                    # The destination's cached token aged out; refresh once.
+                    await response.aclose()
+                    resolver.invalidate()
+                    response = await send(http)
+                raw, over = await read_capped(response)
+            finally:
+                await response.aclose()
     except StepFailed:
         raise
     except httpx.HTTPError as e:
@@ -746,15 +918,25 @@ async def run_http(
             f"destination {cfg.destination!r}: {type(e).__name__}: {e}"
         ) from None
 
-    text = response.text
+    try:
+        text = raw.decode(response.charset_encoding or "utf-8", "replace")
+    except LookupError:  # a charset Python does not know
+        text = raw.decode("utf-8", "replace")
     if response.status_code not in cfg.expect_status:
+        # Only an excerpt is shown, so a body over the cap needs no refusal.
         raise StepFailed(
             f"{cfg.method} {path} returned HTTP {response.status_code} "
             f"(expected {_describe_statuses(cfg.expect_status)}): {_excerpt(text)}"
         )
+    if over:
+        raise StepFailed(
+            f"{cfg.method} {path} answered with a body over the "
+            f"{HTTP_STEP_RESPONSE_CAP} bytes an http step hands on; refused, not "
+            "cut (narrow the request with `query`)"
+        )
     if _is_json_content(response.headers.get("content-type", "")) and text.strip():
         try:
-            text = json.dumps(response.json(), ensure_ascii=False, indent=2)
+            text = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
         except Exception:  # noqa: BLE001
             pass
     return StepOutcome(output=text, detail=f"HTTP {response.status_code}")
@@ -885,9 +1067,9 @@ async def execute_step(
         raise ValueError("agent steps are run by the workflow runner, not execute_step")
     cfg = parse_step_config(kind, config)
     if kind == "condition":
-        return run_condition(cfg, ctx)  # type: ignore[arg-type]
+        return await run_condition(cfg, ctx)  # type: ignore[arg-type]
     if kind == "transform":
-        return run_transform(cfg, ctx)  # type: ignore[arg-type]
+        return await run_transform(cfg, ctx)  # type: ignore[arg-type]
     if kind == "http":
         return await run_http(  # type: ignore[arg-type]
             cfg, ctx, resolver=http_resolver, transport=http_transport,

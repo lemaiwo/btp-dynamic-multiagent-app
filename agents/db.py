@@ -24,6 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import SplitResult, urlsplit
 
 from sqlalchemy import (
     DateTime,
@@ -121,18 +122,38 @@ def _build_ssl_context(ca_pem: str | None) -> ssl.SSLContext:
     """SSL context for asyncpg.
 
     BTP managed postgres uses a self-signed CA chain that isn't in the
-    system trust store. If the binding exposes the CA pem, load it.
-    Otherwise (or if PG_SSL_INSECURE=1) skip verification — TLS is still
-    on but the cert chain isn't validated.
+    system trust store. If the binding exposes the CA pem, it is added to
+    the trust store. Without a usable CA, verification stays ON against the
+    system trust store (one WARNING says so): a connection that cannot be
+    verified fails rather than silently accepting any certificate, which
+    would hand the database password to whoever answers on that address.
+    ``PG_SSL_INSECURE=1`` (exactly) is the explicit opt-out for that case:
+    TLS stays on but neither chain nor host name is checked, and a WARNING
+    is logged each time a context is built that way. A CA that loads is
+    always verified against, whatever the variable says (as before).
     """
     ctx = ssl.create_default_context()
     if ca_pem:
         try:
             ctx.load_verify_locations(cadata=ca_pem)
             return ctx
-        except Exception:
-            logger.exception("Failed to load BTP postgres CA from VCAP; disabling verification")
-    if os.environ.get("PG_SSL_INSECURE", "1") == "1":
+        except Exception as e:
+            # Class name only: the text may quote the PEM.
+            logger.warning(
+                "postgres TLS: the CA in the binding could not be loaded (%s); "
+                "the certificate is checked against the system trust store "
+                "unless PG_SSL_INSECURE=1",
+                type(e).__name__,
+            )
+    else:
+        logger.warning(
+            "postgres TLS: no CA found in the binding; the certificate is "
+            "checked against the system trust store unless PG_SSL_INSECURE=1"
+        )
+    if os.environ.get("PG_SSL_INSECURE", "0") == "1":
+        logger.warning(
+            "postgres TLS: PG_SSL_INSECURE=1, certificate verification is OFF"
+        )
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
@@ -2087,7 +2108,10 @@ def _clean_client_credentials(
         raise ValueError("client_credentials server requires a client_secret")
     if not (cleaned.get("token_url") or cleaned.get("uaa_url")):
         raise ValueError("client_credentials server requires a token_url or uaa_url")
-    cleaned["allow_send"] = bool(src.get("allow_send"))
+    _check_oauth_endpoints(cleaned)
+    # Only the JSON boolean true opens the send tool: the string "false"
+    # is truthy.
+    cleaned["allow_send"] = src.get("allow_send") is True
     return cleaned
 
 
@@ -2172,7 +2196,9 @@ def _clean_destination(oauth: Any, url: str | None = None) -> dict[str, Any]:
     if slack:
         cleaned["allow_send"] = src.get("allow_send") is True
     else:
-        cleaned["allow_comment"] = bool(src.get("allow_comment"))
+        # Only the JSON boolean true registers add_comment, as every other
+        # write switch is read: the string "false" is truthy.
+        cleaned["allow_comment"] = src.get("allow_comment") is True
     return cleaned
 
 
@@ -2291,7 +2317,7 @@ def _clean_oauth(
         return _clean_sharepoint_entry(oauth, mode, fallback)
     if builtin == _BITBUCKET_URL:
         # Its own cleaner for the same reason: the generic destination code
-        # would keep Jira's keys and read `allow_comment` with bool().
+        # would keep Jira's keys and its `allow_comment`.
         return _clean_bitbucket_entry(oauth, mode)
     cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
@@ -2362,7 +2388,9 @@ def _clean_oauth_block(
                 v = ", ".join(str(x).strip() for x in v if str(x).strip())
             if v is not None and str(v).strip() != "":
                 cleaned[k] = str(v).strip()
-        cleaned["allow_send"] = bool(src.get("allow_send"))
+        # `is True`, as Gmail below: the string "false" must not open
+        # send_mail / post_message.
+        cleaned["allow_send"] = src.get("allow_send") is True
     elif builtin == "builtin:gmail":
         # Gmail replies to the thread it was given, so it pins no audience;
         # the switch is all it keeps. Only a real true opens the send tool.
@@ -2375,7 +2403,94 @@ def _clean_oauth_block(
         raise ValueError(
             "oauth2 server requires either uaa_url or both authorize_url and token_url"
         )
+    _check_oauth_endpoints(cleaned)
     return cleaned
+
+
+def split_endpoint_url(
+    value: str, *, field: str = "url", allow_http: bool = False
+) -> SplitResult:
+    """The structural rules of a stored endpoint URL, as storage checks them.
+
+    The same rules, in the same order and with the same texts, as
+    ``agents.admin._split_endpoint_url`` (the payload gate):
+    ``scripts/import_bundle.py`` and direct `upsert_agent` callers reach
+    storage without that gate, and every rule here decides where a user's
+    JWT or a client secret is sent. https only (http only where
+    ``allow_http``: a public server on ``auth_mode=none``), no userinfo, no
+    fragment, a host, a well-formed port. Decided by ``urlsplit``, the
+    parser httpx uses to pick the host it dials. A refusal names the field
+    and the rule, never the value. ``tests/test_db_storage_gate.py`` holds
+    the two to the same answers.
+    """
+    v = (value or "").strip()
+    try:
+        parts = urlsplit(v)
+    except ValueError as e:
+        raise ValueError(f"{field}: invalid URL") from e
+    schemes = ("https", "http") if allow_http else ("https",)
+    if parts.scheme not in schemes:
+        if allow_http:
+            raise ValueError(f"{field} must be http:// or https://")
+        raise ValueError(f"{field} must use https://")
+    if "@" in parts.netloc or parts.username is not None or parts.password is not None:
+        raise ValueError(f"{field} must not carry credentials (user@host)")
+    if "#" in v:
+        raise ValueError(f"{field} must not carry a #fragment")
+    if not parts.hostname:
+        raise ValueError(f"{field} must name a host")
+    try:
+        parts.port  # noqa: B018 - raises ValueError on a malformed port
+    except ValueError as e:
+        raise ValueError(f"{field}: invalid port") from e
+    return parts
+
+
+# The authorization server's endpoints of an oauth2 / app_only block: a
+# client secret and every user's authorization code travel to these hosts.
+_OAUTH_ENDPOINT_KEYS = ("uaa_url", "authorize_url", "token_url")
+
+
+def _check_oauth_endpoints(cleaned: dict[str, Any]) -> None:
+    """https, no userinfo, no fragment for each endpoint the block stores
+    (the payload's ``_validate_oauth_urls``)."""
+    for key in _OAUTH_ENDPOINT_KEYS:
+        if cleaned.get(key):
+            split_endpoint_url(str(cleaned[key]), field=f"oauth.{key}")
+
+
+def _checked_server_url(url: str, mode: str) -> str:
+    """The URL of one server entry as storage keeps it, or a ValueError.
+
+    A ``builtin:`` URL must name a built-in of the closed set
+    (``agents.builtins.BUILTIN_URLS``) and is stored lower-cased without a
+    trailing slash, as the payload stores it: the registry builds any URL it
+    does not know as a built-in as a remote MCP server, and would send that
+    entry's credential there. Any other URL gets `split_endpoint_url`, with
+    http allowed only on ``auth_mode=none`` (nothing is forwarded to a public
+    server). The host allow-list (``MCP_URL_ALLOWLIST``) stays the
+    payload's: it depends on the environment of the instance that saves.
+    """
+    from agents.builtins import BUILTIN_URLS, is_builtin_url
+
+    v = url.strip().rstrip("/")
+    if v.lower().startswith("builtin"):
+        if not is_builtin_url(v):
+            raise ValueError(
+                "url names an unknown built-in toolset; known: "
+                f"{', '.join(sorted(BUILTIN_URLS))}"
+            )
+        return v.lower()
+    public = mode == AUTH_MODE_NONE
+    try:
+        split_endpoint_url(v, allow_http=public)
+    except ValueError as e:
+        if not public and "https://" in str(e):
+            raise ValueError(
+                "url must use https:// (set auth_mode=none for public servers)"
+            ) from None
+        raise
+    return url
 
 
 def prepare_servers(
@@ -2393,6 +2508,12 @@ def prepare_servers(
         for s in existing.mcp_servers:
             if isinstance(s.get("oauth"), dict):
                 prev_oauth_by_url[s["url"]] = s["oauth"]
+                # A built-in is stored canonical now (`_checked_server_url`);
+                # a row written before that in another spelling still keeps
+                # its secret when it is saved again.
+                canonical = str(s["url"]).strip().rstrip("/").lower()
+                if canonical.startswith("builtin"):
+                    prev_oauth_by_url.setdefault(canonical, s["oauth"])
 
     normalized: list[dict[str, Any]] = []
     odata_seen = False
@@ -2404,6 +2525,8 @@ def prepare_servers(
             raise ValueError("MCP server url is required")
         if mode not in VALID_AUTH_MODES:
             raise ValueError(f"invalid auth_mode {mode!r}")
+        # The payload's URL rules again, before anything below reads the URL.
+        url = _checked_server_url(url, mode)
         if url.rstrip("/").lower() == BUILTIN_ODATA_URL:
             # Stored under exactly this spelling. `odata_entries` (who uses a
             # service) forgives case and a trailing slash, the registry's

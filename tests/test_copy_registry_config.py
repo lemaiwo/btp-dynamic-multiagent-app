@@ -624,7 +624,10 @@ def test_the_script_can_be_imported_with_both_services_bound():
         cwd=ROOT, env=environment, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 2, result.stderr[-400:]
-    assert result.stderr == "refused: Source and target are the same database\n"
+    # `agents.db` builds its own engine at import; the fake postgres binding
+    # holds no CA, which is one WARNING line before the refusal.
+    assert result.stderr.endswith("refused: Source and target are the same database\n")
+    assert "postgres TLS: no CA found in the binding" in result.stderr
     for secret in ("pg-pass", "rt-pass", "dt-pass"):
         assert secret not in result.stdout + result.stderr
 
