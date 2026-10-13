@@ -1065,3 +1065,311 @@ opaTest("a credential that scheduled runs depend on and that has expired is name
     });
     Then.iStopTheApp();
 });
+
+// --- invoke API --------------------------------------------------------------
+// FakeBackend.reset() exposes btp-agent (id 100, slug "btp-agent") to the
+// invoke API with a result schema and limits { media_types: [pdf],
+// max_file_bytes: 2 MB }; gmail-agent (id 101) has no slug and no settings.
+
+opaTest("the invoke panel shows the stored settings and an untouched save sends them back", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentExposeInvoke",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            const toggle = element as Switch;
+            Opa5.assert.strictEqual(toggle.getState(), true, "the switch is on");
+            Opa5.assert.strictEqual(toggle.getEnabled(), true, "and enabled: the agent has a slug");
+        }
+    });
+    Then.waitFor({
+        id: "agentResultSchema",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.deepEqual(
+                JSON.parse((element as TextArea).getValue()),
+                { type: "object", properties: { total: { type: "number" } }, required: ["total"] },
+                "the stored schema is shown as JSON");
+        }
+    });
+    Then.waitFor({
+        id: "agentInvokeMediaTypes",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.deepEqual((element as MultiComboBox).getSelectedKeys(), ["application/pdf"], "the stored type is selected");
+        }
+    });
+    Then.waitFor({
+        id: "agentInvokeMaxFileMb",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Input).getValue(), "2", "the size is shown in MB");
+        }
+    });
+
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const body = backend.bodies["PUT agents/100"] ?? {};
+            Opa5.assert.strictEqual(body.expose_invoke, true, "expose_invoke is sent");
+            Opa5.assert.deepEqual(
+                body.result_schema,
+                { type: "object", properties: { total: { type: "number" } }, required: ["total"] },
+                "the schema is sent parsed, as an object");
+            Opa5.assert.deepEqual(
+                body.invoke_limits, { media_types: ["application/pdf"], max_file_bytes: 2 * 1024 * 1024 },
+                "the limits are sent as an object, the size in bytes");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the agent list tags the agent that is exposed to the invoke API", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+
+    Then.waitFor({
+        controlType: "sap.m.ObjectStatus",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) {
+            return (element as ObjectStatus).getText() === "Invoke API";
+        },
+        visible: false,
+        success: function (tags: UI5Element[]) {
+            const shown = tags.filter((tag) => (tag as ObjectStatus).getVisible())
+                .map((tag) => ((tag.getBindingContext("agents")?.getObject() ?? {}) as { name?: string }).name);
+            Opa5.assert.deepEqual(shown, ["btp-agent"], "only btp-agent carries the tag");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("without an API slug the invoke switch is disabled and says why; a typed slug enables it", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    Then.waitFor({
+        id: "agentExposeInvoke",
+        viewName: "AgentDetail",
+        // autoWait matches enabled controls only unless told otherwise.
+        enabled: false,
+        success: function (element: UI5Element) {
+            const toggle = element as Switch;
+            Opa5.assert.strictEqual(toggle.getEnabled(), false, "the switch is disabled");
+            Opa5.assert.strictEqual(toggle.getTooltip_AsString(),
+                "Enter an API slug under Job settings first: the invoke API calls the agent by that slug.",
+                "its tooltip says why");
+        }
+    });
+    Then.waitFor({
+        id: "agentExposeInvokeNoSlug",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.ok((element as Text).getVisible(), "the reason is also shown as text");
+        }
+    });
+
+    When.waitFor({ id: "agentApiSlug", viewName: "AgentDetail", actions: new EnterText({ text: "gmail-agent" }) });
+
+    Then.waitFor({
+        id: "agentExposeInvoke",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as Switch).getEnabled();
+        },
+        success: function () {
+            Opa5.assert.ok(true, "the switch is enabled once the agent has a slug");
+        },
+        errorMessage: "The invoke switch stayed disabled after a slug was typed"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a schema with blank limits sends the parsed schema and invoke_limits null", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    When.waitFor({
+        id: "agentResultSchema",
+        viewName: "AgentDetail",
+        actions: new EnterText({ text: "{\"type\": \"object\", \"required\": [\"a\"]}" })
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const body = backend.bodies["PUT agents/101"] ?? {};
+            Opa5.assert.strictEqual(body.expose_invoke, false, "expose_invoke is sent as a real boolean");
+            Opa5.assert.deepEqual(body.result_schema, { type: "object", required: ["a"] }, "the schema is parsed");
+            Opa5.assert.strictEqual(body.invoke_limits, null, "blank limits are null: the server's defaults");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("invalid JSON in the result schema is refused on the client, in a fixed text, and nothing is sent", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    // The text carries a marker: no message may echo what was typed.
+    When.waitFor({
+        id: "agentResultSchema",
+        viewName: "AgentDetail",
+        actions: new EnterText({ text: "{ total: SECRETVALUE }" })
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    // The box comes first: while it is open the field behind it is not
+    // interactable for OPA.
+    Then.waitFor({
+        controlType: "sap.m.Dialog",
+        searchOpenDialogs: true,
+        success: function (dialogs: UI5Element[]) {
+            const text = (dialogs[0].getDomRef()?.textContent ?? "");
+            Opa5.assert.ok(text.indexOf("Result schema is not valid JSON.") !== -1, "the box says why");
+            Opa5.assert.strictEqual(text.indexOf("SECRETVALUE"), -1, "and does not echo the text");
+        },
+        errorMessage: "No message box for the invalid schema"
+    });
+    When.waitFor({
+        controlType: "sap.m.Button",
+        searchOpenDialogs: true,
+        matchers: function (element: UI5Element) {
+            return (element as Button).getText() === "Close";
+        },
+        actions: new Press()
+    });
+
+    Then.waitFor({
+        id: "agentResultSchema",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as TextArea).getValueState() === "Error";
+        },
+        success: function (element: UI5Element) {
+            const area = element as TextArea;
+            Opa5.assert.strictEqual(area.getValueStateText(), "Result schema is not valid JSON.", "a fixed text");
+            Opa5.assert.strictEqual(area.getValueStateText().indexOf("SECRETVALUE"), -1, "the typed text is not echoed");
+            Opa5.assert.strictEqual(backend.countRequests("PUT agents/100"), 0, "nothing was sent");
+        },
+        errorMessage: "The invalid schema was not flagged"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the server's refusal of the result schema lands on the schema field", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentResultSchema",
+        viewName: "AgentDetail",
+        success: function () {
+            // A 422 of the payload gate: it names the field and the rule.
+            backend.failNext = {
+                path: "agents/100", method: "PUT", status: 422,
+                body: { detail: [{ loc: ["body", "result_schema"], msg: "result_schema: $ref is not supported", type: "value_error" }] }
+            };
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        controlType: "sap.m.Dialog",
+        searchOpenDialogs: true,
+        success: function (dialogs: UI5Element[]) {
+            const text = (dialogs[0].getDomRef()?.textContent ?? "");
+            Opa5.assert.ok(text.indexOf("$ref is not supported") !== -1, "the server's rule is shown in a box");
+        },
+        errorMessage: "No message box for the refused schema"
+    });
+    When.waitFor({
+        controlType: "sap.m.Button",
+        searchOpenDialogs: true,
+        matchers: function (element: UI5Element) {
+            return (element as Button).getText() === "Close";
+        },
+        actions: new Press()
+    });
+    Then.waitFor({
+        id: "agentResultSchema",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as TextArea).getValueState() === "Error";
+        },
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as TextArea).getValueStateText(),
+                "result_schema: $ref is not supported", "and on the field");
+        },
+        errorMessage: "The refused schema was not flagged on its field"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the server's refusal of the invoke limits lands on the limit its message names", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentInvokeMaxFiles",
+        viewName: "AgentDetail",
+        success: function () {
+            // The real shape: the validator checks the whole field, so the loc
+            // is the field alone and the key is in the fixed message prefix.
+            backend.failNext = {
+                path: "agents/100", method: "PUT", status: 422,
+                body: { detail: [{
+                    loc: ["body", "invoke_limits"],
+                    msg: "Value error, invoke_limits.max_files: must be an integer from 1 to 10",
+                    type: "value_error"
+                }] }
+            };
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        controlType: "sap.m.Dialog",
+        searchOpenDialogs: true,
+        success: function (dialogs: UI5Element[]) {
+            const text = (dialogs[0].getDomRef()?.textContent ?? "");
+            Opa5.assert.ok(text.indexOf("must be an integer from 1 to 10") !== -1, "the server's rule is shown in a box");
+        },
+        errorMessage: "No message box for the refused limits"
+    });
+    When.waitFor({
+        controlType: "sap.m.Button",
+        searchOpenDialogs: true,
+        matchers: function (element: UI5Element) {
+            return (element as Button).getText() === "Close";
+        },
+        actions: new Press()
+    });
+    Then.waitFor({
+        id: "agentInvokeMaxFiles",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as Input).getValueState() === "Error";
+        },
+        success: function (element: UI5Element) {
+            Opa5.assert.ok((element as Input).getValueStateText().indexOf("invoke_limits.max_files") !== -1,
+                "the max-files field carries the message");
+        },
+        errorMessage: "The refused limit was not flagged on the max-files field"
+    });
+    Then.waitFor({
+        id: "agentInvokeMaxPdfPages",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Input).getValueState(), "None", "the other limits are not marked");
+        }
+    });
+
+    Then.iStopTheApp();
+});

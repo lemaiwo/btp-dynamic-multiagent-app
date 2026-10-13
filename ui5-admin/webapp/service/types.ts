@@ -233,6 +233,32 @@ export interface AgentInput {
      * wire: an absent key keeps what is stored, like `peers`. See the
      * `--- deep agents ---` section at the end of this file. */
     deep?: DeepConfig;
+    // --- invoke API --- Optional on the wire (an older server neither sends
+    // nor reads them); the form always sends all three.
+    /** Whether `POST /api/invoke/{api_slug}` may run this agent. Needs an
+     * `api_slug`; refused for an agent whose Bitbucket entry approves. */
+    expose_invoke?: boolean;
+    /** The JSON schema `submit_result` checks the agent's result against
+     * (`agents/invoke_config.py`, a subset); null = free text. */
+    result_schema?: JsonSchema | null;
+    /** What the invoke API accepts as attachments; null = the server's
+     * defaults. Every key is optional on the server. */
+    invoke_limits?: InvokeLimits | null;
+}
+
+/** A JSON schema as the server stores it: one JSON object. */
+export type JsonSchema = Record<string, unknown>;
+
+/**
+ * `invoke_limits` of an agent (`agents/invoke_config.py`, `clean_limits`).
+ * An absent key falls back to the server's default: image/png, image/jpeg,
+ * application/pdf; 10 MB; 5 files; 20 PDF pages.
+ */
+export interface InvokeLimits {
+    media_types?: string[];
+    max_file_bytes?: number;
+    max_files?: number;
+    max_pdf_pages?: number;
 }
 
 /**

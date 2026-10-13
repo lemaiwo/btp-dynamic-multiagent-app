@@ -203,10 +203,13 @@
                         <Switch id="agentExposeApi" state="{agent>/data/expose_api}" />
 
                         <Label text="{i18n>apiSlug}" />
+                        <!-- Always editable: the slug is also the invoke API's
+                             address (the Invoke API panel below), which does
+                             not depend on the job switch. -->
                         <Input
                             id="agentApiSlug"
                             value="{agent>/data/api_slug}"
-                            enabled="{agent>/data/expose_api}"
+                            valueLiveUpdate="true"
                             valueState="{agent>/errors/api_slugState}"
                             valueStateText="{agent>/errors/api_slug}"
                             maxLength="64" />
@@ -239,6 +242,83 @@
                                 press=".onUseMyPrincipal"
                                 class="sapUiTinyMarginBegin" />
                         </HBox>
+                    </f:SimpleForm>
+                </Panel>
+
+                <!-- invoke API: POST /api/invoke/{api_slug}. The switch needs
+                     the slug of Job settings (enabled while it is on, so it
+                     can always be switched off); the schema is JSON text,
+                     parsed on Save; blank limits are the server's defaults. -->
+                <Panel id="invokePanel" headerText="{i18n>invokePanel}" expandable="false" class="sapUiSmallMarginTop">
+                    <Text text="{i18n>invokeHint}" />
+                    <f:SimpleForm layout="ResponsiveGridLayout" editable="true">
+                        <Label text="{i18n>exposeInvoke}" labelFor="agentExposeInvoke" />
+                        <VBox>
+                            <Switch
+                                id="agentExposeInvoke"
+                                state="{agent>/data/expose_invoke}"
+                                enabled="{ parts: ['agent>/data/api_slug', 'agent>/data/expose_invoke'], formatter: '.invokeSwitchEnabled' }"
+                                tooltip="{= ${agent>/data/expose_invoke} || !!${agent>/data/api_slug} ? ${i18n>exposeInvoke} : ${i18n>exposeInvokeNoSlug} }" />
+                            <Text
+                                id="agentExposeInvokeNoSlug"
+                                text="{i18n>exposeInvokeNoSlug}"
+                                visible="{= !${agent>/data/api_slug} }" />
+                        </VBox>
+
+                        <Label text="{i18n>resultSchema}" labelFor="agentResultSchema" />
+                        <VBox>
+                            <TextArea
+                                id="agentResultSchema"
+                                value="{agent>/invoke/schemaText}"
+                                valueState="{agent>/errors/result_schemaState}"
+                                valueStateText="{agent>/errors/result_schema}"
+                                placeholder="{i18n>resultSchemaPlaceholder}"
+                                rows="8"
+                                width="100%" />
+                            <Text text="{i18n>resultSchemaHint}" class="sapUiTinyMarginTop" />
+                        </VBox>
+
+                        <Label text="{i18n>invokeMediaTypes}" labelFor="agentInvokeMediaTypes" />
+                        <MultiComboBox
+                            id="agentInvokeMediaTypes"
+                            width="100%"
+                            placeholder="{i18n>invokeMediaTypesPlaceholder}"
+                            items="{agent>/invokeMediaTypes}"
+                            selectedKeys="{agent>/invoke/mediaTypes}"
+                            valueState="{agent>/errors/media_typesState}"
+                            valueStateText="{agent>/errors/media_types}">
+                            <core:Item key="{agent>key}" text="{agent>key}" />
+                        </MultiComboBox>
+
+                        <Label text="{i18n>invokeMaxFileMb}" labelFor="agentInvokeMaxFileMb" />
+                        <Input
+                            id="agentInvokeMaxFileMb"
+                            value="{agent>/invoke/maxFileMb}"
+                            placeholder="{i18n>invokeMaxFileMbPlaceholder}"
+                            valueState="{agent>/errors/max_file_mbState}"
+                            valueStateText="{agent>/errors/max_file_mb}"
+                            width="10rem" />
+
+                        <Label text="{i18n>invokeMaxFiles}" labelFor="agentInvokeMaxFiles" />
+                        <Input
+                            id="agentInvokeMaxFiles"
+                            value="{agent>/invoke/maxFiles}"
+                            placeholder="{i18n>invokeMaxFilesPlaceholder}"
+                            valueState="{agent>/errors/max_filesState}"
+                            valueStateText="{agent>/errors/max_files}"
+                            width="10rem" />
+
+                        <Label text="{i18n>invokeMaxPdfPages}" labelFor="agentInvokeMaxPdfPages" />
+                        <VBox>
+                            <Input
+                                id="agentInvokeMaxPdfPages"
+                                value="{agent>/invoke/maxPdfPages}"
+                                placeholder="{i18n>invokeMaxPdfPagesPlaceholder}"
+                                valueState="{agent>/errors/max_pdf_pagesState}"
+                                valueStateText="{agent>/errors/max_pdf_pages}"
+                                width="10rem" />
+                            <Text text="{i18n>invokeLimitsHint}" class="sapUiTinyMarginTop" />
+                        </VBox>
                     </f:SimpleForm>
                 </Panel>
 

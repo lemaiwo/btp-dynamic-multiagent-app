@@ -67,6 +67,7 @@ from agents.slack_tools import BUILTIN_SLACK_URL
 from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
 from agents.teams_tools import BUILTIN_TEAMS_URL
 from agents.validation_errors import validation_item
+from agents.invoke_config import check_result_schema, clean_limits
 from agents.db import (
     AUTH_MODE_JWT,
     AUTH_MODE_NONE,
@@ -75,6 +76,7 @@ from agents.db import (
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
     BITBUCKET_APPROVER_CHAT_MESSAGE,
+    BITBUCKET_APPROVER_INVOKE_MESSAGE,
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
@@ -966,6 +968,23 @@ class AgentPayload(BaseModel):
     # --- deep agents --- None (key absent) keeps the stored config, like
     # peers/model_name; a sent object replaces it (defaults clear the column).
     deep: DeepConfig | None = None
+    # --- invoke API --- A key the client does not send keeps what is stored
+    # (`invoke_kwargs`); an explicit false / null switches off / clears.
+    expose_invoke: bool = False
+    result_schema: dict[str, Any] | None = None
+    invoke_limits: dict[str, Any] | None = None
+
+    @field_validator("result_schema")
+    @classmethod
+    def _check_result_schema(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        # The function storage calls: neither accepts what the other refuses.
+        # Its text names the rule, never a value of the schema.
+        return check_result_schema(v)
+
+    @field_validator("invoke_limits")
+    @classmethod
+    def _check_invoke_limits(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return clean_limits(v)
 
     @field_validator("name")
     @classmethod
@@ -1079,7 +1098,27 @@ class AgentPayload(BaseModel):
         the database (`agents.db.check_bitbucket_approver_reach`)."""
         if self.expose_chat is not False and bitbucket_approves(self.to_servers_list()):
             raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
+        # The invoke API's caller chooses the prompt as a chat user does.
+        if self.expose_invoke is True and bitbucket_approves(self.to_servers_list()):
+            raise ValueError(BITBUCKET_APPROVER_INVOKE_MESSAGE)
         return self
+
+    def invoke_kwargs(self) -> dict[str, Any]:
+        """``upsert_agent``'s invoke arguments for the keys the client sent.
+
+        A key that is absent is left out, so ``upsert_agent`` keeps what is
+        stored (KEEP): a client or bundle from before the invoke API must not
+        switch it off or wipe a schema. ``expose_invoke`` is passed as the
+        boolean it is (pydantic has already refused anything else)."""
+        sent = self.model_fields_set
+        out: dict[str, Any] = {}
+        if "expose_invoke" in sent:
+            out["expose_invoke"] = self.expose_invoke is True
+        if "result_schema" in sent:
+            out["result_schema"] = self.result_schema
+        if "invoke_limits" in sent:
+            out["invoke_limits"] = self.invoke_limits
+        return out
 
     def to_servers_list(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1301,6 +1340,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 run_timeout_seconds=payload.run_timeout_seconds,
                 model_name=_or_keep(payload.model_name),
                 deep_json=_deep_json_or_keep(payload.deep),
+                **payload.invoke_kwargs(),
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -1416,6 +1456,10 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 raise HTTPException(
                     status_code=409, detail=f"Agent name '{payload.name}' already exists"
                 )
+        # The switch as the row will hold it: the payload's when it carries
+        # one, else the stored one (an older client keeps it).
+        invoke = payload.invoke_kwargs()
+        invoke_on = invoke.get("expose_invoke", bool(row.expose_invoke))
         try:
             primary, extras, primary_oauth_json = prepare_servers(
                 payload.to_servers_list(), row
@@ -1436,8 +1480,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 servers=prepared_server_list(primary, extras, primary_oauth_json),
                 expose_chat=payload.expose_chat,
                 peers=list(row.peers) if payload.peers is None else payload.peers,
-                # The payload does not carry it yet: the stored switch stays.
-                expose_invoke=bool(row.expose_invoke),
+                expose_invoke=invoke_on,
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
@@ -1450,6 +1493,8 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                     )
             if payload.expose_api and not slug:
                 raise ValueError("expose_api requires an api_slug")
+            if invoke_on and not slug:
+                raise ValueError("expose_invoke requires an api_slug")
             if payload.enabled:
                 await check_delegation_name_collision(
                     session, payload.name, exclude_id=agent_id
@@ -1494,6 +1539,17 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         # --- deep agents ---
         if payload.deep is not None:
             row.deep_json = dump_deep_config(payload.deep)
+        # --- invoke API --- No registry reload for these: the invoke route
+        # reads the row on every call (`agents.invoke.invoke_agent`). The
+        # schema and limits were checked (and the limits cleaned) by the
+        # payload's validators, the functions storage uses.
+        row.expose_invoke = 1 if invoke_on else 0
+        if "result_schema" in invoke:
+            schema = invoke["result_schema"]
+            row.result_schema_json = json.dumps(schema) if schema is not None else None
+        if "invoke_limits" in invoke:
+            limits = invoke["invoke_limits"]
+            row.invoke_limits_json = json.dumps(limits) if limits is not None else None
         await session.commit()
         await session.refresh(row)
         _unknown_model_note(payload.name, payload.model_name)
@@ -2503,6 +2559,8 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         ignore_collisions_with=doomed,
                         deep_json=_deep_json_or_keep(agent.deep),
                         ignore_peer_lists_of=doomed | rewrites_peers,
+                        # A bundle without these keys keeps what is stored.
+                        **agent.invoke_kwargs(),
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
@@ -2783,6 +2841,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     model_name=_or_keep(payload.model_name),
                     commit=False,
                     deep_json=_deep_json_or_keep(payload.deep),
+                    **payload.invoke_kwargs(),
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry '%s': %s",

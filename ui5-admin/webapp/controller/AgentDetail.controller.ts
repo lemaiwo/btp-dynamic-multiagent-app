@@ -14,6 +14,8 @@ import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/o
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
 import { LAST_RUNS_LIMIT, RUN_REFRESH_DELAYS_MS, canonical, isDirty, runsCountLabel } from "../model/runsPanel";
+import invokeSettings from "../model/invokeSettings";
+import type { InvokeField, InvokeForm, InvokeRefusal } from "../model/invokeSettings";
 import type Dialog from "sap/m/Dialog";
 import type ColumnListItem from "sap/m/ColumnListItem";
 import type Event from "sap/ui/base/Event";
@@ -40,7 +42,10 @@ const EMPTY_AGENT: AgentInput = {
     run_timeout_seconds: 1800,
     peers: [],
     model_name: "",
-    deep: { ...DEEP_DEFAULTS }
+    deep: { ...DEEP_DEFAULTS },
+    expose_invoke: false,
+    result_schema: null,
+    invoke_limits: null
 };
 
 /** One entry of the model `<Select>`: a real model name, or the blank
@@ -95,6 +100,10 @@ export default class AgentDetail extends BaseController {
             availableAgents: [],
             availableModels: [],
             errors: {},
+            // --- invoke API --- The panel's text fields; /data carries
+            // expose_invoke, Save builds result_schema and invoke_limits.
+            invoke: invokeSettings.toForm(null, null),
+            invokeMediaTypes: AgentDetail.mediaTypeItems([]),
             // --- run / refresh / last runs ---
             isExisting: false,
             canRun: false,
@@ -159,6 +168,7 @@ export default class AgentDetail extends BaseController {
                 model.setProperty("/runs", []);
                 model.setProperty("/runsCount", runsCountLabel(0));
                 model.setProperty("/data", JSON.parse(JSON.stringify(EMPTY_AGENT)) as AgentInput);
+                this.setInvokeForm(null, null);
                 model.setProperty("/title", this.text("newAgent"));
                 // Otherwise a credential table left over from whichever agent was
                 // open before navigating here would still be showing.
@@ -212,13 +222,18 @@ export default class AgentDetail extends BaseController {
                 model_name: agent.model_name ?? "",
                 // --- deep agents --- always resent so the panel can clear a
                 // stored config; an older backend without the field gets defaults.
-                deep: { ...DEEP_DEFAULTS, ...(agent.deep ?? {}) } as DeepConfig
+                deep: { ...DEEP_DEFAULTS, ...(agent.deep ?? {}) } as DeepConfig,
+                // --- invoke API --- An older server sends none of the three.
+                expose_invoke: agent.expose_invoke === true,
+                result_schema: agent.result_schema ?? null,
+                invoke_limits: agent.invoke_limits ?? null
             } as AgentInput);
+            this.setInvokeForm(agent.result_schema, agent.invoke_limits);
             model.setProperty("/title", agent.name);
             // A copy: the form edits its own list, never this one.
             this.storedServers = JSON.parse(JSON.stringify(agent.mcp_servers ?? [])) as McpServer[];
             this.storedName = agent.name;
-            this.snapshot = canonical(model.getProperty("/data"));
+            this.snapshot = canonical(this.formState());
             model.setProperty("/canRun", AgentDetail.isRunnable(agent));
             // An agent must never be offered itself as a peer.
             model.setProperty("/availableAgents", (agents ?? []).filter((a) => a.name !== agent.name));
@@ -921,6 +936,17 @@ export default class AgentDetail extends BaseController {
             return;
         }
 
+        // --- invoke API --- The schema must be JSON (one object) and the
+        // limits numbers within the server's ceilings; the texts are fixed and
+        // never quote what was typed. The schema subset is the server's.
+        const invoke = invokeSettings.fromForm(model.getProperty("/invoke") as InvokeForm);
+        const invokeFields = Object.keys(invoke.errors) as InvokeField[];
+        if (invokeFields.length > 0) {
+            invokeFields.forEach((field) => this.markInvokeField(field, this.invokeText(invoke.errors[field]!)));
+            MessageBox.error(this.invokeText(invoke.errors[invokeFields[0]]!));
+            return;
+        }
+
         // --- odata --- One question when this save newly gives writes.
         // `toSave` is the form as it is now: the question is built from it
         // and the same object is sent, so an edit made while the question
@@ -928,6 +954,9 @@ export default class AgentDetail extends BaseController {
         this.saving = true;
         const agentId = this.agentId;
         const toSave = JSON.parse(JSON.stringify(data)) as AgentInput;
+        toSave.expose_invoke = data.expose_invoke === true;
+        toSave.result_schema = invoke.result_schema;
+        toSave.invoke_limits = invoke.invoke_limits;
         // Decided before anything is read: whether this save gives writes
         // does not depend on a read that can fail.
         const given = odataEntry.newlyGiven(
@@ -1032,10 +1061,96 @@ export default class AgentDetail extends BaseController {
             errors.servers = serverMessages.join("; ");
         }
 
+        // --- invoke API --- `result_schema` (the server names the rule, never
+        // a value) lands on the schema field. `invoke_limits` is checked as a
+        // whole, so its `loc` is the field alone and the key is only in the
+        // message's fixed prefix (`invoke_limits.max_files: ...`): that prefix
+        // picks the control, and without one every limit control is marked.
+        // The panel is far down the page, so the message is also shown in a box.
+        const invokeMessages: string[] = [];
+        const mark = (field: InvokeField, message: string): void => {
+            errors[field] = errors[field] ? `${errors[field]}; ${message}` : message;
+            errors[`${field}State`] = ValueState.Error;
+        };
+        Object.keys(fieldErrors).forEach((key) => {
+            const message = fieldErrors[key];
+            const fields = AgentDetail.invokeFieldsOf(key, message);
+            if (fields.length > 0) {
+                fields.forEach((field) => mark(field, message));
+                invokeMessages.push(message);
+            } else if (key === "expose_invoke") {
+                invokeMessages.push(message);
+            }
+        });
+
         model.setProperty("/errors", errors);
         if (Object.keys(errors).length === 0) {
             MessageBox.error(Object.values(fieldErrors).join("; "));
+        } else if (invokeMessages.length > 0) {
+            MessageBox.error(invokeMessages.join("; "));
         }
+    }
+
+    // --- invoke API ---------------------------------------------------------
+
+    /** The invoke switch is enabled once the agent has an API slug (the
+     *  invoke URL is `/api/invoke/{api_slug}`), and always while it is on, so
+     *  it can be switched off whatever the slug. */
+    public invokeSwitchEnabled(slug: string | undefined, on: boolean | undefined): boolean {
+        return on === true || (slug ?? "").trim() !== "";
+    }
+
+    /** What the dirty check compares: the form's data and the invoke panel's text. */
+    private formState(): unknown {
+        const model = this.getModel("agent") as JSONModel;
+        return { data: model.getProperty("/data") as unknown, invoke: model.getProperty("/invoke") as unknown };
+    }
+
+    private setInvokeForm(schema: AgentInput["result_schema"], limits: AgentInput["invoke_limits"]): void {
+        const model = this.getModel("agent") as JSONModel;
+        const form = invokeSettings.toForm(schema, limits);
+        model.setProperty("/invokeMediaTypes", AgentDetail.mediaTypeItems(form.mediaTypes));
+        model.setProperty("/invoke", form);
+    }
+
+    private static mediaTypeItems(selected: string[]): { key: string }[] {
+        return invokeSettings.mediaTypeOptions(selected).map((key) => ({ key }));
+    }
+
+    private invokeText(refusal: InvokeRefusal): string {
+        return this.text(refusal.key, refusal.args);
+    }
+
+    private markInvokeField(field: InvokeField, message: string): void {
+        const model = this.getModel("agent") as JSONModel;
+        model.setProperty(`/errors/${field}`, message);
+        model.setProperty(`/errors/${field}State`, ValueState.Error);
+    }
+
+    /** The invoke controls a 422 belongs to: `result_schema...` the schema
+     *  field; `invoke_limits` the control its message's prefix names
+     *  (`invoke_limits.<key>:`), or every limit control without a known
+     *  prefix; [] for any other key. */
+    private static invokeFieldsOf(key: string, message: string): InvokeField[] {
+        if (key === "result_schema" || key.indexOf("result_schema.") === 0) {
+            return ["result_schema"];
+        }
+        if (key !== "invoke_limits" && key.indexOf("invoke_limits.") !== 0) {
+            return [];
+        }
+        const limit: Record<string, InvokeField> = {
+            media_types: "media_types",
+            max_file_bytes: "max_file_mb",
+            max_files: "max_files",
+            max_pdf_pages: "max_pdf_pages"
+        };
+        // The sub-key from the loc (`invoke_limits.max_files`) or from the
+        // message's fixed prefix (after pydantic's "Value error, "); a value
+        // is never read from the message.
+        const fromLoc = key.split(".")[1] ?? "";
+        const prefix = /^(?:Value error, )?invoke_limits\.([a-z_]+):/.exec(message ?? "");
+        const sub = limit[fromLoc] ? fromLoc : prefix && limit[prefix[1]] ? prefix[1] : "";
+        return sub ? [limit[sub]] : ["media_types", "max_file_mb", "max_files", "max_pdf_pages"];
     }
 
     public onBack(): void {
@@ -1246,7 +1361,7 @@ export default class AgentDetail extends BaseController {
 
     /** Whether the form differs from what was loaded. */
     private isDirty(): boolean {
-        return isDirty(this.snapshot, (this.getModel("agent") as JSONModel).getProperty("/data"));
+        return isDirty(this.snapshot, this.formState());
     }
 
     /**

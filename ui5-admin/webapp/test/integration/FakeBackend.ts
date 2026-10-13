@@ -155,6 +155,14 @@ export default class FakeBackend {
         // on the list and detail pages; gmail-agent is not.
         this.agents[0].expose_api = true;
         this.agents[0].api_slug = "btp-agent";
+        // --- invoke API --- btp-agent is also exposed to the invoke API, with
+        // a result schema and two of the four attachment limits; gmail-agent
+        // has no API slug, so its invoke switch is disabled.
+        this.agents[0].expose_invoke = true;
+        this.agents[0].result_schema = {
+            type: "object", properties: { total: { type: "number" } }, required: ["total"]
+        };
+        this.agents[0].invoke_limits = { media_types: ["application/pdf"], max_file_bytes: 2 * 1024 * 1024 };
         // btp-agent carries a peer and a model override that IS in the fake
         // GET /model list below, so it exercises the ordinary populate-on-load
         // path. gmail-agent's override is deliberately NOT in that list, so it
@@ -399,6 +407,7 @@ export default class FakeBackend {
             api_slug: "", run_as_principal: "", run_prompt: "",
             run_timeout_seconds: 1800, peers: [], model_name: "",
             deep: { ...DEEP_DEFAULTS },
+            expose_invoke: false, result_schema: null, invoke_limits: null,
             created_at: null, updated_at: null,
             mcp_url: "", auth_mode: "jwt"
         };

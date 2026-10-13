@@ -55,9 +55,16 @@
                             <ObjectIdentifier title="{agents>name}" text="{agents>api_slug}" />
                             <Text text="{agents>description}" maxLines="2" />
                             <Text text="{ path: 'agents>mcp_servers', formatter: '.formatter.serverSummary' }" />
-                            <ObjectStatus
-                                text="{= ${agents>enabled} ? ${i18n>enabled} : ${i18n>disabled} }"
-                                state="{= ${agents>enabled} ? 'Success' : 'None' }" />
+                            <VBox>
+                                <ObjectStatus
+                                    text="{= ${agents>enabled} ? ${i18n>enabled} : ${i18n>disabled} }"
+                                    state="{= ${agents>enabled} ? 'Success' : 'None' }" />
+                                <ObjectStatus
+                                    text="{i18n>invokeTag}"
+                                    tooltip="{i18n>invokeTagTooltip}"
+                                    state="Information"
+                                    visible="{= ${agents>expose_invoke} === true }" />
+                            </VBox>
                             <HBox>
                                 <Button
                                     icon="sap-icon://play"
