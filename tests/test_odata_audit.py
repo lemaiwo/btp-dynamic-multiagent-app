@@ -1395,3 +1395,19 @@ async def test_the_route_needs_the_admin_scope(monkeypatch):
             assert r.status_code == 200 and len(r.json()["items"]) == 5
     finally:
         current_claims.reset(token)
+
+
+# -- the run id of a recorded run ---------------------------------------------------
+
+
+async def test_a_write_inside_a_recorded_run_carries_that_runs_id(alice):
+    """Inside ``recording(run_id)`` (a job or an invoke run) the audit row
+    carries the app-level run id, which peers and sub-agents share; outside
+    it (chat) pydantic-ai's id of the agent run, as before."""
+    from agents.run_activity import recording
+
+    w = World()
+    with recording("r1"):
+        assert await w.run(**UPDATE) == {"ok": True, "status": 204}
+    assert await w.run(**UPDATE) == {"ok": True, "status": 204}
+    assert [row.run_id for row in await all_rows()] == ["r1", "run-1"]

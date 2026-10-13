@@ -17,6 +17,8 @@ BASELINE = {
         "^/healthz$": False,
         "^/.well-known/(agent-card|agent).json$": False,
         "^/a2a$": False,
+        # The invoke API: server-to-server, like /a2a (agents/invoke.py).
+        "^/api/invoke/(.*)$": False,
         "^/ui5admin/resources/(.*)$": False,
         "^/ui5admin/backend/(.*)$": False,
         "^/ui5admin/?$": False,

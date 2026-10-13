@@ -97,6 +97,11 @@ async def import_bundle(bundle: dict) -> None:
                 api_slug=agent.get("api_slug") or None,
                 run_prompt=agent.get("run_prompt") or None,
                 run_timeout_seconds=agent.get("run_timeout_seconds", 1800),
+                # Invoke API settings: a bundle without the key keeps what is
+                # stored (an older export carries none of them).
+                **{key: agent[key] for key in (
+                    "expose_invoke", "result_schema", "invoke_limits",
+                ) if key in agent},
             )
             print(f"  agent  {agent['name']}")
         await session.commit()

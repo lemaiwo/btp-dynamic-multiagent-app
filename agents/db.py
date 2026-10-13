@@ -608,6 +608,16 @@ class AgentConfig(Base):
     # JSON-encoded agents.deep.DeepConfig: planning tool, per-run scratchpad
     # and ephemeral sub-agents, all opt-in. Null means the defaults (off).
     deep_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- invoke API (agents/invoke.py) --- independent of expose_chat and
+    # expose_api: POST /api/invoke/{api_slug} runs the agent as the caller.
+    expose_invoke: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # The JSON schema `submit_result` checks the structured result against
+    # (`agents.invoke_config.check_result_schema`); null accepts any object.
+    result_schema_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Attachment limits (`agents.invoke_config.clean_limits`); null = defaults.
+    invoke_limits_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     @property
     def mcp_servers(self) -> list[dict[str, Any]]:
@@ -702,6 +712,16 @@ class AgentConfig(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deep": self.deep.model_dump(),
+            **self._invoke_dict(),
+        }
+
+    def _invoke_dict(self) -> dict[str, Any]:
+        from agents.invoke_config import loads_or_none
+
+        return {
+            "expose_invoke": bool(self.expose_invoke),
+            "result_schema": loads_or_none(self.result_schema_json),
+            "invoke_limits": loads_or_none(self.invoke_limits_json),
         }
 
     def to_export(self) -> dict[str, Any]:
@@ -720,6 +740,7 @@ class AgentConfig(Base):
             "run_timeout_seconds": self.run_timeout_seconds,
             "model_name": self.model_name or "",
             "deep": self.deep.model_dump(),
+            **self._invoke_dict(),
         }
 
 
@@ -1020,7 +1041,9 @@ class ODataAuditLog(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     call_id: Mapped[str] = mapped_column(String(32), nullable=False)  # uuid4 hex
     agent: Mapped[str] = mapped_column(String(64), nullable=False)
-    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Indexed: the invoke API reads a run's writes by it at every poll
+    # (agents/invoke.py, ix_odata_audit_log_run_id).
+    run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # "technical:<destination>", the principal of the token sent, or
     # "token:<sha256>" when that token's owner could not be named.
     sent_as: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -1663,6 +1686,12 @@ async def _create_and_migrate() -> None:
         )
         # --- deep agents ---
         await _ensure_column(conn, "agent_configs", "deep_json", "TEXT")
+        # --- invoke API ---
+        await _ensure_column(
+            conn, "agent_configs", "expose_invoke", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(conn, "agent_configs", "result_schema_json", "TEXT")
+        await _ensure_column(conn, "agent_configs", "invoke_limits_json", "TEXT")
         await _ensure_column(conn, "job_runs", "activity_json", "TEXT")
         # --- IDE phase 1c: diagnose sessions ---
         await _ensure_column(
@@ -1706,6 +1735,9 @@ async def _create_and_migrate() -> None:
         await _ensure_plain_index(conn, "ix_job_runs_finished_at", "job_runs", "finished_at")
         await _ensure_plain_index(
             conn, "ix_workflow_runs_finished_at", "workflow_runs", "finished_at"
+        )
+        await _ensure_plain_index(
+            conn, "ix_odata_audit_log_run_id", "odata_audit_log", "run_id"
         )
 
 
@@ -2668,6 +2700,12 @@ async def upsert_agent(
     # KEEP (not sent) preserves what is stored, like model_name/peers.
     deep_json: str | None | _Keep = KEEP,
     ignore_peer_lists_of: set[str] | None = None,
+    # --- invoke API --- KEEP (not sent) preserves what is stored; for a new
+    # row it means off / none. Schema and limits are Python objects (None
+    # clears) and are checked by agents.invoke_config before they are stored.
+    expose_invoke: bool | _Keep = KEEP,
+    result_schema: dict[str, Any] | None | _Keep = KEEP,
+    invoke_limits: dict[str, Any] | None | _Keep = KEEP,
 ) -> AgentConfig:
     """Create or update the agent named ``name``.
 
@@ -2704,6 +2742,22 @@ async def upsert_agent(
                 seen.add(p)
                 cleaned_peers.append(p)
         peers_json = json.dumps(cleaned_peers) if cleaned_peers else None
+    from agents.invoke_config import check_result_schema, clean_limits
+
+    schema_json: str | None | _Keep = KEEP
+    if not isinstance(result_schema, _Keep):
+        checked = check_result_schema(result_schema)
+        schema_json = json.dumps(checked) if checked is not None else None
+    limits_json: str | None | _Keep = KEEP
+    if not isinstance(invoke_limits, _Keep):
+        cleaned_limits = clean_limits(invoke_limits)
+        limits_json = json.dumps(cleaned_limits) if cleaned_limits is not None else None
+    # Only the JSON boolean true switches it on: the string "false" of a
+    # hand-written bundle is truthy.
+    invoke_on = (
+        bool(existing is not None and existing.expose_invoke)
+        if isinstance(expose_invoke, _Keep) else expose_invoke is True
+    )
     # Here for the same reason as the OData check above: the last gate for an
     # approving agent, on the entries and the peer list the row will hold.
     await check_bitbucket_approver_reach(
@@ -2711,6 +2765,7 @@ async def upsert_agent(
         name=name,
         servers=prepared_server_list(primary, extras, primary_oauth_json),
         expose_chat=bool(expose_chat),
+        expose_invoke=invoke_on,
         peers=(
             (list(existing.peers) if existing is not None else [])
             if isinstance(peers, _Keep) else cleaned_peers
@@ -2725,6 +2780,8 @@ async def upsert_agent(
             raise ValueError(f"api_slug {slug!r} is already used by agent {clash.name!r}")
     if expose_api and not slug:
         raise ValueError("expose_api requires an api_slug")
+    if invoke_on and not slug:
+        raise ValueError("expose_invoke requires an api_slug")
     if enabled:
         await check_delegation_name_collision(
             session, name,
@@ -2762,6 +2819,10 @@ async def upsert_agent(
         row.peers_json = peers_json
         # --- deep agents ---
         row.deep_json = None if isinstance(deep_json, _Keep) else deep_json
+        # --- invoke API ---
+        row.expose_invoke = 1 if invoke_on else 0
+        row.result_schema_json = None if isinstance(schema_json, _Keep) else schema_json
+        row.invoke_limits_json = None if isinstance(limits_json, _Keep) else limits_json
     else:
         existing.description = description
         existing.instructions = instructions
@@ -2790,6 +2851,12 @@ async def upsert_agent(
         # --- deep agents ---
         if not isinstance(deep_json, _Keep):
             existing.deep_json = deep_json
+        # --- invoke API ---
+        existing.expose_invoke = 1 if invoke_on else 0
+        if not isinstance(schema_json, _Keep):
+            existing.result_schema_json = schema_json
+        if not isinstance(limits_json, _Keep):
+            existing.invoke_limits_json = limits_json
         row = existing
     if commit:
         await session.commit()
@@ -4282,6 +4349,7 @@ async def create_job_run(
     trigger: str,
     created_by: str | None = None,
     scheduler: dict[str, str] | None = None,
+    timeout_seconds: int | None = None,
 ) -> JobRun:
     row = JobRun(
         id=str(uuid.uuid4()),
@@ -4290,7 +4358,9 @@ async def create_job_run(
         trigger=trigger,
         status=ACTIVE_RUN_STATUS,
         started_at=datetime.now(timezone.utc),
-        timeout_seconds=agent.run_timeout_seconds,
+        # The invoke API runs under its own timeout, not the agent's; the
+        # stale sweep reads this column, so it must be the one that applies.
+        timeout_seconds=timeout_seconds or agent.run_timeout_seconds,
         created_by=created_by,
         scheduler_job_id=(scheduler or {}).get("job_id"),
         scheduler_schedule_id=(scheduler or {}).get("schedule_id"),
@@ -4341,9 +4411,12 @@ async def list_job_runs(
 
 
 async def active_job_run(session: AsyncSession, agent_id: int) -> JobRun | None:
+    # An invoke run (agents/invoke.py) is a user's request with its own lock
+    # per user and agent; it must not hold off the agent's scheduled run.
     result = await session.execute(
         select(JobRun).where(
-            JobRun.agent_id == agent_id, JobRun.status == ACTIVE_RUN_STATUS
+            JobRun.agent_id == agent_id, JobRun.status == ACTIVE_RUN_STATUS,
+            JobRun.trigger != "invoke",
         )
     )
     return result.scalars().first()
@@ -4449,6 +4522,11 @@ BITBUCKET_APPROVER_CHAT_MESSAGE = (
     "allow_approve; an approving agent runs only from the scheduler run endpoint "
     "or an admin's Run now, never from chat or A2A"
 )
+BITBUCKET_APPROVER_INVOKE_MESSAGE = (
+    "expose_invoke: must be false for an agent whose builtin:bitbucket entry "
+    "has allow_approve; an approving agent runs only from the scheduler run "
+    "endpoint or an admin's Run now, never from the invoke API"
+)
 _BITBUCKET_APPROVER_PEER_RULE = (
     "an approving agent may not be a peer: no agent may delegate to an agent "
     "whose builtin:bitbucket entry has allow_approve"
@@ -4472,11 +4550,14 @@ async def check_bitbucket_approver_reach(
     peers: list[str],
     stored_name: str | None = None,
     ignore_names: set[str] | None = None,
+    expose_invoke: Any = False,
 ) -> None:
     """Refuse an agent write that would make an approving agent reachable.
 
     ``ValueError`` with a fixed text when, as the row is about to be stored:
-    the agent approves (`bitbucket_approves`) and is exposed to chat; it
+    the agent approves (`bitbucket_approves`) and is exposed to chat or to
+    the invoke API (``expose_invoke``: the caller chooses the prompt there
+    as in chat); it
     approves and another agent lists it as a peer (any other row, enabled or
     not: enabling that one later would touch neither); or one of its own
     ``peers`` is an agent that approves. Called by every write of an agent
@@ -4497,6 +4578,8 @@ async def check_bitbucket_approver_reach(
     if bitbucket_approves(servers):
         if expose_chat:
             raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
+        if expose_invoke:
+            raise ValueError(BITBUCKET_APPROVER_INVOKE_MESSAGE)
         listers = [
             r.name for r in await list_agents(session)
             if r.name not in own and r.name not in ignore and own & set(r.peers)

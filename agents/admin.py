@@ -1436,6 +1436,8 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 servers=prepared_server_list(primary, extras, primary_oauth_json),
                 expose_chat=payload.expose_chat,
                 peers=list(row.peers) if payload.peers is None else payload.peers,
+                # The payload does not carry it yet: the stored switch stays.
+                expose_invoke=bool(row.expose_invoke),
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 

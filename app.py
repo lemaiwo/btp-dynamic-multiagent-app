@@ -40,7 +40,8 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from sqlalchemy import literal_column, select  # noqa: E402
 
 from agents.a2a import router as a2a_router  # noqa: E402
-from agents.admin import router as admin_router, seed_from_file_if_empty  # noqa: E402
+from agents.admin import router as admin_router  # noqa: E402
+from agents.admin import seed_from_file_if_empty  # noqa: E402
 from agents.api_runs import router as runs_router  # noqa: E402
 from agents.auth import (  # noqa: E402
     InvalidToken,
@@ -76,11 +77,13 @@ from agents.ide.store import (  # noqa: E402
     purge_sessions_older_than,
     reset_running_ide_sessions,
 )
+from agents.invoke import cancel_all_invoke_runs  # noqa: E402
+from agents.invoke import router as invoke_router  # noqa: E402
 from agents.job_runner import cancel_all_runs  # noqa: E402
 from agents.oauth2 import refresh_scheduled_tokens  # noqa: E402
+from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.odata import audit as odata_audit  # noqa: E402
 from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
-from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.registry import registry  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
 
@@ -357,6 +360,7 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await task
     await cancel_all_runs()
+    await cancel_all_invoke_runs()
     await cancel_all_workflow_runs()
     await ide_runner.cancel_all()
     # An approved trace whose ARC-1 call is in flight runs in its own task,
@@ -516,7 +520,8 @@ class JWTBindingMiddleware:
             if fetch_site not in ("same-origin", "none") and origin_h:
                 origin = _origin_of(origin_h.decode("latin-1"))
                 allowed = {
-                    _origin_of(u) for u in (base_url, public_base_url() or "", fwd_origin or "") if u
+                    _origin_of(u)
+                    for u in (base_url, public_base_url() or "", fwd_origin or "") if u
                 }
                 if origin not in allowed:
                     logger.warning(
@@ -594,6 +599,9 @@ app.include_router(oauth_router)
 # before the chat mount so it resolves here rather than falling through to
 # the catch-all.
 app.include_router(runs_router)
+# Invoke API (POST /api/invoke/{slug}, GET /api/invoke/runs/{id}), `invoke`
+# scope; before the chat mount for the same reason.
+app.include_router(invoke_router)
 # ABAP IDE API (/ide/api/...), developer scope; before the chat mount.
 # The two routers share no path, so their order does not matter.
 app.include_router(ide_review_router)

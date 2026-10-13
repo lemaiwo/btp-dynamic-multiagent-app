@@ -8,8 +8,8 @@ Provides:
   ``JWTBindingMiddleware`` so the dependencies below never decode twice.
 - `XsuaaValidator` — validates incoming JWTs against the XSUAA JWKS and checks
   required scopes.
-- FastAPI dependencies `require_user`, `require_admin`, `require_a2a` and
-  `require_jobscheduler`.
+- FastAPI dependencies `require_user`, `require_admin`, `require_a2a`,
+  `require_invoke` and `require_jobscheduler`.
 
 Fail-closed switch
 ------------------
@@ -34,7 +34,6 @@ from contextvars import ContextVar
 from functools import lru_cache
 from typing import Any, AsyncIterator
 
-import httpx
 import jwt
 from fastapi import HTTPException, Request, status
 from jwt import PyJWKClient
@@ -442,6 +441,16 @@ def require_a2a(request: Request) -> dict[str, Any]:
     has a public CF route of its own, so the check has to live here too.
     """
     return _require_scope(request, "a2a", "A2A scope required")
+
+
+def require_invoke(request: Request) -> dict[str, Any]:
+    """Ensure the caller holds the `<xsappname>.invoke` scope (the invoke
+    API, `agents/invoke.py`, which runs an agent as the caller).
+
+    The approuter enforces the same scope on its `/api/invoke` route; the
+    backend has a public CF route of its own, so the check lives here too.
+    """
+    return _require_scope(request, "invoke", "Invoke scope required")
 
 
 def require_jobscheduler(request: Request) -> dict[str, Any]:

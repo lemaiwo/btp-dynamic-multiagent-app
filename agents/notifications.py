@@ -134,6 +134,14 @@ async def _marker(session: AsyncSession, principal: str, now: datetime) -> datet
     return now
 
 
+def _not_invoke(model: Any) -> Any:
+    """A user's invoke run (``agents/invoke.py``, ``trigger = 'invoke'``) is
+    that user's request, not an admin's news: it is left out of the list and
+    the unread count alike, so it can neither ring the bell nor push a
+    scheduled run out of the list. The admin runs list still shows it."""
+    return model.trigger != "invoke"
+
+
 async def _finished(
     session: AsyncSession, cutoff: datetime, now: datetime
 ) -> list[tuple[datetime, dict[str, Any]]]:
@@ -154,6 +162,7 @@ async def _finished(
                 model.finished_at.is_not(None),
                 model.finished_at >= cutoff,
                 model.finished_at <= now,
+                _not_invoke(model),
             )
             .order_by(model.finished_at.desc(), model.id.desc())
             .limit(MAX_ITEMS)
@@ -193,6 +202,7 @@ async def _unread_count(
                     model.finished_at >= cutoff,
                     model.finished_at <= now,
                     model.finished_at > seen_at,
+                    _not_invoke(model),
                 )
             )
         ).scalar_one()

@@ -34,6 +34,10 @@
       "grant-as-authority-to-apps": ["$XSAPPNAME(application,sap-provisioning,tenant-onboarding)"]
     },
     {
+      "name": "$XSAPPNAME.invoke",
+      "description": "Invoke an agent with attachments on behalf of the signed-in user (invoke API)"
+    },
+    {
       "name": "$XSAPPNAME.JOBSCHEDULER",
       "description": "Trigger scheduled agent and workflow runs (Job Scheduling Service)",
       "grant-as-authority-to-apps": ["$XSSERVICENAME(agent-jobscheduler)"]
@@ -59,6 +63,11 @@
       "name": "AgentA2AClient",
       "description": "Remote A2A client (e.g. SAP Joule) allowed to invoke the orchestrator",
       "scope-references": ["$XSAPPNAME.a2a"]
+    },
+    {
+      "name": "AgentInvoker",
+      "description": "Invoke an exposed agent with attachments as the signed-in user (invoke API)",
+      "scope-references": ["$XSAPPNAME.invoke"]
     }
   ],
   "role-collections": [
@@ -81,6 +90,11 @@
       "name": "Agent A2A Client",
       "description": "Technical role collection granting A2A invocation rights (assign to the Joule Agent Hub technical user or service instance)",
       "role-template-references": ["$XSAPPNAME.AgentA2AClient"]
+    },
+    {
+      "name": "Agent Invoker",
+      "description": "Users whose applications may invoke an exposed agent on their behalf (invoke API)",
+      "role-template-references": ["$XSAPPNAME.AgentInvoker"]
     }
   ]
 }
