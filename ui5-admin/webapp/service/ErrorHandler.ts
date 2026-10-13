@@ -4,6 +4,29 @@ import { AdminError } from "./AdminService";
 
 export type ErrorKind = "session" | "forbidden" | "conflict" | "error";
 
+/** The part of a resource bundle the handler uses. */
+export interface TextSource {
+    getText(key: string, args?: (string | number)[], ignoreKeyFallback?: boolean): string | undefined;
+}
+
+/**
+ * English texts used until the component hands over its `i18n` bundle
+ * (`useBundle`), and for a key the bundle does not hold: the handler is a
+ * plain module, reached from unit tests without a component.
+ */
+const FALLBACK_TEXTS: Record<string, string> = {
+    sessionExpiredTitle: "Session expired",
+    sessionExpiredMessage: "Your session has expired. Reload the page to sign in again.",
+    sessionExpiredReload: "Reload",
+    accessDeniedTitle: "Access denied",
+    accessDeniedMessage: "You are signed in, but your user has no access to this function. "
+        + "Ask an administrator for the \"Agent Administrator\" role collection (the admin scope), "
+        + "then sign in again.",
+    requestFailedFallback: "The request failed."
+};
+
+let bundle: TextSource | undefined;
+
 /**
  * The application's single error policy.
  *
@@ -20,6 +43,17 @@ export type ErrorKind = "session" | "forbidden" | "conflict" | "error";
  * 409 themselves (the OData pages) branch on it.
  */
 export default {
+
+    /** Hands over the component's `i18n` bundle (Component.init). */
+    useBundle(source: TextSource | undefined): void {
+        bundle = source;
+    },
+
+    /** A text of the bundle, or the English fallback when it has none. */
+    text(key: string): string {
+        const fromBundle = bundle ? bundle.getText(key, undefined, true) : undefined;
+        return fromBundle || FALLBACK_TEXTS[key] || key;
+    },
 
     classify(error: unknown): ErrorKind {
         if (error instanceof AdminError) {
@@ -50,29 +84,22 @@ export default {
         return fallback;
     },
 
-    handle(error: unknown, fallback = "The request failed."): void {
+    handle(error: unknown, fallback?: string): void {
         const kind = this.classify(error);
-        const message = this.messageFor(error, fallback);
+        const message = this.messageFor(error, fallback || this.text("requestFailedFallback"));
 
         if (kind === "session") {
-            MessageBox.error(
-                "Your session has expired. Reload the page to sign in again.",
-                {
-                    title: "Session expired",
-                    actions: ["Reload"],
-                    emphasizedAction: "Reload",
-                    onClose: () => window.location.reload()
-                }
-            );
+            const reload = this.text("sessionExpiredReload");
+            MessageBox.error(this.text("sessionExpiredMessage"), {
+                title: this.text("sessionExpiredTitle"),
+                actions: [reload],
+                emphasizedAction: reload,
+                onClose: () => window.location.reload()
+            });
             return;
         }
         if (kind === "forbidden") {
-            MessageBox.error(
-                "You are signed in, but your user has no access to this function. "
-                + "Ask an administrator for the \"Agent Administrator\" role "
-                + "collection (the admin scope), then sign in again.",
-                { title: "Access denied" }
-            );
+            MessageBox.error(this.text("accessDeniedMessage"), { title: this.text("accessDeniedTitle") });
             return;
         }
         if (kind === "conflict" && error instanceof AdminError && error.runTrigger) {

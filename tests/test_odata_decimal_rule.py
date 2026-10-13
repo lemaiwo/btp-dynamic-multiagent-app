@@ -58,6 +58,25 @@ def test_a_short_decimal_number_is_sent(dialect, place):
     assert send(dialect, place, 123456789012345.0) is not None  # 15 digits; `.0` is none
 
 
+@pytest.mark.parametrize(
+    "value, sent",
+    [
+        (1e15, "1000000000000000.0"),  # 1 significant digit, not 16
+        (9e15, "9000000000000000.0"),
+        (1200000000000000.0, "1200000000000000.0"),
+        (-1e15, "-1000000000000000.0"),
+        (100.0, "100.0"),
+    ],
+)
+def test_trailing_zeros_of_a_whole_number_are_not_significant(value, sent):
+    assert common.plain_float(value) == sent
+
+
+@pytest.mark.parametrize("value", [1234567890123456.0, 1000000000000000.5, 1e16])
+def test_sixteen_significant_digits_are_still_refused(value):
+    assert common.plain_float(value) is None
+
+
 def test_the_hint_of_a_url_parameter_says_pass_it_as_text():
     from agents.odata import v2, v4
 

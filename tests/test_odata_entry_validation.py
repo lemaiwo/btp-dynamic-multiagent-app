@@ -312,7 +312,7 @@ def test_empty_values_of_the_two_keys_do_not_refuse_another_server(extra):
         {
             "url": "builtin:jira",
             "auth_mode": "destination",
-            "oauth": {"destination": "JIRA", **extra},
+            "oauth": {"destination": "JIRA", "project": "ABC", **extra},
         },
         {"url": "builtin:sapnotes", "auth_mode": "none", "oauth": {"min_score": "9.0", **extra}},
         {
@@ -336,9 +336,10 @@ def test_empty_values_of_the_two_keys_do_not_refuse_another_server(extra):
 
 def test_other_destination_servers_validate_as_before():
     jira = McpServerPayload.model_validate(
-        {"url": "builtin:jira", "auth_mode": "destination", "oauth": {"destination": "JIRA"}}
+        {"url": "builtin:jira", "auth_mode": "destination",
+         "oauth": {"destination": "JIRA", "project": "ABC"}}
     )
-    assert jira.oauth.to_config() == {"destination": "JIRA"}
+    assert jira.oauth.to_config() == {"destination": "JIRA", "project": "ABC"}
     assert "oauth.destination" in refusal({"url": "builtin:jira", "auth_mode": "destination"})
 
 

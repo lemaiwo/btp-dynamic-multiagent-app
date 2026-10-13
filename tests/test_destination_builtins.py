@@ -508,7 +508,9 @@ async def test_destination_health_resolves_with_the_app_token_and_warns_on_misma
         async def resolve(self, **kw):
             assert "user_token" not in kw, "health resolves with the app token only"
             if self.name == "GONE":
-                raise DestinationError("destination 'GONE' does not exist; secret=never")
+                raise DestinationError(
+                    "destination 'GONE' does not exist in the subaccount of this "
+                    "app's destination service; secret=never")
             return Destination(
                 url="https://graph.microsoft.com",
                 headers={"Authorization": "Bearer s3cr3t"},
@@ -522,8 +524,10 @@ async def test_destination_health_resolves_with_the_app_token_and_warns_on_misma
     assert graph["state"] == "resolvable" and graph["auth_type"] == "OAuth2ClientCredentials"
     assert "app-level type" in graph["warning"]
     assert gone["state"] == "error" and "does not exist" in gone["error"]
+    assert gone["error"].endswith("(not_found)")
     text = json.dumps(out)
     assert "s3cr3t" not in text and "Authorization" not in text
+    assert "secret=never" not in text, "the resolver's own text goes to the log only"
 
 
 # --- derived-data caches belong to principal AND token -----------------------

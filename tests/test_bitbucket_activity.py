@@ -143,6 +143,20 @@ async def test_the_list_line_counts_what_is_pending_for_an_approver():
         "0 repositories failed, more no, beyond reach no")
 
 
+async def test_builds_that_could_not_be_read_are_recorded_as_unknown():
+    # Review B-bb-1: `unknown` is a fourth state of the read, one fixed word.
+    fake = _fake(MARK)
+    fake.override = lambda r: (httpx.Response(403) if r.url.path.endswith("/statuses")
+                               else None)
+    out = await _toolset(fake).tools["get_pull_request"].function(**KW)
+    assert out["builds"]["state"] == "unknown"
+    assert activity_summary("get_pull_request", out) == \
+        "get_pull_request: 1 comments, builds unknown"
+    # Anything else in that place is still not repeated.
+    assert activity_summary("get_pull_request", {**out, "builds": {"state": MARK}}) == \
+        "get_pull_request: 1 comments, builds ?"
+
+
 @pytest.mark.parametrize("prefix", ["", "bitbucket_", "bitbucket_1_"])
 async def test_a_write_is_recorded_as_fixed_words_and_its_arguments_as_the_model_sent_them(
         prefix):

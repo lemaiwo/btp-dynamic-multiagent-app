@@ -1,6 +1,8 @@
 import UIComponent from "sap/ui/core/UIComponent";
 import Device from "sap/ui/Device";
 import JSONModel from "sap/ui/model/json/JSONModel";
+import type ResourceModel from "sap/ui/model/resource/ResourceModel";
+import type ResourceBundle from "sap/base/i18n/ResourceBundle";
 import AdminService from "./service/AdminService";
 import ErrorHandler from "./service/ErrorHandler";
 
@@ -25,6 +27,15 @@ export default class Component extends UIComponent {
         super.init();
         this.adminService = new AdminService();
         this.setModel(new JSONModel(Device), "device");
+
+        // The error dialogs speak from the same bundle as the views; until it
+        // is there (or without one, in a test host) they use English texts.
+        const i18n = this.getModel("i18n") as ResourceModel | undefined;
+        if (i18n) {
+            void Promise.resolve(i18n.getResourceBundle()).then((bundle: ResourceBundle) => {
+                ErrorHandler.useBundle(bundle);
+            });
+        }
 
         // Guarded so a manifest without a routing section (a stripped-down
         // test host) still boots the component.

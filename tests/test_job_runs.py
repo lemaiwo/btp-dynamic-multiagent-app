@@ -260,6 +260,27 @@ async def main() -> None:
         check("failing run is failed", r.status == "failed", r.status)
         check("error recorded", "mcp down" in (r.error or ""))
 
+    # The stored error keeps class and wording but not a URL with its query:
+    # an httpx error embeds the URL as sent, a destination's query
+    # credential included.
+    leaky = RuntimeError(
+        "Client error '401 Unauthorized' for url "
+        "'https://mcp.example.internal/mcp?apikey=made-up-secret'"
+    )
+    registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(exc=leaky)})
+    async with SessionLocal() as s:
+        job = await get_agent_by_slug(s, "daily-check")
+        run_id_masked = (await create_job_run(s, agent=job, trigger="manual")).id
+    await job_runner.execute_run(run_id_masked, agent_id)
+    async with SessionLocal() as s:
+        r = await get_job_run(s, run_id_masked)
+        check("masked error keeps class and status",
+              (r.error or "").startswith("RuntimeError: ") and "401" in (r.error or ""),
+              r.error)
+        check("masked error drops the URL and its query",
+              "made-up-secret" not in (r.error or "")
+              and "mcp.example.internal" not in (r.error or ""), r.error)
+
     print("\n== runner: credential pre-flight ==")
     job_runner._has_usable_credentials = lambda agent, principal=None: asyncio.sleep(0, result=False)
     registry._build = _FakeBuild({"Daily Check": _FakeSpecialist(good)})

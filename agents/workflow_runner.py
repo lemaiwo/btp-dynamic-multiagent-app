@@ -38,6 +38,7 @@ from agents.db import (
     item_succeeded_before,
     sweep_stale_workflow_runs,
 )
+from agents.errors import describe_exception, mask_text
 from agents.registry import registry
 from agents.shared import run_usage_limits
 
@@ -527,12 +528,12 @@ async def _run_deterministic_step(
             )
         raise
     except (StepFailed, ValueError) as e:
-        message = f"Step {step.position} ({label}) failed: {e}"
+        message = f"Step {step.position} ({label}) failed: {mask_text(str(e))}"
         async with SessionLocal() as session:
             await finish_step_run(session, step_run.id, status="failed", error=message)
         raise _WorkflowError(message) from None
     except Exception as e:  # noqa: BLE001
-        message = f"Step {step.position} ({label}) failed: {type(e).__name__}: {e}"
+        message = f"Step {step.position} ({label}) failed: {describe_exception(e)}"
         logger.exception("Workflow run %s step %s failed", run_id, step.position)
         async with SessionLocal() as session:
             await finish_step_run(session, step_run.id, status="failed", error=message)
@@ -641,7 +642,7 @@ async def _run_step(
             )
         raise
     except Exception as e:  # noqa: BLE001
-        message = f"Step {step.position} ({step.agent_name}) failed: {type(e).__name__}: {e}"
+        message = f"Step {step.position} ({step.agent_name}) failed: {describe_exception(e)}"
         logger.exception("Workflow run %s step %s failed", run_id, step.position)
         async with SessionLocal() as session:
             await finish_step_run(session, step_run.id, status="failed", error=message)
@@ -662,7 +663,7 @@ async def _run_step(
         # output nobody can see.
         message = (
             f"Step {step.position} ({step.agent_name}) completed but its result "
-            f"could not be recorded: {type(e).__name__}: {e}"
+            f"could not be recorded: {describe_exception(e)}"
         )
         logger.exception("Workflow run %s step %s: success write failed", run_id, step.position)
         try:
@@ -780,7 +781,7 @@ async def execute_workflow_run(run_id: str, workflow_id: int) -> None:
         raise
     except Exception as e:  # noqa: BLE001
         logger.exception("Workflow run %s failed", run_id)
-        await _finalize(run_id, status="failed", error=f"{type(e).__name__}: {e}",
+        await _finalize(run_id, status="failed", error=describe_exception(e),
                         counts=counts)
 
 
@@ -952,7 +953,7 @@ async def _run_items(run_id, workflow, branches, branch_steps, after,
                 if item_run is not None:
                     async with SessionLocal() as session:
                         await finish_item_run(session, item_run.id, status="failed",
-                                              error=f"{type(e).__name__}: {e}")
+                                              error=describe_exception(e))
                 async with lock:
                     counts["items_failed"] += 1
                 return

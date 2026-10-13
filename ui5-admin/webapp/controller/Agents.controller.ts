@@ -137,7 +137,7 @@ export default class Agents extends BaseController {
             `Could not start a run for "${agent.name}".`
         );
         if (started) {
-            MessageToast.show(this.text("runStarted").replace("{0}", started.run_id));
+            MessageToast.show(this.text("runStarted", [started.run_id]));
             this.getRouter().navTo("runDetail", { runId: started.run_id });
         }
     }
@@ -146,7 +146,7 @@ export default class Agents extends BaseController {
         const agent = (event.getSource() as Control)
             .getBindingContext("agents")?.getObject() as Agent;
 
-        MessageBox.confirm(this.text("deleteAgentConfirm").replace("{0}", agent.name), {
+        MessageBox.confirm(this.text("deleteAgentConfirm", [agent.name]), {
             title: this.text("delete"),
             emphasizedAction: MessageBox.Action.OK,
             onClose: (action: string) => {

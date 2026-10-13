@@ -436,16 +436,26 @@ async def _store_request(
     tool_call_id: str | None,
 ) -> IdeApproval:
     # The run says it is a diagnose run; the session row is what counts.
-    session_type = (
+    found = (
         await db.execute(
-            select(IdeSession.session_type).where(IdeSession.id == run.session_id)
+            select(IdeSession.session_type, IdeSession.run_id).where(
+                IdeSession.id == run.session_id
+            )
         )
-    ).scalar_one_or_none()
-    if session_type is None:
+    ).one_or_none()
+    if found is None:
         raise _not_found()
+    session_type, holder = found
     if session_type != "diagnose":
         raise ApprovalError(
             "not_diagnose", 409, "Approvals exist only in diagnose sessions"
+        )
+    # As the session tools: a run whose lock was reaped or taken by a newer
+    # run no longer owns the session and may not leave a pending approval
+    # behind. Every arming check still runs again at decision time.
+    if holder != run.run_id:
+        raise ApprovalError(
+            "run_superseded", 409, "This run no longer holds the session"
         )
     if action == "trace_cancel":
         await _check_cancel_target(db, run.session_id, params)

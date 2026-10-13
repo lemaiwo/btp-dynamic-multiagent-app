@@ -1,6 +1,6 @@
 import ActivityState from "./activity";
 import { newRun, reduceRun, type RunState } from "./chatRun";
-import RunWatch from "./runWatch";
+import RunWatch, { isAuthFailure } from "./runWatch";
 import type { SessionDetail, SseEvent } from "../service/types";
 
 /** What a run is: a chat message, a request-changes round or a diagnose report. */
@@ -45,6 +45,12 @@ export interface RunCallbacks {
      * session is watched so the next poll calls this again.
      */
     onFinished(sid: string): Promise<void>;
+    /**
+     * The reload after a run failed for good: an auth failure (at once) or
+     * {@link RunWatch.maxFailures} failed polls in a row. Nothing retries it;
+     * the page stops showing the run as live and tells the user.
+     */
+    onWatchFailed?(sid: string, e: unknown): void;
     /** Awaited inside the run before the stream opens (e.g. a lazy library); a failure counts as a refusal. */
     onBeforeStream?(): Promise<void>;
 }
@@ -91,7 +97,9 @@ export default class RunController {
     private readonly runWatch: RunWatch;
 
     public constructor(private readonly service: RunService, private readonly callbacks: RunCallbacks) {
-        this.runWatch = new RunWatch((sid) => this.pollRun(sid));
+        this.runWatch = new RunWatch((sid) => this.pollRun(sid), RunWatch.intervalMs, (sid, e) => {
+            this.callbacks.onWatchFailed?.(sid, e);
+        });
     }
 
     /** A run this page started is streaming. */
@@ -266,9 +274,11 @@ export default class RunController {
     /**
      * After a run (done, stopped, broken or polled to its end): waits for a
      * pending Stop, then lets the page reload. True when the reload worked;
-     * when it failed, the session is watched so the next poll retries.
+     * when it failed, the session is watched so the next poll retries, unless
+     * it failed as signed out (then the page is told at once). Called by a
+     * poll (`fromPoll`), a failure is thrown to the watch, which counts it.
      */
-    private async finish(sid: string, generation: number): Promise<boolean> {
+    private async finish(sid: string, generation: number, fromPoll = false): Promise<boolean> {
         const stopCall = this.stopCall;
         if (stopCall) {
             await stopCall;
@@ -283,8 +293,17 @@ export default class RunController {
         try {
             await this.callbacks.onFinished(sid);
             return true;
-        } catch {
-            if (generation === this.generation) {
+        } catch (e) {
+            if (generation !== this.generation) {
+                return false;
+            }
+            if (fromPoll) {
+                throw e;
+            }
+            if (isAuthFailure(e)) {
+                this.runWatch.stop();
+                this.callbacks.onWatchFailed?.(sid, e);
+            } else {
                 this.runWatch.watch(sid);
             }
             return false;
@@ -402,7 +421,9 @@ export default class RunController {
         if (detail.status === "running") {
             return true;
         }
-        // A failed reload keeps watching (finish re-arms it): the next poll retries.
-        return !await this.finish(sid, generation) && generation === this.generation;
+        // A failed reload is thrown to the watch: it retries, and gives up on
+        // an auth failure or after RunWatch.maxFailures failures in a row.
+        await this.finish(sid, generation, true);
+        return false;
     }
 }

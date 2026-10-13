@@ -300,13 +300,10 @@ export default class IdeService {
      * `code` when the gate refuses: `open_comments` while a comment is open or
      * sent, `version_changed` when `version` (the document version the UI
      * shows) is no longer the latest of the stage's kind, `missing_artifact`,
-     * `no_proposals`, ... Without `version` no body is sent.
-     */
-    /**
-     * Approves the stage. `version` is the document version on screen; in
-     * propose `revisions` maps each proposed path to the revision on screen.
-     * Either one the server no longer has as the latest answers 409
-     * `version_changed`, so nothing is approved that the user did not see.
+     * `no_proposals`, ... In propose `revisions` maps each proposed path to
+     * the revision on screen; a `version` or revision that is no longer the
+     * latest answers `version_changed`, so nothing is approved that the user
+     * did not see. Without `version` and `revisions` no body is sent.
      */
     public approve(sid: string, version?: number, revisions?: Record<string, number>): Promise<Session> {
         const body = {

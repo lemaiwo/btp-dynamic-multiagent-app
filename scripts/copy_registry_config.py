@@ -183,11 +183,13 @@ class TablePlan:
 
 
 class Plans(list):
-    """The plans of one run. ``source_close_failed`` names the class of an
-    error met while letting go of the source AFTER the target was committed:
-    the copy is done then, and saying otherwise would be wrong."""
+    """The plans of one run. ``source_close_failed`` and
+    ``target_close_failed`` name the class of an error met while letting go
+    of the source, or closing the target connection, AFTER the target was
+    committed: the copy is done then, and saying otherwise would be wrong."""
 
     source_close_failed: str | None = None
+    target_close_failed: str | None = None
 
 
 # Who the audit rows of a copied ``non_production`` flag name.
@@ -406,10 +408,12 @@ async def copy_config(
 
     One transaction on the target, committed only when every table was
     written; a dry run and any failure roll it back. The source is only
-    read. A failure while letting go of the source after the target's
-    commit does not undo the copy and is reported as what it is
-    (``Plans.source_close_failed``)."""
+    read. A failure while letting go of the source, or closing the target
+    connection, after the target's commit does not undo the copy and is
+    reported as what it is (``Plans.source_close_failed``,
+    ``Plans.target_close_failed``)."""
     plans = Plans()
+    committed = False
     reading = await source.connect()
     try:
         if source.dialect.name == "postgresql":
@@ -424,9 +428,17 @@ async def copy_config(
                     reading, writing, name, order, apply=apply, planned=new_workflows))
             if apply:
                 await writing.commit()
+                # From here on the copy is done, whatever closing the
+                # connection below says.
+                committed = True
             else:
                 await writing.rollback()
-        committed = apply
+    except Exception as exc:
+        if not committed:
+            await _let_go(reading)
+            raise
+        # Only closing the target connection is left after the commit.
+        plans.target_close_failed = type(exc).__name__
     except BaseException:
         await _let_go(reading)
         raise
@@ -548,12 +560,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         print("nothing was written; run again with --apply")
         return 0
-    if plans.source_close_failed:
-        print(
-            "the configuration WAS written to the target; closing the source "
-            f"connection failed afterwards ({plans.source_close_failed})",
-            file=sys.stderr,
-        )
+    for side, failed in (("target", plans.target_close_failed),
+                         ("source", plans.source_close_failed)):
+        if failed:
+            print(
+                f"the configuration WAS written to the target; closing the {side} "
+                f"connection failed afterwards ({failed})",
+                file=sys.stderr,
+            )
     for line in AFTER_APPLY:
         print(line)
     return 0

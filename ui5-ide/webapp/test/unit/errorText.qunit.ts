@@ -119,6 +119,10 @@ QUnit.test("target_not_non_production has its own sentence, whatever the status;
         "No ARC-1 server of this agent matches the session target — diagnostics tools are unavailable.");
     assert.ok(runNoteText({ code: "conventions_unavailable", message: "server text" }, text).includes("conventions"));
     assert.strictEqual(runNoteText({ code: "other", message: "server text" }, text), "server text");
+    ["constructor", "toString", "__proto__", "hasOwnProperty"].forEach((code) => {
+        assert.strictEqual(runNoteText({ code, message: "server text" }, text), "server text",
+            `${code} is no note code (Object.prototype is not looked up)`);
+    });
 });
 
 QUnit.test("a 424 is mapped by its code: only a missing user token asks to sign in again", function (assert) {

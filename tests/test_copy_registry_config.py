@@ -383,6 +383,61 @@ async def test_a_source_that_fails_to_close_after_the_commit_is_not_a_failed_cop
     assert code == 0 and err == "" and out.endswith("run again with --apply\n")
 
 
+def _target_close_fails(monkeypatch) -> None:
+    """Closing the TARGET connection raises (with a text that quotes a
+    secret, as a driver's may), after whatever the copy did on it."""
+    real_engine = copy_script._engine
+
+    class ClosingFails:
+        def __init__(self, connection) -> None:
+            self._connection = connection
+
+        async def __aenter__(self):
+            await self._connection.start()
+            return self._connection
+
+        async def __aexit__(self, *exc) -> None:
+            await self._connection.close()
+            raise RuntimeError(f"close failed: {MARKER_TOKEN}")
+
+    class Engine:
+        def __init__(self, engine) -> None:
+            self._engine = engine
+
+        def __getattr__(self, name):
+            return getattr(self._engine, name)
+
+        def connect(self):
+            return ClosingFails(self._engine.connect())
+
+    def engine(target):
+        built = real_engine(target)
+        return Engine(built) if Path(built.url.database).name == "target.db" else built
+
+    monkeypatch.setattr(copy_script, "_engine", engine)
+
+
+async def test_a_target_that_fails_to_close_after_the_commit_is_not_a_failed_copy(
+    dbs, capsys, caplog, monkeypatch
+):
+    """The target is committed; then closing the target connection goes
+    wrong. As for the source: "nothing was written" would be false."""
+    source, target = dbs
+    _target_close_fails(monkeypatch)
+    with caplog.at_level(logging.DEBUG):
+        code, out, err = await run(capsys, "--apply")
+    assert code == 0 and out.startswith("sqlite -> sqlite: APPLIED")
+    assert err == ("the configuration WAS written to the target; closing the target "
+                   "connection failed afterwards (RuntimeError)\n")
+    assert "nothing was written" not in out + err
+    no_secret(out, err, caplog.text)
+    assert await target.count(SkillConfig) == 1
+    # A dry run that meets the same trouble has written nothing and says so.
+    code, out, err = await run(capsys)
+    assert code == 1 and out == ""
+    assert err == "copy failed (RuntimeError); nothing was written to the target\n"
+
+
 async def test_let_go_reports_a_class_and_never_raises():
     class Broken:
         async def rollback(self):

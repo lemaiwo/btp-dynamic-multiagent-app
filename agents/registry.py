@@ -45,6 +45,7 @@ from agents.shared import (
 from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
 # --- deep agents ---
 from agents.deep import deep_toolset, scoped_deep_instructions
+from agents.errors import describe_exception
 from agents.ide.readonly import ReadOnlyGuard
 
 logger = logging.getLogger(__name__)
@@ -269,9 +270,10 @@ def _make_progress_handler(agent_name: str):
 
 
 def _format_error(exc: BaseException) -> str:
-    if isinstance(exc, BaseExceptionGroup):
-        return "; ".join(_format_error(e) for e in exc.exceptions)
-    return f"{type(exc).__name__}: {exc}"
+    """What a failed delegation tells the model (and the tool card): class and
+    message of each member of a group, URLs and credentials masked, because
+    an MCP transport error carries the request URL as sent."""
+    return describe_exception(exc)
 
 
 def _build_login_link(agent_name: str, server_key: str | None = None) -> str | None:

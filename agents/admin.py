@@ -2872,8 +2872,9 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
 
     Each mirrors what the toolset factory refuses at build time, so the
     mistake is a 422 naming the field rather than an agent that vanishes at
-    the next reload. The Jira and Slack rules predate this and live in the
-    branch that calls it; the Teams team-id rule is in `_validate_teams`.
+    the next reload. The Jira and Slack auth-mode rules predate this and live
+    in the branch that calls it (the Jira project pin is here); the Teams
+    team-id rule is in `_validate_teams`.
     """
     key = str(url or "").strip().rstrip("/").lower()
     name = str(cfg.get("destination") or "")
@@ -2894,6 +2895,16 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
         )
     if key == BUILTIN_SMTP_URL:
         _validate_smtp_config(cfg)
+    if key == BUILTIN_JIRA_URL and not str(cfg.get("project") or "").strip():
+        # Without the pin the JQL has no project clause and single-issue calls
+        # accept any key: the agent would reach every issue the destination's
+        # credential can see. Refused for every save (create, edit, import,
+        # seed); a row stored before this rule still builds, with a WARNING
+        # (`agents.jira_tools.jira_toolset`).
+        raise ValueError(
+            f"{BUILTIN_JIRA_URL} requires oauth.project: the Jira project key "
+            "the agent is confined to"
+        )
     if key in _DESTINATION_MAILBOX_URLS and not user_context and not cfg.get("mailbox"):
         raise ValueError(
             f"{key} with auth_mode=destination requires oauth.mailbox unless "
@@ -3041,8 +3052,10 @@ async def _destination_health() -> list[dict[str, Any]]:
 
     Each destination is resolved once with the app's own token -- never a
     user's, there is none on this request worth borrowing -- and reported as
-    ``resolvable``, ``error`` (with the service's message; no header or token
-    ever reaches the response) or ``unbound`` when this app has no
+    ``resolvable``, ``error`` (a fixed text ending in a code,
+    `agents.odata.destinations.destination_failure`; the resolver's own text,
+    which can quote the destination service's answer, goes to the log only,
+    and no header or token ever reaches the response) or ``unbound`` when this app has no
     destination service binding at all. A destination meant to act as the
     signed-in user whose ``Authentication`` is an app-level type gets a
     warning, because that mismatch otherwise surfaces only as every user
@@ -3061,6 +3074,8 @@ async def _destination_health() -> list[dict[str, Any]]:
         DestinationResolver,
         config_from_environment,
     )
+    from agents.odata.destinations import destination_failure
+    from agents.odata.preview import plain
 
     async with SessionLocal() as session:
         rows = await list_agents(session)
@@ -3119,9 +3134,28 @@ async def _destination_health() -> list[dict[str, Any]]:
                         entry["auth_type"] = resolved.auth_type
                     entry["state"] = "resolvable"
                 except DestinationError as e:
-                    entry["error"] = str(e)[:400]
+                    # As in `_odata_destination_health`: the error's own text
+                    # can quote the destination service's answer or a URL, so
+                    # a fixed text ending in a code is answered and the detail
+                    # is logged with URLs masked.
+                    code, entry["error"] = destination_failure(str(e))
+                    logger.warning(
+                        "credential health: destination '%s' of agent '%s' failed (%s): %s",
+                        name,
+                        row.name,
+                        code,
+                        plain(str(e), 400),
+                    )
                 except Exception as e:  # noqa: BLE001 - a health check must not 500
-                    entry["error"] = f"{type(e).__name__}: {e}"[:400]
+                    entry["error"] = (
+                        f"the destination could not be checked ({type(e).__name__})"
+                    )
+                    logger.warning(
+                        "credential health: destination '%s' of agent '%s' failed (%s)",
+                        name,
+                        row.name,
+                        type(e).__name__,
+                    )
             auth_type = str(entry["auth_type"] or "")
             if user_context and auth_type and auth_type not in USER_PROPAGATING_AUTH_TYPES:
                 entry["warning"] = (

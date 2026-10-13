@@ -30,9 +30,9 @@ function block(server: McpServer): Record<string, unknown> {
     return (server.oauth || {}) as Record<string, unknown>;
 }
 
-/** The destination name as `clean` stores it. */
+/** The destination name as `clean` sends it: as typed. */
 function destinationOf(cfg: Record<string, unknown>): string {
-    return String(cfg.destination ?? "").trim();
+    return typeof cfg.destination === "string" ? cfg.destination : "";
 }
 
 function quoted(names: string[]): string {
@@ -98,14 +98,15 @@ export default {
      * Exactly what `clean_entry` stores: its own keys and nothing of another
      * toolset, a switch only as the one boolean that means something.
      *
-     * The destination name is trimmed, as for every other toolset. The pins
-     * (`workspace`, `repositories`, `branch`) are sent as typed: the server
-     * stores a pin in the form it checked and refuses edge whitespace instead
-     * of repairing it, so `validate` and the server must see the same text.
+     * The destination name and the pins (`workspace`, `repositories`,
+     * `branch`) are sent as typed: the server (`bitbucket_config.check_entry`)
+     * stores a value in the form it checked and refuses edge whitespace
+     * instead of repairing it, so `validate` and the server must see the same
+     * text, and a refusal reaches the admin instead of a silent repair.
      */
     clean(raw: Record<string, unknown>): Record<string, unknown> {
         const out: Record<string, unknown> = {
-            destination: String(raw.destination ?? "").trim(),
+            destination: destinationOf(raw),
             workspace: typeof raw.workspace === "string" ? raw.workspace : ""
         };
         if (Array.isArray(raw.repositories) && raw.repositories.length) {

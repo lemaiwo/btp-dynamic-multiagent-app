@@ -369,6 +369,43 @@ async def test_a_sap_error_and_a_destination_failure_end_with_their_outcome(alic
     assert sap_error.finished_at is not None and refused.finished_at is not None
 
 
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ConnectTimeout])
+async def test_a_401_whose_retry_cannot_connect_says_that_a_request_left(alice, failure):
+    """The write was answered 401 (nothing changed in SAP), then the auth
+    layer's one retry failed to connect. A modifying request DID leave: the
+    row must say ``refused`` / ``write``, never "nothing left" (``token``)."""
+    w = World()
+    answers: list[Any] = [httpx.Response(401), failure("connection refused")]
+
+    def write_answer(request: httpx.Request) -> httpx.Response:
+        answer = answers.pop(0)
+        if isinstance(answer, httpx.Response):
+            return answer
+        raise answer
+
+    w.sap.write_answer = write_answer
+    out = await w.run(**UPDATE)
+    assert out["error"]["code"] == "destination_error"
+    assert "nothing was changed" in out["error"]["message"]
+    assert len(w.sap.writes) == 2 and answers == []
+    (row,) = await all_rows()
+    assert (row.outcome, row.phase, row.http_status) == ("refused", "write", None)
+
+
+async def test_a_write_that_never_connects_still_says_that_nothing_left(alice):
+    """Unchanged: a first attempt that cannot connect sent nothing."""
+    w = World()
+
+    def write_answer(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    w.sap.write_answer = write_answer
+    out = await w.run(**UPDATE)
+    assert out["error"]["code"] == "destination_error"
+    (row,) = await all_rows()
+    assert (row.outcome, row.phase, row.http_status) == ("refused", "token", None)
+
+
 async def test_no_body_value_token_cookie_or_etag_is_stored_or_logged(alice, caplog):
     w = World()
     with caplog.at_level(logging.DEBUG, logger="agents"):

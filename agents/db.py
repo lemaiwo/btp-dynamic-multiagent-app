@@ -287,9 +287,21 @@ def _postgres_target(creds: dict[str, Any]) -> DatabaseTarget:
         or creds.get("cert")
     )
     sslmode = "require"
+    # URL.create percent-encodes user and password: interpolated raw, a
+    # password with "@" moved the host ("p@ss" parsed as host "ss@h").
+    # Values the binding lacks stay "None", as the f-string had them, so a
+    # broken binding fails at the database as it did before.
+    url = URL.create(
+        "postgresql+asyncpg",
+        username=str(user),
+        password=str(password),
+        host=str(host),
+        port=int(port),
+        database=str(dbname),
+        query={"ssl": sslmode},
+    )
     return DatabaseTarget(
-        f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
-        f"?ssl={sslmode}",
+        url.render_as_string(hide_password=False),
         "postgres",
         ssl_ca=ssl_ca,
     )

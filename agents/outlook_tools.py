@@ -48,6 +48,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
@@ -232,7 +233,13 @@ class OutlookClient:
         # Values are (monotonic deadline, {display name: id}).
         self._folders: dict[Any, tuple[float, dict[str, str]]] = {}
         self.mailbox = (mailbox or "").strip()
-        self._root = f"/users/{self.mailbox}" if self.mailbox else "/me"
+        # One path segment, whatever the admin typed: unquoted, a '/', '?' or
+        # '#' in the value would change which Graph endpoint the credential
+        # is sent to. '@' stays as it is (Gmail and Teams quote with
+        # safe=""), so a plain address goes out byte-for-byte as before.
+        self._root = (
+            f"/users/{quote(self.mailbox, safe='@')}" if self.mailbox else "/me"
+        )
         self.lookback_minutes = lookback_minutes
         # Pinned, never a tool argument. Every other tool here acts on a
         # message that already exists, so the audience is whoever wrote in.

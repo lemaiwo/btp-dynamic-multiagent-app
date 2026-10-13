@@ -886,6 +886,47 @@ def test_check_write_order_and_plan():
     assert plan.body is None and plan.fields == () and plan.etag is None
 
 
+ES_KEY_RO = ServiceDefinition.model_validate(
+    {
+        "entity_sets": [
+            {
+                "name": "A_Fixed",
+                "keys": [{"name": "Id"}],
+                "operations": ["get", "update"],
+                "fields": [_f("Id"), _f("Text", writable=True)],
+            }
+        ],
+        "operations": [],
+    }
+).entity_set("A_Fixed")
+
+
+def test_an_update_may_echo_a_key_field_that_is_not_writable():
+    """Step 7's promise holds for a key that is not writable as well: the
+    key echoed with the key's own value is accepted and left out."""
+    c = ODataClient(None, SERVICE, V2Dialect())
+    plan = c.check_write(ES_KEY_RO, "update", key={"Id": "1"}, body={"Id": "1", "Text": "x"})
+    assert plan.body == {"Text": "x"} and plan.fields == ("Text",)
+
+
+@pytest.mark.parametrize(
+    "body, code",
+    [
+        ({"Id": "2", "Text": "x"}, "field_not_writable"),  # another value: as before
+        ({"Id": {"deep": 1}, "Text": "x"}, "field_not_writable"),
+        ({"Id": "1"}, "invalid_argument"),  # nothing besides the key
+    ],
+)
+def test_a_not_writable_key_with_another_value_is_still_refused(body, code):
+    c = ODataClient(None, SERVICE, V2Dialect())
+    with pytest.raises(ODataError) as excinfo:
+        c.check_write(ES_KEY_RO, "update", key={"Id": "1"}, body=body)
+    assert excinfo.value.code == code
+    with pytest.raises(ODataError) as excinfo:  # a create never echoes a key
+        c.check_write(ES_KEY_RO, "create", body={"Id": "1", "Text": "x"})
+    assert excinfo.value.code in ("operation_disabled", "field_not_writable")
+
+
 # -- unknown outcome, secrets ------------------------------------------------
 
 

@@ -735,8 +735,15 @@ async def handover_session(
     conv = await store.get_conventions(db, source.target)
     if not is_non_production(conv):
         return _gate_response(_HANDOVER_LOST_FLAG)
+    # The run lock is read under the session row lock, in the transaction
+    # that writes the new session: a report run that took the lock after
+    # ``_owned`` loaded the row is seen (``runner._start`` takes the same
+    # row first). No external call is made while it is held.
+    await store.lock_session_row(db, source.id)
+    await db.refresh(source)
     if source.status == "running":
         # A report run may be about to replace the report being copied.
+        await db.rollback()
         return _gate_response(_HANDOVER_BUSY)
     reports = await store.list_artifacts(db, source.id, REPORT_KIND)
     if not reports:
@@ -1320,6 +1327,11 @@ async def lint_file(
     session, row = await _owned_file(db, sid, path, principal)
     if (lost := await _refuse_lost_flag(db, session)) is not None:
         return lost
+    # A run rewrites the proposals: a lint stored meanwhile would describe a
+    # source the file no longer holds. Refused before the ARC-1 call and
+    # checked again under the session row lock after it (as refresh/open).
+    if (busy := _refuse_while_running(session)) is not None:
+        return busy
     source = row.proposed_source or row.origin_source
     if not source:
         raise HTTPException(status_code=422, detail="The file has no source to lint")
@@ -1339,7 +1351,8 @@ async def lint_file(
     findings = arc1.parse_findings(out)
     # Session row first, then the file row (as refresh/open): a lint and a
     # refresh of the same file cannot deadlock on Postgres.
-    await store.lock_session_row(db, session.id)
+    if (busy := await _lock_for_base_write(db, session)) is not None:
+        return busy
     row = await _file(db, session.id, row.path)
     if row is None:
         await db.rollback()

@@ -120,3 +120,69 @@ QUnit.test("a failing poll keeps watching (a network blip is not the end of the 
     assert.strictEqual(count, 2, "polled again after the failure");
     assert.notOk(watch.isWatching("s-1"), "ended by the second answer");
 });
+
+QUnit.test("an auth failure ends the watch at once and gives up with the error", async function (this: Ctx, assert) {
+    let count = 0;
+    const given: [string, unknown][] = [];
+    const signedOut = Object.assign(new Error("expired"), { status: 401, isAuth: true });
+    const watch = new RunWatch(() => { count++; return Promise.reject(signedOut); }, 1000,
+        (sid, error) => { given.push([sid, error]); });
+    watch.watch("s-1");
+    this.clock.tick(1000);
+    await settle();
+    assert.deepEqual(given, [["s-1", signedOut]], "gave up after the first poll, with its error");
+    assert.notOk(watch.isWatching("s-1"), "no longer watching");
+    this.clock.tick(10000);
+    await settle();
+    assert.strictEqual(count, 1, "no poll after giving up");
+});
+
+QUnit.test("a 403 without isAuth counts as an auth failure; a refused CSRF token does not", async function (this: Ctx, assert) {
+    const given: unknown[] = [];
+    const forbidden = { status: 403 };
+    const csrf = { status: 403, isAuth: false };
+    let answer: unknown = csrf;
+    const watch = new RunWatch(() => Promise.reject(answer), 1000, (_sid, error) => { given.push(error); });
+    watch.watch("s-1");
+    this.clock.tick(1000);
+    await settle();
+    assert.deepEqual(given, [], "isAuth false is believed: keeps watching");
+    answer = forbidden;
+    this.clock.tick(1000);
+    await settle();
+    assert.deepEqual(given, [forbidden], "a bare 403 ends it");
+});
+
+QUnit.test("RunWatch.maxFailures failed polls in a row end the watch; an answer in between resets the count", async function (this: Ctx, assert) {
+    const given: unknown[] = [];
+    const offline = new Error("offline");
+    // One success after maxFailures - 1 failures: the count starts again.
+    const script: boolean[] = [];
+    for (let i = 0; i < RunWatch.maxFailures - 1; i++) {
+        script.push(false);
+    }
+    script.push(true);
+    let count = 0;
+    const watch = new RunWatch(() => {
+        count++;
+        const ok = script.shift();
+        return ok ? Promise.resolve(true) : Promise.reject(offline);
+    }, 1000, (_sid, error) => { given.push(error); });
+    watch.watch("s-1");
+    for (let i = 0; i < RunWatch.maxFailures; i++) {
+        this.clock.tick(1000);
+        await settle();
+    }
+    assert.deepEqual(given, [], "a success before the limit keeps the watch");
+    assert.ok(watch.isWatching("s-1"));
+    for (let i = 0; i < RunWatch.maxFailures; i++) {
+        this.clock.tick(1000);
+        await settle();
+    }
+    assert.deepEqual(given, [offline], "given up after maxFailures failures in a row");
+    assert.notOk(watch.isWatching("s-1"));
+    const polls = count;
+    this.clock.tick(10000);
+    await settle();
+    assert.strictEqual(count, polls, "no poll after giving up");
+});

@@ -46,7 +46,7 @@ const READING: ODataDefinition = { entity_sets: [entitySet("A_Head", "Requisitio
 
 QUnit.test("clean keeps the services and makes allow_write a real boolean", function (assert) {
     assert.deepEqual(odataEntry.clean({ services: ["b", " a ", "b", 7, "", null], allow_write: true, destination: "X" }),
-        { services: ["b", "a"], allow_write: true });
+        { services: ["b", " a "], allow_write: true }, "a name is sent as typed, for the server to refuse edge whitespace");
     for (const value of ["true", 1, "1", {}, [], null, undefined, false]) {
         assert.strictEqual(odataEntry.clean({ services: ["a"], allow_write: value }).allow_write, false, JSON.stringify(value));
     }

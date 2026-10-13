@@ -189,6 +189,13 @@ def confine_key(key: str, project: str) -> str:
     feature's design -- "this is a duplicate of ZZZ-77, answer there" is
     exactly the instruction the agent must never be able to follow, and a
     system prompt is not an enforcement mechanism.
+
+    With no pin (``project`` empty) the project check is skipped and any
+    project key passes. That is not a scope: such an agent reaches every
+    issue the destination's credential can see. It is kept only so rows
+    stored before ``oauth.project`` became required still run; the admin
+    gate refuses a new or edited ``builtin:jira`` entry without it, and
+    `jira_toolset` logs a WARNING when it builds one.
     """
     candidate = str(key or "").strip()
     if not _ISSUE_KEY.match(candidate):
@@ -503,13 +510,16 @@ def jira_toolset(
     lookback: str | None = None,
     api_base: str | None = None,
     labels: Any = None,
+    agent_name: str = "",
 ) -> FunctionToolset:
     """The Jira toolset for one agent, ready for ``Agent(toolsets=...)``.
 
     ``server_key`` and ``auth_mode`` come from
     :func:`agents.builtins.build_builtin_toolset` in production. The rest
     default to the matching values in ``oauth`` and are overridable so tests
-    can set them without building a config block.
+    can set them without building a config block. ``agent_name`` only names
+    the agent in the missing-pin WARNING (the registry does not pass it to
+    this factory yet, so the line names the destination as well).
     """
     resolved_destination = (
         destination if destination is not None else str(oauth.get("destination") or "")
@@ -523,6 +533,18 @@ def jira_toolset(
     resolved_project = (
         project if project is not None else str(oauth.get("project") or "")
     ).strip()
+    if not resolved_project:
+        # Built anyway: a landscape may hold a row stored before the admin
+        # gate required the pin, and refusing it here would drop the agent
+        # at the next reload. Said once per build, never silently.
+        logger.warning(
+            "%s entry of agent %r (destination %r) has no oauth.project: the "
+            "agent can reach every Jira project the destination's credential "
+            "can see; set a project to pin it",
+            server_key,
+            agent_name or "?",
+            resolved_destination,
+        )
     resolved_status = (
         status if status is not None else str(oauth.get("status") or "")
     ).strip()

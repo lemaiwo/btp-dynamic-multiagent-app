@@ -274,6 +274,22 @@ async def main() -> None:
     check("step run error names the exception",
           "boom" in (steps[0].error or ""), steps[0].error)
 
+    print("\n== a stored step error keeps class and wording, not a URL ==")
+    leaky = FakeAgent("leaky", fail_with=RuntimeError(
+        "Client error '401 Unauthorized' for url "
+        "'https://mcp.example.internal/mcp?apikey=made-up-secret'"
+    ))
+    install_specialists({"first": leaky, "second": second})
+    run_id = await run_workflow("linear")
+    async with SessionLocal() as s:
+        row = await get_workflow_run(s, run_id)
+        steps = await list_step_runs(s, run_id)
+    for label, text in (("run", row.error or ""), ("step run", steps[0].error or "")):
+        check(f"{label} error keeps the class and the status",
+              "RuntimeError: " in text and "401" in text, text)
+        check(f"{label} error drops the URL and its query",
+              "made-up-secret" not in text and "mcp.example.internal" not in text, text)
+
     print("\n== a step timeout is recorded on the step run ==")
     # The smallest step_timeout_seconds upsert_workflow accepts is 1 (an
     # Integer column; 0 is treated as "unset" and falls back to 600), so the

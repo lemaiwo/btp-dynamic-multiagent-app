@@ -90,3 +90,42 @@ QUnit.test("classify still answers conflict for every 409 (the OData pages branc
     assert.strictEqual(ErrorHandler.classify(new AdminError(409, "x")), "conflict");
     assert.strictEqual(ErrorHandler.classify(new AdminError(409, "x", {}, "", true)), "conflict");
 });
+
+QUnit.module("ErrorHandler texts", {
+    afterEach: function () {
+        ErrorHandler.useBundle(undefined);
+    }
+});
+
+QUnit.test("without a bundle the dialogs use the English fallback texts", function (assert) {
+    ErrorHandler.useBundle(undefined);
+    assert.strictEqual(ErrorHandler.text("sessionExpiredTitle"), "Session expired");
+    assert.strictEqual(ErrorHandler.text("accessDeniedTitle"), "Access denied");
+    assert.strictEqual(ErrorHandler.text("requestFailedFallback"), "The request failed.");
+});
+
+QUnit.test("with a bundle the texts come from it, the fallback only for a key it lacks", function (assert) {
+    ErrorHandler.useBundle({
+        getText: (key: string) => (key === "sessionExpiredTitle" ? "Sitzung abgelaufen" : undefined)
+    });
+    assert.strictEqual(ErrorHandler.text("sessionExpiredTitle"), "Sitzung abgelaufen");
+    assert.strictEqual(ErrorHandler.text("accessDeniedTitle"), "Access denied", "missing in the bundle");
+});
+
+QUnit.test("a 401 shows the bundle's session-expired texts", function (assert) {
+    const real = MessageBox.error;
+    const seen: { text: string; options: Record<string, unknown> }[] = [];
+    (MessageBox as unknown as { error: unknown }).error = (text: string, options: Record<string, unknown>) => {
+        seen.push({ text, options });
+    };
+    ErrorHandler.useBundle({ getText: (key: string) => `[${key}]` });
+    try {
+        ErrorHandler.handle(new AdminError(401, "no token"));
+    } finally {
+        (MessageBox as unknown as { error: unknown }).error = real;
+    }
+    assert.strictEqual(seen.length, 1);
+    assert.strictEqual(seen[0].text, "[sessionExpiredMessage]");
+    assert.strictEqual(seen[0].options.title, "[sessionExpiredTitle]");
+    assert.deepEqual(seen[0].options.actions, ["[sessionExpiredReload]"]);
+});

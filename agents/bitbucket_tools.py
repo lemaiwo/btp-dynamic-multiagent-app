@@ -394,6 +394,17 @@ def _approval_state_unknown() -> Refused:
         "request under approval_pending for complete_approval")
 
 
+def _own_approval_unknown() -> Refused:
+    """``complete_approval`` when the review was read but this account's entry
+    in the pull request's participants cannot be: the code of an unread
+    state, with a text about the approval (the review itself is fine)."""
+    return Refused(
+        "review_state_unknown",
+        "whether this account already approved the pull request could not be read; "
+        "nothing was sent",
+        "do not call again; a later run may list the pull request under approval_pending")
+
+
 def _already_reviewed(extra: str = "") -> Refused:
     return Refused(
         "already_reviewed",
@@ -1034,7 +1045,8 @@ class BitbucketClient:
             raise Refused("repository_not_allowed", "this agent may not use that repository",
                           f"repositories: {', '.join(pinned)}" if pinned else None)
         if type(pr_id) is not int or not 0 < pr_id < 1_000_000_000:
-            raise _status_refusal(404)
+            # Nothing was sent: not Bitbucket's 404, which nobody was asked for.
+            raise Refused("invalid_argument", "the pull request id must be a positive integer")
         base = f"{self._repo(repository)}/pullrequests/{pr_id}"
         body = self._json(await self._send("GET", base))
         if body.get("state") != "OPEN":
@@ -1264,7 +1276,10 @@ class BitbucketClient:
                 if at is None:       # gone meanwhile: the whole listing, once
                     entries = entries if part == "after" else []
                 else:
-                    entries = entries[at + 1:] if part == "after" else entries[:at + 1]
+                    # The cursor entry was used by the call that set it: the
+                    # `after` turn starts behind it, the `before` turn ends in
+                    # front of it, so a round checks it once.
+                    entries = entries[at + 1:] if part == "after" else entries[:at]
             for entry in entries:
                 if len(listed) >= MAX_LISTED or (account and checked >= MAX_CHECKED):
                     more = full = True
@@ -1333,7 +1348,16 @@ class BitbucketClient:
 
     async def read_pull_request(self, repository: Any, pr_id: Any) -> dict[str, Any]:
         base, body, head = await self.pull_request(repository, pr_id)
-        builds = await self.builds(base)
+        try:
+            builds = await self.builds(base)
+        except Refused as refused:
+            if refused.code in _FATAL:
+                raise                    # the account or the connection: the rest fails too
+            # A review that reads needs the pull request, not its builds: a
+            # refused or unreadable statuses list is said, not fatal. The
+            # approval gate reads them again, strictly, and approves nothing
+            # on a list it could not read.
+            builds = {"state": "unknown", "total": None}
         items, more = await self._pages(f"{base}/comments", {"pagelen": "50"},
                                         max_pages=MAX_COMMENT_PAGES)
         # Asked last and never fatal: without it no comment is marked `own`.
@@ -1707,7 +1731,7 @@ class BitbucketClient:
                     "until a new commit is pushed")
             approved = _own_approval(body, account)
             if approved is None:
-                raise _review_unknown()
+                raise _own_approval_unknown()
             if approved:
                 raise Refused("already_approved",
                               "this account already approved the pull request")
@@ -1725,7 +1749,7 @@ _ACTIVITY_NAME_RE = re.compile(
     r"(?:bitbucket(?:_[0-9]+)?_)?(list_pull_requests|get_pull_request|get_diff|get_file"
     r"|add_inline_comment|submit_review|complete_approval)")
 _CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
-_BUILD_STATES = ("green", "not_green", "none")
+_BUILD_STATES = ("green", "not_green", "none", "unknown")
 
 
 def _size(value: Any, kind: type) -> str:
@@ -1888,7 +1912,8 @@ def bitbucket_toolset(
     async def get_pull_request(repository: str, id: int) -> dict[str, Any]:
         """Read one open pull request: title, description, author, head
         commit, whether it is a draft, the state of its builds (`green` only
-        when every build succeeded, `none` without a build) and its comments
+        when every build succeeded, `none` without a build, `unknown` when
+        they could not be read: review it all the same) and its comments
         (at most 100 are read; `comments_truncated` says when there are more;
         `own` is true for a comment this account wrote). A pull request counts
         as reviewed at a commit only by a top-level comment of this account

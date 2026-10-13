@@ -69,7 +69,7 @@ export default class Workflows extends BaseController {
             `Could not start a run for "${workflow.name}".`
         );
         if (started) {
-            MessageToast.show(this.text("workflowRunStarted").replace("{0}", started.run_id));
+            MessageToast.show(this.text("workflowRunStarted", [started.run_id]));
         }
     }
 
@@ -77,7 +77,7 @@ export default class Workflows extends BaseController {
         const workflow = (event.getSource() as Control)
             .getBindingContext("workflows")?.getObject() as Workflow;
 
-        MessageBox.confirm(this.text("deleteWorkflowConfirm").replace("{0}", workflow.name), {
+        MessageBox.confirm(this.text("deleteWorkflowConfirm", [workflow.name]), {
             title: this.text("delete"),
             emphasizedAction: MessageBox.Action.OK,
             onClose: (action: string) => {

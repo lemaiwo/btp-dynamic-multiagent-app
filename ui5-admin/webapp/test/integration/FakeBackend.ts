@@ -1,5 +1,5 @@
 import type {
-    Agent, CredentialStatus, JobRunDetail, ODataDefinition, ODataEntityOp, ODataEntitySet, ODataField,
+    Agent, CredentialProblem, CredentialStatus, JobRunDetail, ODataDefinition, ODataEntityOp, ODataEntitySet, ODataField,
     NotificationItem, ODataDestination, ODataDestinationList, ODataMetadataPreview, ODataPreviewEntitySet, ODataPreviewOperation, ODataService,
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
@@ -95,6 +95,9 @@ export default class FakeBackend {
     /** Unread runs of the window that the capped list does not hold: added
      *  to `unread_count`, which may exceed the number of items. */
     public notificationsUnreadBeyondList = 0;
+    /** What `GET credential-health` lists as broken; none by default, so the
+     *  Agents page shows no strip unless a journey sets one. */
+    public credentialProblems: CredentialProblem[] = [];
     /** `true`: the next `GET notifications` is worked out when it is asked
      *  but not answered until `releaseNotifications()`: an answer that was
      *  on its way while something else happened. Only that one call. */
@@ -144,6 +147,7 @@ export default class FakeBackend {
         this.notifications = [];
         this.notificationsSeenAt = "2026-08-24T00:00:00+00:00";
         this.notificationsUnreadBeyondList = 0;
+        this.credentialProblems = [];
         this.holdNextNotifications = false;
         this.heldNotifications = [];
         this.agents = [this.makeAgent("btp-agent"), this.makeAgent("gmail-agent")];
@@ -1622,6 +1626,18 @@ export default class FakeBackend {
 
         if (path === "whoami") {
             return this.json({ principal: "uuid-1234", label: "tester@example.com" });
+        }
+        if (path === "credential-health" && method === "GET") {
+            // The shape of agents/admin.py `credential_health`: one user-token
+            // entry per agent server, `problems` the ones neither valid nor
+            // refreshable, destination servers listed apart.
+            const checked = this.agents.length;
+            return this.json({
+                checked,
+                healthy: checked - this.credentialProblems.length,
+                problems: this.credentialProblems,
+                destinations: []
+            });
         }
         if (path === "config") {
             return this.json({ public_base_url: "https://backend.example.test" });

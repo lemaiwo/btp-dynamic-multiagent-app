@@ -768,6 +768,30 @@ async def test_sap_error_text_loses_urls_hosts_and_paths(alice, text, gone, kept
     assert kept in message and message.startswith("X/1: ")
 
 
+@pytest.mark.parametrize(
+    "text, gone",
+    [
+        ("Lock held since 10:25 by another session", []),
+        ("Job started at 12:30:00, try again later", []),
+        ("Window 08:00-17:30 only", []),
+        # Still masked: a host with its port, a dotted address, a URL.
+        ("Call to localhost:8080 at 10:25 failed", ["localhost", "8080"]),
+        ("Call to s4.internal:44300 at 12:30:00 failed", ["s4.internal", "44300"]),
+        ("Call to 10.0.0.7:8443 at 12:30:00 failed", ["10.0.0.7", "8443"]),
+        ("see https://s4.internal:44300/x at 10:25", ["s4.internal", "44300"]),
+    ],
+)
+def test_a_time_in_sap_error_text_is_not_taken_for_a_host(text, gone):
+    from agents.odata.tools import _scrub
+
+    scrubbed = _scrub(text)
+    for part in gone:
+        assert part not in scrubbed, scrubbed
+    for time in ("10:25", "12:30:00", "08:00-17:30"):
+        if time in text:
+            assert time in scrubbed, scrubbed
+
+
 async def test_a_sap_message_code_is_not_taken_for_a_path(alice):
     w = World(v2_error(404, "/IWBEP/CM_MGW_RT/022", "Resource not found for segment 'A_Set'"))
     out = await w.run("execute_operation", **BASE)

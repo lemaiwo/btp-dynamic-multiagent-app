@@ -449,7 +449,7 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
     replace what a newer one stored, nor put an identity change on top of a
     state the admin never saw. Without the field, or with ``null``, the
     route replaces unconditionally, as it always did (API clients,
-    scripts); each such save is one INFO line with the service and the
+    scripts); each such save is one WARNING line with the service and the
     caller's principal (never the body), so a check that is silently off
     shows in the log. A value that is no string, or no such timestamp, is a
     422 naming the field.
@@ -506,7 +506,10 @@ async def api_update_odata_service(name: str, request: Request) -> dict[str, Any
         if _is_stale(row, expected):
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_stale_write(name))
         if expected is None:
-            logger.info(
+            # The lock stays opt-in (a script may leave the field out), but a
+            # replace that can overwrite a concurrent edit is worth a WARNING.
+            # The service name and the principal, nothing of the body.
+            logger.warning(
                 "odata service '%s' replaced without %s (no stale-write check) by %s",
                 name,
                 EXPECTED_FIELD,

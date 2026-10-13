@@ -165,7 +165,7 @@ QUnit.test("each change stage names its effect, with the version it approves", f
     assert.deepEqual(primaryAction(ps("propose"), docs(["note", 1]), [obj("modified")]),
         { key: "approveChanges", enabled: true, textKey: "primaryApproveChanges", textArgs: [] });
     assert.deepEqual(primaryAction(ps("review"), docs(["review", 3])),
-        { key: "finish", enabled: true, textKey: "primaryFinish", textArgs: [], version: 3 });
+        { key: "finish", enabled: true, textKey: "primaryFinishVersion", textArgs: [3], version: 3 });
 });
 
 QUnit.test("missing_artifact: a document stage without its document is disabled with the reason", function (assert) {

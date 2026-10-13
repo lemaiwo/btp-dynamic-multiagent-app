@@ -67,13 +67,15 @@ function isODataUrl(url: string | undefined | null): boolean {
     return String(url ?? "").trim().replace(/\/+$/, "").toLowerCase() === ODATA_URL;
 }
 
-/** Distinct service names in the order given; anything that is no text is
- *  left out. */
+/** Distinct service names in the order given, as typed: the server
+ *  (`_clean_odata_entry`) refuses a name with edge whitespace instead of
+ *  repairing it, so the refusal reaches the admin. Anything that is no text,
+ *  and the empty text, is left out. */
 function distinct(services: unknown): string[] {
     const out: string[] = [];
     (Array.isArray(services) ? services : []).forEach((name) => {
-        if (typeof name === "string" && name.trim() && out.indexOf(name.trim()) === -1) {
-            out.push(name.trim());
+        if (typeof name === "string" && name !== "" && out.indexOf(name) === -1) {
+            out.push(name);
         }
     });
     return out;

@@ -509,6 +509,10 @@ async def test_decided_proposal_can_be_proposed_again_in_the_same_run(fake, fake
     run = DiagnoseRun(session_id=sid, owner="alice", target=TARGET, run_id="r1",
                       destination=DEST)
     async with SessionLocal() as db:
+        # The proposing run holds the session (review B-ide-2).
+        await db.execute(update(IdeSession).where(IdeSession.id == sid)
+                         .values(status="running", run_id="r1"))
+        await db.commit()
         first = await approvals.request(db, run, "trace_start", dict(TRACE), "c1")
         same = await approvals.request(db, run, "trace_start", dict(TRACE), "c2")
         assert same.id == first.id

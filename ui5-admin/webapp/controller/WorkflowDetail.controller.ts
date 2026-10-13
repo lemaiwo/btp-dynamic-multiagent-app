@@ -1011,7 +1011,7 @@ export default class WorkflowDetail extends BaseController {
             if (!started) {
                 return;
             }
-            MessageToast.show(this.text("workflowRunStarted").replace("{0}", started.run_id));
+            MessageToast.show(this.text("workflowRunStarted", [started.run_id]));
             this.clearRunRefreshTimers();
             RUN_REFRESH_DELAYS_MS.forEach((delay) => {
                 this.runRefreshTimers.push(setTimeout(() => {

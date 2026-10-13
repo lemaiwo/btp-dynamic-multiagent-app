@@ -368,8 +368,13 @@ async def _run_orchestrator(text: str, context_id: str) -> str:
         # while the coroutine keeps going.
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Orchestrator run failed (context=%s)", context_id)
-        raise _OrchestratorError(str(exc)) from exc
+        # The class only, in the log and to the caller: an httpx error's text
+        # (and so its traceback) names the request URL as sent, query string
+        # and all, and an `a2a`-scope caller is not the operator.
+        logger.warning(
+            "Orchestrator run failed (context=%s): %s", context_id, type(exc).__name__
+        )
+        raise _OrchestratorError(type(exc).__name__) from exc
 
     # Persist new conversation state for follow-up turns
     try:
@@ -382,7 +387,71 @@ async def _run_orchestrator(text: str, context_id: str) -> str:
 
 
 class _OrchestratorError(RuntimeError):
-    pass
+    """A failed run; its text is the class name of the cause, nothing else."""
+
+    def caller_text(self) -> str:
+        return (
+            f"Orchestrator error: {self} (the run failed; the details are in "
+            "the application log)"
+        )
+
+
+class _ClientGone(Exception):
+    """The ``message/stream`` client disconnected while the run was going."""
+
+
+# Every run of `message/send` and `message/stream`, by task id, while it runs:
+# `tasks/cancel` and a stream whose client went away cancel it here. Per
+# process, like the task store.
+_running: dict[str, asyncio.Task[str]] = {}
+# How often a stream that waits for its run asks whether the client is still
+# there (Starlette notices a disconnect only when it next sends, and nothing
+# is sent while the run goes).
+_DISCONNECT_POLL_SECONDS = 1.0
+# How long a cancelled run is given to unwind before the caller moves on.
+_CANCEL_GRACE_SECONDS = 5.0
+_ACTIVE_STATES = ("submitted", "working")
+
+
+def _start_run(task_id: str, text: str, context_id: str) -> asyncio.Task[str]:
+    """Start the run in a task of its own so it can be cancelled by id.
+
+    Created inside the request, so it inherits the bound JWT and principal
+    (contextvars are copied at task creation).
+    """
+    run = asyncio.create_task(_run_orchestrator(text, context_id))
+    _running[task_id] = run
+    return run
+
+
+def _run_cancelled_alone(run: asyncio.Task[str]) -> bool:
+    """True when ``run`` was cancelled on its own (``tasks/cancel``), not
+    because the task awaiting it is being cancelled."""
+    current = asyncio.current_task()
+    return run.cancelled() and not (current is not None and current.cancelling())
+
+
+def _mark_canceled(task: dict[str, Any]) -> None:
+    """Move a task still in flight to ``canceled``.
+
+    Mutates the dict the store holds (``save_task`` keeps this very object),
+    so it works without an ``await`` in a ``finally`` that runs on
+    cancellation.
+    """
+    if task["status"]["state"] in _ACTIVE_STATES:
+        task["status"] = {"state": "canceled", "timestamp": _iso_now()}
+
+
+async def _stop_run(task_id: str, run: asyncio.Task[str] | None) -> None:
+    """Cancel ``run`` if it still goes, and forget the handle."""
+    if _running.get(task_id) is run:
+        _running.pop(task_id, None)
+    if run is None or run.done():
+        return
+    run.cancel()
+    # Give it a moment to unwind; a cancellation of our own ends the wait
+    # (and propagates), the run is cancelled either way.
+    await asyncio.wait({run}, timeout=_CANCEL_GRACE_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -409,16 +478,25 @@ async def _handle_message_send(req_id: Any, params: dict[str, Any]) -> dict[str,
     task = _initial_task(task_id, context_id, user_message, state="working")
     await store.save_task(_caller(), task)
 
+    run = _start_run(task_id, text, context_id)
     try:
-        output = await _run_orchestrator(text, context_id)
+        output = await run
     except _OrchestratorError as exc:
         task["status"] = {
             "state": "failed",
-            "message": _make_agent_message(f"Orchestrator error: {exc}", context_id),
+            "message": _make_agent_message(exc.caller_text(), context_id),
             "timestamp": _iso_now(),
         }
         await store.save_task(_caller(), task)
         return _rpc_result(req_id, task)
+    except asyncio.CancelledError:
+        _mark_canceled(task)
+        if not _run_cancelled_alone(run):
+            raise
+        # `tasks/cancel` stopped the run: answer the canceled task.
+        return _rpc_result(req_id, task)
+    finally:
+        await _stop_run(task_id, run)
 
     agent_message = _make_agent_message(output, context_id)
     task["status"] = {
@@ -455,13 +533,42 @@ async def _handle_tasks_cancel(req_id: Any, params: dict[str, Any]) -> dict[str,
     task = await store.cancel_task(_caller(), task_id)
     if task is None:
         return _rpc_error(req_id, -32001, f"Task not found: {task_id}")
+    # The store checked the owner; a run still going is stopped, not only
+    # relabelled. The handler awaiting it answers or streams `canceled`.
+    run = _running.get(task_id)
+    if task["status"]["state"] == "canceled" and run is not None and not run.done():
+        run.cancel()
     return _rpc_result(req_id, task)
 
 
 # ---------------------------------------------------------------------------
 # Streaming (Server-Sent Events) for message/stream
 # ---------------------------------------------------------------------------
-async def _stream_message(req_id: Any, params: dict[str, Any]) -> AsyncIterator[str]:
+async def _await_run(run: asyncio.Task[str], request: Request | None) -> str:
+    """Wait for ``run``, asking now and then whether the client is still there.
+
+    Raises ``_ClientGone`` on a disconnect, or what the run raised (its
+    ``CancelledError`` when ``tasks/cancel`` stopped it).
+    """
+    if request is None:
+        return await run
+    while True:
+        done, _ = await asyncio.wait({run}, timeout=_DISCONNECT_POLL_SECONDS)
+        if done:
+            return run.result()
+        if await request.is_disconnected():
+            raise _ClientGone
+
+
+async def _stream_message(
+    req_id: Any, params: dict[str, Any], request: Request | None = None
+) -> AsyncIterator[str]:
+    """The ``message/stream`` events.
+
+    However the stream ends -- the run finishes or fails, ``tasks/cancel``
+    stops it, the client goes away, or the server cancels the response --
+    the run is not left going and the stored task not left ``working``.
+    """
     message = params.get("message")
     if not isinstance(message, dict) or not _extract_text(message):
         yield _sse(_rpc_error(req_id, -32602, "Invalid params: message with text required"))
@@ -480,71 +587,99 @@ async def _stream_message(req_id: Any, params: dict[str, Any]) -> AsyncIterator[
     task = _initial_task(task_id, context_id, user_message, state="submitted")
     await store.save_task(_caller(), task)
 
-    # Emit the initial Task with state=submitted
-    yield _sse(_rpc_result(req_id, task))
-
-    # Transition to working
-    working_event = {
-        "kind": "status-update",
-        "taskId": task_id,
-        "contextId": context_id,
-        "status": {"state": "working", "timestamp": _iso_now()},
-        "final": False,
-    }
-    yield _sse(_rpc_result(req_id, working_event))
-
+    run: asyncio.Task[str] | None = None
     try:
-        output = await _run_orchestrator(text, context_id)
-    except _OrchestratorError as exc:
-        failure = {
+        # Emit the initial Task with state=submitted
+        yield _sse(_rpc_result(req_id, task))
+
+        # Transition to working
+        working_event = {
+            "kind": "status-update",
+            "taskId": task_id,
+            "contextId": context_id,
+            "status": {"state": "working", "timestamp": _iso_now()},
+            "final": False,
+        }
+        task["status"] = dict(working_event["status"])
+        await store.save_task(_caller(), task)
+        yield _sse(_rpc_result(req_id, working_event))
+
+        run = _start_run(task_id, text, context_id)
+        try:
+            output = await _await_run(run, request)
+        except _OrchestratorError as exc:
+            failure = {
+                "kind": "status-update",
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": {
+                    "state": "failed",
+                    "message": _make_agent_message(exc.caller_text(), context_id),
+                    "timestamp": _iso_now(),
+                },
+                "final": True,
+            }
+            task["status"] = failure["status"]
+            await store.save_task(_caller(), task)
+            yield _sse(_rpc_result(req_id, failure))
+            return
+        except _ClientGone:
+            logger.info("A2A stream client went away; run canceled (task=%s)", task_id)
+            _mark_canceled(task)
+            return
+        except asyncio.CancelledError:
+            _mark_canceled(task)
+            if not _run_cancelled_alone(run):
+                raise
+            # `tasks/cancel` stopped the run: close the stream with it.
+            canceled = {
+                "kind": "status-update",
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": dict(task["status"]),
+                "final": True,
+            }
+            yield _sse(_rpc_result(req_id, canceled))
+            return
+
+        agent_message = _make_agent_message(output, context_id)
+        artifact_event = {
+            "kind": "artifact-update",
+            "taskId": task_id,
+            "contextId": context_id,
+            "artifact": {
+                "artifactId": str(uuid.uuid4()),
+                "name": "response",
+                "parts": [{"kind": "text", "text": output}],
+            },
+            "append": False,
+            "lastChunk": True,
+        }
+        done = {
             "kind": "status-update",
             "taskId": task_id,
             "contextId": context_id,
             "status": {
-                "state": "failed",
-                "message": _make_agent_message(
-                    f"Orchestrator error: {exc}", context_id
-                ),
+                "state": "completed",
+                "message": agent_message,
                 "timestamp": _iso_now(),
             },
             "final": True,
         }
-        yield _sse(_rpc_result(req_id, failure))
-        return
+        # Persist final state so tasks/get after the stream still works (and
+        # before the last two events: a client gone now still had its run)
+        task["status"] = done["status"]
+        task["history"].append(agent_message)
+        task["artifacts"].append(artifact_event["artifact"])
+        await store.save_task(_caller(), task)
 
-    agent_message = _make_agent_message(output, context_id)
-    artifact_event = {
-        "kind": "artifact-update",
-        "taskId": task_id,
-        "contextId": context_id,
-        "artifact": {
-            "artifactId": str(uuid.uuid4()),
-            "name": "response",
-            "parts": [{"kind": "text", "text": output}],
-        },
-        "append": False,
-        "lastChunk": True,
-    }
-    yield _sse(_rpc_result(req_id, artifact_event))
-
-    done = {
-        "kind": "status-update",
-        "taskId": task_id,
-        "contextId": context_id,
-        "status": {
-            "state": "completed",
-            "message": agent_message,
-            "timestamp": _iso_now(),
-        },
-        "final": True,
-    }
-    # Persist final state so tasks/get after the stream still works
-    task["status"] = done["status"]
-    task["history"].append(agent_message)
-    task["artifacts"].append(artifact_event["artifact"])
-    await store.save_task(_caller(), task)
-
-    yield _sse(_rpc_result(req_id, done))
+        yield _sse(_rpc_result(req_id, artifact_event))
+        yield _sse(_rpc_result(req_id, done))
+    finally:
+        # Reached on every end, a closed or cancelled generator included:
+        # the state first (no await needed), then the run is stopped.
+        _mark_canceled(task)
+        await _stop_run(task_id, run)
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -600,7 +735,7 @@ async def a2a_jsonrpc(
 
     if method == "message/stream":
         return StreamingResponse(
-            _stream_message(req_id, params),
+            _stream_message(req_id, params, request),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )

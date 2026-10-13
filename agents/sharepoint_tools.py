@@ -87,7 +87,7 @@ from urllib.parse import quote
 import httpx
 from pydantic_ai.toolsets import FunctionToolset
 
-from agents.outlook_tools import GRAPH_V1
+from agents.outlook_tools import GRAPH_API, GRAPH_V1
 from agents.outlook_tools import build_http_client as graph_http_client
 from agents.sharepoint_views import CalendarView, TableView, check_pins, parse_views, site_host
 from agents.sharepoint_workbook import (
@@ -115,6 +115,10 @@ SUPPORTED_AUTH_MODES = (AUTH_MODE_APP_ONLY, AUTH_MODE_DESTINATION)
 FILE_CACHE_TTL_SECONDS = 300
 # How long the resolved library id is trusted.
 DRIVE_CACHE_TTL_SECONDS = 900
+# Pages of a site's document libraries read (200 each) before giving up on
+# finding the configured name; Graph's ``@odata.nextLink`` leads from one to
+# the next, and it is followed only back to Graph (``_graph_link``).
+MAX_DRIVE_PAGES = 10
 DOWNLOAD_TIMEOUT_SECONDS = 60.0
 # The whole download, connect to last byte. The timeout above is per network
 # operation: a host that sends a byte now and then would never reach it, and
@@ -201,6 +205,30 @@ def _install_once() -> None:
 _install_once()
 
 
+_GRAPH_HOST = httpx.URL(GRAPH_API).host
+
+
+def _graph_link(value: Any) -> httpx.URL | None:
+    """A paging link of Graph, if it leads back to Graph over https.
+
+    The Graph client attaches the credential to whatever absolute URL it is
+    given (in destination mode ``DestinationAuth`` refuses another host too,
+    as a ``destination_error``): a link that is not ``https`` on Graph's own
+    host and default port, has userinfo or is not below ``/v1.0/`` is not
+    followed at all.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        url = httpx.URL(value)
+    except httpx.InvalidURL:
+        return None
+    if url.scheme != "https" or (url.host or "").lower() != _GRAPH_HOST or url.userinfo \
+            or url.port not in (None, 443) or not url.path.startswith(f"{GRAPH_V1}/"):
+        return None
+    return url
+
+
 def _status_refusal(step: str, status: int) -> Refused:
     """The refusal for a Graph answer that is not a 200. Status only."""
     if status == 401:
@@ -274,11 +302,17 @@ class SharePointFile:
             self._expiry = None
 
     async def _get(self, step: str, path: str, **params: str) -> dict[str, Any]:
+        return await self._read(step, f"{GRAPH_V1}{path}", params or None)
+
+    async def _read(self, step: str, url: str | httpx.URL,
+                    params: dict[str, str] | None) -> dict[str, Any]:
+        """One Graph GET: a path below ``/v1.0``, or a paging link already
+        checked by :func:`_graph_link`. Failures are refusals with a code."""
         from agents.client_credentials import ClientCredentialsError
         from agents.destination import DestinationError
 
         try:
-            r = await self._http.get(f"{GRAPH_V1}{path}", params=params or None)
+            r = await self._http.get(url, params=params)
         except DestinationError as e:
             logger.warning("builtin:sharepoint: destination failed (%s)", type(e).__name__)
             raise Refused("destination_error", "the BTP destination could not be used",
@@ -320,8 +354,30 @@ class SharePointFile:
             **{"$select": "id,name", "$top": "200"},
         )
         wanted = self.library.casefold()
-        found = [d.get("id") for d in drives.get("value") or []
-                 if isinstance(d, dict) and str(d.get("name") or "").casefold() == wanted]
+        found: list[Any] = []
+        for page in range(1, MAX_DRIVE_PAGES + 1):
+            found += [d.get("id") for d in drives.get("value") or []
+                      if isinstance(d, dict) and str(d.get("name") or "").casefold() == wanted]
+            # A name found on the pages read so far is the answer, as it was
+            # before paging: no further page is read for it.
+            if found:
+                break
+            link = drives.get("@odata.nextLink")
+            if link is None:
+                break
+            url = _graph_link(link)
+            if url is None:
+                # Never the link: it may name another host or carry a token.
+                logger.warning("builtin:sharepoint: a paging link of the libraries was "
+                               "not followed (not https on Graph)")
+                break
+            if page == MAX_DRIVE_PAGES:
+                logger.warning("builtin:sharepoint: library not among the first %d pages "
+                               "of the site's libraries; the rest is not read",
+                               MAX_DRIVE_PAGES)
+                break
+            # The link carries the query of the first request already.
+            drives = await self._read("site", url, None)
         if len(found) != 1 or not isinstance(found[0], str) or not found[0]:
             raise Refused("library_not_found",
                           "the site has no document library of the configured name", _ADMIN)
@@ -419,7 +475,10 @@ class SharePointFile:
                 return cached[2], modified
             url = self._checked_download_url(item.get("@microsoft.graph.downloadUrl"))
             data = await self._download(url)
-            check_archive(data)
+            # Reads the zip directory of up to 20 MB: CPU work, kept off the
+            # event loop. Still before the bytes are cached, with the same
+            # refusals (the readers check again in their own thread).
+            await asyncio.to_thread(check_archive, data)
             self._keep(etag, data)
             return data, modified
 

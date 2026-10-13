@@ -142,6 +142,7 @@ const NOTE_KEYS: Record<string, string> = {
 
 /** The warning for a non-fatal `error` frame; an unknown code shows the server's message. */
 export function runNoteText(data: ErrorEventData, text: TextLookup): string {
-    const key = data.code ? NOTE_KEYS[data.code] : undefined;
+    // Own properties only, as in gateErrorText: "constructor" is no note code.
+    const key = data.code && Object.prototype.hasOwnProperty.call(NOTE_KEYS, data.code) ? NOTE_KEYS[data.code] : undefined;
     return key ? text(key) : data.message || "";
 }

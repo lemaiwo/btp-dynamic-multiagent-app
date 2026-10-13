@@ -36,6 +36,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -62,6 +63,19 @@ PORTAL = "https://apps.support.sap.com/sap/bc/bsp/svt/sapping"
 NOTE = "https://origin.notesdownloads.sap.com/note/0040000000874972019"
 
 
+def _location_host(value: str) -> str:
+    """The host a redirect points to, and nothing else of it.
+
+    A SAML redirect carries a request, a relay state or a session id in its
+    query; the host is all a person needs to tell where the login went. A
+    relative or unparseable ``Location`` shows as empty.
+    """
+    try:
+        return (urlsplit(value).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
 def _redact(user: str) -> str:
     return f"{user[0]}***{user[-1]}" if len(user) > 1 else "***"
 
@@ -77,7 +91,7 @@ async def attempt(
     r = await client.get(url, auth=auth, follow_redirects=False)
     print(f"  status      {r.status_code}")
     print(f"  www-auth    {r.headers.get('www-authenticate', '')[:70]!r}")
-    print(f"  location    {r.headers.get('location', '')[:70]}")
+    print(f"  location    {_location_host(r.headers.get('location', ''))}")
     print(f"  content     {r.headers.get('content-type')}  ({len(r.content)} bytes)")
     # Save BEFORE printing anything derived from the body. The payload is
     # binary and this console is cp1252, so a display bug raises
