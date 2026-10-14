@@ -1876,7 +1876,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   waits up to 300 s; an `AICORE_ENSURE_TIMEOUT` above about 800 s needs a
   higher value in the `.mtaext`), and a `builtin:jira` entry needs a
   `project` at every save (an existing row without one keeps running, with a
-  WARNING, until an admin sets it)
+  WARNING, until an admin sets it); 2.25.0 is the invoke API release
+  (`agents/invoke.py`): no new resource and no new environment variable
+  (`INVOKE_TIMEOUT_SECONDS`, `INVOKE_MAX_CONCURRENT` and
+  `INVOKE_UPLOAD_TIMEOUT_SECONDS` have defaults and are not in the
+  descriptor), but `xs-security.json` gains the `invoke` scope, role
+  template `AgentInvoker` and role collection `Agent Invoker` (the deploy
+  updates `uaa-service`; the collection is assigned per landscape),
+  `approuter/xs-app.json` the `/api/invoke/...` route, and `agent_configs`
+  three columns plus the index `ix_odata_audit_log_run_id` (HANA schema
+  generation 3: the HDI deploy alters the table in place, nothing is
+  undeployed, no `HANA_HDI_ALLOW_DROP`)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
