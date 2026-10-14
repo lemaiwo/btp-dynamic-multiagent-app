@@ -1038,3 +1038,32 @@ async def test_the_cancel_record_never_overwrites_an_outcome():
     assert (done.status, done.error) == ("success", None)
     assert (live.status, live.error) == ("interrupted", "canceled: the run was cancelled")
     assert live.finished_at is not None
+
+
+# ---------------------------------------------------------------------------
+# A result accepted before the run failed is not lost
+# ---------------------------------------------------------------------------
+async def test_a_run_that_fails_after_the_result_keeps_it(client, monkeypatch):
+    async def submits_then_explodes(sp, submit):
+        assert await submit(result={"expense_id": "4711", "status": "draft"}) == {"ok": True}
+        raise RuntimeError("the model endpoint refused the next request")
+
+    use_specialist(monkeypatch, Specialist(submits_then_explodes))
+    await make_agent()
+    answer = (await client.post(f"/api/invoke/{SLUG}?wait=5", **form())).json()
+    assert (answer["status"], answer["error"]) == ("failed", "run_failed")
+    assert answer["result"] == {"expense_id": "4711", "status": "draft"}
+    assert answer["text"] is None
+
+
+async def test_a_run_that_times_out_after_the_result_keeps_it(client, monkeypatch):
+    async def submits_then_hangs(sp, submit):
+        await submit(result={"expense_id": "4711", "status": "draft"})
+        await asyncio.Event().wait()
+
+    use_specialist(monkeypatch, Specialist(submits_then_hangs))
+    monkeypatch.setattr(invoke, "INVOKE_TIMEOUT_SECONDS", 0.05)
+    await make_agent()
+    answer = (await client.post(f"/api/invoke/{SLUG}?wait=5", **form())).json()
+    assert (answer["status"], answer["error"]) == ("failed", "timeout")
+    assert answer["result"] == {"expense_id": "4711", "status": "draft"}
