@@ -38,13 +38,17 @@ are counted conservatively (``count_pdf_pages``). The files reach the model
 as pydantic-ai ``BinaryContent`` (proved for the OpenAI-compatible and the
 Bedrock route by ``scripts/probe_attachments.py``).
 
-Result. The specialist gets a ``submit_result(result)`` tool for this run
-only (passed to ``Agent.run(toolsets=...)``, never registered in the
-registry build). It checks the object against the agent's ``result_schema``
-(``agents/invoke_config.py``) and answers a violation to the model as an
-``error`` it can correct; the first valid call wins. A run that ends without
-one is ``failed`` with ``no_result``: the caller never reads a result the
-model only talked about.
+Result. The specialist gets ``submit_result(result)`` as the OUTPUT tool of
+this run (``Agent.run(output_type=[ToolOutput(...), str])``, never registered
+in the registry build): a valid call ends the run, so the model is not asked
+for anything after the hand-in (a model that answers nothing then, as
+``gpt-5.6-terra`` did, ends the run all the same). The tool checks the object
+against the agent's ``result_schema`` (``agents/invoke_config.py``) and
+answers a violation as a ``ModelRetry`` the model can correct, at most
+``RESULT_RETRIES`` times. A run that ends with text instead is ``failed``
+with ``no_result``: the caller never reads a result the model only talked
+about. ``text`` is the text the model wrote in the response that carried the
+hand-in, if any.
 
 Writes. ``recording(run_id)`` binds the run's id (``current_run_id``), which
 ``builtin:odata`` writes into every audit row of the run, peers and deep
@@ -79,8 +83,9 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic_ai.messages import BinaryContent
-from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai import ModelRetry
+from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
+from pydantic_ai.output import ToolOutput
 from sqlalchemy import select, update
 from starlette.requests import ClientDisconnect
 
@@ -510,47 +515,58 @@ def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, **extra}}
 
 
-def result_toolset(box: ResultBox) -> FunctionToolset:
-    """The ``submit_result`` tool of one run, bound to ``box``."""
+RESULT_RETRIES = 5
+
+
+def result_output(box: ResultBox) -> ToolOutput:
+    """The ``submit_result`` output tool of one run, bound to ``box``: a valid
+    call ends the run with the result; a refused one is a ``ModelRetry``."""
     schema_text = (
         "\n\nThe result must match this JSON schema:\n" + json.dumps(box.schema)
         if box.schema is not None else ""
     )
     description = (
-        "Hand in the structured result of this request. Call it exactly once, "
-        "when the work is done, with the result object; a request is only "
-        "answered through this tool. If it answers an error, correct the "
+        "Hand in the structured result of this request. Call it once, when "
+        "the work is done, with the result object; a request is only answered "
+        "through this tool and the call ends it. If it is refused, correct the "
         "object and call it again." + schema_text
     )
 
-    async def submit_result(result: dict[str, Any]) -> dict[str, Any]:
-        if box.result is not None:
-            return _error("already_submitted",
-                          "A result was already accepted for this request.")
+    def submit_result(result: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(result, dict):
-            return _error("schema_violation", "The result must be a JSON object.")
+            raise ModelRetry("The result must be a JSON object.")
         try:
             # allow_nan=False: NaN / Infinity are no JSON, and the poll answer
             # (JSONResponse) would refuse to serialise a stored one.
             size = len(json.dumps(result, allow_nan=False))
         except (TypeError, ValueError):
-            return _error("schema_violation",
-                          "The result must be plain JSON (no NaN or Infinity).")
+            raise ModelRetry("The result must be plain JSON (no NaN or Infinity).") from None
         if size > MAX_RESULT_CHARS:
-            return _error("result_too_large",
-                          f"The result is longer than {MAX_RESULT_CHARS} characters.")
+            raise ModelRetry(f"The result is longer than {MAX_RESULT_CHARS} characters.")
         if box.schema is not None:
             problems = validate_result(box.schema, result)
             if problems:
-                return _error("schema_violation",
-                              "The result does not match the schema.", problems=problems)
+                raise ModelRetry("The result does not match the schema: "
+                                 + "; ".join(problems))
         box.result = json.loads(json.dumps(result))
-        return {"ok": True}
+        return box.result
 
-    toolset: FunctionToolset = FunctionToolset()
-    toolset.add_function(submit_result, takes_ctx=False, name="submit_result",
-                         description=description)
-    return toolset
+    return ToolOutput(submit_result, name="submit_result", description=description,
+                      max_retries=RESULT_RETRIES)
+
+
+def _final_text(result: Any) -> str | None:
+    """The model's text: a text answer, or what it wrote next to the hand-in."""
+    if isinstance(result.output, str):
+        return result.output
+    # The last message is the tool return of the hand-in ("Final result
+    # processed."); the response that carried the call is before it.
+    for message in reversed(result.all_messages()):
+        if isinstance(message, ModelResponse):
+            texts = [p.content for p in message.parts
+                     if isinstance(p, TextPart) and p.content]
+            return "\n\n".join(texts) if texts else None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -704,17 +720,17 @@ async def _attempt(agent_id: int, principal: str, text: str,
     ]
     result = await specialist.run(
         prompt,
-        output_type=str,
-        toolsets=[result_toolset(box)],
+        output_type=[result_output(box), str],
         usage_limits=run_usage_limits(),
         event_stream_handler=_make_progress_handler(agent.name),
     )
-    final = result.output if isinstance(result.output, str) else str(result.output)
-    report = {"text": final, "result": box.result}
+    text = _final_text(result)
+    report = {"text": text, "result": box.result}
+    summary = (text or "")[:SUMMARY_CHARS]
     if box.result is None:
-        return {"status": "failed", "summary": final[:SUMMARY_CHARS], "report": report,
+        return {"status": "failed", "summary": summary, "report": report,
                 "error": "no_result: the run ended without a valid submit_result"}
-    return {"status": "success", "summary": final[:SUMMARY_CHARS], "report": report}
+    return {"status": "success", "summary": summary, "report": report}
 
 
 # ---------------------------------------------------------------------------

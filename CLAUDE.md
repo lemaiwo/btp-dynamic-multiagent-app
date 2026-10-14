@@ -1642,13 +1642,20 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   run); invoke rows do not count as the scheduler's overlap lock
   (`active_job_run`), are left out of the admin notifications and have no
   markdown report (`report.md` answers 404; `report_json` is `{text,
-  result}`). The specialist gets `submit_result(result)` for this run only
-  (`Agent.run(toolsets=[...])`, never in the registry build), checked
-  against the agent's `result_schema`; a violation (NaN included) goes back
-  to the model as `schema_violation`, the first valid call wins, and a run
-  that ends without one is `failed` with `no_result`; a run that fails or
-  times out AFTER a result was accepted answers `failed` with its code AND
-  that `result` (`text` null): the hand-in is not lost to the caller. A task cancelled
+  result}`). The specialist gets `submit_result(result)` as the OUTPUT tool
+  of this run (`Agent.run(output_type=[ToolOutput(...), str])`, never in
+  the registry build): a valid call ENDS the run, so the model is never
+  asked for anything after the hand-in (with a run-only function tool,
+  `gpt-5.6-terra` answered nothing after it, three times, and the run
+  failed). The object is checked against the agent's `result_schema`; a
+  violation (NaN included) goes back to the model as a `ModelRetry` naming
+  the rule, at most `RESULT_RETRIES` (5) times; a run that ends with text
+  instead is `failed` with `no_result`; `text` is what the model wrote in
+  the response that carried the hand-in (usually nothing). A run that
+  fails or times out AFTER a result was accepted answers `failed` with its
+  code AND that `result`: the hand-in is not lost to the caller. The
+  hand-in is not a tool event in `activity` (output tools emit none); the
+  result itself is the evidence. A task cancelled
   before its first step is closed by a done callback whose `interrupted`
   write is conditional on `status = 'running'`, so it never overwrites a
   stored outcome. `writes` are the `odata_audit_log` rows of the run
@@ -1897,7 +1904,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   landscape test of the invoke API: an empty model response is no longer
   replayed as `content: null` (`SAPAICoreModel._map_messages`), and a run
   that fails after `submit_result` keeps the accepted result in its
-  answer; no descriptor change besides the version
+  answer; no descriptor change besides the version; 2.25.2 makes
+  `submit_result` the run's output tool (a valid hand-in ends the run;
+  the same model answered nothing after a run-only function tool and the
+  run still failed on 2.25.1), no descriptor change besides the version
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -2036,7 +2046,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    body is read into memory and each file checked (magic bytes, limits,
    PDF pages) -> a `job_runs` row with `trigger="invoke"` -> the specialist
    runs under the caller's JWT and principal with the files as
-   `BinaryContent` and a run-only `submit_result` tool -> the outcome is
+   `BinaryContent` and `submit_result` as the run's output tool -> the outcome is
    written -> `GET /api/invoke/runs/{run_id}` answers result, the OData
    writes of the run (audit rows by `run_id`), text, activity and error to
    that caller only

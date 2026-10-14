@@ -7,9 +7,10 @@ request is the same local principal). One test drives the real app, so the
 include line in ``app.py`` and the scope dependency are covered too.
 
 The specialist is a fake set on ``invoke.registry``: it receives the prompt
-and the per-run ``submit_result`` toolset exactly as ``Agent.run`` would, and
-calls the tool's function. One test runs a real pydantic-ai ``Agent`` on a
-``FunctionModel`` to prove ``toolsets=`` and ``BinaryContent`` on 1.72.
+and the per-run ``submit_result`` output tool exactly as ``Agent.run`` would,
+and calls the tool's function (a refusal is a ``ModelRetry``). One test runs
+a real pydantic-ai ``Agent`` on a ``FunctionModel`` to prove the output tool
+ends the run and ``BinaryContent`` reaches the model on 1.72.
 
 Run:  .venv/bin/python -m pytest tests/test_invoke_api.py -q
 """
@@ -95,16 +96,20 @@ class Specialist:
 
     async def run(self, prompt, **kwargs):
         self.calls.append((prompt, kwargs))
-        submit = kwargs["toolsets"][0].tools["submit_result"].function
+        out = kwargs["output_type"][0]
+        assert out.name == "submit_result" and kwargs["output_type"][1] is str
+        submit = out.output
         self.seen_principal = current_principal.get()
         self.seen_jwt = current_jwt.get()
-        return SimpleNamespace(output=await self.behaviour(self, submit))
+        return SimpleNamespace(output=await self.behaviour(self, submit),
+                               all_messages=lambda: [])
 
 
-async def submits_valid(sp: Specialist, submit) -> str:
-    answer = await submit(result={"expense_id": "4711", "status": "draft"})
-    assert answer == {"ok": True}
-    return "Created draft expense 4711 from the receipt."
+async def submits_valid(sp: Specialist, submit) -> dict:
+    # A valid hand-in ends the run: the output IS the result.
+    answer = submit(result={"expense_id": "4711", "status": "draft"})
+    assert answer == {"expense_id": "4711", "status": "draft"}
+    return answer
 
 
 async def never_submits(sp: Specialist, submit) -> str:
@@ -113,7 +118,7 @@ async def never_submits(sp: Specialist, submit) -> str:
 
 async def blocks(sp: Specialist, submit) -> str:
     await sp.release.wait()
-    await submit(result={"expense_id": "1", "status": "draft"})
+    submit(result={"expense_id": "1", "status": "draft"})
     return "done"
 
 
@@ -220,21 +225,21 @@ async def test_202_then_poll_completes_with_the_result(client, monkeypatch):
     answer = await wait_done(client, r.json()["run_id"])
     assert answer["status"] == "completed" and answer["error"] is None
     assert answer["result"] == {"expense_id": "4711", "status": "draft"}
-    assert answer["text"] == "Created draft expense 4711 from the receipt."
+    assert answer["text"] is None
     assert set(answer) == {"status", "result", "writes", "text", "activity", "error"}
     # The run is the caller's: their principal and JWT, no run-as.
     assert (sp.seen_principal, sp.seen_jwt) == (ALICE, f"jwt-of-{ALICE}")
     prompt, kwargs = sp.calls[0]
     assert prompt[-1] == "Book this receipt"
     assert prompt[0].media_type == "image/png" and prompt[0].data == PNG_BYTES
-    assert kwargs["output_type"] is str
+    assert kwargs["output_type"][1] is str and "toolsets" not in kwargs
     async with SessionLocal() as s:
         row = await s.get(JobRun, r.json()["run_id"])
     # The row outlives the deadline by a margin, so a stale sweep never takes
     # a live run.
     assert (row.trigger, row.created_by, row.timeout_seconds) == ("invoke", ALICE, 360)
     assert json.loads(row.report_json) == {"text": answer["text"], "result": answer["result"]}
-    assert row.summary == answer["text"][:200]
+    assert (row.summary or "") == ""
 
 
 async def test_wait_answers_200_with_the_poll_answer(client, monkeypatch):
@@ -273,35 +278,36 @@ async def test_a_run_without_submit_result_fails_with_no_result(client, monkeypa
 
 
 async def test_a_schema_violation_goes_back_to_the_model(client, monkeypatch):
-    answers: list[dict] = []
+    from pydantic_ai import ModelRetry
+
+    answers: list[Any] = []
 
     async def corrects(sp, submit):
-        answers.append(await submit(result={"expense_id": 4711, "status": "posted",
-                                            "extra_secret": "x"}))
-        answers.append(await submit(result={"status": "draft"}))
-        answers.append(await submit(result={"expense_id": "4711", "status": "draft"}))
-        answers.append(await submit(result={"expense_id": "4712", "status": "draft"}))
-        return "ok"
+        for attempt in ({"expense_id": 4711, "status": "posted", "extra_secret": "x"},
+                        {"status": "draft"},
+                        {"expense_id": "4711", "status": "draft"}):
+            try:
+                answers.append(submit(result=attempt))
+            except ModelRetry as refusal:
+                answers.append(str(refusal))
+        return answers[-1]
 
     use_specialist(monkeypatch, Specialist(corrects))
     await make_agent()
     answer = (await client.post(f"/api/invoke/{SLUG}?wait=5", **form())).json()
-    first, second, third, fourth = answers
-    assert first["error"]["code"] == "schema_violation"
-    assert "$.expense_id: must be of type string" in first["error"]["problems"]
-    assert "$.status: must be one of the allowed values" in first["error"]["problems"]
-    assert not any("extra_secret" in p for p in first["error"]["problems"])
-    assert second["error"]["problems"] == ["$.expense_id: is required"]
-    assert third == {"ok": True}
-    assert fourth["error"]["code"] == "already_submitted"
-    # First valid call wins.
+    first, second, third = answers
+    assert first.startswith("The result does not match the schema: ")
+    assert "$.expense_id: must be of type string" in first
+    assert "$.status: must be one of the allowed values" in first
+    assert "extra_secret" not in first
+    assert second == "The result does not match the schema: $.expense_id: is required"
+    assert third == {"expense_id": "4711", "status": "draft"}
     assert answer["status"] == "completed" and answer["result"]["expense_id"] == "4711"
 
 
 async def test_an_agent_without_a_schema_accepts_any_object(client, monkeypatch):
     async def any_obj(sp, submit):
-        assert await submit(result={"anything": [1, 2]}) == {"ok": True}
-        return "ok"
+        return submit(result={"anything": [1, 2]})
 
     use_specialist(monkeypatch, Specialist(any_obj))
     await make_agent(result_schema=None)
@@ -587,7 +593,7 @@ async def test_the_run_binds_its_id_for_the_audit(client, monkeypatch):
 
     async def looks(sp, submit):
         seen.append(current_run_id.get())
-        await submit(result={"expense_id": "1", "status": "draft"})
+        submit(result={"expense_id": "1", "status": "draft"})
         return "ok"
 
     use_specialist(monkeypatch, Specialist(looks))
@@ -670,30 +676,45 @@ async def test_the_real_app_serves_the_routes(monkeypatch):
 
 @pytest.mark.usefixtures("real_agents_and_mcp")
 async def test_a_real_agent_gets_the_tool_and_the_attachment():
-    """pydantic-ai 1.72: ``Agent.run(toolsets=[...])`` adds the tool for the
-    run only, and ``BinaryContent`` reaches the model as a user part."""
+    """pydantic-ai 1.72: ``Agent.run(output_type=[ToolOutput, str])`` adds the
+    output tool for the run only, a valid call ENDS the run (the model is not
+    asked again), a refused one goes back as a retry, and ``BinaryContent``
+    reaches the model as a user part."""
     from pydantic_ai import Agent
-    from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.messages import (
+        BinaryContent,
+        ModelResponse,
+        RetryPromptPart,
+        TextPart,
+        ToolCallPart,
+    )
     from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-    seen: dict[str, Any] = {}
+    seen: dict[str, Any] = {"requests": 0}
 
     def model(messages, info: AgentInfo):
-        seen.setdefault("tools", [t.name for t in info.function_tools])
+        seen["requests"] += 1
+        seen.setdefault("tools", [t.name for t in info.output_tools])
         seen.setdefault("parts", messages[0].parts)
         if len(messages) == 1:
             return ModelResponse(parts=[ToolCallPart(
-                "submit_result", {"result": {"expense_id": "1", "status": "draft"}})])
-        return ModelResponse(parts=[TextPart("done")])
+                "submit_result", {"result": {"expense_id": 1, "status": "draft"}})])
+        retry = messages[-1].parts[-1]
+        assert isinstance(retry, RetryPromptPart)
+        assert "$.expense_id: must be of type string" in retry.content
+        return ModelResponse(parts=[TextPart("here it is"), ToolCallPart(
+            "submit_result", {"result": {"expense_id": "1", "status": "draft"}})])
 
     agent = Agent(FunctionModel(model))
     box = invoke.ResultBox(schema=SCHEMA)
     result = await agent.run(
         [BinaryContent(data=PNG_BYTES, media_type="image/png"), "go"],
-        toolsets=[invoke.result_toolset(box)], output_type=str,
+        output_type=[invoke.result_output(box), str],
     )
-    assert result.output == "done"
+    assert result.output == {"expense_id": "1", "status": "draft"}
     assert box.result == {"expense_id": "1", "status": "draft"}
+    assert seen["requests"] == 2
+    assert invoke._final_text(result) == "here it is"
     assert "submit_result" in seen["tools"]
     content = seen["parts"][-1].content
     assert isinstance(content[0], BinaryContent) and content[1] == "go"
@@ -847,17 +868,16 @@ async def test_expose_invoke_is_on_only_for_the_boolean_true():
 
 
 async def test_a_nan_result_is_refused_and_the_poll_still_answers(client, monkeypatch):
-    answers: list[dict] = []
+    from pydantic_ai import ModelRetry
 
     async def nan(sp, submit):
-        answers.append(await submit(result={"expense_id": float("nan"), "status": "draft"}))
-        answers.append(await submit(result={"expense_id": "1", "status": "draft"}))
-        return "ok"
+        with pytest.raises(ModelRetry, match="plain JSON"):
+            submit(result={"expense_id": float("nan"), "status": "draft"})
+        return submit(result={"expense_id": "1", "status": "draft"})
 
     use_specialist(monkeypatch, Specialist(nan))
     await make_agent(result_schema=None)
     r = await client.post(f"/api/invoke/{SLUG}?wait=5", **form())
-    assert answers[0]["error"]["code"] == "schema_violation" and answers[1] == {"ok": True}
     assert r.status_code == 200 and r.json()["result"] == {"expense_id": "1", "status": "draft"}
 
 
@@ -1045,7 +1065,7 @@ async def test_the_cancel_record_never_overwrites_an_outcome():
 # ---------------------------------------------------------------------------
 async def test_a_run_that_fails_after_the_result_keeps_it(client, monkeypatch):
     async def submits_then_explodes(sp, submit):
-        assert await submit(result={"expense_id": "4711", "status": "draft"}) == {"ok": True}
+        assert submit(result={"expense_id": "4711", "status": "draft"}) == {"ok": True}
         raise RuntimeError("the model endpoint refused the next request")
 
     use_specialist(monkeypatch, Specialist(submits_then_explodes))
@@ -1058,7 +1078,7 @@ async def test_a_run_that_fails_after_the_result_keeps_it(client, monkeypatch):
 
 async def test_a_run_that_times_out_after_the_result_keeps_it(client, monkeypatch):
     async def submits_then_hangs(sp, submit):
-        await submit(result={"expense_id": "4711", "status": "draft"})
+        submit(result={"expense_id": "4711", "status": "draft"})
         await asyncio.Event().wait()
 
     use_specialist(monkeypatch, Specialist(submits_then_hangs))
