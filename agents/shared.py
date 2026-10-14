@@ -459,6 +459,23 @@ class SAPAICoreModel(OpenAIChatModel):
     def _get_stream_options(self, model_settings: OpenAIChatModelSettings):
         return OMIT
 
+    async def _map_messages(self, messages, model_request_parameters):
+        """Leave out an assistant message that carries neither text nor a tool call.
+
+        A model response without any part (or with thinking only) stays in
+        pydantic-ai's history, which asks the model again; the chat mapping
+        turns it into ``{"role": "assistant", "content": null}`` without
+        ``tool_calls``, and the OpenAI-compatible endpoint refuses that
+        replay (seen with ``gpt-5.6-terra``: "Invalid value for 'content':
+        expected a string, got null"), failing the whole run.
+        """
+        mapped = await super()._map_messages(messages, model_request_parameters)
+        return [
+            m for m in mapped
+            if not (m.get("role") == "assistant"
+                    and m.get("content") is None and not m.get("tool_calls"))
+        ]
+
     def _get_tools(self, model_request_parameters):
         tools = super()._get_tools(model_request_parameters)
         return [self._clean_tool(t) for t in tools]

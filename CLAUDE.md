@@ -252,7 +252,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `AICORE_MAX_RETRIES` times (default 8, about 40 s of backoff, so a
   per-minute rate limit can clear; `0` switches retries off; read when a
   model is built, and models are cached per name, so a change needs a
-  restart; `tests/test_model_retries.py`). A remote MCP URL can be
+  restart; `tests/test_model_retries.py`). `SAPAICoreModel._map_messages`
+  leaves an assistant message with neither text nor a tool call out of the
+  payload: a model response without any part stays in pydantic-ai's history
+  (it asks again), and the endpoint refuses its replay as `content: null`
+  (seen with `gpt-5.6-terra`: "expected a string, got null"), which failed
+  the whole run (`tests/test_model_empty_response.py`). A remote MCP URL can be
   reached through a BTP destination (`auth_mode="destination"`,
   `_destination_mcp_server`): the destination names the host and holds the
   credential, as the signed-in user when `user_context` is true; no JWT bound
@@ -1641,7 +1646,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   (`Agent.run(toolsets=[...])`, never in the registry build), checked
   against the agent's `result_schema`; a violation (NaN included) goes back
   to the model as `schema_violation`, the first valid call wins, and a run
-  that ends without one is `failed` with `no_result`. A task cancelled
+  that ends without one is `failed` with `no_result`; a run that fails or
+  times out AFTER a result was accepted answers `failed` with its code AND
+  that `result` (`text` null): the hand-in is not lost to the caller. A task cancelled
   before its first step is closed by a done callback whose `interrupted`
   write is conditional on `status = 'running'`, so it never overwrites a
   stored outcome. `writes` are the `odata_audit_log` rows of the run
@@ -1886,7 +1893,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `approuter/xs-app.json` the `/api/invoke/...` route, and `agent_configs`
   three columns plus the index `ix_odata_audit_log_run_id` (HANA schema
   generation 3: the HDI deploy alters the table in place, nothing is
-  undeployed, no `HANA_HDI_ALLOW_DROP`)
+  undeployed, no `HANA_HDI_ALLOW_DROP`); 2.25.1 is the fix of the first
+  landscape test of the invoke API: an empty model response is no longer
+  replayed as `content: null` (`SAPAICoreModel._map_messages`), and a run
+  that fails after `submit_result` keeps the accepted result in its
+  answer; no descriptor change besides the version
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

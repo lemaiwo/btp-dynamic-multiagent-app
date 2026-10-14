@@ -646,12 +646,13 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
     the row ``running``. The row's own timeout is the deadline plus
     ``ROW_TIMEOUT_MARGIN_SECONDS``, so a stale sweep never takes a live run.
     """
+    box = ResultBox(schema=None)
     try:
         for item in attachments:
             activity.record_attachment(item.name, item.media_type, item.size)
         async with asyncio.timeout(INVOKE_TIMEOUT_SECONDS) as deadline:
             try:
-                outcome = await _attempt(agent_id, principal, text, attachments)
+                outcome = await _attempt(agent_id, principal, text, attachments, box)
             except TimeoutError:
                 if deadline.expired():
                     raise
@@ -667,13 +668,22 @@ async def _execute(run_id: str, activity: Any, agent_id: int, principal: str, te
         logger.warning("Invoke run %s of agent id %s failed (%s)",
                        run_id, agent_id, type(exc).__name__)
         outcome = {"status": "failed", "error": f"run_failed: {describe_exception(exc)}"}
+    if outcome["status"] == "failed" and "report" not in outcome and box.result is not None:
+        # The result was handed in before the run failed (the model endpoint
+        # refused a later request, the deadline passed): the caller still gets
+        # it, with the failure; `writes` are read from the audit log anyway.
+        outcome["report"] = {"text": None, "result": box.result}
     await _finalize(run_id, **outcome)
     state.finalized = True
 
 
 async def _attempt(agent_id: int, principal: str, text: str,
-                   attachments: list[Attachment]) -> dict[str, Any]:
-    """The run itself; answers the keyword arguments of the outcome."""
+                   attachments: list[Attachment], box: ResultBox) -> dict[str, Any]:
+    """The run itself; answers the keyword arguments of the outcome.
+
+    ``box`` is the caller's: a result accepted before a failure stays
+    readable there.
+    """
     async with SessionLocal() as session:
         agent = await session.get(AgentConfig, agent_id)
     if agent is None:
@@ -687,7 +697,7 @@ async def _attempt(agent_id: int, principal: str, text: str,
     specialist = registry.build.specialists.get(agent.name)
     if specialist is None:
         return {"status": "failed", "error": "agent_not_built: the agent is not built"}
-    box = ResultBox(schema=loads_or_none(agent.result_schema_json))
+    box.schema = loads_or_none(agent.result_schema_json)
     prompt: list[Any] = [
         *(BinaryContent(data=a.data, media_type=a.media_type) for a in attachments),
         text,
