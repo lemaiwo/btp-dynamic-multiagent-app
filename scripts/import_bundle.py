@@ -12,6 +12,15 @@ prints a secret. Two modes:
         to feed /admin -> Import on a landscape this machine cannot reach
         directly, then delete the file.
 
+Agents are written one by one, each in its own commit, through the storage
+gate (``upsert_agent``). A refused agent is rolled back, reported as
+``FAIL   agent <name>: <rule>`` (the rule names the field, never the value) and
+skipped; the others are still imported, and the script exits 1. That differs
+from ``POST /admin/api/import``, which writes nothing at all when any entry is
+refused (one transaction, all-or-nothing). ``expose_invoke`` must be a JSON
+boolean here: the HTTP import's lax boolean reads the string "true" as true,
+so the script refuses any other value rather than silently storing "off".
+
 Secrets come from --secrets (a Google client_secret_*.json, or a flat
 {"<url>": {"client_secret": "..."}} map). Without it, the repo root is searched
 for a client_secret_*.json, which covers builtin:gmail.
@@ -65,7 +74,18 @@ def fill_secrets(bundle: dict, secrets_file: Path | None) -> list[str]:
     return missing
 
 
-async def import_bundle(bundle: dict) -> None:
+EXPOSE_INVOKE_NOT_BOOLEAN = "expose_invoke: must be a JSON boolean (true or false)"
+
+
+async def import_bundle(bundle: dict) -> list[str]:
+    """Import the bundle; answers the names of the agents that were refused.
+
+    Every agent is written (and committed) on its own through
+    ``upsert_agent``, the storage gate: a refused agent (a ``ValueError``, for
+    example an invoke ``result_schema`` outside the supported subset) is
+    rolled back, reported with the gate's text (which names the field and the
+    rule, never the value) and skipped; the others are still imported.
+    """
     from agents.db import (  # noqa: PLC0415 - after sys.path setup
         SessionLocal,
         init_db,
@@ -74,6 +94,7 @@ async def import_bundle(bundle: dict) -> None:
     )
 
     await init_db()
+    failed: list[str] = []
     async with SessionLocal() as session:
         for skill in bundle.get("skills") or []:
             await upsert_skill(
@@ -84,22 +105,40 @@ async def import_bundle(bundle: dict) -> None:
             )
             print(f"  skill  {skill['name']}")
         for agent in bundle.get("agents") or []:
-            await upsert_agent(
-                session,
-                name=agent["name"],
-                description=agent["description"],
-                instructions=agent["instructions"],
-                mcp_servers=agent["mcp_servers"],
-                skills=agent.get("skills") or [],
-                enabled=agent.get("enabled", True),
-                expose_chat=agent.get("expose_chat", True),
-                expose_api=agent.get("expose_api", False),
-                api_slug=agent.get("api_slug") or None,
-                run_prompt=agent.get("run_prompt") or None,
-                run_timeout_seconds=agent.get("run_timeout_seconds", 1800),
-            )
+            if "expose_invoke" in agent and not isinstance(agent["expose_invoke"], bool):
+                failed.append(agent["name"])
+                print(f"  FAIL   agent {agent['name']}: {EXPOSE_INVOKE_NOT_BOOLEAN}")
+                continue
+            try:
+                await upsert_agent(
+                    session,
+                    name=agent["name"],
+                    description=agent["description"],
+                    instructions=agent["instructions"],
+                    mcp_servers=agent["mcp_servers"],
+                    skills=agent.get("skills") or [],
+                    enabled=agent.get("enabled", True),
+                    expose_chat=agent.get("expose_chat", True),
+                    expose_api=agent.get("expose_api", False),
+                    api_slug=agent.get("api_slug") or None,
+                    run_prompt=agent.get("run_prompt") or None,
+                    run_timeout_seconds=agent.get("run_timeout_seconds", 1800),
+                    # Invoke API settings: a bundle without the key keeps what
+                    # is stored (an older export carries none of them).
+                    # `upsert_agent` checks schema and limits and stores the
+                    # switch only for the JSON boolean true.
+                    **{key: agent[key] for key in (
+                        "expose_invoke", "result_schema", "invoke_limits",
+                    ) if key in agent},
+                )
+            except ValueError as e:
+                await session.rollback()
+                failed.append(agent["name"])
+                print(f"  FAIL   agent {agent['name']}: {e}")
+                continue
             print(f"  agent  {agent['name']}")
         await session.commit()
+    return failed
 
 
 def main() -> int:
@@ -120,7 +159,9 @@ def main() -> int:
         print(f"  WARN   no client_secret for {entry}", file=sys.stderr)
 
     if args.out:
-        args.out.write_text(json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        args.out.write_text(
+            json.dumps(bundle, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
         print(f"  wrote  {args.out}  (contains secrets -- delete after use)")
         return 0
 
@@ -131,9 +172,9 @@ def main() -> int:
     # The URL holds the database password; this output ends up in terminals
     # and CI logs.
     print(f"  db     {make_url(DATABASE_URL).render_as_string(hide_password=True)}")
-    asyncio.run(import_bundle(bundle))
+    failed = asyncio.run(import_bundle(bundle))
     print("  done   restart or reload the app to pick this up")
-    return 1 if missing else 0
+    return 1 if missing or failed else 0
 
 
 if __name__ == "__main__":

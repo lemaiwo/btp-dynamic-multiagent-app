@@ -519,6 +519,25 @@
                     <input type="text" id="agent-api-slug" placeholder="daily-check" oninput="updateEndpointHint()">
                 </label>
                 <p class="hint" id="agent-endpoint-hint">Endpoint: <code>POST /api/agents/&lt;slug&gt;/run</code></p>
+                <label><input type="checkbox" id="agent-expose-invoke" onchange="updateEndpointHint()"> Expose to the invoke API</label>
+                <p class="hint" id="agent-invoke-hint">Endpoint: <code>POST /api/invoke/&lt;slug&gt;</code>
+                    (uses the API slug; the caller's own identity, <code>invoke</code> scope)</p>
+                <label>Result schema (JSON) <span style="color:var(--muted);font-weight:normal">(optional — the object <code>submit_result</code> must match)</span>
+                    <textarea id="agent-result-schema" rows="5"
+                              placeholder='{"type": "object", "properties": {}}'></textarea>
+                </label>
+                <label>Attachment media types <span style="color:var(--muted);font-weight:normal">(comma-separated; blank = image/png, image/jpeg, application/pdf)</span>
+                    <input type="text" id="agent-invoke-media-types" placeholder="image/png, image/jpeg, application/pdf">
+                </label>
+                <label>Max file size (MB) <span style="color:var(--muted);font-weight:normal">(blank = 10)</span>
+                    <input type="number" id="agent-invoke-max-mb" min="0" step="any" placeholder="10">
+                </label>
+                <label>Max files <span style="color:var(--muted);font-weight:normal">(blank = 5)</span>
+                    <input type="number" id="agent-invoke-max-files" min="1" step="1" placeholder="5">
+                </label>
+                <label>Max PDF pages <span style="color:var(--muted);font-weight:normal">(blank = 20)</span>
+                    <input type="number" id="agent-invoke-max-pages" min="1" step="1" placeholder="20">
+                </label>
                 <label>Run as (technical user)
                     <input type="text" id="agent-run-as" placeholder="XSUAA principal id"
                            oninput="refreshCredentials()">
@@ -731,7 +750,7 @@ async function loadAgents() {
                 <td style="max-width:280px">${escapeHtml(a.description)}${skillChips ? `<div style="margin-top:4px">${skillChips}</div>` : ''}</td>
                 <td style="max-width:260px;word-break:break-all">${urlCell}</td>
                 <td>${authCell}</td>
-                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span></td>
+                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span>${a.expose_invoke === true ? ' <span class="status-badge on invoke-tag" title="Exposed to the invoke API">Invoke</span>' : ''}</td>
                 <td class="row-actions">
                     <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
                     ${a.expose_api ? `<button class="small secondary" onclick="runAgentNow(${a.id})">Run now</button>` : ''}
@@ -1077,6 +1096,85 @@ function updateDeepHint() {
     ['agent-deep-planning', 'agent-deep-scratchpad', 'agent-deep-subagents',
      'agent-deep-max-subagents', 'agent-deep-max-depth', 'agent-deep-instructions']
         .forEach(id => { document.getElementById(id).disabled = !on; });
+}
+
+// --- invoke API --------------------------------------------------------------
+// The server checks schema and limits with agents.invoke_config (the rules
+// and the ceilings live there); the form only turns the fields into JSON.
+// Fixed texts: a refusal never repeats what was typed.
+const INVOKE_MB = 1024 * 1024;
+const INVOKE_SCHEMA_NOT_JSON = 'Result schema is not valid JSON';
+const INVOKE_SCHEMA_NOT_OBJECT = 'Result schema must be a JSON object';
+const INVOKE_MB_INVALID = 'Max file size must be a positive number of MB';
+const INVOKE_COUNTS = [
+    ['agent-invoke-max-files', 'max_files', 'Max files must be a whole number'],
+    ['agent-invoke-max-pages', 'max_pdf_pages', 'Max PDF pages must be a whole number'],
+];
+
+function setInvokeForm(a) {
+    const agent = a || {};
+    document.getElementById('agent-expose-invoke').checked = agent.expose_invoke === true;
+    const schema = agent.result_schema;
+    document.getElementById('agent-result-schema').value =
+        schema && typeof schema === 'object' ? JSON.stringify(schema, null, 2) : '';
+    const limits = agent.invoke_limits && typeof agent.invoke_limits === 'object'
+        ? agent.invoke_limits : {};
+    document.getElementById('agent-invoke-media-types').value =
+        Array.isArray(limits.media_types) ? limits.media_types.join(', ') : '';
+    const mb = document.getElementById('agent-invoke-max-mb');
+    const bytes = Number.isInteger(limits.max_file_bytes) ? limits.max_file_bytes : null;
+    mb.value = bytes === null ? '' : String(Math.round(bytes / INVOKE_MB * 100) / 100);
+    // The stored byte count goes back unchanged while the field still shows
+    // it: two decimals of MB would otherwise move a value nobody touched.
+    mb.dataset.bytes = bytes === null ? '' : String(bytes);
+    mb.dataset.shown = mb.value;
+    for (const [id, key] of INVOKE_COUNTS) {
+        document.getElementById(id).value = Number.isInteger(limits[key]) ? String(limits[key]) : '';
+    }
+}
+
+/** {expose_invoke, result_schema, invoke_limits} from the form; throws an
+ *  Error with a fixed text for a field that cannot be sent. Blank limits are
+ *  null (the server defaults), a blank schema is null (no schema). */
+function collectInvoke() {
+    const raw = document.getElementById('agent-result-schema').value.trim();
+    let schema = null;
+    if (raw) {
+        try {
+            schema = JSON.parse(raw);
+        } catch (e) {
+            throw new Error(INVOKE_SCHEMA_NOT_JSON);
+        }
+        if (schema === null || typeof schema !== 'object' || Array.isArray(schema)) {
+            throw new Error(INVOKE_SCHEMA_NOT_OBJECT);
+        }
+    }
+    const limits = {};
+    const types = document.getElementById('agent-invoke-media-types').value
+        .split(',').map(t => t.trim()).filter(Boolean);
+    if (types.length) limits.media_types = types;
+    const mb = document.getElementById('agent-invoke-max-mb');
+    const mbText = mb.value.trim();
+    if (mbText) {
+        if (mb.dataset.bytes && mbText === mb.dataset.shown) {
+            limits.max_file_bytes = parseInt(mb.dataset.bytes, 10);
+        } else {
+            const n = Number(mbText);
+            if (!Number.isFinite(n) || n <= 0) throw new Error(INVOKE_MB_INVALID);
+            limits.max_file_bytes = Math.round(n * INVOKE_MB);
+        }
+    }
+    for (const [id, key, message] of INVOKE_COUNTS) {
+        const text = document.getElementById(id).value.trim();
+        if (!text) continue;
+        if (!/^[0-9]+$/.test(text)) throw new Error(message);
+        limits[key] = parseInt(text, 10);
+    }
+    return {
+        expose_invoke: document.getElementById('agent-expose-invoke').checked,
+        result_schema: schema,
+        invoke_limits: Object.keys(limits).length ? limits : null,
+    };
 }
 
 async function renderAgentModelOptions(selected) {
@@ -1928,6 +2026,7 @@ async function openAgentModal() {
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-expose-api').checked = false;
     document.getElementById('agent-api-slug').value = '';
+    setInvokeForm(null);
     refreshCredentials();
     document.getElementById('agent-run-as').value = '';
     document.getElementById('agent-run-prompt').value = '';
@@ -1952,6 +2051,11 @@ function updateEndpointHint() {
             + 'and authorize the run-as account.';
     }
     document.getElementById('agent-endpoint-hint').innerHTML = html;
+    const invokeHint = document.getElementById('agent-invoke-hint');
+    if (invokeHint) {
+        invokeHint.innerHTML = 'Endpoint: <code>POST /api/invoke/' + shown + '</code> '
+            + '(uses the API slug; the caller\'s own identity, <code>invoke</code> scope)';
+    }
     // Rows were added or removed, or the API switch moved: which row holds
     // the one builtin:odata entry and its job-run warning follow both.
     syncODataRows();
@@ -2063,6 +2167,7 @@ async function editAgent(id) {
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
     document.getElementById('agent-api-slug').value = a.api_slug || '';
+    setInvokeForm(a);
     document.getElementById('agent-run-as').value = a.run_as_principal || '';
     refreshCredentials();
     document.getElementById('agent-run-prompt').value = a.run_prompt || '';
@@ -2076,8 +2181,10 @@ async function editAgent(id) {
 async function saveAgent() {
     const id = document.getElementById('agent-id').value;
     let servers;
+    let invoke;
     try {
         servers = collectMcpServers();
+        invoke = collectInvoke();
     } catch (e) {
         toast(e.message, 'error');
         return;
@@ -2099,6 +2206,11 @@ async function saveAgent() {
         expose_chat: document.getElementById('agent-expose-chat').checked,
         expose_api: document.getElementById('agent-expose-api').checked,
         api_slug: document.getElementById('agent-api-slug').value.trim(),
+        // Always sent: the server keeps a stored value for an absent key, so
+        // only an explicit false / null can switch it off or clear it.
+        expose_invoke: invoke.expose_invoke,
+        result_schema: invoke.result_schema,
+        invoke_limits: invoke.invoke_limits,
         run_as_principal: document.getElementById('agent-run-as').value.trim(),
         run_prompt: document.getElementById('agent-run-prompt').value.trim(),
         run_timeout_seconds: parseInt(document.getElementById('agent-run-timeout').value, 10) || 1800,
@@ -3309,6 +3421,9 @@ function detailFormSnapshot(kind) {
                 model_name: v('agent-model-name'), deep: collectDeep(),
                 enabled: c('agent-enabled'), expose_chat: c('agent-expose-chat'),
                 expose_api: c('agent-expose-api'), api_slug: v('agent-api-slug'),
+                expose_invoke: c('agent-expose-invoke'), result_schema: v('agent-result-schema'),
+                invoke_limits: [v('agent-invoke-media-types'), v('agent-invoke-max-mb'),
+                                v('agent-invoke-max-files'), v('agent-invoke-max-pages')],
                 run_as_principal: v('agent-run-as'), run_prompt: v('agent-run-prompt'),
                 run_timeout_seconds: v('agent-run-timeout'),
             });

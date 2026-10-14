@@ -48,7 +48,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `OrchestratorConfig`), `init_db`, CRUD helpers, VCAP/ENV postgres URL
   resolver. `AgentConfig.auth_mode` is one of `jwt`, `none`, `oauth2`,
   `app_only`, `destination`, `session`. Skills are reusable instruction
-  blocks attached to agents by name (`AgentConfig.skills_json`). Six more
+  blocks attached to agents by name (`AgentConfig.skills_json`). The invoke
+  API's per-agent settings are `expose_invoke` (NOT NULL, `server_default`
+  `"0"`; the admin payload parses it as pydantic's lax bool like
+  `expose_chat` / `expose_api`, while a direct `upsert_agent` caller — the
+  seed, `scripts/import_bundle.py` — stores 1 only for the JSON boolean
+  `true` and the script refuses any other value; needs an `api_slug`,
+  refused for an approving `builtin:bitbucket` entry by
+  `check_bitbucket_approver_reach`), `result_schema_json` and
+  `invoke_limits_json` (both checked by `agents/invoke_config.py` at every
+  write, `upsert_agent` keeps a value that is not sent); together with the
+  index `ix_odata_audit_log_run_id` they are HANA schema generation 3. Six more
   tables back the workflow engine: `Workflow`, `WorkflowBranch`,
   `WorkflowStep` (the definition), and `WorkflowRun`, `WorkflowItemRun`,
   `WorkflowStepRun` (what happened on a run). `validate_workflow_parts` is
@@ -1064,7 +1074,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   while live, served by `GET /admin/api/runs/{id}` as `activity`, stored in
   `job_runs.activity_json` when the run ends. The sink sets
   `interactive = False` (`progress.is_interactive`), so a run that needs
-  sign-in still fails fast instead of waiting for a click. Every run site
+  sign-in still fails fast instead of waiting for a click. `recording` also
+  binds `current_run_id`, the id `builtin:odata` writes into the audit row
+  of every write of that run (peers and deep sub-agents included) in place of
+  pydantic-ai's per-`agent.run` id. Every run site
   (chat, jobs, workflows, IDE, A2A) passes `shared.run_usage_limits()`
   (`AGENT_REQUEST_LIMIT`, default 200, instead of pydantic-ai's 50 that deep
   sub-agents share with their parent; `tests/test_run_finalize_retry.py` pins
@@ -1453,7 +1466,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   seen_at}`: an item is `{kind` (`agent` | `workflow`)`, run_id, name,
   status, trigger, created_by, finished_at, unread}`, runs with a
   `finished_at` in the last 7 days, newest first, at most 50 of both kinds
-  together (one statement per table, merged in Python: no `UNION`);
+  together (one statement per table, merged in Python: no `UNION`; job runs
+  with `trigger="invoke"` are left out of the list and the count: they are a
+  user's own runs, read through the invoke API, and would push the
+  scheduled runs out of the 50);
   `unread_count` covers the whole 7 days and can exceed the list. One `now`
   per request bounds list and count alike (`finished_at <= now`), so they
   cannot disagree about a run that finishes meanwhile. Both run tables have
@@ -1527,7 +1543,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `replace` deletes only a service that is absent from a non-empty section
   and attached by no remaining agent; the answer adds
   `imported_/created_/updated_/removed_odata_services`,
-  `removed_odata_service_names` and `odata_identity_changes`. The import
+  `removed_odata_service_names` and `odata_identity_changes`. The HTTP
+  import is all-or-nothing (one transaction, nothing written on any
+  error); `scripts/import_bundle.py` writes agent by agent, skips a refused
+  one with a `FAIL agent <name>: <rule>` line and exits 1. The import
   does not reload the registry for agents, skills or workflows, but it does
   when it created, changed or removed a catalogue service that is in use,
   or changed what an agent's `builtin:odata` or `builtin:bitbucket` entry
@@ -1573,6 +1592,78 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   disconnect while nothing is sent) or whose response is cancelled cancels
   the run and leaves the task `canceled`, not `working` until the TTL; per
   process, like the task store.
+- `agents/invoke.py` — the **invoke API**: another application calls ONE
+  agent by slug on behalf of its signed-in user, with attachments, and reads
+  back a structured result plus what the agent changed (the expense-app use
+  case: a receipt in, the id of the created draft out). Both routes are
+  behind the `invoke` scope (`require_invoke`; the approuter route demands it
+  too, the backend has a public CF route of its own).
+  `POST /api/invoke/{slug}`, multipart `input` (text, required) + `files`
+  (0..n): the agent must exist, be enabled and have `expose_invoke`, and an
+  agent whose `builtin:bitbucket` entry approves is never run here (every
+  case the same 404 that names nothing). Answers `202 {run_id}`;
+  `?wait=<0..30>` answers 200 with the poll answer when the run finished in
+  time. `GET /api/invoke/runs/{run_id}`, only to the principal that started
+  it (404 otherwise, also for a run of another trigger): `{status`
+  (`completed|running|failed|canceled`; a row's `interrupted` is
+  `canceled`)`, result, writes, text, activity, error}`; `error` is a stable
+  code (`no_result`, `timeout`, `canceled`, `agent_missing`,
+  `agent_not_built`, `credential_required`, `run_failed`), the masked
+  exception text stays on the row for admins. **Identity is the caller's**:
+  `current_principal` AND `current_jwt` from the validated JWT, inherited by
+  the run's task; no `run_as`, no `run_as_principal`. **Attachments are in
+  memory for the run only**: the multipart body is read by the module's own
+  reader (Starlette's spools a part over 1 MB to disk), never stored or
+  logged, the activity gets `{name, media_type, size}` per file; the media
+  type is decided by magic bytes (PNG, JPEG, PDF; a declared type that
+  disagrees is refused); PDF pages are counted by `count_pdf_pages` (one
+  forward scan, only `/Type /ObjStm` streams inflated, at most
+  `MAX_PDF_STREAMS` = 5,000, a 64 MB inflate budget; 0 = "cannot tell" =
+  refused); a body without its closing boundary is refused (python-multipart's
+  `finalize()` would drop the last part silently). Refusals are fixed texts:
+  413 size, 415 not multipart / type not allowed / type mismatch, 422 count,
+  pages, empty or missing `input`, unknown field, 400 client disconnect, 408
+  upload not received within `INVOKE_UPLOAD_TIMEOUT_SECONDS` (60). **The
+  slot is taken before the body is read**: one run per (principal, agent)
+  at a time (409 with the running `run_id`, `null` while its upload is still
+  being read) and at most `INVOKE_MAX_CONCURRENT` (8) per app instance
+  (429), both in memory per process like the job runner's start lock, released
+  on every refusal path. The files reach the model as pydantic-ai
+  `BinaryContent` (proved on AI Core for the OpenAI-compatible and the
+  Bedrock route by `scripts/probe_attachments.py`). The run is a `job_runs`
+  row with `trigger="invoke"`, `created_by` the caller and `timeout_seconds`
+  360 (the 300 s deadline `INVOKE_TIMEOUT_SECONDS` around the whole run,
+  preflight included, plus a margin so the stale sweep never closes a live
+  run); invoke rows do not count as the scheduler's overlap lock
+  (`active_job_run`), are left out of the admin notifications and have no
+  markdown report (`report.md` answers 404; `report_json` is `{text,
+  result}`). The specialist gets `submit_result(result)` for this run only
+  (`Agent.run(toolsets=[...])`, never in the registry build), checked
+  against the agent's `result_schema`; a violation (NaN included) goes back
+  to the model as `schema_violation`, the first valid call wins, and a run
+  that ends without one is `failed` with `no_result`. A task cancelled
+  before its first step is closed by a done callback whose `interrupted`
+  write is conditional on `status = 'running'`, so it never overwrites a
+  stored outcome. `writes` are the `odata_audit_log` rows of the run
+  (`service, entity_set, operation, key` = the key SAP returned for a
+  create, `outcome`; nothing else, never `sent_as`), keyed by `run_id`,
+  which `run_activity.recording(run_id)` binds as `current_run_id` and
+  `agents/odata/tools.py` prefers over pydantic-ai's `ctx.run_id`: so the
+  audit row of a job or invoke run carries the `job_runs` id (workflow runs
+  do not call `recording`, chat runs keep pydantic-ai's id).
+  `tests/test_invoke_api.py`, `tests/test_invoke_limits.py`
+- `agents/invoke_config.py` — the one reading of an agent's invoke settings,
+  standard library only, called by storage and the invoke API alike:
+  `invoke_limits_json` (`media_types` among the three sniffable ones,
+  `max_file_bytes` default 10 MB, `max_files` 5, `max_pdf_pages` 20; every
+  key optional, unknown keys dropped) and `result_schema_json`, a JSON
+  schema restricted to a subset enforced in full (`type`, `properties`,
+  `required`, `additionalProperties`, `items`, `enum`, `minLength`/
+  `maxLength`, `minimum`/`maximum`, `minItems`/`maxItems`; annotations
+  allowed; root `type: object`; `$ref`, `oneOf` and every other keyword
+  refused at save) because `jsonschema` is in the venv only through `mcp`
+  and is not pinned. A refusal names the rule, never a value of the schema
+  or of the result
 - `agents/cf_api.py` — CF v3 API restart helper (optional, password grant)
 - `templates/admin.html` — Admin UI (single-page, vanilla JS); attaches
   catalogue services to an agent (checkbox list and Allow writes), the
@@ -1598,7 +1689,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   URL passes through while it is typed (a half-typed name, another type)
   unticks nothing. An approving agent that is
   still exposed to chat is refused by the server (422, fixed text). It asks
-  no question when approving is switched on
+  no question when approving is switched on. The invoke API's settings
+  ("Expose to the invoke API", "Result schema (JSON)", the four attachment
+  limits) sit under the run-endpoint hint: a schema that is not JSON or not
+  an object and a count that is not a whole number are refused before the
+  save with a fixed text; all limits blank sends `invoke_limits: null`; an
+  untouched max-MB field sends the stored byte count back unchanged; the
+  list row shows an "Invoke" tag. The admin payload (`AgentPayload`) treats
+  an ABSENT `expose_invoke` / `result_schema` / `invoke_limits` key as "keep
+  what is stored" (`invoke_kwargs`, by `model_fields_set`), so an older
+  client cannot wipe them, and an explicit `false` / `null` switches off or
+  clears: a client that edits them must always send all three
 - `ui5-admin/` — SAPUI5 (TypeScript) rebuild of the admin UI, deployed to the
   BTP HTML5 Application Repository and served at `/ui5admin`. Runs **alongside**
   `templates/admin.html`, which is still the supported admin at `/admin`. All HTTP goes through `webapp/service/AdminService.ts`, which sends
@@ -1685,6 +1786,24 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     ("Saved, but not active yet": press Reload in Settings), through
     `BaseController.warnIfNotLive`; the two outcome keys are never sent back
     in a body
+  - Invoke API panel on the agent page (`model/invokeSettings.ts`, after Job
+    settings): the switch "Expose to the invoke API" (disabled without an API
+    slug, with the reason shown; stays enabled while on so it can always be
+    switched off), the result schema as a `TextArea` (must be JSON and one
+    object, refused before the save with a fixed text; the subset stays the
+    server's to check), the media types as a `MultiComboBox` over the three
+    the server can sniff, and three plain inputs checked by `fromForm` (MB =
+    1024², sent as `max_file_bytes`; an untouched field sends the stored
+    bytes back unchanged; a blank field is left out, all blank sends
+    `invoke_limits: null`; the client checks the server's ceilings 25 MB / 10
+    / 100). The form always sends all three keys (the server keeps a stored
+    value for an absent key). A server 422 on `result_schema` marks the
+    field; one on `invoke_limits` (its `loc` is the whole field, the sub-key
+    is only in the fixed message prefix `invoke_limits.<key>:`) marks the
+    control that prefix names; both show a box (the panel is far down). The list shows an "Invoke API" `ObjectStatus` when exposed. The
+    API slug input is always editable (before only with "Expose as an
+    API-triggered job" on: an invoke-only agent could never get a slug).
+    `test/unit/invokeSettings.qunit.ts`, six OPA tests in `AgentJourney.ts`
   - Notifications: a bell with the unread count (also in its tooltip, for
     screen readers) and a toast in the app shell for finished agent and
     workflow runs, logic in `model/notifications.ts`. `GET notifications` is
@@ -1757,7 +1876,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   waits up to 300 s; an `AICORE_ENSURE_TIMEOUT` above about 800 s needs a
   higher value in the `.mtaext`), and a `builtin:jira` entry needs a
   `project` at every save (an existing row without one keeps running, with a
-  WARNING, until an admin sets it)
+  WARNING, until an admin sets it); 2.25.0 is the invoke API release
+  (`agents/invoke.py`): no new resource and no new environment variable
+  (`INVOKE_TIMEOUT_SECONDS`, `INVOKE_MAX_CONCURRENT` and
+  `INVOKE_UPLOAD_TIMEOUT_SECONDS` have defaults and are not in the
+  descriptor), but `xs-security.json` gains the `invoke` scope, role
+  template `AgentInvoker` and role collection `Agent Invoker` (the deploy
+  updates `uaa-service`; the collection is assigned per landscape),
+  `approuter/xs-app.json` the `/api/invoke/...` route, and `agent_configs`
+  three columns plus the index `ix_odata_audit_log_run_id` (HANA schema
+  generation 3: the HDI deploy alters the table in place, nothing is
+  undeployed, no `HANA_HDI_ALLOW_DROP`)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -1835,16 +1964,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   they bill and take minutes. Deployments are per group, so a fresh group
   has no models until that script runs against it. See
   `docs/AICORE_RESOURCE_GROUP.md`
-- `xs-security.json` — `admin`, `user`, `a2a` and `developer` scopes with
-  matching role templates and role collections (the `developer` one is
-  still named `ABAP IDE Developer`; its descriptions say ABAP Assistant),
-  plus the `JOBSCHEDULER` scope granted as authority to the
+- `xs-security.json` — `admin`, `user`, `a2a`, `developer` and `invoke`
+  scopes with matching role templates and role collections (the `developer`
+  one is still named `ABAP IDE Developer`; its descriptions say ABAP
+  Assistant; `AgentInvoker` / `Agent Invoker` grants `invoke` ONLY, not the
+  chat), plus the `JOBSCHEDULER` scope granted as authority to the
   `agent-jobscheduler` instance (no role). Its `redirect-uris` are
   landscape-wide wildcards (`https://*.cfapps.<region>.hana.ondemand.com/**`);
   a landscape should pin them to its approuter route(s) in the `.mtaext`
 - `approuter/xs-app.json` — `/admin` requires admin scope, `/a2a`
   requires `a2a` scope, `/ui5ide` and `/ide/api` require `developer`,
-  `/.well-known/agent-card.json` is anonymous. The two IDE backend routes
+  `/api/invoke/...` requires `invoke` (server-to-server, `csrfProtection`
+  off, placed before the catch-all; `tests/test_ide_csrf_config.py` pins
+  every route's flag), `/.well-known/agent-card.json` is anonymous. The two IDE backend routes
   (`/ui5ide/backend/...` and `/ide/api/...`, also in `ui5-ide/xs-app.json`)
   have `csrfProtection: true`; every other route has it off
 - `JOULE_A2A.md` — configuration guide for BTP + Joule Agent Hub
@@ -1888,6 +2020,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    destination -> rows cut to the readable fields -> the result row is
    written. A refusal or a SAP error is returned to the model as an `error`
    object, never raised
+8. `POST /api/invoke/{slug}` (another app, as its signed-in user with the
+   `invoke` scope): the slot per (user, agent) is reserved -> the multipart
+   body is read into memory and each file checked (magic bytes, limits,
+   PDF pages) -> a `job_runs` row with `trigger="invoke"` -> the specialist
+   runs under the caller's JWT and principal with the files as
+   `BinaryContent` and a run-only `submit_result` tool -> the outcome is
+   written -> `GET /api/invoke/runs/{run_id}` answers result, the OData
+   writes of the run (audit rows by `run_id`), text, activity and error to
+   that caller only
 
 ## Running locally
 ```bash

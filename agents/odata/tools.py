@@ -68,6 +68,7 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from agents.destination import DestinationError
 from agents.destination_auth import DestinationUserRequired, destination_http_client
+from agents.run_activity import current_run_id
 
 from . import BUILTIN_ODATA_URL
 from .calls import DIALECTS
@@ -1667,7 +1668,11 @@ def odata_toolset(
                 or SAP asks for one, 'get' the entity again. The same value
                 on a second 'get' means the entity did not change.
         """
-        run_id = getattr(ctx, "run_id", None)
+        # The recorded run's own id when there is one (a job, an invoke run:
+        # agents.run_activity.recording), so every write of that run, its
+        # peers' and sub-agents' included, carries the id its caller knows;
+        # else pydantic-ai's id of this agent run (chat).
+        run_id = current_run_id.get() or getattr(ctx, "run_id", None)
         run_id = run_id if isinstance(run_id, str) else None
         args = {
             "key": key,

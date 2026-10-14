@@ -624,3 +624,17 @@ async def test_the_app_serves_both_routes_under_admin_api():
         parsed(r.json()["seen_at"])
     # One marker, for the principal the middleware bound.
     assert len(await markers()) == 1
+
+
+async def test_invoke_runs_neither_ring_the_bell_nor_take_a_place(client):
+    """A user's invoke run (trigger ``invoke``) is not an admin notification:
+    it is left out of the list and of the unread count, so fifty of them do
+    not push a scheduled run out (the admin runs list still shows them)."""
+    await set_marker("alice", ago(days=2))
+    scheduled = await agent_run(ago(hours=5), trigger="schedule")
+    for minutes in range(60):
+        await agent_run(ago(minutes=minutes + 1), name="expense", trigger="invoke",
+                        created_by="user@example.com")
+    body = await listing(client)
+    assert [i["run_id"] for i in body["items"]] == [scheduled]
+    assert body["unread_count"] == 1

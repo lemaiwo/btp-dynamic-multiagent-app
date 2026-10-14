@@ -20,10 +20,19 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from agents.progress import ProgressUpdate, current_progress
+
+# The app-level id of the run being recorded (a ``job_runs`` id), bound by
+# :func:`recording` next to the progress sink, so it reaches delegated peers
+# and deep sub-agents the same way. ``builtin:odata`` writes it into the audit
+# row (``agents/odata/tools.py``), so a run's writes can be found by its id;
+# pydantic-ai's own ``RunContext.run_id`` differs per agent run (specialist,
+# each peer, each sub-agent). ``None`` outside a recorded run (chat).
+current_run_id: ContextVar[str | None] = ContextVar("current_run_id", default=None)
 
 # A long deep run makes a few hundred tool calls; keep the most recent ones.
 MAX_EVENTS = 500
@@ -105,6 +114,14 @@ class RunActivity:
                     "detail": _clip(update.text, _DETAIL_CHARS * 2),
                 })
 
+    def record_attachment(self, name: str, media_type: str, size: int) -> None:
+        """One entry per file a run was given: name, media type and size,
+        never content. ``name`` must already be cleaned by the caller."""
+        self._append({
+            "ts": _now(), "agent": None, "kind": "attachment",
+            "name": name, "media_type": media_type, "size": int(size),
+        })
+
     def _set_plan(self, todos: Any) -> None:
         if not isinstance(todos, list):
             return
@@ -143,9 +160,11 @@ def recording(run_id: str) -> Iterator[RunActivity]:
     activity = RunActivity()
     _live[run_id] = activity
     token = current_progress.set(activity)
+    run_token = current_run_id.set(run_id)
     try:
         yield activity
     finally:
+        current_run_id.reset(run_token)
         current_progress.reset(token)
         activity.close_open_calls()
         _live.pop(run_id, None)

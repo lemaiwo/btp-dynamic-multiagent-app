@@ -1796,6 +1796,9 @@ const dom = new JSDOM(`<!doctype html><html><body>
   <input type="checkbox" id="agent-deep-subagents">
   <input id="agent-deep-max-subagents" value="5"><input id="agent-deep-max-depth" value="1">
   <textarea id="agent-deep-instructions"></textarea>
+  <input type="checkbox" id="agent-expose-invoke"><textarea id="agent-result-schema"></textarea>
+  <input id="agent-invoke-media-types" value=""><input id="agent-invoke-max-mb" value="">
+  <input id="agent-invoke-max-files" value=""><input id="agent-invoke-max-pages" value="">
 </body></html>`, { url: 'https://admin.example/admin' });
 global.window = dom.window;
 global.document = dom.window.document;
@@ -2888,6 +2891,23 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         # sends neither, stops wiping them) -- which makes it load-bearing
         # that saveAgent() keeps sending both explicitly, including when they
         # are empty. Drop either key here and clearing silently stops working.
+        # The invoke settings likewise: an absent key keeps what is stored,
+        # so only an explicit false / null from this form switches off or clears.
+        print("\n== saveAgent() sends the invoke settings ==")
+        for field in ("expose_invoke", "result_schema", "invoke_limits"):
+            check(
+                f"saveAgent() sends {field}",
+                re.search(rf"\b{field}\s*:", save_agent_body) is not None,
+                f"{field}: not found as an object key in saveAgent()",
+            )
+        for fid in ("agent-expose-invoke", "agent-result-schema", "agent-invoke-media-types",
+                    "agent-invoke-max-mb", "agent-invoke-max-files", "agent-invoke-max-pages"):
+            check(f"invoke form field #{fid}", any(
+                e[1].get("id") == fid for e in coll.elements
+                if e[0] in ("input", "textarea")))
+        check("editAgent() fills the invoke fields", "setInvokeForm(a)" in js)
+        check("openAgentModal() resets the invoke fields", "setInvokeForm(null)" in js)
+
         print("\n== saveAgent() sends peers and model_name (clearing depends on it) ==")
         for field in ("peers", "model_name"):
             check(
@@ -3475,6 +3495,155 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                 )
             finally:
                 os.unlink(autorefresh_harness_path)
+
+            # --- invoke API --- the agent dialog's invoke fields under jsdom:
+            # load (editAgent -> setInvokeForm), the save payload, the
+            # client-side refusal of a schema that is not JSON (fixed text,
+            # no request), and blank limits sent as null.
+            invoke_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div>
+  <input type="checkbox" id="agent-expose-invoke">
+  <textarea id="agent-result-schema"></textarea>
+  <input id="agent-invoke-media-types"><input id="agent-invoke-max-mb">
+  <input id="agent-invoke-max-files"><input id="agent-invoke-max-pages">
+  <table><tbody id="agents-tbody"></tbody></table>
+</body></html>`, { url: 'https://admin.example/admin' });
+global.window = dom.window;
+global.document = dom.window.document;
+global.location = dom.window.location;
+
+""" + js_no_autoinvoke + r"""
+
+const byId = id => document.getElementById(id);
+const SCHEMA = { type: 'object', properties: { amount: { type: 'number' } },
+                 required: ['amount'] };
+
+(async () => {
+    // 1. Load: an agent with all three fills the fields.
+    setInvokeForm({ expose_invoke: true, result_schema: SCHEMA, invoke_limits: {
+        media_types: ['application/pdf', 'image/png'], max_file_bytes: 2000000,
+        max_files: 2, max_pdf_pages: 4 } });
+    assert.strictEqual(byId('agent-expose-invoke').checked, true);
+    assert.deepStrictEqual(JSON.parse(byId('agent-result-schema').value), SCHEMA);
+    assert.strictEqual(byId('agent-invoke-media-types').value, 'application/pdf, image/png');
+    assert.strictEqual(byId('agent-invoke-max-mb').value, '1.91');
+    assert.strictEqual(byId('agent-invoke-max-files').value, '2');
+    assert.strictEqual(byId('agent-invoke-max-pages').value, '4');
+    // 2. Collected untouched: the same values, the byte count unchanged.
+    assert.deepStrictEqual(collectInvoke(), { expose_invoke: true, result_schema: SCHEMA,
+        invoke_limits: { media_types: ['application/pdf', 'image/png'],
+                         max_file_bytes: 2000000, max_files: 2, max_pdf_pages: 4 } });
+    // An edited MB value is converted.
+    byId('agent-invoke-max-mb').value = '3';
+    assert.strictEqual(collectInvoke().invoke_limits.max_file_bytes, 3 * 1024 * 1024);
+
+    // 3. Reset (new agent) and blank limits: null, schema null, switch off.
+    setInvokeForm(null);
+    assert.deepStrictEqual(collectInvoke(),
+        { expose_invoke: false, result_schema: null, invoke_limits: null });
+    // A string "true" from somewhere is not the switch.
+    setInvokeForm({ expose_invoke: 'true' });
+    assert.strictEqual(byId('agent-expose-invoke').checked, false);
+
+    // 4. saveAgent() sends the three; blank limits as null.
+    let calls = [];
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => ({}) }; };
+    // The rest of the dialog is not under test here: the page's own
+    // functions are replaced in the scope they were declared in.
+    collectMcpServers = () => [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }];
+    const fields = ['agent-id', 'agent-name', 'agent-description', 'agent-instructions',
+        'agent-model-name', 'agent-api-slug', 'agent-run-as', 'agent-run-prompt',
+        'agent-run-timeout'];
+    for (const id of fields) {
+        const el = document.createElement('input'); el.id = id; document.body.appendChild(el);
+    }
+    for (const id of ['agent-enabled', 'agent-expose-chat', 'agent-expose-api']) {
+        const el = document.createElement('input'); el.type = 'checkbox'; el.id = id;
+        document.body.appendChild(el);
+    }
+    byId('agent-id').value = '7';
+    collectAgentSkills = () => [];
+    collectAgentPeers = () => [];
+    collectDeep = () => ({});
+    closeAgentModal = () => {};
+    const realLoadAgents = loadAgents;
+    loadAgents = () => {};
+    byId('agent-expose-invoke').checked = true;
+    byId('agent-result-schema').value = JSON.stringify(SCHEMA);
+    await saveAgent();
+    assert.strictEqual(calls.length, 1, 'one request');
+    assert.deepStrictEqual(calls[0].slice(0, 2), ['/admin/api/agents/7', 'PUT']);
+    let sent = JSON.parse(calls[0][2]);
+    assert.strictEqual(sent.expose_invoke, true);
+    assert.deepStrictEqual(sent.result_schema, SCHEMA);
+    assert.strictEqual(sent.invoke_limits, null, 'blank limits are null');
+    assert.ok('invoke_limits' in sent);
+
+    // Limits typed in: an object with only what was typed.
+    byId('agent-invoke-max-files').value = '3';
+    byId('agent-invoke-media-types').value = ' image/png ,, ';
+    calls = [];
+    await saveAgent();
+    sent = JSON.parse(calls[0][2]);
+    assert.deepStrictEqual(sent.invoke_limits, { media_types: ['image/png'], max_files: 3 });
+
+    // 5. A schema that is not JSON is refused before the save, fixed text.
+    const typed = '{"type": "object", SECRETMARK';
+    byId('agent-result-schema').value = typed;
+    calls = [];
+    await saveAgent();
+    assert.deepStrictEqual(calls, [], 'no request for a schema that is not JSON');
+    assert.strictEqual(byId('toast').textContent, 'Result schema is not valid JSON');
+    // JSON that is not an object: refused as well.
+    byId('agent-result-schema').value = '[1, 2]';
+    await saveAgent();
+    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(byId('toast').textContent, 'Result schema must be a JSON object');
+    // A count that is not a whole number: refused, fixed text.
+    byId('agent-result-schema').value = '';
+    byId('agent-invoke-max-files').value = '2.5';
+    await saveAgent();
+    assert.deepStrictEqual(calls, []);
+    assert.strictEqual(byId('toast').textContent, 'Max files must be a whole number');
+    byId('agent-invoke-max-files').value = '';
+
+    // 6. The list row shows an "Invoke" tag only for an exposed agent.
+    global.fetch = async () => ({ ok: true, json: async () => ([
+        { id: 1, name: 'a', description: 'x', mcp_servers: [{ url: 'https://x.example.com',
+          auth_mode: 'none' }], skills: [], enabled: true, expose_invoke: true },
+        { id: 2, name: 'b', description: 'x', mcp_servers: [{ url: 'https://x.example.com',
+          auth_mode: 'none' }], skills: [], enabled: true, expose_invoke: false },
+    ]) });
+    renderSkillsTable = () => {};
+    await realLoadAgents();
+    const rows = byId('agents-tbody').querySelectorAll('tr');
+    assert.strictEqual(rows.length, 2);
+    assert.strictEqual(rows[0].querySelectorAll('.invoke-tag').length, 1);
+    assert.strictEqual(rows[0].querySelector('.invoke-tag').textContent, 'Invoke');
+    assert.strictEqual(rows[1].querySelectorAll('.invoke-tag').length, 0);
+    console.log('invoke field scenarios passed');
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=ROOT) as f:
+                f.write(invoke_harness)
+                invoke_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", invoke_harness_path], capture_output=True, text=True, timeout=30,
+                )
+                check(
+                    "invoke fields: load, save payload, non-JSON refusal, blank limits = null",
+                    result.returncode == 0 and "invoke field scenarios passed" in result.stdout,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(invoke_harness_path)
 
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})
