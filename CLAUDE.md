@@ -785,7 +785,7 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `auth_mode="destination"` with `{destination, user_context}` plus its pinned
   keys; `user_context=false` keeps the app-only rules (mailbox required,
   Teams read-only); `user_context` is stored for Gmail, Outlook and Teams
-  only (Jira, Slack, SMTP and the SAP-notes built-ins are app-level;
+  only (Jira, Confluence, Slack, SMTP and the SAP-notes built-ins are app-level;
   `builtin:bitbucket` and `builtin:sharepoint` refuse `user_context: true`
   instead of dropping it) and
   `builtin:odata` carries it per catalogue service. Storage keys per
@@ -1019,6 +1019,47 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   Neither UI marks the field required yet (the server's 422 reaches them).
   `add_comment` is registered only when `allow_comment` is exactly `true`.
   See `docs/JIRA_SETUP.md`
+- `agents/confluence_tools.py` — Confluence pages over the REST API
+  (`builtin:confluence`), read-only, through a BTP destination as its
+  technical user (`destination` mode only; `user_context` refused at the
+  gate, dropped in storage, refused at build). The entry stores exactly
+  `destination`, `spaces` (comma-separated space keys, each
+  `^[A-Za-z0-9_~-]{1,255}$`, at most 20; blank = every space the credential
+  can see, one WARNING per build) and `api_base` (default `/wiki/rest/api`,
+  Jira's `normalize_api_base` rules); `_CONFLUENCE_DEST_KEYS` in
+  `agents/db.py`. Three tools: `search_pages(query, in_title=False,
+  limit=10)` builds the CQL server side (`type = page AND text ~ "<q>"` or
+  `title ~`, `AND space in (...)` from the pin, `ORDER BY lastmodified
+  DESC`; `"` and `\` escaped; 1-200 characters; `limit` 1..25; excerpt at
+  most 300 characters), `get_page(page_id)` (`^[0-9]{1,20}$`; a page outside
+  the pin, or without a space key while pinned, is `space_not_allowed`
+  without its body; the storage-format body becomes plain text through
+  `agents/confluence_text.py`, cut at `MAX_BODY_CHARS` = 60,000 with
+  `truncated` and `body_chars`; `last_modified_by` is the display name only;
+  `url` is `_links.webui` on the destination's host) and
+  `list_children(page_id, start=0, limit=100)` (`start` 0..10,000; the
+  parent's space is checked first, cached 300 s per toolset; `next_start`).
+  Every refusal is `{"error": {code, message, hint?}}` with a fixed text from
+  the closed list `ERROR_CODES` (`destination_error`, `unauthorized`,
+  `forbidden`, `not_found`, `throttled`, `confluence_error`, `unreachable`,
+  `not_json`, `invalid_id`, `invalid_query`, `space_not_allowed`,
+  `too_large`), never an exception and never Confluence's text; a 401 is
+  retried once after the destination is invalidated; the body of an error
+  status is never read; a 2xx body over 8 MB is `too_large`; a destination
+  that is OnPremise or not `https` is `destination_error` before anything is
+  sent; httpx's request line (it carries the CQL) is kept out of the log by
+  the same contextvar filter `agents/bitbucket_tools.py` uses. Denied in ABAP
+  Assistant sessions (not in `READONLY_POLICY`). Unit-tested only
+  (`tests/test_confluence_tools.py`, `tests/test_confluence_registration.py`);
+  first landscape test planned on b-fdn-dev with the `JIRA` destination
+- `agents/confluence_text.py` — storage-format XHTML to plain text, standard
+  library `HTMLParser` only: headings `#`, lists `- ` / `1. `, tables `| a |
+  b |` with `| --- |` after the first row, macros `[macro: name]` plus title
+  and body text, `pre` and code macros keep their lines (CDATA is escaped
+  before parsing), task lists `- [ ]` / `- [x]`, `ri:` references as
+  `[filename]` / `[page title]`; scripts, styles, comments, images,
+  emoticons, control and format characters dropped; over `MAX_HTML_BYTES`
+  (4 MB) is `TooLarge` before parsing (`tests/test_confluence_text.py`)
 - `agents/lookback.py` — the shared `parse_lookback` window parser
 - `agents/sapnotes_tools.py` — SAP security notes discovered through the
   public NVD API (`builtin:sapnotes`). `sourceIdentifier=cna@sap.com` is
@@ -1907,7 +1948,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   answer; no descriptor change besides the version; 2.25.2 makes
   `submit_result` the run's output tool (a valid hand-in ends the run;
   the same model answered nothing after a run-only function tool and the
-  run still failed on 2.25.1), no descriptor change besides the version
+  run still failed on 2.25.1), no descriptor change besides the version;
+  2.26.0 is the `builtin:confluence` release (`agents/confluence_tools.py`):
+  no new resource, environment variable, table or column (HANA schema
+  generation unchanged)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

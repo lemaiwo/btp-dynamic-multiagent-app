@@ -315,7 +315,7 @@ export default class AgentDetail extends BaseController {
         // one the fragment's bindings test for.
         const isBitbucket = bitbucketEntry.isBitbucketUrl(server.url);
         const pins = ((isBitbucket ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
-        const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false };
+        const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", spaces: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false };
         const opening = ++this.odataOpening;
         this.odataCatalogue = null;
         this.odataDefinitions = {};
