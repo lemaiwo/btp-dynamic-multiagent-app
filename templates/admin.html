@@ -2609,6 +2609,9 @@ function openFromHash() {
 // in agents/db.py: a field shown here and not listed there is dropped on save.
 const DESTINATION_FIELDS = {
     'builtin:jira':          ['project', 'status', 'labels', 'api_base', 'lookback', 'allow_comment'],
+    // Reads pages as the destination's technical user: no user_context, no
+    // comment switch. The space pin and the REST prefix are all it stores.
+    'builtin:confluence':    ['spaces', 'api_base'],
     'builtin:slack':         ['channels', 'lookback', 'allow_send'],
     'builtin:gmail':         ['user_context', 'mailbox'],
     'builtin:outlook':       ['user_context', 'mailbox', 'lookback', 'recipients', 'allow_send', 'theme'],
@@ -2647,7 +2650,7 @@ function destinationFieldsFor(builtin) {
 
 // Text fields, in the order they appear; the two switches are checkboxes.
 const DESTINATION_TEXT_KEYS = ['destination', 'mailbox', 'team', 'channels', 'recipients', 'from',
-    'lookback', 'project', 'status', 'labels', 'api_base', 'min_score'];
+    'lookback', 'project', 'status', 'labels', 'spaces', 'api_base', 'min_score'];
 // The pins of builtin:sharepoint, and the workspace and branch of
 // builtin:bitbucket, are sent exactly as typed, never trimmed: the server
 // refuses a pin with edge whitespace instead of repairing it, so what is
@@ -2726,6 +2729,9 @@ function destinationFieldsHtml() {
                 </label>
                 <label class="dest-field-labels">Labels
                     <input type="text" class="dest-labels" placeholder="comma-separated; ALL must match">
+                </label>
+                <label class="dest-field-spaces">Spaces
+                    <input type="text" class="dest-spaces" placeholder="comma-separated space keys; blank = every space the credential can see">
                 </label>
                 <label class="dest-field-api_base">API base path
                     <input type="text" class="dest-api_base" placeholder="blank means /rest/api/2">
@@ -2843,6 +2849,9 @@ function syncDestinationFields(row) {
         row.dataset.commentType = commentType;
     }
     row.dataset.destBuiltin = builtin;
+    // One API base field for two toolsets with two defaults.
+    row.querySelector('.dest-api_base').placeholder =
+        builtin === 'builtin:confluence' ? 'blank means /wiki/rest/api' : 'blank means /rest/api/2';
     const fields = destinationFieldsFor(builtin);
     const known = fields !== null;
     const wanted = fields || [];
@@ -2866,7 +2875,7 @@ function syncDestinationFields(row) {
     let hint = '';
     if (!known) {
         hint = 'A destination works with an https MCP server or a built-in toolset (builtin:gmail, builtin:outlook, '
-            + 'builtin:teams, builtin:slack, builtin:jira, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
+            + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
     } else if (isRemoteMcpUrl(builtin)) {

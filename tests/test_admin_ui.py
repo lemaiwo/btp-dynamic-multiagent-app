@@ -1712,6 +1712,12 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               all(f'class="dest-{k}"' in html for k in
                   ("workspace", "repositories", "branch", "allow_approve", "require_green_builds")))
         check("the hint list names builtin:bitbucket", "builtin:sharepoint, builtin:bitbucket," in html)
+        # builtin:confluence: destination mode only, read-only, as a technical
+        # user; a space pin and the REST prefix, no comment or user switch.
+        check("confluence is a known destination built-in",
+              "'builtin:confluence':" in html and "['spaces', 'api_base']" in html)
+        check("confluence has its spaces field", 'class="dest-spaces"' in html)
+        check("the hint list names builtin:confluence", "builtin:jira, builtin:confluence," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
         # A stored server on an auth mode this page does not offer (app_only,
@@ -2099,6 +2105,24 @@ assert.throws(() => collectMcpServers(), /Two builtin:bitbucket rows/);
              require_green_builds: false } }));
 assert.deepStrictEqual(out.oauth, { destination: 'JIRA', project: 'ABC' });
 assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
+// 4b. Confluence keeps its space pin and api_base; nothing of Jira's, no user switch.
+({ row, out } = addAndCollect({
+    url: 'builtin:confluence', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', spaces: 'shERPa, DOCS', api_base: '/rest/api',
+             user_context: true, allow_comment: true, project: 'ABC' },
+}));
+assert.strictEqual(row.querySelector('.dest-field-spaces').style.display, '');
+assert.strictEqual(row.querySelector('.dest-field-api_base').style.display, '');
+assert.strictEqual(row.querySelector('.dest-field-user_context').style.display, 'none');
+assert.strictEqual(row.querySelector('.dest-field-allow_comment').style.display, 'none');
+assert.strictEqual(row.querySelector('.dest-field-project').style.display, 'none');
+assert.strictEqual(row.querySelector('.dest-api_base').placeholder, 'blank means /wiki/rest/api',
+    "the API base hint is Confluence's on a confluence row");
+assert.deepStrictEqual(out.oauth, { destination: 'JIRA', spaces: 'shERPa, DOCS', api_base: '/rest/api' });
+({ row, out } = addAndCollect({ url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'J', project: 'P' } }));
+assert.strictEqual(row.querySelector('.dest-field-spaces').style.display, 'none', 'spaces is a confluence field');
+assert.strictEqual(row.querySelector('.dest-api_base').placeholder, 'blank means /rest/api/2');
 assert.strictEqual(row.querySelector('.dest-require_green_builds').checked, true);
 // ... nor its workspace and branch: they are filled for a bitbucket row only.
 assert.strictEqual(row.querySelector('.dest-workspace').value, '');
