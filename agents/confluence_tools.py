@@ -383,7 +383,11 @@ class ConfluenceClient:
                 self._remember_space(page_id, key)
             results.append({
                 "id": page_id,
-                "title": _one_line(item.get("title") or content.get("title")),
+                # `excerpt=highlight` may mark the matched words in the title
+                # as it does in the excerpt.
+                "title": _one_line(
+                    _HL_RE.sub("", str(item.get("title") or content.get("title") or ""))
+                ),
                 "space": key,
                 "last_modified": _timestamp(
                     item.get("lastModified") or _obj(content.get("version")).get("when")

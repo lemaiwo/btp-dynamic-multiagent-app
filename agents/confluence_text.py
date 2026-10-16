@@ -40,7 +40,15 @@ _BLOCKS = frozenset({
 # Elements that keep their line breaks and indentation.
 _PRE = frozenset({"pre", "ac:plain-text-body"})
 # Elements whose whole subtree is dropped.
-_DROPPED = frozenset({"script", "style", "ac:emoticon", "ac:image", "ac:placeholder"})
+_DROPPED = frozenset({
+    "script", "style", "ac:emoticon", "ac:image", "ac:placeholder",
+    # A task's id and uuid are bookkeeping, not text.
+    "ac:task-id", "ac:task-uuid",
+    # New-editor blocks: the attribute values are layout, and the fallback
+    # repeats the content of `ac:adf-content`.
+    "ac:adf-attribute", "ac:adf-fallback",
+})
+_ALL_WS_RE = re.compile(r"\s+")
 # Elements without an end tag, so they do not count towards nesting.
 _VOID = frozenset({"br", "hr", "img", "input", "meta", "link", "col", "wbr", "source"})
 _CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.S)
@@ -67,6 +75,7 @@ class _TextBuilder(HTMLParser):
         self._status: list[str] | None = None  # text of an open ac:task-status
         self._task_done = False
         self._lead = ""  # a list / task marker waiting for its line's text
+        self._inline_tables = 0  # tables open inside a cell: their text joins the cell
 
     # -- lines ---------------------------------------------------------------
 
@@ -116,7 +125,9 @@ class _TextBuilder(HTMLParser):
                 self._skip = 1
             return
         if tag.startswith("ri:"):
-            label = a.get("ri:filename") or a.get("ri:content-title") or a.get("ri:value")
+            # A file name or a page title, never `ri:value` (a URL, query
+            # string included): the link's own body text says where it goes.
+            label = a.get("ri:filename") or a.get("ri:content-title")
             if label:
                 self._append(f"[{label}] ")
             return
@@ -146,8 +157,16 @@ class _TextBuilder(HTMLParser):
                 self._lead = "- "
             return
         if tag == "table":
+            if self._cell is not None:
+                # A table inside a cell cannot be a second pipe table on the
+                # same line: its cells join the enclosing cell as text.
+                self._inline_tables += 1
+                return
             self._break()
             self._tables.append(0)
+            return
+        if tag in ("tr", "td", "th") and self._inline_tables:
+            self._flush()
             return
         if tag == "tr":
             self._flush()
@@ -180,9 +199,18 @@ class _TextBuilder(HTMLParser):
             if tag not in _VOID:
                 self._skip -= 1
             return
+        if tag == "table" and self._inline_tables:
+            self._inline_tables -= 1
+            self._flush()
+            return
+        if tag in ("tr", "td", "th") and self._inline_tables:
+            self._flush()
+            return
         if tag in ("td", "th"):
             if self._cell is not None and self._row is not None:
-                self._row.append(_SPACES_RE.sub(" ", "".join(self._cell)).strip())
+                # One line per row: a line break or a code block in a cell
+                # becomes a space, else the pipe table splits mid-row.
+                self._row.append(_ALL_WS_RE.sub(" ", "".join(self._cell)).strip())
             self._cell = None
             return
         if tag == "tr":

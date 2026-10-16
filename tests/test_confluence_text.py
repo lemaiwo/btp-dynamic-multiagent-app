@@ -62,6 +62,44 @@ def test_task_lists_become_checkboxes():
     assert to_text(doc) == "- [x] Done thing\n- [ ] Open thing"
 
 
+def test_task_ids_and_uuids_are_not_text():
+    doc = ("<ac:task-list><ac:task><ac:task-id>12</ac:task-id>"
+           "<ac:task-uuid>1abc-123</ac:task-uuid><ac:task-status>complete</ac:task-status>"
+           "<ac:task-body><span>Done thing</span></ac:task-body></ac:task></ac:task-list>")
+    assert to_text(doc) == "- [x] Done thing"
+
+
+def test_a_url_reference_shows_no_url():
+    doc = ('<p>See <ac:link><ri:url ri:value="https://x.example/a?token=SECRET"/>'
+           "<ac:plain-text-link-body><![CDATA[the site]]></ac:plain-text-link-body>"
+           "</ac:link> now</p>")
+    out = to_text(doc)
+    assert out == "See the site now"
+    assert "SECRET" not in out and "x.example" not in out
+
+
+def test_a_table_inside_a_cell_stays_in_that_cell():
+    doc = ("<table><tr><th>H1</th><th>H2</th></tr>"
+           "<tr><td>A<table><tr><td>B</td><td>b2</td></tr></table></td><td>C</td></tr></table>")
+    assert to_text(doc) == "| H1 | H2 |\n| --- | --- |\n| A B b2 | C |"
+
+
+def test_a_code_block_or_line_break_inside_a_cell_keeps_the_row_on_one_line():
+    doc = ("<table><tr><td>x<br/>y</td><td><ac:structured-macro ac:name=\"code\">"
+           "<ac:plain-text-body><![CDATA[l1\nl2]]></ac:plain-text-body>"
+           "</ac:structured-macro></td></tr></table>")
+    assert to_text(doc) == "| x y | [macro: code] l1 l2 |\n| --- | --- |"
+
+
+def test_adf_panels_show_their_content_once_without_attribute_values():
+    doc = ('<ac:adf-extension><ac:adf-node type="panel">'
+           '<ac:adf-attribute key="panel-type">note</ac:adf-attribute>'
+           "<ac:adf-content><p>Read this</p></ac:adf-content></ac:adf-node>"
+           '<ac:adf-fallback><div class="panel"><p>Read this</p></div></ac:adf-fallback>'
+           "</ac:adf-extension><p>after</p>")
+    assert to_text(doc) == "Read this\n\nafter"
+
+
 def test_links_keep_text_images_and_emoticons_vanish_references_are_bracketed():
     doc = ('<p>See <a href="https://x.example/secret?token=1">the page</a> '
            '<ac:image><ri:attachment ri:filename="diagram.png"/></ac:image>'

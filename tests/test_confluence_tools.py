@@ -238,6 +238,17 @@ async def test_search_builds_cql_server_side_and_answers_the_fields():
     }
 
 
+async def test_search_strips_highlight_markers_from_titles_too():
+    server = Server()
+    item = _search_item(title="Action @@@hl@@@boxes@@@endhl@@@ (TSP)")
+    item["content"]["title"] = "Action boxes (TSP)"
+    server.routes["/search"] = {"results": [item], "totalSize": 1}
+    client, http, _ = _client(server)
+    async with http:
+        out = await client.search_pages("boxes")
+    assert out["results"][0]["title"] == "Action boxes (TSP)"
+
+
 async def test_search_in_title_uses_the_title_field_and_an_unpinned_client_adds_no_space_clause():
     server = Server()
     server.routes["/search"] = {"results": [], "totalSize": 0}
