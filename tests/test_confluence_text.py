@@ -116,6 +116,12 @@ def test_script_style_comments_and_control_characters_are_dropped():
     assert to_text(doc) == "ab\n\ncde"
 
 
+def test_lone_surrogates_are_dropped():
+    # A JSON "\ud800" from Confluence would otherwise fail the tool-result
+    # serialisation after the tool returned.
+    assert to_text("<p>a\ud800b</p>") == "ab"
+
+
 def test_blank_runs_collapse_and_layout_wrappers_add_nothing():
     doc = ("<ac:layout><ac:layout-section><ac:layout-cell><p>a</p><p></p><p> </p>"
            "<div><br/><br/></div><p>b</p></ac:layout-cell></ac:layout-section></ac:layout>")

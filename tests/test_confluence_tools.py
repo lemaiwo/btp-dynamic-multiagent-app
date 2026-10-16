@@ -147,7 +147,8 @@ class FakeResolver:
         if self.fail is not None:
             raise self.fail
         return Destination(url=self.url, headers={"Authorization": "Basic c2VjcmV0"},
-                           expires_at=time.monotonic() + 600)
+                           expires_at=time.monotonic() + 600,
+                           proxy_type=getattr(self, "proxy_type", ""))
 
     def invalidate(self, principal: str | None = None) -> None:
         self.invalidations += 1
@@ -513,6 +514,39 @@ async def test_a_transport_error_is_unreachable(caplog):
     err = await _refused(client.get_page("1"))
     assert err.code == "unreachable" and "ConnectTimeout" in caplog.text
     assert SITE not in err.message
+
+
+@pytest.mark.parametrize("url, proxy_type", [("http://confluence.internal", ""),
+                                             ("http://virtual.host", "OnPremise"),
+                                             (SITE, "OnPremise")])
+async def test_a_destination_that_is_not_https_internet_is_refused_before_any_request(
+    url, proxy_type, caplog
+):
+    caplog.set_level(logging.WARNING)
+    server = Server()
+    server.routes["/content/1"] = _page(pid="1")
+    resolver = FakeResolver(url=url)
+    resolver.proxy_type = proxy_type
+    http = httpx.AsyncClient(transport=httpx.MockTransport(server.handler))
+    async with http:
+        err = await _refused(ConfluenceClient(resolver, http).get_page("1"))
+    assert err.code == "destination_error" and server.requests == []
+    assert url not in err.message and url not in caplog.text
+
+
+async def test_httpx_does_not_log_the_request_url(caplog):
+    caplog.set_level(logging.INFO, logger="httpx")
+    server = Server()
+    server.routes["/search"] = {"results": []}
+    client, http, _ = _client(server, spaces=["shERPa"])
+    async with http:
+        await client.search_pages("Z_SECRET_NAME")
+    assert server.requests, "the request was sent"
+    assert "Z_SECRET_NAME" not in caplog.text and "HTTP Request" not in caplog.text
+    # Another client's requests are still logged.
+    async with httpx.AsyncClient(transport=httpx.MockTransport(server.handler)) as other:
+        await other.get(f"{SITE}/wiki/rest/api/search?cql=other")
+    assert "HTTP Request" in caplog.text
 
 
 async def test_a_resolver_failure_is_destination_error(caplog):

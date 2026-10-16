@@ -27,6 +27,7 @@ destination a Jira Cloud entry would use. ``spaces`` names the space keys;
 
 from __future__ import annotations
 
+import contextvars
 import html
 import json
 import logging
@@ -80,6 +81,40 @@ _TAG_RE = re.compile(r"<[^>]*>")
 _HL_RE = re.compile(r"@@@(?:end)?hl@@@")
 _SPACES_RE = re.compile(r"\s+")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+# True in the task that is inside ``ConfluenceClient._send``, for that time only.
+_sending: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "confluence_sending", default=False
+)
+
+
+class _NoRequestUrl(logging.Filter):
+    """Drops what ``httpx`` logs about a request of this toolset.
+
+    ``httpx`` logs ``HTTP Request: GET <url> ...`` at INFO for every request,
+    and here the URL carries the CQL (the model's words and the space pins).
+    Only the records made in the sending task are dropped (the context
+    variable); every other client is logged as before. Same pattern as
+    :mod:`agents.bitbucket_tools`.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _sending.get()
+
+
+def _install_once() -> None:
+    """Puts the filter on the ``httpx`` logger unless one is there; called at
+    import and before every request (a logging setup may replace filters)."""
+    log = logging.getLogger("httpx")
+    for installed in log.filters:
+        kind = type(installed)
+        if kind.__name__ == _NoRequestUrl.__name__ and kind.__module__ == __name__:
+            return
+    log.addFilter(_NoRequestUrl())
+
+
+_install_once()
 
 
 class ConfluenceError(Exception):
@@ -277,7 +312,23 @@ class ConfluenceClient:
                 "destination_error",
                 "the BTP destination could not be resolved; ask an administrator to check it",
             ) from None
-        self._site_url = str(destination.url or "").rstrip("/")
+        site = str(destination.url or "").rstrip("/")
+        # An Internet destination over https only: an OnPremise one needs the
+        # connectivity proxy (which this toolset does not route through), and a
+        # plain-http URL would carry the Basic credential in clear.
+        if (
+            str(getattr(destination, "proxy_type", "") or "") == "OnPremise"
+            or urlsplit(site).scheme != "https"
+        ):
+            logger.warning(
+                "%s: the destination is not an https Internet destination", self._server_key
+            )
+            raise ConfluenceError(
+                "destination_error",
+                "the BTP destination must be an Internet destination with an https URL; "
+                "ask an administrator to check it",
+            )
+        self._site_url = site
         return destination
 
     async def _send(
@@ -286,6 +337,16 @@ class ConfluenceClient:
         """One GET. The body of an error status is never read; a 2xx body is
         read up to MAX_RESPONSE_BYTES and refused beyond it."""
         url = f"{self._site_url}{self.api_base}{path}"
+        _install_once()
+        quiet = _sending.set(True)
+        try:
+            return await self._stream(destination, url, path, params)
+        finally:
+            _sending.reset(quiet)
+
+    async def _stream(
+        self, destination: Any, url: str, path: str, params: dict[str, Any]
+    ) -> tuple[int, httpx.Headers, bytes]:
         try:
             async with self._http.stream(
                 "GET", url, params=params, headers=destination.headers

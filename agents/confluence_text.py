@@ -58,7 +58,9 @@ _SPACES_RE = re.compile(r"[ \t\r\f\v ]+")
 
 def _clean_chars(text: str) -> str:
     text = _CONTROL_RE.sub("", text)
-    return "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    # Format characters (zero width, bidi marks) and lone surrogates (a JSON
+    # "\ud800" from Confluence would fail the tool-result serialisation).
+    return "".join(ch for ch in text if unicodedata.category(ch) not in ("Cf", "Cs"))
 
 
 class _TextBuilder(HTMLParser):
