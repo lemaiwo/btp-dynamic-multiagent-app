@@ -79,6 +79,12 @@ export type OAuthClient =
            */
           labels?: string;
           /**
+           * `builtin:confluence` only. Comma-separated Confluence space keys
+           * the toolset may read; blank means every space the destination's
+           * credential can see. Sent as a string; the server parses it.
+           */
+          spaces?: string;
+          /**
            * `destination` only. Whether the agent gets a comment tool.
            * Separate from what the destination's credential permits, for the
            * same reason `allow_send` is.

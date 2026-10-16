@@ -106,6 +106,18 @@ QUnit.test("destination keeps Jira filters, and Slack its channel pin", function
     assert.deepEqual(Object.keys(slack).sort(), ["allow_send", "channels", "destination", "lookback"]);
 });
 
+QUnit.test("destination keeps the Confluence space pin and api base, nothing of Jira's", function (assert) {
+    const out = oauthConfig.cleanOAuth(fullForm({ spaces: " shERPa, DOCS " }), "destination", "builtin:confluence") as Record<string, unknown>;
+    assert.deepEqual(Object.keys(out).sort(), ["api_base", "destination", "spaces"]);
+    assert.strictEqual(out.spaces, "shERPa, DOCS", "trimmed, as the server stores it");
+    assert.notOk("allow_comment" in out, "Jira's comment switch is not Confluence's");
+    assert.notOk("project" in out, "Jira's project pin is not Confluence's");
+    assert.notOk(oauthConfig.supportsUserContext("builtin:confluence"), "reads as the technical user");
+    assert.strictEqual(oauthConfig.keepsAllowSend("builtin:confluence", "destination"), false);
+    const blank = oauthConfig.cleanOAuth(fullForm({ spaces: "" }), "destination", "builtin:confluence") as Record<string, unknown>;
+    assert.notOk("spaces" in blank, "a blank pin is not sent as an empty string");
+});
+
 QUnit.test("blank values are dropped, not stored as empty strings", function (assert) {
     const out = oauthConfig.cleanOAuth(fullForm({ scope: "  ", recipients: "" }), "oauth2", "builtin:outlook") as Record<string, unknown>;
     assert.notOk("scope" in out);

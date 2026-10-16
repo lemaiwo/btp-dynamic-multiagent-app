@@ -95,6 +95,13 @@ export const BUILTINS: BuiltinToolset[] = [
     {
         url: "builtin:bitbucket", titleKey: "builtinBitbucket", descriptionKey: "builtinBitbucketDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
+    },
+    // confluence_toolset reads pages as the technical user of a destination
+    // and has no other way to authenticate -- see agents/confluence_tools.py
+    // and `_validate_destination_config` in agents/admin.py.
+    {
+        url: "builtin:confluence", titleKey: "builtinConfluence", descriptionKey: "builtinConfluenceDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
     }
 ];
 

@@ -317,7 +317,7 @@
             <Input
                 id="oauthDestination"
                 value="{server>/oauth/destination}"
-                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/url} === 'builtin:bitbucket' ? 'MY_BITBUCKET_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
+                placeholder="{= ${server>/url} === 'builtin:slack' ? 'MY_SLACK_DESTINATION' : ${server>/url} === 'builtin:jira' ? 'MY_JIRA_DESTINATION' : ${server>/url} === 'builtin:gmail' ? 'MY_GMAIL_DESTINATION' : ${server>/url} === 'builtin:sapnotes' ? 'MY_NVD_DESTINATION' : ${server>/url} === 'builtin:sapnotedetail' ? 'MY_SAP_ME_DESTINATION' : ${server>/url} === 'builtin:smtp' ? 'MY_MAIL_DESTINATION' : ${server>/url} === 'builtin:confluence' ? 'MY_CONFLUENCE_DESTINATION' : ${server>/url} === 'builtin:bitbucket' ? 'MY_BITBUCKET_DESTINATION' : ${server>/kind} === 'mcp' ? 'MY_MCP_DESTINATION' : 'MY_GRAPH_DESTINATION' }"
                 visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} !== 'builtin:odata' }" />
 
             <!-- destinations: whose credential the destination hands back.
@@ -387,6 +387,22 @@
                 selected="{server>/oauth/allow_comment}"
                 text="{i18n>allowCommentHint}"
                 visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:jira' }" />
+
+            <!-- confluence: the space pin and the REST prefix. Read-only, as the
+                 destination's technical user: no comment switch, no user context. -->
+            <Label text="{i18n>confluenceSpaces}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:confluence' }" />
+            <Input
+                id="oauthSpaces"
+                value="{server>/oauth/spaces}"
+                placeholder="{i18n>confluenceSpacesHint}"
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:confluence' }" />
+
+            <Label text="{i18n>jiraApiBase}" visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:confluence' }" />
+            <Input
+                id="oauthConfluenceApiBase"
+                value="{server>/oauth/api_base}"
+                placeholder="{i18n>confluenceApiBaseHint}"
+                visible="{= ${server>/auth_mode} === 'destination' &amp;&amp; ${server>/url} === 'builtin:confluence' }" />
 
             <!-- odata: the agent's one OData services entry. Its state lives
                  under server>/odata, apart from server>/oauth, so that a click on
