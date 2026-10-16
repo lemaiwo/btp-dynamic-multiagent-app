@@ -4479,6 +4479,11 @@ _SAPNOTEDETAIL_DEST_KEYS = ("destination",)
 # builtin:smtp: the fixed audience and an optional sender overriding the MAIL
 # destination's mail.smtp.from. The SMTP credential stays in the destination.
 _SMTP_DEST_KEYS = ("destination", "recipients", "from")
+# builtin:confluence: the destination, the space-key pin and the REST prefix.
+# No user_context (not in `_DEST_USER_CONTEXT_URLS`): it reads as the
+# destination's technical user. `spaces` may arrive as a list (a bundle);
+# the generic cleaner stores it comma-separated.
+_CONFLUENCE_DEST_KEYS = ("destination", "spaces", "api_base")
 
 _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:gmail": _GMAIL_DEST_KEYS,
@@ -4487,6 +4492,7 @@ _DEST_KEYS_BY_URL: dict[str, tuple[str, ...]] = {
     "builtin:sapnotes": _SAPNOTES_DEST_KEYS,
     "builtin:sapnotedetail": _SAPNOTEDETAIL_DEST_KEYS,
     "builtin:smtp": _SMTP_DEST_KEYS,
+    "builtin:confluence": _CONFLUENCE_DEST_KEYS,
 }
 # builtin:odata is not in the map above on purpose: its entry stores no
 # destination. Which destination a call goes through, and whether as the

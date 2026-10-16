@@ -52,6 +52,7 @@ from pydantic import (
 from agents.auth import current_base_url, current_principal, require_admin
 from agents.chat_app import dynamic_chat_app
 from agents.builtins import BUILTIN_URLS, is_builtin_url
+from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, normalize_spaces
 from agents.jira_tools import BUILTIN_JIRA_URL
 from agents.mail_render import MailTheme
 from agents.odata import BUILTIN_ODATA_URL
@@ -290,6 +291,10 @@ class OAuthClientPayload(BaseModel):
     # labels", not "any of them". See agents/jira_tools.build_jql for why
     # this is the opposite of how `status` combines.
     labels: str = Field(default="", max_length=256)
+    # builtin:confluence only. Comma-separated space keys the toolset may read;
+    # blank means every space the destination's credential can see (a WARNING
+    # at build). Pinned here, never a tool argument: the CQL carries it.
+    spaces: str = Field(default="", max_length=256)
     # builtin:sapnotes only. The CVSS floor; 9.0 is what SAP calls HotNews.
     # A string, not a float, because every other field here is one and the
     # storage cleaner stringifies anyway.
@@ -398,7 +403,7 @@ class OAuthClientPayload(BaseModel):
             raise ValueError("min_score must be between 0 and 10")
         return text
 
-    @field_validator("status", "labels", "recipients", "channels", mode="before")
+    @field_validator("status", "labels", "recipients", "channels", "spaces", mode="before")
     @classmethod
     def _csv_list_is_a_string(cls, v: Any) -> Any:
         """Accept a JSON list for a multi-value field, store it as CSV.
@@ -411,7 +416,7 @@ class OAuthClientPayload(BaseModel):
             return ", ".join(str(x).strip() for x in v if str(x).strip())
         return v
 
-    @field_validator("status", "labels", "recipients", "channels")
+    @field_validator("status", "labels", "recipients", "channels", "spaces")
     @classmethod
     def _validate_csv_list(cls, v: str) -> str:
         # A bounded number of values: the cap is not about Jira's limits but
@@ -478,6 +483,7 @@ class OAuthClientPayload(BaseModel):
             "status": self.status.strip(),
             "api_base": self.api_base.strip(),
             "labels": self.labels.strip(),
+            "spaces": self.spaces.strip(),
             "min_score": self.min_score.strip(),
             "recipients": self.recipients.strip(),
             "team": self.team.strip(),
@@ -715,6 +721,20 @@ class McpServerPayload(BaseModel):
         if is_bitbucket:
             # Again on the block the route hands to storage.
             check_bitbucket_entry(self.oauth.to_config() if self.oauth else None)
+        is_confluence = _server_key(self.url) == BUILTIN_CONFLUENCE_URL
+        if not is_confluence and self.oauth is not None and self.oauth.spaces:
+            raise ValueError(
+                f"oauth.spaces belongs to a {BUILTIN_CONFLUENCE_URL} entry only; no other "
+                "server reads it"
+            )
+        if is_confluence and self.auth_mode != AUTH_MODE_DESTINATION:
+            # As for Jira: the toolset has no other way to reach Confluence,
+            # so any other mode would build and then drop the agent at reload.
+            raise ValueError(
+                f"{BUILTIN_CONFLUENCE_URL} requires auth_mode=destination: it holds no "
+                "credential of its own and reaches Confluence only through the BTP "
+                "destination named in oauth.destination"
+            )
         # Before the per-mode rules, because the oauth2 branch below returns
         # early for DCR.
         if (
@@ -2966,6 +2986,16 @@ def _validate_destination_config(url: str, cfg: dict[str, Any]) -> None:
             f"{BUILTIN_JIRA_URL} requires oauth.project: the Jira project key "
             "the agent is confined to"
         )
+    if key == BUILTIN_CONFLUENCE_URL:
+        try:
+            normalize_spaces(cfg.get("spaces"))
+        except ValueError:
+            # The helper's text names the rule already; said again here
+            # without the value, as the answer to a refused save.
+            raise ValueError(
+                "oauth.spaces must be comma-separated Confluence space keys of 1-255 "
+                "letters, digits, '_', '~' or '-'"
+            ) from None
     if key in _DESTINATION_MAILBOX_URLS and not user_context and not cfg.get("mailbox"):
         raise ValueError(
             f"{key} with auth_mode=destination requires oauth.mailbox unless "

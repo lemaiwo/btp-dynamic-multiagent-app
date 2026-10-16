@@ -31,6 +31,7 @@ builtin:sapnotedetail --     --        app (cookie)  --       default
 builtin:odata      --        --        user / app    --       --
 builtin:sharepoint --        app (ro)  app (ro)      --       --
 builtin:bitbucket  --        --        app           --       --
+builtin:confluence --        --        app           --       --
 ================== ========= ========= ============= ======== ========
 
 ``destination`` reaches the API through a BTP destination. The config block's
@@ -60,6 +61,11 @@ destination and has no per-user mode: ``user_context`` is refused. Its config
 block pins one workspace, optionally a repository list and the target branch,
 and holds the two capability switches ``allow_comment`` and ``allow_approve``;
 see :mod:`agents.bitbucket_tools`.
+
+``builtin:confluence`` reads Confluence pages as the technical user of a
+destination and has no per-user mode: ``user_context`` is refused. Its config
+block pins the space keys (``spaces``) and the REST prefix (``api_base``); see
+:mod:`agents.confluence_tools`.
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ from typing import Any, Callable
 
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_tools import bitbucket_toolset
+from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, confluence_toolset
 from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
 from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.odata import BUILTIN_ODATA_URL
@@ -94,6 +101,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_ODATA_URL: odata_toolset,
     BUILTIN_SHAREPOINT_URL: sharepoint_toolset,
     BUILTIN_BITBUCKET_URL: bitbucket_toolset,
+    BUILTIN_CONFLUENCE_URL: confluence_toolset,
 }
 
 BUILTIN_URLS = frozenset(_FACTORIES)
