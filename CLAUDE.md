@@ -261,7 +261,17 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   reached through a BTP destination (`auth_mode="destination"`,
   `_destination_mcp_server`): the destination names the host and holds the
   credential, as the signed-in user when `user_context` is true; no JWT bound
-  means a refusal, never an app-level fallback
+  means a refusal, never an app-level fallback. **Token counts are read directly** (`_usage_from_chat_completion`,
+  `SAPAICoreStreamedResponse`): pydantic-ai 1.72 maps usage through
+  genai-prices and swallows every error of that mapping, and with the
+  genai-prices versions in use (0.1.9 locally, 0.2.1 on the platform: it is
+  not pinned) the mapping hands back a field `RequestUsage` does not take, so
+  every chat answer with `completion_tokens_details` counted 0 in / 0 out
+  (seen on acc/AI 2026-10-31 with `gpt-5.6-terra` and `gpt-4o`; the Claude
+  deployments were not affected). `_get_stream_options` no longer strips
+  `stream_options` (AI Core accepts `include_usage`, checked on the three
+  deployed model families); `AICORE_STREAM_USAGE=0` strips it again for a
+  deployment that refuses it (`tests/test_model_usage.py`)
 - `agents/oauth2.py` — per-user OAuth2 authorization_code for
   `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
   refreshes the user's token, raises `OAuthAuthorizationRequired`),
@@ -2168,7 +2178,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `admin` scope); schema generation 6 is deployed by it; 2.29.0 adds the context view of a
   conversation (`agents/webchat/context.py`): no new resource, variable,
   table or column (`CHAT_CONTEXT_WINDOWS` is optional and not in the
-  descriptor)
+  descriptor); 2.29.1 is the fix of the first signed-in test on acc/AI: the
+  token counts of AI Core's GPT deployments (every usage line, the context
+  view's measured size) were 0 (`SAPAICoreModel` reads them directly now and
+  asks a stream for its usage chunk; `AICORE_STREAM_USAGE=0` strips
+  `stream_options` again, not in the descriptor), and streamed text parts
+  around a tool call are shown as separate paragraphs
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

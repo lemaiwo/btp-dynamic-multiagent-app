@@ -9,9 +9,13 @@ import { activityStrip } from './activity.js';
 import { usagePart } from '../state.js';
 import { formatElapsed, formatTokens } from '../util.js';
 
+// While a turn streams, the text the model wrote before a tool call and the
+// text after it are two parts; shown as one string they ran into each other
+// ("Checking with the specialist…The service is"), so a paragraph break
+// separates them. The stored `content` wins once the turn is over.
 function textOf(message) {
   if (message.content) return message.content;
-  return (message.parts || []).filter((p) => p.type === 'text').map((p) => p.text).join('');
+  return (message.parts || []).filter((p) => p.type === 'text' && p.text).map((p) => p.text.trim()).filter(Boolean).join('\n\n');
 }
 
 function generatedFiles(message) {

@@ -198,7 +198,13 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
   function sectionHead(text, badge, count) {
     const h = el('div', 'section-head');
     const t = el('h3', null, text);
-    if (badge) t.appendChild(lock());
+    if (badge) {
+      // The heading already says "read-only": the icon is decoration here.
+      const icon = lock();
+      icon.removeAttribute('aria-label');
+      icon.setAttribute('aria-hidden', 'true');
+      t.appendChild(icon);
+    }
     h.appendChild(t);
     h.appendChild(el('span', 'section-count', count));
     return h;
