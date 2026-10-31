@@ -2,12 +2,14 @@
 // the right (showModal traps focus and binds Escape). Name, description,
 // instructions / content with a character counter, and for an agent the
 // skills (Mine, Admin · read-only), the admin agents it may consult and the
-// model. Client checks mirror the limits with fixed texts; a server 422
-// marks the field, a 409 marks the name. Names and descriptions of the
-// catalogue are inserted as text nodes only.
+// model; for a developer (addendum d) the "Deep agent tools" toggle and the
+// advanced agents in "May consult", each with the Developer badge, which a
+// non-developer never sees. Client checks mirror the limits with fixed
+// texts; a server 422 marks the field, a 409 marks the name. Names and
+// descriptions of the catalogue are inserted as text nodes only.
 
 import * as api from '../api.js';
-import { LIMITS, TEXTS, validateAgent, validateSkill, takenNames, fieldErrors } from '../myagents.js';
+import { LIMITS, TEXTS, validateAgent, validateSkill, takenNames, fieldErrors, isAdvanced, advancedAgentNames } from '../myagents.js';
 
 function el(tag, className, text) {
   const n = document.createElement(tag);
@@ -60,7 +62,9 @@ function checkGroup(legend, items, checked, { emptyText, lockBadge = false } = {
     box.value = it.value;
     box.checked = checked.has(it.value);
     const text = el('span', 'check-text');
-    text.appendChild(el('span', 'check-name', it.name));
+    const nm = el('span', 'check-name', it.name);
+    if (it.badge) { nm.appendChild(document.createTextNode(' ')); nm.appendChild(developerBadge()); }
+    text.appendChild(nm);
     if (it.description) text.appendChild(el('span', 'check-desc', it.description));
     row.append(box, text);
     fs.appendChild(row);
@@ -92,6 +96,13 @@ export function lock() {
   return b;
 }
 
+/** The "Developer" badge of an advanced agent (a text node; the word is ours). */
+export function developerBadge() {
+  const b = el('span', 'badge dev', 'Developer');
+  b.title = 'Developer agent: advanced access only';
+  return b;
+}
+
 function counter(textarea, max) {
   const c = el('p', 'counter');
   c.setAttribute('aria-live', 'polite');
@@ -107,8 +118,9 @@ function counter(textarea, max) {
 
 /**
  * createAgentEditor({notify, onSaved}) -> {openAgent(opts), openSkill(opts), close()}
- *   openAgent({agent, duplicate, catalog, mine, models})   agent = row to edit (null = new),
- *     duplicate = prefill from a row but create; mine = {agents, skills}
+ *   openAgent({agent, duplicate, catalog, mine, models, developer})   agent = row to edit (null = new),
+ *     duplicate = prefill from a row but create; mine = {agents, skills};
+ *     developer = the caller has the developer role (deep toggle, advanced consults)
  *   openSkill({skill, duplicate, mine})
  * `onSaved(kind, row, {created})` after a 2xx.
  */
@@ -175,7 +187,7 @@ export function createAgentEditor({ notify, onSaved }) {
     formError.hidden = false;
   }
 
-  function openAgent({ agent = null, duplicate = false, catalog, mine, models = [] }) {
+  function openAgent({ agent = null, duplicate = false, catalog, mine, models = [], developer = false }) {
     const editing = agent && !duplicate ? agent : null;
     const src = agent || {};
     const { body, formError } = frame(editing ? 'Edit agent' : 'New agent', submit, editing ? 'Save changes' : 'Create agent');
@@ -210,8 +222,37 @@ export function createAgentEditor({ notify, onSaved }) {
     const skillsErr = { setError: (t) => { gMine.setError(t); } };
 
     const pickedConsults = new Set(src.consults || []);
-    const gConsult = checkGroup('May consult · admin agents', (catalog?.agents || []).map((a) => ({ value: a.name, name: a.name, description: a.description })), pickedConsults,
+    const consultable = (catalog?.agents || []).filter((a) => developer || !isAdvanced(a));
+    const gConsult = checkGroup('May consult · admin agents', consultable.map((a) => ({ value: a.name, name: a.name, description: a.description, badge: isAdvanced(a) })), pickedConsults,
       { emptyText: 'No admin agent is open to chat right now.', lockBadge: true });
+
+    // Deep agent tools (developers only): plan, scratchpad, sub-agents
+    let deepBox = null;
+    let deepErr = null;
+    let deepSection = null;
+    if (developer) {
+      deepSection = el('div', 'panel-section');
+      const h = el('h3', null, 'Developer tools');
+      h.appendChild(document.createTextNode(' '));
+      h.appendChild(developerBadge());
+      deepSection.appendChild(h);
+      deepSection.appendChild(el('p', 'section-sub', 'An agent with deep tools, or one that consults a developer agent, is a developer agent itself: it is offered in advanced conversations only.'));
+      const row = el('label', 'check deep-toggle');
+      deepBox = document.createElement('input');
+      deepBox.type = 'checkbox';
+      deepBox.checked = src.deep === true;
+      deepBox.setAttribute('aria-describedby', 'deep-desc');
+      const text = el('span', 'check-text');
+      text.appendChild(el('span', 'check-name', 'Deep agent tools'));
+      const d = el('span', 'check-desc', 'A plan (write_todos / read_todos), a scratchpad of files and sub-agents that share both, with the app’s default limits.');
+      d.id = 'deep-desc';
+      text.appendChild(d);
+      row.append(deepBox, text);
+      deepErr = el('p', 'field-error');
+      deepErr.hidden = true;
+      deepSection.append(row, deepErr);
+    }
+    const deepField = { setError: (t) => { if (!deepErr) return; deepErr.textContent = t || ''; deepErr.hidden = !t; }, control: deepBox };
 
     const model = document.createElement('select');
     const def = document.createElement('option');
@@ -237,9 +278,12 @@ export function createAgentEditor({ notify, onSaved }) {
     consultBox.appendChild(el('h3', null, 'May consult'));
     consultBox.appendChild(el('p', 'section-sub', `Admin agents this agent can hand a question to. At most ${LIMITS.consults}.`));
     consultBox.appendChild(gConsult.wrap);
-    body.append(grid, skillsBox, consultBox, fModel.wrap);
+    body.append(grid, skillsBox, consultBox);
+    if (deepSection) body.appendChild(deepSection);
+    body.appendChild(fModel.wrap);
 
     const fields = { name: fName, description: fDesc, instructions: fInstr, skills: skillsErr, consults: gConsult, model: fModel };
+    if (developer) fields.deep = deepField;
     const read = () => ({
       name: name.value,
       description: desc.value,
@@ -247,11 +291,14 @@ export function createAgentEditor({ notify, onSaved }) {
       skills: [...gMine.values(), ...gAdmin.values()].map((v) => { const i = v.indexOf(':'); return { scope: v.slice(0, i), name: v.slice(i + 1) }; }),
       consults: gConsult.values(),
       model: model.value || null,
+      // `deep` is sent by a developer only; the server's default is false
+      ...(developer ? { deep: deepBox.checked === true } : {}),
     });
 
     async function submit() {
       const form = read();
-      const errs = validateAgent({ ...form, models: models.map((m) => m.id) }, { taken: takenNames(mine.agents, editing?.id) });
+      const errs = validateAgent({ ...form, models: models.map((m) => m.id) },
+        { taken: takenNames(mine.agents, editing?.id), developer, advancedNames: advancedAgentNames(catalog) });
       let first = null;
       for (const [k, f] of Object.entries(fields)) { f.setError(errs[k] || ''); if (errs[k] && !first) first = f; }
       if (first) { (first.control || gMine.wrap.querySelector('input') || name).focus(); return; }

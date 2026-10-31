@@ -24,6 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from agents.access import ADVANCED, BASIC, agent_allowed, caller_is_developer, tier_of
 from agents.auth import require_user
 from agents.db import SessionLocal, SkillConfig
 from agents.multipart_form import FormRefused, FormSpec, read_multipart
@@ -48,6 +49,7 @@ SKILL_LIMIT = f"You have reached the limit of {m.MAX_SKILLS} personal skills"
 MSG_REF_SKILL = "Value error, skills: not a skill you can attach"
 MSG_REF_CONSULT = "Value error, consults: not an agent you may consult"
 MSG_MODEL = "Value error, model: not an offered model"
+MSG_DEEP = "Value error, deep: needs the developer role"
 BAD_IDS = "agents and skills must be comma-separated ids"
 IMPORT_NOT_JSON = "The file is not a webchat bundle"
 IMPORT_FORMAT = "The bundle is not of the format webchat-bundle/1"
@@ -84,9 +86,15 @@ def _catalog_text(text: str | None) -> str:
 
 
 @router.get("/catalog")
-async def catalog() -> dict[str, Any]:
+async def catalog(
+    access: Literal["basic", "advanced"] = Query(default=BASIC),
+) -> dict[str, Any]:
+    # Advanced admin agents only for an advanced listing by a developer;
+    # anyone else gets the basic listing (not an error: the switch is UI).
+    tier = ADVANCED if access == ADVANCED and caller_is_developer() else BASIC
     async with SessionLocal() as db:
-        agents = await ua.chat_agents(db)
+        agents = {name: row for name, row in (await ua.chat_agents(db)).items()
+                  if agent_allowed(row, tier)}
         skills = (await db.execute(
             select(SkillConfig.name, SkillConfig.description).order_by(SkillConfig.name)
         )).all()
@@ -94,6 +102,7 @@ async def catalog() -> dict[str, Any]:
         "agents": [
             {"ref": f"{ua.ADMIN_PREFIX}{name}", "name": name,
              "description": _catalog_text(row.description),
+             "tier": tier_of(row),
              "source": "admin", "readonly": True}
             for name, row in sorted(agents.items())
         ],
@@ -111,7 +120,8 @@ async def catalog() -> dict[str, Any]:
 # Agents
 # ---------------------------------------------------------------------------
 def _refused(problems: list[tuple[tuple[Any, ...], str]]) -> RequestValidationError:
-    messages = {"skills": MSG_REF_SKILL, "consults": MSG_REF_CONSULT, "model": MSG_MODEL}
+    messages = {"skills": MSG_REF_SKILL, "consults": MSG_REF_CONSULT, "model": MSG_MODEL,
+                "deep": MSG_DEEP}
     return RequestValidationError([
         {"loc": ("body", *loc), "msg": messages[kind], "type": "value_error"}
         for loc, kind in problems
@@ -119,7 +129,8 @@ def _refused(problems: list[tuple[tuple[Any, ...], str]]) -> RequestValidationEr
 
 
 async def _checked_refs(db: Any, principal: str, body: m.AgentIn) -> my_store.Refs:
-    refs = await my_store.resolve_refs(db, principal, body)
+    refs = await my_store.resolve_refs(db, principal, body,
+                                       developer=caller_is_developer())
     if body.model is not None and body.model not in await run.catalog.names():
         refs.problems.append((("model",), "model"))
     if refs.problems:
@@ -131,7 +142,8 @@ async def _checked_refs(db: Any, principal: str, body: m.AgentIn) -> my_store.Re
 async def list_my_agents() -> list[dict[str, Any]]:
     async with SessionLocal() as db:
         rows = await my_store.list_agents(db, store.caller())
-    return [my_store.agent_out(r) for r in rows]
+        usable = await ua.chat_agents(db)
+    return [my_store.agent_out(r, usable) for r in rows]
 
 
 @router.post("/my/agents", status_code=201)
@@ -145,7 +157,7 @@ async def create_my_agent(body: m.AgentIn) -> dict[str, Any]:
             row = await my_store.create_agent(db, principal, body, refs)
         except (my_store.NameTaken, IntegrityError):
             raise HTTPException(status_code=409, detail=AGENT_EXISTS) from None
-        return my_store.agent_out(row)
+        return my_store.agent_out(row, await ua.chat_agents(db))
 
 
 async def _my_agent(db: Any, principal: str, aid: str) -> Any:
@@ -158,7 +170,8 @@ async def _my_agent(db: Any, principal: str, aid: str) -> Any:
 @router.get("/my/agents/{aid}")
 async def get_my_agent(aid: str) -> dict[str, Any]:
     async with SessionLocal() as db:
-        return my_store.agent_out(await _my_agent(db, store.caller(), aid))
+        row = await _my_agent(db, store.caller(), aid)
+        return my_store.agent_out(row, await ua.chat_agents(db))
 
 
 @router.put("/my/agents/{aid}")
@@ -171,7 +184,7 @@ async def replace_my_agent(aid: str, body: m.AgentIn) -> dict[str, Any]:
             row = await my_store.replace_agent(db, row, body, refs)
         except (my_store.NameTaken, IntegrityError):
             raise HTTPException(status_code=409, detail=AGENT_EXISTS) from None
-        return my_store.agent_out(row)
+        return my_store.agent_out(row, await ua.chat_agents(db))
 
 
 @router.delete("/my/agents/{aid}", status_code=204)
@@ -341,7 +354,8 @@ async def import_bundle(
     async with SessionLocal() as db:
         try:
             return await my_store.import_bundle(db, store.caller(), bundle,
-                                                on_conflict=rule, models=models)
+                                                on_conflict=rule, models=models,
+                                                developer=caller_is_developer())
         except IntegrityError:
             await db.rollback()
             raise HTTPException(status_code=409, detail=IMPORT_COLLIDED) from None

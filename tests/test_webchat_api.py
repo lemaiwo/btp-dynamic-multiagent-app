@@ -260,7 +260,7 @@ async def test_crud_and_newest_first(client):
     listed = (await client.get(f"{API}/conversations")).json()
     assert [c["id"] for c in listed] == [second, first]
     assert set(listed[0]) == {"id", "title", "updated_at", "created_at", "status",
-                              "agent_ref", "agent_name"}
+                              "agent_ref", "agent_name", "access"}
     assert (listed[0]["agent_ref"], listed[0]["agent_name"]) == (None, "Orchestrator")
     assert listed[0]["title"] == "Mine second line"
     assert listed[1]["title"] == store.DEFAULT_TITLE

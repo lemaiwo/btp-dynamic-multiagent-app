@@ -130,6 +130,10 @@ async def import_bundle(bundle: dict) -> list[str]:
                     **{key: agent[key] for key in (
                         "expose_invoke", "result_schema", "invoke_limits",
                     ) if key in agent},
+                    # The access tier: absent (or null) keeps what is stored,
+                    # a new agent is "basic"; `upsert_agent` refuses any
+                    # value but "basic" / "advanced".
+                    **({"tier": agent["tier"]} if agent.get("tier") is not None else {}),
                 )
             except ValueError as e:
                 await session.rollback()

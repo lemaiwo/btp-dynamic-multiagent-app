@@ -214,6 +214,13 @@ export function createSidebar(root, handlers) {
       badge.title = `Talks to ${conv.agent_name || 'an agent'}`;
       a.appendChild(badge);
     }
+    if (conv.access === 'advanced') {
+      const tag = document.createElement('span');
+      tag.className = 'conv-tag';
+      tag.textContent = 'Advanced';
+      tag.title = 'Advanced access (developer agents)';
+      a.appendChild(tag);
+    }
     a.title = conv.title || '';
     if (active) a.setAttribute('aria-current', 'page');
     a.addEventListener('click', () => handlers.onSelect?.(conv.id));
@@ -242,7 +249,7 @@ export function createSidebar(root, handlers) {
   function render(state) {
     current = state;
     const sig = JSON.stringify([
-      state.conversations.map((c) => [c.id, c.title, c.updated_at, c.status, c.agent_ref, c.agent_name]),
+      state.conversations.map((c) => [c.id, c.title, c.updated_at, c.status, c.agent_ref, c.agent_name, c.access]),
       state.query, state.currentId, state.principal, renaming, state.view,
     ]);
     if (sig === lastSig) return;

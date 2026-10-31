@@ -146,7 +146,8 @@ async def test_catalog_shows_chat_usable_admin_agents_and_all_skills(client):
     assert [a["name"] for a in out["agents"]] == ["btp-admin"]
     agent = out["agents"][0]
     assert agent == {"ref": "admin:btp-admin", "name": "btp-admin",
-                     "description": agent["description"], "source": "admin", "readonly": True}
+                     "description": agent["description"], "tier": "basic", "source": "admin",
+                     "readonly": True}
     assert len(agent["description"]) <= 300 and "\x00" not in agent["description"]
     assert out["skills"] == [{"name": "abap-review", "description": "Reviews ABAP. Second line",
                               "source": "admin", "readonly": True}]
@@ -169,7 +170,8 @@ async def test_agent_crud_and_shape(client):
                 {"scope": "mine", "name": "TONE"}],
         consults=["btp-admin", "btp-admin"])
     assert set(made) == {"id", "ref", "name", "description", "instructions", "skills", "consults",
-                         "model", "created_at", "updated_at", "source", "readonly"}
+                         "model", "deep", "tier", "created_at", "updated_at", "source",
+                         "readonly"}
     assert made["ref"] == f"mine:{made['id']}"
     assert made["description"] == "Writes things"
     assert made["instructions"] == "Write.\nWell.\tOK"
@@ -363,7 +365,7 @@ async def test_export_bytes_and_selection(client):
     assert bundle["agents"][1] == {"name": "Writer", "description": "",
                                    "instructions": "Be helpful.",
                                    "skills": [{"scope": "mine", "name": "Tone"}],
-                                   "consults": ["btp-admin"], "model": None}
+                                   "consults": ["btp-admin"], "model": None, "deep": False}
     assert [s["name"] for s in bundle["skills"]] == ["Other", "Tone"]
     assert "id" not in json.dumps(bundle["agents"]) and ALICE not in r.text
 

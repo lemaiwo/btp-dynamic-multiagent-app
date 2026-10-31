@@ -195,3 +195,26 @@ export function escapeHtml(s) {
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
 }
+
+// ---------- access (addendum d): the Basic | Advanced switch, remembered per principal ----------
+export const ACCESS_TIERS = ['basic', 'advanced'];
+export function normalizeAccess(value, fallback = 'basic') {
+  return ACCESS_TIERS.includes(value) ? value : (ACCESS_TIERS.includes(fallback) ? fallback : 'basic');
+}
+/** The localStorage key of a principal's last choice (the principal is part of the key, never read back). */
+export function accessStorageKey(principal) {
+  return `webchat.access.${String(principal || 'local')}`;
+}
+/** The remembered access of `principal`, or `fallback` (a value that is no tier is ignored). */
+export function rememberedAccess(principal, fallback = 'basic', storage = globalThis.localStorage) {
+  try {
+    const raw = storage?.getItem(accessStorageKey(principal));
+    return ACCESS_TIERS.includes(raw) ? raw : normalizeAccess(fallback);
+  } catch { return normalizeAccess(fallback); }
+}
+/** Remember `access` for `principal`; a value that is no tier is not written. Returns the stored value or null. */
+export function rememberAccess(principal, access, storage = globalThis.localStorage) {
+  if (!ACCESS_TIERS.includes(access)) return null;
+  try { storage?.setItem(accessStorageKey(principal), access); } catch { /* private mode: not remembered */ }
+  return access;
+}

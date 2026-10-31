@@ -12,6 +12,7 @@ Start it::
     .venv/bin/python tests/e2e/webchat_fake_server.py --port 7940
     .venv/bin/python tests/e2e/webchat_fake_server.py --fast     # no sleeps
     .venv/bin/python tests/e2e/webchat_fake_server.py --slow 4   # 4x longer turn
+    .venv/bin/python tests/e2e/webchat_fake_server.py --basic-user  # no developer role
 
 then open http://127.0.0.1:7935/chat . ``Ctrl-C`` stops it.
 
@@ -46,6 +47,19 @@ What it serves:
   the ref, 422 when it names nothing the user may use; a deleted personal
   agent falls back to the orchestrator). Seeded: one personal agent with a
   skill and a consult, one personal skill
+- addendum (d): ``GET /me`` carries ``developer`` (true unless
+  ``--basic-user``), ``access_default`` and ``tiers``; ``GET /catalog?access=``
+  lists the two advanced admin agents (``abap-developer-deep``,
+  ``ui5-fiori-developer-deep``, ``tier: advanced``) only for
+  ``access=advanced`` AND a developer, every agent with its ``tier``; a
+  conversation carries ``access`` (``POST``/``PATCH`` take it; ``advanced``
+  by a non-developer is 403 ``Advanced access needs the developer role``; an
+  ``agent_ref`` naming an advanced agent in a basic conversation is 422
+  ``Unknown agent``); ``/my/agents`` takes ``deep`` (422 at the field from a
+  non-developer) and answers ``tier`` (advanced when ``deep`` or an advanced
+  consult); an import by a non-developer drops ``deep`` and advanced consults
+  (``dropped`` with ``field: "deep"`` / ``"consults"``). A developer run seeds
+  one advanced conversation and one deep personal agent on top
 
 Three conversations are seeded (today, yesterday, older) so the sidebar
 groups show; the first one holds a stored turn with agent, tool, usage and
@@ -94,9 +108,16 @@ APP_NAME = "SAP BTP Multi-Agent"
 
 # ---- addendum (c): the admin catalogue (name + description only) and the limits ----
 ADMIN_AGENTS = [
-    {"name": "btp-admin", "description": "Reads and changes the BTP account model: subaccounts, entitlements, service instances, role collections."},
-    {"name": "entitlement-analyst", "description": "Ranks entitlements by unused quota and flags what nobody used in 90 days."},
+    {"name": "btp-admin", "description": "Reads and changes the BTP account model: subaccounts, entitlements, service instances, role collections.", "tier": "basic"},
+    {"name": "entitlement-analyst", "description": "Ranks entitlements by unused quota and flags what nobody used in 90 days.", "tier": "basic"},
+    # addendum (d): the advanced (developer) agents, deep agents on their own MCP servers
+    {"name": "abap-developer-deep", "description": "ABAP developer on the dev system through ARC-1: reads, analyses, proposes and tests changes with a plan and a scratchpad.", "tier": "advanced"},
+    {"name": "ui5-fiori-developer-deep", "description": "UI5 / Fiori developer: views, controllers, annotations and tests of the Fiori apps, with sub-agents per task.", "tier": "advanced"},
 ]
+TIERS = ("basic", "advanced")
+ACCESS_DENIED = "Advanced access needs the developer role"
+DEVELOPER = True  # --basic-user turns it off
+ADVANCED_ADMIN = {a["name"] for a in ADMIN_AGENTS if a["tier"] == "advanced"}
 ADMIN_SKILLS = [
     {"name": "btp-naming-conventions", "description": "How subaccounts, spaces, instances and destinations are named in this landscape."},
     {"name": "report-layout", "description": "The table and heading layout of a platform review document."},
@@ -268,6 +289,19 @@ class Store:
                                    "consults": ["btp-admin"], "model": None})
         c2["agent_ref"], c2["agent_label"] = "admin:btp-admin", "btp-admin"
         c4["agent_ref"], c4["agent_label"] = f"mine:{ag['id']}", ag["name"]
+        if DEVELOPER:
+            # addendum (d): an advanced conversation and a deep personal agent
+            self.put_agent(None, {"name": "ABAP reviewer", "description": "Reviews ABAP changes against clean core and drafts the ATC fix list.",
+                                  "instructions": "Review the named objects with abap-developer-deep. Plan first, keep findings in the scratchpad, answer with a fix list.",
+                                  "skills": [], "consults": ["abap-developer-deep"], "model": None, "deep": True})
+            c5 = self.new_conversation("Dump in ZCL_ORDER_CHECK on dev", "gpt-5.6-terra", t - timedelta(hours=1))
+            c5["access"] = "advanced"
+            c5["agent_ref"], c5["agent_label"] = "admin:abap-developer-deep", "abap-developer-deep"
+            self.add_message(c5["id"], "user", "There is a short dump in ZCL_ORDER_CHECK=>VALIDATE on dev since this morning. What changed?")
+            m5 = self.add_message(c5["id"], "assistant", "The dump is a `CX_SY_ITAB_LINE_NOT_FOUND` in `VALIDATE`, line 142: the read on `mt_rules` has no `sy-subrc` check since transport **DEVK912345** (yesterday 17:40).", status="done")
+            m5["parts"] = [{"type": "text", "text": m5["content"]},
+                           {"type": "usage", "input_tokens": 2210, "output_tokens": 140, "cache_read_tokens": 0, "total_tokens": 2350,
+                            "requests": 2, "tool_calls": 2, "model": "gpt-5.6-terra", "duration_ms": 5400, "agents": []}]
 
     # ---- addendum (c): personal agents and skills ----
     def put_agent(self, aid: str | None, body: dict) -> dict:
@@ -275,9 +309,15 @@ class Store:
         row = self.my_agents.get(aid) if aid else None
         new = {"id": row["id"] if row else str(uuid.uuid4()), "name": body["name"], "description": body.get("description") or "",
                "instructions": body["instructions"], "skills": list(body.get("skills") or []), "consults": list(body.get("consults") or []),
-               "model": body.get("model"), "created_at": row["created_at"] if row else t, "updated_at": t}
+               "model": body.get("model"), "deep": body.get("deep") is True,
+               "created_at": row["created_at"] if row else t, "updated_at": t}
         self.my_agents[new["id"]] = new
         return new
+
+    @staticmethod
+    def tier_of(a: dict) -> str:
+        """advanced when deep is on or any consult names an advanced admin agent (addendum d)."""
+        return "advanced" if a.get("deep") or any(c in ADVANCED_ADMIN for c in a.get("consults") or []) else "basic"
 
     def put_skill(self, sid: str | None, body: dict) -> dict:
         t = now()
@@ -289,7 +329,8 @@ class Store:
 
     def agent_out(self, a: dict) -> dict:
         return {"id": a["id"], "ref": f"mine:{a['id']}", "name": a["name"], "description": a["description"], "instructions": a["instructions"],
-                "skills": a["skills"], "consults": a["consults"], "model": a["model"], "created_at": utc(a["created_at"]),
+                "skills": a["skills"], "consults": a["consults"], "model": a["model"], "deep": a.get("deep") is True,
+                "tier": self.tier_of(a), "created_at": utc(a["created_at"]),
                 "updated_at": utc(a["updated_at"]), "source": "mine", "readonly": False}
 
     def skill_out(self, s: dict) -> dict:
@@ -309,23 +350,29 @@ class Store:
         for a in self.my_agents.values():
             a["skills"] = [x for x in a["skills"] if not (x["scope"] == "mine" and x["name"] == s["name"])]
 
-    def resolve_ref(self, ref) -> tuple[bool, str | None]:
-        """(usable, name): None is the orchestrator; admin:<name> and mine:<id> must exist."""
+    def resolve_ref(self, ref, access: str = "basic") -> tuple[bool, str | None]:
+        """(usable, name): None is the orchestrator; admin:<name> and mine:<id> must exist,
+        and an advanced one exists only for an advanced context (addendum d)."""
         if ref is None:
             return True, ORCHESTRATOR["name"]
         if not isinstance(ref, str):
             return False, None
         if ref.startswith("admin:"):
             name = ref[6:]
-            return any(a["name"] == name for a in ADMIN_AGENTS), name
+            a = next((x for x in ADMIN_AGENTS if x["name"] == name), None)
+            if a is None:
+                return False, name
+            return (a["tier"] == "basic" or access == "advanced"), name
         if ref.startswith("mine:"):
             a = self.my_agents.get(ref[5:])
-            return (a is not None), (a["name"] if a else None)
+            if a is None:
+                return False, None
+            return (self.tier_of(a) == "basic" or access == "advanced"), a["name"]
         return False, None
 
     def agent_name_of(self, c: dict) -> str:
         ref = c.get("agent_ref")
-        ok, name = self.resolve_ref(ref)
+        ok, name = self.resolve_ref(ref, c.get("access", "basic"))
         if ok:
             return name
         return f"{c.get('agent_label')} (deleted)" if c.get("agent_label") else "Agent (deleted)"
@@ -338,7 +385,7 @@ class Store:
         skills = [s for s in self.my_skills.values() if everything or s["id"] in (skill_ids or []) or s["name"] in attached]
         return {"format": BUNDLE_FORMAT, "exported_at": utc(now()),
                 "agents": [{"name": a["name"], "description": a["description"], "instructions": a["instructions"],
-                            "skills": a["skills"], "consults": a["consults"], "model": a["model"]} for a in agents],
+                            "skills": a["skills"], "consults": a["consults"], "model": a["model"], "deep": a.get("deep") is True} for a in agents],
                 "skills": [{"name": s["name"], "description": s["description"], "content": s["content"]} for s in skills]}
 
     # ---- helpers ----
@@ -346,7 +393,7 @@ class Store:
         at = at or now()
         conv = {"id": str(uuid.uuid4()), "principal": PRINCIPAL, "title": title[:120] or "New chat",
                 "model_name": model, "created_at": at, "updated_at": at, "status": "idle",
-                "agent_ref": None, "agent_label": None}
+                "agent_ref": None, "agent_label": None, "access": "basic"}
         self.conversations[conv["id"]] = conv
         self.messages[conv["id"]] = []
         self.cancel_flags[conv["id"]] = threading.Event()
@@ -369,7 +416,7 @@ class Store:
 
     def conv_summary(self, c: dict) -> dict:
         return {"id": c["id"], "title": c["title"], "updated_at": utc(c["updated_at"]),
-                "created_at": utc(c["created_at"]), "status": c["status"],
+                "created_at": utc(c["created_at"]), "status": c["status"], "access": c.get("access", "basic"),
                 "agent_ref": c.get("agent_ref"), "agent_name": self.agent_name_of(c)}
 
     def conv_usage(self, cid: str) -> dict:
@@ -386,7 +433,7 @@ class Store:
     def conv_detail(self, c: dict) -> dict:
         out = {"id": c["id"], "title": c["title"], "model": c["model_name"], "status": c["status"],
                "created_at": utc(c["created_at"]), "updated_at": utc(c["updated_at"]),
-               "agent_ref": c.get("agent_ref"), "agent_name": self.agent_name_of(c),
+               "access": c.get("access", "basic"), "agent_ref": c.get("agent_ref"), "agent_name": self.agent_name_of(c),
                "usage": self.conv_usage(c["id"]), "messages": []}
         for m in self.messages[c["id"]]:
             files = [self.files[fid] for fid in m["file_ids"] if fid in self.files]
@@ -466,16 +513,27 @@ def text_ok(v, *, min_len: int, max_len: int, one_line: bool = False) -> str | N
     return None
 
 
-AGENT_KEYS = {"name", "description", "instructions", "skills", "consults", "model"}
+AGENT_KEYS = {"name", "description", "instructions", "skills", "consults", "model", "deep"}
 SKILL_KEYS = {"name", "description", "content"}
 
 
 def check_agent(body: dict, *, my_skill_names: set[str], dropping: bool = False) -> tuple[list[dict], list[dict]]:
-    """-> (field errors as (field, rule) dicts, dropped references [{field, name}])."""
+    """-> (field errors as (field, rule) dicts, dropped references [{field, name}]).
+    Addendum (d): ``deep`` must be a boolean; ``deep: true`` and a consult of an advanced
+    admin agent are accepted from a developer only (422 at the field, or dropped on import)."""
     errors: list[tuple[str, str]] = []
     dropped: list[dict] = []
     if not isinstance(body, dict):
         return [("item", "pattern")], dropped
+    deep = body.get("deep", False)
+    if deep is not None and not isinstance(deep, bool):
+        errors.append(("deep", "pattern"))
+    elif deep is True and not DEVELOPER:
+        if dropping:
+            dropped.append({"field": "deep", "name": None})
+            body["deep"] = False
+        else:
+            errors.append(("deep", "developer_only"))
     for k in body:
         if k not in AGENT_KEYS:
             errors.append((k, "unknown_key"))
@@ -514,10 +572,13 @@ def check_agent(body: dict, *, my_skill_names: set[str], dropping: bool = False)
             if not isinstance(c, str):
                 errors.append(("consults", "pattern"))
                 break
-            if any(a["name"] == c for a in ADMIN_AGENTS):
+            known = any(a["name"] == c for a in ADMIN_AGENTS)
+            if known and (DEVELOPER or c not in ADVANCED_ADMIN):
                 kept.append(c)
             elif dropping:
                 dropped.append({"field": "consults", "name": c})
+            elif known:
+                errors.append(("consults", "developer_only", i))
             else:
                 errors.append(("consults", "pattern", i))
         body["consults"] = kept
@@ -552,7 +613,8 @@ def check_skill(body: dict) -> list[tuple[str, str]]:
 
 RULE_TEXT = {"pattern": "is not a valid name or value", "too_long": "is too long", "too_short": "is empty",
              "too_many": "has too many entries", "control": "holds control characters", "unknown_key": "is not a key of this format",
-             "unknown_model": "names a model that does not exist here", "limit": "would pass your limit"}
+             "unknown_model": "names a model that does not exist here", "limit": "would pass your limit",
+             "developer_only": "needs the developer role"}
 
 
 def rule_text(code: str) -> str:
@@ -683,11 +745,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parts == ["me"] and method == "GET":
             return self.send_json(200, {"principal": PRINCIPAL, "models": MODELS, "app_name": APP_NAME,
+                                        "developer": DEVELOPER, "access_default": "basic", "tiers": list(TIERS),
                                         "limits": {"max_file_bytes": MAX_FILE_BYTES, "max_files": MAX_FILES,
                                                    "media_types": MEDIA_TYPES}})
         if parts == ["catalog"] and method == "GET":
+            access = (query.get("access", ["basic"])[0] or "basic")
+            if access not in TIERS:
+                return self.detail(422, "access must be basic or advanced")
+            advanced = access == "advanced" and DEVELOPER  # else as if basic
             return self.send_json(200, {
-                "agents": [{"ref": f"admin:{a['name']}", "name": a["name"], "description": a["description"], "source": "admin", "readonly": True} for a in ADMIN_AGENTS],
+                "agents": [{"ref": f"admin:{a['name']}", "name": a["name"], "description": a["description"], "tier": a["tier"], "source": "admin", "readonly": True}
+                           for a in ADMIN_AGENTS if advanced or a["tier"] == "basic"],
                 "skills": [{"name": s["name"], "description": s["description"], "source": "admin", "readonly": True} for s in ADMIN_SKILLS],
                 "orchestrator": ORCHESTRATOR,
             })
@@ -708,11 +776,17 @@ class Handler(BaseHTTPRequestHandler):
                 if model is not None and model not in {m["id"] for m in MODELS}:
                     return self.detail(422, "unknown model")
                 ref = data.get("agent_ref")
+                access = data.get("access", "basic")
+                if access not in TIERS:
+                    return self.detail(422, "access must be basic or advanced")
+                if access == "advanced" and not DEVELOPER:
+                    return self.detail(403, ACCESS_DENIED)
                 with STORE.lock:
-                    ok, name = STORE.resolve_ref(ref)
+                    ok, name = STORE.resolve_ref(ref, access)
                     if not ok:
                         return self.detail(422, "Unknown agent")
                     conv = STORE.new_conversation(title, model)
+                    conv["access"] = access
                     conv["agent_ref"], conv["agent_label"] = ref, (name if ref else None)
                     out = STORE.conv_summary(conv)
                 out["model"] = model
@@ -740,12 +814,27 @@ class Handler(BaseHTTPRequestHandler):
                             if data["model"] is not None and data["model"] not in {m["id"] for m in MODELS}:
                                 return self.detail(422, "unknown model")
                             conv["model_name"] = data["model"]
+                        access = conv.get("access", "basic")
+                        if "access" in data:
+                            if data["access"] not in TIERS:
+                                return self.detail(422, "access must be basic or advanced")
+                            if data["access"] == "advanced" and not DEVELOPER:
+                                return self.detail(403, ACCESS_DENIED)
+                            access = data["access"]
                         if "agent_ref" in data:
-                            ok, name = STORE.resolve_ref(data["agent_ref"])
+                            # checked against the access of this PATCH (both keys in one body are one decision)
+                            ok, name = STORE.resolve_ref(data["agent_ref"], access)
                             if not ok:
                                 return self.detail(422, "Unknown agent")
                             conv["agent_ref"] = data["agent_ref"]
                             conv["agent_label"] = name if data["agent_ref"] else None
+                        elif "access" in data:
+                            # as the real route: an agent the new access does not offer
+                            # falls back to the orchestrator (like a deleted agent)
+                            ok, _name = STORE.resolve_ref(conv.get("agent_ref"), access)
+                            if not ok:
+                                conv["agent_ref"], conv["agent_label"] = None, None
+                        conv["access"] = access
                         detail = STORE.conv_detail(conv)
                     return self.send_json(200, detail)
                 if method == "DELETE":
@@ -1148,15 +1237,19 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv=None) -> int:
-    global FAST, SLOW
+    global FAST, SLOW, DEVELOPER
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=7935)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--fast", action="store_true", help="no sleeps in the scripted turn")
     ap.add_argument("--slow", type=float, default=1.0, help="multiply every sleep (screenshots mid-turn)")
+    ap.add_argument("--basic-user", action="store_true", help="the signed-in user has no developer role (addendum d)")
     args = ap.parse_args(argv)
     FAST = args.fast
     SLOW = max(0.0, args.slow)
+    if args.basic_user:
+        DEVELOPER = False
+        STORE.__init__()  # re-seed without the developer-only rows
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"webchat fake server on http://{args.host}:{args.port}/chat", flush=True)

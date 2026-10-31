@@ -399,3 +399,299 @@ def test_personal_agents_never_reach_the_registry_a2a_invoke_or_jobs():
         assert "ChatUserAgent" not in text and "chat_user_agents" not in text, module
         assert "webchat" not in text or module == "chat_app.py", module
 
+
+
+# ---------------------------------------------------------------------------
+# Basic and advanced access (addendum (d))
+# ---------------------------------------------------------------------------
+class FakeValidator:
+    """``has_scope`` as ``XsuaaValidator`` answers it."""
+
+    xsappname = "app!t1"
+
+    def has_scope(self, payload, scope):
+        scopes = payload.get("scope") or []
+        return f"{self.xsappname}.{scope}" in scopes or scope in scopes
+
+
+ROLES = {
+    "user": {"user_name": "u", "scope": ["app!t1.user"]},
+    "developer": {"user_name": "d", "scope": ["app!t1.user", "app!t1.developer"]},
+    "admin": {"user_name": "a", "scope": ["app!t1.user", "app!t1.admin"]},
+}
+ADVANCED_FORBIDDEN = {"detail": "Advanced access needs the developer role"}
+
+
+def role_app() -> Any:
+    """Like ``bound_app``, with XSUAA claims of the role in ``x-test-role``."""
+    inner = FastAPI()
+    inner.include_router(routes.router)
+    inner.include_router(my_routes.router)
+    install_validation_handler(inner)
+
+    async def asgi(scope, receive, send):
+        if scope["type"] != "http":
+            return await inner(scope, receive, send)
+        role = dict(scope["headers"]).get(b"x-test-role", b"user").decode()
+        p = current_principal.set(ALICE)
+        j = current_jwt.set("jwt-of-alice")
+        c = auth.current_claims.set(ROLES[role])
+        try:
+            await inner(scope, receive, send)
+        finally:
+            auth.current_claims.reset(c)
+            current_principal.reset(p)
+            current_jwt.reset(j)
+
+    return asgi
+
+
+@pytest.fixture
+async def roles():
+    auth._validator, auth._validator_checked = FakeValidator(), True
+    async with AsyncClient(transport=ASGITransport(app=role_app()),
+                           base_url="http://test") as c:
+        yield c
+    # `_clean` restores the validator.
+
+
+def as_role(role: str) -> dict[str, dict[str, str]]:
+    return {"headers": {"x-test-role": role}}
+
+
+async def test_me_tells_who_may_switch(roles):
+    for role, developer in (("user", False), ("developer", True), ("admin", True)):
+        me = (await roles.get(f"{API}/me", **as_role(role))).json()
+        assert me["developer"] is developer, role
+        assert me["access_default"] == "basic" and me["tiers"] == ["basic", "advanced"]
+
+
+async def test_the_catalogue_lists_advanced_agents_only_for_an_advanced_developer(roles):
+    await admin_agent("btp-admin")
+    await admin_agent("abap-dev")
+    await set_admin("abap-dev", tier="advanced")
+
+    async def listed(role: str, query: str = "") -> dict[str, str]:
+        r = await roles.get(f"{API}/catalog{query}", **as_role(role))
+        assert r.status_code == 200
+        return {a["name"]: a["tier"] for a in r.json()["agents"]}
+
+    assert await listed("developer") == {"btp-admin": "basic"}
+    assert await listed("developer", "?access=basic") == {"btp-admin": "basic"}
+    assert await listed("user", "?access=advanced") == {"btp-admin": "basic"}
+    both = {"btp-admin": "basic", "abap-dev": "advanced"}
+    assert await listed("developer", "?access=advanced") == both
+    assert await listed("admin", "?access=advanced") == both
+    r = await roles.get(f"{API}/catalog?access=root", **as_role("admin"))
+    assert r.status_code == 422
+
+
+async def test_advanced_conversations_need_the_developer_or_admin_role(
+        roles, monkeypatch, real_agents_and_mcp):
+    await admin_agent("btp-admin")
+    await admin_agent("abap-dev")
+    await set_admin("abap-dev", tier="advanced")
+
+    r = await roles.post(f"{API}/conversations", json={"access": "advanced"}, **as_role("user"))
+    assert (r.status_code, r.json()) == (403, ADVANCED_FORBIDDEN)
+    r = await roles.post(f"{API}/conversations", json={}, **as_role("user"))
+    assert r.status_code == 201 and r.json()["access"] == "basic"
+    basic = r.json()["id"]
+    r = await roles.patch(f"{API}/conversations/{basic}", json={"access": "advanced"},
+                          **as_role("user"))
+    assert (r.status_code, r.json()) == (403, ADVANCED_FORBIDDEN)
+    r = await roles.post(f"{API}/conversations", json={"access": "expert"}, **as_role("admin"))
+    assert r.status_code == 422
+
+    # The advanced admin agent does not exist for a basic conversation.
+    for role in ("user", "developer"):
+        r = await roles.post(f"{API}/conversations", json={"agent_ref": "admin:abap-dev"},
+                             **as_role(role))
+        assert (r.status_code, r.json()) == (422, {"detail": "Unknown agent"})
+        r = await roles.patch(f"{API}/conversations/{basic}",
+                              json={"agent_ref": "admin:abap-dev"}, **as_role(role))
+        assert (r.status_code, r.json()) == (422, {"detail": "Unknown agent"})
+
+    for role in ("developer", "admin"):
+        r = await roles.post(f"{API}/conversations",
+                             json={"access": "advanced", "agent_ref": "admin:abap-dev"},
+                             **as_role(role))
+        assert r.status_code == 201, (role, r.text)
+        assert (r.json()["access"], r.json()["agent_ref"]) == ("advanced", "admin:abap-dev")
+    advanced = r.json()["id"]
+    listed = (await roles.get(f"{API}/conversations", **as_role("admin"))).json()
+    accesses = {c["id"]: c["access"] for c in listed}
+    assert len(accesses) == 3 and accesses[basic] == "basic"
+    assert accesses[advanced] == "advanced"
+    detail = (await roles.get(f"{API}/conversations/{advanced}", **as_role("admin"))).json()
+    assert detail["access"] == "advanced"
+
+    # Back to basic: the advanced agent cannot run there, the conversation
+    # falls back to the orchestrator.
+    r = await roles.patch(f"{API}/conversations/{advanced}", json={"access": "basic"},
+                          **as_role("developer"))
+    assert r.status_code == 200
+    assert (r.json()["access"], r.json()["agent_ref"]) == ("basic", None)
+    r = await roles.patch(f"{API}/conversations/{advanced}", json={"access": "advanced"},
+                          **as_role("developer"))
+    assert r.json()["access"] == "advanced"
+
+    # The role is checked again at every turn.
+    use_registry(monkeypatch, Recorder(), {})
+    r = await roles.post(f"{API}/conversations/{advanced}/messages", **form(),
+                         **as_role("user"))
+    assert (r.status_code, r.json()) == (403, ADVANCED_FORBIDDEN)
+    async with SessionLocal() as s:
+        conv = await s.get(ChatConversation, advanced)
+        assert conv.status == "idle"
+    r = await roles.post(f"{API}/conversations/{advanced}/messages", **form(),
+                         **as_role("admin"))
+    assert r.status_code == 200
+
+
+async def test_an_advanced_turn_binds_its_access_for_the_orchestrator(
+        roles, monkeypatch, real_agents_and_mcp):
+    """The turn's task sees the conversation's access, not the role."""
+    from agents import access
+
+    seen: list[str] = []
+
+    async def stream(messages, info):
+        seen.append(access.effective_tier())
+        yield "ok"
+
+    fake = use_registry(monkeypatch, Recorder(), {})
+    fake.orchestrator = Agent(FunctionModel(stream_function=stream, model_name="o"))
+    for value in ("basic", "advanced"):
+        r = await roles.post(f"{API}/conversations", json={"access": value},
+                             **as_role("developer"))
+        r = await roles.post(f"{API}/conversations/{r.json()['id']}/messages", **form(),
+                             **as_role("developer"))
+        assert r.status_code == 200
+    assert seen == ["basic", "advanced"]
+    assert access.current_access.get() is None
+
+
+async def test_deep_and_advanced_consults_only_for_a_developer_or_admin(roles):
+    await admin_agent("btp-admin")
+    await admin_agent("abap-dev")
+    await set_admin("abap-dev", tier="advanced")
+    body = {"name": "Deep one", "instructions": "x", "deep": True}
+
+    r = await roles.post(f"{API}/my/agents", json=body, **as_role("user"))
+    assert r.status_code == 422
+    assert [d["loc"] for d in r.json()["detail"]] == [["body", "deep"]]
+    r = await roles.post(f"{API}/my/agents", json={"name": "Consulter", "instructions": "x",
+                                                   "consults": ["btp-admin", "abap-dev"]},
+                         **as_role("user"))
+    assert r.status_code == 422
+    assert [d["loc"] for d in r.json()["detail"]] == [["body", "consults", 1]]
+    r = await roles.post(f"{API}/my/agents", json={**body, "deep": "true"}, **as_role("admin"))
+    assert r.status_code == 422  # strict boolean
+
+    r = await roles.post(f"{API}/my/agents", json=body, **as_role("developer"))
+    assert r.status_code == 201, r.text
+    assert (r.json()["deep"], r.json()["tier"]) == (True, "advanced")
+    deep_ref = r.json()["ref"]
+    r = await roles.post(f"{API}/my/agents", json={"name": "Consulter", "instructions": "x",
+                                                   "consults": ["abap-dev"]}, **as_role("admin"))
+    assert r.status_code == 201 and r.json()["tier"] == "advanced"
+    r = await roles.post(f"{API}/my/agents", json={"name": "Plain", "instructions": "x",
+                                                   "consults": ["btp-admin"]}, **as_role("user"))
+    assert (r.json()["deep"], r.json()["tier"]) == (False, "basic")
+    listed = {a["name"]: a["tier"]
+              for a in (await roles.get(f"{API}/my/agents", **as_role("user"))).json()}
+    assert listed == {"Consulter": "advanced", "Deep one": "advanced", "Plain": "basic"}
+
+    # An advanced personal agent does not exist for a basic conversation.
+    r = await roles.post(f"{API}/conversations", json={"agent_ref": deep_ref},
+                         **as_role("developer"))
+    assert (r.status_code, r.json()) == (422, {"detail": "Unknown agent"})
+    r = await roles.post(f"{API}/conversations",
+                         json={"agent_ref": deep_ref, "access": "advanced"},
+                         **as_role("developer"))
+    assert r.status_code == 201
+
+    # Export carries deep; an import by a plain user drops it and the
+    # advanced consult, a developer's or an admin's keeps both.
+    bundle = (await roles.get(f"{API}/my/export", **as_role("user"))).json()
+    assert {a["name"]: a["deep"] for a in bundle["agents"]} == {
+        "Consulter": False, "Deep one": True, "Plain": False}
+    r = await roles.post(f"{API}/my/import?on_conflict=replace", json=bundle,
+                         **as_role("user"))
+    assert r.status_code == 200, r.text
+    assert sorted((d["item"], d["field"], d["name"]) for d in r.json()["dropped"]) == [
+        ("agent:Consulter", "consults", "abap-dev"), ("agent:Deep one", "deep", None)]
+    listed = {a["name"]: (a["deep"], a["tier"], a["consults"])
+              for a in (await roles.get(f"{API}/my/agents", **as_role("user"))).json()}
+    assert listed["Deep one"] == (False, "basic", [])
+    assert listed["Consulter"] == (False, "basic", [])
+    for role in ("developer", "admin"):
+        r = await roles.post(f"{API}/my/import?on_conflict=replace", json=bundle,
+                             **as_role(role))
+        assert r.status_code == 200 and r.json()["dropped"] == [], role
+
+
+async def test_a_deep_personal_agent_runs_with_the_deep_tools(
+        roles, monkeypatch, real_agents_and_mcp):
+    model = Recorder()
+    use_registry(monkeypatch, model, {"abap-dev": specialist(), "btp-admin": specialist()})
+    await admin_agent("btp-admin")
+    await admin_agent("abap-dev")
+    await set_admin("abap-dev", tier="advanced")
+    r = await roles.post(f"{API}/my/agents", json={
+        "name": "Deep one", "instructions": "You plan.", "deep": True,
+        "consults": ["btp-admin", "abap-dev"]}, **as_role("developer"))
+    assert r.status_code == 201, r.text
+    deep_ref = r.json()["ref"]
+    r = await roles.post(f"{API}/my/agents", json={"name": "Flat", "instructions": "x",
+                                                   "consults": ["btp-admin"]},
+                         **as_role("developer"))
+    flat = r.json()["ref"]
+
+    cid = (await roles.post(f"{API}/conversations",
+                            json={"access": "advanced", "agent_ref": deep_ref},
+                            **as_role("developer"))).json()["id"]
+    r = await roles.post(f"{API}/conversations/{cid}/messages", **form(),
+                         **as_role("developer"))
+    assert r.status_code == 200
+    tools = set(model.tools[0])
+    assert {"write_todos", "read_todos", "write_file", "read_file", "edit_file", "ls",
+            "task"} <= tools
+    assert {"delegate_btp_admin", "delegate_abap_dev", "create_word_document"} <= tools
+    instructions = model.instructions[0]
+    assert instructions.startswith("You plan.") and "write_todos" in instructions
+
+    # A basic personal agent: no deep tools; in a basic conversation.
+    model.tools.clear()
+    model.instructions.clear()
+    cid = (await roles.post(f"{API}/conversations", json={"agent_ref": flat},
+                            **as_role("developer"))).json()["id"]
+    r = await roles.post(f"{API}/conversations/{cid}/messages", **form(),
+                         **as_role("developer"))
+    assert r.status_code == 200
+    tools = set(model.tools[0])
+    assert "write_todos" not in tools and "task" not in tools
+    assert "delegate_btp_admin" in tools
+
+
+async def test_a_consult_gone_advanced_is_not_listed_in_a_basic_turn(
+        roles, monkeypatch, real_agents_and_mcp):
+    """An admin agent made advanced after the save: the personal agent is
+    advanced now and refused in a basic conversation; the turn of an
+    advanced conversation lists the consult."""
+    model = Recorder()
+    use_registry(monkeypatch, model, {"abap-dev": specialist()})
+    await admin_agent("abap-dev")
+    r = await roles.post(f"{API}/my/agents", json={"name": "C", "instructions": "x",
+                                                   "consults": ["abap-dev"]},
+                         **as_role("user"))
+    ref = r.json()["ref"]
+    cid = (await roles.post(f"{API}/conversations", json={"agent_ref": ref},
+                            **as_role("user"))).json()["id"]
+    await set_admin("abap-dev", tier="advanced")
+    r = await roles.post(f"{API}/conversations/{cid}/messages", **form(), **as_role("user"))
+    events = frames(r.text)
+    assert ("error", {"code": "agent_unavailable",
+                      "message": run.MSG_AGENT_UNAVAILABLE}) in events
+    assert model.tools == []

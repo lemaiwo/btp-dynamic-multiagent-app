@@ -620,6 +620,13 @@ class AgentConfig(Base):
     result_schema_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Attachment limits (`agents.invoke_config.clean_limits`); null = defaults.
     invoke_limits_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- access tier (agents/access.py) --- "basic" (every chat user) or
+    # "advanced" (the developer role): an advanced specialist is reachable
+    # from chat only in an advanced context. Jobs, workflows and invoke run
+    # named agents and ignore it.
+    tier: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="basic", server_default="basic"
+    )
 
     @property
     def mcp_servers(self) -> list[dict[str, Any]]:
@@ -714,6 +721,7 @@ class AgentConfig(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deep": self.deep.model_dump(),
+            "tier": self.tier or "basic",
             **self._invoke_dict(),
         }
 
@@ -742,6 +750,7 @@ class AgentConfig(Base):
             "run_timeout_seconds": self.run_timeout_seconds,
             "model_name": self.model_name or "",
             "deep": self.deep.model_dump(),
+            "tier": self.tier or "basic",
             **self._invoke_dict(),
         }
 
@@ -1547,6 +1556,11 @@ class ChatConversation(Base):
     # ``admin:<name>`` = an admin specialist straight, ``mine:<id>`` = one of
     # the owner's personal agents (``agents/webchat/user_agents.py``).
     agent_ref: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # The access tier of this conversation (``agents/access.py``): "basic" or
+    # "advanced"; "advanced" needs the developer role, checked at every turn.
+    access: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="basic", server_default="basic"
+    )
 
 
 class ChatMessage(Base):
@@ -1634,6 +1648,9 @@ class ChatUserAgent(Base):
     # ["<admin agent name>", ...]
     consults_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # 1 = the deep-agent tools (plan, scratchpad, sub-agents) at run time;
+    # only a developer may switch it on (addendum (d)).
+    deep: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_chat_now,
         server_default=func.now(),
@@ -1897,6 +1914,16 @@ async def _create_and_migrate() -> None:
         await _ensure_column(conn, "ide_comments", "quote", "VARCHAR(200)")
         # The web chat's agent picker (personal agents, addendum (c)).
         await _ensure_column(conn, "chat_conversations", "agent_ref", "VARCHAR(80)")
+        # Basic and advanced access (addendum (d)).
+        await _ensure_column(
+            conn, "agent_configs", "tier", "VARCHAR(16) NOT NULL DEFAULT 'basic'"
+        )
+        await _ensure_column(
+            conn, "chat_conversations", "access", "VARCHAR(16) NOT NULL DEFAULT 'basic'"
+        )
+        await _ensure_column(
+            conn, "chat_user_agents", "deep", "INTEGER NOT NULL DEFAULT 0"
+        )
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -2851,6 +2878,10 @@ class _Keep:
 
 KEEP = _Keep()
 
+# The access tiers of an admin agent (``agents.access.TIERS`` repeats them;
+# agents.access imports nothing from here).
+AGENT_TIERS = ("basic", "advanced")
+
 
 async def upsert_agent(
     session: AsyncSession,
@@ -2881,6 +2912,9 @@ async def upsert_agent(
     expose_invoke: bool | _Keep = KEEP,
     result_schema: dict[str, Any] | None | _Keep = KEEP,
     invoke_limits: dict[str, Any] | None | _Keep = KEEP,
+    # --- access tier --- KEEP (not sent) preserves what is stored; for a
+    # new row it means "basic". Only "basic" and "advanced" are stored.
+    tier: str | _Keep = KEEP,
 ) -> AgentConfig:
     """Create or update the agent named ``name``.
 
@@ -2893,6 +2927,8 @@ async def upsert_agent(
     (`check_bitbucket_approver_reach`).
     """
     name = name.strip()
+    if not isinstance(tier, _Keep) and tier not in AGENT_TIERS:
+        raise ValueError("tier must be basic or advanced")
     existing = await get_agent_by_name(session, name)
     primary, extras, primary_oauth_json = prepare_servers(mcp_servers, existing)
     # Here rather than in the admin routes: scripts and seeds write agents
@@ -2998,6 +3034,7 @@ async def upsert_agent(
         row.expose_invoke = 1 if invoke_on else 0
         row.result_schema_json = None if isinstance(schema_json, _Keep) else schema_json
         row.invoke_limits_json = None if isinstance(limits_json, _Keep) else limits_json
+        row.tier = "basic" if isinstance(tier, _Keep) else tier
     else:
         existing.description = description
         existing.instructions = instructions
@@ -3032,6 +3069,8 @@ async def upsert_agent(
             existing.result_schema_json = schema_json
         if not isinstance(limits_json, _Keep):
             existing.invoke_limits_json = limits_json
+        if not isinstance(tier, _Keep):
+            existing.tier = tier
         row = existing
     if commit:
         await session.commit()

@@ -177,6 +177,9 @@ export default class FakeBackend {
             url: "https://arc1.example.com/mcp", auth_mode: "destination",
             oauth: { destination: "arc1-abap-readonly", user_context: true }
         }]);
+        // --- tier --- gmail-agent is an advanced (developer-only) agent,
+        // btp-agent keeps the default basic.
+        this.agents[1].tier = "advanced";
         // --- deep agents --- btp-agent carries a non-default config so a
         // journey can check it is shown and resent unchanged; gmail-agent
         // keeps the defaults (GET always returns the object).
@@ -403,7 +406,7 @@ export default class FakeBackend {
             id: this.nextId++, name, description: `${name} description`,
             instructions: "Do the thing.",
             mcp_servers: [{ url: "https://x.hana.ondemand.com/mcp", auth_mode: "jwt" }],
-            skills: [], enabled: true, expose_chat: true, expose_api: false,
+            skills: [], enabled: true, expose_chat: true, tier: "basic", expose_api: false,
             api_slug: "", run_as_principal: "", run_prompt: "",
             run_timeout_seconds: 1800, peers: [], model_name: "",
             deep: { ...DEEP_DEFAULTS },
@@ -1655,6 +1658,12 @@ export default class FakeBackend {
             return this.json(this.agents);
         }
         if ((path === "agents" && method === "POST") || (/^agents\/\d+$/.test(path) && method === "PUT")) {
+            // `AgentPayload.tier` (agents/admin.py): absent keeps what is
+            // stored, anything but basic / advanced is a 422 naming the field.
+            if (body && "tier" in body && body.tier !== "basic" && body.tier !== "advanced") {
+                return this.json({ detail: [{ loc: ["body", "tier"], msg: "Input should be 'basic' or 'advanced'",
+                    type: "literal_error" }] }, 422);
+            }
             const refusal = this.storeODataEntries(body);
             if (refusal) {
                 return this.json({ detail: refusal }, 422);

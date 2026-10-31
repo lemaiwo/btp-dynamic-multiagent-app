@@ -1659,6 +1659,47 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     updates the user's agents, deleting an agent resets the conversations
     that pointed at it. `tests/test_webchat_my.py`,
     `tests/test_webchat_user_agents.py`
+  - **Basic and advanced access** (`agents/access.py`). Two tiers: `basic`
+    (the `user` scope) and `advanced`, granted by the `developer` OR the
+    `admin` scope (`is_developer`; without an XSUAA validator everyone is
+    advanced, as `require_developer` admits everyone locally).
+    `AgentConfig.tier` (`basic` default | `advanced`; `AgentPayload.tier`
+    lax: absent keeps the stored value; in list/detail, export, import,
+    `scripts/import_bundle.py`, the seed loop; both admin UIs have a Tier
+    field) marks the developer agents (ABAP on ARC-1, UI5/Fiori, CAP deep
+    agents). `effective_tier()` = `current_access` (a contextvar the web chat
+    binds from the conversation's `access` column for the run) else the tier
+    the bound claims give; the orchestrator's delegation tools are registered
+    with a `prepare` (`_tier_gate`) that drops an advanced specialist's tool
+    in a basic run (peer tools are not gated; the "only ONE specialist" rule
+    is not applied when that one is advanced), and the orchestrator
+    instructions list advanced specialists under "Developer specialists
+    (advanced access only)". The classic chat, A2A and the IDE are gated by
+    the claims; jobs, workflows and invoke run named agents and are not. Web
+    chat: `/me` answers `developer`, `access_default`, `tiers`; `GET
+    /catalog?access=advanced` lists advanced admin agents only for a
+    developer/admin (every agent carries `tier`); `POST`/`PATCH
+    /conversations` take `access` (403 "Advanced access needs the developer
+    role" for anyone else, re-checked at every turn of an advanced
+    conversation before the run lock); an advanced admin or personal agent
+    named as `agent_ref` of a basic conversation is 422 "Unknown agent"; a
+    `PATCH` to basic resets an advanced `agent_ref` to the orchestrator. A
+    personal agent is `advanced` (computed live) when `deep` is on
+    (`chat_user_agents.deep`: the deep toolset with the default `DeepConfig`
+    and `scoped_deep_instructions`; its sub-agents get the document tools,
+    not its consults) or when it consults an advanced admin agent; `deep` and
+    advanced consults are accepted only from a developer/admin (422 at the
+    field), an import by anyone else drops them into `dropped`. The three
+    columns (`tier`, `access`, `deep`) are HANA schema generation 6. The seed
+    ships three DISABLED advanced deep agents (`abap-developer-deep` on a
+    destination placeholder `ARC1_DEV`, `ui5-fiori-developer-deep`,
+    `cap-developer-deep` on `*-replace-me.hana.ondemand.com` placeholders: a
+    `jwt` MCP URL must sit on `*.hana.ondemand.com` unless
+    `MCP_URL_ALLOWLIST` says otherwise) and the skills
+    `ui5-freestyle-conventions`, `fiori-elements-guidance`,
+    `cap-cds-modeling` (seed skills must not reuse IDE seed skill names:
+    `ensure_ide_seed` skips existing names). An admin's tier change applies
+    at the next reload, like `expose_chat`. `tests/test_access_tier.py`
 - `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
   ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
   DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`
@@ -1881,7 +1922,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   an object and a count that is not a whole number are refused before the
   save with a fixed text; all limits blank sends `invoke_limits: null`; an
   untouched max-MB field sends the stored byte count back unchanged; the
-  list row shows an "Invoke" tag. The admin payload (`AgentPayload`) treats
+  list row shows an "Invoke" tag. A **Tier** select (Basic / Advanced, next to
+  "Available in chat", with a hint) is always sent as `tier`; an advanced
+  agent's row carries an "Advanced" tag; an agent loaded without `tier` is
+  shown and sent as basic (`agents/access.py`). list row shows an "Invoke" tag. The admin payload (`AgentPayload`) treats
   an ABSENT `expose_invoke` / `result_schema` / `invoke_limits` key as "keep
   what is stored" (`invoke_kwargs`, by `model_fields_set`), so an older
   client cannot wipe them, and an explicit `false` / `null` switches off or
@@ -1990,6 +2034,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     API slug input is always editable (before only with "Expose as an
     API-triggered job" on: an invoke-only agent could never get a slug).
     `test/unit/invokeSettings.qunit.ts`, six OPA tests in `AgentJourney.ts`
+  - Tier: a `Select` on the agent page bound to `tier` (Basic / Advanced, i18n
+    keys `tier*`, a hint), always sent on save, `basic` for a new agent or one
+    loaded without it; the list shows an "Advanced" `ObjectStatus`
+    (`AgentJourney.ts`, `FakeBackend.ts` refuse another value with a 422 at
+    `tier`).
   - Notifications: a bell with the unread count (also in its tooltip, for
     screen readers) and a toast in the app shell for finished agent and
     workflow runs, logic in `model/notifications.ts`. `GET notifications` is
@@ -2084,10 +2133,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   no new resource, environment variable, table or column (HANA schema
   generation unchanged); 2.27.0 is the web chat release (`agents/webchat/`): no
   new resource, one environment variable `CHAT_RETENTION_DAYS` (180), five
-  new tables and one column (HANA schema generation 5: the three chat tables
-  are generation 4, the personal agents/skills tables and
-  `chat_conversations.agent_ref` generation 5), `reportlab` in
-  `requirements.txt`
+  new tables and four columns (HANA schema generation 6: the three chat
+  tables are generation 4, the personal agents/skills tables and
+  `chat_conversations.agent_ref` generation 5, `agent_configs.tier`,
+  `chat_conversations.access` and `chat_user_agents.deep` generation 6),
+  `reportlab` in `requirements.txt`
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

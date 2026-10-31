@@ -21,13 +21,15 @@ export function createStore(initial) {
 }
 
 export const initialState = {
-  me: null,            // {principal, models, limits, app_name}
+  me: null,            // {principal, models, limits, app_name, developer, access_default, tiers}
   conversations: [],   // sidebar list
   currentId: null,     // from the hash
   conversation: null,  // the open conversation with messages
   loading: false,
   run: null,           // {conversationId, assistantId, startedAt, controller}
   draftModel: null,    // model picked before a conversation exists
+  draftAccess: 'basic', // the switch's value for the next conversation ('basic' | 'advanced')
+  catalogAccess: 'basic', // the access the loaded catalogue was asked for
   banner: null,        // 'expired' | null
   sidebarOpen: false,  // the drawer on narrow screens
   query: '',

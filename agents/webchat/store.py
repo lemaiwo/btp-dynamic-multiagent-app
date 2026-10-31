@@ -99,12 +99,13 @@ def conversation_out(conv: ChatConversation, agent_name: str | None = None) -> d
         "updated_at": iso_utc(conv.updated_at),
         "agent_ref": conv.agent_ref,
         "agent_name": agent_name or ORCHESTRATOR_NAME,
+        "access": conv.access or "basic",
     }
 
 
 async def create_conversation(
     db: AsyncSession, principal: str, *, title: str | None, model: str | None,
-    agent_ref: str | None = None,
+    agent_ref: str | None = None, access: str = "basic",
 ) -> ChatConversation:
     now = utcnow()
     conv = ChatConversation(
@@ -112,6 +113,7 @@ async def create_conversation(
         title=one_line(title or "") or DEFAULT_TITLE,
         model_name=model,
         agent_ref=agent_ref,
+        access=access,
         created_at=now,
         updated_at=now,
         status="idle",
@@ -160,7 +162,7 @@ async def get_conversation(
 async def update_conversation(
     db: AsyncSession, conv: ChatConversation, *,
     title: str | None = None, model: str | None = None, clear_model: bool = False,
-    agent_ref: Any = KEEP,
+    agent_ref: Any = KEEP, access: Any = KEEP,
 ) -> ChatConversation:
     values: dict[str, Any] = {}
     if title is not None:
@@ -169,6 +171,8 @@ async def update_conversation(
         values["model_name"] = model
     if agent_ref is not KEEP:
         values["agent_ref"] = agent_ref
+    if access is not KEEP:
+        values["access"] = access
     if values:
         await db.execute(
             update(ChatConversation)

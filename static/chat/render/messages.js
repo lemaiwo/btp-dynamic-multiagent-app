@@ -253,30 +253,46 @@ const PROMPTS = [
   'Summarise the open pull requests on our Fiori repositories',
   'Create an Excel workbook of the destinations in our dev subaccount',
 ];
+// Advanced access (addendum d): one chip per developer specialist.
+export const DEVELOPER_PROMPTS = [
+  'ABAP: review class ZCL_ORDER_CHECK for clean-core violations and propose a fix',
+  'UI5/Fiori: add a filter bar with a date range to the worklist of our orders app',
+  'CAP: model a Shipment entity with a status flow and expose it in the admin service',
+];
+export const DEVELOPER_GREETING = 'What are we building today?';
 
 /**
  * The empty state: logo, greeting, three example prompts. With a picked
  * agent the heading names it and the subline is its description.
  */
-export function renderEmpty(container, { appName, onPrompt, agentName = '', agentDescription = '' }) {
+export function renderEmpty(container, { appName, onPrompt, agentName = '', agentDescription = '', advanced = false }) {
   container.classList.add('empty-state');
   const wrap = document.createElement('div');
-  wrap.className = 'empty';
+  wrap.className = advanced ? 'empty advanced' : 'empty';
   const logo = document.createElement('img');
   logo.src = '/static/sap.png';
   logo.alt = '';
   logo.className = 'empty-logo';
   const h = document.createElement('h2');
   h.className = 'greeting';
-  h.textContent = agentName ? `Ask ${agentName}` : 'What are we doing on BTP today?';
+  h.textContent = agentName ? `Ask ${agentName}` : (advanced ? DEVELOPER_GREETING : 'What are we doing on BTP today?');
   const sub = document.createElement('p');
   sub.className = 'greeting-sub';
   sub.textContent = agentName
     ? (agentDescription || `This conversation goes straight to ${agentName}. Attach a document or ask for one.`)
-    : `${appName || 'SAP BTP Multi-Agent'} hands your question to the specialist that can answer it. Attach a document or ask for one.`;
+    : (advanced
+      ? 'Advanced access: the ABAP, UI5/Fiori and CAP developer agents are on hand, each with its own tools. Ask for a review, a change or a design.'
+      : `${appName || 'SAP BTP Multi-Agent'} hands your question to the specialist that can answer it. Attach a document or ask for one.`);
+  if (advanced) {
+    const tag = document.createElement('span');
+    tag.className = 'dev-tag';
+    tag.textContent = 'Developer';
+    h.appendChild(document.createTextNode(' '));
+    h.appendChild(tag);
+  }
   const chips = document.createElement('div');
   chips.className = 'prompt-chips';
-  for (const text of PROMPTS) {
+  for (const text of (advanced && !agentName ? DEVELOPER_PROMPTS : PROMPTS)) {
     const b = document.createElement('button');
     b.type = 'button';
     b.className = 'prompt-chip';

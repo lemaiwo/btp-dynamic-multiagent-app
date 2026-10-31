@@ -86,7 +86,8 @@ export const cancelRun = (id) =>
   request(`/conversations/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
 
 // ---- personal agents and skills, the admin catalogue (addendum c) ----
-export const getCatalog = () => request('/catalog');
+/** GET /catalog, or /catalog?access=advanced for the developer tier (addendum d). */
+export const getCatalog = (access) => request(access === 'advanced' || access === 'basic' ? `/catalog?access=${access}` : '/catalog');
 export const listMyAgents = () => request('/my/agents');
 export const createMyAgent = (body) => request('/my/agents', { method: 'POST', body });
 export const getMyAgent = (id) => request(`/my/agents/${encodeURIComponent(id)}`);

@@ -78,6 +78,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
 )
 
+from agents.access import BASIC, current_access
 from agents.db import SessionLocal
 from agents.errors import describe_exception, mask_text
 from agents.oauth2 import OAuthAuthorizationRequired
@@ -617,6 +618,8 @@ class TurnInput:
     model_name: str | None
     title: str | None
     agent_ref: str | None = None
+    # The conversation's access tier (agents/access.py), bound for the run.
+    access: str = BASIC
 
 
 @dataclass
@@ -658,7 +661,8 @@ async def _personal_model(stored: str | None, picked: str | None) -> tuple[Any, 
 async def resolve_runner(data: TurnInput) -> Runner:
     """The runner of ``data.agent_ref`` (re-read every turn);
     ``AgentUnavailable`` when it names nothing usable now."""
-    target = await user_agents.resolve_agent_ref(data.principal, data.agent_ref)
+    target = await user_agents.resolve_agent_ref(data.principal, data.agent_ref,
+                                                 data.access)
     if isinstance(target, str):
         raise AgentUnavailable(target)
     if target.kind == "orchestrator":
@@ -753,6 +757,10 @@ async def _run(turn: Turn, data: TurnInput) -> None:
     # Bound here, in the run's own task, and reset in it.
     progress_token = current_progress.set(rec.sink)
     ctx_token = current_chat_run.set(ctx)
+    # The orchestrator's (and a personal agent's consults') delegation tools
+    # are gated on this (agents/access.py): the conversation decides, not
+    # the caller's role alone, so a developer's basic conversation stays basic.
+    access_token = current_access.set(data.access)
     beat = asyncio.create_task(rec.heartbeat())
     status, content, model_json, error = "failed", None, None, None
     counter = None
@@ -807,6 +815,7 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             counter.value -= 1
         rec.finished = True
         beat.cancel()
+        current_access.reset(access_token)
         current_chat_run.reset(ctx_token)
         current_progress.reset(progress_token)
     await _finish(turn, rec, status=status, content=content, model_json=model_json,

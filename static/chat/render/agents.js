@@ -2,12 +2,14 @@
 // "Mine" (edit, duplicate, delete, export selection) and "Admin · read-only"
 // (lock badge, name + description; an agent row offers "Chat with this
 // agent"). Toolbar: New, Import (file -> conflict rule dialog -> result
-// summary), Export selected / Export all. Everything of the server is
-// inserted as text nodes.
+// summary), Export selected / Export all. For a developer (addendum d) the
+// catalogue is loaded with access=advanced, so the advanced admin agents are
+// listed too, and every advanced agent (admin or personal) carries the
+// Developer badge. Everything of the server is inserted as text nodes.
 
 import * as api from '../api.js';
-import { exportQuery, formatImportResult, LIMITS, TEXTS } from '../myagents.js';
-import { lock } from './agentEditor.js';
+import { exportQuery, formatImportResult, LIMITS, TEXTS, isAdvanced } from '../myagents.js';
+import { lock, developerBadge } from './agentEditor.js';
 
 function el(tag, className, text) {
   const n = document.createElement(tag);
@@ -23,11 +25,13 @@ function button(label, className, onClick) {
 }
 
 /**
- * createAgentsPage(root, {editor, notify, onChat(ref, name), onChanged(data), getModels})
+ * createAgentsPage(root, {editor, notify, onChat(ref, name, agent), onChanged(data), getModels, isDeveloper})
  * -> {load(), show(), hide(), data()}
+ * `isDeveloper()` decides the catalogue's access and what the editor offers.
  */
-export function createAgentsPage(root, { editor, notify, onChat, onChanged, getModels }) {
-  const data = { catalog: null, agents: [], skills: [], loaded: false, error: null };
+export function createAgentsPage(root, { editor, notify, onChat, onChanged, getModels, isDeveloper }) {
+  const data = { catalog: null, agents: [], skills: [], loaded: false, error: null, catalogAccess: 'basic' };
+  const developer = () => isDeveloper?.() === true;
   let tab = 'agents';
   const selected = { agents: new Set(), skills: new Set() };
 
@@ -139,9 +143,11 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
   // ---- data ----
   async function load() {
     data.error = null;
+    const access = developer() ? 'advanced' : 'basic';
     try {
-      const [catalog, agents, skills] = await Promise.all([api.getCatalog(), api.listMyAgents(), api.listMySkills()]);
+      const [catalog, agents, skills] = await Promise.all([api.getCatalog(developer() ? access : undefined), api.listMyAgents(), api.listMySkills()]);
       data.catalog = catalog && typeof catalog === 'object' ? catalog : { agents: [], skills: [], orchestrator: null };
+      data.catalogAccess = access;
       data.agents = Array.isArray(agents) ? agents : [];
       data.skills = Array.isArray(skills) ? skills : [];
       data.loaded = true;
@@ -240,6 +246,7 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
     li.appendChild(selectBox(kind, it));
     const main = el('div', 'row-main');
     const name = el('span', 'row-name', it.name);
+    if (kind === 'agents' && isAdvanced(it)) name.appendChild(developerBadge());
     main.appendChild(name);
     if (it.description) main.appendChild(el('span', 'row-desc', it.description));
     if (meta.length) {
@@ -265,8 +272,9 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
     const consults = Array.isArray(a.consults) ? a.consults.length : 0;
     const meta = [modelLabel(a.model), `${skills} ${skills === 1 ? 'skill' : 'skills'}`];
     if (consults) meta.push(`consults ${consults}`);
+    if (a.deep === true) meta.push('deep tools');
     return rowShell('agents', a, meta, [
-      button('Chat', 'btn small', () => onChat(a.ref || `mine:${a.id}`, a.name)),
+      button('Chat', 'btn small', () => onChat(a.ref || `mine:${a.id}`, a.name, a)),
       button('Edit', 'btn small ghost', () => openAgent(a, false)),
       button('Duplicate', 'btn small ghost', () => openAgent(a, true)),
       button('Delete', 'btn small ghost danger-text', () => askDelete('agent', a)),
@@ -285,7 +293,8 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
   }
 
   function adminSection() {
-    const items = tab === 'agents' ? (data.catalog?.agents || []) : (data.catalog?.skills || []);
+    // a non-developer never sees an advanced agent, whatever the catalogue answered
+    const items = tab === 'agents' ? (data.catalog?.agents || []).filter((a) => developer() || !isAdvanced(a)) : (data.catalog?.skills || []);
     const sec = el('section', 'list-section admin');
     sec.appendChild(sectionHead('Admin · read-only', true, String(items.length)));
     if (!items.length) {
@@ -298,11 +307,12 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
       const main = el('div', 'row-main');
       const name = el('span', 'row-name', it.name);
       name.appendChild(lock());
+      if (tab === 'agents' && isAdvanced(it)) name.appendChild(developerBadge());
       main.appendChild(name);
       if (it.description) main.appendChild(el('span', 'row-desc', it.description));
       li.appendChild(main);
       const act = el('div', 'row-actions');
-      if (tab === 'agents') act.appendChild(button('Chat with this agent', 'btn small', () => onChat(it.ref || `admin:${it.name}`, it.name)));
+      if (tab === 'agents') act.appendChild(button('Chat with this agent', 'btn small', () => onChat(it.ref || `admin:${it.name}`, it.name, it)));
       li.appendChild(act);
       ul.appendChild(li);
     }
@@ -314,7 +324,7 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
   function openNew() { if (tab === 'agents') openAgent(null, false); else openSkill(null, false); }
   function openAgent(agent, duplicate) {
     const src = agent && duplicate ? { ...agent, name: copyNameOf(agent.name, data.agents) } : agent;
-    editor.openAgent({ agent: src, duplicate, catalog: data.catalog, mine: { agents: data.agents, skills: mineSkillsSeen() }, models: getModels?.() || [] });
+    editor.openAgent({ agent: src, duplicate, catalog: data.catalog, mine: { agents: data.agents, skills: mineSkillsSeen() }, models: getModels?.() || [], developer: developer() });
   }
   function openSkill(skill, duplicate) {
     const src = skill && duplicate ? { ...skill, name: copyNameOf(skill.name, data.skills) } : skill;

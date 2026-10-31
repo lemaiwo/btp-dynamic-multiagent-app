@@ -35,6 +35,7 @@ const EMPTY_AGENT: AgentInput = {
     skills: [],
     enabled: true,
     expose_chat: true,
+    tier: "basic",
     expose_api: false,
     api_slug: "",
     run_as_principal: "",
@@ -213,6 +214,8 @@ export default class AgentDetail extends BaseController {
                 skills: agent.skills ?? [],
                 enabled: agent.enabled,
                 expose_chat: agent.expose_chat,
+                // An older server sends no tier: basic.
+                tier: agent.tier === "advanced" ? "advanced" : "basic",
                 expose_api: agent.expose_api,
                 api_slug: agent.api_slug ?? "",
                 run_as_principal: agent.run_as_principal ?? "",
@@ -955,6 +958,8 @@ export default class AgentDetail extends BaseController {
         const agentId = this.agentId;
         const toSave = JSON.parse(JSON.stringify(data)) as AgentInput;
         toSave.expose_invoke = data.expose_invoke === true;
+        // Always sent: an absent key keeps what is stored on the server.
+        toSave.tier = data.tier === "advanced" ? "advanced" : "basic";
         toSave.result_schema = invoke.result_schema;
         toSave.invoke_limits = invoke.invoke_limits;
         // Decided before anything is read: whether this save gives writes

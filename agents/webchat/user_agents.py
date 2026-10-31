@@ -29,8 +29,16 @@ from typing import Any
 from pydantic_ai import Agent
 from sqlalchemy import select
 
+from agents.access import ADVANCED, BASIC, agent_allowed, tier_of
 from agents.db import AgentConfig, ChatUserAgent, ChatUserSkill, SessionLocal, SkillConfig
-from agents.registry import _TOOL_RETRIES, _approves, _attach_delegation_tool
+from agents.deep import DeepConfig, deep_toolset, scoped_deep_instructions
+from agents.registry import (
+    _TOOL_RETRIES,
+    _approves,
+    _attach_delegation_tool,
+    _make_progress_handler,
+)
+from agents.webchat.docgen import docgen_toolset
 from agents.webchat.store import ORCHESTRATOR_NAME
 
 logger = logging.getLogger(__name__)
@@ -99,6 +107,20 @@ def consult_names(row: ChatUserAgent) -> list[str]:
     return [n for n in load_list(row.consults_json) if isinstance(n, str)]
 
 
+def personal_tier(row: ChatUserAgent, usable: dict[str, AgentConfig]) -> str:
+    """``advanced`` when the personal agent has the deep tools on or
+    consults an advanced admin agent that is chat-usable now, else
+    ``basic`` (addendum (d)): such an agent is refused in a basic
+    conversation."""
+    if row.deep:
+        return ADVANCED
+    for name in consult_names(row):
+        admin_row = usable.get(name)
+        if admin_row is not None and tier_of(admin_row) != BASIC:
+            return ADVANCED
+    return BASIC
+
+
 def parse_ref(ref: str | None) -> tuple[str, str | None]:
     """``("orchestrator", None)``, ``("admin", name)`` or ``("mine", id)``;
     ``ValueError`` for anything else."""
@@ -122,9 +144,12 @@ class RefTarget:
     user_row: ChatUserAgent | None = None
 
 
-async def resolve_agent_ref(principal: str, ref: str | None) -> RefTarget | str:
-    """The target of ``ref`` for this principal, or :data:`AGENT_UNAVAILABLE`
-    when it names nothing the user may use (now)."""
+async def resolve_agent_ref(principal: str, ref: str | None,
+                            access: str = BASIC) -> RefTarget | str:
+    """The target of ``ref`` for this principal in a conversation of
+    ``access``, or :data:`AGENT_UNAVAILABLE` when it names nothing the user
+    may use (now): an advanced admin agent or an advanced personal agent
+    does not exist for a basic conversation."""
     try:
         kind, value = parse_ref(ref)
     except ValueError:
@@ -132,16 +157,17 @@ async def resolve_agent_ref(principal: str, ref: str | None) -> RefTarget | str:
     if kind == "orchestrator":
         return RefTarget("orchestrator", ORCHESTRATOR_NAME)
     async with SessionLocal() as db:
+        usable = await chat_agents(db)
         if kind == "admin":
-            row = (await chat_agents(db)).get(value or "")
-            if row is None:
+            row = usable.get(value or "")
+            if row is None or not agent_allowed(row, access):
                 return AGENT_UNAVAILABLE
             return RefTarget("admin", row.name, admin_row=row)
         mine = (await db.execute(
             select(ChatUserAgent).where(ChatUserAgent.id == value,
                                         ChatUserAgent.principal == principal)
         )).scalar_one_or_none()
-    if mine is None:
+    if mine is None or not agent_allowed(personal_tier(mine, usable), access):
         return AGENT_UNAVAILABLE
     return RefTarget("mine", mine.name, user_row=mine)
 
@@ -219,8 +245,23 @@ async def build_personal_agent(row: ChatUserAgent, *, model: Any,
             skills.append((skill.name, skill.content))
         else:
             skipped_skills += 1
-    agent = Agent(model, instructions=personal_instructions(row.instructions, skills),
-                  retries=_TOOL_RETRIES)
+    text = personal_instructions(row.instructions, skills)
+    if row.deep:
+        # The app's default limits; sub-agents get this agent's own toolset
+        # (the document tools), as an admin deep agent's get its servers.
+        config = DeepConfig(enabled=True)
+        agent = Agent(
+            model,
+            instructions=[text, lambda: scoped_deep_instructions(config)],
+            toolsets=[deep_toolset(
+                config, parent_toolsets=[docgen_toolset()], model=model,
+                agent_name=row.name, retries=_TOOL_RETRIES,
+                progress_handler_factory=_make_progress_handler,
+            )],
+            retries=_TOOL_RETRIES,
+        )
+    else:
+        agent = Agent(model, instructions=text, retries=_TOOL_RETRIES)
     specialists = getattr(build, "specialists", {}) if build is not None else {}
     counter = getattr(build, "in_flight", None)
     skipped_consults = 0
@@ -230,7 +271,10 @@ async def build_personal_agent(row: ChatUserAgent, *, model: Any,
         if admin_row is None or specialist is None:
             skipped_consults += 1
             continue
-        _attach_delegation_tool(agent, specialist, admin_row, counter=counter)
+        # Gated like the orchestrator's: the turn binds current_access, so an
+        # advanced consult is attached but listed only in an advanced turn.
+        _attach_delegation_tool(agent, specialist, admin_row, counter=counter,
+                                tier_gated=True)
     note = (skipped_note(skipped_consults, skipped_skills)
             if skipped_consults or skipped_skills else None)
     return agent, note

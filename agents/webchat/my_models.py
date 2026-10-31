@@ -101,6 +101,9 @@ class AgentIn(BaseModel):
     skills: list[SkillRef] = Field(default_factory=list, max_length=MAX_AGENT_SKILLS)
     consults: list[Name] = Field(default_factory=list, max_length=MAX_CONSULTS)
     model: Annotated[str, Field(min_length=1, max_length=MODEL_MAX)] | None = None
+    # The deep-agent tools (plan, scratchpad, sub-agents); only a developer
+    # may switch them on (checked against the caller, not here).
+    deep: bool = False
 
     @field_validator("instructions")
     @classmethod
@@ -174,7 +177,8 @@ _RULES = {
     # Only the blank checks of this module raise a ValueError.
     "value_error": RULE_TOO_SHORT,
 }
-_FIELDS = {"name", "description", "instructions", "skills", "consults", "model", "content"}
+_FIELDS = {"name", "description", "instructions", "skills", "consults", "model", "content",
+           "deep"}
 _LIST_FIELDS = {"skills", "consults"}
 UNKNOWN_FIELD = "<unknown field>"
 

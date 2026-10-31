@@ -64,6 +64,11 @@
                                     tooltip="{i18n>invokeTagTooltip}"
                                     state="Information"
                                     visible="{= ${agents>expose_invoke} === true }" />
+                                <ObjectStatus
+                                    text="{i18n>tierAdvancedTag}"
+                                    tooltip="{i18n>tierAdvancedTagTooltip}"
+                                    state="Information"
+                                    visible="{= ${agents>tier} === 'advanced' }" />
                             </VBox>
                             <HBox>
                                 <Button

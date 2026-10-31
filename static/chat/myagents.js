@@ -1,7 +1,33 @@
 // Personal agents and skills: the limits of addendum (c) as client-side
 // checks with fixed texts, the export selection as a query string, the
 // import result as lines for the summary dialog, and the header picker's
-// option groups. Pure: no DOM, no fetch (the jsdom tests import it as is).
+// option groups; addendum (d) adds the tier of an agent (basic | advanced),
+// the "Developer" badge and the developer-only checks (deep agent tools,
+// consulting an advanced agent). Pure: no DOM, no fetch (the jsdom tests
+// import it as is).
+
+export const TIERS = ['basic', 'advanced'];
+export const DEVELOPER_BADGE = 'Developer';
+
+/** 'basic' | 'advanced' from the server's `tier`; a personal agent with `deep` on is advanced too. */
+export function tierOf(agent) {
+  if (!agent || typeof agent !== 'object') return 'basic';
+  if (agent.tier === 'advanced') return 'advanced';
+  if (agent.deep === true) return 'advanced';
+  return 'basic';
+}
+export function isAdvanced(agent) { return tierOf(agent) === 'advanced'; }
+
+/** The option label of the picker: "name · Developer" for an advanced agent. */
+export function optionLabel(agent) {
+  const name = String(agent?.name ?? '');
+  return isAdvanced(agent) ? `${name} · ${DEVELOPER_BADGE}` : name;
+}
+
+/** The names of the catalogue's advanced agents (for the consults check). */
+export function advancedAgentNames(catalog) {
+  return new Set((catalog?.agents || []).filter(isAdvanced).map((a) => String(a.name)));
+}
 
 export const LIMITS = {
   name: 64,
@@ -28,6 +54,8 @@ export const TEXTS = {
   content: 'Write 1 to 50,000 characters.',
   skills: 'Pick at most 20 skills.',
   consults: 'Pick at most 10 agents.',
+  consults_advanced: 'Consulting a developer agent needs the developer role.',
+  deep: 'Deep agent tools need the developer role.',
   model: 'Pick a model from the list, or the default.',
   control: 'Control characters are not allowed (tab and line breaks are fine).',
   server: 'The server did not accept this value.',
@@ -49,9 +77,11 @@ function checkText(value, { min = 0, max, oneLine = false }) {
 
 /**
  * Check an agent form -> {field: text}. Empty when it may be sent.
- * `taken` is a lower-cased set of the user's other agent names.
+ * `taken` is a lower-cased set of the user's other agent names;
+ * `developer` false refuses `deep` and a consult in `advancedNames`
+ * (the server answers 422 at the field for a non-developer).
  */
-export function validateAgent(form, { taken = new Set() } = {}) {
+export function validateAgent(form, { taken = new Set(), developer = true, advancedNames = new Set() } = {}) {
   const errors = {};
   const name = String(form.name ?? '');
   if (!NAME_RE.test(name) || CONTROL_RE.test(name)) errors.name = TEXTS.name;
@@ -64,6 +94,9 @@ export function validateAgent(form, { taken = new Set() } = {}) {
   if (skills.length > LIMITS.skills) errors.skills = TEXTS.skills;
   const consults = Array.isArray(form.consults) ? form.consults : [];
   if (consults.length > LIMITS.consults) errors.consults = TEXTS.consults;
+  else if (!developer && consults.some((c) => advancedNames.has(c))) errors.consults = TEXTS.consults_advanced;
+  if (form.deep != null && typeof form.deep !== 'boolean') errors.deep = TEXTS.deep;
+  else if (form.deep === true && !developer) errors.deep = TEXTS.deep;
   if (form.model != null && form.model !== '' && Array.isArray(form.models) && !form.models.includes(form.model)) errors.model = TEXTS.model;
   return errors;
 }
@@ -151,9 +184,11 @@ export function formatImportResult(result) {
     }
   }
   const dropped = (Array.isArray(r.dropped) ? r.dropped : []).map((d) => {
+    const item = String(d.item ?? '');
+    if (d.field === 'deep') return `${item}: Deep agent tools (needs the developer role) were dropped`;
     const what = d.field === 'consults' ? 'consulted agent' : d.field === 'model' ? 'model' : 'skill';
     const name = d.name == null || d.name === '' ? '' : ` ${String(d.name)}`;
-    return `${String(d.item ?? '')}: ${what}${name} does not exist here and was dropped`;
+    return `${item}: ${what}${name} does not exist here and was dropped`;
   });
   // `rule` is the server's fixed text (never a value); a short code is worded here
   const errors = (Array.isArray(r.errors) ? r.errors : []).map((e) => {
@@ -167,21 +202,38 @@ export function formatImportResult(result) {
 /**
  * The header picker: [{label, options: [{value, label, disabled?}]}].
  * `value` is the agent_ref ('' for the orchestrator). A `current` ref that
- * is in no group (a deleted agent) gets a disabled option so the select
- * still shows the conversation's state.
+ * is in no group (a deleted agent, or an advanced one in a basic
+ * conversation) gets a disabled option so the select still shows the
+ * conversation's state. `access` basic leaves every advanced agent out;
+ * advanced lists them with the Developer badge in the label.
  */
-export function pickerGroups(catalog, mine, current = null, currentName = '') {
+export function pickerGroups(catalog, mine, current = null, currentName = '', { access = 'basic' } = {}) {
   const orch = catalog?.orchestrator || {};
+  const offered = (list) => (list || []).filter((a) => access === 'advanced' || !isAdvanced(a));
   const groups = [
     { label: 'Orchestrator', options: [{ value: '', label: orch.name || 'Orchestrator' }] },
-    { label: 'My agents', options: (mine || []).map((a) => ({ value: a.ref || `mine:${a.id}`, label: a.name })) },
-    { label: 'Admin agents · read-only', options: (catalog?.agents || []).map((a) => ({ value: a.ref || `admin:${a.name}`, label: a.name })) },
+    { label: 'My agents', options: offered(mine).map((a) => ({ value: a.ref || `mine:${a.id}`, label: optionLabel(a) })) },
+    { label: 'Admin agents · read-only', options: offered(catalog?.agents).map((a) => ({ value: a.ref || `admin:${a.name}`, label: optionLabel(a) })) },
   ];
   const ref = current || '';
   if (ref && !groups.some((g) => g.options.some((o) => o.value === ref))) {
     groups.push({ label: 'Unavailable', options: [{ value: ref, label: currentName || 'Deleted agent', disabled: true }] });
   }
   return groups.filter((g) => g.options.length);
+}
+
+/** Is `ref` offered by the picker for this access (not the Unavailable group)? '' / null = the orchestrator, always. */
+export function refOffered(ref, catalog, mine, access = 'basic') {
+  if (!ref) return true;
+  return pickerGroups(catalog, mine, null, '', { access }).some((g) => g.options.some((o) => o.value === ref));
+}
+
+/** The agent row behind a ref (mine or admin), or null. */
+export function agentOf(ref, catalog, mine) {
+  if (!ref) return null;
+  return (mine || []).find((a) => (a.ref || `mine:${a.id}`) === ref)
+    || (catalog?.agents || []).find((x) => (x.ref || `admin:${x.name}`) === ref)
+    || null;
 }
 
 /** The display name of a ref from the lists, or the stored name, or ''. */

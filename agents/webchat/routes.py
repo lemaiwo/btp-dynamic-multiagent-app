@@ -17,7 +17,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
+from agents.access import BASIC, TIERS, caller_is_developer
 from agents.auth import current_principal, require_user
 from agents.db import SessionLocal
 from agents.multipart_form import FormRefused
@@ -51,6 +52,7 @@ BAD_BEFORE = "before must be a timestamp with a time zone"
 FULL = "The conversation has reached its message limit"
 UPLOAD_TIMEOUT = "The request body was not received in time"
 UNKNOWN_AGENT = "Unknown agent"
+ADVANCED_FORBIDDEN = "Advanced access needs the developer role"
 
 
 class ConversationIn(BaseModel):
@@ -59,6 +61,7 @@ class ConversationIn(BaseModel):
     title: str | None = Field(default=None, max_length=1000)
     model: str | None = Field(default=None, max_length=128)
     agent_ref: str | None = Field(default=None, max_length=80)
+    access: Literal["basic", "advanced"] | None = None
 
 
 @page_router.get("/chat", response_class=HTMLResponse, dependencies=[Depends(require_user)])
@@ -89,12 +92,24 @@ async def _checked_model(name: str | None) -> str | None:
     return name
 
 
-async def _checked_agent_ref(principal: str, ref: str | None) -> str | None:
-    """The ref as stored when the caller may use it now; 422 otherwise."""
-    target = await user_agents.resolve_agent_ref(principal, ref)
+async def _checked_agent_ref(principal: str, ref: str | None,
+                             access: str = BASIC) -> str | None:
+    """The ref as stored when the caller may use it now in a conversation
+    of ``access``; 422 otherwise (an advanced agent does not exist for a
+    basic conversation)."""
+    target = await user_agents.resolve_agent_ref(principal, ref, access)
     if isinstance(target, str):
         raise HTTPException(status_code=422, detail=UNKNOWN_AGENT)
     return ref
+
+
+def _checked_access(access: str | None) -> str:
+    """The access as stored; 403 for ``advanced`` without the developer or
+    the admin role (the fixed text names the developer role only)."""
+    value = access or BASIC
+    if value != BASIC and not caller_is_developer():
+        raise HTTPException(status_code=403, detail=ADVANCED_FORBIDDEN)
+    return value
 
 
 async def _out(db: Any, conv: Any, principal: str) -> dict[str, Any]:
@@ -113,6 +128,9 @@ async def me() -> dict[str, Any]:
             "media_types": list(uploads.MEDIA_TYPES),
         },
         "app_name": APP_NAME,
+        "developer": caller_is_developer(),
+        "access_default": BASIC,
+        "tiers": list(TIERS),
     }
 
 
@@ -150,11 +168,12 @@ async def list_conversations(
 @router.post("/conversations", status_code=201)
 async def create_conversation(body: ConversationIn) -> dict[str, Any]:
     principal = store.caller()
+    access = _checked_access(body.access)
     model = await _checked_model(body.model)
-    agent_ref = await _checked_agent_ref(principal, body.agent_ref)
+    agent_ref = await _checked_agent_ref(principal, body.agent_ref, access)
     async with SessionLocal() as db:
         conv = await store.create_conversation(db, principal, title=body.title, model=model,
-                                               agent_ref=agent_ref)
+                                               agent_ref=agent_ref, access=access)
         return await _out(db, conv, principal)
 
 
@@ -173,10 +192,22 @@ async def get_conversation(cid: str) -> dict[str, Any]:
 async def patch_conversation(cid: str, body: ConversationIn) -> dict[str, Any]:
     principal = store.caller()
     sent = body.model_fields_set
+    access_sent = "access" in sent
+    access = _checked_access(body.access) if access_sent else None
     model = await _checked_model(body.model) if "model" in sent else None
-    await _owned(cid, principal)
-    agent_ref = (await _checked_agent_ref(principal, body.agent_ref)
-                 if "agent_ref" in sent else store.KEEP)
+    current = await _owned(cid, principal)
+    effective = access if access is not None else (current.access or BASIC)
+    if "agent_ref" in sent:
+        agent_ref = await _checked_agent_ref(principal, body.agent_ref, effective)
+    elif access_sent and current.agent_ref is not None and isinstance(
+        await user_agents.resolve_agent_ref(principal, current.agent_ref, effective), str
+    ):
+        # Switched to an access the picked agent does not exist in: the
+        # conversation falls back to the orchestrator (as when the agent is
+        # deleted) rather than keeping a ref no turn could run.
+        agent_ref = None
+    else:
+        agent_ref = store.KEEP
     async with SessionLocal() as db:
         conv = await store.get_conversation(db, cid, principal)
         if conv is None:
@@ -186,6 +217,7 @@ async def patch_conversation(cid: str, body: ConversationIn) -> dict[str, Any]:
             title=body.title if "title" in sent and body.title is not None else None,
             model=model, clear_model="model" in sent and body.model is None,
             agent_ref=agent_ref,
+            access=access if access is not None else store.KEEP,
         )
         return await _out(db, conv, principal)
 
@@ -210,6 +242,10 @@ async def _release(cid: str) -> None:
 async def post_message(cid: str, request: Request) -> Response:
     principal = store.caller()
     conv = await _owned(cid, principal)
+    access = conv.access or BASIC
+    # Every turn: the role may have been taken away since the switch.
+    if access != BASIC and not caller_is_developer():
+        return JSONResponse(status_code=403, content={"detail": ADVANCED_FORBIDDEN})
     async with SessionLocal() as db:
         if not await store.claim_run(db, conv.id, principal):
             return JSONResponse(status_code=409, content={"detail": RUNNING})
@@ -243,6 +279,7 @@ async def post_message(cid: str, request: Request) -> Response:
             history=history,
             model_name=model_name,
             agent_ref=conv.agent_ref,
+            access=access,
             title=store.title_from(form.text) if conv.title == store.DEFAULT_TITLE else None,
         )
         turn, queue = run.start_turn(data, {

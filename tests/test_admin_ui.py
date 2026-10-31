@@ -1794,6 +1794,7 @@ const dom = new JSDOM(`<!doctype html><html><body>
   <select id="agent-model-name"><option value="" selected></option></select>
   <input type="checkbox" id="agent-enabled" checked>
   <input type="checkbox" id="agent-expose-chat" checked>
+  <select id="agent-tier"><option value="basic" selected>Basic</option><option value="advanced">Advanced</option></select>
   <input id="agent-run-as" value=""><input id="agent-run-prompt" value="">
   <input id="agent-run-timeout" value="1800">
   <div id="agent-skills"></div><div id="agent-peers"></div>
@@ -2930,6 +2931,19 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                 e[1].get("id") == fid for e in coll.elements
                 if e[0] in ("input", "textarea")))
         check("editAgent() fills the invoke fields", "setInvokeForm(a)" in js)
+
+        print("\n== agent tier (Basic / Advanced) ==")
+        check("saveAgent() sends tier",
+              re.search(r"\btier\s*:", save_agent_body) is not None,
+              "tier: not found as an object key in saveAgent()")
+        check("tier form field select#agent-tier", find(coll, "select", id="agent-tier") is not None)
+        check("tier select offers basic and advanced",
+              find(coll, "option", value="basic") is not None
+              and find(coll, "option", value="advanced") is not None)
+        tier_hint = find(coll, "p", id="agent-tier-hint")
+        check("tier hint names the developer role",
+              tier_hint is not None and "developer role" in tier_hint[2],
+              repr(tier_hint))
         check("openAgentModal() resets the invoke fields", "setInvokeForm(null)" in js)
 
         print("\n== saveAgent() sends peers and model_name (clearing depends on it) ==")
@@ -3583,7 +3597,7 @@ const SCHEMA = { type: 'object', properties: { amount: { type: 'number' } },
     collectMcpServers = () => [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }];
     const fields = ['agent-id', 'agent-name', 'agent-description', 'agent-instructions',
         'agent-model-name', 'agent-api-slug', 'agent-run-as', 'agent-run-prompt',
-        'agent-run-timeout'];
+        'agent-run-timeout', 'agent-tier'];
     for (const id of fields) {
         const el = document.createElement('input'); el.id = id; document.body.appendChild(el);
     }
@@ -3668,6 +3682,122 @@ const SCHEMA = { type: 'object', properties: { amount: { type: 'number' } },
                 )
             finally:
                 os.unlink(invoke_harness_path)
+
+            # --- tier --- the agent dialog's Tier select under jsdom: an
+            # advanced agent loads into the select and its row gets the
+            # "Advanced" tag; a save always sends tier; a new agent sends basic.
+            tier_harness = r"""
+'use strict';
+const assert = require('node:assert');
+const { JSDOM } = require('jsdom');
+
+const dom = new JSDOM(`<!doctype html><html><body>
+  <div id="toast"></div><div id="agent-modal"></div><h2 id="modal-title"></h2>
+  <input id="agent-id"><input id="agent-name"><input id="agent-description">
+  <textarea id="agent-instructions"></textarea><select id="agent-model-name"></select>
+  <input type="checkbox" id="agent-enabled"><input type="checkbox" id="agent-expose-chat">
+  <select id="agent-tier"><option value="basic">Basic</option>
+    <option value="advanced">Advanced</option></select>
+  <input type="checkbox" id="agent-expose-api"><input id="agent-api-slug">
+  <input id="agent-run-as"><input id="agent-run-prompt"><input id="agent-run-timeout">
+  <table><tbody id="agents-tbody"></tbody></table>
+</body></html>`, { url: 'https://admin.example/admin' });
+global.window = dom.window;
+global.document = dom.window.document;
+global.location = dom.window.location;
+
+""" + js_no_autoinvoke + r"""
+
+const byId = id => document.getElementById(id);
+const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
+    mcp_servers: [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }], skills: [],
+    enabled: true, expose_chat: true, tier: 'advanced' };
+
+(async () => {
+    // The rest of the dialog is not under test: the page's own functions
+    // are replaced in the scope they were declared in.
+    for (const name of ['renderMcpServers', 'loadODataCatalogue', 'renderAgentSkillChecks',
+        'renderAgentPeerChecks', 'loadAgentWhereUsed', 'renderAgentWhereUsed', 'setDeepForm',
+        'setInvokeForm', 'refreshCredentials', 'updateEndpointHint', 'setDetailRunsMode',
+        'closeAgentModal', 'renderSkillsTable']) {
+        eval(name + ' = () => {}');
+    }
+    renderAgentModelOptions = async () => {};
+    collectMcpServers = () => [{ url: 'https://x.example.com/mcp', auth_mode: 'none' }];
+    collectAgentSkills = () => [];
+    collectAgentPeers = () => [];
+    collectDeep = () => ({});
+    collectInvoke = () => ({ expose_invoke: false, result_schema: null, invoke_limits: null });
+    const realLoadAgents = loadAgents;
+    loadAgents = () => {};
+
+    // 1. Load: an advanced agent shows Advanced in the select.
+    let calls = [];
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => AGENT }; };
+    assert.strictEqual(await editAgent(9), true);
+    assert.strictEqual(byId('agent-tier').value, 'advanced');
+    // 2. Save sends tier as loaded.
+    calls = [];
+    await saveAgent();
+    assert.strictEqual(calls.length, 1, 'one request');
+    assert.deepStrictEqual(calls[0].slice(0, 2), ['/admin/api/agents/9', 'PUT']);
+    assert.strictEqual(JSON.parse(calls[0][2]).tier, 'advanced');
+    // ... and the changed value when the admin picks Basic.
+    byId('agent-tier').value = 'basic';
+    calls = [];
+    await saveAgent();
+    assert.strictEqual(JSON.parse(calls[0][2]).tier, 'basic');
+    // An agent without the key (older server) loads as Basic.
+    global.fetch = async () => ({ ok: true, status: 200,
+        json: async () => Object.assign({}, AGENT, { tier: undefined }) });
+    byId('agent-tier').value = 'advanced';
+    await editAgent(9);
+    assert.strictEqual(byId('agent-tier').value, 'basic');
+
+    // 3. New agent: the select is reset and the POST sends basic.
+    byId('agent-tier').value = 'advanced';
+    await openAgentModal();
+    assert.strictEqual(byId('agent-tier').value, 'basic');
+    byId('agent-name').value = 'new-one';
+    calls = [];
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => ({}) }; };
+    await saveAgent();
+    assert.deepStrictEqual(calls[0].slice(0, 2), ['/admin/api/agents', 'POST']);
+    const sent = JSON.parse(calls[0][2]);
+    assert.ok('tier' in sent);
+    assert.strictEqual(sent.tier, 'basic');
+
+    // 4. The list row shows an "Advanced" tag only for an advanced agent.
+    global.fetch = async () => ({ ok: true, json: async () => ([
+        AGENT, Object.assign({}, AGENT, { id: 10, name: 'b', tier: 'basic' }),
+        Object.assign({}, AGENT, { id: 11, name: 'c', tier: undefined }),
+    ]) });
+    await realLoadAgents();
+    const rows = byId('agents-tbody').querySelectorAll('tr');
+    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows[0].querySelectorAll('.tier-tag').length, 1);
+    assert.strictEqual(rows[0].querySelector('.tier-tag').textContent, 'Advanced');
+    assert.strictEqual(rows[1].querySelectorAll('.tier-tag').length, 0);
+    assert.strictEqual(rows[2].querySelectorAll('.tier-tag').length, 0);
+    console.log('tier field scenarios passed');
+})().catch(e => { console.error(e && e.stack || e); process.exit(1); });
+"""
+            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, dir=ROOT) as f:
+                f.write(tier_harness)
+                tier_harness_path = f.name
+            try:
+                result = subprocess.run(
+                    ["node", tier_harness_path], capture_output=True, text=True, timeout=30,
+                )
+                check(
+                    "tier field: advanced loads and tags, save sends tier, new agent sends basic",
+                    result.returncode == 0 and "tier field scenarios passed" in result.stdout,
+                    (result.stdout + result.stderr).strip()[:800],
+                )
+            finally:
+                os.unlink(tier_harness_path)
 
     # Shutdown lifespan
     lifespan_incoming.append({"type": "lifespan.shutdown"})

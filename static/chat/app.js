@@ -1,4 +1,7 @@
-// Bootstrap: layout, router (#/c/<id>, #/agents), store wiring, streaming turns.
+// Bootstrap: layout, router (#/c/<id>, #/agents), store wiring, streaming
+// turns; the Basic | Advanced access switch of addendum (d) (developers only:
+// it PATCHes the open conversation, is the default of the next one and is
+// remembered per principal), the catalogue per access and the picker.
 
 import * as api from './api.js';
 import { createStore, initialState, newUserMessage, newAssistantMessage, applyStreamEvent } from './state.js';
@@ -7,9 +10,9 @@ import { createMessageList, renderEmpty } from './render/messages.js';
 import { createComposer } from './composer.js';
 import { createAgentsPage } from './render/agents.js';
 import { createAgentEditor } from './render/agentEditor.js';
-import { pickerGroups, agentNameOf } from './myagents.js';
+import { pickerGroups, agentNameOf, refOffered, isAdvanced } from './myagents.js';
 import { initTheme, toggleTheme, onThemeChange } from './theme.js';
-import { titleFromText, formatTokens } from './util.js';
+import { titleFromText, formatTokens, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
 
 const store = createStore({ ...initialState, catalog: null, myAgents: [], draftAgentRef: null, view: 'chat' });
 const root = document.getElementById('app');
@@ -27,6 +30,10 @@ root.innerHTML = `
       <h1 class="title" id="title">SAP BTP Multi-Agent</h1>
       <div class="topbar-right">
         <span class="usage-chip" id="usage-chip" hidden tabindex="0" role="status" aria-label="Conversation usage"></span>
+        <div class="access-switch" id="access" role="radiogroup" aria-label="Access" hidden>
+          <button type="button" class="seg" role="radio" aria-checked="true" data-access="basic" title="Basic access: the standard agents">Basic</button>
+          <button type="button" class="seg" role="radio" aria-checked="false" data-access="advanced" tabindex="-1" title="Advanced access: the developer agents (ABAP, UI5/Fiori, CAP)">Advanced</button>
+        </div>
         <label class="model-pick agent-pick"><span class="sr-only">Agent</span><select id="agent" aria-label="Agent"></select></label>
         <label class="model-pick"><span class="sr-only">Model</span><select id="model" aria-label="Model"></select></label>
         <button type="button" class="icon-btn theme" id="theme" aria-label="Switch to dark theme" title="Theme">
@@ -57,6 +64,8 @@ const hamburger = $('.hamburger');
 const titleEl = $('#title');
 const modelSel = $('#model');
 const agentSel = $('#agent');
+const accessEl = $('#access');
+const accessBtns = [...accessEl.querySelectorAll('[role="radio"]')];
 const logEl = $('.log');
 const composerWrap = $('.composer-wrap');
 const pageEl = $('#page');
@@ -193,8 +202,9 @@ function fillAgents() {
   const s = store.get();
   const conv = s.conversation;
   const current = conv ? (conv.agent_ref || null) : (s.draftAgentRef || null);
-  const groups = pickerGroups(s.catalog, s.myAgents, current, conv?.agent_name || '');
-  const sig = JSON.stringify([groups, current]);
+  const access = effectiveAccess();
+  const groups = pickerGroups(s.catalog, s.myAgents, current, conv?.agent_name || '', { access });
+  const sig = JSON.stringify([groups, current, access]);
   if (sig === agentsSig) return;
   agentsSig = sig;
   agentSel.replaceChildren();
@@ -242,12 +252,100 @@ agentSel.addEventListener('change', async () => {
     fillAgents();
   }
 });
-async function loadAgentLists() {
+async function loadAgentLists(access = 'basic') {
+  const want = isDeveloper() ? normalizeAccess(access) : 'basic';
   try {
-    const [catalog, mine] = await Promise.all([api.getCatalog(), api.listMyAgents()]);
-    store.set({ catalog: catalog && typeof catalog === 'object' ? catalog : null, myAgents: Array.isArray(mine) ? mine : [] });
+    // a non-developer asks without the parameter (the server answers basic either way)
+    const [catalog, mine] = await Promise.all([api.getCatalog(isDeveloper() ? want : undefined), api.listMyAgents()]);
+    store.set({ catalog: catalog && typeof catalog === 'object' ? catalog : null, myAgents: Array.isArray(mine) ? mine : [], catalogAccess: want });
   } catch { /* the picker keeps what it has */ }
 }
+/** The catalogue of `access` is loaded (a developer's picker follows the switch). */
+async function ensureCatalog(access) {
+  const want = isDeveloper() ? normalizeAccess(access) : 'basic';
+  const s = store.get();
+  if (s.catalog && s.catalogAccess === want) return;
+  await loadAgentLists(want);
+}
+
+// ---------- access switch: Basic | Advanced (developers only) ----------
+const ACCESS_DENIED_TEXT = 'Advanced access needs the developer role.';
+function isDeveloper() { return store.get().me?.developer === true; }
+/** The access of the open conversation, else the switch's value for the next one. */
+function effectiveAccess() {
+  const s = store.get();
+  return normalizeAccess(s.conversation ? s.conversation.access : s.draftAccess);
+}
+function reflectAccess() {
+  const s = store.get();
+  accessEl.hidden = !isDeveloper() || s.view === 'agents';
+  const cur = effectiveAccess();
+  for (const b of accessBtns) {
+    const on = b.dataset.access === cur;
+    b.setAttribute('aria-checked', String(on));
+    b.tabIndex = on ? 0 : -1;
+  }
+}
+let accessBusy = false;
+async function setAccess(next) {
+  next = normalizeAccess(next);
+  if (accessBusy || next === effectiveAccess()) { reflectAccess(); return; }
+  if (next === 'advanced' && !isDeveloper()) { notify(ACCESS_DENIED_TEXT, 'error'); reflectAccess(); return; }
+  const s = store.get();
+  const conv = s.conversation;
+  const currentRef = conv ? (conv.agent_ref || null) : (s.draftAgentRef || null);
+  // an agent the new tier does not offer: back to the orchestrator, in the same PATCH
+  const keepRef = refOffered(currentRef, s.catalog, s.myAgents, next);
+  accessBusy = true;
+  try {
+    if (conv) {
+      let fresh;
+      try {
+        fresh = await api.patchConversation(conv.id, keepRef ? { access: next } : { access: next, agent_ref: null });
+      } catch (e) {
+        if (e.status === 403) notify(ACCESS_DENIED_TEXT, 'error');
+        else if (e.status !== 401) notify(e.detail || 'The access could not be changed.', 'error');
+        return; // the switch reverts in `finally`
+      }
+      const access = normalizeAccess(fresh?.access, next);
+      const agent_ref = keepRef ? (conv.agent_ref || null) : (fresh && 'agent_ref' in fresh ? fresh.agent_ref : null);
+      const agent_name = keepRef ? conv.agent_name : (fresh?.agent_name || agentNameOf(agent_ref, s.catalog, s.myAgents, ''));
+      store.set((st) => ({
+        draftAccess: access,
+        draftAgentRef: agent_ref || null,
+        conversation: st.conversation?.id === conv.id ? { ...st.conversation, access, agent_ref, agent_name } : st.conversation,
+        conversations: st.conversations.map((c) => (c.id === conv.id ? { ...c, access, agent_ref, agent_name } : c)),
+      }));
+    } else {
+      store.set({ draftAccess: next, draftAgentRef: keepRef ? (s.draftAgentRef || null) : null });
+    }
+    rememberAccess(s.me?.principal, next);
+    if (!keepRef) notify('That agent is not offered at this access level; the conversation continues with the orchestrator.');
+    await ensureCatalog(next);
+    agentsSig = '';
+    fillAgents();
+    reflectModel();
+    emptySig = null;
+    if (store.get().conversation) renderMessages(); else renderDraftEmpty();
+  } finally {
+    accessBusy = false;
+    reflectAccess();
+  }
+}
+accessEl.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[role="radio"]');
+  if (b && accessEl.contains(b)) setAccess(b.dataset.access);
+});
+accessEl.addEventListener('keydown', (e) => {
+  const keys = ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'];
+  if (!keys.includes(e.key)) return;
+  e.preventDefault();
+  const i = Math.max(0, accessBtns.findIndex((b) => b.getAttribute('aria-checked') === 'true'));
+  const n = accessBtns.length;
+  const j = e.key === 'Home' ? 0 : e.key === 'End' ? n - 1 : (i + (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ? -1 : 1) + n) % n;
+  accessBtns[j].focus();
+  setAccess(accessBtns[j].dataset.access);
+});
 
 // ---------- Agents & skills page ----------
 const editor = createAgentEditor({
@@ -258,11 +356,14 @@ const agentsPage = createAgentsPage(pageEl, {
   editor,
   notify,
   getModels: () => store.get().me?.models || [],
-  onChanged: (d) => store.set({ catalog: d.catalog, myAgents: d.agents }),
-  onChat: async (ref, name) => {
+  isDeveloper,
+  onChanged: (d) => store.set({ catalog: d.catalog, myAgents: d.agents, catalogAccess: d.catalogAccess || 'basic' }),
+  onChat: async (ref, name, agent) => {
+    // an advanced agent needs an advanced conversation; otherwise the switch's value
+    const access = isDeveloper() && (store.get().draftAccess === 'advanced' || isAdvanced(agent)) ? 'advanced' : 'basic';
     try {
-      const created = await api.createConversation({ title: 'New chat', agent_ref: ref, model: selectedModel() || undefined });
-      store.set((st) => ({ draftAgentRef: ref, conversations: [{ ...created, agent_ref: created.agent_ref ?? ref, agent_name: created.agent_name || name }, ...st.conversations] }));
+      const created = await api.createConversation({ title: 'New chat', agent_ref: ref, model: selectedModel() || undefined, ...(isDeveloper() ? { access } : {}) });
+      store.set((st) => ({ draftAgentRef: ref, conversations: [{ ...created, access: normalizeAccess(created.access, access), agent_ref: created.agent_ref ?? ref, agent_name: created.agent_name || name }, ...st.conversations] }));
       goTo(created.id);
     } catch (e) {
       if (e.status !== 401) notify('The conversation could not be created.', 'error');
@@ -278,6 +379,7 @@ function showView(view) {
   agentSel.parentElement.hidden = agents;
   modelSel.parentElement.hidden = agents;
   usageChip.hidden = agents || usageChip.hidden;
+  reflectAccess();
   if (agents) agentsPage.show(); else agentsPage.hide();
 }
 
@@ -300,10 +402,11 @@ function renderEmptyFor(ref, storedName = '') {
   const s = store.get();
   const name = ref ? agentNameOf(ref, s.catalog, s.myAgents, storedName) : '';
   const desc = ref ? (s.myAgents.find((a) => (a.ref || `mine:${a.id}`) === ref)?.description || s.catalog?.agents?.find((a) => (a.ref || `admin:${a.name}`) === ref)?.description || '') : '';
-  const sig = `${ref || ''}|${name}`;
+  const access = effectiveAccess();
+  const sig = `${ref || ''}|${name}|${access}`;
   if (messagesEl.classList.contains('empty-state') && emptySig === sig) return;
   emptySig = sig;
-  renderEmpty(messagesEl, { appName: s.me?.app_name, onPrompt: (t) => composer.setText(t), agentName: name, agentDescription: desc });
+  renderEmpty(messagesEl, { appName: s.me?.app_name, onPrompt: (t) => composer.setText(t), agentName: name, agentDescription: desc, advanced: access === 'advanced' });
 }
 function renderDraftEmpty() { renderEmptyFor(store.get().draftAgentRef || null); }
 async function route() {
@@ -323,6 +426,7 @@ async function route() {
     list.clear();
     renderDraftEmpty();
     composer.focus();
+    await ensureCatalog(store.get().draftAccess);
     return;
   }
   store.set({ currentId: id, loading: true });
@@ -331,9 +435,11 @@ async function route() {
     if (seq !== routeSeq) return;
     list.clear();
     list.resetStick();
-    store.set({ conversation: normalizeConversation(conv), loading: false, draftAgentRef: conv.agent_ref || null });
+    const normalized = normalizeConversation(conv);
+    store.set({ conversation: normalized, loading: false, draftAgentRef: conv.agent_ref || null });
     renderMessages();
     list.scrollToBottom(true);
+    await ensureCatalog(normalized.access);
   } catch (e) {
     if (seq !== routeSeq) return;
     store.set({ loading: false });
@@ -344,6 +450,7 @@ async function route() {
 function normalizeConversation(conv) {
   return {
     ...conv,
+    access: normalizeAccess(conv.access),
     usage: conv.usage && typeof conv.usage === 'object' ? conv.usage : null,
     messages: (conv.messages || []).map((m) => ({
       ...m,
@@ -372,7 +479,9 @@ async function sendTurn(text, files) {
   try {
     if (!conv) {
       const agent_ref = s.draftAgentRef || null;
-      const created = await api.createConversation({ title: titleFromText(text), model: model || undefined, agent_ref });
+      const access = normalizeAccess(s.draftAccess);
+      const created = await api.createConversation({ title: titleFromText(text), model: model || undefined, agent_ref, ...(isDeveloper() ? { access } : {}) });
+      if (!('access' in created)) created.access = isDeveloper() ? access : 'basic';
       if (agent_ref && created.agent_ref !== agent_ref) {
         // the create did not take the ref: bind it before the first turn
         const patched = await api.patchConversation(created.id, { agent_ref });
@@ -486,6 +595,7 @@ store.subscribe((s) => {
     document.title = s.conversation?.title ? `${s.conversation.title} · ${s.me?.app_name || 'SAP BTP Multi-Agent'}` : (s.me?.app_name || 'SAP BTP Multi-Agent');
   }
   reflectModel();
+  reflectAccess();
   fillAgents();
   reflectUsage(s.conversation?.usage);
   if (s.view === 'agents') usageChip.hidden = true;
@@ -541,14 +651,17 @@ new MutationObserver(() => {
 async function boot() {
   try {
     const me = await api.getMe();
-    store.set({ me });
+    // the switch's value: the last choice of this principal, else the server's default; basic for everyone else
+    const draftAccess = me?.developer === true ? rememberedAccess(me.principal, normalizeAccess(me.access_default)) : 'basic';
+    store.set({ me, draftAccess });
     fillModels(me.models);
     reflectModel();
+    reflectAccess();
   } catch (e) {
     if (e.status !== 401) notify('The chat service did not answer. Reload to try again.', 'error');
     fillModels([]);
   }
-  await Promise.all([refreshList(), loadAgentLists()]);
+  await Promise.all([refreshList(), loadAgentLists(store.get().draftAccess)]);
   await route();
 }
 boot();

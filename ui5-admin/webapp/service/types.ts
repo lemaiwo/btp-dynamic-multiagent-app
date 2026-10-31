@@ -224,6 +224,11 @@ export interface AgentInput {
     skills: string[];
     enabled: boolean;
     expose_chat: boolean;
+    /** Who reaches the agent in chat: `basic` (everyone) or `advanced`
+     * (users with the developer role only). Optional on the wire (an absent
+     * key keeps what is stored, an older server neither sends nor reads it);
+     * the form always sends it. */
+    tier?: AgentTier;
     expose_api: boolean;
     api_slug: string;
     run_as_principal: string;
@@ -251,6 +256,9 @@ export interface AgentInput {
      * defaults. Every key is optional on the server. */
     invoke_limits?: InvokeLimits | null;
 }
+
+/** `tier` of an agent: `basic` (default) or `advanced` (developer role). */
+export type AgentTier = "basic" | "advanced";
 
 /** A JSON schema as the server stores it: one JSON object. */
 export type JsonSchema = Record<string, unknown>;

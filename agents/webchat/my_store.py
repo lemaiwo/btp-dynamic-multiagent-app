@@ -30,6 +30,7 @@ from pydantic import ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agents.access import BASIC, agent_allowed
 from agents.db import ChatConversation, ChatUserAgent, ChatUserSkill
 from agents.ide.models import iso_utc
 from agents.ide.store import _chunks
@@ -47,7 +48,10 @@ class NameTaken(Exception):
 # ---------------------------------------------------------------------------
 # Answers
 # ---------------------------------------------------------------------------
-def agent_out(row: ChatUserAgent) -> dict[str, Any]:
+def agent_out(row: ChatUserAgent,
+              usable: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``usable`` are the chat-usable admin agents (``ua.chat_agents``), for
+    the agent's ``tier``; without them only ``deep`` decides it."""
     return {
         "id": row.id,
         "ref": f"{ua.MINE_PREFIX}{row.id}",
@@ -57,6 +61,8 @@ def agent_out(row: ChatUserAgent) -> dict[str, Any]:
         "skills": ua.skill_refs(row),
         "consults": ua.consult_names(row),
         "model": row.model_name,
+        "deep": bool(row.deep),
+        "tier": ua.personal_tier(row, usable or {}),
         "created_at": iso_utc(row.created_at),
         "updated_at": iso_utc(row.updated_at),
         "source": "mine",
@@ -136,17 +142,24 @@ class Refs:
 
     skills: list[dict[str, str]] = field(default_factory=list)
     consults: list[str] = field(default_factory=list)
+    deep: bool = False
     problems: list[tuple[tuple[Any, ...], str]] = field(default_factory=list)
 
 
 async def resolve_refs(db: AsyncSession, principal: str, data: m.AgentIn,
-                       own_names: dict[str, str] | None = None) -> Refs:
+                       own_names: dict[str, str] | None = None, *,
+                       developer: bool = False) -> Refs:
     """Check ``data``'s skills and consults against what the caller may use
     now: admin skills by exact name, own skills by name (case-insensitive,
     stored in the skill's own spelling; ``own_names`` maps key -> name when
     the caller already knows them), consults among the chat-usable admin
-    agents."""
+    agents. ``deep`` and an advanced consult only for a ``developer``."""
     out = Refs()
+    if data.deep:
+        if developer:
+            out.deep = True
+        else:
+            out.problems.append((("deep",), "deep"))
     admin_skills = await ua.admin_skill_names(db) if any(
         r.scope == "admin" for r in data.skills) else set()
     if own_names is None and any(r.scope == "mine" for r in data.skills):
@@ -161,7 +174,7 @@ async def resolve_refs(db: AsyncSession, principal: str, data: m.AgentIn,
             out.problems.append((("skills", index, "name"), "skills"))
     usable = await ua.chat_agents(db) if data.consults else {}
     for index, name in enumerate(data.consults):
-        if name in usable:
+        if name in usable and (developer or agent_allowed(usable[name], BASIC)):
             out.consults.append(name)
         else:
             out.problems.append((("consults", index), "consults"))
@@ -179,6 +192,7 @@ def _apply_agent(row: ChatUserAgent, data: m.AgentIn, refs: Refs) -> None:
     row.skills_json = _dump(refs.skills)
     row.consults_json = _dump(refs.consults)
     row.model_name = data.model
+    row.deep = 1 if refs.deep else 0
 
 
 async def agent_count(db: AsyncSession, principal: str) -> int:
@@ -326,7 +340,8 @@ async def export_bundle(db: AsyncSession, principal: str, *, agent_ids: list[str
         "agents": [
             {"name": a.name, "description": a.description or "",
              "instructions": a.instructions, "skills": ua.skill_refs(a),
-             "consults": ua.consult_names(a), "model": a.model_name}
+             "consults": ua.consult_names(a), "model": a.model_name,
+             "deep": bool(a.deep)}
             for a in agents
         ],
         "skills": [
@@ -397,12 +412,15 @@ def _target_name(state: _Import, kind: str, label: str, name: str, existing: Any
 
 
 async def import_bundle(db: AsyncSession, principal: str, bundle: dict[str, Any], *,
-                        on_conflict: str, models: set[str]) -> dict[str, Any]:
+                        on_conflict: str, models: set[str],
+                        developer: bool = False) -> dict[str, Any]:
     """Write a bundle's skills, then its agents, per item; the report.
 
     ``bundle`` has been checked for its format and caps by the route;
     ``models`` are the model ids offered here (another one is dropped to the
-    default and reported). One commit at the end.
+    default and reported). For a caller who is not a ``developer``, ``deep``
+    and consults of advanced admin agents are dropped and reported. One
+    commit at the end.
     """
     state = _Import(principal, on_conflict)
     now = utcnow()
@@ -465,10 +483,15 @@ async def import_bundle(db: AsyncSession, principal: str, bundle: dict[str, Any]
             else:
                 state.drop(label, "skills", ref.name)
         for name in data.consults:
-            if name in usable:
+            if name in usable and (developer or agent_allowed(usable[name], BASIC)):
                 refs.consults.append(name)
             else:
                 state.drop(label, "consults", name)
+        if data.deep:
+            if developer:
+                refs.deep = True
+            else:
+                state.drop(label, "deep", None)
         if data.model is not None and data.model not in models:
             state.drop(label, "model", None)
             data = data.model_copy(update={"model": None})

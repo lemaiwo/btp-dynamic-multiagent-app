@@ -29,6 +29,7 @@ const util = await import('../static/chat/util.js');
 const { toSafeHtml, renderMarkdown } = await import('../static/chat/render/markdown.js');
 const my = await import('../static/chat/myagents.js');
 const { attachmentFilename } = await import('../static/chat/api.js');
+const { renderEmpty, DEVELOPER_PROMPTS, DEVELOPER_GREETING } = await import('../static/chat/render/messages.js');
 
 // ---------------------------------------------------------------- SSE parser
 console.log('\n== SSE parser ==');
@@ -294,6 +295,67 @@ console.log('\n== export query, import result, picker ==');
   check('a ref in no group gets a disabled option so the select shows it', gone[gone.length - 1].options[0].disabled === true && gone[gone.length - 1].options[0].label === 'Old one (deleted)');
   check('agentNameOf resolves mine, admin, orchestrator and falls back to the stored name', my.agentNameOf('mine:1', catalog, mine) === 'Quota watcher' && my.agentNameOf('admin:btp-admin', catalog, mine) === 'btp-admin' && my.agentNameOf(null, catalog, mine) === 'Orchestrator' && my.agentNameOf('mine:x', catalog, mine, 'Gone (deleted)') === 'Gone (deleted)');
   check('attachment filename: RFC 5987 first, then quoted, then bare, then the fallback', attachmentFilename("attachment; filename*=UTF-8''webchat-bundle-2026-10-31.json") === 'webchat-bundle-2026-10-31.json' && attachmentFilename('attachment; filename="a b.json"') === 'a b.json' && attachmentFilename('attachment; filename=x.json') === 'x.json' && attachmentFilename('') === 'webchat-bundle.json' && attachmentFilename('attachment; filename="../x.json"') === '..x.json');
+}
+
+// ---------------------------------------------------------------- basic and advanced access (addendum d)
+console.log('\n== tiers, badges and the access-aware picker ==');
+{
+  const adv = { ref: 'admin:abap-developer-deep', name: 'abap-developer-deep', tier: 'advanced' };
+  const basic = { ref: 'admin:btp-admin', name: 'btp-admin', tier: 'basic' };
+  const catalog = { orchestrator: { ref: null, name: 'Orchestrator' }, agents: [basic, adv], skills: [] };
+  const mine = [{ id: '1', ref: 'mine:1', name: 'Quota watcher', tier: 'basic', deep: false }, { id: '2', ref: 'mine:2', name: 'ABAP reviewer', tier: 'advanced', deep: true }];
+  check('tierOf: the server tier, deep implies advanced, anything else is basic', my.tierOf(adv) === 'advanced' && my.tierOf(basic) === 'basic' && my.tierOf({ name: 'x', deep: true }) === 'advanced' && my.tierOf({ name: 'x', tier: 'nope' }) === 'basic' && my.tierOf(null) === 'basic' && my.tierOf({ deep: 'true' }) === 'basic');
+  check('optionLabel carries the Developer badge for an advanced agent only', my.optionLabel(adv) === 'abap-developer-deep · Developer' && my.optionLabel(basic) === 'btp-admin' && my.DEVELOPER_BADGE === 'Developer');
+  check('advancedAgentNames lists the advanced catalogue agents', eq([...my.advancedAgentNames(catalog)], ['abap-developer-deep']) && my.advancedAgentNames(null).size === 0);
+  const gBasic = my.pickerGroups(catalog, mine, null, '', { access: 'basic' });
+  check('basic access hides advanced admin and personal agents', eq(gBasic.map((g) => g.options.map((o) => o.value)), [[''], ['mine:1'], ['admin:btp-admin']]));
+  check('the default access is basic', eq(my.pickerGroups(catalog, mine, null), gBasic));
+  const gAdv = my.pickerGroups(catalog, mine, null, '', { access: 'advanced' });
+  check('advanced access lists them with the badge in the label', eq(gAdv[1].options.map((o) => o.label), ['Quota watcher', 'ABAP reviewer · Developer']) && eq(gAdv[2].options.map((o) => o.label), ['btp-admin', 'abap-developer-deep · Developer']));
+  const stale = my.pickerGroups(catalog, mine, 'admin:abap-developer-deep', 'abap-developer-deep', { access: 'basic' });
+  check('an advanced current ref in a basic conversation is shown disabled under Unavailable', stale[stale.length - 1].label === 'Unavailable' && stale[stale.length - 1].options[0].disabled === true);
+  check('refOffered follows the access; the orchestrator always is', my.refOffered('admin:abap-developer-deep', catalog, mine, 'basic') === false && my.refOffered('admin:abap-developer-deep', catalog, mine, 'advanced') === true && my.refOffered('mine:2', catalog, mine, 'basic') === false && my.refOffered('mine:1', catalog, mine, 'basic') === true && my.refOffered(null, catalog, mine, 'basic') === true && my.refOffered('mine:dead', catalog, mine, 'advanced') === false);
+  check('agentOf finds the row behind a ref', my.agentOf('mine:2', catalog, mine).name === 'ABAP reviewer' && my.agentOf('admin:abap-developer-deep', catalog, mine).tier === 'advanced' && my.agentOf('admin:none', catalog, mine) === null && my.agentOf(null, catalog, mine) === null);
+}
+
+console.log('\n== developer-only validators and import lines ==');
+{
+  const ok = { name: 'Quota watcher', description: '', instructions: 'Do', skills: [], consults: [], model: null };
+  const advancedNames = new Set(['abap-developer-deep']);
+  check('a developer may switch deep on and consult an advanced agent', eq(my.validateAgent({ ...ok, deep: true, consults: ['abap-developer-deep'] }, { developer: true, advancedNames }), {}));
+  check('a non-developer: deep refused with the fixed text', my.validateAgent({ ...ok, deep: true }, { developer: false }).deep === my.TEXTS.deep && !my.validateAgent({ ...ok, deep: false }, { developer: false }).deep && !my.validateAgent(ok, { developer: false }).deep);
+  check('a non-developer: an advanced consult refused with the fixed text, a basic one fine', my.validateAgent({ ...ok, consults: ['abap-developer-deep'] }, { developer: false, advancedNames }).consults === my.TEXTS.consults_advanced && !my.validateAgent({ ...ok, consults: ['btp-admin'] }, { developer: false, advancedNames }).consults);
+  check('deep must be a boolean whoever sends it', my.validateAgent({ ...ok, deep: 'yes' }, { developer: true }).deep === my.TEXTS.deep);
+  check('the default is a developer (older callers unchanged)', eq(my.validateAgent({ ...ok, deep: true }), {}));
+  check('fieldErrors maps a 422 at deep to our text', eq(my.fieldErrors([{ loc: ['body', 'deep'], msg: 'SECRET' }], ['deep', 'name']), { deep: my.TEXTS.deep }));
+  const r = my.formatImportResult({ dropped: [{ item: 'agent:ABAP reviewer', field: 'deep', name: null }, { item: 'agent:ABAP reviewer', field: 'consults', name: 'abap-developer-deep' }] });
+  check('a dropped deep is worded as the developer-role refusal, a dropped consult as before', r.dropped[0] === 'agent:ABAP reviewer: Deep agent tools (needs the developer role) were dropped' && r.dropped[1] === 'agent:ABAP reviewer: consulted agent abap-developer-deep does not exist here and was dropped' && r.ok);
+}
+
+console.log('\n== the access switch state (remembered per principal) ==');
+{
+  const store = new Map();
+  const storage = { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, v) };
+  check('normalizeAccess keeps the two tiers and falls back', util.normalizeAccess('advanced') === 'advanced' && util.normalizeAccess('basic') === 'basic' && util.normalizeAccess('root') === 'basic' && util.normalizeAccess(undefined, 'advanced') === 'advanced' && util.normalizeAccess('x', 'y') === 'basic');
+  check('nothing remembered: the fallback', util.rememberedAccess('a@x', 'basic', storage) === 'basic' && util.rememberedAccess('a@x', 'advanced', storage) === 'advanced');
+  check('rememberAccess writes a tier under the principal key and returns it', util.rememberAccess('a@x', 'advanced', storage) === 'advanced' && store.get(util.accessStorageKey('a@x')) === 'advanced');
+  check('the choice comes back for that principal only', util.rememberedAccess('a@x', 'basic', storage) === 'advanced' && util.rememberedAccess('b@x', 'basic', storage) === 'basic');
+  check('a value that is no tier is never written and a stored one is ignored', util.rememberAccess('a@x', 'root', storage) === null && store.get(util.accessStorageKey('a@x')) === 'advanced' && (store.set(util.accessStorageKey('c@x'), 'root'), util.rememberedAccess('c@x', 'basic', storage) === 'basic'));
+  const broken = { getItem: () => { throw new Error('private mode'); }, setItem: () => { throw new Error('private mode'); } };
+  check('a storage that throws is the fallback and a silent write', util.rememberedAccess('a@x', 'advanced', broken) === 'advanced' && util.rememberAccess('a@x', 'basic', broken) === 'basic');
+  check('the real localStorage round-trips', util.rememberAccess('p', 'advanced') === 'advanced' && util.rememberedAccess('p') === 'advanced');
+}
+
+console.log('\n== the developer empty state ==');
+{
+  const box = document.createElement('div');
+  renderEmpty(box, { appName: 'App', onPrompt: () => {}, advanced: true });
+  const chips = [...box.querySelectorAll('.prompt-chip')].map((b) => b.textContent);
+  check('advanced: the developer heading, the Developer tag and the three developer chips (ABAP, UI5/Fiori, CAP)', box.querySelector('.greeting').textContent.startsWith(DEVELOPER_GREETING) && !!box.querySelector('.greeting .dev-tag') && eq(chips, DEVELOPER_PROMPTS) && chips.length === 3 && chips[0].startsWith('ABAP') && chips[1].startsWith('UI5/Fiori') && chips[2].startsWith('CAP'));
+  renderEmpty(box, { appName: 'App', onPrompt: () => {}, advanced: false });
+  check('basic: the usual heading and chips, no tag', box.querySelector('.greeting').textContent === 'What are we doing on BTP today?' && !box.querySelector('.dev-tag') && box.querySelectorAll('.prompt-chip').length === 3 && !eq([...box.querySelectorAll('.prompt-chip')].map((b) => b.textContent), DEVELOPER_PROMPTS));
+  renderEmpty(box, { appName: 'App', onPrompt: () => {}, advanced: true, agentName: 'abap-developer-deep', agentDescription: 'd' });
+  check('advanced with an agent picked: "Ask <agent>" and the standard chips', box.querySelector('.greeting').textContent.startsWith('Ask abap-developer-deep') && !eq([...box.querySelectorAll('.prompt-chip')].map((b) => b.textContent), DEVELOPER_PROMPTS));
 }
 
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');

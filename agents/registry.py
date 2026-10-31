@@ -20,6 +20,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai.tools import ToolDefinition
 
 from agents.db import (
     AgentConfig,
@@ -45,6 +46,7 @@ from agents.shared import (
 )
 from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
 # --- deep agents ---
+from agents.access import BASIC, agent_allowed, effective_tier, tier_of
 from agents.deep import deep_toolset, scoped_deep_instructions
 from agents.errors import describe_exception, mask_text
 from agents.ide.readonly import ReadOnlyGuard
@@ -730,17 +732,34 @@ async def build_orchestrator() -> BuildResult:
     # Run-only agents (expose_chat=False) are still built into `specialists`
     # below (a later task's runner needs them) but must stay invisible to chat.
     chat_rows = [r for r in enabled_rows if r.expose_chat]
+    # Advanced (developer) specialists are listed apart: their delegation
+    # tool exists only in an advanced run (`_tier_gate`), so the model must
+    # not promise them to a basic user.
+    basic_rows = [r for r in chat_rows if tier_of(r) == BASIC]
+    advanced_rows = [r for r in chat_rows if tier_of(r) != BASIC]
     specialist_lines = [
-        f"- **{r.name}**: {r.description.strip()}" for r in chat_rows
+        f"- **{r.name}**: {r.description.strip()}" for r in basic_rows
+    ]
+    advanced_lines = [
+        f"- **{r.name}**: {r.description.strip()}" for r in advanced_rows
     ]
     instructions = orch_instructions.strip()
-    if specialist_lines:
-        instructions += "\n\nAvailable specialists:\n" + "\n".join(specialist_lines)
+    if specialist_lines or advanced_lines:
+        if specialist_lines:
+            instructions += "\n\nAvailable specialists:\n" + "\n".join(specialist_lines)
+        if advanced_lines:
+            instructions += (
+                "\n\nDeveloper specialists (advanced access only):\n"
+                + "\n".join(advanced_lines)
+                + "\nThese are reachable only when the user works with advanced "
+                "access; when you have no tool for one of them, do not offer it."
+            )
 
         # With exactly one specialist there is no routing decision to make —
         # always forward. Deliberating (or trying to answer directly) just adds
         # latency and the occasional refusal, so make delegation mandatory.
-        if len(chat_rows) == 1:
+        # (Not for a lone advanced specialist: a basic run has no tool for it.)
+        if len(chat_rows) == 1 and basic_rows:
             only = chat_rows[0]
             instructions += (
                 f"\n\nThere is currently only ONE specialist available: "
@@ -947,7 +966,8 @@ async def build_orchestrator() -> BuildResult:
         # Run-only agents are built (the runner needs them) but must not be
         # reachable from chat.
         if row.expose_chat:
-            _attach_delegation_tool(orchestrator, specialist, row, counter=in_flight)
+            _attach_delegation_tool(orchestrator, specialist, row, counter=in_flight,
+                                    tier_gated=True)
 
     # Second pass: attach peer delegation tools. This cannot be folded into the
     # loop above, because a peer may be built after the agent that consults it
@@ -1038,11 +1058,28 @@ def specialist_usage(messages: list[Any]) -> dict[str, Any]:
     return {**totals, "requests": requests, "model": model}
 
 
+def _tier_gate(row: AgentConfig) -> Callable[[RunContext, ToolDefinition], Any]:
+    """A tool ``prepare`` that hides the delegation tool of ``row`` in a run
+    whose tier may not reach it (``agents.access``). Decided per run step,
+    so one orchestrator build serves basic and advanced runs alike."""
+    tier = tier_of(row)
+
+    async def prepare(_ctx: RunContext, tool_def: ToolDefinition) -> ToolDefinition | None:
+        return tool_def if agent_allowed(tier, effective_tier()) else None
+
+    return prepare
+
+
 def _attach_delegation_tool(
     orchestrator: Agent, specialist: Agent, row: AgentConfig,
-    counter: RunCounter | None = None,
+    counter: RunCounter | None = None, *, tier_gated: bool = False,
 ) -> None:
-    """Register a per-specialist delegation tool on the orchestrator."""
+    """Register a per-specialist delegation tool on the orchestrator.
+
+    ``tier_gated`` (the orchestrator, a web chat personal agent's consults)
+    drops the tool in a run whose access tier may not reach ``row``; peer
+    delegation is an admin-authored graph and is not gated.
+    """
     tool_name = _sanitize_tool_name(row.name)
     description = (
         f"Delegate to the '{row.name}' specialist. {row.description.strip()}"
@@ -1234,7 +1271,10 @@ def _attach_delegation_tool(
 
     _delegate.__name__ = tool_name
     _delegate.__doc__ = description
-    orchestrator.tool(name=tool_name, description=description)(_delegate)
+    orchestrator.tool(
+        name=tool_name, description=description,
+        prepare=_tier_gate(row) if tier_gated else None,
+    )(_delegate)
 
 
 # ---------------------------------------------------------------------------

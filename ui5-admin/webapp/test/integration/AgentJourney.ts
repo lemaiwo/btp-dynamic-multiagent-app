@@ -10,6 +10,7 @@ import type ColumnListItem from "sap/m/ColumnListItem";
 import type CustomListItem from "sap/m/CustomListItem";
 import type HBox from "sap/m/HBox";
 import type Input from "sap/m/Input";
+import type Item from "sap/ui/core/Item";
 import type Link from "sap/m/Link";
 import type List from "sap/m/List";
 import type JSONModel from "sap/ui/model/json/JSONModel";
@@ -68,6 +69,8 @@ opaTest("creating an agent with two toolsets adds it to the list", function (Giv
                 backend.agents.some((a) => a.name === "new-agent" && a.mcp_servers.length === 2),
                 "the agent reached the backend with both toolsets"
             );
+            Opa5.assert.strictEqual((backend.bodies["POST agents"] ?? {}).tier, "basic",
+                "a new agent is sent with tier basic");
         }
     });
 
@@ -1368,6 +1371,95 @@ opaTest("the server's refusal of the invoke limits lands on the limit its messag
         viewName: "AgentDetail",
         success: function (element: UI5Element) {
             Opa5.assert.strictEqual((element as Input).getValueState(), "None", "the other limits are not marked");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- tier ---------------------------------------------------------------------
+// FakeBackend.reset() makes gmail-agent (id 101) advanced; btp-agent (id 100)
+// keeps the default basic.
+
+opaTest("an advanced agent shows Advanced in the tier select and an untouched save sends it back", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/101");
+
+    Then.waitFor({
+        id: "agentTier",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Select).getSelectedKey(), "advanced", "the stored tier is selected");
+        }
+    });
+    Then.waitFor({
+        id: "agentTierHint",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Text).getText(false),
+                "Advanced agents are reachable only by users with the developer role (advanced access in the web chat)",
+                "the hint explains who reaches an advanced agent");
+        }
+    });
+
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/101"] ?? {}).tier, "advanced", "tier is sent as stored");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("choosing Advanced for a basic agent sends tier advanced", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentTier",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Select).getSelectedKey(), "basic", "a basic agent shows Basic");
+        }
+    });
+    When.waitFor({ id: "agentTier", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({
+        controlType: "sap.ui.core.Item",
+        matchers: function (element: UI5Element) {
+            return (element as Item).getKey() === "advanced";
+        },
+        searchOpenDialogs: true,
+        actions: new Press()
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).tier, "advanced", "the chosen tier is sent");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the agent list tags the advanced agent", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+
+    Then.waitFor({
+        controlType: "sap.m.ObjectStatus",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) {
+            return (element as ObjectStatus).getText() === "Advanced";
+        },
+        visible: false,
+        success: function (tags: UI5Element[]) {
+            const shown = tags.filter((tag) => (tag as ObjectStatus).getVisible())
+                .map((tag) => ((tag.getBindingContext("agents")?.getObject() ?? {}) as { name?: string }).name);
+            Opa5.assert.deepEqual(shown, ["gmail-agent"], "only gmail-agent carries the tag");
         }
     });
 

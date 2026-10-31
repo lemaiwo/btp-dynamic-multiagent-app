@@ -31,7 +31,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import SplitResult, urlsplit
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
@@ -993,6 +993,9 @@ class AgentPayload(BaseModel):
     expose_invoke: bool = False
     result_schema: dict[str, Any] | None = None
     invoke_limits: dict[str, Any] | None = None
+    # --- access tier (agents/access.py) --- None (absent) keeps the stored
+    # value; a new row is "basic". Any other string is a 422 at the field.
+    tier: Literal["basic", "advanced"] | None = None
 
     @field_validator("result_schema")
     @classmethod
@@ -1139,6 +1142,11 @@ class AgentPayload(BaseModel):
         if "invoke_limits" in sent:
             out["invoke_limits"] = self.invoke_limits
         return out
+
+    def tier_kwargs(self) -> dict[str, Any]:
+        """``upsert_agent``'s ``tier`` when the client sent one; nothing
+        (KEEP) otherwise, so an older client or bundle keeps the tier."""
+        return {"tier": self.tier} if self.tier is not None else {}
 
     def to_servers_list(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1361,6 +1369,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 model_name=_or_keep(payload.model_name),
                 deep_json=_deep_json_or_keep(payload.deep),
                 **payload.invoke_kwargs(),
+                **payload.tier_kwargs(),
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -1559,6 +1568,11 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         # --- deep agents ---
         if payload.deep is not None:
             row.deep_json = dump_deep_config(payload.deep)
+        # --- access tier --- absent keeps; the orchestrator's gate reads the
+        # tier of the build, so it applies at the next reload, as
+        # expose_chat does.
+        if payload.tier is not None:
+            row.tier = payload.tier
         # --- invoke API --- No registry reload for these: the invoke route
         # reads the row on every call (`agents.invoke.invoke_agent`). The
         # schema and limits were checked (and the limits cleaned) by the
@@ -2581,6 +2595,7 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         ignore_peer_lists_of=doomed | rewrites_peers,
                         # A bundle without these keys keeps what is stored.
                         **agent.invoke_kwargs(),
+                        **agent.tier_kwargs(),
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
@@ -2862,6 +2877,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     commit=False,
                     deep_json=_deep_json_or_keep(payload.deep),
                     **payload.invoke_kwargs(),
+                    **payload.tier_kwargs(),
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry '%s': %s",
