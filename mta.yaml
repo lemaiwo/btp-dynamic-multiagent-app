@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.28.0
+version: 2.29.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with

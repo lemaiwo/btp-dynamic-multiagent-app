@@ -2165,7 +2165,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `reportlab` in `requirements.txt`; 2.28.0 is the advanced-access release
   (`agents/access.py`, the `tier` of admin agents): no new resource,
   environment variable or role (advanced = the existing `developer` or
-  `admin` scope); schema generation 6 is deployed by it
+  `admin` scope); schema generation 6 is deployed by it; 2.29.0 adds the context view of a
+  conversation (`agents/webchat/context.py`): no new resource, variable,
+  table or column (`CHAT_CONTEXT_WINDOWS` is optional and not in the
+  descriptor)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
