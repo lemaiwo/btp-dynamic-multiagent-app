@@ -56,9 +56,15 @@ export function createSidebar(root, handlers) {
 
   const foot = document.createElement('div');
   foot.className = 'sb-foot';
+  const agentsLink = document.createElement('a');
+  agentsLink.className = 'sb-link';
+  agentsLink.href = '#/agents';
+  agentsLink.appendChild(svg('M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5', 16));
+  agentsLink.appendChild(document.createTextNode('Agents & skills'));
+  agentsLink.addEventListener('click', () => handlers.onAgents?.());
   const who = document.createElement('span');
   who.className = 'sb-who';
-  foot.appendChild(who);
+  foot.append(agentsLink, who);
 
   root.append(top, newBtn, search, list, foot);
 
@@ -157,7 +163,7 @@ export function createSidebar(root, handlers) {
   // ---- rendering ----
   let renaming = null; // conversation id being renamed
   let lastSig = '';
-  let current = { conversations: [], query: '', currentId: null, principal: '' };
+  let current = { conversations: [], query: '', currentId: null, principal: '', view: 'chat' };
 
   function startRename(id) {
     renaming = id;
@@ -196,7 +202,18 @@ export function createSidebar(root, handlers) {
     const a = document.createElement('a');
     a.className = 'conv-link';
     a.href = `#/c/${encodeURIComponent(conv.id)}`;
-    a.textContent = conv.title || 'New chat';
+    const t = document.createElement('span');
+    t.className = 'conv-title';
+    t.textContent = conv.title || 'New chat';
+    a.appendChild(t);
+    if (conv.agent_ref) {
+      // not the orchestrator: say who the conversation talks to
+      const badge = document.createElement('span');
+      badge.className = 'conv-badge';
+      badge.textContent = conv.agent_name || 'agent';
+      badge.title = `Talks to ${conv.agent_name || 'an agent'}`;
+      a.appendChild(badge);
+    }
     a.title = conv.title || '';
     if (active) a.setAttribute('aria-current', 'page');
     a.addEventListener('click', () => handlers.onSelect?.(conv.id));
@@ -225,12 +242,15 @@ export function createSidebar(root, handlers) {
   function render(state) {
     current = state;
     const sig = JSON.stringify([
-      state.conversations.map((c) => [c.id, c.title, c.updated_at, c.status]),
-      state.query, state.currentId, state.principal, renaming,
+      state.conversations.map((c) => [c.id, c.title, c.updated_at, c.status, c.agent_ref, c.agent_name]),
+      state.query, state.currentId, state.principal, renaming, state.view,
     ]);
     if (sig === lastSig) return;
     lastSig = sig;
     who.textContent = state.principal || '';
+    const onAgents = state.view === 'agents';
+    agentsLink.classList.toggle('active', onAgents);
+    if (onAgents) agentsLink.setAttribute('aria-current', 'page'); else agentsLink.removeAttribute('aria-current');
     if (search.value !== state.query) search.value = state.query;
     const groups = groupConversations(filterConversations(state.conversations, state.query));
     list.replaceChildren();

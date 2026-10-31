@@ -7,11 +7,13 @@
 export const BASE = '/chat/api';
 
 export class ApiError extends Error {
-  constructor(status, detail, code) {
+  constructor(status, detail, code, errors = []) {
     super(detail || `HTTP ${status}`);
     this.status = status;
     this.detail = detail || '';
     this.code = code || null;
+    // a 422's `detail[]` as [{loc, msg, type}] (never the input), else []
+    this.errors = Array.isArray(errors) ? errors : [];
   }
 }
 
@@ -24,18 +26,32 @@ export function baseHeaders(extra = {}) {
   return { 'X-Requested-With': 'XMLHttpRequest', ...extra };
 }
 
-async function readDetail(res) {
+/** {detail, errors}: the text of a refusal and, for a 422, its `detail[]`. */
+async function readError(res) {
   let detail = '';
+  let errors = [];
   try {
     const text = await res.text();
     try {
       const j = JSON.parse(text);
       if (typeof j?.detail === 'string') detail = j.detail;
-      else if (Array.isArray(j?.detail)) detail = j.detail.map((d) => d.msg || '').filter(Boolean).join('; ');
-      else if (j?.message) detail = String(j.message);
+      else if (Array.isArray(j?.detail)) {
+        errors = j.detail.filter((d) => d && typeof d === 'object').map((d) => ({
+          loc: Array.isArray(d.loc) ? d.loc.map(String) : [],
+          msg: typeof d.msg === 'string' ? d.msg : '',
+          type: typeof d.type === 'string' ? d.type : '',
+        }));
+        detail = errors.map((d) => d.msg).filter(Boolean).join('; ');
+      } else if (j?.message) detail = String(j.message);
     } catch { detail = text.slice(0, 200); }
   } catch { /* nothing to read */ }
-  return detail;
+  return { detail, errors };
+}
+
+async function fail(res) {
+  unauthorized(res);
+  const { detail, errors } = await readError(res);
+  return new ApiError(res.status, detail, null, errors);
 }
 
 function unauthorized(res) {
@@ -51,10 +67,7 @@ export async function request(path, { method = 'GET', body, headers, signal } = 
     init.body = JSON.stringify(body);
   }
   const res = await fetchImpl(BASE + path, init);
-  if (!res.ok) {
-    unauthorized(res);
-    throw new ApiError(res.status, await readDetail(res));
-  }
+  if (!res.ok) throw await fail(res);
   if (res.status === 204) return null;
   const ct = res.headers.get('content-type') || '';
   return ct.includes('json') ? res.json() : res.text();
@@ -72,16 +85,54 @@ export const deleteConversation = (id) =>
 export const cancelRun = (id) =>
   request(`/conversations/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
 
+// ---- personal agents and skills, the admin catalogue (addendum c) ----
+export const getCatalog = () => request('/catalog');
+export const listMyAgents = () => request('/my/agents');
+export const createMyAgent = (body) => request('/my/agents', { method: 'POST', body });
+export const getMyAgent = (id) => request(`/my/agents/${encodeURIComponent(id)}`);
+export const updateMyAgent = (id, body) => request(`/my/agents/${encodeURIComponent(id)}`, { method: 'PUT', body });
+export const deleteMyAgent = (id) => request(`/my/agents/${encodeURIComponent(id)}`, { method: 'DELETE' });
+export const listMySkills = () => request('/my/skills');
+export const createMySkill = (body) => request('/my/skills', { method: 'POST', body });
+export const getMySkill = (id) => request(`/my/skills/${encodeURIComponent(id)}`);
+export const updateMySkill = (id, body) => request(`/my/skills/${encodeURIComponent(id)}`, { method: 'PUT', body });
+export const deleteMySkill = (id) => request(`/my/skills/${encodeURIComponent(id)}`, { method: 'DELETE' });
+
+/** The filename of a Content-Disposition header (RFC 5987 form first), or the fallback. */
+export function attachmentFilename(header, fallback = 'webchat-bundle.json') {
+  const h = String(header || '');
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/.exec(h);
+  if (star) { try { return decodeURIComponent(star[1].trim()); } catch { /* fall through */ } }
+  const plain = /filename\s*=\s*"([^"]+)"|filename\s*=\s*([^;\s]+)/.exec(h);
+  const name = plain ? (plain[1] || plain[2] || '') : '';
+  return name.replace(/[\\/]/g, '').trim() || fallback;
+}
+
+/**
+ * GET /my/export as a Blob with the server's filename. `query` comes from
+ * `exportQuery` (myagents.js): '' exports everything of the user.
+ */
+export async function exportBundle(query = '') {
+  const res = await fetchImpl(`${BASE}/my/export${query}`, { headers: baseHeaders(), credentials: 'same-origin' });
+  if (!res.ok) throw await fail(res);
+  return { blob: await res.blob(), filename: attachmentFilename(res.headers.get('content-disposition')) };
+}
+
+/** POST /my/import: multipart `file` plus `on_conflict` (rename | replace | skip). */
+export function importBundle(file, onConflict = 'rename') {
+  const form = new FormData();
+  form.append('file', file, file.name || 'bundle.json');
+  form.append('on_conflict', onConflict);
+  return request('/my/import', { method: 'POST', body: form });
+}
+
 export const fileUrl = (id, inline = false) =>
   `${BASE}/files/${encodeURIComponent(id)}${inline ? '?inline=1' : ''}`;
 
 /** Fetch a file as a Blob (for image thumbnails). */
 export async function fetchFileBlob(id) {
   const res = await fetchImpl(fileUrl(id, true), { headers: baseHeaders(), credentials: 'same-origin' });
-  if (!res.ok) {
-    unauthorized(res);
-    throw new ApiError(res.status, await readDetail(res));
-  }
+  if (!res.ok) throw await fail(res);
   return res.blob();
 }
 
@@ -161,10 +212,7 @@ export async function sendMessage(conversationId, { text, files = [], model }, {
     credentials: 'same-origin',
     signal,
   });
-  if (!res.ok) {
-    unauthorized(res);
-    throw new ApiError(res.status, await readDetail(res));
-  }
+  if (!res.ok) throw await fail(res);
   await consumeStream(res.body, onEvent);
 }
 

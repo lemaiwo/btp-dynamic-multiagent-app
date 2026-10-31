@@ -1,14 +1,17 @@
-// Bootstrap: layout, router (#/c/<id>), store wiring, streaming turns.
+// Bootstrap: layout, router (#/c/<id>, #/agents), store wiring, streaming turns.
 
 import * as api from './api.js';
 import { createStore, initialState, newUserMessage, newAssistantMessage, applyStreamEvent } from './state.js';
 import { createSidebar } from './render/sidebar.js';
 import { createMessageList, renderEmpty } from './render/messages.js';
 import { createComposer } from './composer.js';
+import { createAgentsPage } from './render/agents.js';
+import { createAgentEditor } from './render/agentEditor.js';
+import { pickerGroups, agentNameOf } from './myagents.js';
 import { initTheme, toggleTheme, onThemeChange } from './theme.js';
 import { titleFromText, formatTokens } from './util.js';
 
-const store = createStore(initialState);
+const store = createStore({ ...initialState, catalog: null, myAgents: [], draftAgentRef: null, view: 'chat' });
 const root = document.getElementById('app');
 
 // ---------- layout (static, trusted markup: nothing of the model in here) ----------
@@ -24,6 +27,7 @@ root.innerHTML = `
       <h1 class="title" id="title">SAP BTP Multi-Agent</h1>
       <div class="topbar-right">
         <span class="usage-chip" id="usage-chip" hidden tabindex="0" role="status" aria-label="Conversation usage"></span>
+        <label class="model-pick agent-pick"><span class="sr-only">Agent</span><select id="agent" aria-label="Agent"></select></label>
         <label class="model-pick"><span class="sr-only">Model</span><select id="model" aria-label="Model"></select></label>
         <button type="button" class="icon-btn theme" id="theme" aria-label="Switch to dark theme" title="Theme">
           <svg class="sun" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
@@ -40,6 +44,7 @@ root.innerHTML = `
       <div class="column" id="messages"></div>
     </section>
     <div class="composer-wrap"><div class="column" id="composer"></div></div>
+    <section class="page-wrap" id="page" hidden aria-label="Agents and skills"></section>
   </main>
   <div class="toasts" id="toasts" aria-live="polite"></div>
 </div>`;
@@ -51,6 +56,10 @@ const scrim = $('.scrim');
 const hamburger = $('.hamburger');
 const titleEl = $('#title');
 const modelSel = $('#model');
+const agentSel = $('#agent');
+const logEl = $('.log');
+const composerWrap = $('.composer-wrap');
+const pageEl = $('#page');
 const usageChip = $('#usage-chip');
 const themeBtn = $('#theme');
 const bannerEl = $('#banner');
@@ -100,6 +109,7 @@ document.addEventListener('keydown', (e) => {
 // ---------- sidebar ----------
 const sidebar = createSidebar(sidebarEl, {
   onNew: () => { setSidebar(false); composer.clearFiles(); goTo(null); },
+  onAgents: () => setSidebar(false),
   onSelect: () => setSidebar(false),
   onSearch: (q) => store.set({ query: q }),
   onClose: () => setSidebar(false),
@@ -158,6 +168,12 @@ function selectedModel() {
 function reflectModel() {
   const id = selectedModel();
   if (id && modelSel.value !== id) modelSel.value = id;
+  // an admin agent runs on its own model: the pick does not apply to it
+  const s = store.get();
+  const ref = s.conversation ? (s.conversation.agent_ref || null) : (s.draftAgentRef || null);
+  const adminAgent = typeof ref === 'string' && ref.startsWith('admin:');
+  modelSel.disabled = adminAgent;
+  modelSel.title = adminAgent ? 'Admin agents run on their own model' : '';
 }
 modelSel.addEventListener('change', async () => {
   const model = modelSel.value;
@@ -171,18 +187,133 @@ modelSel.addEventListener('change', async () => {
   }
 });
 
+// ---------- agent picker ----------
+let agentsSig = '';
+function fillAgents() {
+  const s = store.get();
+  const conv = s.conversation;
+  const current = conv ? (conv.agent_ref || null) : (s.draftAgentRef || null);
+  const groups = pickerGroups(s.catalog, s.myAgents, current, conv?.agent_name || '');
+  const sig = JSON.stringify([groups, current]);
+  if (sig === agentsSig) return;
+  agentsSig = sig;
+  agentSel.replaceChildren();
+  for (const g of groups) {
+    const og = document.createElement('optgroup');
+    og.label = g.label;
+    for (const o of g.options) {
+      const opt = document.createElement('option');
+      opt.value = o.value;
+      opt.textContent = o.label;
+      if (o.disabled) opt.disabled = true;
+      og.appendChild(opt);
+    }
+    agentSel.appendChild(og);
+  }
+  agentSel.value = current || '';
+  agentSel.hidden = !s.catalog && !s.myAgents.length;
+}
+function currentAgentName() {
+  const s = store.get();
+  const conv = s.conversation;
+  if (conv) return conv.agent_name || agentNameOf(conv.agent_ref || null, s.catalog, s.myAgents, '');
+  return agentNameOf(s.draftAgentRef || null, s.catalog, s.myAgents, '');
+}
+agentSel.addEventListener('change', async () => {
+  const ref = agentSel.value || null;
+  const s = store.get();
+  const name = agentNameOf(ref, s.catalog, s.myAgents, '');
+  const conv = s.conversation;
+  store.set({ draftAgentRef: ref });
+  if (!conv) { renderDraftEmpty(); reflectModel(); return; }
+  try {
+    const fresh = await api.patchConversation(conv.id, { agent_ref: ref });
+    const agent_ref = fresh && 'agent_ref' in fresh ? fresh.agent_ref : ref;
+    const agent_name = fresh?.agent_name || name;
+    store.set((st) => ({
+      conversation: st.conversation?.id === conv.id ? { ...st.conversation, agent_ref, agent_name } : st.conversation,
+      conversations: st.conversations.map((c) => (c.id === conv.id ? { ...c, agent_ref, agent_name } : c)),
+    }));
+    renderMessages();
+    reflectModel();
+  } catch (e) {
+    if (e.status === 422) notify('That agent cannot be used in this conversation.', 'error');
+    else if (e.status !== 401) notify(e.detail || 'The agent could not be changed.', 'error');
+    fillAgents();
+  }
+});
+async function loadAgentLists() {
+  try {
+    const [catalog, mine] = await Promise.all([api.getCatalog(), api.listMyAgents()]);
+    store.set({ catalog: catalog && typeof catalog === 'object' ? catalog : null, myAgents: Array.isArray(mine) ? mine : [] });
+  } catch { /* the picker keeps what it has */ }
+}
+
+// ---------- Agents & skills page ----------
+const editor = createAgentEditor({
+  notify,
+  onSaved: () => agentsPage.load(),
+});
+const agentsPage = createAgentsPage(pageEl, {
+  editor,
+  notify,
+  getModels: () => store.get().me?.models || [],
+  onChanged: (d) => store.set({ catalog: d.catalog, myAgents: d.agents }),
+  onChat: async (ref, name) => {
+    try {
+      const created = await api.createConversation({ title: 'New chat', agent_ref: ref, model: selectedModel() || undefined });
+      store.set((st) => ({ draftAgentRef: ref, conversations: [{ ...created, agent_ref: created.agent_ref ?? ref, agent_name: created.agent_name || name }, ...st.conversations] }));
+      goTo(created.id);
+    } catch (e) {
+      if (e.status !== 401) notify('The conversation could not be created.', 'error');
+    }
+  },
+});
+function showView(view) {
+  const agents = view === 'agents';
+  store.set({ view });
+  logEl.hidden = agents;
+  composerWrap.hidden = agents;
+  pageEl.hidden = !agents;
+  agentSel.parentElement.hidden = agents;
+  modelSel.parentElement.hidden = agents;
+  usageChip.hidden = agents || usageChip.hidden;
+  if (agents) agentsPage.show(); else agentsPage.hide();
+}
+
 // ---------- router ----------
 function parseHash() {
   const m = /^#\/c\/([^/?#]+)/.exec(location.hash || '');
   return m ? decodeURIComponent(m[1]) : null;
 }
+function isAgentsHash() { return /^#\/agents(?:[/?#]|$)/.test(location.hash || ''); }
 function goTo(id) {
   const target = id ? `#/c/${encodeURIComponent(id)}` : '#/';
   if (location.hash === target) route();
   else location.hash = target;
 }
 let routeSeq = 0;
+let emptySig = null;
+// The empty state for a draft (the picked ref) or for a conversation without
+// messages yet (one made by "Chat with this agent"); redrawn when the agent changes.
+function renderEmptyFor(ref, storedName = '') {
+  const s = store.get();
+  const name = ref ? agentNameOf(ref, s.catalog, s.myAgents, storedName) : '';
+  const desc = ref ? (s.myAgents.find((a) => (a.ref || `mine:${a.id}`) === ref)?.description || s.catalog?.agents?.find((a) => (a.ref || `admin:${a.name}`) === ref)?.description || '') : '';
+  const sig = `${ref || ''}|${name}`;
+  if (messagesEl.classList.contains('empty-state') && emptySig === sig) return;
+  emptySig = sig;
+  renderEmpty(messagesEl, { appName: s.me?.app_name, onPrompt: (t) => composer.setText(t), agentName: name, agentDescription: desc });
+}
+function renderDraftEmpty() { renderEmptyFor(store.get().draftAgentRef || null); }
 async function route() {
+  if (isAgentsHash()) {
+    routeSeq++;
+    store.set({ currentId: null, conversation: null });
+    showView('agents');
+    return;
+  }
+  if (store.get().view !== 'chat') showView('chat');
   const id = parseHash();
   const s = store.get();
   if (id && s.conversation?.id === id) { store.set({ currentId: id }); return; }
@@ -190,7 +321,7 @@ async function route() {
   if (!id) {
     store.set({ currentId: null, conversation: null });
     list.clear();
-    renderEmpty(messagesEl, { appName: s.me?.app_name, onPrompt: (t) => composer.setText(t) });
+    renderDraftEmpty();
     composer.focus();
     return;
   }
@@ -200,7 +331,8 @@ async function route() {
     if (seq !== routeSeq) return;
     list.clear();
     list.resetStick();
-    store.set({ conversation: normalizeConversation(conv), loading: false });
+    store.set({ conversation: normalizeConversation(conv), loading: false, draftAgentRef: conv.agent_ref || null });
+    renderMessages();
     list.scrollToBottom(true);
   } catch (e) {
     if (seq !== routeSeq) return;
@@ -239,7 +371,15 @@ async function sendTurn(text, files) {
   const model = selectedModel();
   try {
     if (!conv) {
-      const created = await api.createConversation({ title: titleFromText(text), model: model || undefined });
+      const agent_ref = s.draftAgentRef || null;
+      const created = await api.createConversation({ title: titleFromText(text), model: model || undefined, agent_ref });
+      if (agent_ref && created.agent_ref !== agent_ref) {
+        // the create did not take the ref: bind it before the first turn
+        const patched = await api.patchConversation(created.id, { agent_ref });
+        created.agent_ref = patched?.agent_ref ?? agent_ref;
+        created.agent_name = patched?.agent_name || created.agent_name;
+      }
+      if (!created.agent_name) created.agent_name = agentNameOf(created.agent_ref || null, s.catalog, s.myAgents, '');
       conv = normalizeConversation({ ...created, messages: [] });
       store.set({ conversation: conv, currentId: conv.id, conversations: [created, ...store.get().conversations] });
       routeSeq++; // the hashchange below must not reload what we hold
@@ -328,21 +468,27 @@ async function refreshList() {
 function renderMessages() {
   const s = store.get();
   if (!s.conversation) return;
-  list.render(s.conversation, { live: !!s.run });
+  if (!s.run && !(s.conversation.messages || []).length) {
+    renderEmptyFor(s.conversation.agent_ref || null, s.conversation.agent_name || '');
+    return;
+  }
+  list.render(s.conversation, { live: !!s.run, agentName: currentAgentName() || 'Agents' });
 }
 
 store.subscribe((s) => {
   sidebar.render({
     conversations: s.conversations, query: s.query, currentId: s.currentId,
-    principal: s.me?.principal || '',
+    principal: s.me?.principal || '', view: s.view,
   });
-  const title = s.conversation?.title || s.me?.app_name || 'SAP BTP Multi-Agent';
+  const title = s.view === 'agents' ? 'Agents & skills' : (s.conversation?.title || s.me?.app_name || 'SAP BTP Multi-Agent');
   if (titleEl.textContent !== title) {
     titleEl.textContent = title;
     document.title = s.conversation?.title ? `${s.conversation.title} · ${s.me?.app_name || 'SAP BTP Multi-Agent'}` : (s.me?.app_name || 'SAP BTP Multi-Agent');
   }
   reflectModel();
+  fillAgents();
   reflectUsage(s.conversation?.usage);
+  if (s.view === 'agents') usageChip.hidden = true;
   if (s.conversation && !s.run) renderMessages();
 });
 
@@ -402,7 +548,7 @@ async function boot() {
     if (e.status !== 401) notify('The chat service did not answer. Reload to try again.', 'error');
     fillModels([]);
   }
-  await refreshList();
+  await Promise.all([refreshList(), loadAgentLists()]);
   await route();
 }
 boot();

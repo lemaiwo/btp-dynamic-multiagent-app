@@ -37,6 +37,7 @@ const ERROR_TEXTS = {
   canceled: 'Stopped.',
   model_unavailable: 'The model is not available right now.',
   credential_required: 'A sign-in is needed before the agents can continue.',
+  agent_unavailable: 'The selected agent is no longer available. Pick another one in the header.',
 };
 
 function buildUser(message) {
@@ -56,6 +57,10 @@ function buildAssistant() {
   const art = document.createElement('article');
   art.className = 'msg assistant';
   art.setAttribute('aria-label', 'Agents');
+  const from = document.createElement('div');
+  from.className = 'from';
+  from.textContent = 'Agents';
+  art.appendChild(from);
   const activity = document.createElement('div');
   activity.className = 'activity-slot';
   const body = document.createElement('div');
@@ -109,10 +114,16 @@ export function usageLine(usage) {
   return el;
 }
 
-function updateAssistant(el, message, live) {
+function updateAssistant(el, message, live, agentName = 'Agents') {
   el.dataset.id = message.id;
   const running = message.status === 'running';
   el.classList.toggle('running', running);
+  // who answers: the conversation's agent_name, "Agents" when unknown
+  const from = el.querySelector('.from');
+  if (from && from.textContent !== agentName) {
+    from.textContent = agentName;
+    el.setAttribute('aria-label', agentName);
+  }
 
   const asig = activitySig(message);
   if (el._asig !== asig) {
@@ -200,9 +211,14 @@ export function createMessageList(container) {
   }
   container.addEventListener('chat:layout', () => scrollToBottom());
 
-  function render(conversation, { live = false } = {}) {
+  function render(conversation, { live = false, agentName = 'Agents' } = {}) {
     const messages = conversation?.messages || [];
-    container.classList.remove('empty-state');
+    if (container.classList.contains('empty-state')) {
+      // the empty state gives way to the first message
+      container.classList.remove('empty-state');
+      container.replaceChildren();
+      nodes.clear();
+    }
     const keep = new Set();
     let cursor = null;
     for (const m of messages) {
@@ -212,7 +228,7 @@ export function createMessageList(container) {
         el = m.role === 'user' ? buildUser(m) : buildAssistant();
         nodes.set(m.id, el);
       }
-      if (m.role === 'assistant') updateAssistant(el, m, live);
+      if (m.role === 'assistant') updateAssistant(el, m, live, agentName || 'Agents');
       const next = cursor ? cursor.nextSibling : container.firstChild;
       if (next !== el) container.insertBefore(el, next);
       cursor = el;
@@ -238,8 +254,11 @@ const PROMPTS = [
   'Create an Excel workbook of the destinations in our dev subaccount',
 ];
 
-/** The empty state: logo, greeting, three example prompts. */
-export function renderEmpty(container, { appName, onPrompt }) {
+/**
+ * The empty state: logo, greeting, three example prompts. With a picked
+ * agent the heading names it and the subline is its description.
+ */
+export function renderEmpty(container, { appName, onPrompt, agentName = '', agentDescription = '' }) {
   container.classList.add('empty-state');
   const wrap = document.createElement('div');
   wrap.className = 'empty';
@@ -249,10 +268,12 @@ export function renderEmpty(container, { appName, onPrompt }) {
   logo.className = 'empty-logo';
   const h = document.createElement('h2');
   h.className = 'greeting';
-  h.textContent = 'What are we doing on BTP today?';
+  h.textContent = agentName ? `Ask ${agentName}` : 'What are we doing on BTP today?';
   const sub = document.createElement('p');
   sub.className = 'greeting-sub';
-  sub.textContent = `${appName || 'SAP BTP Multi-Agent'} hands your question to the specialist that can answer it. Attach a document or ask for one.`;
+  sub.textContent = agentName
+    ? (agentDescription || `This conversation goes straight to ${agentName}. Attach a document or ask for one.`)
+    : `${appName || 'SAP BTP Multi-Agent'} hands your question to the specialist that can answer it. Attach a document or ask for one.`;
   const chips = document.createElement('div');
   chips.className = 'prompt-chips';
   for (const text of PROMPTS) {

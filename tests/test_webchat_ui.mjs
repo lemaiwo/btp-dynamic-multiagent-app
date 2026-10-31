@@ -27,6 +27,8 @@ const { createSSEParser } = await import('../static/chat/api.js');
 const { applyEvent, applyStreamEvent, newAssistantMessage, activitySummary, activityTree, usagePart, addUsage } = await import('../static/chat/state.js');
 const util = await import('../static/chat/util.js');
 const { toSafeHtml, renderMarkdown } = await import('../static/chat/render/markdown.js');
+const my = await import('../static/chat/myagents.js');
+const { attachmentFilename } = await import('../static/chat/api.js');
 
 // ---------------------------------------------------------------- SSE parser
 console.log('\n== SSE parser ==');
@@ -245,6 +247,53 @@ console.log('\n== markdown rendering is sanitized ==');
   check('table rendered', !!div.querySelector('table td'));
   renderMarkdown(div, '```mermaid\nflowchart LR\nA-->B\n```', { final: false });
   check('mermaid fence left as source while streaming', !!div.querySelector('pre.mermaid-source'));
+}
+
+// ---------------------------------------------------------------- personal agents and skills (addendum c)
+console.log('\n== agent / skill validators ==');
+{
+  const ok = { name: 'Quota watcher', description: 'one line', instructions: 'Do the thing', skills: [], consults: [], model: null };
+  check('a valid agent has no errors', eq(my.validateAgent(ok), {}));
+  check('name pattern: must start with a letter or digit', my.validateAgent({ ...ok, name: '-x' }).name === my.TEXTS.name && my.validateAgent({ ...ok, name: '' }).name === my.TEXTS.name);
+  check('name pattern: allowed characters only, parentheses included', my.validateAgent({ ...ok, name: 'a/b' }).name === my.TEXTS.name && !my.validateAgent({ ...ok, name: 'a_b.c-d 9' }).name && !my.validateAgent({ ...ok, name: 'Report (2)' }).name);
+  check('name at most 64 characters', !my.validateAgent({ ...ok, name: 'a'.repeat(64) }).name && my.validateAgent({ ...ok, name: 'a'.repeat(65) }).name === my.TEXTS.name);
+  check('name taken (case-insensitive) is the fixed text', my.validateAgent(ok, { taken: new Set(['quota watcher']) }).name === my.TEXTS.name_taken_agent);
+  check('takenNames lower-cases and leaves the edited row out', eq([...my.takenNames([{ id: 1, name: 'A' }, { id: 2, name: 'Bee' }], 2)], ['a']));
+  check('description over 300 or with a line break', my.validateAgent({ ...ok, description: 'x'.repeat(301) }).description === my.TEXTS.description && my.validateAgent({ ...ok, description: 'a\nb' }).description === my.TEXTS.description && !my.validateAgent({ ...ok, description: 'x'.repeat(300) }).description);
+  check('instructions 1..20,000', my.validateAgent({ ...ok, instructions: '' }).instructions === my.TEXTS.instructions && my.validateAgent({ ...ok, instructions: 'x'.repeat(20_001) }).instructions === my.TEXTS.instructions && !my.validateAgent({ ...ok, instructions: 'x'.repeat(20_000) }).instructions);
+  check('control characters refused, tab and newline kept', my.validateAgent({ ...ok, instructions: 'a\u0007b' }).instructions === my.TEXTS.control && !my.validateAgent({ ...ok, instructions: 'a\tb\nc' }).instructions);
+  check('at most 20 skills and 10 consults', my.validateAgent({ ...ok, skills: Array(21).fill({ scope: 'mine', name: 's' }) }).skills === my.TEXTS.skills && my.validateAgent({ ...ok, consults: Array(11).fill('a') }).consults === my.TEXTS.consults && !my.validateAgent({ ...ok, skills: Array(20).fill({ scope: 'mine', name: 's' }), consults: Array(10).fill('a') }).skills);
+  check('model must be one of the list, null or empty is the default', my.validateAgent({ ...ok, model: 'nope', models: ['gpt'] }).model === my.TEXTS.model && !my.validateAgent({ ...ok, model: 'gpt', models: ['gpt'] }).model && !my.validateAgent({ ...ok, model: '', models: ['gpt'] }).model);
+  const sk = { name: 'report', description: '', content: 'x' };
+  check('a valid skill has no errors', eq(my.validateSkill(sk), {}));
+  check('skill content 1..50,000', my.validateSkill({ ...sk, content: '' }).content === my.TEXTS.content && my.validateSkill({ ...sk, content: 'x'.repeat(50_001) }).content === my.TEXTS.content && !my.validateSkill({ ...sk, content: 'x'.repeat(50_000) }).content);
+  check('skill name taken text', my.validateSkill(sk, { taken: new Set(['report']) }).name === my.TEXTS.name_taken_skill);
+  check('fieldErrors maps a 422 loc to the field with our text, never the message', eq(my.fieldErrors([{ loc: ['body', 'skills', 0, 'name'], msg: 'SECRET' }, { loc: ['body', 'nope'], msg: 'x' }, { loc: ['body', 'name'], msg: 'y' }], ['name', 'skills']), { skills: my.TEXTS.skills, name: my.TEXTS.name }));
+}
+
+console.log('\n== export query, import result, picker ==');
+{
+  check('nothing selected exports everything', my.exportQuery([], []) === '');
+  check('agents and skills joined by commas, deduplicated, encoded', my.exportQuery(['a1', 'a2', 'a1'], ['s 1']) === '?agents=a1,a2&skills=s%201');
+  check('skills only', my.exportQuery([], ['s1']) === '?skills=s1');
+  const r = my.formatImportResult({ agents: { created: 1, replaced: 0, skipped: 2, renamed: [{ from: 'Quota watcher', to: 'Quota watcher 2' }] }, skills: { created: 3, replaced: 1, skipped: 0, renamed: [] },
+    dropped: [{ item: 'agent:Quota watcher', field: 'consults', name: 'btp-prod' }, { item: 'agent:Quota watcher', field: 'skills', name: 'gone' }, { item: 'agent:Quota watcher', field: 'model', name: null }],
+    errors: [{ item: 'skill:bad', field: 'content', rule: 'too_long' }, { item: 'agent:#3', field: 'name', rule: 'is not a valid name' }, { item: 'agent:x', field: 'name', rule: '' }] });
+  check('summary line per kind', eq(r.summary, ['1 agent created, 0 replaced, 2 skipped', '3 skills created, 1 replaced, 0 skipped']));
+  check('renamed from -> to', eq(r.renamed, ['agent Quota watcher → Quota watcher 2']));
+  check('dropped references name the item, the kind and the name (a dropped model has none)', r.dropped.length === 3 && r.dropped[0].includes('consulted agent btp-prod') && r.dropped[1].includes('skill gone') && r.dropped[2] === 'agent:Quota watcher: model does not exist here and was dropped');
+  check('errors: a short code is worded, the server\'s fixed text is shown as is, empty falls back', r.errors[0] === 'skill:bad: content \u2014 is too long; not imported' && r.errors[1] === 'agent:#3: name \u2014 is not a valid name; not imported' && r.errors[2] === 'agent:x: name \u2014 was not accepted; not imported' && r.ok === false);
+  check('an empty answer is ok with zero lines', my.formatImportResult({}).ok && my.formatImportResult(null).summary.length === 2);
+  const catalog = { orchestrator: { ref: null, name: 'Orchestrator' }, agents: [{ ref: 'admin:btp-admin', name: 'btp-admin' }], skills: [] };
+  const mine = [{ id: '1', ref: 'mine:1', name: 'Quota watcher' }];
+  const g = my.pickerGroups(catalog, mine, null);
+  check('three groups in order with the orchestrator first', eq(g.map((x) => x.label), ['Orchestrator', 'My agents', 'Admin agents · read-only']) && g[0].options[0].value === '');
+  check('option values are the refs', g[1].options[0].value === 'mine:1' && g[2].options[0].value === 'admin:btp-admin');
+  check('an empty group is left out', my.pickerGroups(catalog, [], null).length === 2);
+  const gone = my.pickerGroups(catalog, mine, 'mine:dead', 'Old one (deleted)');
+  check('a ref in no group gets a disabled option so the select shows it', gone[gone.length - 1].options[0].disabled === true && gone[gone.length - 1].options[0].label === 'Old one (deleted)');
+  check('agentNameOf resolves mine, admin, orchestrator and falls back to the stored name', my.agentNameOf('mine:1', catalog, mine) === 'Quota watcher' && my.agentNameOf('admin:btp-admin', catalog, mine) === 'btp-admin' && my.agentNameOf(null, catalog, mine) === 'Orchestrator' && my.agentNameOf('mine:x', catalog, mine, 'Gone (deleted)') === 'Gone (deleted)');
+  check('attachment filename: RFC 5987 first, then quoted, then bare, then the fallback', attachmentFilename("attachment; filename*=UTF-8''webchat-bundle-2026-10-31.json") === 'webchat-bundle-2026-10-31.json' && attachmentFilename('attachment; filename="a b.json"') === 'a b.json' && attachmentFilename('attachment; filename=x.json') === 'x.json' && attachmentFilename('') === 'webchat-bundle.json' && attachmentFilename('attachment; filename="../x.json"') === '..x.json');
 }
 
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');

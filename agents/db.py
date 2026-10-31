@@ -1543,6 +1543,10 @@ class ChatConversation(Base):
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default="idle", server_default="idle"
     )
+    # Who answers in this conversation: NULL = the orchestrator,
+    # ``admin:<name>`` = an admin specialist straight, ``mine:<id>`` = one of
+    # the owner's personal agents (``agents/webchat/user_agents.py``).
+    agent_ref: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
 class ChatMessage(Base):
@@ -1597,6 +1601,71 @@ class ChatFile(Base):
     size: Mapped[int] = mapped_column(Integer, nullable=False)
     data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
+class ChatUserAgent(Base):
+    """A personal agent of the web chat: prompt-level only (instructions,
+    attached skills, a model, the admin specialists it may consult), owned by
+    one principal. Never read by the registry build, A2A, invoke or jobs.
+
+    ``name_key`` is the case-folded name, unique per principal.
+    ``instructions``, ``skills_json`` and ``consults_json`` are ``Text``:
+    never compared, ordered or grouped in SQL.
+    """
+
+    __tablename__ = "chat_user_agents"
+    __table_args__ = (
+        UniqueConstraint("principal", "name_key", name="uq_chat_user_agents_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    name_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(
+        String(300), nullable=False, default="", server_default=""
+    )
+    instructions: Mapped[str] = mapped_column(Text, nullable=False)
+    # [{"scope": "admin"|"mine", "name": "..."}]
+    skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ["<admin agent name>", ...]
+    consults_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
+class ChatUserSkill(Base):
+    """A personal skill of the web chat (a named instruction block), owned by
+    one principal; attached to that principal's personal agents by name."""
+
+    __tablename__ = "chat_user_skills"
+    __table_args__ = (
+        UniqueConstraint("principal", "name_key", name="uq_chat_user_skills_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    name_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str] = mapped_column(
+        String(300), nullable=False, default="", server_default=""
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_chat_now,
         server_default=func.now(),
     )
@@ -1826,6 +1895,8 @@ async def _create_and_migrate() -> None:
         await _ensure_column(conn, "ide_workspace_files", "base_checked_at", tstz)
         # ide_comments already exists where the redesign ran before quotes.
         await _ensure_column(conn, "ide_comments", "quote", "VARCHAR(200)")
+        # The web chat's agent picker (personal agents, addendum (c)).
+        await _ensure_column(conn, "chat_conversations", "agent_ref", "VARCHAR(80)")
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an

@@ -1627,6 +1627,38 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     as `/admin`; the client sends `X-Requested-With: XMLHttpRequest` on every
     call. Tests: `tests/test_webchat_api.py`, `tests/test_webchat_docgen.py`,
     `tests/test_webchat_uploads.py`
+  - **Personal agents and skills** (`my_models.py`, `my_store.py`,
+    `my_routes.py`, `user_agents.py`): a chat user's own agents and skills,
+    in `chat_user_agents` / `chat_user_skills` (owned by `principal`, unique
+    name per user case-insensitively via `name_key`; HANA schema generation
+    5 together with `chat_conversations.agent_ref`). A personal agent is
+    prompt-level only: name (`^[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}$`),
+    description, instructions (≤ 20,000), skills (`{scope: admin|mine,
+    name}`, ≤ 20), `consults` (≤ 10 admin agents that are enabled,
+    `expose_chat` and not approving: `chat_usable`), an optional model; no
+    MCP servers, built-ins, destinations, credentials, deep config or
+    personal peers, and **never in the registry build, A2A, jobs or the
+    invoke API**. Per user 50 agents and 100 skills (skill content ≤
+    50,000). A conversation's `agent_ref` (`null` = the orchestrator,
+    `admin:<name>` = that specialist run straight, with the document tools,
+    on its own model, holding `build.in_flight`; `mine:<id>` = a fresh
+    pydantic-ai `Agent` per turn: instructions + one `## Skill:` section per
+    resolvable skill + the document tools + the registry's delegation tool
+    for each usable consult) is validated at `POST`/`PATCH` (422 "Unknown
+    agent"); a ref that resolves to nothing at run time is a failed turn with
+    the fixed code `agent_unavailable`, a consult or skill that is gone is
+    skipped with one stored note. `GET /catalog` lists the admin agents a
+    user may reach and all admin skills by **name and description only**
+    (read-only in the UI). Export (`GET /my/export?agents=&skills=`) is a
+    `webchat-bundle/1` JSON of the user's OWN items (a selection brings the
+    own skills it attaches); import (`POST /my/import`, ≤ 1 MiB, multipart
+    `file` + `on_conflict` rename|replace|skip) validates per item, drops
+    references to admin agents/skills/models that do not exist here and
+    reports them (`dropped`), writes the valid items and reports the rest
+    (`errors` with fixed rule texts); deleting a skill or renaming it
+    updates the user's agents, deleting an agent resets the conversations
+    that pointed at it. `tests/test_webchat_my.py`,
+    `tests/test_webchat_user_agents.py`
 - `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
   ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
   DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`
@@ -2051,8 +2083,11 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   2.26.0 is the `builtin:confluence` release (`agents/confluence_tools.py`):
   no new resource, environment variable, table or column (HANA schema
   generation unchanged); 2.27.0 is the web chat release (`agents/webchat/`): no
-  new resource, one environment variable `CHAT_RETENTION_DAYS` (180), three
-  new tables (HANA schema generation 4), `reportlab` in `requirements.txt`
+  new resource, one environment variable `CHAT_RETENTION_DAYS` (180), five
+  new tables and one column (HANA schema generation 5: the three chat tables
+  are generation 4, the personal agents/skills tables and
+  `chat_conversations.agent_ref` generation 5), `reportlab` in
+  `requirements.txt`
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

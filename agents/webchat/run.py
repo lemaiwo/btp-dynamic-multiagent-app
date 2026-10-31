@@ -38,6 +38,15 @@ run's ``result.usage()``) and the per-delegation shares; ``done`` carries
 the turn's ``duration_ms``. Durations are measured here (monotonic), and
 only numbers and the model id go into ``usage``.
 
+Who answers is the conversation's ``agent_ref`` (``user_agents``): the
+orchestrator (``None``), an admin specialist run straight (``admin:<name>``)
+or a personal agent built for this turn (``mine:<id>``). The running agent's
+own tool cards carry its display name (``orchestrator`` for the
+orchestrator); a ref that names nothing usable fails the turn with
+``agent_unavailable``, stored as a ``failed`` assistant message. A
+specialist run straight holds its build's ``in_flight`` counter, as a
+delegation does, so a reload does not close its MCP clients mid-turn.
+
 Exception text reaches the stream and the row only through
 ``agents.errors.describe_exception``. The turns are per process (one app
 instance, like the other runners); the run lock is the database row.
@@ -73,10 +82,10 @@ from agents.db import SessionLocal
 from agents.errors import describe_exception, mask_text
 from agents.oauth2 import OAuthAuthorizationRequired
 from agents.progress import ProgressUpdate, current_progress
-from agents.registry import registry
+from agents.registry import _short_tool_output, registry
 from agents.run_activity import _clip, _detail
 from agents.shared import available_models, default_model_name, get_model, run_usage_limits
-from agents.webchat import store
+from agents.webchat import store, user_agents
 from agents.webchat.docgen import (
     TOOL_NAMES,
     ChatRunContext,
@@ -110,7 +119,9 @@ SSE_HEADERS = {
 MSG_CANCELED = "The run was cancelled."
 MSG_MODEL_UNAVAILABLE = "The selected model is not available."
 MSG_CREDENTIAL = "A system the agents use needs you to sign in first."
+MSG_AGENT_UNAVAILABLE = "The selected agent is no longer available."
 CANCELED_ERROR = "canceled: the run was cancelled"
+AGENT_UNAVAILABLE_ERROR = "agent_unavailable: the selected agent is no longer available"
 
 
 class UnknownModel(ValueError):
@@ -119,6 +130,10 @@ class UnknownModel(ValueError):
 
 class ModelUnavailable(RuntimeError):
     """An offered model that could not be built."""
+
+
+class AgentUnavailable(RuntimeError):
+    """The conversation's ``agent_ref`` names nothing the user may use now."""
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +339,10 @@ class TurnRecorder:
     loop and mutate this in synchronous bursts only, so no lock is needed.
     """
 
-    def __init__(self, turn: Turn) -> None:
+    def __init__(self, turn: Turn, agent_label: str = ORCHESTRATOR_AGENT) -> None:
         self.turn = turn
+        # The name on the running agent's own tool cards.
+        self.agent_label = agent_label
         self.parts: list[dict[str, Any]] = []
         self._tools: dict[str, dict[str, Any]] = {}
         self._tool_started: dict[str, float] = {}
@@ -512,7 +529,7 @@ class TurnRecorder:
                     args = part.args_as_dict()
                 except Exception:  # noqa: BLE001
                     args = None
-                self.tool_start(f"own:{part.tool_call_id}", ORCHESTRATOR_AGENT,
+                self.tool_start(f"own:{part.tool_call_id}", self.agent_label,
                                 part.tool_name, args)
             elif isinstance(event, FunctionToolResultEvent):
                 result = event.result
@@ -525,8 +542,11 @@ class TurnRecorder:
                     if isinstance(content, dict) and "error" in content:
                         failed = True
                 else:
-                    output = _preview_output(content if isinstance(content, str)
-                                             else json.dumps(content, default=str))
+                    # An admin specialist run straight has its own tools here:
+                    # the registry's preview keeps the fixed-form lines of the
+                    # tools whose results are never stored (SharePoint,
+                    # Bitbucket).
+                    output = _preview_output(_short_tool_output(result))
                 self.tool_end(f"own:{result.tool_call_id}", not failed, output)
                 if (not failed and result.tool_name in TOOL_NAMES
                         and isinstance(content, dict) and content.get("file_id")):
@@ -596,6 +616,65 @@ class TurnInput:
     history: list[ModelMessage]
     model_name: str | None
     title: str | None
+    agent_ref: str | None = None
+
+
+@dataclass
+class Runner:
+    """What runs one turn: the agent, the label of its own tool cards, the
+    ``model=`` override of the run (``None``: the agent's own), the model id
+    for ``usage``, the one note of what a personal agent skipped, and the
+    build counter a specialist run straight holds."""
+
+    agent: Any
+    label: str
+    model: Any
+    model_name: str | None
+    note: str | None = None
+    counter: Any = None
+
+
+def _model_id(model: Any) -> str | None:
+    name = getattr(model, "model_name", None)
+    return name if isinstance(name, str) and name else None
+
+
+async def _personal_model(stored: str | None, picked: str | None) -> tuple[Any, str]:
+    """A personal agent's model: its own when still offered, else the
+    conversation's pick, else the default (the orchestrator's model)."""
+    for name in (stored, picked):
+        if not name:
+            continue
+        try:
+            checked = await catalog.check(name)
+        except UnknownModel:
+            continue
+        if checked is not None:
+            return catalog.build(checked), checked
+        break
+    return registry.orchestrator.model, catalog.default_name()
+
+
+async def resolve_runner(data: TurnInput) -> Runner:
+    """The runner of ``data.agent_ref`` (re-read every turn);
+    ``AgentUnavailable`` when it names nothing usable now."""
+    target = await user_agents.resolve_agent_ref(data.principal, data.agent_ref)
+    if isinstance(target, str):
+        raise AgentUnavailable(target)
+    if target.kind == "orchestrator":
+        return Runner(registry.orchestrator, ORCHESTRATOR_AGENT, catalog.build(data.model_name),
+                      data.model_name or catalog.default_name())
+    build = registry.build
+    if target.kind == "admin":
+        specialist = build.specialists.get(target.name)
+        if specialist is None:
+            raise AgentUnavailable(user_agents.AGENT_UNAVAILABLE)
+        return Runner(specialist, target.name, None, _model_id(specialist.model),
+                      counter=getattr(build, "in_flight", None))
+    model, model_name = await _personal_model(target.user_row.model_name, data.model_name)
+    agent, note = await user_agents.build_personal_agent(target.user_row, model=model,
+                                                         build=build)
+    return Runner(agent, target.name, None, _model_id(model) or model_name, note=note)
 
 
 async def _save_generated(turn: Turn, name: str, media_type: str, data: bytes) -> dict[str, Any]:
@@ -676,13 +755,20 @@ async def _run(turn: Turn, data: TurnInput) -> None:
     ctx_token = current_chat_run.set(ctx)
     beat = asyncio.create_task(rec.heartbeat())
     status, content, model_json, error = "failed", None, None, None
+    counter = None
     try:
         try:
-            model = catalog.build(data.model_name)
-            result = await registry.orchestrator.run(
+            runner = await resolve_runner(data)
+            rec.agent_label = runner.label
+            if runner.note:
+                rec.message(runner.note)
+            counter = runner.counter
+            if counter is not None:
+                counter.value += 1
+            result = await runner.agent.run(
                 data.prompt,
                 message_history=data.history or None,
-                model=model,
+                model=runner.model,
                 toolsets=[docgen_toolset()],
                 usage_limits=run_usage_limits(),
                 event_stream_handler=rec.handler,
@@ -694,13 +780,16 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             # Whatever is still open is closed first, so the usage part is
             # the last part and its event comes after every agent frame.
             rec.close_open_tools()
-            rec.usage(result.usage(), data.model_name or catalog.default_name())
+            rec.usage(result.usage(), runner.model_name)
         except asyncio.CancelledError:
             rec.finished = True
             turn.publish("error", {"code": "canceled", "message": MSG_CANCELED})
             await _finish(turn, rec, status="canceled", content=rec.text_so_far or None,
                           model_json=None, error=CANCELED_ERROR, title=data.title)
             raise
+        except AgentUnavailable:
+            error = AGENT_UNAVAILABLE_ERROR
+            turn.publish("error", {"code": "agent_unavailable", "message": MSG_AGENT_UNAVAILABLE})
         except ModelUnavailable as exc:
             error = describe_exception(exc)
             turn.publish("error", {"code": "model_unavailable", "message": MSG_MODEL_UNAVAILABLE})
@@ -714,6 +803,8 @@ async def _run(turn: Turn, data: TurnInput) -> None:
                 turn.publish("error", {"code": "run_failed", "message": error})
             content = rec.text_so_far or None
     finally:
+        if counter is not None:
+            counter.value -= 1
         rec.finished = True
         beat.cancel()
         current_chat_run.reset(ctx_token)

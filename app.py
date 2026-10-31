@@ -87,6 +87,7 @@ from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
 from agents.registry import registry  # noqa: E402
 from agents.webchat import run as webchat_run  # noqa: E402
 from agents.webchat import store as webchat_store  # noqa: E402
+from agents.webchat.my_routes import router as webchat_my_router  # noqa: E402
 from agents.webchat.routes import page_router as webchat_page_router  # noqa: E402
 from agents.webchat.routes import router as webchat_router  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
@@ -624,6 +625,7 @@ app.include_router(invoke_router)
 # chat mount, which would otherwise answer every path.
 app.include_router(webchat_page_router)
 app.include_router(webchat_router)
+app.include_router(webchat_my_router)
 # ABAP IDE API (/ide/api/...), developer scope; before the chat mount.
 # The two routers share no path, so their order does not matter.
 app.include_router(ide_review_router)

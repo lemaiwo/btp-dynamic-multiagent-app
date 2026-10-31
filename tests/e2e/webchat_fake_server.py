@@ -34,6 +34,18 @@ What it serves:
   ``error canceled`` + ``done canceled``
 - ``GET  /chat/api/conversations/{id}/stream`` -> 409 ``not_running``
 - ``GET  /chat/api/files/{id}[?inline=1]``   -> dummy bytes, the real headers
+- addendum (c): ``GET /chat/api/catalog`` (two admin agents, two admin
+  skills, the orchestrator), ``GET|POST /chat/api/my/agents``,
+  ``GET|PUT|DELETE /chat/api/my/agents/{id}``, the same under ``/my/skills``
+  (the limits of the addendum, 409 on a duplicate name, FastAPI-shaped 422s
+  that name the field and never the value), ``GET /chat/api/my/export``
+  (the ``webchat-bundle/1`` file, ``Content-Disposition: attachment``),
+  ``POST /chat/api/my/import`` (multipart ``file`` + ``on_conflict``, or a
+  JSON body; per item, dropped references and errors reported); a
+  conversation carries ``agent_ref`` / ``agent_name`` (``PATCH`` validates
+  the ref, 422 when it names nothing the user may use; a deleted personal
+  agent falls back to the orchestrator). Seeded: one personal agent with a
+  skill and a consult, one personal skill
 
 Three conversations are seeded (today, yesterday, older) so the sidebar
 groups show; the first one holds a stored turn with agent, tool, usage and
@@ -46,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import struct
 import sys
 import threading
@@ -78,6 +91,22 @@ MODELS = [
 ]
 PRINCIPAL = "wouter@example.org"
 APP_NAME = "SAP BTP Multi-Agent"
+
+# ---- addendum (c): the admin catalogue (name + description only) and the limits ----
+ADMIN_AGENTS = [
+    {"name": "btp-admin", "description": "Reads and changes the BTP account model: subaccounts, entitlements, service instances, role collections."},
+    {"name": "entitlement-analyst", "description": "Ranks entitlements by unused quota and flags what nobody used in 90 days."},
+]
+ADMIN_SKILLS = [
+    {"name": "btp-naming-conventions", "description": "How subaccounts, spaces, instances and destinations are named in this landscape."},
+    {"name": "report-layout", "description": "The table and heading layout of a platform review document."},
+]
+ORCHESTRATOR = {"ref": None, "name": "Orchestrator", "description": "Hands your question to the specialist that can answer it."}
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}$")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+LIM = {"agents": 50, "skills": 100, "description": 300, "instructions": 20_000, "content": 50_000,
+       "agent_skills": 20, "consults": 10, "bundle": 1024 * 1024}
+BUNDLE_FORMAT = "webchat-bundle/1"
 
 MIME = {
     ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
@@ -173,6 +202,8 @@ class Store:
         self.messages: dict[str, list[dict]] = {}
         self.files: dict[str, dict] = {}
         self.cancel_flags: dict[str, threading.Event] = {}
+        self.my_agents: dict[str, dict] = {}
+        self.my_skills: dict[str, dict] = {}
         self.seed()
 
     # ---- seed ----
@@ -226,12 +257,96 @@ class Store:
         c4 = self.new_conversation("Cloud Connector trust on prod", "gpt-5.6-terra", t - timedelta(days=23))
         self.add_message(c4["id"], "user", "Is the Cloud Connector trust configured on prod?")
         self.add_message(c4["id"], "assistant", "Yes, the location id `SCC-PRD` is trusted since 2026-09-02.", status="done")
+        # personal skill + agent (addendum c)
+        sk = self.put_skill(None, {"name": "weekly-quota-report", "description": "The shape of the Monday quota mail: one table per subaccount, unused quota first.",
+                                   "content": "# Weekly quota report\n\nOne table per subaccount. Columns: service, plan, assigned, used, spare.\nSort by spare quota, largest first. End with the three actions that free the most quota."})
+        self.put_skill(None, {"name": "ticket-tone", "description": "How to word a Jira comment for the platform team.",
+                              "content": "Short, factual, one action per paragraph. Name the subaccount and the service plan. No greetings."})
+        ag = self.put_agent(None, {"name": "Quota watcher", "description": "Watches the dev entitlements and drafts the Monday quota report.",
+                                   "instructions": "You watch the entitlements of the dev subaccounts.\n\n1. Ask btp-admin for the entitlements with spare quota.\n2. Rank them with the weekly-quota-report skill.\n3. Draft the report as a Word document.",
+                                   "skills": [{"scope": "mine", "name": sk["name"]}, {"scope": "admin", "name": "btp-naming-conventions"}],
+                                   "consults": ["btp-admin"], "model": None})
+        c2["agent_ref"], c2["agent_label"] = "admin:btp-admin", "btp-admin"
+        c4["agent_ref"], c4["agent_label"] = f"mine:{ag['id']}", ag["name"]
+
+    # ---- addendum (c): personal agents and skills ----
+    def put_agent(self, aid: str | None, body: dict) -> dict:
+        t = now()
+        row = self.my_agents.get(aid) if aid else None
+        new = {"id": row["id"] if row else str(uuid.uuid4()), "name": body["name"], "description": body.get("description") or "",
+               "instructions": body["instructions"], "skills": list(body.get("skills") or []), "consults": list(body.get("consults") or []),
+               "model": body.get("model"), "created_at": row["created_at"] if row else t, "updated_at": t}
+        self.my_agents[new["id"]] = new
+        return new
+
+    def put_skill(self, sid: str | None, body: dict) -> dict:
+        t = now()
+        row = self.my_skills.get(sid) if sid else None
+        new = {"id": row["id"] if row else str(uuid.uuid4()), "name": body["name"], "description": body.get("description") or "",
+               "content": body["content"], "created_at": row["created_at"] if row else t, "updated_at": t}
+        self.my_skills[new["id"]] = new
+        return new
+
+    def agent_out(self, a: dict) -> dict:
+        return {"id": a["id"], "ref": f"mine:{a['id']}", "name": a["name"], "description": a["description"], "instructions": a["instructions"],
+                "skills": a["skills"], "consults": a["consults"], "model": a["model"], "created_at": utc(a["created_at"]),
+                "updated_at": utc(a["updated_at"]), "source": "mine", "readonly": False}
+
+    def skill_out(self, s: dict) -> dict:
+        return {"id": s["id"], "name": s["name"], "description": s["description"], "content": s["content"],
+                "created_at": utc(s["created_at"]), "updated_at": utc(s["updated_at"]), "source": "mine", "readonly": False}
+
+    def delete_agent(self, aid: str) -> None:
+        self.my_agents.pop(aid, None)
+        for c in self.conversations.values():
+            if c.get("agent_ref") == f"mine:{aid}":
+                c["agent_ref"], c["agent_label"] = None, None
+
+    def delete_skill(self, sid: str) -> None:
+        s = self.my_skills.pop(sid, None)
+        if s is None:
+            return
+        for a in self.my_agents.values():
+            a["skills"] = [x for x in a["skills"] if not (x["scope"] == "mine" and x["name"] == s["name"])]
+
+    def resolve_ref(self, ref) -> tuple[bool, str | None]:
+        """(usable, name): None is the orchestrator; admin:<name> and mine:<id> must exist."""
+        if ref is None:
+            return True, ORCHESTRATOR["name"]
+        if not isinstance(ref, str):
+            return False, None
+        if ref.startswith("admin:"):
+            name = ref[6:]
+            return any(a["name"] == name for a in ADMIN_AGENTS), name
+        if ref.startswith("mine:"):
+            a = self.my_agents.get(ref[5:])
+            return (a is not None), (a["name"] if a else None)
+        return False, None
+
+    def agent_name_of(self, c: dict) -> str:
+        ref = c.get("agent_ref")
+        ok, name = self.resolve_ref(ref)
+        if ok:
+            return name
+        return f"{c.get('agent_label')} (deleted)" if c.get("agent_label") else "Agent (deleted)"
+
+    def bundle(self, agent_ids: list[str] | None, skill_ids: list[str] | None) -> dict:
+        everything = agent_ids is None and skill_ids is None  # no parameter at all = all of the user's
+        agents = [a for a in self.my_agents.values() if everything or a["id"] in (agent_ids or [])]
+        # a selection also carries the own skills the selected agents attach
+        attached = {x["name"] for a in agents for x in a["skills"] if x["scope"] == "mine"}
+        skills = [s for s in self.my_skills.values() if everything or s["id"] in (skill_ids or []) or s["name"] in attached]
+        return {"format": BUNDLE_FORMAT, "exported_at": utc(now()),
+                "agents": [{"name": a["name"], "description": a["description"], "instructions": a["instructions"],
+                            "skills": a["skills"], "consults": a["consults"], "model": a["model"]} for a in agents],
+                "skills": [{"name": s["name"], "description": s["description"], "content": s["content"]} for s in skills]}
 
     # ---- helpers ----
     def new_conversation(self, title: str, model: str | None, at: datetime | None = None) -> dict:
         at = at or now()
         conv = {"id": str(uuid.uuid4()), "principal": PRINCIPAL, "title": title[:120] or "New chat",
-                "model_name": model, "created_at": at, "updated_at": at, "status": "idle"}
+                "model_name": model, "created_at": at, "updated_at": at, "status": "idle",
+                "agent_ref": None, "agent_label": None}
         self.conversations[conv["id"]] = conv
         self.messages[conv["id"]] = []
         self.cancel_flags[conv["id"]] = threading.Event()
@@ -254,7 +369,8 @@ class Store:
 
     def conv_summary(self, c: dict) -> dict:
         return {"id": c["id"], "title": c["title"], "updated_at": utc(c["updated_at"]),
-                "created_at": utc(c["created_at"]), "status": c["status"]}
+                "created_at": utc(c["created_at"]), "status": c["status"],
+                "agent_ref": c.get("agent_ref"), "agent_name": self.agent_name_of(c)}
 
     def conv_usage(self, cid: str) -> dict:
         total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 0, "turns": 0}
@@ -270,6 +386,7 @@ class Store:
     def conv_detail(self, c: dict) -> dict:
         out = {"id": c["id"], "title": c["title"], "model": c["model_name"], "status": c["status"],
                "created_at": utc(c["created_at"]), "updated_at": utc(c["updated_at"]),
+               "agent_ref": c.get("agent_ref"), "agent_name": self.agent_name_of(c),
                "usage": self.conv_usage(c["id"]), "messages": []}
         for m in self.messages[c["id"]]:
             files = [self.files[fid] for fid in m["file_ids"] if fid in self.files]
@@ -328,6 +445,129 @@ def sniff(name: str, declared: str, data: bytes) -> str | None:
             return None
         return by_ext[ext]
     return None
+
+
+def v_err(field, rule, index: int | None = None) -> dict:
+    loc = ["body", field] + ([index] if index is not None else [])
+    return {"loc": loc, "msg": rule, "type": "value_error"}
+
+
+def text_ok(v, *, min_len: int, max_len: int, one_line: bool = False) -> str | None:
+    if not isinstance(v, str):
+        return "too_short" if min_len else "pattern"
+    if len(v) < min_len:
+        return "too_short"
+    if len(v) > max_len:
+        return "too_long"
+    if CONTROL_RE.search(v):
+        return "control"
+    if one_line and ("\n" in v or "\r" in v):
+        return "too_long"
+    return None
+
+
+AGENT_KEYS = {"name", "description", "instructions", "skills", "consults", "model"}
+SKILL_KEYS = {"name", "description", "content"}
+
+
+def check_agent(body: dict, *, my_skill_names: set[str], dropping: bool = False) -> tuple[list[dict], list[dict]]:
+    """-> (field errors as (field, rule) dicts, dropped references [{field, name}])."""
+    errors: list[tuple[str, str]] = []
+    dropped: list[dict] = []
+    if not isinstance(body, dict):
+        return [("item", "pattern")], dropped
+    for k in body:
+        if k not in AGENT_KEYS:
+            errors.append((k, "unknown_key"))
+    name = body.get("name")
+    if not isinstance(name, str) or not NAME_RE.match(name) or CONTROL_RE.search(name):
+        errors.append(("name", "pattern"))
+    r = text_ok(body.get("description") or "", min_len=0, max_len=LIM["description"], one_line=True)
+    if r:
+        errors.append(("description", r))
+    r = text_ok(body.get("instructions"), min_len=1, max_len=LIM["instructions"])
+    if r:
+        errors.append(("instructions", r))
+    skills = body.get("skills") or []
+    if not isinstance(skills, list) or len(skills) > LIM["agent_skills"]:
+        errors.append(("skills", "too_many"))
+    else:
+        kept = []
+        for i, sk in enumerate(skills):
+            if not isinstance(sk, dict) or sk.get("scope") not in ("admin", "mine") or not isinstance(sk.get("name"), str):
+                errors.append(("skills", "pattern"))
+                break
+            exists = (sk["name"] in {a["name"] for a in ADMIN_SKILLS}) if sk["scope"] == "admin" else (sk["name"] in my_skill_names)
+            if exists:
+                kept.append({"scope": sk["scope"], "name": sk["name"]})
+            elif dropping:
+                dropped.append({"field": "skills", "name": sk["name"]})
+            else:
+                errors.append(("skills", "pattern", i))
+        body["skills"] = kept
+    consults = body.get("consults") or []
+    if not isinstance(consults, list) or len(consults) > LIM["consults"]:
+        errors.append(("consults", "too_many"))
+    else:
+        kept = []
+        for i, c in enumerate(consults):
+            if not isinstance(c, str):
+                errors.append(("consults", "pattern"))
+                break
+            if any(a["name"] == c for a in ADMIN_AGENTS):
+                kept.append(c)
+            elif dropping:
+                dropped.append({"field": "consults", "name": c})
+            else:
+                errors.append(("consults", "pattern", i))
+        body["consults"] = kept
+    model = body.get("model")
+    if model is not None and model not in {m["id"] for m in MODELS}:
+        if dropping:
+            dropped.append({"field": "model", "name": None})
+            body["model"] = None
+        else:
+            errors.append(("model", "unknown_model"))
+    return errors, dropped
+
+
+def check_skill(body: dict) -> list[tuple[str, str]]:
+    errors: list[tuple[str, str]] = []
+    if not isinstance(body, dict):
+        return [("item", "pattern")]
+    for k in body:
+        if k not in SKILL_KEYS:
+            errors.append((k, "unknown_key"))
+    name = body.get("name")
+    if not isinstance(name, str) or not NAME_RE.match(name) or CONTROL_RE.search(name):
+        errors.append(("name", "pattern"))
+    r = text_ok(body.get("description") or "", min_len=0, max_len=LIM["description"], one_line=True)
+    if r:
+        errors.append(("description", r))
+    r = text_ok(body.get("content"), min_len=1, max_len=LIM["content"])
+    if r:
+        errors.append(("content", r))
+    return errors
+
+
+RULE_TEXT = {"pattern": "is not a valid name or value", "too_long": "is too long", "too_short": "is empty",
+             "too_many": "has too many entries", "control": "holds control characters", "unknown_key": "is not a key of this format",
+             "unknown_model": "names a model that does not exist here", "limit": "would pass your limit"}
+
+
+def rule_text(code: str) -> str:
+    return RULE_TEXT.get(code, code)
+
+
+def free_name(name: str, taken: set[str]) -> str:
+    if name.lower() not in taken:
+        return name
+    for i in range(2, 1000):
+        suffix = f" {i}"
+        cand = name[: 64 - len(suffix)] + suffix
+        if cand.lower() not in taken:
+            return cand
+    return name
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -403,6 +643,13 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.detail(404, "not found")
 
+    def do_PUT(self):
+        url = urlsplit(self.path)
+        if url.path.startswith("/chat/api/"):
+            self.api("PUT", url.path[len("/chat/api"):], parse_qs(url.query))
+        else:
+            self.detail(404, "not found")
+
     def do_PATCH(self):
         url = urlsplit(self.path)
         if url.path.startswith("/chat/api/"):
@@ -438,6 +685,14 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(200, {"principal": PRINCIPAL, "models": MODELS, "app_name": APP_NAME,
                                         "limits": {"max_file_bytes": MAX_FILE_BYTES, "max_files": MAX_FILES,
                                                    "media_types": MEDIA_TYPES}})
+        if parts == ["catalog"] and method == "GET":
+            return self.send_json(200, {
+                "agents": [{"ref": f"admin:{a['name']}", "name": a["name"], "description": a["description"], "source": "admin", "readonly": True} for a in ADMIN_AGENTS],
+                "skills": [{"name": s["name"], "description": s["description"], "source": "admin", "readonly": True} for s in ADMIN_SKILLS],
+                "orchestrator": ORCHESTRATOR,
+            })
+        if parts[:1] == ["my"]:
+            return self.my(method, parts[1:], query)
         if parts == ["conversations"]:
             if method == "GET":
                 q = (query.get("q", [""])[0] or "").lower()
@@ -452,8 +707,13 @@ class Handler(BaseHTTPRequestHandler):
                 model = data.get("model")
                 if model is not None and model not in {m["id"] for m in MODELS}:
                     return self.detail(422, "unknown model")
+                ref = data.get("agent_ref")
                 with STORE.lock:
+                    ok, name = STORE.resolve_ref(ref)
+                    if not ok:
+                        return self.detail(422, "Unknown agent")
                     conv = STORE.new_conversation(title, model)
+                    conv["agent_ref"], conv["agent_label"] = ref, (name if ref else None)
                     out = STORE.conv_summary(conv)
                 out["model"] = model
                 return self.send_json(201, out)
@@ -480,6 +740,12 @@ class Handler(BaseHTTPRequestHandler):
                             if data["model"] is not None and data["model"] not in {m["id"] for m in MODELS}:
                                 return self.detail(422, "unknown model")
                             conv["model_name"] = data["model"]
+                        if "agent_ref" in data:
+                            ok, name = STORE.resolve_ref(data["agent_ref"])
+                            if not ok:
+                                return self.detail(422, "Unknown agent")
+                            conv["agent_ref"] = data["agent_ref"]
+                            conv["agent_label"] = name if data["agent_ref"] else None
                         detail = STORE.conv_detail(conv)
                     return self.send_json(200, detail)
                 if method == "DELETE":
@@ -505,6 +771,152 @@ class Handler(BaseHTTPRequestHandler):
             if action == "stream" and method == "GET":
                 return self.detail(409, "not_running")
         return self.detail(404, "not found")
+
+    # ---- addendum (c): /my/... ----
+    def errors_422(self, errs: list[tuple[str, str]]) -> None:
+        self.send_json(422, {"detail": [v_err(*e) for e in errs]})
+
+    def my(self, method: str, parts: list[str], query: dict) -> None:
+        if parts == ["export"] and method == "GET":
+            def ids(key):
+                raw = ",".join(query.get(key, []))
+                return [x for x in raw.split(",") if x] if raw else None
+            with STORE.lock:
+                bundle = STORE.bundle(ids("agents"), ids("skills"))
+            body = json.dumps(bundle, indent=1).encode()
+            return self.send_bytes(200, body, "application/json", {
+                "Content-Disposition": f'attachment; filename="webchat-bundle-{now().date().isoformat()}.json"',
+                "Cache-Control": "private, no-store"})
+        if parts == ["import"] and method == "POST":
+            return self.import_bundle()
+        if not parts or parts[0] not in ("agents", "skills"):
+            return self.detail(404, "not found")
+        kind = parts[0]
+        table = STORE.my_agents if kind == "agents" else STORE.my_skills
+        out = STORE.agent_out if kind == "agents" else STORE.skill_out
+        if len(parts) == 1:
+            if method == "GET":
+                with STORE.lock:
+                    rows = sorted(table.values(), key=lambda r: r["name"].lower())
+                    return self.send_json(200, [out(r) for r in rows])
+            if method == "POST":
+                return self.write_my(kind, None)
+            return self.detail(405, "method not allowed")
+        if len(parts) == 2:
+            rid = parts[1]
+            with STORE.lock:
+                row = table.get(rid)
+            if row is None:
+                return self.detail(404, "not found")
+            if method == "GET":
+                return self.send_json(200, out(row))
+            if method == "PUT":
+                return self.write_my(kind, rid)
+            if method == "DELETE":
+                with STORE.lock:
+                    if kind == "agents":
+                        STORE.delete_agent(rid)
+                    else:
+                        STORE.delete_skill(rid)
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
+            return self.detail(405, "method not allowed")
+        return self.detail(404, "not found")
+
+    def write_my(self, kind: str, rid: str | None) -> None:
+        raw = self.body()
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            return self.errors_422([("body", "pattern")])
+        if not isinstance(body, dict):
+            return self.errors_422([("body", "pattern")])
+        with STORE.lock:
+            table = STORE.my_agents if kind == "agents" else STORE.my_skills
+            if kind == "agents":
+                errs, _dropped = check_agent(body, my_skill_names={s["name"] for s in STORE.my_skills.values()})
+            else:
+                errs = check_skill(body)
+            if errs:
+                return self.errors_422(errs)
+            taken = {r["name"].lower() for r in table.values() if r["id"] != rid}
+            if body["name"].lower() in taken:
+                return self.detail(409, "an agent of this name exists" if kind == "agents" else "a skill of this name exists")
+            if rid is None and len(table) >= LIM[kind]:
+                return self.detail(422, f"the limit of {LIM[kind]} {kind} is reached")
+            row = STORE.put_agent(rid, body) if kind == "agents" else STORE.put_skill(rid, body)
+            payload = STORE.agent_out(row) if kind == "agents" else STORE.skill_out(row)
+        return self.send_json(200 if rid else 201, payload)
+
+    def import_bundle(self) -> None:
+        ctype = self.headers.get("Content-Type", "")
+        rule = "rename"
+        if ctype.startswith("multipart/form-data"):
+            fields, uploads = parse_multipart(ctype, self.body())
+            rule = fields.get("on_conflict") or "rename"
+            if not uploads:
+                return self.detail(422, "file is required")
+            raw = uploads[0][2]
+        else:
+            raw = self.body()
+        if len(raw) > LIM["bundle"]:
+            return self.detail(413, "bundle too large")
+        if rule not in ("rename", "replace", "skip"):
+            return self.detail(422, "on_conflict must be rename, replace or skip")
+        try:
+            bundle = json.loads(raw)
+        except ValueError:
+            return self.detail(422, "the file is not JSON")
+        if not isinstance(bundle, dict) or bundle.get("format") != BUNDLE_FORMAT:
+            return self.detail(422, "not a webchat-bundle/1 file")
+        agents_in = bundle.get("agents") or []
+        skills_in = bundle.get("skills") or []
+        if not isinstance(agents_in, list) or not isinstance(skills_in, list) or len(agents_in) > 50 or len(skills_in) > 100:
+            return self.detail(422, "the bundle holds too many items")
+        result = {"agents": {"created": 0, "replaced": 0, "skipped": 0, "renamed": []},
+                  "skills": {"created": 0, "replaced": 0, "skipped": 0, "renamed": []},
+                  "dropped": [], "errors": []}
+        with STORE.lock:
+            def place(kind: str, item: dict, table: dict, put) -> None:
+                label = f"{kind[:-1]}:{item.get('name') if isinstance(item.get('name'), str) else '?'}"
+                by_name = {r["name"].lower(): r for r in table.values()}
+                existing = by_name.get(item["name"].lower())
+                if existing is not None:
+                    if rule == "skip":
+                        result[kind]["skipped"] += 1
+                        return
+                    if rule == "replace":
+                        put(existing["id"], item)
+                        result[kind]["replaced"] += 1
+                        return
+                    new_name = free_name(item["name"], set(by_name))
+                    result[kind]["renamed"].append({"from": item["name"], "to": new_name})
+                    item = {**item, "name": new_name}
+                if len(table) >= LIM[kind]:
+                    result["errors"].append({"item": label, "field": "name", "rule": rule_text("limit")})
+                    return
+                put(None, item)
+                result[kind]["created"] += 1
+
+            for i, item in enumerate(skills_in):
+                label = f"skill:{item.get('name')}" if isinstance(item, dict) and isinstance(item.get('name'), str) else f"skill:#{i}"
+                errs = check_skill(item)
+                if errs:
+                    result["errors"].extend({"item": label, "field": f, "rule": rule_text(e[1])} for e in errs for f in [e[0]])
+                    continue
+                place("skills", item, STORE.my_skills, STORE.put_skill)
+            my_skill_names = {s["name"] for s in STORE.my_skills.values()}
+            for i, item in enumerate(agents_in):
+                label = f"agent:{item.get('name')}" if isinstance(item, dict) and isinstance(item.get('name'), str) else f"agent:#{i}"
+                errs, dropped = check_agent(item, my_skill_names=my_skill_names, dropping=True)
+                if errs:
+                    result["errors"].extend({"item": label, "field": f, "rule": rule_text(e[1])} for e in errs for f in [e[0]])
+                    continue
+                result["dropped"].extend({"item": label, **d} for d in dropped)
+                place("agents", item, STORE.my_agents, STORE.put_agent)
+        return self.send_json(200, result)
 
     def get_file(self, fid: str, query: dict) -> None:
         with STORE.lock:
@@ -628,6 +1040,14 @@ class Handler(BaseHTTPRequestHandler):
             emit("start", {"user_message_id": um["id"], "assistant_message_id": am["id"],
                            "files": [{"id": f["id"], "name": f["name"], "media_type": f["media_type"], "size": f["size"]} for f in file_rows]})
             nap(0.4)
+            with STORE.lock:
+                ref_ok, _ = STORE.resolve_ref(conv.get("agent_ref"))
+            if not ref_ok:
+                emit("error", {"code": "agent_unavailable", "message": "The selected agent is no longer available."})
+                with STORE.lock:
+                    am["error"] = "agent_unavailable"
+                finish("failed")
+                return
             note("Reading your question" + (" and the attachments" if file_rows else ""))
             nap(0.9)
             if canceled():
@@ -708,7 +1128,8 @@ class Handler(BaseHTTPRequestHandler):
                 with STORE.lock:
                     conv["title"] = title
                 emit("title", {"title": title})
-            model = conv["model_name"] or "gpt-5.6-terra"
+            # an admin agent runs on its own model, whatever the conversation picked
+            model = "gpt-5.6-terra" if str(conv.get("agent_ref") or "").startswith("admin:") else (conv["model_name"] or "gpt-5.6-terra")
             usage = {"input_tokens": 3410, "output_tokens": 812, "cache_read_tokens": 1024, "total_tokens": 4222,
                      "requests": 6, "tool_calls": 4, "model": model, "duration_ms": elapsed_ms(),
                      "agents": [{"id": "a1", "agent": "btp-admin", "input_tokens": 1820, "output_tokens": 260, "requests": 3, "model": model},

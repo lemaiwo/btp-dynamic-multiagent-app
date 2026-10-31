@@ -81,7 +81,15 @@ def title_from(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Conversations
 # ---------------------------------------------------------------------------
-def conversation_out(conv: ChatConversation) -> dict[str, Any]:
+ORCHESTRATOR_NAME = "Orchestrator"
+# ``update_conversation``: leave ``agent_ref`` as it is.
+KEEP = object()
+
+
+def conversation_out(conv: ChatConversation, agent_name: str | None = None) -> dict[str, Any]:
+    """``agent_name`` is the display name of ``agent_ref`` the caller resolved
+    (``agents.webchat.user_agents.display_names``); ``Orchestrator`` without
+    a ref."""
     return {
         "id": conv.id,
         "title": conv.title,
@@ -89,17 +97,21 @@ def conversation_out(conv: ChatConversation) -> dict[str, Any]:
         "status": conv.status,
         "created_at": iso_utc(conv.created_at),
         "updated_at": iso_utc(conv.updated_at),
+        "agent_ref": conv.agent_ref,
+        "agent_name": agent_name or ORCHESTRATOR_NAME,
     }
 
 
 async def create_conversation(
-    db: AsyncSession, principal: str, *, title: str | None, model: str | None
+    db: AsyncSession, principal: str, *, title: str | None, model: str | None,
+    agent_ref: str | None = None,
 ) -> ChatConversation:
     now = utcnow()
     conv = ChatConversation(
         principal=principal,
         title=one_line(title or "") or DEFAULT_TITLE,
         model_name=model,
+        agent_ref=agent_ref,
         created_at=now,
         updated_at=now,
         status="idle",
@@ -148,12 +160,15 @@ async def get_conversation(
 async def update_conversation(
     db: AsyncSession, conv: ChatConversation, *,
     title: str | None = None, model: str | None = None, clear_model: bool = False,
+    agent_ref: Any = KEEP,
 ) -> ChatConversation:
     values: dict[str, Any] = {}
     if title is not None:
         values["title"] = one_line(title) or DEFAULT_TITLE
     if model is not None or clear_model:
         values["model_name"] = model
+    if agent_ref is not KEEP:
+        values["agent_ref"] = agent_ref
     if values:
         await db.execute(
             update(ChatConversation)
@@ -273,7 +288,8 @@ _FILE_META = (ChatFile.id, ChatFile.message_id, ChatFile.name, ChatFile.media_ty
               ChatFile.size, ChatFile.kind, ChatFile.created_at)
 
 
-async def conversation_detail(db: AsyncSession, conv: ChatConversation) -> dict[str, Any]:
+async def conversation_detail(db: AsyncSession, conv: ChatConversation,
+                              agent_name: str | None = None) -> dict[str, Any]:
     messages = (await db.execute(
         select(ChatMessage).where(ChatMessage.conversation_id == conv.id)
         .order_by(ChatMessage.position)
@@ -285,7 +301,7 @@ async def conversation_detail(db: AsyncSession, conv: ChatConversation) -> dict[
     by_message: dict[str | None, list[dict[str, Any]]] = {}
     for row in files:
         by_message.setdefault(row.message_id, []).append(file_out(row))
-    out = conversation_out(conv)
+    out = conversation_out(conv, agent_name)
     out["messages"] = [message_out(m, by_message.get(m.id, [])) for m in messages]
     out["usage"] = conversation_usage(out["messages"])
     return out

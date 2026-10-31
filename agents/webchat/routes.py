@@ -28,7 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from agents.auth import current_principal, require_user
 from agents.db import SessionLocal
 from agents.multipart_form import FormRefused
-from agents.webchat import run, store, uploads
+from agents.webchat import run, store, uploads, user_agents
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ UNKNOWN_MODEL = "Unknown model"
 BAD_BEFORE = "before must be a timestamp with a time zone"
 FULL = "The conversation has reached its message limit"
 UPLOAD_TIMEOUT = "The request body was not received in time"
+UNKNOWN_AGENT = "Unknown agent"
 
 
 class ConversationIn(BaseModel):
@@ -57,6 +58,7 @@ class ConversationIn(BaseModel):
 
     title: str | None = Field(default=None, max_length=1000)
     model: str | None = Field(default=None, max_length=128)
+    agent_ref: str | None = Field(default=None, max_length=80)
 
 
 @page_router.get("/chat", response_class=HTMLResponse, dependencies=[Depends(require_user)])
@@ -85,6 +87,19 @@ async def _checked_model(name: str | None) -> str | None:
     except run.UnknownModel:
         raise HTTPException(status_code=422, detail=UNKNOWN_MODEL) from None
     return name
+
+
+async def _checked_agent_ref(principal: str, ref: str | None) -> str | None:
+    """The ref as stored when the caller may use it now; 422 otherwise."""
+    target = await user_agents.resolve_agent_ref(principal, ref)
+    if isinstance(target, str):
+        raise HTTPException(status_code=422, detail=UNKNOWN_AGENT)
+    return ref
+
+
+async def _out(db: Any, conv: Any, principal: str) -> dict[str, Any]:
+    names = await user_agents.display_names(db, principal, [conv.agent_ref])
+    return store.conversation_out(conv, names.get(conv.agent_ref))
 
 
 @router.get("/me")
@@ -124,8 +139,10 @@ async def list_conversations(
     async with SessionLocal() as db:
         rows = await store.list_conversations(db, principal, q=(q or "").strip() or None,
                                               limit=limit, before=cutoff)
+        names = await user_agents.display_names(db, principal, [c.agent_ref for c in rows])
     return [
-        {k: v for k, v in store.conversation_out(c).items() if k != "model"}
+        {k: v for k, v in store.conversation_out(c, names.get(c.agent_ref)).items()
+         if k != "model"}
         for c in rows
     ]
 
@@ -134,9 +151,11 @@ async def list_conversations(
 async def create_conversation(body: ConversationIn) -> dict[str, Any]:
     principal = store.caller()
     model = await _checked_model(body.model)
+    agent_ref = await _checked_agent_ref(principal, body.agent_ref)
     async with SessionLocal() as db:
-        conv = await store.create_conversation(db, principal, title=body.title, model=model)
-    return store.conversation_out(conv)
+        conv = await store.create_conversation(db, principal, title=body.title, model=model,
+                                               agent_ref=agent_ref)
+        return await _out(db, conv, principal)
 
 
 @router.get("/conversations/{cid}")
@@ -146,7 +165,8 @@ async def get_conversation(cid: str) -> dict[str, Any]:
         conv = await store.get_conversation(db, cid, principal)
         if conv is None:
             raise _not_found()
-        return await store.conversation_detail(db, conv)
+        names = await user_agents.display_names(db, principal, [conv.agent_ref])
+        return await store.conversation_detail(db, conv, names.get(conv.agent_ref))
 
 
 @router.patch("/conversations/{cid}")
@@ -154,6 +174,9 @@ async def patch_conversation(cid: str, body: ConversationIn) -> dict[str, Any]:
     principal = store.caller()
     sent = body.model_fields_set
     model = await _checked_model(body.model) if "model" in sent else None
+    await _owned(cid, principal)
+    agent_ref = (await _checked_agent_ref(principal, body.agent_ref)
+                 if "agent_ref" in sent else store.KEEP)
     async with SessionLocal() as db:
         conv = await store.get_conversation(db, cid, principal)
         if conv is None:
@@ -162,8 +185,9 @@ async def patch_conversation(cid: str, body: ConversationIn) -> dict[str, Any]:
             db, conv,
             title=body.title if "title" in sent and body.title is not None else None,
             model=model, clear_model="model" in sent and body.model is None,
+            agent_ref=agent_ref,
         )
-        return store.conversation_out(conv)
+        return await _out(db, conv, principal)
 
 
 @router.delete("/conversations/{cid}", status_code=204)
@@ -218,6 +242,7 @@ async def post_message(cid: str, request: Request) -> Response:
             prompt=run.build_prompt(form.text, form.uploads),
             history=history,
             model_name=model_name,
+            agent_ref=conv.agent_ref,
             title=store.title_from(form.text) if conv.title == store.DEFAULT_TITLE else None,
         )
         turn, queue = run.start_turn(data, {
