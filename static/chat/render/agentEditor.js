@@ -181,7 +181,7 @@ function counter(textarea, max) {
   const update = () => {
     const n = textarea.value.length;
     c.textContent = `${n.toLocaleString('en-US')} / ${max.toLocaleString('en-US')}`;
-    c.classList.toggle('over', n > max || n === 0);
+    c.classList.toggle('over', n > max); // empty is refused on save, not shouted at in red
   };
   textarea.addEventListener('input', update);
   update();

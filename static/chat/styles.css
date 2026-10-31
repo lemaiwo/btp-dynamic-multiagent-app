@@ -389,9 +389,12 @@ dialog.confirm p { margin: 0 0 18px; color: var(--muted); }
 .sb-link:hover { background: var(--surface-2); color: var(--accent); }
 .sb-link.active { background: var(--accent-tint); color: var(--accent); }
 .sb-who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; }
-.conv-link { display: flex; align-items: center; gap: 8px; }
-.conv-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conv-badge { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; line-height: 1.4; padding: 1px 7px; border-radius: 999px; background: var(--accent-tint-2); color: var(--accent); }
+/* The title gets the whole row; the agent badge and the Advanced tag, when
+   there are any, sit on a second line under it (they used to share the row
+   and squeezed the title to three letters). */
+.conv-link { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; }
+.conv-title { flex: 1 1 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-badge { flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; line-height: 1.4; padding: 1px 7px; border-radius: 999px; background: var(--accent-tint-2); color: var(--accent); }
 .conv.active .conv-badge { background: var(--accent); color: var(--accent-ink); }
 .msg.assistant .from { font-size: 12.5px; font-weight: 600; color: var(--muted); margin-bottom: -4px; }
 .main > .log[hidden], .main > .composer-wrap[hidden], .main > .page-wrap[hidden] { display: none; }
@@ -445,7 +448,7 @@ dialog.confirm p { margin: 0 0 18px; color: var(--muted); }
 .lock svg { stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .rows { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
 .row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 11px 6px; border-bottom: 1px solid var(--line); }
-.row.readonly { grid-template-columns: minmax(0, 1fr) auto; padding-left: 12px; }
+.row.readonly { grid-template-columns: minmax(0, 1fr) auto; padding-left: 44px; } /* names line up with the Mine rows (checkbox column + gap) */
 .row:hover { background: var(--surface-2); }
 .row-select { display: flex; align-items: center; justify-content: center; height: 100%; }
 .row-select input, .check input { width: 16px; height: 16px; accent-color: var(--accent); margin: 0; }
@@ -618,7 +621,7 @@ dialog.panel.context { width: min(560px, 100vw); }
 .viewer-title { margin: 0; font-size: 15px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .viewer-title:focus { outline: none; }
 .viewer-title:focus-visible { outline: 2px solid var(--accent); }
-.viewer-meta { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.viewer-meta { font-size: 12px; color: var(--muted); }
 .viewer-actions { display: flex; align-items: center; gap: 6px; flex: none; }
 .viewer-actions [hidden] { display: none; }
 .viewer-actions a.btn { text-decoration: none; }

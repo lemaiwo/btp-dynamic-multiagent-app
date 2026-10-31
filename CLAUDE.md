@@ -2250,7 +2250,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   chat's viewer (`agents/webchat/preview.py`, `static/chat/render/viewer.js`):
   no new resource, variable, table or column; 2.31.0 adds tools and connectors
   for personal agents (`agent_configs.share_tools`, `chat_user_agents.tools_json`:
-  HANA schema generation 7, no new resource, variable or role)
+  HANA schema generation 7, no new resource, variable or role); 2.31.1 is layout
+  polish of the web chat after the first look at acc (sidebar rows, agents page,
+  viewer header), no descriptor change besides the version
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
