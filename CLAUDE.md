@@ -1543,6 +1543,79 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `tests/test_notifications.py`
 - `agents/chat_app.py` — `DynamicChatApp` ASGI wrapper that forwards to
   the current `Agent.to_web()` and is rebuilt on reload
+- `agents/webchat/` — the **web chat** at `GET /chat` (`templates/webchat.html`
+  + `static/chat/`), a Claude-style client next to the stock chat, which stays
+  at `/` (the stock app's catch-all `/{id}` used to answer `/chat` too; the new
+  route is registered before the mount and wins). Router prefix `/chat/api`,
+  every route `require_user`, owner-scoped by `current_principal` (`local-dev`
+  without XSUAA): a conversation or file of another user is 404. Tables
+  `chat_conversations`, `chat_messages` (one row per user and assistant turn:
+  `content`, `parts_json` = the rendered trail of `text`/`tool`/`file`/`note`
+  parts, `model_json` = pydantic-ai's `new_messages()` of that turn, which the
+  next turn concatenates as `message_history`; `Text` columns are never
+  compared) and `chat_files` (uploads and generated files as `LargeBinary`,
+  never selected in a list) are **HANA schema generation 4**. Design:
+  `docs/designs/2026-10-31-webchat.md` (local).
+  - `routes.py` — `GET /me` (principal, models, limits), conversations CRUD
+    (list newest first, `PATCH` title/model, `DELETE` 409 while running),
+    `POST /conversations/{id}/messages` (multipart `text` + `files` 0..5 +
+    `model`; answers an SSE stream: `start`, then `text`/`tool`/`note`/
+    `message`/`file` in arrival order, `error` on failure, `title` once,
+    `done`; `: ping` every 15 s; headers `Cache-Control: no-cache,
+    no-transform` and `X-Accel-Buffering: no` so the approuter does not buffer;
+    409 while a turn runs), `POST .../cancel` (the partial answer is kept,
+    status `canceled`), `GET .../stream` (re-attach: replay then live; 409
+    `not_running`), `GET /files/{id}` (`attachment` with `nosniff` and
+    `no-store`; `?inline=1` only for PNG/JPEG/PDF). A client disconnect does
+    not cancel the turn: it finishes and is stored
+  - `run.py` — one turn: conditional UPDATE idle→running, the prompt
+    (`BinaryContent` for PNG/JPEG/PDF, a delimited `<attachment>` block for
+    extracted text, the user text last), `registry.orchestrator.run(...,
+    toolsets=[docgen], event_stream_handler=..., model=<picked or None>,
+    usage_limits=run_usage_limits())` in its own task with the progress sink of
+    `chat_app.py` reproduced (`delegate_*` cards suppressed, specialists' tools
+    as `spec:` cards, the orchestrator's own tools as `own:` cards, heartbeat
+    "Working…" after 1.5 s), finalize through `describe_exception`; ghost
+    `running` conversations are reset at startup, live turns cancelled at
+    shutdown; one process (lock and cancel are in memory)
+  - `uploads.py` — media type by content, never by the declared type: PNG,
+    JPEG, PDF (≤ 50 pages) by magic bytes; `.docx`/`.xlsx` by `PK\x03\x04` +
+    extension + main part, text extracted with defusedxml / the SharePoint
+    reader's guarded archive, cut at 200,000 chars with a marker; `.txt`/
+    `.md`/`.csv`/`.json` only when UTF-8. Limits `CHAT_MAX_FILE_BYTES` (10 MiB),
+    `CHAT_MAX_FILES_PER_MESSAGE` (5), text 64 KiB; refusals are fixed texts
+    (413/415/422). The multipart reader is `agents/multipart_form.py`, shared
+    with the invoke API
+  - `docgen.py` + `md.py` — the three tools attached **per run** (never in the
+    registry build): `create_word_document`, `create_pdf_document`
+    (markdown subset of `md.py`: headings, paragraphs with bold/italic/code,
+    lists, pipe tables, fenced code, hr) and `create_excel_workbook(sheets=
+    [{name, columns, rows}])` (bold frozen header, auto-filter, a cell starting
+    with `=` stored as text). Word is written as OOXML with `zipfile` and the
+    standard library; PDF with reportlab (built-in fonts: Latin-1, other
+    characters become `?`); Excel with openpyxl. **python-docx must not be
+    added**: it depends on lxml, and with lxml installed openpyxl stops using
+    defusedxml (`tests/test_sharepoint_requirements.py`). Files go to
+    `chat_files` through the `ChatRunContext` contextvar, never an argument;
+    caps 10 MiB, 10 per run, 500,000 cells; every refusal is `{"error": ...}`
+  - `store.py` — owner-scoped persistence, `CHAT_RETENTION_DAYS` (180, `0`
+    keeps) purge in the app's daily retention pass, `MAX_MESSAGES` 500
+  - CSRF: the middleware's Origin check (`app.py`) covers `/chat/api` as well
+    as `/admin`; the client sends `X-Requested-With: XMLHttpRequest` on every
+    call. Tests: `tests/test_webchat_api.py`, `tests/test_webchat_docgen.py`,
+    `tests/test_webchat_uploads.py`
+- `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
+  ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
+  DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`
+  (every call with `X-Requested-With`, a hand-written SSE parser over the
+  `fetch` POST body, 401 → "Session expired" banner), `state.js` (parts
+  reducer), `render/*` (sidebar grouped Today/Yesterday/Previous 7 days/Older,
+  markdown through DOMPurify with copy buttons and mermaid, the collapsible
+  activity strip, file cards, image thumbnails), `composer.js` (Enter sends,
+  attach / drag-and-drop / paste, chips, Stop), `theme.js`. Same-origin
+  `/oauth/login` popup handling as `templates/chat.html`. Tests:
+  `node tests/test_webchat_ui.mjs` (jsdom); `tests/e2e/webchat_fake_server.py`
+  serves the page on a scripted backend for browser work
 - `agents/workflow_runner.py` — runs a workflow: the declared main line, a
   fan-out step returning `WorkItem`s, and per-item branches the fan-out step
   selects. Mirrors `job_runner.py` (task set, start lock, the stale sweep at
@@ -1951,7 +2024,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   run still failed on 2.25.1), no descriptor change besides the version;
   2.26.0 is the `builtin:confluence` release (`agents/confluence_tools.py`):
   no new resource, environment variable, table or column (HANA schema
-  generation unchanged)
+  generation unchanged); 2.27.0 is the web chat release (`agents/webchat/`): no
+  new resource, one environment variable `CHAT_RETENTION_DAYS` (180), three
+  new tables (HANA schema generation 4), `reportlab` in `requirements.txt`
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets
@@ -2094,13 +2169,21 @@ SAP AI Core's Generative AI Hub is the LLM provider.
    written -> `GET /api/invoke/runs/{run_id}` answers result, the OData
    writes of the run (audit rows by `run_id`), text, activity and error to
    that caller only
+9. `POST /chat/api/conversations/{id}/messages` (the web chat, as the
+   signed-in user): the conversation is locked idle→running -> uploads are
+   read, sniffed and stored -> user and assistant rows -> the orchestrator
+   runs with the stored history, the attachments and the three document
+   tools -> the SSE stream relays text, tool cards, notes and generated files
+   -> the turn is stored (content, parts, `new_messages()`), the title set,
+   the lock released
 
 ## Running locally
 ```bash
 pip install -r requirements.txt
 cp .env.example .env  # AICORE_* + (optional) DATABASE_URL
 python app.py         # listens on 127.0.0.1; HOST=0.0.0.0 to open it up
-# Chat:  http://127.0.0.1:7932/chat
+# Chat:  http://127.0.0.1:7932/       (stock pydantic-ai UI)
+# Web chat: http://127.0.0.1:7932/chat  (agents/webchat; conversations, uploads, Word/PDF/Excel)
 # Admin: http://127.0.0.1:7932/admin  (no XSUAA locally → open access)
 ```
 
@@ -2117,6 +2200,9 @@ bump a pin, rerun the suites, then deploy.
 - `fastapi`, `jinja2`, `python-multipart` — admin UI
 - `builtin:odata` adds no dependency: `$metadata` is parsed with the standard
   library's expat
+- `reportlab` — the web chat's `create_pdf_document` (`agents/webchat/docgen.py`);
+  Word files are written with the standard library on purpose (python-docx
+  would bring lxml, see the next entry)
 - `openpyxl` and `defusedxml` — `builtin:sharepoint` reads `.xlsx`; openpyxl
   uses defusedxml when it is installed and then refuses entity declarations
   (not a DTD as such). That holds only without `lxml`: with it openpyxl

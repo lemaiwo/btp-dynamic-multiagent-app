@@ -28,8 +28,10 @@ from urllib.parse import SplitResult, urlsplit
 
 from sqlalchemy import (
     DateTime,
+    ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -1495,6 +1497,108 @@ class AdminNotificationState(Base):
     principal: Mapped[str] = mapped_column(String(255), primary_key=True)
     seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+def _chat_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _chat_now() -> datetime:
+    # Python-side next to the server default: microsecond precision keeps
+    # rows written in the same second in order on SQLite.
+    return datetime.now(timezone.utc)
+
+
+def _chat_conversation_fk() -> ForeignKey:
+    return ForeignKey("chat_conversations.id", ondelete="CASCADE")
+
+
+class ChatConversation(Base):
+    """One conversation of the web chat (``agents/webchat``), owned by one
+    principal. ``status`` is the run lock: ``idle`` -> ``running`` in a
+    conditional UPDATE, one run per conversation at a time.
+
+    SQLite enforces the ``ON DELETE CASCADE`` of the child tables only with
+    ``PRAGMA foreign_keys=ON``, which this app does not set, so
+    ``agents.webchat.store`` also deletes the children explicitly.
+    """
+
+    __tablename__ = "chat_conversations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    title: Mapped[str] = mapped_column(
+        String(120), nullable=False, default="", server_default=""
+    )
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(), index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="idle", server_default="idle"
+    )
+
+
+class ChatMessage(Base):
+    """One message of a conversation; ``position`` counts 1..n.
+
+    ``content``, ``parts_json`` and ``model_json`` are ``Text`` (NCLOB on
+    SAP HANA): never compared, ordered or grouped in SQL.
+    """
+
+    __tablename__ = "chat_messages"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "position", name="uq_chat_messages_position"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), _chat_conversation_fk(), nullable=False, index=True
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False)  # user|assistant
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # pydantic-ai's new_messages() of this turn (assistant rows that ended done).
+    model_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="done", server_default="done"
+    )  # done|running|failed|canceled
+    error: Mapped[str | None] = mapped_column(String(400), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
+    )
+
+
+class ChatFile(Base):
+    """A file of a conversation: an upload or a generated document.
+
+    ``data`` is the bytes; a listing never selects it.
+    """
+
+    __tablename__ = "chat_files"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_chat_uuid)
+    conversation_id: Mapped[str] = mapped_column(
+        String(36), _chat_conversation_fk(), nullable=False, index=True
+    )
+    message_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # upload|generated
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_chat_now,
+        server_default=func.now(),
     )
 
 

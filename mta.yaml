@@ -3,7 +3,7 @@
 _schema-version: "3.2"
 ID: pydantic-agent
 description: Dynamic multi-agent Pydantic AI application for SAP BTP management
-version: 2.26.0
+version: 2.27.0
 
 parameters:
   # Sequential on purpose. xs-security.json grants the JOBSCHEDULER scope with
@@ -134,6 +134,10 @@ modules:
       # --- OData services (builtin:odata) ---
       # Days an odata_audit_log row is kept; 0 keeps them forever.
       ODATA_AUDIT_RETENTION_DAYS: "365"
+      # --- Web chat (/chat, agents/webchat) ---
+      # Days a conversation is kept from its last activity, with its
+      # messages and files; 0 keeps them forever.
+      CHAT_RETENTION_DAYS: "180"
     requires:
       - name: aicore-service
       - name: uaa-service

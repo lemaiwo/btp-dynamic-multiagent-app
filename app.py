@@ -85,6 +85,10 @@ from agents.oauth_routes import router as oauth_router  # noqa: E402
 from agents.odata import audit as odata_audit  # noqa: E402
 from agents.odata.audit import ODATA_AUDIT_RETENTION_DAYS  # noqa: E402
 from agents.registry import registry  # noqa: E402
+from agents.webchat import run as webchat_run  # noqa: E402
+from agents.webchat import store as webchat_store  # noqa: E402
+from agents.webchat.routes import page_router as webchat_page_router  # noqa: E402
+from agents.webchat.routes import router as webchat_router  # noqa: E402
 from agents.workflow_runner import cancel_all_workflow_runs  # noqa: E402
 
 SEED_FILE = Path(__file__).resolve().parent / "agents.seed.json"
@@ -229,6 +233,13 @@ async def _purge_ide_sessions() -> int:
         ODATA_AUDIT_RETENTION_DAYS >= 1,
         lambda s: purge_odata_audit(s, ODATA_AUDIT_RETENTION_DAYS),
     )
+    # Web chat conversations (agents/webchat), aged from their last
+    # activity; their messages and files go with them. 0 keeps them.
+    await _pass(
+        "chat conversations purged",
+        webchat_store.CHAT_RETENTION_DAYS >= 1,
+        lambda s: webchat_store.purge_older_than(s, webchat_store.CHAT_RETENTION_DAYS),
+    )
     return purged
 
 
@@ -306,6 +317,10 @@ async def lifespan(app: FastAPI):
         ide_reset = await reset_running_ide_sessions(
             session, min_age_s=ide_runner.ghost_age()
         )
+        # Web chat turns live in one process: any `running` one is a ghost.
+        chat_reset = await webchat_store.reset_running(session)
+    if chat_reset:
+        logger.info("Reset %d ghost web chat conversation(s) to idle", chat_reset)
     if ide_reset:
         logger.info("Reset %d ghost IDE session(s) to idle", ide_reset)
     if IDE_DIAGNOSE_RETENTION_DAYS < 1:
@@ -363,6 +378,7 @@ async def lifespan(app: FastAPI):
     await cancel_all_invoke_runs()
     await cancel_all_workflow_runs()
     await ide_runner.cancel_all()
+    await webchat_run.cancel_all_chat_runs()
     # An approved trace whose ARC-1 call is in flight runs in its own task,
     # not in a run: let it record its outcome (armed / failed) rather than
     # leave the approval `approved` with nothing behind it. Each call is
@@ -508,13 +524,15 @@ class JWTBindingMiddleware:
             elif fwd_origin:
                 base_url = fwd_origin
 
-        # CSRF guard for the admin API. The approuter routes run with
-        # csrfProtection off, so a state-changing admin request that the
-        # browser attributes to another site is refused here. Browsers send
-        # Origin on every cross-site POST/PUT/PATCH/DELETE; server-to-server
-        # callers (the job scheduler on /api/*/run) send none and are not
-        # affected, and /admin is the only prefix checked.
-        if is_admin and method in _STATE_CHANGING:
+        # CSRF guard for the admin API and the web chat API. The approuter
+        # routes run with csrfProtection off, so a state-changing request
+        # under /admin or /chat/api that the browser attributes to another
+        # site is refused here. Browsers send Origin on every cross-site
+        # POST/PUT/PATCH/DELETE; server-to-server callers (the job scheduler
+        # on /api/*/run) send none and are not affected, and these two are
+        # the only prefixes checked.
+        is_chat_api = path == "/chat/api" or path.startswith("/chat/api/")
+        if (is_admin or is_chat_api) and method in _STATE_CHANGING:
             fetch_site = (hdrs.get(b"sec-fetch-site") or b"").decode("latin-1").strip().lower()
             origin_h = hdrs.get(b"origin")
             if fetch_site not in ("same-origin", "none") and origin_h:
@@ -602,6 +620,10 @@ app.include_router(runs_router)
 # Invoke API (POST /api/invoke/{slug}, GET /api/invoke/runs/{id}), `invoke`
 # scope; before the chat mount for the same reason.
 app.include_router(invoke_router)
+# Web chat (GET /chat and /chat/api/...), any signed-in user; before the
+# chat mount, which would otherwise answer every path.
+app.include_router(webchat_page_router)
+app.include_router(webchat_router)
 # ABAP IDE API (/ide/api/...), developer scope; before the chat mount.
 # The two routers share no path, so their order does not matter.
 app.include_router(ide_review_router)
@@ -637,5 +659,6 @@ if __name__ == "__main__":
     host, port = serve_address()
     print(f"Starting SAP BTP Management app on http://{host}:{port}")
     print(f"  Chat:  http://{host}:{port}/")
+    print(f"  Web chat: http://{host}:{port}/chat")
     print(f"  Admin: http://{host}:{port}/admin")
     uvicorn.run(app, host=host, port=port)

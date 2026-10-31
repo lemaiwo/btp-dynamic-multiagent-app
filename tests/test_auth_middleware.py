@@ -341,6 +341,55 @@ async def test_csrf_get_and_non_admin_paths_are_unaffected(local):
         assert r.status_code == 200
 
 
+# The web chat API (/chat/api, agents/webchat) has the same Origin check.
+# Probe: a body the request model refuses (422) before the handler runs.
+CHAT_PROBE = "/chat/api/conversations"
+CHAT_PROBE_BODY = [1, 2, 3]  # ConversationIn wants an object
+
+
+async def test_csrf_cross_site_origin_on_chat_api_is_403(local):
+    async with _client() as c:
+        for method in ("POST", "PATCH", "DELETE", "PUT"):
+            r = await c.request(method, CHAT_PROBE + ("/x" if method != "POST" else ""),
+                                json=CHAT_PROBE_BODY, headers={"Origin": "https://evil.example"})
+            assert r.status_code == 403, method
+            assert r.json() == {
+                "detail": "Cross-site request refused: Origin does not match this app."}
+
+
+async def test_csrf_chat_api_same_origin_and_no_origin_pass(local):
+    async with _client() as c:
+        r = await c.post(CHAT_PROBE, json=CHAT_PROBE_BODY, headers={"Origin": "http://test"})
+        assert r.status_code == PASSED
+        r = await c.post(CHAT_PROBE, json=CHAT_PROBE_BODY)
+        assert r.status_code == PASSED
+        r = await c.post(CHAT_PROBE, json=CHAT_PROBE_BODY, headers={
+            "Origin": "https://evil.example", "Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == PASSED
+        r = await c.post(CHAT_PROBE, json=CHAT_PROBE_BODY, headers={
+            "Origin": "https://router.example.com",
+            "X-Forwarded-Host": "router.example.com", "X-Forwarded-Proto": "https"})
+        assert r.status_code == PASSED
+
+
+async def test_csrf_chat_api_on_cf_matches_the_public_url(cf, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://app.example.com")
+    async with _client() as c:
+        r = await c.post(CHAT_PROBE, json=CHAT_PROBE_BODY, headers={
+            "Origin": "https://app.example.com", **_bearer("user-tok")})
+        assert r.status_code == PASSED
+        r = await c.post(CHAT_PROBE, json=CHAT_PROBE_BODY, headers={
+            "Origin": "https://evil.example", **_bearer("user-tok")})
+        assert r.status_code == 403
+
+
+async def test_csrf_a_chat_api_get_is_unaffected(local):
+    async with _client() as c:
+        r = await c.get("/chat/api/conversations?limit=0",
+                        headers={"Origin": "https://evil.example"})
+        assert r.status_code == 422  # a GET is not state-changing
+
+
 # ---------------------------------------------------------------------------
 # M3: no X-Forwarded-Host derived base URL on CF
 # ---------------------------------------------------------------------------
