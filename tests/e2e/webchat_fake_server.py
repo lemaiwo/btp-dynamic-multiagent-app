@@ -13,6 +13,8 @@ Start it::
     .venv/bin/python tests/e2e/webchat_fake_server.py --fast     # no sleeps
     .venv/bin/python tests/e2e/webchat_fake_server.py --slow 4   # 4x longer turn
     .venv/bin/python tests/e2e/webchat_fake_server.py --basic-user  # no developer role
+    .venv/bin/python tests/e2e/webchat_fake_server.py --admin       # the admin scope (instructions visible)
+    CHAT_CONTEXT_WINDOWS='{"gpt-5.6-terra": 24000}' .venv/bin/python tests/e2e/webchat_fake_server.py
 
 then open http://127.0.0.1:7935/chat . ``Ctrl-C`` stops it.
 
@@ -60,6 +62,16 @@ What it serves:
   consult); an import by a non-developer drops ``deep`` and advanced consults
   (``dropped`` with ``field: "deep"`` / ``"consults"``). A developer run seeds
   one advanced conversation and one deep personal agent on top
+- addendum (e): ``GET /chat/api/conversations/{id}/context`` built from the
+  stored data (who answers, the model's window from a code table matched by
+  substring and overridable by ``CHAT_CONTEXT_WINDOWS`` as on the server,
+  instructions visible only with ``--admin`` for the orchestrator and an admin
+  agent, the estimate = characters / 4 plus a fixed figure per binary, the
+  measured figure a fixed number once a turn has usage, the uploads with their
+  ``excluded`` flag, the tools of the turn, the usage totals);
+  ``POST .../context/attachments/{file_id}`` ``{"excluded": bool}`` toggles the
+  flag on the stored upload (409 while a turn runs, 404 for a generated file or
+  a file of another conversation, 422 for a body that is no boolean)
 
 Three conversations are seeded (today, yesterday, older) so the sidebar
 groups show; the first one holds a stored turn with agent, tool, usage and
@@ -72,6 +84,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
 import struct
 import sys
@@ -123,6 +137,36 @@ ADMIN_SKILLS = [
     {"name": "report-layout", "description": "The table and heading layout of a platform review document."},
 ]
 ORCHESTRATOR = {"ref": None, "name": "Orchestrator", "description": "Hands your question to the specialist that can answer it."}
+
+# ---- addendum (e): the context of a conversation ----
+ADMIN = False  # --admin: the admin scope sees the orchestrator's and the admin agents' instructions
+# the window table of the design, matched by substring; CHAT_CONTEXT_WINDOWS (JSON {id or prefix: tokens}) overrides
+CONTEXT_WINDOWS = [("gpt-4o", 128_000), ("gpt-5", 400_000), ("claude", 200_000), ("gemini", 1_000_000)]
+MEASURED_FIXED = 2_950  # the measured context of a stored turn (the fake has no model request to read)
+DOCUMENT_TOOLS = ["create_word_document", "create_pdf_document", "create_excel_workbook"]
+DEEP_TOOLS = ["write_todos", "read_todos", "ls", "read_file", "write_file", "edit_file", "task"]
+ORCHESTRATOR_INSTRUCTIONS = (
+    "You are the orchestrator of the SAP BTP Multi-Agent app. Read the question, pick the specialist that can answer it "
+    "and delegate with a precise prompt. Combine the answers into one reply. Never invent a subaccount, a service plan or a quota: "
+    "quote what the specialist returned. When the user asks for a document, call the document tool after the facts are in."
+)
+ADMIN_INSTRUCTIONS = {
+    "btp-admin": "You administer the BTP account model through the btp and cf MCP servers. Read before you change; name the subaccount, "
+                 "the service and the plan in every answer. Destructive changes (delete, unsubscribe) need an explicit confirmation.",
+    "entitlement-analyst": "You rank entitlements by unused quota. Ask btp-admin for the figures; report assigned, used and spare per plan, "
+                           "largest spare first; flag what nobody used in 90 days.",
+    "abap-developer-deep": "You are the ABAP developer on the dev system through ARC-1. Plan with write_todos, keep findings in the scratchpad, "
+                           "read before you propose, and run the syntax check on every proposal. Never activate.",
+    "ui5-fiori-developer-deep": "You are the UI5 / Fiori developer. Work per task with sub-agents, keep the views, controllers and annotations "
+                                "consistent with the app's conventions and run the linter on every change.",
+}
+ADMIN_AGENT_SKILLS = {"btp-admin": ["btp-naming-conventions"], "entitlement-analyst": ["report-layout"]}
+ADMIN_SKILL_TEXT = {
+    "btp-naming-conventions": "# Naming\n\nSubaccounts: <b>-<area>-<env> (b-fdn-dev). Spaces: dev | test | prod. Service instances: <app>-<service> "
+                              "(agent-registry-db). Destinations: UPPER_SNAKE (S4H_DEV, JIRA).",
+    "report-layout": "# Platform review layout\n\n1. Summary (five lines at most).\n2. One table per subaccount: service, plan, assigned, used, spare.\n"
+                     "3. Actions, ordered by money saved.",
+}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}$")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 LIM = {"agents": 50, "skills": 100, "description": 300, "instructions": 20_000, "content": 50_000,
@@ -429,6 +473,118 @@ class Store:
                 for k in ("input_tokens", "output_tokens", "total_tokens", "requests"):
                     total[k] += int(p.get(k) or 0)
         return total
+
+    # ---- addendum (e): the context of a conversation ----
+    @staticmethod
+    def context_window(model_id: str | None) -> int | None:
+        mid = (model_id or "").lower()
+        raw = os.environ.get("CHAT_CONTEXT_WINDOWS")
+        if raw:
+            try:
+                table = json.loads(raw)
+            except ValueError:
+                table = {}
+            if isinstance(table, dict):
+                for key, tokens in sorted(table.items(), key=lambda kv: -len(str(kv[0]))):
+                    if isinstance(tokens, int) and tokens > 0 and mid.startswith(str(key).lower()):
+                        return tokens
+        for key, tokens in CONTEXT_WINDOWS:
+            if key in mid:
+                return tokens
+        return None
+
+    def context_model(self, c: dict) -> str:
+        ref = c.get("agent_ref") or ""
+        if ref.startswith("admin:"):
+            return "gpt-5.6-terra"  # an admin agent runs on its own model
+        if ref.startswith("mine:"):
+            a = self.my_agents.get(ref[5:])
+            if a and a.get("model"):
+                return a["model"]
+        return c.get("model_name") or MODELS[0]["id"]
+
+    def context(self, c: dict) -> dict:
+        cid = c["id"]
+        access = c.get("access", "basic")
+        ref = c.get("agent_ref")
+        ok, name = self.resolve_ref(ref, access)
+        # who answers
+        if not ref or not ok:
+            agent = {"ref": None, "name": ORCHESTRATOR["name"], "kind": "orchestrator", "tier": "basic"}
+            visible, text = ADMIN, ORCHESTRATOR_INSTRUCTIONS
+            skill_names = []
+            own = None
+        elif ref.startswith("admin:"):
+            row = next(x for x in ADMIN_AGENTS if x["name"] == name)
+            agent = {"ref": ref, "name": name, "kind": "admin", "tier": row["tier"]}
+            visible, text = ADMIN, ADMIN_INSTRUCTIONS.get(name, f"You are {name}.")
+            skill_names = [("admin", n) for n in ADMIN_AGENT_SKILLS.get(name, [])]
+            own = None
+        else:
+            own = self.my_agents[ref[5:]]
+            agent = {"ref": ref, "name": own["name"], "kind": "mine", "tier": self.tier_of(own)}
+            visible, text = True, own["instructions"]
+            skill_names = [(x["scope"], x["name"]) for x in own["skills"]]
+        skills = []
+        for scope, sname in skill_names:
+            if scope == "mine":
+                row = next((x for x in self.my_skills.values() if x["name"] == sname), None)
+                if row is None:
+                    continue
+                skills.append({"scope": "mine", "name": sname, "chars": len(row["content"]), "visible": True, "text": row["content"]})
+            else:
+                content = ADMIN_SKILL_TEXT.get(sname)
+                if content is None:
+                    continue
+                skills.append({"scope": "admin", "name": sname, "chars": len(content), "visible": ADMIN, "text": content if ADMIN else None})
+        # history: the finished turns
+        msgs = [m for m in self.messages[cid] if m["status"] != "running"]
+        if any(m["status"] == "running" for m in self.messages[cid]) and msgs and msgs[-1]["role"] == "user":
+            msgs = msgs[:-1]  # the running turn's user message is not in the context yet
+        chars = len(text) + sum(sk["chars"] for sk in skills)
+        for m in msgs:
+            chars += len(m["content"] or "")
+            for part in m["parts"]:
+                for key in ("text", "prompt", "output"):
+                    v = part.get(key)
+                    if isinstance(v, str):
+                        chars += len(v)
+        in_history = {fid for m in msgs for fid in m["file_ids"]}
+        uploads = [f for f in self.files.values() if f["conversation_id"] == cid and f["kind"] == "upload" and f["id"] in in_history]
+        binary = 0
+        for f in uploads:
+            if f.get("excluded"):
+                continue
+            if f["media_type"].startswith("image/"):
+                binary += 1_000
+            elif f["media_type"] == "application/pdf":
+                binary += 1_500 * max(1, math.ceil(f["size"] / 102_400))
+            else:
+                binary += f["size"] // 4
+        has_usage = any(p.get("type") == "usage" for m in msgs for p in m["parts"])
+        model_id = self.context_model(c)
+        tools = [{"kind": "document", "name": n} for n in DOCUMENT_TOOLS]
+        if own is not None and own.get("deep"):
+            tools += [{"kind": "deep", "name": n} for n in DEEP_TOOLS]
+        if agent["kind"] == "orchestrator":
+            targets = [a["name"] for a in ADMIN_AGENTS if a["tier"] == "basic" or access == "advanced"]
+        elif agent["kind"] == "mine":
+            targets = [n for n in own["consults"] if n not in ADVANCED_ADMIN or access == "advanced"]
+        else:
+            targets = []
+        tools += [{"kind": "delegate", "name": f"delegate_to_{t.replace('-', '_')}", "agent": t} for t in targets]
+        return {
+            "agent": agent,
+            "access": access,
+            "model": {"id": model_id, "context_window": self.context_window(model_id)},
+            "instructions": {"visible": visible, "text": text if visible else None, "chars": len(text), "skills": skills},
+            "history": {"turns": sum(1 for m in msgs if m["role"] == "assistant"), "messages": len(msgs), "chars": chars,
+                        "estimated_tokens": chars // 4 + binary, "measured_tokens": MEASURED_FIXED if has_usage else None,
+                        "attachments": [{"file_id": f["id"], "name": f["name"], "media_type": f["media_type"], "size": f["size"],
+                                         "excluded": bool(f.get("excluded"))} for f in uploads]},
+            "tools": tools,
+            "usage": self.conv_usage(cid),
+        }
 
     def conv_detail(self, c: dict) -> dict:
         out = {"id": c["id"], "title": c["title"], "model": c["model_name"], "status": c["status"],
@@ -859,6 +1015,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(200, {"canceled": running})
             if action == "stream" and method == "GET":
                 return self.detail(409, "not_running")
+            if action == "context":
+                if len(parts) == 3 and method == "GET":
+                    with STORE.lock:
+                        return self.send_json(200, STORE.context(conv))
+                if len(parts) == 5 and parts[3] == "attachments" and method == "POST":
+                    data = self.json_body()
+                    if not isinstance(data.get("excluded"), bool):
+                        return self.detail(422, "excluded must be a boolean")
+                    with STORE.lock:
+                        f = STORE.files.get(parts[4])
+                        if f is None or f["conversation_id"] != cid or f["kind"] != "upload":
+                            return self.detail(404, "not found")
+                        if conv["status"] == "running":
+                            return self.detail(409, "a run is in progress")
+                        f["excluded"] = data["excluded"]
+                        return self.send_json(200, {"file_id": f["id"], "excluded": f["excluded"]})
         return self.detail(404, "not found")
 
     # ---- addendum (c): /my/... ----
@@ -1237,14 +1409,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main(argv=None) -> int:
-    global FAST, SLOW, DEVELOPER
+    global FAST, SLOW, DEVELOPER, ADMIN
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--port", type=int, default=7935)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--fast", action="store_true", help="no sleeps in the scripted turn")
     ap.add_argument("--slow", type=float, default=1.0, help="multiply every sleep (screenshots mid-turn)")
     ap.add_argument("--basic-user", action="store_true", help="the signed-in user has no developer role (addendum d)")
+    ap.add_argument("--admin", action="store_true", help="the signed-in user has the admin scope: instructions visible in the context drawer (addendum e)")
     args = ap.parse_args(argv)
+    ADMIN = args.admin
     FAST = args.fast
     SLOW = max(0.0, args.slow)
     if args.basic_user:

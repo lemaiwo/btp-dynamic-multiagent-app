@@ -218,3 +218,49 @@ export function rememberAccess(principal, access, storage = globalThis.localStor
   try { storage?.setItem(accessStorageKey(principal), access); } catch { /* private mode: not remembered */ }
   return access;
 }
+
+// ---------- the context of a conversation (addendum e) ----------
+export const FILL_WARN_PCT = 70;
+export const FILL_DANGER_PCT = 90;
+
+function nonNegative(n) {
+  if (n == null || n === '' || typeof n === 'boolean') return null;
+  const v = Number(n);
+  return Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+/**
+ * How full the model's context is. The measured figure (the input tokens of
+ * the last request) wins over the estimate; `pct` is null without a window.
+ * -> {tokens, pct, level: 'ok' | 'warn' | 'danger', measured: bool}
+ */
+export function fillLevel(estimated, measured, window) {
+  const m = nonNegative(measured);
+  const e = nonNegative(estimated);
+  const tokens = m ?? e ?? 0;
+  const w = nonNegative(window);
+  const pct = w && w > 0 ? (tokens / w) * 100 : null;
+  const level = pct == null ? 'ok' : pct > FILL_DANGER_PCT ? 'danger' : pct > FILL_WARN_PCT ? 'warn' : 'ok';
+  return { tokens, pct, level, measured: m != null };
+}
+
+/** 12.34 -> "12%"; 0.4 -> "<1%"; null -> "". */
+export function formatPct(pct) {
+  if (pct == null || !Number.isFinite(pct)) return '';
+  if (pct > 0 && pct < 1) return '<1%';
+  return `${Math.round(pct)}%`;
+}
+
+/**
+ * The composer's indicator from a context answer: "~12.4k / 128k" with a
+ * window, "~12.4k tokens" without, '' without data. A tilde always: the
+ * next turn adds to whatever was counted.
+ */
+export function contextIndicatorText(context) {
+  const h = context?.history;
+  if (!h || typeof h !== 'object') return '';
+  const fill = fillLevel(h.estimated_tokens, h.measured_tokens, context.model?.context_window);
+  const w = nonNegative(context.model?.context_window);
+  if (w) return `~${formatTokens(fill.tokens)} / ${formatTokens(w)}`;
+  return `~${formatTokens(fill.tokens)} tokens`;
+}

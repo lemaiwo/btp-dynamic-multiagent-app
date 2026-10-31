@@ -26,10 +26,10 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field
 
 from agents.access import BASIC, TIERS, caller_is_developer
-from agents.auth import current_principal, require_user
+from agents.auth import current_claims, current_principal, require_user
 from agents.db import SessionLocal
 from agents.multipart_form import FormRefused
-from agents.webchat import run, store, uploads, user_agents
+from agents.webchat import context, run, store, uploads, user_agents
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,7 @@ FULL = "The conversation has reached its message limit"
 UPLOAD_TIMEOUT = "The request body was not received in time"
 UNKNOWN_AGENT = "Unknown agent"
 ADVANCED_FORBIDDEN = "Advanced access needs the developer role"
+BAD_EXCLUDED = 'The body must be exactly {"excluded": true} or {"excluded": false}'
 
 
 class ConversationIn(BaseModel):
@@ -275,7 +276,7 @@ async def post_message(cid: str, request: Request) -> Response:
             conversation_id=conv.id,
             assistant_message_id=rows.assistant_message_id,
             principal=principal,
-            prompt=run.build_prompt(form.text, form.uploads),
+            prompt=run.build_prompt(form.text, form.uploads, [f["id"] for f in rows.files]),
             history=history,
             model_name=model_name,
             agent_ref=conv.agent_ref,
@@ -315,6 +316,33 @@ async def reattach(cid: str) -> Response:
     queue = turn.subscribe()
     return StreamingResponse(run.sse(turn, queue), media_type="text/event-stream",
                              headers=run.SSE_HEADERS)
+
+
+@router.get("/conversations/{cid}/context")
+async def get_context(cid: str) -> dict[str, Any]:
+    """What the agent gets on the next turn (``agents/webchat/context.py``)."""
+    principal = store.caller()
+    conv = await _owned(cid, principal)
+    return await context.describe(conv, principal, current_claims.get())
+
+
+@router.post("/conversations/{cid}/context/attachments/{fid}")
+async def set_attachment(cid: str, fid: str, request: Request) -> dict[str, Any]:
+    """Take an upload out of the stored history or put it back. The body is
+    read raw so a refusal is one fixed text that echoes nothing."""
+    principal = store.caller()
+    conv = await _owned(cid, principal)
+    try:
+        body = await request.json()
+    except ValueError:
+        body = None
+    if not (isinstance(body, dict) and set(body) == {"excluded"}
+            and isinstance(body["excluded"], bool)):
+        raise HTTPException(status_code=422, detail=BAD_EXCLUDED)
+    try:
+        return await context.set_attachment_excluded(conv, fid, body["excluded"])
+    except context.ContextError as refused:
+        raise HTTPException(status_code=refused.status, detail=refused.detail) from None
 
 
 @router.get("/files/{fid}")

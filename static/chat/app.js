@@ -10,9 +10,11 @@ import { createMessageList, renderEmpty } from './render/messages.js';
 import { createComposer } from './composer.js';
 import { createAgentsPage } from './render/agents.js';
 import { createAgentEditor } from './render/agentEditor.js';
+import { createContextDrawer } from './render/contextDrawer.js';
 import { pickerGroups, agentNameOf, refOffered, isAdvanced } from './myagents.js';
 import { initTheme, toggleTheme, onThemeChange } from './theme.js';
-import { titleFromText, formatTokens, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
+import { titleFromText, formatTokens, formatPct, fillLevel, contextIndicatorText, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
+import { excludedFileIds } from './state.js';
 
 const store = createStore({ ...initialState, catalog: null, myAgents: [], draftAgentRef: null, view: 'chat' });
 const root = document.getElementById('app');
@@ -30,6 +32,10 @@ root.innerHTML = `
       <h1 class="title" id="title">SAP BTP Multi-Agent</h1>
       <div class="topbar-right">
         <span class="usage-chip" id="usage-chip" hidden tabindex="0" role="status" aria-label="Conversation usage"></span>
+        <button type="button" class="context-btn" id="context-btn" hidden aria-haspopup="dialog" title="What the agent gets on the next turn">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M4 6h16M4 12h10M4 18h14"/><circle cx="18" cy="12" r="2.5"/></svg>
+          <span>Context</span><span class="context-pct" id="context-pct" hidden></span>
+        </button>
         <div class="access-switch" id="access" role="radiogroup" aria-label="Access" hidden>
           <button type="button" class="seg" role="radio" aria-checked="true" data-access="basic" title="Basic access: the standard agents">Basic</button>
           <button type="button" class="seg" role="radio" aria-checked="false" data-access="advanced" tabindex="-1" title="Advanced access: the developer agents (ABAP, UI5/Fiori, CAP)">Advanced</button>
@@ -70,17 +76,34 @@ const logEl = $('.log');
 const composerWrap = $('.composer-wrap');
 const pageEl = $('#page');
 const usageChip = $('#usage-chip');
+const contextBtn = $('#context-btn');
+const contextPct = $('#context-pct');
 const themeBtn = $('#theme');
 const bannerEl = $('#banner');
 const messagesEl = $('#messages');
 const toastsEl = $('#toasts');
 
 // ---------- toasts ----------
+// While a modal <dialog> (the editor, the context drawer) is open it sits in
+// the top layer above the page's toast box, so the toast goes into a box of
+// the dialog's own (same class, same fixed position) and is seen.
+function toastBox() {
+  const open = document.querySelector('dialog[open]');
+  if (!open) return toastsEl;
+  let box = open.querySelector(':scope > .toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'toasts';
+    box.setAttribute('aria-live', 'polite');
+    open.appendChild(box);
+  }
+  return box;
+}
 function notify(text, kind = 'info') {
   const t = document.createElement('div');
   t.className = `toast ${kind}`;
   t.textContent = text;
-  toastsEl.appendChild(t);
+  toastBox().appendChild(t);
   setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 300); }, 4500);
 }
 
@@ -156,6 +179,80 @@ const composer = createComposer($('#composer'), {
   },
 });
 
+// ---------- the context drawer (addendum e) ----------
+let contextSeq = 0;
+/** One GET .../context for the open conversation; a stale answer (another conversation meanwhile) is dropped. */
+async function loadContext(id) {
+  const seq = ++contextSeq;
+  try {
+    const ctx = await api.getContext(id);
+    if (seq !== contextSeq || store.get().conversation?.id !== id) return;
+    store.set({ context: ctx && typeof ctx === 'object' ? ctx : null, contextError: !(ctx && typeof ctx === 'object') });
+  } catch (e) {
+    if (seq !== contextSeq || store.get().conversation?.id !== id) return;
+    store.set({ context: null, contextError: true });
+  }
+}
+function refreshContext() {
+  const id = store.get().conversation?.id;
+  if (id) loadContext(id);
+}
+const contextDrawer = createContextDrawer({
+  onRefresh: refreshContext,
+  onToggle: async (fileId, excluded) => {
+    const conv = store.get().conversation;
+    if (!conv) throw new Error('no conversation');
+    const name = (store.get().context?.history?.attachments || []).find((a) => String(a.file_id) === String(fileId))?.name || 'The file';
+    try {
+      const r = await api.setAttachmentExcluded(conv.id, fileId, excluded);
+      const stored = r?.excluded === true;
+      store.set((s) => (s.context?.history ? {
+        context: {
+          ...s.context,
+          history: { ...s.context.history, attachments: (s.context.history.attachments || []).map((a) => (String(a.file_id) === String(fileId) ? { ...a, excluded: stored } : a)) },
+        },
+      } : null));
+      notify(stored ? `${name} is no longer in the context.` : `${name} is back in the context.`);
+      loadContext(conv.id); // the estimate moved
+      return stored;
+    } catch (e) {
+      if (e.status === 409) notify('Wait until the turn has finished, then try again.', 'error');
+      else if (e.status === 404) notify('Only an uploaded file can be switched off.', 'error');
+      else if (e.status !== 401) notify(e.detail || 'The change could not be saved.', 'error');
+      throw e;
+    }
+  },
+});
+contextBtn.addEventListener('click', () => {
+  const s = store.get();
+  if (!s.conversation) return;
+  contextDrawer.open(s.context, s.contextError);
+});
+let contextSig = null;
+// The header button ("Context 12%"), the composer indicator and the open drawer follow the store.
+function reflectContext(s) {
+  const show = !!s.conversation && s.view !== 'agents';
+  contextBtn.hidden = !show;
+  const h = s.context?.history;
+  const fill = h ? fillLevel(h.estimated_tokens, h.measured_tokens, s.context.model?.context_window) : null;
+  const pct = fill && fill.pct != null ? formatPct(fill.pct) : '';
+  const text = contextIndicatorText(s.context);
+  const level = fill?.level || 'ok';
+  const sig = `${show}|${pct}|${text}|${level}`;
+  if (sig !== contextSig) {
+    contextSig = sig;
+    contextPct.textContent = pct;
+    contextPct.hidden = !pct;
+    contextBtn.classList.toggle('warn', level === 'warn');
+    contextBtn.classList.toggle('danger', level === 'danger');
+    contextBtn.setAttribute('aria-label', pct ? `Context, ${pct} of the model's window used` : 'Context');
+    const window = Number(s.context?.model?.context_window) || 0;
+    const title = window ? `${pct} of the model's context window (${formatTokens(window)} tokens)` : (text ? 'The size of the model\'s context; this model\'s window is unknown' : '');
+    composer.setContext({ text, level, title });
+  }
+  contextDrawer.update(s.context, s.contextError);
+}
+
 // ---------- model picker ----------
 function fillModels(models) {
   modelSel.replaceChildren();
@@ -192,6 +289,7 @@ modelSel.addEventListener('change', async () => {
     try {
       await api.patchConversation(conv.id, { model });
       store.set((s) => ({ conversation: s.conversation?.id === conv.id ? { ...s.conversation, model } : s.conversation }));
+      refreshContext(); // the window may differ
     } catch (e) { notify(e.detail || 'The model could not be changed.', 'error'); }
   }
 });
@@ -246,6 +344,7 @@ agentSel.addEventListener('change', async () => {
     }));
     renderMessages();
     reflectModel();
+    refreshContext();
   } catch (e) {
     if (e.status === 422) notify('That agent cannot be used in this conversation.', 'error');
     else if (e.status !== 401) notify(e.detail || 'The agent could not be changed.', 'error');
@@ -326,7 +425,7 @@ async function setAccess(next) {
     fillAgents();
     reflectModel();
     emptySig = null;
-    if (store.get().conversation) renderMessages(); else renderDraftEmpty();
+    if (store.get().conversation) { renderMessages(); refreshContext(); } else renderDraftEmpty();
   } finally {
     accessBusy = false;
     reflectAccess();
@@ -379,6 +478,7 @@ function showView(view) {
   agentSel.parentElement.hidden = agents;
   modelSel.parentElement.hidden = agents;
   usageChip.hidden = agents || usageChip.hidden;
+  contextBtn.hidden = agents || contextBtn.hidden;
   reflectAccess();
   if (agents) agentsPage.show(); else agentsPage.hide();
 }
@@ -412,7 +512,7 @@ function renderDraftEmpty() { renderEmptyFor(store.get().draftAgentRef || null);
 async function route() {
   if (isAgentsHash()) {
     routeSeq++;
-    store.set({ currentId: null, conversation: null });
+    store.set({ currentId: null, conversation: null, context: null, contextError: false });
     showView('agents');
     return;
   }
@@ -422,14 +522,14 @@ async function route() {
   if (id && s.conversation?.id === id) { store.set({ currentId: id }); return; }
   const seq = ++routeSeq;
   if (!id) {
-    store.set({ currentId: null, conversation: null });
+    store.set({ currentId: null, conversation: null, context: null, contextError: false });
     list.clear();
     renderDraftEmpty();
     composer.focus();
     await ensureCatalog(store.get().draftAccess);
     return;
   }
-  store.set({ currentId: id, loading: true });
+  store.set({ currentId: id, loading: true, context: null, contextError: false });
   try {
     const conv = await api.getConversation(id);
     if (seq !== routeSeq) return;
@@ -439,6 +539,7 @@ async function route() {
     store.set({ conversation: normalized, loading: false, draftAgentRef: conv.agent_ref || null });
     renderMessages();
     list.scrollToBottom(true);
+    loadContext(id); // one call, not awaited: the log is already on screen
     await ensureCatalog(normalized.access);
   } catch (e) {
     if (seq !== routeSeq) return;
@@ -490,7 +591,7 @@ async function sendTurn(text, files) {
       }
       if (!created.agent_name) created.agent_name = agentNameOf(created.agent_ref || null, s.catalog, s.myAgents, '');
       conv = normalizeConversation({ ...created, messages: [] });
-      store.set({ conversation: conv, currentId: conv.id, conversations: [created, ...store.get().conversations] });
+      store.set({ conversation: conv, currentId: conv.id, context: null, contextError: false, conversations: [created, ...store.get().conversations] });
       routeSeq++; // the hashchange below must not reload what we hold
       history.replaceState(null, '', `#/c/${encodeURIComponent(conv.id)}`);
       list.clear();
@@ -551,6 +652,7 @@ async function sendTurn(text, files) {
       // its own, so re-read what it stored.
       await reloadCurrent(conv.id);
     }
+    if (store.get().conversation?.id === conv.id) loadContext(conv.id); // after each turn, one call
     refreshList();
   }
 }
@@ -581,7 +683,7 @@ function renderMessages() {
     renderEmptyFor(s.conversation.agent_ref || null, s.conversation.agent_name || '');
     return;
   }
-  list.render(s.conversation, { live: !!s.run, agentName: currentAgentName() || 'Agents' });
+  list.render(s.conversation, { live: !!s.run, agentName: currentAgentName() || 'Agents', excludedIds: excludedFileIds(s.context) });
 }
 
 store.subscribe((s) => {
@@ -599,6 +701,7 @@ store.subscribe((s) => {
   fillAgents();
   reflectUsage(s.conversation?.usage);
   if (s.view === 'agents') usageChip.hidden = true;
+  reflectContext(s);
   if (s.conversation && !s.run) renderMessages();
 });
 

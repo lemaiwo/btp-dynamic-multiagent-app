@@ -1,5 +1,8 @@
 // Store + the reducer that applies SSE events to the in-flight assistant
-// message. Pure: no DOM, no fetch (the jsdom tests import it as is).
+// message, and the view model of the context drawer. Pure: no DOM, no fetch
+// (the jsdom tests import it as is).
+
+import { fillLevel, formatPct, formatSize, formatTokens } from './util.js';
 
 /** A tiny observable store. `set` takes a patch object or an updater fn. */
 export function createStore(initial) {
@@ -33,6 +36,8 @@ export const initialState = {
   banner: null,        // 'expired' | null
   sidebarOpen: false,  // the drawer on narrow screens
   query: '',
+  context: null,       // the last GET .../context answer of the open conversation (addendum e)
+  contextError: false, // that GET failed (the drawer shows a fixed text)
 };
 
 let localSeq = 0;
@@ -353,4 +358,116 @@ export function applyStreamEvent(conversation, userLocalId, assistantLocalId, ev
     if (event.type === 'done' || event.type === 'error') conv.status = 'idle';
   }
   return conv;
+}
+
+// ---------- the context drawer (addendum e) ----------
+const KIND_LABELS = { orchestrator: 'Orchestrator', admin: 'Admin agent', mine: 'Personal agent' };
+const TIER_LABELS = { basic: 'Basic', advanced: 'Advanced' };
+const TOOL_GROUPS = [
+  ['document', 'Document tools'],
+  ['deep', 'Deep agent tools'],
+  ['delegate', 'Delegation'],
+];
+
+const str = (v, fallback = '') => (typeof v === 'string' ? v : fallback);
+const int = (v) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? Math.round(n) : 0; };
+const plural = (n, one, many) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
+
+/** The file ids the context answer marks excluded (for the struck-through cards). */
+export function excludedFileIds(context) {
+  const out = new Set();
+  for (const a of context?.history?.attachments || []) {
+    if (a && a.excluded === true && a.file_id != null) out.add(String(a.file_id));
+  }
+  return out;
+}
+
+/**
+ * What the drawer shows, from a GET .../context answer: five sections of
+ * plain strings and rows. Every field is tolerant of a missing or odd
+ * value; nothing here is markup, the renderer inserts text nodes only.
+ */
+export function contextViewModel(ctx) {
+  const c = ctx && typeof ctx === 'object' ? ctx : {};
+  const agent = c.agent && typeof c.agent === 'object' ? c.agent : {};
+  const model = c.model && typeof c.model === 'object' ? c.model : {};
+  const instr = c.instructions && typeof c.instructions === 'object' ? c.instructions : {};
+  const hist = c.history && typeof c.history === 'object' ? c.history : {};
+  const usage = c.usage && typeof c.usage === 'object' ? c.usage : {};
+  const windowTokens = Number(model.context_window);
+  const hasWindow = Number.isFinite(windowTokens) && windowTokens > 0;
+  const fill = fillLevel(hist.estimated_tokens, hist.measured_tokens, hasWindow ? windowTokens : null);
+  const kind = str(agent.kind);
+  const tier = str(agent.tier);
+  const access = str(c.access);
+  const who = {
+    agent: str(agent.name) || (kind === 'orchestrator' ? 'Orchestrator' : 'Agent'),
+    kind: KIND_LABELS[kind] || '',
+    tier: TIER_LABELS[tier] || tier,
+    access: TIER_LABELS[access] || access,
+    model: str(model.id) || 'Default model',
+    window: hasWindow ? windowTokens : null,
+    fill,
+    pctText: formatPct(fill.pct),
+    fillText: hasWindow
+      ? `~${formatTokens(fill.tokens)} of ${formatTokens(windowTokens)} tokens`
+      : `~${formatTokens(fill.tokens)} tokens · window unknown`,
+    fillSource: fill.measured ? 'measured on the last request' : 'estimated',
+  };
+  const chars = int(instr.chars);
+  const visible = instr.visible === true && typeof instr.text === 'string';
+  const skills = (Array.isArray(instr.skills) ? instr.skills : []).filter((s) => s && typeof s === 'object').map((s) => {
+    const own = str(s.scope) === 'mine';
+    const text = s.visible === true && typeof s.text === 'string' ? s.text : null;
+    return {
+      name: str(s.name) || 'skill',
+      scope: own ? 'mine' : 'admin',
+      scopeLabel: own ? 'Mine' : 'Admin',
+      chars: int(s.chars),
+      charsText: plural(int(s.chars), 'character', 'characters'),
+      text,
+    };
+  });
+  const instructions = {
+    visible,
+    text: visible ? instr.text : null,
+    chars,
+    hiddenText: `${plural(chars, 'character', 'characters')} · shown to admins only`,
+    skills,
+  };
+  const attachments = (Array.isArray(hist.attachments) ? hist.attachments : []).filter((a) => a && typeof a === 'object' && a.file_id != null).map((a) => ({
+    file_id: String(a.file_id),
+    name: str(a.name) || 'file',
+    media_type: str(a.media_type),
+    size: int(a.size),
+    sizeText: formatSize(int(a.size)),
+    excluded: a.excluded === true,
+  }));
+  const measured = hist.measured_tokens == null ? NaN : Number(hist.measured_tokens);
+  const history = {
+    turns: int(hist.turns),
+    messages: int(hist.messages),
+    estimated: int(hist.estimated_tokens),
+    measured: Number.isFinite(measured) && measured >= 0 ? Math.round(measured) : null,
+    summary: `${plural(int(hist.turns), 'turn', 'turns')} · ${plural(int(hist.messages), 'message', 'messages')}`,
+    estimatedText: `~${formatTokens(int(hist.estimated_tokens))} tokens estimated`,
+    measuredText: Number.isFinite(measured) && measured >= 0 ? `${formatTokens(measured)} tokens measured on the last request` : 'not measured yet',
+    attachments,
+  };
+  const byKind = new Map(TOOL_GROUPS.map(([k]) => [k, []]));
+  for (const t of Array.isArray(c.tools) ? c.tools : []) {
+    if (!t || typeof t !== 'object') continue;
+    const k = byKind.has(t.kind) ? t.kind : 'document';
+    const name = str(t.name) || 'tool';
+    const target = str(t.agent);
+    byKind.get(k).push({ kind: k, name, agent: target || null, label: k === 'delegate' && target ? `${name} → ${target}` : name });
+  }
+  const tools = TOOL_GROUPS.map(([kind, label]) => ({ kind, label, items: byKind.get(kind) })).filter((g) => g.items.length);
+  const total = int(usage.total_tokens);
+  const usageOut = {
+    total,
+    totalText: `${formatTokens(total)} tokens`,
+    detail: `${formatTokens(int(usage.input_tokens))} in / ${formatTokens(int(usage.output_tokens))} out · ${plural(int(usage.requests), 'request', 'requests')} over ${plural(int(usage.turns), 'turn', 'turns')}`,
+  };
+  return { who, instructions, history, tools, usage: usageOut };
 }

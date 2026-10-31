@@ -1700,6 +1700,31 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `cap-cds-modeling` (seed skills must not reuse IDE seed skill names:
     `ensure_ide_seed` skips existing names). An admin's tier change applies
     at the next reload, like `expose_chat`. `tests/test_access_tier.py`
+  - **The context of a conversation** (`context.py`): `GET
+    /conversations/{id}/context` answers what the next turn gets: `agent`
+    (ref, name, kind `orchestrator|admin|mine`, tier), `access`, `model`
+    (the id that will run and its `context_window`: a code table by substring,
+    `gpt-4o` 128k, `gpt-5` 400k, `claude` 200k, `gemini` 1M, overridden by
+    `CHAT_CONTEXT_WINDOWS` JSON, exact id then longest prefix; unknown
+    `null`), `instructions` (a personal agent's text always; the orchestrator's
+    and an admin agent's only for the `admin` scope, `is_admin` in
+    `agents/access.py`; skills: own with text, admin by name and length),
+    `history` (turns, messages, chars, `estimated_tokens` = chars/4 plus a
+    fixed figure per binary, `measured_tokens` = the `input_tokens` of the
+    last `ModelResponse` of the last stored turn, `attachments` of the
+    history with `excluded`), `tools` (document, deep, delegate targets the
+    tier allows) and `usage`. Every upload enters the prompt as
+    `BinaryContent(identifier=<file_id>)` (the identifier survives
+    `ModelMessagesTypeAdapter`; it is never sent to the model in a user
+    prompt) or as an `<attachment id="<file_id>" …>` text block, so `POST
+    /conversations/{id}/context/attachments/{file_id}` with exactly
+    `{"excluded": bool}` can rewrite the stored `model_json` of that turn
+    (the part becomes `[attachment "<name>" removed from the context]`;
+    including puts the bytes or the extracted text back from `chat_files`),
+    under the conversation's run lock (409 while a turn runs), 404 for a
+    file that is not an upload of this conversation or whose turn stored no
+    history; `excluded` is derived from the history, no column.
+    `tests/test_webchat_context.py`
 - `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
   ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
   DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`

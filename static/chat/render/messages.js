@@ -49,8 +49,19 @@ function buildUser(message) {
   bubble.className = 'bubble';
   bubble.textContent = message.content || '';
   art.appendChild(bubble);
-  if (message.files && message.files.length) art.appendChild(fileCards(message.files));
   return art;
+}
+
+// The user's file cards: rebuilt when the files or their "in context" state
+// change (the context drawer's switch, addendum e), not on every render.
+function updateUser(el, message, excludedIds) {
+  const files = message.files || [];
+  const sig = files.map((f) => `${f.id || f.file_id || f.name}:${excludedIds.has(String(f.id || f.file_id || '')) ? 'x' : ''}`).join(',');
+  if (el._fsig === sig) return;
+  el._fsig = sig;
+  const prev = el.querySelector(':scope > .file-row');
+  if (prev) prev.remove();
+  if (files.length) el.appendChild(fileCards(files, { excludedIds }));
 }
 
 function buildAssistant() {
@@ -211,8 +222,10 @@ export function createMessageList(container) {
   }
   container.addEventListener('chat:layout', () => scrollToBottom());
 
-  function render(conversation, { live = false, agentName = 'Agents' } = {}) {
+  const NO_IDS = new Set();
+  function render(conversation, { live = false, agentName = 'Agents', excludedIds = NO_IDS } = {}) {
     const messages = conversation?.messages || [];
+    const excluded = excludedIds instanceof Set ? excludedIds : NO_IDS;
     if (container.classList.contains('empty-state')) {
       // the empty state gives way to the first message
       container.classList.remove('empty-state');
@@ -229,6 +242,7 @@ export function createMessageList(container) {
         nodes.set(m.id, el);
       }
       if (m.role === 'assistant') updateAssistant(el, m, live, agentName || 'Agents');
+      else updateUser(el, m, excluded);
       const next = cursor ? cursor.nextSibling : container.firstChild;
       if (next !== el) container.insertBefore(el, next);
       cursor = el;

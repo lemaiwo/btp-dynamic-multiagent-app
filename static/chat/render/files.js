@@ -34,12 +34,19 @@ function thumbnail(id) {
   return thumbs.get(id);
 }
 
-/** One card. `file` = {id|file_id, name, media_type, size}. */
-export function fileCard(file) {
+export const NOT_IN_CONTEXT = 'not in context';
+
+/**
+ * One card. `file` = {id|file_id, name, media_type, size}. An upload the
+ * user excluded from the model's context (`excluded`, or its id in
+ * `excludedIds`) is struck through and says so (addendum e).
+ */
+export function fileCard(file, { excludedIds } = {}) {
   const id = file.id || file.file_id;
   const kind = fileKind(file.media_type, file.name);
+  const excluded = file.excluded === true || (!!id && excludedIds instanceof Set && excludedIds.has(String(id)));
   const card = document.createElement('div');
-  card.className = `file-card kind-${kind}`;
+  card.className = `file-card kind-${kind}${excluded ? ' excluded' : ''}`;
   const tile = document.createElement('div');
   tile.className = 'file-tile';
   tile.appendChild(icon(kind));
@@ -61,7 +68,8 @@ export function fileCard(file) {
   name.title = file.name || '';
   const sub = document.createElement('div');
   sub.className = 'file-sub';
-  sub.textContent = formatSize(file.size);
+  sub.textContent = excluded ? `${formatSize(file.size)} · ${NOT_IN_CONTEXT}` : formatSize(file.size);
+  if (excluded) card.setAttribute('aria-label', `${file.name || 'file'}, ${NOT_IN_CONTEXT}`);
   meta.append(name, sub);
   card.append(tile, meta);
   if (id) {
@@ -76,9 +84,9 @@ export function fileCard(file) {
   return card;
 }
 
-export function fileCards(files) {
+export function fileCards(files, opts = {}) {
   const row = document.createElement('div');
   row.className = 'file-row';
-  for (const f of files) row.appendChild(fileCard(f));
+  for (const f of files) row.appendChild(fileCard(f, opts));
   return row;
 }

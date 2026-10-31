@@ -85,6 +85,14 @@ export const deleteConversation = (id) =>
 export const cancelRun = (id) =>
   request(`/conversations/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
 
+// ---- the context of a conversation (addendum e) ----
+/** GET /conversations/{id}/context: who answers, instructions, history, tools, usage. */
+export const getContext = (id) => request(`/conversations/${encodeURIComponent(id)}/context`);
+/** POST .../context/attachments/{fileId} {excluded}: 409 while a turn runs, 404 for a generated file. */
+export const setAttachmentExcluded = (id, fileId, excluded) =>
+  request(`/conversations/${encodeURIComponent(id)}/context/attachments/${encodeURIComponent(fileId)}`,
+    { method: 'POST', body: { excluded: excluded === true } });
+
 // ---- personal agents and skills, the admin catalogue (addendum c) ----
 /** GET /catalog, or /catalog?access=advanced for the developer tier (addendum d). */
 export const getCatalog = (access) => request(access === 'advanced' || access === 'basic' ? `/catalog?access=${access}` : '/catalog');

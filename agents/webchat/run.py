@@ -566,20 +566,34 @@ class TurnRecorder:
 # ---------------------------------------------------------------------------
 # Prompt and history
 # ---------------------------------------------------------------------------
-def build_prompt(text: str, uploads: list[Upload]) -> list[Any]:
+def attachment_block(name: str, media_type: str, text: str, file_id: str | None) -> str:
+    """The delimited text of an extracted upload. The text is data: a
+    closing tag inside it is defused so it cannot end its own block. The
+    ``id`` attribute is the ``chat_files`` id, by which the context view
+    finds the block again (``agents/webchat/context.py``)."""
+    body = text.replace("</attachment", "<\\/attachment")
+    ident = f" id={quoteattr(file_id)}" if file_id else ""
+    return (f"<attachment name={quoteattr(name)} type={quoteattr(media_type)}{ident}>\n"
+            f"{body}\n</attachment>")
+
+
+def build_prompt(text: str, uploads: list[Upload],
+                 file_ids: list[str] | None = None) -> list[Any]:
     """``[BinaryContent…, "<attachment …>…</attachment>"…, text]``.
 
-    The extracted text of a file is data: it is delimited, and a closing tag
-    inside it is defused so it cannot end its own block.
+    ``file_ids`` are the ``chat_files`` ids of ``uploads``, in the same
+    order: a binary upload carries its id as the ``BinaryContent``
+    identifier (pydantic-ai keeps it in the stored ``model_json``), so the
+    context view can take the bytes out of a stored turn and put them back.
     """
-    prompt: list[Any] = [BinaryContent(data=u.data, media_type=u.media_type)
-                         for u in uploads if u.binary]
-    for u in uploads:
+    ids: list[str | None] = list(file_ids or [])
+    ids += [None] * (len(uploads) - len(ids))
+    prompt: list[Any] = [BinaryContent(data=u.data, media_type=u.media_type, identifier=fid)
+                         for u, fid in zip(uploads, ids) if u.binary]
+    for u, fid in zip(uploads, ids):
         if u.binary or u.text is None:
             continue
-        body = u.text.replace("</attachment", "<\\/attachment")
-        prompt.append(f"<attachment name={quoteattr(u.name)} type={quoteattr(u.media_type)}>\n"
-                      f"{body}\n</attachment>")
+        prompt.append(attachment_block(u.name, u.media_type, u.text, fid))
     prompt.append(text)
     return prompt
 
@@ -642,9 +656,10 @@ def _model_id(model: Any) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
-async def _personal_model(stored: str | None, picked: str | None) -> tuple[Any, str]:
-    """A personal agent's model: its own when still offered, else the
-    conversation's pick, else the default (the orchestrator's model)."""
+async def personal_model_name(stored: str | None, picked: str | None) -> str | None:
+    """The checked model of a personal agent: its own when still offered,
+    else the conversation's pick; ``None`` for the default (the
+    orchestrator's model)."""
     for name in (stored, picked):
         if not name:
             continue
@@ -652,9 +667,14 @@ async def _personal_model(stored: str | None, picked: str | None) -> tuple[Any, 
             checked = await catalog.check(name)
         except UnknownModel:
             continue
-        if checked is not None:
-            return catalog.build(checked), checked
-        break
+        return checked
+    return None
+
+
+async def _personal_model(stored: str | None, picked: str | None) -> tuple[Any, str]:
+    checked = await personal_model_name(stored, picked)
+    if checked is not None:
+        return catalog.build(checked), checked
     return registry.orchestrator.model, catalog.default_name()
 
 

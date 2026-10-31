@@ -84,7 +84,15 @@ export function createComposer(root, { getLimits, onSend, onStop, notify, dropZo
   row.append(attach, textarea, send, stop);
   const hint = document.createElement('p');
   hint.className = 'composer-hint';
-  hint.textContent = 'Enter to send, Shift+Enter for a new line. The agents can make mistakes; check what matters.';
+  const hintText = document.createElement('span');
+  hintText.className = 'composer-hint-text';
+  hintText.textContent = 'Enter to send, Shift+Enter for a new line. The agents can make mistakes; check what matters.';
+  // the context indicator (addendum e): "~12.4k / 128k", from the last context answer
+  const indicator = document.createElement('span');
+  indicator.className = 'context-indicator';
+  indicator.hidden = true;
+  indicator.setAttribute('role', 'status');
+  hint.append(hintText, indicator);
   form.append(chips, row, picker, hint);
   root.appendChild(form);
 
@@ -230,6 +238,15 @@ export function createComposer(root, { getLimits, onSend, onStop, notify, dropZo
     setText(text) { textarea.value = text; grow(); refresh(); textarea.focus(); textarea.setSelectionRange(text.length, text.length); },
     focus() { textarea.focus(); },
     clearFiles() { files = []; renderChips(); refresh(); },
+    /** The context indicator: `text` '' hides it; `level` is ok | warn | danger. */
+    setContext({ text = '', level = 'ok', title = '' } = {}) {
+      indicator.textContent = text;
+      indicator.title = title;
+      indicator.setAttribute('aria-label', title ? `Context: ${text}, ${title}` : (text ? `Context: ${text}` : ''));
+      indicator.classList.toggle('warn', level === 'warn');
+      indicator.classList.toggle('danger', level === 'danger');
+      indicator.hidden = !text;
+    },
     get files() { return files; },
   };
 }

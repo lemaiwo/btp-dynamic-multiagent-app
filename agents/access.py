@@ -51,6 +51,19 @@ def is_developer(claims: dict[str, Any] | None) -> bool:
     scope (the rules of ``require_developer`` / ``require_admin``). Without
     an XSUAA validator (local development) it is assumed; a validator that
     cannot be set up admits nobody."""
+    return _has_any_scope(claims, ADVANCED_SCOPES)
+
+
+def is_admin(claims: dict[str, Any] | None) -> bool:
+    """Whether ``claims`` carry the admin scope (the rule of
+    ``require_admin``), with :func:`is_developer`'s behaviour: assumed
+    without an XSUAA validator, nobody with a validator that cannot be set
+    up. The web chat's context view shows admin-authored instructions only
+    to an admin."""
+    return _has_any_scope(claims, (ADMIN_SCOPE,))
+
+
+def _has_any_scope(claims: dict[str, Any] | None, scopes: tuple[str, ...]) -> bool:
     try:
         validator = auth.get_validator()
     except Exception:  # noqa: BLE001 - AuthConfigurationError: fail closed
@@ -59,7 +72,7 @@ def is_developer(claims: dict[str, Any] | None) -> bool:
         return True
     if not isinstance(claims, dict):
         return False
-    return any(bool(validator.has_scope(claims, scope)) for scope in ADVANCED_SCOPES)
+    return any(bool(validator.has_scope(claims, scope)) for scope in scopes)
 
 
 def caller_is_developer() -> bool:

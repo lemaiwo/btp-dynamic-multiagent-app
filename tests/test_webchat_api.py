@@ -381,8 +381,10 @@ async def test_a_turn_streams_its_events_and_is_stored(client, monkeypatch,
     # The model got the image as bytes and the CSV as a delimited block.
     first_request = script.seen[0][-1]
     prompt = next(p for p in first_request.parts if isinstance(p, UserPromptPart)).content
-    assert prompt[0].media_type == "image/png"
-    assert prompt[1].startswith('<attachment name="notes.csv" type="text/csv">\na,b')
+    png_id, csv_id = (f["id"] for f in start["files"])
+    assert prompt[0].media_type == "image/png" and prompt[0].identifier == png_id
+    assert prompt[1].startswith(
+        f'<attachment name="notes.csv" type="text/csv" id="{csv_id}">\na,b')
     assert prompt[-1].startswith("Quarterly numbers")
 
     detail = (await client.get(f"{API}/conversations/{cid}")).json()

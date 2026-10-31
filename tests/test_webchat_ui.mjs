@@ -29,7 +29,10 @@ const util = await import('../static/chat/util.js');
 const { toSafeHtml, renderMarkdown } = await import('../static/chat/render/markdown.js');
 const my = await import('../static/chat/myagents.js');
 const { attachmentFilename } = await import('../static/chat/api.js');
-const { renderEmpty, DEVELOPER_PROMPTS, DEVELOPER_GREETING } = await import('../static/chat/render/messages.js');
+const { renderEmpty, DEVELOPER_PROMPTS, DEVELOPER_GREETING, createMessageList } = await import('../static/chat/render/messages.js');
+const { contextViewModel, excludedFileIds } = await import('../static/chat/state.js');
+const { fileCard, fileCards, NOT_IN_CONTEXT } = await import('../static/chat/render/files.js');
+const { renderContextBody, IN_CONTEXT } = await import('../static/chat/render/contextDrawer.js');
 
 // ---------------------------------------------------------------- SSE parser
 console.log('\n== SSE parser ==');
@@ -356,6 +359,118 @@ console.log('\n== the developer empty state ==');
   check('basic: the usual heading and chips, no tag', box.querySelector('.greeting').textContent === 'What are we doing on BTP today?' && !box.querySelector('.dev-tag') && box.querySelectorAll('.prompt-chip').length === 3 && !eq([...box.querySelectorAll('.prompt-chip')].map((b) => b.textContent), DEVELOPER_PROMPTS));
   renderEmpty(box, { appName: 'App', onPrompt: () => {}, advanced: true, agentName: 'abap-developer-deep', agentDescription: 'd' });
   check('advanced with an agent picked: "Ask <agent>" and the standard chips', box.querySelector('.greeting').textContent.startsWith('Ask abap-developer-deep') && !eq([...box.querySelectorAll('.prompt-chip')].map((b) => b.textContent), DEVELOPER_PROMPTS));
+}
+
+// ---------------------------------------------------------------- the context of a conversation (addendum e)
+console.log('\n== fillLevel ==');
+{
+  check('measured wins over the estimate', eq(util.fillLevel(20000, 12400, 128000), { tokens: 12400, pct: 9.6875, level: 'ok', measured: true }));
+  check('estimated when nothing was measured', eq(util.fillLevel(12400, null, 128000), { tokens: 12400, pct: 9.6875, level: 'ok', measured: false }));
+  check('no window: pct null and level ok', util.fillLevel(12400, null, null).pct === null && util.fillLevel(12400, null, 0).pct === null && util.fillLevel(500000, null, undefined).level === 'ok');
+  check('warn above 70, danger above 90, the boundaries stay below', util.fillLevel(0, 70000, 100000).level === 'ok' && util.fillLevel(0, 70001, 100000).level === 'warn' && util.fillLevel(0, 90000, 100000).level === 'warn' && util.fillLevel(0, 90001, 100000).level === 'danger' && util.fillLevel(0, 150000, 100000).level === 'danger');
+  check('garbage is zero tokens, never NaN', eq(util.fillLevel('x', undefined, 'y'), { tokens: 0, pct: null, level: 'ok', measured: false }) && util.fillLevel(-5, -1, 1000).tokens === 0);
+  check('formatPct rounds, says <1% for a sliver and nothing for null', util.formatPct(12.4) === '12%' && util.formatPct(0.4) === '<1%' && util.formatPct(0) === '0%' && util.formatPct(null) === '' && util.formatPct(NaN) === '');
+}
+
+console.log('\n== the composer indicator text ==');
+{
+  check('with a window: "~12.4k / 128k"', util.contextIndicatorText({ model: { context_window: 128000 }, history: { estimated_tokens: 12400, measured_tokens: null } }) === '~12.4k / 128k');
+  check('the measured figure is the one shown', util.contextIndicatorText({ model: { context_window: 128000 }, history: { estimated_tokens: 99000, measured_tokens: 12400 } }) === '~12.4k / 128k');
+  check('without a window: "~12.4k tokens"', util.contextIndicatorText({ model: { id: 'x', context_window: null }, history: { estimated_tokens: 12400 } }) === '~12.4k tokens');
+  check('without data: empty (the indicator hides)', util.contextIndicatorText(null) === '' && util.contextIndicatorText({}) === '' && util.contextIndicatorText({ history: 'no' }) === '');
+}
+
+const SAMPLE_CONTEXT = {
+  agent: { ref: 'mine:7', name: 'Quota watcher', kind: 'mine', tier: 'basic' },
+  access: 'basic',
+  model: { id: 'gpt-4o', context_window: 128000 },
+  instructions: { visible: true, text: 'You watch the entitlements.', chars: 27, skills: [
+    { scope: 'mine', name: 'weekly-quota-report', chars: 240, visible: true, text: '# Weekly\nOne table per subaccount.' },
+    { scope: 'admin', name: 'btp-naming-conventions', chars: 180, visible: false, text: null },
+  ] },
+  history: { turns: 2, messages: 4, chars: 49600, estimated_tokens: 12400, measured_tokens: 15300, attachments: [
+    { file_id: 'f1', name: 'subaccounts.png', media_type: 'image/png', size: 2048, excluded: false },
+    { file_id: 'f2', name: 'quota.pdf', media_type: 'application/pdf', size: 1048576, excluded: true },
+  ] },
+  tools: [
+    { kind: 'document', name: 'create_word_document' }, { kind: 'document', name: 'create_excel_workbook' },
+    { kind: 'delegate', name: 'delegate_to_btp_admin', agent: 'btp-admin' },
+    { kind: 'deep', name: 'write_todos' },
+  ],
+  usage: { input_tokens: 4390, output_tokens: 876, total_tokens: 5266, requests: 7, turns: 2 },
+};
+
+console.log('\n== the drawer view model ==');
+{
+  const vm = contextViewModel(SAMPLE_CONTEXT);
+  check('who answers: agent, kind label, tier, access, model', vm.who.agent === 'Quota watcher' && vm.who.kind === 'Personal agent' && vm.who.tier === 'Basic' && vm.who.access === 'Basic' && vm.who.model === 'gpt-4o');
+  check('the fill: measured wins, "12%" and "~15.3k of 128k tokens"', vm.who.window === 128000 && vm.who.pctText === '12%' && vm.who.fillText === '~15.3k of 128k tokens' && vm.who.fill.level === 'ok' && vm.who.fillSource.startsWith('measured'));
+  check('instructions visible with their text', vm.instructions.visible && vm.instructions.text === 'You watch the entitlements.');
+  check('skills: own with text, admin by name and length', vm.instructions.skills.length === 2 && vm.instructions.skills[0].scope === 'mine' && vm.instructions.skills[0].text.startsWith('# Weekly') && vm.instructions.skills[1].scope === 'admin' && vm.instructions.skills[1].text === null && vm.instructions.skills[1].charsText === '180 characters');
+  check('history: summary, estimated and measured texts', vm.history.summary === '2 turns · 4 messages' && vm.history.estimatedText === '~12.4k tokens estimated' && vm.history.measuredText === '15.3k tokens measured on the last request');
+  check('attachments with size text and the excluded flag', vm.history.attachments.length === 2 && vm.history.attachments[0].sizeText === '2 KB' && vm.history.attachments[0].excluded === false && vm.history.attachments[1].excluded === true && vm.history.attachments[1].sizeText === '1 MB');
+  check('tools grouped by kind in a fixed order, the delegate target named', eq(vm.tools.map((g) => g.kind), ['document', 'deep', 'delegate']) && vm.tools[0].items.length === 2 && vm.tools[2].items[0].label === 'delegate_to_btp_admin → btp-admin' && vm.tools[2].items[0].agent === 'btp-admin');
+  check('usage: total and detail', vm.usage.totalText === '5,266 tokens' && vm.usage.detail === '4,390 in / 876 out · 7 requests over 2 turns');
+  const hidden = contextViewModel({ ...SAMPLE_CONTEXT, agent: { kind: 'orchestrator', name: 'Orchestrator' }, instructions: { visible: false, text: null, chars: 1234, skills: [] }, model: { id: 'm', context_window: null }, history: { ...SAMPLE_CONTEXT.history, measured_tokens: null } });
+  check('hidden instructions: "1,234 characters · shown to admins only"; no window: tokens without a percentage; no measure: estimated', hidden.instructions.hiddenText === '1,234 characters · shown to admins only' && hidden.who.kind === 'Orchestrator' && hidden.who.window === null && hidden.who.pctText === '' && hidden.who.fillText === '~12.4k tokens · window unknown' && hidden.who.fillSource === 'estimated' && hidden.history.measuredText === 'not measured yet');
+  check('an empty or odd answer is a usable model', contextViewModel(null).who.agent === 'Agent' && contextViewModel({ tools: 'x', history: { attachments: [null, { name: 'no id' }] } }).history.attachments.length === 0 && contextViewModel({}).tools.length === 0);
+  check('excludedFileIds: the excluded ids as strings', eq([...excludedFileIds(SAMPLE_CONTEXT)], ['f2']) && excludedFileIds(null).size === 0 && excludedFileIds({ history: { attachments: [{ file_id: 3, excluded: 'true' }] } }).size === 0);
+}
+
+console.log('\n== the drawer body (text nodes only) ==');
+{
+  const body = document.createElement('div');
+  const calls = [];
+  renderContextBody(body, { ...SAMPLE_CONTEXT, agent: { ...SAMPLE_CONTEXT.agent, name: '<b>evil</b>' } }, { onToggle: async (id, ex) => { calls.push([id, ex]); return ex; } });
+  const heads = [...body.querySelectorAll('.ctx-section > h3')].map((h) => h.textContent);
+  check('five sections in order', eq(heads, ['Who answers', 'Instructions & skills', 'History', 'Tools this turn', 'Usage so far']));
+  check('server text is a text node, never markup', body.querySelector('b') === null && body.textContent.includes('<b>evil</b>'));
+  check('the fill bar is a meter at 12', body.querySelector('.fill-bar[role="meter"]').getAttribute('aria-valuenow') === '12' && body.querySelector('.fill-text').textContent.startsWith('12% · ~15.3k of 128k tokens'));
+  const rows = [...body.querySelectorAll('.ctx-table tbody tr')];
+  check('one attachment row per upload with an In context switch; the excluded one is marked', rows.length === 2 && rows[1].classList.contains('excluded') && rows[0].querySelector('input[role="switch"]').checked === true && rows[1].querySelector('input[role="switch"]').checked === false && rows[0].querySelector('input').getAttribute('aria-label') === `${IN_CONTEXT}: subaccounts.png`);
+  const sw = rows[0].querySelector('input');
+  sw.checked = false;
+  sw.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 0));
+  check('switching off posts excluded=true and marks the row', eq(calls, [['f1', true]]) && rows[0].classList.contains('excluded') && sw.disabled === false);
+  const body409 = document.createElement('div');
+  renderContextBody(body409, SAMPLE_CONTEXT, { onToggle: async () => { throw Object.assign(new Error('409'), { status: 409 }); } });
+  const sw409 = body409.querySelector('.ctx-table tbody tr input');
+  sw409.checked = false;
+  sw409.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 0));
+  check('a refused toggle (409 while a turn runs) puts the switch back and leaves the row as it was', sw409.checked === true && !sw409.closest('tr').classList.contains('excluded') && sw409.disabled === false);
+  const sw409b = body409.querySelectorAll('.ctx-table tbody tr input')[1];
+  sw409b.checked = true;
+  sw409b.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((r) => setTimeout(r, 0));
+  check('the same the other way round: an excluded file stays excluded', sw409b.checked === false && sw409b.closest('tr').classList.contains('excluded'));
+  const body2 = document.createElement('div');
+  renderContextBody(body2, { ...SAMPLE_CONTEXT, instructions: { visible: false, text: null, chars: 1234, skills: [] } });
+  check('hidden instructions show the length line only', body2.querySelector('.ctx-pre') === null && body2.textContent.includes('1,234 characters · shown to admins only'));
+  check('a delegate tool names its target', body2.querySelector('.ctx-target').textContent === 'btp-admin');
+}
+
+console.log('\n== the excluded state on file cards ==');
+{
+  const c = fileCard({ id: 'f2', name: 'quota.pdf', media_type: 'application/pdf', size: 1048576 }, { excludedIds: new Set(['f2']) });
+  check('an excluded upload: class, "not in context" and the aria label', c.classList.contains('excluded') && c.querySelector('.file-sub').textContent === `1 MB · ${NOT_IN_CONTEXT}` && c.getAttribute('aria-label') === `quota.pdf, ${NOT_IN_CONTEXT}`);
+  const plain = fileCard({ id: 'f1', name: 'a.png', media_type: 'image/png', size: 10 }, { excludedIds: new Set(['f2']) });
+  check('another file is untouched', !plain.classList.contains('excluded') && plain.querySelector('.file-sub').textContent === '10 B');
+  check('the flag on the file itself works too; the download link stays', fileCard({ id: 'f1', name: 'a.png', media_type: 'image/png', size: 10, excluded: true }).classList.contains('excluded') && !!fileCard({ id: 'f2', name: 'q.pdf', size: 1, excluded: true }).querySelector('.file-download'));
+  check('fileCards passes the set through', fileCards([{ id: 'f2', name: 'q.pdf', size: 1 }], { excludedIds: new Set(['f2']) }).querySelector('.file-card.excluded') !== null);
+  // through the message list: the user card follows the set across renders
+  const log = document.createElement('section'); log.className = 'log';
+  const col = document.createElement('div'); log.appendChild(col); document.body.appendChild(log);
+  const list = createMessageList(col);
+  const conv = { messages: [{ id: 'u1', role: 'user', content: 'hi', files: [{ id: 'f2', name: 'quota.pdf', media_type: 'application/pdf', size: 5, kind: 'upload' }] }, { id: 'a1', role: 'assistant', content: 'ok', parts: [], status: 'done' }] };
+  list.render(conv, {});
+  check('without a set the card is plain', col.querySelector('.msg.user .file-card') !== null && col.querySelector('.msg.user .file-card.excluded') === null);
+  list.render(conv, { excludedIds: new Set(['f2']) });
+  check('with the id in the set the user card is struck through', col.querySelector('.msg.user .file-card.excluded') !== null && col.querySelectorAll('.msg.user .file-row').length === 1);
+  list.render(conv, { excludedIds: new Set() });
+  check('and back', col.querySelector('.msg.user .file-card.excluded') === null && col.querySelectorAll('.msg.user .file-row').length === 1);
+  log.remove();
 }
 
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
