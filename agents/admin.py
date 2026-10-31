@@ -42,9 +42,11 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    PrivateAttr,
     StrictBool,
     StrictStr,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -78,6 +80,7 @@ from agents.db import (
     AUTH_MODE_SESSION,
     BITBUCKET_APPROVER_CHAT_MESSAGE,
     BITBUCKET_APPROVER_INVOKE_MESSAGE,
+    BITBUCKET_APPROVER_SHARE_MESSAGE,
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
     KEEP,
@@ -996,6 +999,33 @@ class AgentPayload(BaseModel):
     # --- access tier (agents/access.py) --- None (absent) keeps the stored
     # value; a new row is "basic". Any other string is a 422 at the field.
     tier: Literal["basic", "advanced"] | None = None
+    # --- tools usable by personal agents (web chat addendum (g)) --- lax
+    # boolean like expose_chat; None (absent or null) keeps the stored value,
+    # a new row is off. Declared after mcp_servers: its validator reads them.
+    share_tools: bool | None = None
+    # Whether the body held the JSON boolean true itself (the import's rule:
+    # the string "true" of a hand-written bundle must not share anything).
+    _share_tools_json_true: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _remember_share_tools(cls, data: Any, handler: Any) -> "AgentPayload":
+        model = handler(data)
+        if isinstance(data, dict):
+            model._share_tools_json_true = data.get("share_tools") is True
+        return model
+
+    @field_validator("share_tools")
+    @classmethod
+    def _approver_shares_nothing(cls, v: bool | None, info: ValidationInfo) -> bool | None:
+        """An approving ``builtin:bitbucket`` agent never shares its tools: a
+        personal agent would approve with a chat user's prompt. At the field,
+        so the 422 names ``share_tools``; storage checks again
+        (`agents.db.check_bitbucket_approver_reach`)."""
+        servers = _servers_list(info.data.get("mcp_servers") or [])
+        if v is True and bitbucket_approves(servers):
+            raise ValueError(BITBUCKET_APPROVER_SHARE_MESSAGE)
+        return v
 
     @field_validator("result_schema")
     @classmethod
@@ -1148,14 +1178,30 @@ class AgentPayload(BaseModel):
         (KEEP) otherwise, so an older client or bundle keeps the tier."""
         return {"tier": self.tier} if self.tier is not None else {}
 
+    def share_tools_kwargs(self, *, strict: bool = False) -> dict[str, Any]:
+        """``upsert_agent``'s ``share_tools`` when the client sent one;
+        nothing (KEEP) otherwise. ``strict`` (the import): on only for the
+        JSON boolean true of the body, not for what the lax bool accepts."""
+        if self.share_tools is None:
+            return {}
+        if strict:
+            return {"share_tools": self._share_tools_json_true}
+        return {"share_tools": self.share_tools is True}
+
     def to_servers_list(self) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for s in self.mcp_servers:
-            entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
-            if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
-                entry["oauth"] = s.oauth.to_config()
-            out.append(entry)
-        return out
+        return _servers_list(self.mcp_servers)
+
+
+def _servers_list(servers: list[Any]) -> list[dict[str, Any]]:
+    """The storage form of validated ``McpServerPayload`` entries (url,
+    auth mode and the oauth block where the mode has one)."""
+    out: list[dict[str, Any]] = []
+    for s in servers:
+        entry: dict[str, Any] = {"url": s.url, "auth_mode": s.auth_mode}
+        if s.auth_mode in OAUTH_CONFIG_MODES and s.oauth is not None:
+            entry["oauth"] = s.oauth.to_config()
+        out.append(entry)
+    return out
 
 
 class OrchestratorPayload(BaseModel):
@@ -1370,6 +1416,7 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
                 deep_json=_deep_json_or_keep(payload.deep),
                 **payload.invoke_kwargs(),
                 **payload.tier_kwargs(),
+                **payload.share_tools_kwargs(),
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
@@ -1489,6 +1536,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         # one, else the stored one (an older client keeps it).
         invoke = payload.invoke_kwargs()
         invoke_on = invoke.get("expose_invoke", bool(row.expose_invoke))
+        share_on = payload.share_tools_kwargs().get("share_tools", bool(row.share_tools))
         try:
             primary, extras, primary_oauth_json = prepare_servers(
                 payload.to_servers_list(), row
@@ -1510,6 +1558,7 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
                 expose_chat=payload.expose_chat,
                 peers=list(row.peers) if payload.peers is None else payload.peers,
                 expose_invoke=invoke_on,
+                share_tools=share_on,
             )
             skills_json = await normalize_skills_json(session, payload.skills)
 
@@ -1573,6 +1622,10 @@ async def api_update_agent(agent_id: int, payload: AgentPayload) -> dict[str, An
         # expose_chat does.
         if payload.tier is not None:
             row.tier = payload.tier
+        # --- tools usable by personal agents --- read by the next build
+        # (`BuildResult.shared_toolsets`); a personal agent's turn re-reads the
+        # row, so switching it off applies to the next turn.
+        row.share_tools = 1 if share_on else 0
         # --- invoke API --- No registry reload for these: the invoke route
         # reads the row on every call (`agents.invoke.invoke_agent`). The
         # schema and limits were checked (and the limits cleaned) by the
@@ -2596,6 +2649,8 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                         # A bundle without these keys keeps what is stored.
                         **agent.invoke_kwargs(),
                         **agent.tier_kwargs(),
+                        # Only the JSON boolean true shares.
+                        **agent.share_tools_kwargs(strict=True),
                     )
                 except ValueError as e:
                     errors.append(f"Agent '{agent.name}': {e}")
@@ -2878,6 +2933,7 @@ async def seed_from_file_if_empty(seed_path: Path) -> None:
                     deep_json=_deep_json_or_keep(payload.deep),
                     **payload.invoke_kwargs(),
                     **payload.tier_kwargs(),
+                    **payload.share_tools_kwargs(strict=True),
                 )
             except ValueError as e:
                 logger.warning("Skipping invalid seed entry '%s': %s",

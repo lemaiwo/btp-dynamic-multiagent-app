@@ -3,7 +3,8 @@
 Owner-scoped throughout: every read and write takes the caller's principal
 (``store.caller()``), and a row of another principal is simply not found.
 Statements run on SQLite, Postgres and SAP HANA alike: the ``Text`` columns
-(``instructions``, ``content``, ``skills_json``, ``consults_json``) are never
+(``instructions``, ``content``, ``skills_json``, ``consults_json``,
+``tools_json``) are never
 compared, ordered or grouped; a cascade that edits ``skills_json`` reads the
 caller's rows and rewrites them in Python.
 
@@ -48,10 +49,11 @@ class NameTaken(Exception):
 # ---------------------------------------------------------------------------
 # Answers
 # ---------------------------------------------------------------------------
-def agent_out(row: ChatUserAgent,
-              usable: dict[str, Any] | None = None) -> dict[str, Any]:
-    """``usable`` are the chat-usable admin agents (``ua.chat_agents``), for
-    the agent's ``tier``; without them only ``deep`` decides it."""
+def agent_out(row: ChatUserAgent, usable: dict[str, Any] | None = None,
+              sources: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``usable`` are the chat-usable admin agents (``ua.chat_agents``) and
+    ``sources`` the admin agents that share their tools (``ua.tool_sources``),
+    for the agent's ``tier``; without them only ``deep`` decides it."""
     return {
         "id": row.id,
         "ref": f"{ua.MINE_PREFIX}{row.id}",
@@ -60,9 +62,10 @@ def agent_out(row: ChatUserAgent,
         "instructions": row.instructions,
         "skills": ua.skill_refs(row),
         "consults": ua.consult_names(row),
+        "tools": ua.tool_names(row),
         "model": row.model_name,
         "deep": bool(row.deep),
-        "tier": ua.personal_tier(row, usable or {}),
+        "tier": ua.personal_tier(row, usable or {}, sources),
         "created_at": iso_utc(row.created_at),
         "updated_at": iso_utc(row.updated_at),
         "source": "mine",
@@ -142,6 +145,7 @@ class Refs:
 
     skills: list[dict[str, str]] = field(default_factory=list)
     consults: list[str] = field(default_factory=list)
+    tools: list[str] = field(default_factory=list)
     deep: bool = False
     problems: list[tuple[tuple[Any, ...], str]] = field(default_factory=list)
 
@@ -153,7 +157,9 @@ async def resolve_refs(db: AsyncSession, principal: str, data: m.AgentIn,
     now: admin skills by exact name, own skills by name (case-insensitive,
     stored in the skill's own spelling; ``own_names`` maps key -> name when
     the caller already knows them), consults among the chat-usable admin
-    agents. ``deep`` and an advanced consult only for a ``developer``."""
+    agents, tools among the admin agents that share them
+    (``ua.tool_sources``). ``deep``, an advanced consult and an advanced tool
+    source only for a ``developer``."""
     out = Refs()
     if data.deep:
         if developer:
@@ -178,7 +184,35 @@ async def resolve_refs(db: AsyncSession, principal: str, data: m.AgentIn,
             out.consults.append(name)
         else:
             out.problems.append((("consults", index), "consults"))
+    sources = await ua.tool_sources(db) if data.tools else {}
+    for index, name in enumerate(data.tools):
+        problem = tool_problem(sources, name, developer)
+        if problem is None:
+            out.tools.append(name)
+        else:
+            out.problems.append((("tools", index), problem))
     return out
+
+
+TOOLS_NOT_SOURCE = "tools: not a tool source you can use"
+TOOLS_ADVANCED = "tools: advanced tools need the developer role"
+# The problem kinds of a tool source; the routes' messages and the import's
+# dropped rules are the texts above.
+PROBLEM_TOOLS = "tools"
+PROBLEM_TOOLS_ADVANCED = "tools_advanced"
+TOOL_RULES = {PROBLEM_TOOLS: TOOLS_NOT_SOURCE, PROBLEM_TOOLS_ADVANCED: TOOLS_ADVANCED}
+
+
+def tool_problem(sources: dict[str, Any], name: str, developer: bool) -> str | None:
+    """Why ``name`` may not be stored as a tool source of this caller's
+    agent (a problem kind), or ``None``: it must share its tools now, and an
+    advanced one needs a ``developer``."""
+    source = sources.get(name)
+    if source is None:
+        return PROBLEM_TOOLS
+    if not developer and not agent_allowed(source, BASIC):
+        return PROBLEM_TOOLS_ADVANCED
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +225,7 @@ def _apply_agent(row: ChatUserAgent, data: m.AgentIn, refs: Refs) -> None:
     row.instructions = data.instructions
     row.skills_json = _dump(refs.skills)
     row.consults_json = _dump(refs.consults)
+    row.tools_json = _dump(refs.tools)
     row.model_name = data.model
     row.deep = 1 if refs.deep else 0
 
@@ -340,8 +375,8 @@ async def export_bundle(db: AsyncSession, principal: str, *, agent_ids: list[str
         "agents": [
             {"name": a.name, "description": a.description or "",
              "instructions": a.instructions, "skills": ua.skill_refs(a),
-             "consults": ua.consult_names(a), "model": a.model_name,
-             "deep": bool(a.deep)}
+             "consults": ua.consult_names(a), "tools": ua.tool_names(a),
+             "model": a.model_name, "deep": bool(a.deep)}
             for a in agents
         ],
         "skills": [
@@ -368,8 +403,12 @@ class _Import:
     def error(self, item: str, field_name: str, rule: str) -> None:
         self.report["errors"].append({"item": item, "field": field_name, "rule": rule})
 
-    def drop(self, item: str, field_name: str, name: str | None) -> None:
-        self.report["dropped"].append({"item": item, "field": field_name, "name": name})
+    def drop(self, item: str, field_name: str, name: str | None,
+             rule: str | None = None) -> None:
+        entry: dict[str, Any] = {"item": item, "field": field_name, "name": name}
+        if rule is not None:
+            entry["rule"] = rule
+        self.report["dropped"].append(entry)
 
 
 def _validated(state: _Import, model: Any, kind: str, raw: Any, index: int) -> tuple[str, Any]:
@@ -419,8 +458,9 @@ async def import_bundle(db: AsyncSession, principal: str, bundle: dict[str, Any]
     ``bundle`` has been checked for its format and caps by the route;
     ``models`` are the model ids offered here (another one is dropped to the
     default and reported). For a caller who is not a ``developer``, ``deep``
-    and consults of advanced admin agents are dropped and reported. One
-    commit at the end.
+    and consults of advanced admin agents are dropped and reported; a tool
+    source that does not share here, or an advanced one for such a caller,
+    is dropped with its rule text. One commit at the end.
     """
     state = _Import(principal, on_conflict)
     now = utcnow()
@@ -460,6 +500,7 @@ async def import_bundle(db: AsyncSession, principal: str, bundle: dict[str, Any]
 
     admin_skills = await ua.admin_skill_names(db)
     usable = await ua.chat_agents(db)
+    sources = await ua.tool_sources(db)
     seen = set()
     count = len(agents)
     for index, raw in enumerate(bundle.get("agents") or []):
@@ -487,6 +528,12 @@ async def import_bundle(db: AsyncSession, principal: str, bundle: dict[str, Any]
                 refs.consults.append(name)
             else:
                 state.drop(label, "consults", name)
+        for name in data.tools:
+            problem = tool_problem(sources, name, developer)
+            if problem is None:
+                refs.tools.append(name)
+            else:
+                state.drop(label, "tools", name, TOOL_RULES[problem])
         if data.deep:
             if developer:
                 refs.deep = True

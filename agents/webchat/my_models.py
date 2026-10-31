@@ -31,6 +31,8 @@ INSTRUCTIONS_MAX = 20_000
 CONTENT_MAX = 50_000
 MAX_AGENT_SKILLS = 20
 MAX_CONSULTS = 10
+# Admin agents whose tools a personal agent may use (addendum (g)).
+MAX_TOOLS = 5
 MODEL_MAX = 128
 BUNDLE_MAX_BYTES = 1024 * 1024
 BUNDLE_FORMAT = "webchat-bundle/1"
@@ -100,6 +102,9 @@ class AgentIn(BaseModel):
                             Field(min_length=1, max_length=INSTRUCTIONS_MAX)]
     skills: list[SkillRef] = Field(default_factory=list, max_length=MAX_AGENT_SKILLS)
     consults: list[Name] = Field(default_factory=list, max_length=MAX_CONSULTS)
+    # Admin agents that share their tools (``share_tools``); checked against
+    # what the caller may use, not here.
+    tools: list[Name] = Field(default_factory=list, max_length=MAX_TOOLS)
     model: Annotated[str, Field(min_length=1, max_length=MODEL_MAX)] | None = None
     # The deep-agent tools (plan, scratchpad, sub-agents); only a developer
     # may switch them on (checked against the caller, not here).
@@ -124,9 +129,9 @@ class AgentIn(BaseModel):
                 out.append(ref)
         return out
 
-    @field_validator("consults")
+    @field_validator("consults", "tools")
     @classmethod
-    def _distinct_consults(cls, value: list[str]) -> list[str]:
+    def _distinct_names(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(value))
 
 
@@ -178,8 +183,8 @@ _RULES = {
     "value_error": RULE_TOO_SHORT,
 }
 _FIELDS = {"name", "description", "instructions", "skills", "consults", "model", "content",
-           "deep"}
-_LIST_FIELDS = {"skills", "consults"}
+           "deep", "tools"}
+_LIST_FIELDS = {"skills", "consults", "tools"}
 UNKNOWN_FIELD = "<unknown field>"
 
 

@@ -406,7 +406,7 @@ export default class FakeBackend {
             id: this.nextId++, name, description: `${name} description`,
             instructions: "Do the thing.",
             mcp_servers: [{ url: "https://x.hana.ondemand.com/mcp", auth_mode: "jwt" }],
-            skills: [], enabled: true, expose_chat: true, tier: "basic", expose_api: false,
+            skills: [], enabled: true, expose_chat: true, tier: "basic", share_tools: false, expose_api: false,
             api_slug: "", run_as_principal: "", run_prompt: "",
             run_timeout_seconds: 1800, peers: [], model_name: "",
             deep: { ...DEEP_DEFAULTS },
@@ -1136,6 +1136,16 @@ export default class FakeBackend {
      * the block in every answer. Returns the refusal, or "" after rewriting
      * the entries in `body` to what is stored.
      */
+    /** Whether the agent being saved has a builtin:bitbucket entry with
+     *  `allow_approve: true` (the body's servers, else the stored ones). */
+    private approvesPullRequests(body: Record<string, unknown>, path: string): boolean {
+        const stored = /^agents\/\d+$/.test(path)
+            ? this.agents.find((a) => a.id === Number(path.split("/")[1]))?.mcp_servers : undefined;
+        const servers = (body.mcp_servers ?? stored ?? []) as { url: string; oauth?: Record<string, unknown> | null }[];
+        return servers.some((server) => String(server.url).trim().toLowerCase() === "builtin:bitbucket"
+            && server.oauth?.allow_approve === true);
+    }
+
     private storeODataEntries(body: Record<string, unknown> | undefined): string {
         const servers = (body?.mcp_servers ?? []) as { url: string; oauth?: Record<string, unknown> }[];
         const entries = servers.filter((server) => String(server.url).trim().toLowerCase() === "builtin:odata");
@@ -1663,6 +1673,13 @@ export default class FakeBackend {
             if (body && "tier" in body && body.tier !== "basic" && body.tier !== "advanced") {
                 return this.json({ detail: [{ loc: ["body", "tier"], msg: "Input should be 'basic' or 'advanced'",
                     type: "literal_error" }] }, 422);
+            }
+            // `AgentPayload.share_tools` (addendum g of the web chat design):
+            // an agent whose builtin:bitbucket entry approves never shares.
+            if (body && body.share_tools === true && this.approvesPullRequests(body, path)) {
+                return this.json({ detail: [{ loc: ["body", "share_tools"],
+                    msg: "Value error, share_tools: an agent that approves pull requests cannot share its tools",
+                    type: "value_error" }] }, 422);
             }
             const refusal = this.storeODataEntries(body);
             if (refusal) {

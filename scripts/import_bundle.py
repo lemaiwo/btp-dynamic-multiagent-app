@@ -17,9 +17,10 @@ gate (``upsert_agent``). A refused agent is rolled back, reported as
 ``FAIL   agent <name>: <rule>`` (the rule names the field, never the value) and
 skipped; the others are still imported, and the script exits 1. That differs
 from ``POST /admin/api/import``, which writes nothing at all when any entry is
-refused (one transaction, all-or-nothing). ``expose_invoke`` must be a JSON
-boolean here: the HTTP import's lax boolean reads the string "true" as true,
-so the script refuses any other value rather than silently storing "off".
+refused (one transaction, all-or-nothing). ``expose_invoke`` (and
+``share_tools``) must be a JSON boolean here: the HTTP import's lax boolean
+reads the string "true" as true, so the script refuses any other value rather
+than silently storing "off".
 
 Secrets come from --secrets (a Google client_secret_*.json, or a flat
 {"<url>": {"client_secret": "..."}} map). Without it, the repo root is searched
@@ -75,6 +76,7 @@ def fill_secrets(bundle: dict, secrets_file: Path | None) -> list[str]:
 
 
 EXPOSE_INVOKE_NOT_BOOLEAN = "expose_invoke: must be a JSON boolean (true or false)"
+SHARE_TOOLS_NOT_BOOLEAN = "share_tools: must be a JSON boolean (true or false)"
 
 
 async def import_bundle(bundle: dict) -> list[str]:
@@ -109,6 +111,11 @@ async def import_bundle(bundle: dict) -> list[str]:
                 failed.append(agent["name"])
                 print(f"  FAIL   agent {agent['name']}: {EXPOSE_INVOKE_NOT_BOOLEAN}")
                 continue
+            # The same rule for the personal-agent tool switch.
+            if "share_tools" in agent and not isinstance(agent["share_tools"], bool):
+                failed.append(agent["name"])
+                print(f"  FAIL   agent {agent['name']}: {SHARE_TOOLS_NOT_BOOLEAN}")
+                continue
             try:
                 await upsert_agent(
                     session,
@@ -134,6 +141,9 @@ async def import_bundle(bundle: dict) -> list[str]:
                     # a new agent is "basic"; `upsert_agent` refuses any
                     # value but "basic" / "advanced".
                     **({"tier": agent["tier"]} if agent.get("tier") is not None else {}),
+                    # Tools usable by personal agents: absent keeps,
+                    # `upsert_agent` stores 1 only for the JSON boolean true.
+                    **({"share_tools": agent["share_tools"]} if "share_tools" in agent else {}),
                 )
             except ValueError as e:
                 await session.rollback()

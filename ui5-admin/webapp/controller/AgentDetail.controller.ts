@@ -36,6 +36,7 @@ const EMPTY_AGENT: AgentInput = {
     enabled: true,
     expose_chat: true,
     tier: "basic",
+    share_tools: false,
     expose_api: false,
     api_slug: "",
     run_as_principal: "",
@@ -216,6 +217,8 @@ export default class AgentDetail extends BaseController {
                 expose_chat: agent.expose_chat,
                 // An older server sends no tier: basic.
                 tier: agent.tier === "advanced" ? "advanced" : "basic",
+                // An older server sends no share_tools: off.
+                share_tools: agent.share_tools === true,
                 expose_api: agent.expose_api,
                 api_slug: agent.api_slug ?? "",
                 run_as_principal: agent.run_as_principal ?? "",
@@ -960,6 +963,7 @@ export default class AgentDetail extends BaseController {
         toSave.expose_invoke = data.expose_invoke === true;
         // Always sent: an absent key keeps what is stored on the server.
         toSave.tier = data.tier === "advanced" ? "advanced" : "basic";
+        toSave.share_tools = data.share_tools === true;
         toSave.result_schema = invoke.result_schema;
         toSave.invoke_limits = invoke.invoke_limits;
         // Decided before anything is read: whether this save gives writes
@@ -1058,6 +1062,13 @@ export default class AgentDetail extends BaseController {
                 errors[`${field}State`] = ValueState.Error;
             }
         });
+
+        // --- share_tools --- refused for an agent that approves pull
+        // requests: the Switch has no value state, so the message is shown
+        // in a strip under it.
+        if (fieldErrors.share_tools) {
+            errors.share_tools = fieldErrors.share_tools;
+        }
 
         const serverMessages = Object.keys(fieldErrors)
             .filter((key) => key.indexOf("mcp_servers") === 0)

@@ -1465,3 +1465,113 @@ opaTest("the agent list tags the advanced agent", function (Given: Common, When:
 
     Then.iStopTheApp();
 });
+
+// --- share_tools ----------------------------------------------------------------
+// "Tools usable by personal agents" (addendum g of the web chat design).
+
+opaTest("switching on Tools usable by personal agents is saved, read back and tagged in the list", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents/100");
+
+    Then.waitFor({
+        id: "agentShareToolsHint",
+        viewName: "AgentDetail",
+        success: function (element: UI5Element) {
+            Opa5.assert.strictEqual((element as Text).getText(false),
+                "A personal agent in the web chat may attach this agent's MCP servers and built-ins; not for an agent that approves pull requests",
+                "the hint explains what sharing means");
+        }
+    });
+    When.waitFor({
+        id: "agentShareTools",
+        viewName: "AgentDetail",
+        actions: function (element: UI5Element | null) {
+            const toggle = element as Switch;
+            Opa5.assert.strictEqual(toggle.getState(), false, "an agent loaded without share_tools shows it off");
+            toggle.setState(true);
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        controlType: "sap.m.ObjectStatus",
+        viewName: "Agents",
+        matchers: function (element: UI5Element) {
+            return (element as ObjectStatus).getText() === "Shared tools";
+        },
+        visible: false,
+        success: function (tags: UI5Element[]) {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).share_tools, true, "share_tools is sent");
+            const shown = tags.filter((tag) => (tag as ObjectStatus).getVisible())
+                .map((tag) => ((tag.getBindingContext("agents")?.getObject() ?? {}) as { name?: string }).name);
+            Opa5.assert.deepEqual(shown, ["btp-agent"], "only btp-agent carries the tag");
+            HashChanger.getInstance().setHash("agents/100");
+        }
+    });
+
+    Then.waitFor({
+        id: "agentShareTools",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as Switch).getState() === true;
+        },
+        success: function () {
+            Opa5.assert.ok(true, "the stored value is read back on the detail page");
+        },
+        errorMessage: "share_tools was not read back"
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).share_tools, true,
+                "an untouched save sends it back");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the server's refusal of share_tools for an approving agent is shown under the switch", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("agents");
+    // reset() runs when the app starts, so give the stored agent an approving
+    // Bitbucket entry after it, then open it.
+    When.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const agent = backend.agents.find((a) => a.id === 100)!;
+            agent.mcp_servers = agent.mcp_servers.concat([{
+                url: "builtin:bitbucket", auth_mode: "destination",
+                oauth: { destination: "bitbucket", workspace: "acme", allow_comment: true, allow_approve: true }
+            }]);
+            agent.expose_chat = false;
+            HashChanger.getInstance().setHash("agents/100");
+        }
+    });
+    When.waitFor({
+        id: "agentShareTools",
+        viewName: "AgentDetail",
+        actions: function (element: UI5Element | null) {
+            (element as Switch).setState(true);
+        }
+    });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentShareToolsError",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return (element as MessageStrip).getVisible();
+        },
+        success: function (element: UI5Element) {
+            Opa5.assert.ok((element as MessageStrip).getText().indexOf("approves pull requests") !== -1,
+                "the server's rule is shown at the field");
+            Opa5.assert.strictEqual((backend.bodies["PUT agents/100"] ?? {}).share_tools, true, "share_tools was sent");
+            Opa5.assert.ok(backend.agents.find((a) => a.id === 100)!.share_tools !== true, "nothing was stored");
+        },
+        errorMessage: "The refusal of share_tools was not shown"
+    });
+
+    Then.iStopTheApp();
+});

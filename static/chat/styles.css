@@ -505,6 +505,17 @@ dialog.panel::backdrop { background: rgba(10, 20, 30, 0.35); }
 .check-text { display: flex; flex-direction: column; min-width: 0; }
 .check-name { font-size: 14px; font-weight: 600; }
 .check-desc { font-size: 12.5px; color: var(--muted); }
+/* addendum (g): tool sources of the admin */
+.check.disabled { cursor: not-allowed; }
+.check.disabled .check-name, .check.disabled .check-desc { color: var(--faint); }
+.check-hint { font-size: 12px; color: var(--muted); font-style: italic; margin-top: 2px; }
+.check-note { margin: 6px 0 2px; font-size: 12.5px; color: var(--muted); }
+.tools-group .check-name { overflow-wrap: anywhere; }
+.badge.tools, .share-tag {
+  display: inline-flex; align-items: center; font-size: 11px; font-weight: 600; line-height: 1.4;
+  padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line-strong); color: var(--muted); vertical-align: middle; white-space: nowrap;
+}
+.row-name .badge.tools, .row-name .share-tag { margin-left: 6px; }
 
 /* ---------- import dialogs ---------- */
 dialog.confirm.import, dialog.confirm.result { max-width: 540px; width: min(540px, 92vw); }

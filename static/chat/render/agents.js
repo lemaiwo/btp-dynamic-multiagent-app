@@ -5,10 +5,13 @@
 // summary), Export selected / Export all. For a developer (addendum d) the
 // catalogue is loaded with access=advanced, so the advanced admin agents are
 // listed too, and every advanced agent (admin or personal) carries the
-// Developer badge. Everything of the server is inserted as text nodes.
+// Developer badge. Addendum (g): a personal agent with tool sources carries
+// an "n tools" badge, an admin agent that is also a tool source of the
+// catalogue a "Shares tools" tag. Everything of the server is inserted as
+// text nodes.
 
 import * as api from '../api.js';
-import { exportQuery, formatImportResult, LIMITS, TEXTS, isAdvanced } from '../myagents.js';
+import { exportQuery, formatImportResult, LIMITS, TEXTS, isAdvanced, toolSourceNames } from '../myagents.js';
 import { lock, developerBadge } from './agentEditor.js';
 
 function el(tag, className, text) {
@@ -253,6 +256,12 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
     const main = el('div', 'row-main');
     const name = el('span', 'row-name', it.name);
     if (kind === 'agents' && isAdvanced(it)) name.appendChild(developerBadge());
+    const tools = kind === 'agents' && Array.isArray(it.tools) ? it.tools.length : 0;
+    if (tools > 0) {
+      const b = el('span', 'badge tools', `${tools} ${tools === 1 ? 'tool' : 'tools'}`);
+      b.title = 'Tool sources from admin agents';
+      name.appendChild(b);
+    }
     main.appendChild(name);
     if (it.description) main.appendChild(el('span', 'row-desc', it.description));
     if (meta.length) {
@@ -308,12 +317,18 @@ export function createAgentsPage(root, { editor, notify, onChat, onChanged, getM
       return sec;
     }
     const ul = el('ul', 'rows');
+    const sharing = toolSourceNames(data.catalog);
     for (const it of items) {
       const li = el('li', 'row readonly');
       const main = el('div', 'row-main');
       const name = el('span', 'row-name', it.name);
       name.appendChild(lock());
       if (tab === 'agents' && isAdvanced(it)) name.appendChild(developerBadge());
+      if (tab === 'agents' && sharing.has(it.name)) {
+        const t = el('span', 'share-tag', 'Shares tools');
+        t.title = 'Your agents can use this agent’s tools';
+        name.appendChild(t);
+      }
       main.appendChild(name);
       if (it.description) main.appendChild(el('span', 'row-desc', it.description));
       li.appendChild(main);

@@ -514,6 +514,8 @@
             <fieldset class="exposure">
                 <legend>Availability</legend>
                 <label><input type="checkbox" id="agent-expose-chat" checked> Available in chat</label>
+                <label><input type="checkbox" id="agent-share-tools"> Tools usable by personal agents</label>
+                <p class="hint" id="agent-share-tools-hint">A personal agent in the web chat may attach this agent's MCP servers and built-ins; not for an agent that approves pull requests</p>
                 <label>Tier
                     <select id="agent-tier">
                         <option value="basic">Basic</option>
@@ -757,7 +759,7 @@ async function loadAgents() {
                 <td style="max-width:280px">${escapeHtml(a.description)}${skillChips ? `<div style="margin-top:4px">${skillChips}</div>` : ''}</td>
                 <td style="max-width:260px;word-break:break-all">${urlCell}</td>
                 <td>${authCell}</td>
-                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span>${a.expose_invoke === true ? ' <span class="status-badge on invoke-tag" title="Exposed to the invoke API">Invoke</span>' : ''}${a.tier === 'advanced' ? ' <span class="status-badge on tier-tag" title="Reachable only by users with the developer role">Advanced</span>' : ''}</td>
+                <td><span class="status-badge ${a.enabled ? 'on' : 'off'}">${a.enabled ? 'enabled' : 'disabled'}</span>${a.expose_invoke === true ? ' <span class="status-badge on invoke-tag" title="Exposed to the invoke API">Invoke</span>' : ''}${a.tier === 'advanced' ? ' <span class="status-badge on tier-tag" title="Reachable only by users with the developer role">Advanced</span>' : ''}${a.share_tools === true ? ' <span class="status-badge on share-tools-tag" title="Tools usable by personal agents in the web chat">Shared tools</span>' : ''}</td>
                 <td class="row-actions">
                     <button class="small secondary" onclick="editAgent(${a.id})">Edit</button>
                     ${a.expose_api ? `<button class="small secondary" onclick="runAgentNow(${a.id})">Run now</button>` : ''}
@@ -2032,6 +2034,7 @@ async function openAgentModal() {
     document.getElementById('agent-enabled').checked = true;
     document.getElementById('agent-expose-chat').checked = true;
     document.getElementById('agent-tier').value = 'basic';
+    setShareToolsField(false);
     document.getElementById('agent-expose-api').checked = false;
     document.getElementById('agent-api-slug').value = '';
     setInvokeForm(null);
@@ -2174,6 +2177,7 @@ async function editAgent(id) {
     document.getElementById('agent-enabled').checked = a.enabled;
     document.getElementById('agent-expose-chat').checked = a.expose_chat !== false;
     document.getElementById('agent-tier').value = a.tier === 'advanced' ? 'advanced' : 'basic';
+    setShareToolsField(a.share_tools === true);
     document.getElementById('agent-expose-api').checked = !!a.expose_api;
     document.getElementById('agent-api-slug').value = a.api_slug || '';
     setInvokeForm(a);
@@ -2215,6 +2219,8 @@ async function saveAgent() {
         expose_chat: document.getElementById('agent-expose-chat').checked,
         // Always sent: an absent key keeps what is stored on the server.
         tier: document.getElementById('agent-tier').value === 'advanced' ? 'advanced' : 'basic',
+        // Always sent as a boolean: an absent key keeps what is stored.
+        share_tools: readShareToolsField(),
         expose_api: document.getElementById('agent-expose-api').checked,
         api_slug: document.getElementById('agent-api-slug').value.trim(),
         // Always sent: the server keeps a stored value for an absent key, so
@@ -3427,6 +3433,17 @@ function setDetailRunsMode(kind, id) {
     if (existing) loadDetailRuns(kind, id);
 }
 
+// "Tools usable by personal agents" (agents/webchat, addendum g). Null-safe:
+// a page fragment without the checkbox reads as off.
+function setShareToolsField(on) {
+    const el = document.getElementById('agent-share-tools');
+    if (el) el.checked = on === true;
+}
+function readShareToolsField() {
+    const el = document.getElementById('agent-share-tools');
+    return !!(el && el.checked);
+}
+
 // The same fields saveAgent()/saveWorkflow() send, read the same way; kept
 // separate because those bodies are contract-checked by the test suite.
 function detailFormSnapshot(kind) {
@@ -3440,7 +3457,7 @@ function detailFormSnapshot(kind) {
                 skills: collectAgentSkills(), peers: collectAgentPeers(),
                 model_name: v('agent-model-name'), deep: collectDeep(),
                 enabled: c('agent-enabled'), expose_chat: c('agent-expose-chat'),
-                tier: v('agent-tier'),
+                tier: v('agent-tier'), share_tools: readShareToolsField(),
                 expose_api: c('agent-expose-api'), api_slug: v('agent-api-slug'),
                 expose_invoke: c('agent-expose-invoke'), result_schema: v('agent-result-schema'),
                 invoke_limits: [v('agent-invoke-media-types'), v('agent-invoke-max-mb'),

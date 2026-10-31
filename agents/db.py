@@ -627,6 +627,14 @@ class AgentConfig(Base):
     tier: Mapped[str] = mapped_column(
         String(16), nullable=False, default="basic", server_default="basic"
     )
+    # --- tools usable by personal agents (web chat addendum (g)) --- 1: the
+    # MCP servers and built-ins of this agent may be attached to a personal
+    # agent (`BuildResult.shared_toolsets`). Only an enabled agent shares; an
+    # approving builtin:bitbucket agent never does
+    # (`check_bitbucket_approver_reach`, and again at build).
+    share_tools: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     @property
     def mcp_servers(self) -> list[dict[str, Any]]:
@@ -722,6 +730,7 @@ class AgentConfig(Base):
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "deep": self.deep.model_dump(),
             "tier": self.tier or "basic",
+            "share_tools": bool(self.share_tools),
             **self._invoke_dict(),
         }
 
@@ -751,6 +760,7 @@ class AgentConfig(Base):
             "model_name": self.model_name or "",
             "deep": self.deep.model_dump(),
             "tier": self.tier or "basic",
+            "share_tools": bool(self.share_tools),
             **self._invoke_dict(),
         }
 
@@ -1647,6 +1657,9 @@ class ChatUserAgent(Base):
     skills_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     # ["<admin agent name>", ...]
     consults_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ["<admin agent name>", ...]: admin agents with share_tools whose MCP
+    # servers and built-ins this agent gets at run time (addendum (g)).
+    tools_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # 1 = the deep-agent tools (plan, scratchpad, sub-agents) at run time;
     # only a developer may switch it on (addendum (d)).
@@ -1924,6 +1937,11 @@ async def _create_and_migrate() -> None:
         await _ensure_column(
             conn, "chat_user_agents", "deep", "INTEGER NOT NULL DEFAULT 0"
         )
+        # Tools for personal agents (addendum (g)).
+        await _ensure_column(
+            conn, "agent_configs", "share_tools", "INTEGER NOT NULL DEFAULT 0"
+        )
+        await _ensure_column(conn, "chat_user_agents", "tools_json", "TEXT")
         await _backfill_ide_revisions(conn)
         await _resync_ide_revisions(conn)
         # create_all only creates indexes together with a new table; an
@@ -2915,6 +2933,9 @@ async def upsert_agent(
     # --- access tier --- KEEP (not sent) preserves what is stored; for a
     # new row it means "basic". Only "basic" and "advanced" are stored.
     tier: str | _Keep = KEEP,
+    # --- tools usable by personal agents --- KEEP (not sent) preserves what
+    # is stored; for a new row it means off. Stored 1 only for ``True``.
+    share_tools: bool | _Keep = KEEP,
 ) -> AgentConfig:
     """Create or update the agent named ``name``.
 
@@ -2969,6 +2990,11 @@ async def upsert_agent(
         bool(existing is not None and existing.expose_invoke)
         if isinstance(expose_invoke, _Keep) else expose_invoke is True
     )
+    # Same rule: only the boolean True shares.
+    share_on = (
+        bool(existing is not None and existing.share_tools)
+        if isinstance(share_tools, _Keep) else share_tools is True
+    )
     # Here for the same reason as the OData check above: the last gate for an
     # approving agent, on the entries and the peer list the row will hold.
     await check_bitbucket_approver_reach(
@@ -2977,6 +3003,7 @@ async def upsert_agent(
         servers=prepared_server_list(primary, extras, primary_oauth_json),
         expose_chat=bool(expose_chat),
         expose_invoke=invoke_on,
+        share_tools=share_on,
         peers=(
             (list(existing.peers) if existing is not None else [])
             if isinstance(peers, _Keep) else cleaned_peers
@@ -3035,6 +3062,7 @@ async def upsert_agent(
         row.result_schema_json = None if isinstance(schema_json, _Keep) else schema_json
         row.invoke_limits_json = None if isinstance(limits_json, _Keep) else limits_json
         row.tier = "basic" if isinstance(tier, _Keep) else tier
+        row.share_tools = 1 if share_on else 0
     else:
         existing.description = description
         existing.instructions = instructions
@@ -3071,6 +3099,7 @@ async def upsert_agent(
             existing.invoke_limits_json = limits_json
         if not isinstance(tier, _Keep):
             existing.tier = tier
+        existing.share_tools = 1 if share_on else 0
         row = existing
     if commit:
         await session.commit()
@@ -4747,6 +4776,11 @@ BITBUCKET_APPROVER_INVOKE_MESSAGE = (
     "has allow_approve; an approving agent runs only from the scheduler run "
     "endpoint or an admin's Run now, never from the invoke API"
 )
+# A personal agent that got the approving agent's tools would approve with a
+# chat user's prompt (web chat addendum (g)).
+BITBUCKET_APPROVER_SHARE_MESSAGE = (
+    "share_tools: an agent that approves pull requests cannot share its tools"
+)
 _BITBUCKET_APPROVER_PEER_RULE = (
     "an approving agent may not be a peer: no agent may delegate to an agent "
     "whose builtin:bitbucket entry has allow_approve"
@@ -4771,14 +4805,15 @@ async def check_bitbucket_approver_reach(
     stored_name: str | None = None,
     ignore_names: set[str] | None = None,
     expose_invoke: Any = False,
+    share_tools: Any = False,
 ) -> None:
     """Refuse an agent write that would make an approving agent reachable.
 
     ``ValueError`` with a fixed text when, as the row is about to be stored:
     the agent approves (`bitbucket_approves`) and is exposed to chat or to
     the invoke API (``expose_invoke``: the caller chooses the prompt there
-    as in chat); it
-    approves and another agent lists it as a peer (any other row, enabled or
+    as in chat) or shares its tools with personal agents (``share_tools``);
+    it approves and another agent lists it as a peer (any other row, enabled or
     not: enabling that one later would touch neither); or one of its own
     ``peers`` is an agent that approves. Called by every write of an agent
     (`upsert_agent`, and the admin update route beside its own
@@ -4800,6 +4835,8 @@ async def check_bitbucket_approver_reach(
             raise ValueError(BITBUCKET_APPROVER_CHAT_MESSAGE)
         if expose_invoke:
             raise ValueError(BITBUCKET_APPROVER_INVOKE_MESSAGE)
+        if share_tools:
+            raise ValueError(BITBUCKET_APPROVER_SHARE_MESSAGE)
         listers = [
             r.name for r in await list_agents(session)
             if r.name not in own and r.name not in ignore and own & set(r.peers)

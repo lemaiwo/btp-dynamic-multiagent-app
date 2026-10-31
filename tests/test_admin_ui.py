@@ -2946,6 +2946,18 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
               repr(tier_hint))
         check("openAgentModal() resets the invoke fields", "setInvokeForm(null)" in js)
 
+        print("\n== agent share_tools (Tools usable by personal agents) ==")
+        check("saveAgent() sends share_tools",
+              re.search(r"\bshare_tools\s*:", save_agent_body) is not None,
+              "share_tools: not found as an object key in saveAgent()")
+        check("share_tools checkbox input#agent-share-tools",
+              find(coll, "input", id="agent-share-tools") is not None)
+        share_hint = find(coll, "p", id="agent-share-tools-hint")
+        check("share_tools hint names personal agents and approving",
+              share_hint is not None and "personal agent" in share_hint[2]
+              and "approves pull requests" in share_hint[2],
+              repr(share_hint))
+
         print("\n== saveAgent() sends peers and model_name (clearing depends on it) ==")
         for field in ("peers", "model_name"):
             check(
@@ -3698,6 +3710,7 @@ const dom = new JSDOM(`<!doctype html><html><body>
   <input type="checkbox" id="agent-enabled"><input type="checkbox" id="agent-expose-chat">
   <select id="agent-tier"><option value="basic">Basic</option>
     <option value="advanced">Advanced</option></select>
+  <input type="checkbox" id="agent-share-tools">
   <input type="checkbox" id="agent-expose-api"><input id="agent-api-slug">
   <input id="agent-run-as"><input id="agent-run-prompt"><input id="agent-run-timeout">
   <table><tbody id="agents-tbody"></tbody></table>
@@ -3743,6 +3756,23 @@ const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
     assert.strictEqual(calls.length, 1, 'one request');
     assert.deepStrictEqual(calls[0].slice(0, 2), ['/admin/api/agents/9', 'PUT']);
     assert.strictEqual(JSON.parse(calls[0][2]).tier, 'advanced');
+    // share_tools is always sent as a boolean: off as loaded (absent)...
+    assert.strictEqual(JSON.parse(calls[0][2]).share_tools, false);
+    // ... and true once the admin ticks the checkbox.
+    byId('agent-share-tools').checked = true;
+    calls = [];
+    await saveAgent();
+    assert.strictEqual(JSON.parse(calls[0][2]).share_tools, true);
+    // A sharing agent loads with the box ticked.
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => Object.assign({}, AGENT, { share_tools: true }) }; };
+    byId('agent-share-tools').checked = false;
+    await editAgent(9);
+    assert.strictEqual(byId('agent-share-tools').checked, true);
+    global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
+        return { ok: true, status: 200, json: async () => AGENT }; };
+    await editAgent(9);
+    assert.strictEqual(byId('agent-share-tools').checked, false);
     // ... and the changed value when the admin picks Basic.
     byId('agent-tier').value = 'basic';
     calls = [];
@@ -3757,8 +3787,10 @@ const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
 
     // 3. New agent: the select is reset and the POST sends basic.
     byId('agent-tier').value = 'advanced';
+    byId('agent-share-tools').checked = true;
     await openAgentModal();
     assert.strictEqual(byId('agent-tier').value, 'basic');
+    assert.strictEqual(byId('agent-share-tools').checked, false);
     byId('agent-name').value = 'new-one';
     calls = [];
     global.fetch = async (url, opts) => { calls.push([url, opts && opts.method, opts && opts.body]);
@@ -3768,10 +3800,11 @@ const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
     const sent = JSON.parse(calls[0][2]);
     assert.ok('tier' in sent);
     assert.strictEqual(sent.tier, 'basic');
+    assert.strictEqual(sent.share_tools, false);
 
     // 4. The list row shows an "Advanced" tag only for an advanced agent.
     global.fetch = async () => ({ ok: true, json: async () => ([
-        AGENT, Object.assign({}, AGENT, { id: 10, name: 'b', tier: 'basic' }),
+        AGENT, Object.assign({}, AGENT, { id: 10, name: 'b', tier: 'basic', share_tools: true }),
         Object.assign({}, AGENT, { id: 11, name: 'c', tier: undefined }),
     ]) });
     await realLoadAgents();
@@ -3781,6 +3814,10 @@ const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
     assert.strictEqual(rows[0].querySelector('.tier-tag').textContent, 'Advanced');
     assert.strictEqual(rows[1].querySelectorAll('.tier-tag').length, 0);
     assert.strictEqual(rows[2].querySelectorAll('.tier-tag').length, 0);
+    // ... and a "Shared tools" tag only for an agent with share_tools true.
+    assert.strictEqual(rows[0].querySelectorAll('.share-tools-tag').length, 0);
+    assert.strictEqual(rows[1].querySelector('.share-tools-tag').textContent, 'Shared tools');
+    assert.strictEqual(rows[2].querySelectorAll('.share-tools-tag').length, 0);
     console.log('tier field scenarios passed');
 })().catch(e => { console.error(e && e.stack || e); process.exit(1); });
 """
@@ -3792,7 +3829,7 @@ const AGENT = { id: 9, name: 'abap-dev', description: 'x', instructions: 'y',
                     ["node", tier_harness_path], capture_output=True, text=True, timeout=30,
                 )
                 check(
-                    "tier field: advanced loads and tags, save sends tier, new agent sends basic",
+                    "tier + share_tools fields: load, tags, save sends both, new agent sends basic / false",
                     result.returncode == 0 and "tier field scenarios passed" in result.stdout,
                     (result.stdout + result.stderr).strip()[:800],
                 )

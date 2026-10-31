@@ -3,8 +3,10 @@
 // import result as lines for the summary dialog, and the header picker's
 // option groups; addendum (d) adds the tier of an agent (basic | advanced),
 // the "Developer" badge and the developer-only checks (deep agent tools,
-// consulting an advanced agent). Pure: no DOM, no fetch (the jsdom tests
-// import it as is).
+// consulting an advanced agent); addendum (g) adds the tool sources of the
+// catalogue (`tool_sources`: admin agents whose MCP servers and built-ins a
+// personal agent may attach, at most 5). Pure: no DOM, no fetch (the jsdom
+// tests import it as is).
 
 export const TIERS = ['basic', 'advanced'];
 export const DEVELOPER_BADGE = 'Developer';
@@ -29,6 +31,39 @@ export function advancedAgentNames(catalog) {
   return new Set((catalog?.agents || []).filter(isAdvanced).map((a) => String(a.name)));
 }
 
+/**
+ * The catalogue's tool sources (addendum g), normalised:
+ * [{name, description, tier, connectors: [label]}]. An older server answers
+ * no `tool_sources`: [].
+ */
+export function toolSources(catalog) {
+  const list = Array.isArray(catalog?.tool_sources) ? catalog.tool_sources : [];
+  return list.filter((s) => s && typeof s === 'object' && typeof s.name === 'string' && s.name)
+    .map((s) => ({
+      name: s.name,
+      description: typeof s.description === 'string' ? s.description : '',
+      tier: s.tier === 'advanced' ? 'advanced' : 'basic',
+      connectors: (Array.isArray(s.connectors) ? s.connectors : []).filter((c) => typeof c === 'string' && c),
+    }));
+}
+
+/** The option text of a tool source: "name · label, label" (the name alone without connectors). */
+export function toolSourceLabel(source) {
+  const name = String(source?.name ?? '');
+  const labels = Array.isArray(source?.connectors) ? source.connectors.filter(Boolean) : [];
+  return labels.length ? `${name} · ${labels.join(', ')}` : name;
+}
+
+/** The names of the catalogue's advanced tool sources (for the tools check). */
+export function advancedToolNames(catalog) {
+  return new Set(toolSources(catalog).filter((s) => s.tier === 'advanced').map((s) => s.name));
+}
+
+/** The names of the catalogue's tool sources (the "Shares tools" tag of the admin list). */
+export function toolSourceNames(catalog) {
+  return new Set(toolSources(catalog).map((s) => s.name));
+}
+
 export const LIMITS = {
   name: 64,
   description: 300,
@@ -36,6 +71,7 @@ export const LIMITS = {
   content: 50_000,
   skills: 20,
   consults: 10,
+  tools: 5,
   agents: 50,
   bundleBytes: 1024 * 1024,
 };
@@ -55,6 +91,8 @@ export const TEXTS = {
   skills: 'Pick at most 20 skills.',
   consults: 'Pick at most 10 agents.',
   consults_advanced: 'Consulting a developer agent needs the developer role.',
+  tools: 'Pick at most 5 tool sources.',
+  tools_advanced: 'Advanced tools need the developer role',
   deep: 'Deep agent tools need the developer role.',
   model: 'Pick a model from the list, or the default.',
   control: 'Control characters are not allowed (tab and line breaks are fine).',
@@ -81,7 +119,7 @@ function checkText(value, { min = 0, max, oneLine = false }) {
  * `developer` false refuses `deep` and a consult in `advancedNames`
  * (the server answers 422 at the field for a non-developer).
  */
-export function validateAgent(form, { taken = new Set(), developer = true, advancedNames = new Set() } = {}) {
+export function validateAgent(form, { taken = new Set(), developer = true, advancedNames = new Set(), advancedTools = new Set() } = {}) {
   const errors = {};
   const name = String(form.name ?? '');
   if (!NAME_RE.test(name) || CONTROL_RE.test(name)) errors.name = TEXTS.name;
@@ -95,6 +133,9 @@ export function validateAgent(form, { taken = new Set(), developer = true, advan
   const consults = Array.isArray(form.consults) ? form.consults : [];
   if (consults.length > LIMITS.consults) errors.consults = TEXTS.consults;
   else if (!developer && consults.some((c) => advancedNames.has(c))) errors.consults = TEXTS.consults_advanced;
+  const tools = Array.isArray(form.tools) ? form.tools : [];
+  if (tools.length > LIMITS.tools || new Set(tools).size !== tools.length) errors.tools = TEXTS.tools;
+  else if (!developer && tools.some((t) => advancedTools.has(t))) errors.tools = TEXTS.tools_advanced;
   if (form.deep != null && typeof form.deep !== 'boolean') errors.deep = TEXTS.deep;
   else if (form.deep === true && !developer) errors.deep = TEXTS.deep;
   if (form.model != null && form.model !== '' && Array.isArray(form.models) && !form.models.includes(form.model)) errors.model = TEXTS.model;
@@ -119,6 +160,11 @@ export function takenNames(items, exceptId = null) {
   return new Set((items || []).filter((x) => x.id !== exceptId).map((x) => String(x.name || '').toLowerCase()));
 }
 
+/** What a server 422 at a field says, where the client text (a limit) would not fit. */
+export const SERVER_TEXTS = {
+  tools: 'A picked tool source is not available to you. Pick again.',
+};
+
 /**
  * A server 422's `detail[]` -> {field: text}. The first path part after
  * `body` names the field (`skills.0.name` -> `skills`); the text is ours,
@@ -129,7 +175,7 @@ export function fieldErrors(errors, fields) {
   for (const e of errors || []) {
     const loc = (e.loc || []).filter((p) => p !== 'body');
     const field = loc[0];
-    if (field && fields.includes(field) && !out[field]) out[field] = TEXTS[field] || TEXTS.server;
+    if (field && fields.includes(field) && !out[field]) out[field] = SERVER_TEXTS[field] || TEXTS[field] || TEXTS.server;
   }
   return out;
 }
@@ -186,7 +232,7 @@ export function formatImportResult(result) {
   const dropped = (Array.isArray(r.dropped) ? r.dropped : []).map((d) => {
     const item = String(d.item ?? '');
     if (d.field === 'deep') return `${item}: Deep agent tools (needs the developer role) were dropped`;
-    const what = d.field === 'consults' ? 'consulted agent' : d.field === 'model' ? 'model' : 'skill';
+    const what = d.field === 'consults' ? 'consulted agent' : d.field === 'tools' ? 'tool source' : d.field === 'model' ? 'model' : 'skill';
     const name = d.name == null || d.name === '' ? '' : ` ${String(d.name)}`;
     return `${item}: ${what}${name} does not exist here and was dropped`;
   });

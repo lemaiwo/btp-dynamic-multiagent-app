@@ -194,6 +194,9 @@ export function renderContextBody(body, ctx, { onToggle } = {}) {
       if (t.kind === 'delegate' && t.agent) {
         li.appendChild(document.createTextNode(' → '));
         li.appendChild(el('span', 'ctx-target', t.agent));
+      } else if (t.kind === 'connector' && t.agent) {
+        li.appendChild(document.createTextNode(' · from '));
+        li.appendChild(el('span', 'ctx-target', t.agent));
       }
       ul.appendChild(li);
     }

@@ -698,7 +698,11 @@ async def resolve_runner(data: TurnInput) -> Runner:
     model, model_name = await _personal_model(target.user_row.model_name, data.model_name)
     agent, note = await user_agents.build_personal_agent(target.user_row, model=model,
                                                          build=build)
-    return Runner(agent, target.name, None, _model_id(model) or model_name, note=note)
+    # Held like a specialist run straight: the shared tool sets of the build
+    # (addendum (g)) use its MCP clients, which a reload must not close
+    # mid-turn.
+    return Runner(agent, target.name, None, _model_id(model) or model_name, note=note,
+                  counter=getattr(build, "in_flight", None))
 
 
 async def _save_generated(turn: Turn, name: str, media_type: str, data: bytes) -> dict[str, Any]:

@@ -17,19 +17,31 @@ is gone fails the turn with ``agent_unavailable``.
 
 Exactly the same "chat-usable" rule is used by the catalogue, the save-time
 checks of a personal agent and the run: :func:`chat_agents`.
+
+Tool sources (addendum (g)): a personal agent may name admin agents that
+share their tools (enabled, ``share_tools``, not approving:
+:func:`tool_sources`, one rule for the catalogue, the save-time checks, the
+context view and the run). At run time it gets the guarded server list the
+current build keeps for that agent (``BuildResult.shared_toolsets``): the
+MCP servers and built-ins with their credentials where they are, never the
+specialist's own function tools. Only the connector label of an entry
+(:func:`connector_labels`) ever leaves the server.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic_ai import Agent
 from sqlalchemy import select
 
-from agents.access import ADVANCED, BASIC, agent_allowed, tier_of
+from agents.access import ADVANCED, BASIC, agent_allowed, effective_tier, tier_of
+from agents.builtins import is_builtin_url
 from agents.db import AgentConfig, ChatUserAgent, ChatUserSkill, SessionLocal, SkillConfig
 from agents.deep import DeepConfig, deep_toolset, scoped_deep_instructions
 from agents.registry import (
@@ -60,7 +72,13 @@ DOCUMENTS_SECTION = (
 )
 
 
-def skipped_note(consults: int, skills: int) -> str:
+def skipped_note(consults: int, skills: int, tools: int = 0) -> str:
+    """The one note of what a turn could not attach. The tool sources are
+    named only when one was skipped, so the note of an agent without tools
+    reads as before."""
+    if tools:
+        return (f"Skipped: {consults} consult(s) / {skills} skill(s) / "
+                f"{tools} tool source(s) no longer available")
     return f"Skipped: {consults} consult(s) / {skills} skill(s) no longer available"
 
 
@@ -77,6 +95,39 @@ async def chat_agents(db: Any) -> dict[str, AgentConfig]:
     """The chat-usable admin agents by name (one query)."""
     rows = (await db.execute(select(AgentConfig))).scalars().all()
     return {r.name: r for r in rows if chat_usable(r)}
+
+
+def shares_tools(row: AgentConfig) -> bool:
+    """An admin agent whose tools a personal agent may use: enabled, with
+    ``share_tools``, and not an approving Bitbucket agent (the build shares
+    nothing of that one either). ``expose_chat`` is not required."""
+    return (bool(row.enabled) and bool(getattr(row, "share_tools", 0))
+            and not _approves(row.mcp_servers))
+
+
+async def tool_sources(db: Any) -> dict[str, AgentConfig]:
+    """The admin agents that share their tools, by name (one query)."""
+    rows = (await db.execute(select(AgentConfig))).scalars().all()
+    return {r.name: r for r in rows if shares_tools(r)}
+
+
+def connector_labels(row: AgentConfig) -> list[str]:
+    """What a user is shown of an agent's server entries: ``builtin:<name>``
+    for a built-in, the host of an MCP server's URL; never a path, query,
+    credential or destination name. Distinct, in entry order."""
+    labels: list[str] = []
+    for spec in row.mcp_servers:
+        url = str(spec.get("url") or "").strip() if isinstance(spec, dict) else ""
+        if is_builtin_url(url):
+            label = url.lower()
+        else:
+            try:
+                label = urlparse(url).hostname or ""
+            except ValueError:
+                label = ""
+        if label and label not in labels:
+            labels.append(label)
+    return labels
 
 
 async def admin_skill_names(db: Any) -> set[str]:
@@ -107,16 +158,27 @@ def consult_names(row: ChatUserAgent) -> list[str]:
     return [n for n in load_list(row.consults_json) if isinstance(n, str)]
 
 
-def personal_tier(row: ChatUserAgent, usable: dict[str, AgentConfig]) -> str:
-    """``advanced`` when the personal agent has the deep tools on or
-    consults an advanced admin agent that is chat-usable now, else
-    ``basic`` (addendum (d)): such an agent is refused in a basic
+def tool_names(row: ChatUserAgent) -> list[str]:
+    """The admin agents whose tools this personal agent names (addendum (g))."""
+    return [n for n in load_list(getattr(row, "tools_json", None)) if isinstance(n, str)]
+
+
+def personal_tier(row: ChatUserAgent, usable: dict[str, AgentConfig],
+                  sources: dict[str, AgentConfig] | None = None) -> str:
+    """``advanced`` when the personal agent has the deep tools on, consults
+    an advanced admin agent that is chat-usable now, or names an advanced
+    tool source that shares now (``sources``, :func:`tool_sources`), else
+    ``basic`` (addenda (d), (g)): such an agent is refused in a basic
     conversation."""
     if row.deep:
         return ADVANCED
     for name in consult_names(row):
         admin_row = usable.get(name)
         if admin_row is not None and tier_of(admin_row) != BASIC:
+            return ADVANCED
+    for name in tool_names(row):
+        source = (sources or {}).get(name)
+        if source is not None and tier_of(source) != BASIC:
             return ADVANCED
     return BASIC
 
@@ -167,7 +229,8 @@ async def resolve_agent_ref(principal: str, ref: str | None,
             select(ChatUserAgent).where(ChatUserAgent.id == value,
                                         ChatUserAgent.principal == principal)
         )).scalar_one_or_none()
-    if mine is None or not agent_allowed(personal_tier(mine, usable), access):
+        sources = await tool_sources(db) if mine is not None and tool_names(mine) else {}
+    if mine is None or not agent_allowed(personal_tier(mine, usable, sources), access):
         return AGENT_UNAVAILABLE
     return RefTarget("mine", mine.name, user_row=mine)
 
@@ -221,10 +284,17 @@ async def build_personal_agent(row: ChatUserAgent, *, model: Any,
     one note of what was skipped (``None`` when nothing was).
 
     ``build`` is the registry's current build: a consulted name is attached
-    only when its row is chat-usable now AND the build holds its specialist.
+    only when its row is chat-usable now AND the build holds its specialist;
+    a tool source only when its row shares now (re-read: switching it off
+    applies to the next turn, without a reload), the build holds its server
+    list and the turn's tier allows it (the second lock after the
+    conversation's ``agent_ref`` check). Two or more sources are prefixed
+    with their agent's name, so the same connector in two sources does not
+    make two tools of one name.
     """
     refs = skill_refs(row)
     consults = consult_names(row)
+    tools = tool_names(row)
     async with SessionLocal() as db:
         admin_wanted = [r["name"] for r in refs if r["scope"] == "admin"]
         admin_skills = dict((await db.execute(
@@ -235,6 +305,25 @@ async def build_personal_agent(row: ChatUserAgent, *, model: Any,
             select(ChatUserSkill).where(ChatUserSkill.principal == row.principal)
         )).scalars().all()}
         usable = await chat_agents(db) if consults else {}
+        sources = await tool_sources(db) if tools else {}
+    shared_by_name = getattr(build, "shared_toolsets", None) or {}
+    tier = effective_tier()
+    attached: list[tuple[str, list]] = []
+    skipped_tools = 0
+    for name in tools:
+        source = sources.get(name)
+        shared = shared_by_name.get(name)
+        if source is None or not shared or not agent_allowed(source, tier):
+            skipped_tools += 1
+            continue
+        attached.append((name, shared))
+    shared_toolsets: list = []
+    for name, shared in attached:
+        if len(attached) > 1:
+            prefix = _tool_prefix(name)
+            shared_toolsets += [t.prefixed(prefix) for t in shared]
+        else:
+            shared_toolsets += list(shared)
     skills: list[tuple[str, str]] = []
     skipped_skills = 0
     for ref in refs:
@@ -247,21 +336,23 @@ async def build_personal_agent(row: ChatUserAgent, *, model: Any,
             skipped_skills += 1
     text = personal_instructions(row.instructions, skills)
     if row.deep:
-        # The app's default limits; sub-agents get this agent's own toolset
-        # (the document tools), as an admin deep agent's get its servers.
+        # The app's default limits; sub-agents get this agent's own toolsets
+        # (the document tools and the shared tool sets), as an admin deep
+        # agent's get its servers.
         config = DeepConfig(enabled=True)
         agent = Agent(
             model,
             instructions=[text, lambda: scoped_deep_instructions(config)],
-            toolsets=[deep_toolset(
-                config, parent_toolsets=[docgen_toolset()], model=model,
+            toolsets=[*shared_toolsets, deep_toolset(
+                config, parent_toolsets=[docgen_toolset(), *shared_toolsets], model=model,
                 agent_name=row.name, retries=_TOOL_RETRIES,
                 progress_handler_factory=_make_progress_handler,
             )],
             retries=_TOOL_RETRIES,
         )
     else:
-        agent = Agent(model, instructions=text, retries=_TOOL_RETRIES)
+        agent = Agent(model, instructions=text, toolsets=shared_toolsets,
+                      retries=_TOOL_RETRIES)
     specialists = getattr(build, "specialists", {}) if build is not None else {}
     counter = getattr(build, "in_flight", None)
     skipped_consults = 0
@@ -275,6 +366,12 @@ async def build_personal_agent(row: ChatUserAgent, *, model: Any,
         # advanced consult is attached but listed only in an advanced turn.
         _attach_delegation_tool(agent, specialist, admin_row, counter=counter,
                                 tier_gated=True)
-    note = (skipped_note(skipped_consults, skipped_skills)
-            if skipped_consults or skipped_skills else None)
+    note = (skipped_note(skipped_consults, skipped_skills, skipped_tools)
+            if skipped_consults or skipped_skills or skipped_tools else None)
     return agent, note
+
+
+def _tool_prefix(name: str) -> str:
+    """A tool-name prefix from an admin agent's name (letters, digits and
+    ``_`` only, as tool names allow)."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", name)[:32] or "tools"

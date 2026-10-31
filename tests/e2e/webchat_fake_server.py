@@ -62,6 +62,15 @@ What it serves:
   consult); an import by a non-developer drops ``deep`` and advanced consults
   (``dropped`` with ``field: "deep"`` / ``"consults"``). A developer run seeds
   one advanced conversation and one deep personal agent on top
+- addendum (g): ``GET /catalog`` answers ``tool_sources`` (three admin agents
+  that share their tools, ``platform-tickets`` not a chat agent,
+  ``abap-developer-deep`` advanced and listed only for ``access=advanced`` AND
+  a developer), each ``{name, description, tier, connectors}``; ``/my/agents``
+  takes ``tools`` (at most 5 distinct names of tool sources; an unknown name or
+  a 6th is a 422 at ``tools``, an advanced source from a non-developer too;
+  an import drops them into ``dropped`` with ``field: "tools"``) and answers
+  ``tools`` (an advanced source makes the agent advanced). The seeded personal
+  agent uses two sources
 - addendum (e): ``GET /chat/api/conversations/{id}/context`` built from the
   stored data (who answers, the model's window from a code table matched by
   substring and overridable by ``CHAT_CONTEXT_WINDOWS`` as on the server,
@@ -132,6 +141,17 @@ TIERS = ("basic", "advanced")
 ACCESS_DENIED = "Advanced access needs the developer role"
 DEVELOPER = True  # --basic-user turns it off
 ADVANCED_ADMIN = {a["name"] for a in ADMIN_AGENTS if a["tier"] == "advanced"}
+# addendum (g): admin agents that share their MCP servers and built-ins with
+# personal agents; a source need not be a chat agent (platform-tickets is not)
+TOOL_SOURCES = [
+    {"name": "btp-admin", "description": "The BTP account model and the SAP security notes that apply to it.", "tier": "basic",
+     "connectors": ["btp-mcp.cfapps.eu10.hana.ondemand.com", "builtin:sapnotes"]},
+    {"name": "platform-tickets", "description": "Jira tickets and Confluence runbooks of the platform team.", "tier": "basic",
+     "connectors": ["builtin:jira", "builtin:confluence"]},
+    {"name": "abap-developer-deep", "description": "The ABAP dev system through ARC-1, as the signed-in user.", "tier": "advanced",
+     "connectors": ["arc1.example.hana.ondemand.com"]},
+]
+ADVANCED_TOOLS = {t["name"] for t in TOOL_SOURCES if t["tier"] == "advanced"}
 ADMIN_SKILLS = [
     {"name": "btp-naming-conventions", "description": "How subaccounts, spaces, instances and destinations are named in this landscape."},
     {"name": "report-layout", "description": "The table and heading layout of a platform review document."},
@@ -170,7 +190,7 @@ ADMIN_SKILL_TEXT = {
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.()-]{0,63}$")
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 LIM = {"agents": 50, "skills": 100, "description": 300, "instructions": 20_000, "content": 50_000,
-       "agent_skills": 20, "consults": 10, "bundle": 1024 * 1024}
+       "agent_skills": 20, "consults": 10, "tools": 5, "bundle": 1024 * 1024}
 BUNDLE_FORMAT = "webchat-bundle/1"
 
 MIME = {
@@ -422,7 +442,7 @@ class Store:
         ag = self.put_agent(None, {"name": "Quota watcher", "description": "Watches the dev entitlements and drafts the Monday quota report.",
                                    "instructions": "You watch the entitlements of the dev subaccounts.\n\n1. Ask btp-admin for the entitlements with spare quota.\n2. Rank them with the weekly-quota-report skill.\n3. Draft the report as a Word document.",
                                    "skills": [{"scope": "mine", "name": sk["name"]}, {"scope": "admin", "name": "btp-naming-conventions"}],
-                                   "consults": ["btp-admin"], "model": None})
+                                   "consults": ["btp-admin"], "tools": ["btp-admin", "platform-tickets"], "model": None})
         c2["agent_ref"], c2["agent_label"] = "admin:btp-admin", "btp-admin"
         c4["agent_ref"], c4["agent_label"] = f"mine:{ag['id']}", ag["name"]
         if DEVELOPER:
@@ -451,6 +471,7 @@ class Store:
         row = self.my_agents.get(aid) if aid else None
         new = {"id": row["id"] if row else str(uuid.uuid4()), "name": body["name"], "description": body.get("description") or "",
                "instructions": body["instructions"], "skills": list(body.get("skills") or []), "consults": list(body.get("consults") or []),
+               "tools": list(body.get("tools") or []),
                "model": body.get("model"), "deep": body.get("deep") is True,
                "created_at": row["created_at"] if row else t, "updated_at": t}
         self.my_agents[new["id"]] = new
@@ -458,8 +479,10 @@ class Store:
 
     @staticmethod
     def tier_of(a: dict) -> str:
-        """advanced when deep is on or any consult names an advanced admin agent (addendum d)."""
-        return "advanced" if a.get("deep") or any(c in ADVANCED_ADMIN for c in a.get("consults") or []) else "basic"
+        """advanced when deep is on, any consult names an advanced admin agent (addendum d)
+        or any tool source is advanced (addendum g)."""
+        return "advanced" if a.get("deep") or any(c in ADVANCED_ADMIN for c in a.get("consults") or []) \
+            or any(t in ADVANCED_TOOLS for t in a.get("tools") or []) else "basic"
 
     def put_skill(self, sid: str | None, body: dict) -> dict:
         t = now()
@@ -471,7 +494,8 @@ class Store:
 
     def agent_out(self, a: dict) -> dict:
         return {"id": a["id"], "ref": f"mine:{a['id']}", "name": a["name"], "description": a["description"], "instructions": a["instructions"],
-                "skills": a["skills"], "consults": a["consults"], "model": a["model"], "deep": a.get("deep") is True,
+                "skills": a["skills"], "consults": a["consults"], "tools": list(a.get("tools") or []),
+                "model": a["model"], "deep": a.get("deep") is True,
                 "tier": self.tier_of(a), "created_at": utc(a["created_at"]),
                 "updated_at": utc(a["updated_at"]), "source": "mine", "readonly": False}
 
@@ -527,7 +551,8 @@ class Store:
         skills = [s for s in self.my_skills.values() if everything or s["id"] in (skill_ids or []) or s["name"] in attached]
         return {"format": BUNDLE_FORMAT, "exported_at": utc(now()),
                 "agents": [{"name": a["name"], "description": a["description"], "instructions": a["instructions"],
-                            "skills": a["skills"], "consults": a["consults"], "model": a["model"], "deep": a.get("deep") is True} for a in agents],
+                            "skills": a["skills"], "consults": a["consults"], "tools": list(a.get("tools") or []),
+                            "model": a["model"], "deep": a.get("deep") is True} for a in agents],
                 "skills": [{"name": s["name"], "description": s["description"], "content": s["content"]} for s in skills]}
 
     # ---- helpers ----
@@ -767,7 +792,7 @@ def text_ok(v, *, min_len: int, max_len: int, one_line: bool = False) -> str | N
     return None
 
 
-AGENT_KEYS = {"name", "description", "instructions", "skills", "consults", "model", "deep"}
+AGENT_KEYS = {"name", "description", "instructions", "skills", "consults", "tools", "model", "deep"}
 SKILL_KEYS = {"name", "description", "content"}
 
 
@@ -836,6 +861,23 @@ def check_agent(body: dict, *, my_skill_names: set[str], dropping: bool = False)
             else:
                 errors.append(("consults", "pattern", i))
         body["consults"] = kept
+    # addendum (g): at most 5 distinct names of tool sources; an advanced one from a developer only
+    tools = body.get("tools") or []
+    if not isinstance(tools, list) or len(tools) > LIM["tools"] or len(set(map(str, tools))) != len(tools):
+        errors.append(("tools", "too_many"))
+    else:
+        kept = []
+        for i, t in enumerate(tools):
+            known = isinstance(t, str) and any(x["name"] == t for x in TOOL_SOURCES)
+            if known and (DEVELOPER or t not in ADVANCED_TOOLS):
+                kept.append(t)
+            elif dropping:
+                dropped.append({"field": "tools", "name": t if isinstance(t, str) else None})
+            elif known:
+                errors.append(("tools", "developer_only", i))
+            else:
+                errors.append(("tools", "not_a_tool_source", i))
+        body["tools"] = kept
     model = body.get("model")
     if model is not None and model not in {m["id"] for m in MODELS}:
         if dropping:
@@ -868,7 +910,7 @@ def check_skill(body: dict) -> list[tuple[str, str]]:
 RULE_TEXT = {"pattern": "is not a valid name or value", "too_long": "is too long", "too_short": "is empty",
              "too_many": "has too many entries", "control": "holds control characters", "unknown_key": "is not a key of this format",
              "unknown_model": "names a model that does not exist here", "limit": "would pass your limit",
-             "developer_only": "needs the developer role"}
+             "developer_only": "needs the developer role", "not_a_tool_source": "is not a tool source you can use"}
 
 
 def rule_text(code: str) -> str:
@@ -1019,6 +1061,8 @@ class Handler(BaseHTTPRequestHandler):
                            for a in ADMIN_AGENTS if advanced or a["tier"] == "basic"],
                 "skills": [{"name": s["name"], "description": s["description"], "source": "admin", "readonly": True} for s in ADMIN_SKILLS],
                 "orchestrator": ORCHESTRATOR,
+                "tool_sources": [{"name": t["name"], "description": t["description"], "tier": t["tier"], "connectors": list(t["connectors"])}
+                                 for t in TOOL_SOURCES if advanced or t["tier"] == "basic"],
             })
         if parts[:1] == ["my"]:
             return self.my(method, parts[1:], query)

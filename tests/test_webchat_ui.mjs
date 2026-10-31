@@ -610,5 +610,110 @@ console.log('\n== the viewer (addendum f) ==');
   log.remove();
 }
 
+// ------------------------------------------- addendum (g): tools for personal agents
+console.log('\n== tool sources (addendum g) ==');
+{
+  const catalog = {
+    agents: [{ name: 'btp-admin', description: 'BTP', tier: 'basic' }, { name: 'entitlement-analyst', description: 'Ent', tier: 'basic' }],
+    skills: [],
+    tool_sources: [
+      { name: 'btp-admin', description: 'The BTP account model', tier: 'basic', connectors: ['btp-mcp.cfapps.eu10.hana.ondemand.com', 'builtin:sapnotes'] },
+      { name: 'platform-tickets', description: 'Jira and Confluence', tier: 'basic', connectors: ['builtin:jira', 'builtin:confluence'] },
+      { name: 'abap-developer-deep', description: 'ARC-1', tier: 'advanced', connectors: ['arc1.example.hana.ondemand.com'] },
+    ],
+  };
+  check('toolSources normalises the catalogue; an older server without tool_sources gives []', my.toolSources(catalog).length === 3 && eq(my.toolSources({ agents: [] }), []) && my.toolSources(catalog)[2].tier === 'advanced');
+  check('toolSourceLabel: "name · label, label"', my.toolSourceLabel(catalog.tool_sources[0]) === 'btp-admin · btp-mcp.cfapps.eu10.hana.ondemand.com, builtin:sapnotes' && my.toolSourceLabel({ name: 'x', connectors: [] }) === 'x');
+  const ok = { name: 'Quota watcher', description: '', instructions: 'Do', skills: [], consults: [], model: null };
+  const advancedTools = my.advancedToolNames(catalog);
+  check('validateAgent: at most 5 distinct tools, fixed text', my.validateAgent({ ...ok, tools: ['a', 'b', 'c', 'd', 'e', 'f'] }).tools === my.TEXTS.tools && my.validateAgent({ ...ok, tools: ['a', 'a'] }).tools === my.TEXTS.tools && !my.validateAgent({ ...ok, tools: ['a', 'b', 'c', 'd', 'e'] }).tools);
+  check('validateAgent: an advanced tool from a non-developer is refused, from a developer fine', my.validateAgent({ ...ok, tools: ['abap-developer-deep'] }, { developer: false, advancedTools }).tools === my.TEXTS.tools_advanced && !my.validateAgent({ ...ok, tools: ['abap-developer-deep'] }, { developer: true, advancedTools }).tools);
+  check('a server 422 at tools maps to the fixed server text', my.fieldErrors([{ loc: ['body', 'tools', '0'], msg: 'x' }], ['tools']).tools === my.SERVER_TEXTS.tools);
+  const r = my.formatImportResult({ dropped: [{ item: 'agent:Quota watcher', field: 'tools', name: 'gone-source' }] });
+  check('a dropped tool source is worded as such', r.dropped[0] === 'agent:Quota watcher: tool source gone-source does not exist here and was dropped');
+
+  // The editor, under jsdom (no showModal there).
+  const D = dom.window.HTMLDialogElement.prototype;
+  if (!D.showModal) { D.showModal = function () { this.open = true; }; D.close = function () { this.open = false; this.dispatchEvent(new dom.window.Event('close')); }; }
+  const { createAgentEditor } = await import('../static/chat/render/agentEditor.js');
+  const notes = [];
+  const saved = [];
+  const editor = createAgentEditor({ notify: (t) => notes.push(t), onSaved: (k, row) => saved.push(row) });
+  const dlg = () => document.querySelector('dialog.panel');
+  const toolBoxes = () => [...dlg().querySelectorAll('.tools-group input[type=checkbox]')];
+  const mine = { agents: [], skills: [] };
+
+  editor.openAgent({ agent: null, catalog, mine, models: [], developer: false });
+  let boxes = toolBoxes();
+  const labels = [...dlg().querySelectorAll('.tools-group .check-name')].map((n) => n.firstChild.textContent);
+  check('editor: the multi-select is built from tool_sources with the connector labels', boxes.length === 3 && labels[1] === 'platform-tickets · builtin:jira, builtin:confluence', JSON.stringify(labels));
+  check('editor: the group is titled "Tools from admin agents"', dlg().querySelector('.tools-group legend').textContent.startsWith('Tools from admin agents'));
+  const advRow = boxes[2].closest('label');
+  check('editor, basic user: the advanced option carries the Advanced tag, is disabled and says why', boxes[2].disabled && advRow.querySelector('.badge.dev').textContent === 'Advanced' && advRow.querySelector('.check-hint').textContent === 'Advanced tools need the developer role' && boxes[2].getAttribute('aria-describedby') === advRow.querySelector('.check-hint').id);
+  check('editor, basic user: the basic options are enabled', !boxes[0].disabled && !boxes[1].disabled);
+  editor.close();
+
+  editor.openAgent({ agent: { id: 'a1', name: 'Quota watcher', description: '', instructions: 'Do', skills: [], consults: [], tools: ['btp-admin', 'abap-developer-deep'], model: null }, catalog, mine, models: [], developer: true });
+  boxes = toolBoxes();
+  check('editor, developer: the advanced option is enabled, no hint', !boxes[2].disabled && !boxes[2].closest('label').querySelector('.check-hint'));
+  check('editor: stored tools are loaded ticked on edit', boxes[0].checked && !boxes[1].checked && boxes[2].checked);
+  // save sends tools
+  let sent = null;
+  let answer = { status: 200, body: {} };
+  globalThis.fetch = async (url, init) => {
+    sent = { url, init };
+    const status = answer.status;
+    return { ok: status < 300, status, headers: { get: () => 'application/json' }, json: async () => answer.body, text: async () => JSON.stringify(answer.body) };
+  };
+  answer = { status: 200, body: { id: 'a1', name: 'Quota watcher', tools: ['btp-admin', 'abap-developer-deep'] } };
+  dlg().querySelector('form').dispatchEvent(new dom.window.Event('submit', { cancelable: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  check('editor: save sends tools', sent && sent.init.method === 'PUT' && eq(JSON.parse(sent.init.body).tools, ['btp-admin', 'abap-developer-deep']), sent && sent.init.body);
+
+  // the 6th tick is refused in the editor
+  const six = { ...catalog, tool_sources: Array.from({ length: 6 }, (_, i) => ({ name: `src-${i}`, description: '', tier: 'basic', connectors: [`builtin:x${i}`] })) };
+  editor.openAgent({ agent: null, catalog: six, mine, models: [], developer: true });
+  boxes = toolBoxes();
+  for (const b of boxes) { b.checked = true; b.dispatchEvent(new dom.window.Event('change')); }
+  const err = dlg().querySelector('.tools-group .field-error');
+  check('editor: a 6th tool source is refused with the fixed text', boxes.filter((b) => b.checked).length === 5 && !boxes[5].checked && !err.hidden && err.textContent === my.TEXTS.tools);
+  editor.close();
+
+  // a server 422 at tools is shown at the field
+  editor.openAgent({ agent: null, catalog, mine, models: [], developer: true });
+  dlg().querySelector('input[type=text]').value = 'Ticket bot';
+  dlg().querySelector('textarea').value = 'Answer tickets.';
+  toolBoxes()[1].checked = true;
+  answer = { status: 422, body: { detail: [{ loc: ['body', 'tools', 0], msg: 'tools: not a tool source you can use', type: 'value_error' }] } };
+  dlg().querySelector('form').dispatchEvent(new dom.window.Event('submit', { cancelable: true }));
+  await new Promise((r) => setTimeout(r, 20));
+  const terr = dlg().querySelector('.tools-group .field-error');
+  check('editor: a server 422 at tools is shown at that field', sent.init.method === 'POST' && eq(JSON.parse(sent.init.body).tools, ['platform-tickets']) && !terr.hidden && terr.textContent === my.SERVER_TEXTS.tools && dlg().querySelector('.tools-group').classList.contains('invalid'));
+  editor.close();
+
+  // the lists: "n tools" badge on Mine, "Shares tools" on the admin list
+  const { createAgentsPage } = await import('../static/chat/render/agents.js');
+  globalThis.fetch = async (url) => {
+    const body = url.includes('/catalog') ? catalog
+      : url.includes('/my/agents') ? [
+        { id: 'a1', name: 'Quota watcher', description: '', instructions: 'Do', skills: [], consults: [], tools: ['btp-admin', 'platform-tickets'], model: null, tier: 'basic' },
+        { id: 'a2', name: 'Plain', description: '', instructions: 'Do', skills: [], consults: [], tools: [], model: null, tier: 'basic' },
+        { id: 'a3', name: 'Single', description: '', instructions: 'Do', skills: [], consults: [], tools: ['btp-admin'], model: null, tier: 'basic' }]
+        : [];
+    return { ok: true, status: 200, headers: { get: () => 'application/json' }, json: async () => body };
+  };
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const pageApi = createAgentsPage(host, { editor, notify: () => {}, onChat: () => {}, onChanged: () => {}, getModels: () => [], isDeveloper: () => false });
+  await pageApi.load();
+  const mineRows = [...host.querySelectorAll('.list-section.mine .row')];
+  const badge = (row) => row.querySelector('.badge.tools')?.textContent || null;
+  check('Mine list: a "n tools" badge only for an agent with tools', badge(mineRows[0]) === '2 tools' && badge(mineRows[1]) === null && badge(mineRows[2]) === '1 tool');
+  const adminRows = [...host.querySelectorAll('.list-section.admin .row')];
+  const tag = (row) => row.querySelector('.share-tag')?.textContent || null;
+  check('admin list: "Shares tools" for a catalogue agent that is a tool source', tag(adminRows[0]) === 'Shares tools' && tag(adminRows[1]) === null, JSON.stringify(adminRows.map(tag)));
+  host.remove();
+}
+
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

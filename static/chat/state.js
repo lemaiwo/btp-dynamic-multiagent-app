@@ -367,6 +367,7 @@ const TOOL_GROUPS = [
   ['document', 'Document tools'],
   ['deep', 'Deep agent tools'],
   ['delegate', 'Delegation'],
+  ['connector', 'Connectors (shared by admin agents)'],
 ];
 
 const str = (v, fallback = '') => (typeof v === 'string' ? v : fallback);

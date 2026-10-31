@@ -388,8 +388,9 @@ async def describe(conv: ChatConversation, principal: str,
                       for p in row.peers if p != row.name and p in enabled]
         else:
             mine = target.user_row
+            sources = {r.name: r for r in rows if user_agents.shares_tools(r)}
             agent = {"ref": conv.agent_ref, "name": mine.name, "kind": "mine",
-                     "tier": user_agents.personal_tier(mine, usable)}
+                     "tier": user_agents.personal_tier(mine, usable, sources)}
             text, visible = mine.instructions or "", True
             checked = await run.personal_model_name(mine.model_name, conv.model_name)
             model_id = checked or run.catalog.default_name()
@@ -416,6 +417,12 @@ async def describe(conv: ChatConversation, principal: str,
             tools += [{"kind": "delegate", "name": delegation_tool_name(n), "agent": n}
                       for n in user_agents.consult_names(mine)
                       if n in usable and agent_allowed(usable[n], access)]
+            # The shared tool sets of the next turn (addendum (g)): one entry
+            # per connector label of each source that still shares.
+            tools += [{"kind": "connector", "name": label, "agent": n}
+                      for n in user_agents.tool_names(mine)
+                      if n in sources and agent_allowed(sources[n], access)
+                      for label in user_agents.connector_labels(sources[n])]
         turns = await _stored_turns(db, conv.id)
         files = (await db.execute(
             select(ChatFile.id, ChatFile.message_id, ChatFile.name, ChatFile.media_type,

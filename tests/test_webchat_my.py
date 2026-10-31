@@ -170,7 +170,7 @@ async def test_agent_crud_and_shape(client):
                 {"scope": "mine", "name": "TONE"}],
         consults=["btp-admin", "btp-admin"])
     assert set(made) == {"id", "ref", "name", "description", "instructions", "skills", "consults",
-                         "model", "deep", "tier", "created_at", "updated_at", "source",
+                         "tools", "model", "deep", "tier", "created_at", "updated_at", "source",
                          "readonly"}
     assert made["ref"] == f"mine:{made['id']}"
     assert made["description"] == "Writes things"
@@ -365,7 +365,8 @@ async def test_export_bytes_and_selection(client):
     assert bundle["agents"][1] == {"name": "Writer", "description": "",
                                    "instructions": "Be helpful.",
                                    "skills": [{"scope": "mine", "name": "Tone"}],
-                                   "consults": ["btp-admin"], "model": None, "deep": False}
+                                   "consults": ["btp-admin"], "tools": [], "model": None,
+                                   "deep": False}
     assert [s["name"] for s in bundle["skills"]] == ["Other", "Tone"]
     assert "id" not in json.dumps(bundle["agents"]) and ALICE not in r.text
 

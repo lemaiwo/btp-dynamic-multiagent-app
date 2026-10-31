@@ -229,6 +229,11 @@ export interface AgentInput {
      * key keeps what is stored, an older server neither sends nor reads it);
      * the form always sends it. */
     tier?: AgentTier;
+    /** "Tools usable by personal agents": a personal agent in the web chat
+     * may attach this agent's MCP servers and built-ins. Refused (422 at
+     * `share_tools`) for an agent whose Bitbucket entry approves. Optional on
+     * the wire (an absent key keeps what is stored); the form always sends it. */
+    share_tools?: boolean;
     expose_api: boolean;
     api_slug: string;
     run_as_principal: string;

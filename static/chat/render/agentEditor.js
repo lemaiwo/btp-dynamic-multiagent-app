@@ -4,12 +4,16 @@
 // skills (Mine, Admin · read-only), the admin agents it may consult and the
 // model; for a developer (addendum d) the "Deep agent tools" toggle and the
 // advanced agents in "May consult", each with the Developer badge, which a
-// non-developer never sees. Client checks mirror the limits with fixed
+// non-developer never sees. Addendum (g): "Tools from admin agents", the
+// catalogue's tool sources (at most 5), each with its connector labels and
+// an "Advanced" tag; an advanced one is disabled with a hint for a
+// non-developer. Client checks mirror the limits with fixed
 // texts; a server 422 marks the field, a 409 marks the name. Names and
 // descriptions of the catalogue are inserted as text nodes only.
 
 import * as api from '../api.js';
-import { LIMITS, TEXTS, validateAgent, validateSkill, takenNames, fieldErrors, isAdvanced, advancedAgentNames } from '../myagents.js';
+import { LIMITS, TEXTS, validateAgent, validateSkill, takenNames, fieldErrors, isAdvanced, advancedAgentNames,
+  toolSources, toolSourceLabel, advancedToolNames } from '../myagents.js';
 
 function el(tag, className, text) {
   const n = document.createElement(tag);
@@ -77,6 +81,74 @@ function checkGroup(legend, items, checked, { emptyText, lockBadge = false } = {
     wrap: fs,
     values: () => boxes.filter((b) => b.checked).map((b) => b.value),
     setError(text) { err.textContent = text || ''; err.hidden = !text; fs.classList.toggle('invalid', !!text); },
+  };
+}
+
+/** The "Advanced" tag of an advanced tool source (the word is ours). */
+export function advancedTag() {
+  const b = el('span', 'badge dev', 'Advanced');
+  b.title = 'Advanced tool source: developer role only';
+  return b;
+}
+
+/**
+ * The tool sources of the catalogue as checkboxes (addendum g): the label
+ * is "name · connector, connector", the description below it, an advanced
+ * source carries the "Advanced" tag and, for a non-developer, is disabled
+ * with the fixed hint. A 6th tick is undone with the fixed limit text.
+ * A stored name the catalogue no longer lists is said in one note and
+ * dropped on save (the server would refuse it).
+ */
+function toolGroup(sources, picked, developer) {
+  const fs = el('fieldset', 'check-group tools-group');
+  const lg = el('legend', null, 'Tools from admin agents');
+  lg.appendChild(lock());
+  fs.appendChild(lg);
+  if (!sources.length) fs.appendChild(el('p', 'check-empty', 'The admin shares no tools right now.'));
+  const boxes = [];
+  const err = el('p', 'field-error');
+  err.hidden = true;
+  const setError = (text) => { err.textContent = text || ''; err.hidden = !text; fs.classList.toggle('invalid', !!text); };
+  for (const src of sources) {
+    const advanced = src.tier === 'advanced';
+    const locked = advanced && !developer;
+    const row = el('label', locked ? 'check disabled' : 'check');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.value = src.name;
+    box.checked = picked.has(src.name) && !locked;
+    box.disabled = locked;
+    const text = el('span', 'check-text');
+    const nm = el('span', 'check-name', toolSourceLabel(src));
+    if (advanced) { nm.appendChild(document.createTextNode(' ')); nm.appendChild(advancedTag()); }
+    text.appendChild(nm);
+    if (src.description) text.appendChild(el('span', 'check-desc', src.description));
+    if (locked) {
+      const hint = el('span', 'check-hint', TEXTS.tools_advanced);
+      hint.id = `tool-hint-${++fieldSeq}`;
+      box.setAttribute('aria-describedby', hint.id);
+      text.appendChild(hint);
+    }
+    box.addEventListener('change', () => {
+      if (box.checked && boxes.filter((b) => b.checked).length > LIMITS.tools) {
+        box.checked = false;
+        setError(TEXTS.tools);
+        return;
+      }
+      setError('');
+    });
+    row.append(box, text);
+    fs.appendChild(row);
+    boxes.push(box);
+  }
+  const listed = new Set(sources.map((s) => s.name));
+  const gone = [...picked].filter((n) => !listed.has(n)).length;
+  if (gone) fs.appendChild(el('p', 'check-note', `${gone} tool ${gone === 1 ? 'source is' : 'sources are'} no longer shared and will be removed when you save.`));
+  fs.appendChild(err);
+  return {
+    wrap: fs,
+    values: () => boxes.filter((b) => b.checked && !b.disabled).map((b) => b.value),
+    setError,
   };
 }
 
@@ -226,6 +298,9 @@ export function createAgentEditor({ notify, onSaved }) {
     const gConsult = checkGroup('May consult · admin agents', consultable.map((a) => ({ value: a.name, name: a.name, description: a.description, badge: isAdvanced(a) })), pickedConsults,
       { emptyText: 'No admin agent is open to chat right now.', lockBadge: true });
 
+    const sources = toolSources(catalog);
+    const gTools = toolGroup(sources, new Set(Array.isArray(src.tools) ? src.tools : []), developer);
+
     // Deep agent tools (developers only): plan, scratchpad, sub-agents
     let deepBox = null;
     let deepErr = null;
@@ -278,11 +353,15 @@ export function createAgentEditor({ notify, onSaved }) {
     consultBox.appendChild(el('h3', null, 'May consult'));
     consultBox.appendChild(el('p', 'section-sub', `Admin agents this agent can hand a question to. At most ${LIMITS.consults}.`));
     consultBox.appendChild(gConsult.wrap);
-    body.append(grid, skillsBox, consultBox);
+    const toolsBox = el('div', 'panel-section');
+    toolsBox.appendChild(el('h3', null, 'Tools'));
+    toolsBox.appendChild(el('p', 'section-sub', `MCP servers and built-ins the admin shares; the agent calls them itself, with the admin's connections. At most ${LIMITS.tools}.`));
+    toolsBox.appendChild(gTools.wrap);
+    body.append(grid, skillsBox, consultBox, toolsBox);
     if (deepSection) body.appendChild(deepSection);
     body.appendChild(fModel.wrap);
 
-    const fields = { name: fName, description: fDesc, instructions: fInstr, skills: skillsErr, consults: gConsult, model: fModel };
+    const fields = { name: fName, description: fDesc, instructions: fInstr, skills: skillsErr, consults: gConsult, tools: gTools, model: fModel };
     if (developer) fields.deep = deepField;
     const read = () => ({
       name: name.value,
@@ -290,6 +369,7 @@ export function createAgentEditor({ notify, onSaved }) {
       instructions: instr.value,
       skills: [...gMine.values(), ...gAdmin.values()].map((v) => { const i = v.indexOf(':'); return { scope: v.slice(0, i), name: v.slice(i + 1) }; }),
       consults: gConsult.values(),
+      tools: gTools.values(),
       model: model.value || null,
       // `deep` is sent by a developer only; the server's default is false
       ...(developer ? { deep: deepBox.checked === true } : {}),
@@ -298,7 +378,7 @@ export function createAgentEditor({ notify, onSaved }) {
     async function submit() {
       const form = read();
       const errs = validateAgent({ ...form, models: models.map((m) => m.id) },
-        { taken: takenNames(mine.agents, editing?.id), developer, advancedNames: advancedAgentNames(catalog) });
+        { taken: takenNames(mine.agents, editing?.id), developer, advancedNames: advancedAgentNames(catalog), advancedTools: advancedToolNames(catalog) });
       let first = null;
       for (const [k, f] of Object.entries(fields)) { f.setError(errs[k] || ''); if (errs[k] && !first) first = f; }
       if (first) { (first.control || gMine.wrap.querySelector('input') || name).focus(); return; }

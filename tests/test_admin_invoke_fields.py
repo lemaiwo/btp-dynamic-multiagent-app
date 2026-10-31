@@ -343,3 +343,89 @@ async def test_update_without_the_switch_refuses_an_approving_entry_when_stored_
     assert after.expose_invoke == 1
     assert after.mcp_servers == before.mcp_servers
     assert after.expose_chat == before.expose_chat
+
+
+# --- share_tools (web chat addendum (g)) ---------------------------------------
+# The same "absent keeps" rule as the invoke switch; an approving agent never
+# shares; the imports store 1 only for the JSON boolean true.
+
+async def test_share_tools_is_stored_kept_and_cleared(client):
+    r = await client.post("/admin/api/agents", json=agent("share", share_tools=True))
+    assert r.status_code == 201, r.text
+    assert r.json()["share_tools"] is True
+    agent_id = r.json()["id"]
+    assert (await _row("share")).share_tools == 1
+    # The admin payload's bool is lax, like expose_chat: "false" is false.
+    r = await client.put(f"/admin/api/agents/{agent_id}",
+                         json=agent("share", share_tools="false"))
+    assert r.status_code == 200 and r.json()["share_tools"] is False
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=agent("share", share_tools=True))
+    assert r.json()["share_tools"] is True
+    # Absent (or null) keeps what is stored.
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=agent("share", description="e"))
+    assert r.status_code == 200 and r.json()["share_tools"] is True
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=agent("share", share_tools=None))
+    assert r.json()["share_tools"] is True
+    listed = {a["name"]: a for a in (await client.get("/admin/api/agents")).json()}
+    assert listed[PREFIX + "share"]["share_tools"] is True
+    r = await client.post("/admin/api/agents", json=agent("noshare"))
+    assert r.json()["share_tools"] is False
+
+
+async def test_an_approving_agent_cannot_share_its_tools(client):
+    from agents.db import BITBUCKET_APPROVER_SHARE_MESSAGE
+
+    body = agent("bb-share", mcp_servers=APPROVING, expose_chat=False, share_tools=True)
+    r = await client.post("/admin/api/agents", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert [d["loc"] for d in detail] == [["body", "share_tools"]]
+    assert BITBUCKET_APPROVER_SHARE_MESSAGE in detail[0]["msg"]
+    # Stored without it; an update that keeps the stored switch on while
+    # adding an approving entry is refused by storage.
+    r = await client.post("/admin/api/agents", json=agent("plain-share", share_tools=True))
+    agent_id = r.json()["id"]
+    r = await client.put(f"/admin/api/agents/{agent_id}", json=agent(
+        "plain-share", mcp_servers=APPROVING, expose_chat=False))
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == BITBUCKET_APPROVER_SHARE_MESSAGE
+    assert (await _row("plain-share")).share_tools == 1
+    r = await client.post("/admin/api/import", json={"agents": [body]})
+    assert r.status_code == 422 and "share_tools" in r.text
+
+
+async def test_share_tools_export_import_round_trip(client):
+    r = await client.post("/admin/api/agents", json=agent("exp-share", share_tools=True))
+    assert r.status_code == 201, r.text
+    exported = next(a for a in (await client.get("/admin/api/export")).json()["agents"]
+                    if a["name"] == PREFIX + "exp-share")
+    assert exported["share_tools"] is True
+    await client.delete(f"/admin/api/agents/{r.json()['id']}?force=true")
+    r = await client.post("/admin/api/import", json={"agents": [exported]})
+    assert r.status_code == 200, r.text
+    assert (await _row("exp-share")).share_tools == 1
+    # Without the key: kept.
+    legacy = {k: v for k, v in exported.items() if k != "share_tools"}
+    r = await client.post("/admin/api/import", json={"agents": [legacy]})
+    assert r.status_code == 200 and (await _row("exp-share")).share_tools == 1
+    # Only the JSON boolean true shares: the string "true" switches it off.
+    r = await client.post("/admin/api/import", json={"agents": [
+        {**exported, "share_tools": "true"}]})
+    assert r.status_code == 200, r.text
+    assert (await _row("exp-share")).share_tools == 0
+
+
+async def test_the_import_script_applies_share_tools_and_refuses_a_non_boolean(client, capsys):
+    script = _script()
+    failed = await script.import_bundle({"agents": [agent("scr-share", share_tools=True)]})
+    assert failed == [] and (await _row("scr-share")).share_tools == 1
+    failed = await script.import_bundle({"agents": [agent("scr-share", description="e")]})
+    assert failed == [] and (await _row("scr-share")).share_tools == 1
+    for value in ("true", 1, None):
+        failed = await script.import_bundle({"agents": [
+            agent("scr-share", share_tools=value)]})
+        assert failed == [PREFIX + "scr-share"]
+        assert script.SHARE_TOOLS_NOT_BOOLEAN in capsys.readouterr().out
+    assert (await _row("scr-share")).share_tools == 1
+    failed = await script.import_bundle({"agents": [agent("scr-share", share_tools=False)]})
+    assert failed == [] and (await _row("scr-share")).share_tools == 0

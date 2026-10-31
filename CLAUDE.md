@@ -1646,7 +1646,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     description, instructions (≤ 20,000), skills (`{scope: admin|mine,
     name}`, ≤ 20), `consults` (≤ 10 admin agents that are enabled,
     `expose_chat` and not approving: `chat_usable`), an optional model; no
-    MCP servers, built-ins, destinations, credentials, deep config or
+    MCP servers or built-ins of its own (it may attach an admin agent's shared
+    ones, see "Tools and connectors" below), no destinations, credentials or
     personal peers, and **never in the registry build, A2A, jobs or the
     invoke API**. Per user 50 agents and 100 skills (skill content ≤
     50,000). A conversation's `agent_ref` (`null` = the orchestrator,
@@ -1735,6 +1736,40 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     file that is not an upload of this conversation or whose turn stored no
     history; `excluded` is derived from the history, no column.
     `tests/test_webchat_context.py`
+  - **Tools and connectors for personal agents** (design addendum g). An
+    admin agent with `share_tools` (`agent_configs.share_tools`, NOT NULL,
+    `server_default "0"`; "Tools usable by personal agents" in both admin UIs;
+    `AgentPayload.share_tools` lax, absent or `null` keeps; export carries it;
+    the HTTP import, the seed and `scripts/import_bundle.py` store 1 only for
+    the JSON boolean `true`, the script refuses any other value) lends its MCP
+    servers and built-ins to personal agents: `BuildResult.shared_toolsets`
+    holds, for every enabled sharing row, the same guarded `servers` list its
+    specialist gets (never its own function tools: `load_skill`, `delegate_*`,
+    deep, IDE session tools). An agent whose `builtin:bitbucket` entry approves
+    cannot share (422 at `share_tools`, storage
+    `BITBUCKET_APPROVER_SHARE_MESSAGE`, nothing shared at build with one
+    WARNING). A personal agent names up to 5 sources in `tools`
+    (`chat_user_agents.tools_json`; `AgentIn.tools`): each must be enabled and
+    sharing (422 at `tools[i]` "not a tool source you can use"), an advanced
+    source makes the agent advanced and is accepted only from a developer/admin
+    ("advanced tools need the developer role"); an import drops a refused name
+    into `dropped` with a `rule` key and writes the agent without it.
+    `build_personal_agent` attaches `build.shared_toolsets[name]` for each
+    source that still shares and the turn's tier allows (a deep personal
+    agent's sub-agents get them too); with two or more sources every toolset is
+    prefixed by its source's name (`[^A-Za-z0-9_]` → `_`) so two connectors of
+    one name cannot collide; a source that is gone, disabled, no longer sharing
+    or above the tier is counted in the stored note ("… / n tool source(s) no
+    longer available"); a personal-agent turn holds the build's `in_flight`
+    counter so a reload cannot close the shared MCP clients mid-turn. `GET
+    /catalog` answers `tool_sources: [{name, description, tier, connectors}]`
+    (a connector label is the built-in's canonical URL or the MCP URL's host,
+    never a path, query, credential or destination name), filtered by tier
+    like `agents`; the context view lists `{"kind": "connector", "name",
+    "agent"}` per label of each attached source. The web chat editor has a
+    "Tools from admin agents" multi-select (advanced sources disabled for a
+    basic user), the lists a tools badge and a "Shares tools" tag.
+    `tests/test_webchat_tools.py`
   - **The viewer** (`preview.py`, design addendum f): a panel beside the
     messages that shows a file of the conversation or, in an advanced
     conversation, a code block the model wrote. `GET /files/{fid}/preview`
@@ -2213,7 +2248,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `stream_options` again, not in the descriptor), and streamed text parts
   around a tool call are shown as separate paragraphs; 2.30.0 adds the web
   chat's viewer (`agents/webchat/preview.py`, `static/chat/render/viewer.js`):
-  no new resource, variable, table or column
+  no new resource, variable, table or column; 2.31.0 adds tools and connectors
+  for personal agents (`agent_configs.share_tools`, `chat_user_agents.tools_json`:
+  HANA schema generation 7, no new resource, variable or role)
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

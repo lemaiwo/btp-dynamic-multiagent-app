@@ -9,7 +9,10 @@ the value. Other refusals are ``{"detail": "<fixed text>"}``.
 
 The catalogue shows what the admin configured, read-only and by name and
 description only: chat-usable admin agents (``user_agents.chat_usable``) and
-every admin skill; never instructions, servers or skill content.
+every admin skill; never instructions, servers or skill content. Its
+``tool_sources`` are the admin agents that share their tools
+(``user_agents.shares_tools``), with the connector label of each server
+entry only (``user_agents.connector_labels``).
 """
 
 from __future__ import annotations
@@ -50,6 +53,8 @@ MSG_REF_SKILL = "Value error, skills: not a skill you can attach"
 MSG_REF_CONSULT = "Value error, consults: not an agent you may consult"
 MSG_MODEL = "Value error, model: not an offered model"
 MSG_DEEP = "Value error, deep: needs the developer role"
+MSG_TOOLS = f"Value error, {my_store.TOOLS_NOT_SOURCE}"
+MSG_TOOLS_ADVANCED = f"Value error, {my_store.TOOLS_ADVANCED}"
 BAD_IDS = "agents and skills must be comma-separated ids"
 IMPORT_NOT_JSON = "The file is not a webchat bundle"
 IMPORT_FORMAT = "The bundle is not of the format webchat-bundle/1"
@@ -98,6 +103,8 @@ async def catalog(
         skills = (await db.execute(
             select(SkillConfig.name, SkillConfig.description).order_by(SkillConfig.name)
         )).all()
+        sources = {name: row for name, row in (await ua.tool_sources(db)).items()
+                   if agent_allowed(row, tier)}
     return {
         "agents": [
             {"ref": f"{ua.ADMIN_PREFIX}{name}", "name": name,
@@ -111,6 +118,11 @@ async def catalog(
              "source": "admin", "readonly": True}
             for name, description in skills
         ],
+        "tool_sources": [
+            {"name": name, "description": _catalog_text(row.description),
+             "tier": tier_of(row), "connectors": ua.connector_labels(row)}
+            for name, row in sorted(sources.items())
+        ],
         "orchestrator": {"ref": None, "name": ua.ORCHESTRATOR_NAME,
                          "description": ORCHESTRATOR_DESCRIPTION},
     }
@@ -121,7 +133,8 @@ async def catalog(
 # ---------------------------------------------------------------------------
 def _refused(problems: list[tuple[tuple[Any, ...], str]]) -> RequestValidationError:
     messages = {"skills": MSG_REF_SKILL, "consults": MSG_REF_CONSULT, "model": MSG_MODEL,
-                "deep": MSG_DEEP}
+                "deep": MSG_DEEP, my_store.PROBLEM_TOOLS: MSG_TOOLS,
+                my_store.PROBLEM_TOOLS_ADVANCED: MSG_TOOLS_ADVANCED}
     return RequestValidationError([
         {"loc": ("body", *loc), "msg": messages[kind], "type": "value_error"}
         for loc, kind in problems
@@ -143,7 +156,8 @@ async def list_my_agents() -> list[dict[str, Any]]:
     async with SessionLocal() as db:
         rows = await my_store.list_agents(db, store.caller())
         usable = await ua.chat_agents(db)
-    return [my_store.agent_out(r, usable) for r in rows]
+        sources = await ua.tool_sources(db)
+    return [my_store.agent_out(r, usable, sources) for r in rows]
 
 
 @router.post("/my/agents", status_code=201)
@@ -157,7 +171,8 @@ async def create_my_agent(body: m.AgentIn) -> dict[str, Any]:
             row = await my_store.create_agent(db, principal, body, refs)
         except (my_store.NameTaken, IntegrityError):
             raise HTTPException(status_code=409, detail=AGENT_EXISTS) from None
-        return my_store.agent_out(row, await ua.chat_agents(db))
+        return my_store.agent_out(row, await ua.chat_agents(db),
+                                  await ua.tool_sources(db))
 
 
 async def _my_agent(db: Any, principal: str, aid: str) -> Any:
@@ -171,7 +186,8 @@ async def _my_agent(db: Any, principal: str, aid: str) -> Any:
 async def get_my_agent(aid: str) -> dict[str, Any]:
     async with SessionLocal() as db:
         row = await _my_agent(db, store.caller(), aid)
-        return my_store.agent_out(row, await ua.chat_agents(db))
+        return my_store.agent_out(row, await ua.chat_agents(db),
+                                  await ua.tool_sources(db))
 
 
 @router.put("/my/agents/{aid}")
@@ -184,7 +200,8 @@ async def replace_my_agent(aid: str, body: m.AgentIn) -> dict[str, Any]:
             row = await my_store.replace_agent(db, row, body, refs)
         except (my_store.NameTaken, IntegrityError):
             raise HTTPException(status_code=409, detail=AGENT_EXISTS) from None
-        return my_store.agent_out(row, await ua.chat_agents(db))
+        return my_store.agent_out(row, await ua.chat_agents(db),
+                                  await ua.tool_sources(db))
 
 
 @router.delete("/my/agents/{aid}", status_code=204)

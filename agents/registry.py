@@ -588,6 +588,12 @@ class BuildResult:
     # handed (enabled or not). Each toolset keeps its own copy until the
     # next reload, so a catalogue edit asks here whether a reload is due.
     odata_services: frozenset[str] = frozenset()
+    # Web chat addendum (g): per enabled agent with ``share_tools``, the same
+    # guarded server list its specialist and deep sub-agents get (MCP
+    # servers and built-ins only, never the specialist's function tools).
+    # A personal agent attaches it per turn; a `PerRunMCPServer` opens its own
+    # MCP session per run, so one object serves several agents.
+    shared_toolsets: dict[str, list] = field(default_factory=dict)
 
 
 def _model_for(row: AgentConfig, *, default_model, default_name: str, cache: dict):
@@ -799,6 +805,7 @@ async def build_orchestrator() -> BuildResult:
 
     orchestrator = Agent(model, instructions=instructions, retries=_TOOL_RETRIES)
 
+    shared_toolsets: dict[str, list] = {}
     # Build each specialist and register a delegation tool on the orchestrator
     for row in enabled_rows:
         servers = []
@@ -903,6 +910,17 @@ async def build_orchestrator() -> BuildResult:
         # is a pass-through unless an IDE session is bound.
         mcp_clients.extend(closable)
         servers = [ReadOnlyGuard(server) for server in servers]
+        if getattr(row, "share_tools", 0):
+            # The save gate and storage refuse sharing on an approving agent;
+            # a row written by hand passes neither: it shares nothing.
+            if _approves(specs):
+                logger.warning(
+                    "Agent '%s' shares its tools and its builtin:bitbucket entry "
+                    "approves; an approving agent shares nothing with personal agents",
+                    row.name,
+                )
+            else:
+                shared_toolsets[row.name] = list(servers)
 
         attached_skills = []
         for skill_name in row.skills:
@@ -1011,6 +1029,7 @@ async def build_orchestrator() -> BuildResult:
         configs=configs,
         in_flight=in_flight,
         odata_services=frozenset(odata_by_name),
+        shared_toolsets=shared_toolsets,
     )
 
 
