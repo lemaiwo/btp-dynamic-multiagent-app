@@ -1718,6 +1718,25 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
               "'builtin:confluence':" in html and "['spaces', 'api_base']" in html)
         check("confluence has its spaces field", 'class="dest-spaces"' in html)
         check("the hint list names builtin:confluence", "builtin:jira, builtin:confluence," in html)
+        # builtin:git (addendum h of the web chat design): destination mode
+        # only, as a technical user; provider, repositories, base branch,
+        # prefix and two switches, collected by their own function.
+        check("git is a known destination built-in",
+              "'builtin:git':" in html
+              and "['provider', 'repositories', 'base_branch', 'branch_prefix', 'allow_push', "
+                  "'allow_pull_request']" in html)
+        check("git is offered under its toolset name",
+              "const GIT_TOOLSET_LABEL = 'Git repositories (GitHub, Bitbucket, GitLab)';" in html)
+        check("git has its fields",
+              all(f'class="dest-{k}"' in html for k in
+                  ("provider", "base_branch", "branch_prefix", "allow_push", "allow_pull_request")))
+        check("git provider select offers the three providers",
+              '<option value="github">GitHub</option>' in html
+              and '<option value="bitbucket">Bitbucket Cloud</option>' in html
+              and '<option value="gitlab">GitLab</option>' in html)
+        check("git switches use the approved wording",
+              "Allow pushing to agent branches" in html and "Allow opening pull requests" in html)
+        check("the hint list names builtin:git", "builtin:bitbucket, builtin:git, builtin:sapnotes," in html)
         check("the views placeholder shows a calendar view with its kinds",
               '"kinds": ["Presence", "Guard"]' in html)
         # A stored server on an auth mode this page does not offer (app_only,
@@ -2106,6 +2125,87 @@ assert.throws(() => collectMcpServers(), /Two builtin:bitbucket rows/);
              require_green_builds: false } }));
 assert.deepStrictEqual(out.oauth, { destination: 'JIRA', project: 'ABC' });
 assert.strictEqual(row.querySelector('.dest-allow_approve').checked, false);
+// 7e. builtin:git: provider, repositories as a list, base branch, prefix, two switches.
+const GIT_OAUTH = { destination: 'GITLAB_API', provider: 'gitlab', repositories: ['grp/web', 'grp/sub/api'],
+    base_branch: 'develop', branch_prefix: 'bot/', allow_push: true, allow_pull_request: true };
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { ...GIT_OAUTH, user_context: true, project: 'ABC', lookback: '2d', allow_send: true,
+             workspace: 'ws', branch: 'main', allow_comment: true, allow_approve: true } }));
+for (const k of ['destination', 'provider', 'repositories', 'base_branch', 'branch_prefix',
+                 'allow_push', 'allow_pull_request']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, '', k + ' is shown');
+}
+for (const k of ['user_context', 'project', 'lookback', 'allow_send', 'workspace', 'branch',
+                 'allow_comment', 'allow_approve', 'require_green_builds', 'api_base', 'spaces']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none', k + ' is hidden');
+}
+// The loaded entry fills the fields; the block is built from them only.
+assert.strictEqual(row.querySelector('.dest-provider').value, 'gitlab');
+assert.strictEqual(row.querySelector('.dest-repositories').value, 'grp/web, grp/sub/api');
+assert.strictEqual(row.querySelector('.dest-base_branch').value, 'develop');
+assert.strictEqual(row.querySelector('.dest-branch_prefix').value, 'bot/');
+assert.deepStrictEqual(out, { url: 'builtin:git', auth_mode: 'destination', oauth: GIT_OAUTH });
+assert.ok(row.querySelector('.dest-hint').textContent.startsWith('Git repositories (GitHub, Bitbucket, GitLab).'));
+console.log('GIT:' + JSON.stringify(out));
+// Built from the fields as the admin leaves them: the repositories split on
+// commas with empty parts dropped, base branch and prefix as typed (edge
+// whitespace sent for the server to refuse), blank ones and unticked
+// switches absent.
+row.querySelector('.dest-provider').value = 'github';
+row.querySelector('.dest-repositories').value = ' acme/web, ,acme/api ,';
+row.querySelector('.dest-base_branch').value = '';
+row.querySelector('.dest-branch_prefix').value = ' agent/';
+row.querySelector('.dest-allow_push').checked = false;
+row.querySelector('.dest-allow_pull_request').checked = false;
+assert.deepStrictEqual(collectMcpServers()[0].oauth,
+    { destination: 'GITLAB_API', provider: 'github', repositories: ['acme/web', 'acme/api'],
+      branch_prefix: ' agent/' });
+// No repository is refused before the save, with a fixed text.
+row.querySelector('.dest-repositories').value = ' , ';
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'Git: list at least one repository.');
+    return true;
+});
+// A new row starts on GitHub with both switches off.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+row.querySelector('.mcp-url').value = 'builtin:git';
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.strictEqual(row.querySelector('.dest-provider').value, 'github');
+assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
+// A switch stored as anything but the JSON boolean is not loaded as that switch;
+// a provider this page does not know leaves the select blank and is refused.
+({ row, out } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'], allow_push: 'true',
+             allow_pull_request: 1 } }));
+assert.deepStrictEqual(out.oauth, { destination: 'GH', provider: 'github', repositories: ['a/b'] });
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'SECRETVALUE', repositories: ['a/b'] } });
+assert.throws(() => collectMcpServers(), e => {
+    assert.ok(/choose a provider/.test(e.message));
+    assert.ok(!e.message.includes('SECRETVALUE'));
+    return true;
+});
+// Only the destination mode.
+({ row } = addAndCollect({ url: 'builtin:git', auth_mode: 'destination',
+    oauth: { destination: 'GH', provider: 'github', repositories: ['a/b'] } }));
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+assert.throws(() => collectMcpServers(), /builtin:git needs the auth mode "BTP destination"/);
+// An agent takes one git entry: two rows (in any spelling) are refused here, not posted.
+row.querySelector('.mcp-auth-mode').value = 'destination';
+addMcpServerRow({ url: 'Builtin:Git/', auth_mode: 'destination',
+    oauth: { destination: 'GH2', provider: 'github', repositories: ['c/d'] } });
+assert.throws(() => collectMcpServers(), /Two builtin:git rows/);
+// A Bitbucket row loads none of the git fields from a stored block.
+({ row, out } = addAndCollect({ url: 'builtin:bitbucket', auth_mode: 'destination',
+    oauth: { destination: 'BITBUCKET', workspace: 'acme-ws', provider: 'gitlab', base_branch: 'dev',
+             branch_prefix: 'bot/', allow_push: true, allow_pull_request: true } }));
+assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
+assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
+assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
 // 4b. Confluence keeps its space pin and api_base; nothing of Jira's, no user switch.
 ({ row, out } = addAndCollect({
     url: 'builtin:confluence', auth_mode: 'destination',

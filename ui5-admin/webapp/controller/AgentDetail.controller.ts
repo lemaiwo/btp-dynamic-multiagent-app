@@ -10,6 +10,7 @@ import validators, { validateDeep } from "../model/validators";
 import oauthConfig from "../model/oauthConfig";
 import odataEntry from "../model/odataEntry";
 import bitbucketEntry from "../model/bitbucketEntry";
+import gitEntry from "../model/gitEntry";
 import type { ODataEntryGiven, ODataEntryOpens, ODataEntryRow } from "../model/odataEntry";
 import { AUTH_MODE_TEXT_KEYS, BUILTINS, authModesFor, findBuiltin } from "../model/builtins";
 import formatter from "../model/formatter";
@@ -321,6 +322,9 @@ export default class AgentDetail extends BaseController {
         // one the fragment's bindings test for.
         const isBitbucket = bitbucketEntry.isBitbucketUrl(server.url);
         const pins = ((isBitbucket ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
+        // --- git --- Likewise: its own state, its canonical spelling.
+        const isGit = gitEntry.isGitUrl(server.url);
+        const git = ((isGit ? server.oauth : undefined) ?? {}) as Record<string, unknown>;
         const blankOAuth = { dcr: false, client_id: "", client_secret: "", uaa_url: "", authorize_url: "", token_url: "", scope: "", mailbox: "", allow_send: false, lookback: "", destination: "", project: "", status: "", api_base: "", labels: "", spaces: "", allow_comment: false, min_score: "", recipients: "", from: "", team: "", channels: "", user_context: false };
         const opening = ++this.odataOpening;
         this.odataCatalogue = null;
@@ -334,7 +338,8 @@ export default class AgentDetail extends BaseController {
             // exactly `builtin:odata`: an entry stored in another spelling
             // (`Builtin:OData`) is held in that one, or OK would write back
             // an `allow_write` the admin never saw.
-            url: isOData ? odataEntry.ODATA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL : server.url,
+            url: isOData ? odataEntry.ODATA_URL : isBitbucket ? bitbucketEntry.BITBUCKET_URL
+                : isGit ? gitEntry.GIT_URL : server.url,
             auth_mode: server.auth_mode,
             odata: {
                 services: stored.services, allowWrite: stored.allow_write, loaded: isOData, loadError,
@@ -342,7 +347,8 @@ export default class AgentDetail extends BaseController {
             },
             oauth: isOData || !server.oauth ? blankOAuth
                 : isBitbucket ? { ...blankOAuth, destination: typeof pins.destination === "string" ? pins.destination : "" }
-                    : server.oauth,
+                    : isGit ? { ...blankOAuth, destination: typeof git.destination === "string" ? git.destination : "" }
+                        : server.oauth,
             // --- bitbucket --- Workspace and branch as stored (never
             // trimmed); the switches as real booleans. No stored
             // `require_green_builds` means the builds must be successful:
@@ -354,6 +360,16 @@ export default class AgentDetail extends BaseController {
                 allowComment: pins.allow_comment === true,
                 allowApprove: pins.allow_comment === true && pins.allow_approve === true,
                 requireGreenBuilds: pins.require_green_builds !== false
+            },
+            // --- git --- As stored (never trimmed); a new entry starts on
+            // GitHub; the switches as real booleans, on only for `true`.
+            git: {
+                provider: isGit ? (typeof git.provider === "string" ? git.provider : "") : "github",
+                repositoriesText: gitEntry.formatRepositories(git.repositories),
+                baseBranch: typeof git.base_branch === "string" ? git.base_branch : "",
+                branchPrefix: typeof git.branch_prefix === "string" ? git.branch_prefix : "",
+                allowPush: git.allow_push === true,
+                allowPullRequest: git.allow_pull_request === true
             },
             // "mcp" for a remote server, otherwise the built-in's url.
             kind: findBuiltin(server.url)?.url ?? "mcp",
@@ -420,6 +436,8 @@ export default class AgentDetail extends BaseController {
             void this.enterODataEntry();
         } else if (bitbucketEntry.isBitbucketUrl(url)) {
             serverModel.setProperty("/url", bitbucketEntry.BITBUCKET_URL);
+        } else if (gitEntry.isGitUrl(url)) {
+            serverModel.setProperty("/url", gitEntry.GIT_URL);
         }
     }
 
@@ -783,6 +801,26 @@ export default class AgentDetail extends BaseController {
         delete oauthRaw.repositories;
         delete oauthRaw.allow_approve;
         delete oauthRaw.require_green_builds;
+        // --- git --- Likewise its own keys.
+        delete oauthRaw.provider;
+        delete oauthRaw.base_branch;
+        delete oauthRaw.branch_prefix;
+        delete oauthRaw.allow_push;
+        delete oauthRaw.allow_pull_request;
+        if (gitEntry.isGitUrl(url)) {
+            // Only the entry's own values reach cleanOAuth: the destination
+            // name and what the Git fields hold now, as typed.
+            const destination = oauthRaw.destination;
+            const form = serverModel.getProperty("/git") as Record<string, unknown>;
+            Object.keys(oauthRaw).forEach((key) => { delete oauthRaw[key]; });
+            oauthRaw.destination = destination;
+            oauthRaw.provider = form.provider;
+            oauthRaw.repositories = gitEntry.parseRepositories(form.repositoriesText as string);
+            oauthRaw.base_branch = form.baseBranch;
+            oauthRaw.branch_prefix = form.branchPrefix;
+            oauthRaw.allow_push = form.allowPush === true;
+            oauthRaw.allow_pull_request = form.allowPullRequest === true;
+        }
         if (bitbucketEntry.isBitbucketUrl(url)) {
             // Only the entry's own values reach cleanOAuth: the destination
             // name and what the Bitbucket fields hold now. Workspace and

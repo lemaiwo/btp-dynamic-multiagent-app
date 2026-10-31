@@ -98,9 +98,11 @@ export type OAuthClient =
            */
           workspace?: string;
           /**
-           * `builtin:bitbucket` only. 1 to 50 distinct repository slugs that
+           * `builtin:bitbucket`: 1 to 50 distinct repository slugs that
            * narrow `workspace`; left out means every repository of the
-           * workspace (an empty list is refused).
+           * workspace (an empty list is refused). `builtin:git`: 1 to 50
+           * distinct repository paths (`owner/name`, `workspace/slug`,
+           * `group[/subgroup]/project`), required.
            */
           repositories?: string[];
           /** `builtin:bitbucket` only. The target branch of the pull requests
@@ -116,6 +118,23 @@ export type OAuthClient =
            * builds; only ever sent as `false`.
            */
           require_green_builds?: boolean;
+          // --- git ---
+          /** `builtin:git` only. Which REST API the destination reaches. See
+           * agents/git_config.py and model/gitEntry.ts. */
+          provider?: "github" | "bitbucket" | "gitlab";
+          /** `builtin:git` only. The branch new branches start from and pull
+           * requests target; left out is the server's default, `main`. */
+          base_branch?: string;
+          /** `builtin:git` only. The prefix every branch the agent creates
+           * carries (`^[A-Za-z0-9][A-Za-z0-9._-]{0,39}/$`); left out is
+           * `agent/`. */
+          branch_prefix?: string;
+          /** `builtin:git` only. Whether the agent may create prefixed
+           * branches and commit to them. Only ever sent as `true`. */
+          allow_push?: boolean;
+          /** `builtin:git` only. Whether the agent may open pull requests
+           * against the base branch. Only ever sent as `true`. */
+          allow_pull_request?: boolean;
           /**
            * `builtin:sapnotes` only, on `auth_mode: "none"`. The CVSS floor a
            * note must reach to be reported; 9.0 is what SAP calls HotNews.

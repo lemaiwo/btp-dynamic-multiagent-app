@@ -3,6 +3,7 @@ import { BUILTINS, DESTINATION_MAILBOX_URLS, DESTINATION_USER_CONTEXT_URLS } fro
 import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
+import gitEntry from "./gitEntry";
 
 // --- odata ---
 /** `SERVICE_NAME_RE` in agents/odata/models.py: the slug of a catalogue service. */
@@ -343,6 +344,10 @@ export default {
             // --- bitbucket --- Its own rules and none of the Jira ones below.
             return bitbucketEntry.validate(oauth, authMode);
         }
+        if (gitEntry.isGitUrl(url)) {
+            // --- git --- Its own rules and none of the Jira ones below.
+            return gitEntry.validate(oauth, authMode);
+        }
         if (this.isTeams(url)) {
             const teamsError = this.validateTeams(oauth, authMode);
             if (teamsError) {
@@ -541,6 +546,8 @@ export default {
                     errors[index] = "An agent has one OData services entry; add the services to the existing one.";
                 } else if (key === bitbucketEntry.BITBUCKET_URL) {
                     errors[index] = "An agent has one Bitbucket entry; change the existing one.";
+                } else if (key === gitEntry.GIT_URL) {
+                    errors[index] = "An agent has one Git entry; add the repositories to the existing one.";
                 } else {
                     errors[index] = "This is a duplicate URL; each server may appear once.";
                 }

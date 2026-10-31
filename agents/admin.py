@@ -51,31 +51,19 @@ from pydantic import (
     model_validator,
 )
 
+from agents import git_config
 from agents.auth import current_base_url, current_principal, require_admin
-from agents.chat_app import dynamic_chat_app
-from agents.builtins import BUILTIN_URLS, is_builtin_url
-from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, normalize_spaces
-from agents.jira_tools import BUILTIN_JIRA_URL
-from agents.mail_render import MailTheme
-from agents.odata import BUILTIN_ODATA_URL
-from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
-from agents.outlook_tools import BUILTIN_OUTLOOK_URL
-from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_config import check_entry as check_bitbucket_entry
 from agents.bitbucket_config import clean_entry as clean_bitbucket_entry
-from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
-from agents.sharepoint_views import check_pins, clean_views
-from agents.slack_tools import BUILTIN_SLACK_URL
-from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
-from agents.teams_tools import BUILTIN_TEAMS_URL
-from agents.validation_errors import validation_item
-from agents.invoke_config import check_result_schema, clean_limits
+from agents.builtins import BUILTIN_URLS, is_builtin_url
+from agents.chat_app import dynamic_chat_app
+from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, normalize_spaces
 from agents.db import (
-    AUTH_MODE_JWT,
-    AUTH_MODE_NONE,
     AUTH_MODE_APP_ONLY,
     AUTH_MODE_DESTINATION,
+    AUTH_MODE_JWT,
+    AUTH_MODE_NONE,
     AUTH_MODE_OAUTH2,
     AUTH_MODE_SESSION,
     BITBUCKET_APPROVER_CHAT_MESSAGE,
@@ -83,6 +71,7 @@ from agents.db import (
     BITBUCKET_APPROVER_SHARE_MESSAGE,
     BITBUCKET_SINGLE_ENTRY_MESSAGE,
     BUILTIN_PUBLIC_KEYS,
+    GIT_SINGLE_ENTRY_MESSAGE,
     KEEP,
     MAX_ODATA_ENTRY_SERVICES,
     OAUTH_CONFIG_MODES,
@@ -95,12 +84,12 @@ from agents.db import (
     bitbucket_approves,
     check_bitbucket_approver_reach,
     check_delegation_name_collision,
-    delete_agent,
-    delete_skill,
-    delete_workflow,
     check_odata_services,
     create_odata_service,
+    delete_agent,
     delete_odata_service,
+    delete_skill,
+    delete_workflow,
     describe_referrers,
     get_active_model_name,
     get_agent,
@@ -122,8 +111,8 @@ from agents.db import (
     normalize_skills_json,
     odata_entries,
     odata_service_columns,
-    odata_service_unchanged,
     odata_service_referrers,
+    odata_service_unchanged,
     prepare_servers,
     prepared_server_list,
     rename_agent_references,
@@ -137,12 +126,29 @@ from agents.db import (
     validate_api_slug,
     validate_odata_service,
 )
-from agents.registry import registry
-from agents.shared import available_models, default_model_name
-from agents.workflow_runner import RunRefused as WorkflowRunRefused
-from agents.workflow_runner import start_workflow_run
+
 # --- deep agents ---
 from agents.deep import DeepConfig, dump_deep_config
+from agents.git_config import BUILTIN_GIT_URL
+from agents.git_config import check_entry as check_git_entry
+from agents.git_config import clean_entry as clean_git_entry
+from agents.invoke_config import check_result_schema, clean_limits
+from agents.jira_tools import BUILTIN_JIRA_URL
+from agents.mail_render import MailTheme
+from agents.odata import BUILTIN_ODATA_URL
+from agents.odata.models import MAX_DEFINITION_BYTES, SERVICE_NAME_RE
+from agents.outlook_tools import BUILTIN_OUTLOOK_URL
+from agents.registry import registry
+from agents.sapnotedetail_tools import BUILTIN_SAPNOTEDETAIL_URL
+from agents.shared import available_models, default_model_name
+from agents.sharepoint_tools import BUILTIN_SHAREPOINT_URL
+from agents.sharepoint_views import check_pins, clean_views
+from agents.slack_tools import BUILTIN_SLACK_URL
+from agents.smtp_tools import BUILTIN_SMTP_URL, is_address
+from agents.teams_tools import BUILTIN_TEAMS_URL
+from agents.validation_errors import validation_item
+from agents.workflow_runner import RunRefused as WorkflowRunRefused
+from agents.workflow_runner import start_workflow_run
 
 logger = logging.getLogger(__name__)
 
@@ -349,10 +355,20 @@ class OAuthClientPayload(BaseModel):
     branch: StrictStr = Field(default="", max_length=200)
     allow_approve: StrictBool = False
     require_green_builds: StrictBool | None = None
+    # builtin:git only. The provider, the base branch pull requests target,
+    # the prefix of every branch the agent may push to, and the two write
+    # switches; `repositories` (above) holds the repository paths.
+    # agents/git_config.py is the gate. Strict, and handed on untrimmed.
+    provider: StrictStr = Field(default="", max_length=16)
+    base_branch: StrictStr = Field(default="", max_length=200)
+    branch_prefix: StrictStr = Field(default="", max_length=41)
+    allow_push: StrictBool = False
+    allow_pull_request: StrictBool = False
 
     model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("services", "allow_write", "allow_approve", mode="before")
+    @field_validator("services", "allow_write", "allow_approve", "allow_push",
+                     "allow_pull_request", mode="before")
     @classmethod
     def _null_is_absent(cls, v: Any, info: Any) -> Any:
         """A client that serialises an unset field as ``null`` means "not
@@ -361,7 +377,8 @@ class OAuthClientPayload(BaseModel):
             return [] if info.field_name == "services" else False
         return v
 
-    @field_validator("site", "library", "path", "workspace", "branch", mode="before")
+    @field_validator("site", "library", "path", "workspace", "branch", "provider",
+                     "base_branch", "branch_prefix", mode="before")
     @classmethod
     def _null_pin_is_absent(cls, v: Any) -> Any:
         """``null`` means "not set", as for ``services`` and ``views``: a
@@ -498,6 +515,9 @@ class OAuthClientPayload(BaseModel):
             "path": self.path,
             "workspace": self.workspace,
             "branch": self.branch,
+            "provider": self.provider,
+            "base_branch": self.base_branch,
+            "branch_prefix": self.branch_prefix,
         }
         config = {k: v for k, v in fields.items() if v}
         if self.theme:
@@ -520,6 +540,10 @@ class OAuthClientPayload(BaseModel):
             config["allow_approve"] = True
         if self.require_green_builds is False:
             config["require_green_builds"] = False
+        if self.allow_push:
+            config["allow_push"] = True
+        if self.allow_pull_request:
+            config["allow_pull_request"] = True
         return config
 
 
@@ -680,6 +704,26 @@ class McpServerPayload(BaseModel):
             check_bitbucket_entry(oauth)
         return data
 
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_raw_git_entry(cls, data: Any) -> Any:
+        """The ``builtin:git`` block as the client sent it, for the reason
+        ``_validate_raw_bitbucket_entry`` gives: afterwards a stray key or the
+        string "true" can no longer be told from a correct entry."""
+        if isinstance(data, dict) and _server_key(data.get("url")) == BUILTIN_GIT_URL:
+            mode = str(data.get("auth_mode") or "").strip().lower()
+            if mode != AUTH_MODE_DESTINATION:
+                raise ValueError(
+                    f"{BUILTIN_GIT_URL} requires auth_mode=destination: it holds no "
+                    "credential of its own and reaches the provider only through the "
+                    "BTP destination named in oauth.destination"
+                )
+            oauth = data.get("oauth")
+            if isinstance(oauth, OAuthClientPayload):
+                oauth = {k: getattr(oauth, k) for k in oauth.model_fields_set}
+            check_git_entry(oauth)
+        return data
+
     @model_validator(mode="after")
     def _validate_oauth(self) -> "McpServerPayload":
         if _server_key(self.url) == BUILTIN_ODATA_URL:
@@ -712,8 +756,22 @@ class McpServerPayload(BaseModel):
         if is_sharepoint:
             self._validate_sharepoint()
         is_bitbucket = _server_key(self.url) == BUILTIN_BITBUCKET_URL
+        is_git = _server_key(self.url) == BUILTIN_GIT_URL
+        if not is_git and self.oauth is not None and (
+            self.oauth.provider or self.oauth.base_branch or self.oauth.branch_prefix
+            or self.oauth.allow_push or self.oauth.allow_pull_request
+        ):
+            raise ValueError(
+                "oauth.provider, oauth.base_branch, oauth.branch_prefix, oauth.allow_push "
+                f"and oauth.allow_pull_request belong to a {BUILTIN_GIT_URL} entry only; "
+                "no other server reads them"
+            )
+        if is_git:
+            # Again on the block the route hands to storage.
+            check_git_entry(self.oauth.to_config() if self.oauth else None)
         if not is_bitbucket and self.oauth is not None and (
-            self.oauth.workspace or self.oauth.repositories is not None or self.oauth.branch
+            self.oauth.workspace or self.oauth.branch
+            or (not is_git and self.oauth.repositories is not None)
             or self.oauth.allow_approve or self.oauth.require_green_builds is not None
         ):
             raise ValueError(
@@ -1135,6 +1193,8 @@ class AgentPayload(BaseModel):
         # as the one entry (`prepare_servers`, which refuses this as well).
         if sum(1 for u in urls if _server_key(u) == BUILTIN_BITBUCKET_URL) > 1:
             raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
+        if sum(1 for u in urls if _server_key(u) == BUILTIN_GIT_URL) > 1:
+            raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
         if len(set(urls)) != len(urls):
             raise ValueError("mcp_servers contains duplicate urls")
         return self
@@ -1428,8 +1488,8 @@ async def api_create_agent(payload: AgentPayload) -> dict[str, Any]:
 
 
 def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
-    """What an agent's ``builtin:odata`` and ``builtin:bitbucket`` entries
-    let it do: the part of an agent row whose change must reach the running
+    """What an agent's ``builtin:odata``, ``builtin:bitbucket`` and
+    ``builtin:git`` entries let it do: the part of an agent row whose change must reach the running
     build at once. ``[]`` for an agent with neither entry.
 
     Per OData entry the attached services (sorted) and whether it may write;
@@ -1467,7 +1527,26 @@ def _entry_signature(servers: Any, enabled: Any = True) -> list[Any]:
         bitbucket.append(
             (BUILTIN_BITBUCKET_URL, json.dumps(stored, sort_keys=True, default=str))
         )
-    return sorted(odata) + sorted(bitbucket)
+    # A ``builtin:git`` entry the same way: repositories, branches and the two
+    # switches are read from the build, so unticking "Allow pushing" must not
+    # wait for a manual reload either (addendum h).
+    git = []
+    for server in servers:
+        if not isinstance(server, dict) or _server_key(server.get("url")) != BUILTIN_GIT_URL:
+            continue
+        block = server.get("oauth")
+        try:
+            if server.get("auth_mode") != AUTH_MODE_DESTINATION:
+                raise ValueError("not a destination entry")
+            stored = clean_git_entry(block)
+            # The cleaner keeps a default that was spelled out; the build does
+            # not care, so neither does the signature.
+            stored.setdefault("base_branch", git_config.DEFAULT_BASE_BRANCH)
+            stored.setdefault("branch_prefix", git_config.DEFAULT_BRANCH_PREFIX)
+        except ValueError:
+            stored = {"refused": [server.get("auth_mode"), block]}
+        git.append((BUILTIN_GIT_URL, json.dumps(stored, sort_keys=True, default=str)))
+    return sorted(odata) + sorted(bitbucket) + sorted(git)
 
 
 async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[str, bool]:

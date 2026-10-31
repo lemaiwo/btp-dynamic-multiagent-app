@@ -27,6 +27,7 @@ import type UI5Element from "sap/ui/core/Element";
 import type StepInput from "sap/m/StepInput";
 import type Switch from "sap/m/Switch";
 import Common, { backend } from "./pages/Common";
+import type { McpServer } from "../../service/types";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -840,6 +841,102 @@ opaTest("a SharePoint server stores the pins and the views", function (Given: Co
                 },
                 "posted exactly {destination, site, library, path, views}"
             );
+        }
+    });
+    Then.iStopTheApp();
+});
+
+// --- git ---
+opaTest("a Git server stores exactly the cleaned block and is read back into the dialog", function (Given: Common, When: Common, Then: Common) {
+    const expected = {
+        destination: "GITLAB_API", provider: "gitlab" as const, repositories: ["grp/web", "grp/sub/api"],
+        branch_prefix: "bot/", allow_push: true
+    };
+    Given.iStartTheApp("agents/101");
+    When.waitFor({ id: "addServerButton", viewName: "AgentDetail", actions: new Press() });
+    When.waitFor({
+        id: "serverKind",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            const item = select.getItems().find((i) => i.getText() === "Git repositories (GitHub, Bitbucket, GitLab)");
+            Opa5.assert.ok(item, "the toolset is offered under its name");
+            select.setSelectedKey("builtin:git");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+    Then.waitFor({
+        id: "serverAuthMode",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const select = element as Select;
+            Opa5.assert.deepEqual(select.getItems().map((i) => i.getKey()), ["destination"], "destination mode only");
+            Opa5.assert.strictEqual(
+                dialogControl<Select>(element, "serverAuthMode", "oauthGitProvider")?.getSelectedKey(), "github",
+                "a new entry starts on GitHub");
+            Opa5.assert.notOk(dialogControl<Input>(element, "serverAuthMode", "oauthLookback")?.getVisible(),
+                "no look-back window");
+            Opa5.assert.notOk(dialogControl<CheckBox>(element, "serverAuthMode", "oauthUserContext")?.getVisible(),
+                "no signed-in-user switch");
+        }
+    });
+    When.waitFor({
+        id: "oauthGitProvider",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        actions: function (element: UI5Element | null) {
+            const select = element as Select;
+            select.setSelectedKey("gitlab");
+            select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+        }
+    });
+    iTypeInTheServerDialog(When, "oauthDestination", "GITLAB_API");
+    iTypeInTheServerDialog(When, "oauthGitRepositories", " grp/web, ,grp/sub/api ");
+    iTypeInTheServerDialog(When, "oauthGitBranchPrefix", "bot/");
+    When.waitFor({ id: "oauthGitAllowPush", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "serverConfirm", viewName: "AgentDetail", searchOpenDialogs: true, actions: new Press() });
+    When.waitFor({ id: "saveAgentButton", viewName: "AgentDetail", actions: new Press() });
+
+    Then.waitFor({
+        id: "agentsTable",
+        viewName: "Agents",
+        success: function () {
+            const sent = ((backend.bodies["PUT agents/101"] ?? {}).mcp_servers ?? []) as McpServer[];
+            Opa5.assert.deepEqual(sent[2], { url: "builtin:git", auth_mode: "destination", oauth: expected },
+                "posted exactly the cleaned block: no default base branch, no switch that is off");
+            HashChanger.getInstance().setHash("agents/101");
+        }
+    });
+
+    When.waitFor({
+        id: "serversTable",
+        viewName: "AgentDetail",
+        matchers: function (element: UI5Element) {
+            return ((element as Table).getItems() as ColumnListItem[]).length === 3;
+        },
+        actions: function (element: UI5Element | null) {
+            const row = (element as Table).getItems()[2] as ColumnListItem;
+            ((row.getCells()[2] as HBox).getItems()[0] as Button).firePress();
+        }
+    });
+    Then.waitFor({
+        id: "oauthGitRepositories",
+        viewName: "AgentDetail",
+        searchOpenDialogs: true,
+        success: function (element: UI5Element) {
+            const control = function <T extends UI5Element>(id: string): T | undefined {
+                return dialogControl<T>(element, "oauthGitRepositories", id);
+            };
+            Opa5.assert.strictEqual((element as Input).getValue(), "grp/web, grp/sub/api", "the repositories are read back");
+            Opa5.assert.strictEqual(control<Select>("oauthGitProvider")?.getSelectedKey(), "gitlab", "the provider");
+            Opa5.assert.strictEqual(control<Input>("oauthDestination")?.getValue(), "GITLAB_API", "the destination");
+            Opa5.assert.strictEqual(control<Input>("oauthGitBaseBranch")?.getValue(), "", "no base branch: the default");
+            Opa5.assert.strictEqual(control<Input>("oauthGitBranchPrefix")?.getValue(), "bot/", "the prefix");
+            Opa5.assert.strictEqual(control<CheckBox>("oauthGitAllowPush")?.getSelected(), true, "pushing is on");
+            Opa5.assert.strictEqual(control<CheckBox>("oauthGitAllowPullRequest")?.getSelected(), false,
+                "pull requests are off");
         }
     });
     Then.iStopTheApp();

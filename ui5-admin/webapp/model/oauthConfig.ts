@@ -4,6 +4,7 @@ import { findBuiltin } from "./builtins";
 import { isRemoteUrl } from "./remoteUrl";
 import odataEntry from "./odataEntry";
 import bitbucketEntry from "./bitbucketEntry";
+import gitEntry from "./gitEntry";
 
 /**
  * Turns the server dialog's flat form model into the config block the API
@@ -291,6 +292,12 @@ export default {
             // default below would send project, status and a false
             // allow_comment, all of which the server refuses for this entry.
             return bitbucketEntry.clean(raw) as McpServer["oauth"];
+        }
+        if (key === gitEntry.GIT_URL) {
+            // --- git --- Before the generic branches, as for Bitbucket: the
+            // Jira-shaped default would send project, status and a false
+            // allow_comment, all of which the server refuses for this entry.
+            return gitEntry.clean(raw) as McpServer["oauth"];
         }
         if (authMode === "none") {
             // Whitelisted, not "everything that isn't blank": this block goes

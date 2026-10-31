@@ -738,6 +738,51 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   previous step's text). Likewise not closed: the agent's own
   deep sub-agents share its toolsets (`tests/test_bitbucket_reach.py`).
   `tests/test_bitbucket_config.py`, `tests/test_bitbucket_registration.py`
+- `agents/git_tools.py` + `agents/git_config.py` + `agents/git_http.py` +
+  `agents/git_providers.py` — Git remotes as an in-process toolset (`builtin:git`,
+  design addendum h of the web chat design): GitHub (cloud or GHES), Bitbucket
+  Cloud and GitLab (gitlab.com or self-hosted) behind ONE tool contract, REST
+  only (no git binary, no clone). **Destination mode only**, Internet
+  destinations (an OnPremise one is `destination_error` when a call resolves
+  it), `user_context` refused: the technical user of the destination commits,
+  the chat user and the conversation (or run) id go into a commit trailer.
+  The entry is exactly `{"url": "builtin:git", "auth_mode": "destination",
+  "oauth": {destination, provider: github|bitbucket|gitlab, repositories (1..50
+  paths: `owner/name`, `workspace/slug`, `group[/subgroup]/project`),
+  base_branch (default `main`), branch_prefix (default `agent/`), allow_push,
+  allow_pull_request}}`; `git_config.py` is the one reading (gate
+  `_validate_raw_git_entry` in `agents/admin.py`, storage `_clean_git_entry` in
+  `agents/db.py`, build), switches stored only as `true`, unknown keys and a
+  second entry per agent refused (`GIT_SINGLE_ENTRY_MESSAGE`; a hand-written
+  row with two gets no git tools, one WARNING). Tools: `list_repositories`,
+  `list_files`, `read_repository_file` (NOT `read_file`: the deep agents'
+  scratchpad owns that name and a single-server agent's tools are not
+  prefixed), `list_branches`, `get_pull_request`, `get_pipeline_status`; with
+  `allow_push` `create_branch` (always under the prefix) and `commit_files`
+  (ONE commit per call, on a prefixed branch only, never the base branch;
+  1..50 files/deletes, 1 MB each, 5 MB in all, confined paths; pipeline files
+  `.github/workflows/*`, `bitbucket-pipelines.yml`, `.gitlab-ci.yml`,
+  `.gitlab/` refused: an agent must not define the CI that holds the deploy
+  credentials); with `allow_pull_request` `open_pull_request` (an open one of
+  that branch is answered with `already_open`). GitHub commits through the Git
+  Data API (only the final ref `PATCH` is the write: a 422 there is
+  `branch_moved`), Bitbucket one multipart `src` POST, GitLab one `commits`
+  POST with `actions` (project, file and branch encoded as ONE segment, which
+  is why the client is `GitAuth`, a `BitbucketAuth` subclass that keeps the raw
+  path: the plain `DestinationAuth` rebuilds the URL from the decoded path).
+  Every refusal is `{"error": {code, message, hint?}}` from the closed
+  `ERROR_CODES` (`git_http.py`), never the provider's text, a URL or a header;
+  a write that may have left is `outcome_unknown`, never repeated; only a 429
+  is retried. Activity previews are fixed-form lines (`activity_summary`), as
+  for Bitbucket. An agent save that changes the entry reloads the registry
+  (`_entry_signature`). Shared helpers are imported from `bitbucket_tools.py`
+  (log filter, `_shown_text`, `BitbucketAuth`), not copied. Denied in ABAP
+  Assistant sessions. Unit-tested only (`tests/test_git_config.py`,
+  `tests/test_git_tools.py`, `tests/test_git_registration.py`,
+  `tests/test_git_activity.py`): **never run against a real remote**; setup
+  per provider in `docs/GIT_SETUP.md` (local, not in repo). Usable by any
+  admin agent and, through a shared tool source (addendum g), by personal
+  agents; the intended holders are the advanced UI5/Fiori and CAP agents
 - `agents/slack_tools.py` — Slack over the Web API (`builtin:slack`), as a
   bot. Slack has no client-credentials grant, so the `xoxb-` token lives in a
   BTP destination (NoAuthentication + `URL.headers.Authorization`, which
@@ -2252,7 +2297,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   for personal agents (`agent_configs.share_tools`, `chat_user_agents.tools_json`:
   HANA schema generation 7, no new resource, variable or role); 2.31.1 is layout
   polish of the web chat after the first look at acc (sidebar rows, agents page,
-  viewer header), no descriptor change besides the version
+  viewer header), no descriptor change besides the version; 2.32.0 is the
+  `builtin:git` release (`agents/git_tools.py`): no new resource, environment
+  variable, table or column (HANA schema generation unchanged); the credential of
+  a remote is a BTP destination created per landscape
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

@@ -32,6 +32,7 @@ builtin:odata      --        --        user / app    --       --
 builtin:sharepoint --        app (ro)  app (ro)      --       --
 builtin:bitbucket  --        --        app           --       --
 builtin:confluence --        --        app           --       --
+builtin:git        --        --        app           --       --
 ================== ========= ========= ============= ======== ========
 
 ``destination`` reaches the API through a BTP destination. The config block's
@@ -66,6 +67,14 @@ see :mod:`agents.bitbucket_tools`.
 destination and has no per-user mode: ``user_context`` is refused. Its config
 block pins the space keys (``spaces``) and the REST prefix (``api_base``); see
 :mod:`agents.confluence_tools`.
+
+``builtin:git`` reads and writes Git repositories on GitHub, Bitbucket Cloud
+or GitLab as the technical user of a destination and has no per-user mode:
+``user_context`` is refused. Its config block names the provider, pins the
+repositories, the base branch and the branch prefix, and holds the two
+switches ``allow_push`` and ``allow_pull_request``. Its factory is the one
+besides ``builtin:odata`` that gets something from ``context``: the agent's
+name, which goes into the trailer of every commit; see :mod:`agents.git_tools`.
 """
 
 from __future__ import annotations
@@ -75,6 +84,8 @@ from typing import Any, Callable
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL
 from agents.bitbucket_tools import bitbucket_toolset
 from agents.confluence_tools import BUILTIN_CONFLUENCE_URL, confluence_toolset
+from agents.git_config import BUILTIN_GIT_URL
+from agents.git_tools import git_toolset
 from agents.gmail_tools import BUILTIN_GMAIL_URL, gmail_toolset
 from agents.jira_tools import BUILTIN_JIRA_URL, jira_toolset
 from agents.odata import BUILTIN_ODATA_URL
@@ -102,6 +113,7 @@ _FACTORIES: dict[str, Callable[..., Any]] = {
     BUILTIN_SHAREPOINT_URL: sharepoint_toolset,
     BUILTIN_BITBUCKET_URL: bitbucket_toolset,
     BUILTIN_CONFLUENCE_URL: confluence_toolset,
+    BUILTIN_GIT_URL: git_toolset,
 }
 
 BUILTIN_URLS = frozenset(_FACTORIES)
@@ -128,8 +140,9 @@ def build_builtin_toolset(
 
     ``context`` is what the registry knows and an entry does not hold:
     ``odata_services`` (the catalogue snapshot, by service name) and
-    ``agent_name``. Only ``builtin:odata`` receives it; every other factory
-    is called exactly as before, so none has to accept keywords it ignores.
+    ``agent_name``. Only ``builtin:odata`` receives it, and ``builtin:git``
+    the agent name alone; every other factory is called exactly as before,
+    so none has to accept keywords it ignores.
 
     ``builtin:odata`` is always built with the storing audit recorder of
     this process. It is not read from ``context``: no caller can build the
@@ -151,4 +164,7 @@ def build_builtin_toolset(
             agent_name=context.get("agent_name") or "",
             recorder=stored_recorder(),
         )
+    if key == BUILTIN_GIT_URL:
+        return factory(oauth or {}, server_key=key, auth_mode=auth_mode,
+                       agent_name=(context or {}).get("agent_name") or "")
     return factory(oauth or {}, server_key=key, auth_mode=auth_mode)

@@ -35,6 +35,8 @@ from agents.db import (
 )
 from agents.bitbucket_config import BUILTIN_BITBUCKET_URL, asks_to_approve
 from agents.bitbucket_tools import activity_summary as bitbucket_activity_summary
+from agents.git_config import BUILTIN_GIT_URL
+from agents.git_tools import activity_summary as git_activity_summary
 from agents.builtins import build_builtin_toolset, is_builtin_url
 from agents.odata import BUILTIN_ODATA_URL
 from agents.odata.tools import NoUsableServiceError, attached_services
@@ -163,6 +165,12 @@ def _is_bitbucket_entry(spec: dict) -> bool:
     return str(spec.get("url") or "").strip().rstrip("/").lower() == BUILTIN_BITBUCKET_URL
 
 
+def _server_key_of(spec: dict) -> str:
+    """A server entry's URL as storage compares it (trimmed, no trailing
+    slash, lower case)."""
+    return str(spec.get("url") or "").strip().rstrip("/").lower()
+
+
 def _approves(specs: list) -> bool:
     """Whether an agent's row holds a ``builtin:bitbucket`` entry that asks
     for approving, read as widely as `asks_to_approve` reads a block: the
@@ -190,6 +198,13 @@ def _short_tool_output(result) -> str:
         # The Bitbucket tools return source code and what pull request
         # authors wrote: sizes, counts and codes only.
         fixed = bitbucket_activity_summary(
+            getattr(result, "tool_name", None), getattr(result, "content", None)
+        )
+        if fixed is not None:
+            return fixed
+        # The Git tools return source code, paths, titles and commit
+        # messages: counts, fixed words and codes only.
+        fixed = git_activity_summary(
             getattr(result, "tool_name", None), getattr(result, "content", None)
         )
         if fixed is not None:
@@ -846,8 +861,19 @@ async def build_orchestrator() -> BuildResult:
                 "approves; the agent is built without the Bitbucket tools",
                 row.name,
             )
+        # The same for builtin:git: two entries could not be told apart, and
+        # the second could carry wider switches (allow_push).
+        no_git = sum(_server_key_of(s) == BUILTIN_GIT_URL for s in specs) > 1
+        if no_git:
+            logger.warning(
+                "Agent '%s': its row holds more than one builtin:git entry; "
+                "the agent is built without the Git tools",
+                row.name,
+            )
         for idx, (spec, prefix) in enumerate(zip(specs, prefixes)):
             if no_bitbucket and _is_bitbucket_entry(spec):
+                continue
+            if no_git and _server_key_of(spec) == BUILTIN_GIT_URL:
                 continue
             server_name = row.name if idx == 0 else f"{row.name}-{idx}"
             try:

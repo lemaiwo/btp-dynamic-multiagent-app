@@ -2565,6 +2565,29 @@ def _clean_bitbucket_entry(oauth: Any, mode: str) -> dict[str, Any]:
     return clean_entry(oauth)
 
 
+# builtin:git: provider, destination, repositories, base branch, branch prefix
+# and the two write switches. Nothing else is stored for it.
+_GIT_URL = "builtin:git"
+
+
+def _clean_git_entry(oauth: Any, mode: str) -> dict[str, Any]:
+    """Normalize the block of a ``builtin:git`` entry for storage.
+
+    The last gate before the row, whoever the caller is: the block is read by
+    ``agents.git_config`` (the reading the admin gate and the toolset use), a
+    value is stored only in the form that was checked, an unknown key and
+    ``user_context: true`` are a ValueError, and the switches that let an
+    agent write (``allow_push``, ``allow_pull_request``) are stored only for
+    the JSON boolean ``true``. No fallback to the row being replaced: the
+    block holds no secret (the destination holds the token).
+    """
+    from agents.git_config import clean_entry
+
+    if mode != AUTH_MODE_DESTINATION:
+        raise ValueError(f"{_GIT_URL} requires auth_mode=destination")
+    return clean_entry(oauth)
+
+
 def _clean_oauth(
     oauth: Any, mode: str, fallback: dict[str, Any] | None, url: str | None = None
 ) -> dict[str, Any] | None:
@@ -2583,6 +2606,10 @@ def _clean_oauth(
         # Its own cleaner for the same reason: the generic destination code
         # would keep Jira's keys and its `allow_comment`.
         return _clean_bitbucket_entry(oauth, mode)
+    if builtin == _GIT_URL:
+        # Its own cleaner, as builtin:bitbucket: a list and the switches are
+        # stored only as checked.
+        return _clean_git_entry(oauth, mode)
     cleaned = _clean_oauth_block(oauth, mode, fallback, url=url)
     if cleaned is not None and builtin in _MAIL_THEME_URLS and isinstance(oauth, dict):
         from agents.mail_render import MailTheme
@@ -2782,6 +2809,7 @@ def prepare_servers(
     normalized: list[dict[str, Any]] = []
     odata_seen = False
     bitbucket_seen = False
+    git_seen = False
     for s in mcp_servers:
         url = (s.get("url") or "").strip()
         mode = (s.get("auth_mode") or AUTH_MODE_JWT).strip().lower()
@@ -2818,6 +2846,13 @@ def prepare_servers(
             if bitbucket_seen:
                 raise ValueError(BITBUCKET_SINGLE_ENTRY_MESSAGE)
             bitbucket_seen = True
+        elif url.rstrip("/").lower() == _GIT_URL:
+            # Stored under exactly this spelling and counted after it is
+            # settled, as builtin:bitbucket is.
+            url = _GIT_URL
+            if git_seen:
+                raise ValueError(GIT_SINGLE_ENTRY_MESSAGE)
+            git_seen = True
         oauth = _clean_oauth(s.get("oauth"), mode, prev_oauth_by_url.get(url), url=url)
         entry: dict[str, Any] = {"url": url, "auth_mode": mode}
         if oauth is not None:
@@ -4870,6 +4905,12 @@ ODATA_SINGLE_ENTRY_MESSAGE = (
 BITBUCKET_SINGLE_ENTRY_MESSAGE = (
     "an agent may have at most one builtin:bitbucket entry; pin every "
     "repository it reviews in that entry's oauth.repositories"
+)
+# Two entries would share the server key and their tools' names; the one
+# with the wider switches could not be told from the other.
+GIT_SINGLE_ENTRY_MESSAGE = (
+    "an agent may have at most one builtin:git entry; pin every repository it "
+    "uses in that entry's oauth.repositories"
 )
 _ODATA_MODE_MESSAGE = (
     "builtin:odata requires auth_mode=destination: every catalogue service "

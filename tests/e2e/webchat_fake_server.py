@@ -62,9 +62,10 @@ What it serves:
   consult); an import by a non-developer drops ``deep`` and advanced consults
   (``dropped`` with ``field: "deep"`` / ``"consults"``). A developer run seeds
   one advanced conversation and one deep personal agent on top
-- addendum (g): ``GET /catalog`` answers ``tool_sources`` (three admin agents
+- addendum (g): ``GET /catalog`` answers ``tool_sources`` (four admin agents
   that share their tools, ``platform-tickets`` not a chat agent,
-  ``abap-developer-deep`` advanced and listed only for ``access=advanced`` AND
+  ``abap-developer-deep`` and ``ui5-fiori-developer-deep`` (``builtin:git``,
+  addendum h) advanced and listed only for ``access=advanced`` AND
   a developer), each ``{name, description, tier, connectors}``; ``/my/agents``
   takes ``tools`` (at most 5 distinct names of tool sources; an unknown name or
   a 6th is a 422 at ``tools``, an advanced source from a non-developer too;
@@ -150,6 +151,9 @@ TOOL_SOURCES = [
      "connectors": ["builtin:jira", "builtin:confluence"]},
     {"name": "abap-developer-deep", "description": "The ABAP dev system through ARC-1, as the signed-in user.", "tier": "advanced",
      "connectors": ["arc1.example.hana.ondemand.com"]},
+    # addendum (h): builtin:git is labelled like every other built-in
+    {"name": "ui5-fiori-developer-deep", "description": "The Fiori apps' Git repositories: read, push to agent branches, open pull requests.",
+     "tier": "advanced", "connectors": ["builtin:git"]},
 ]
 ADVANCED_TOOLS = {t["name"] for t in TOOL_SOURCES if t["tier"] == "advanced"}
 ADMIN_SKILLS = [

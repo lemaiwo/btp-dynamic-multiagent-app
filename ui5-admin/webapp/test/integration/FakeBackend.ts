@@ -1681,6 +1681,15 @@ export default class FakeBackend {
                     msg: "Value error, share_tools: an agent that approves pull requests cannot share its tools",
                     type: "value_error" }] }, 422);
             }
+            // `builtin:git` (addendum h of the web chat design): at most one
+            // entry per agent, refused at `mcp_servers` like the server's gate.
+            const gitEntries = ((body?.mcp_servers ?? []) as { url: string }[])
+                .filter((server) => String(server.url).trim().replace(/\/+$/, "").toLowerCase() === "builtin:git");
+            if (gitEntries.length > 1) {
+                return this.json({ detail: [{ loc: ["body", "mcp_servers"],
+                    msg: "Value error, mcp_servers: an agent may have at most one builtin:git entry",
+                    type: "value_error" }] }, 422);
+            }
             const refusal = this.storeODataEntries(body);
             if (refusal) {
                 return this.json({ detail: refusal }, 422);

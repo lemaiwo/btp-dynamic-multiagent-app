@@ -102,6 +102,14 @@ export const BUILTINS: BuiltinToolset[] = [
     {
         url: "builtin:confluence", titleKey: "builtinConfluence", descriptionKey: "builtinConfluenceDesc",
         defaultAuthMode: "destination", authModes: ["destination"]
+    },
+    // --- git --- git_toolset reads and writes repositories of GitHub,
+    // Bitbucket Cloud or GitLab as the technical user of a destination and
+    // has no other way to authenticate -- see agents/git_config.py
+    // (addendum h of the web chat design) and model/gitEntry.ts.
+    {
+        url: "builtin:git", titleKey: "builtinGit", descriptionKey: "builtinGitDesc",
+        defaultAuthMode: "destination", authModes: ["destination"]
     }
 ];
 
