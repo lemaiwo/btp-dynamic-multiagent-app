@@ -29,7 +29,7 @@ from agents.access import BASIC, TIERS, caller_is_developer
 from agents.auth import current_claims, current_principal, require_user
 from agents.db import SessionLocal
 from agents.multipart_form import FormRefused
-from agents.webchat import context, run, store, uploads, user_agents
+from agents.webchat import context, preview, run, store, uploads, user_agents
 
 logger = logging.getLogger(__name__)
 
@@ -362,3 +362,22 @@ async def download(fid: str, inline: int = Query(default=0, ge=0, le=1)) -> Resp
             "Cache-Control": "private, no-store",
         },
     )
+
+
+@router.get("/files/{fid}/preview")
+async def file_preview(fid: str) -> Response:
+    """The viewer's preview of a file (``agents/webchat/preview.py``): parsed
+    in a worker thread, never stored, never cached by the browser."""
+    principal = store.caller()
+    async with SessionLocal() as db:
+        row = await store.get_file(db, fid, principal)
+    if row is None:
+        raise HTTPException(status_code=404, detail=FILE_NOT_FOUND)
+    no_store = {"Cache-Control": "private, no-store"}
+    try:
+        body = await asyncio.to_thread(preview.build_preview, row.media_type, row.name,
+                                       row.data, row.id)
+    except preview.PreviewError as refused:
+        return JSONResponse(status_code=refused.status, content={"detail": refused.detail},
+                            headers=no_store)
+    return JSONResponse(content=body, headers=no_store)

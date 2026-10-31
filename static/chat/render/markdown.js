@@ -40,10 +40,12 @@ export function toSafeHtml(markdown) {
  * Render markdown into `container` (replacing its children): code blocks get a
  * header with language + copy button and highlight.js colours; `final` also
  * renders mermaid fences (async) and auto-highlights unknown languages.
+ * `onOpenCode(code, lang)`, when given, adds an "Open" button to each code
+ * block header (the viewer of addendum f; advanced conversations only).
  */
-export function renderMarkdown(container, markdown, { final = false } = {}) {
+export function renderMarkdown(container, markdown, { final = false, onOpenCode = null } = {}) {
   container.innerHTML = toSafeHtml(markdown);
-  decorateCode(container, final);
+  decorateCode(container, final, typeof onOpenCode === 'function' ? onOpenCode : null);
   if (final) renderMermaid(container);
   return container;
 }
@@ -53,7 +55,7 @@ function languageOf(code) {
   return m ? m[1].toLowerCase() : '';
 }
 
-function decorateCode(container, final) {
+function decorateCode(container, final, onOpenCode = null) {
   const { hljs } = libs();
   for (const code of container.querySelectorAll('pre > code')) {
     const pre = code.parentElement;
@@ -91,7 +93,19 @@ function decorateCode(container, final) {
       }
       setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
     });
-    head.append(label, copy);
+    const tools = document.createElement('span');
+    tools.className = 'codeblock-tools';
+    if (onOpenCode) {
+      const openBtn = document.createElement('button');
+      openBtn.type = 'button';
+      openBtn.className = 'codeblock-open';
+      openBtn.textContent = 'Open';
+      openBtn.setAttribute('aria-label', 'Open code in the viewer');
+      openBtn.addEventListener('click', () => onOpenCode(code.textContent, lang));
+      tools.appendChild(openBtn);
+    }
+    tools.appendChild(copy);
+    head.append(label, tools);
     pre.replaceWith(wrap);
     wrap.append(head, pre);
   }

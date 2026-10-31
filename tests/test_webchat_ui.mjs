@@ -473,5 +473,142 @@ console.log('\n== the excluded state on file cards ==');
   log.remove();
 }
 
+
+console.log('\n== the viewer (addendum f) ==');
+{
+  const V = await import('../static/chat/render/viewer.js');
+  const abap = '* file: zcl_order_check.clas.abap\nMETHOD validate.\n  LOOP AT it_items INTO DATA(ls_item).\n    READ TABLE mt_rules INTO ls_rule WITH KEY rule_id = ls_item-rule_id.\n    IF sy-subrc <> 0.\n      RAISE EXCEPTION NEW zcx_order_check( ).\n    ENDIF.\n  ENDLOOP.\nENDMETHOD.';
+  const answer = `Here:\n\n\`\`\`abap\n${abap}\n\`\`\`\n\nA diagram:\n\n\`\`\`mermaid\ngraph TD; A-->B\n\`\`\`\n\nAnd a short one:\n\n\`\`\`js\nconst a = 1;\n\`\`\`\n`;
+  const conv = (access) => ({ id: 'c1', access, messages: [
+    { id: 'u1', role: 'user', content: 'hi', files: [{ id: 'up1', name: 'quota.pdf', media_type: 'application/pdf', size: 5, kind: 'upload' }] },
+    { id: 'a1', role: 'assistant', content: answer, status: 'done', parts: [{ type: 'text', text: answer }, { type: 'file', file_id: 'g1', name: 'report.xlsx', media_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', size: 9 }] },
+  ] });
+
+  // items derived
+  const basic = V.viewerItems(conv('basic'));
+  check('basic: files only (upload and generated), no code', eq(basic.files.map((f) => f.key), ['file:up1', 'file:g1']) && basic.code.length === 0);
+  const adv = V.viewerItems(conv('advanced'));
+  check('advanced: the code blocks too, mermaid excluded', adv.files.length === 2 && eq(adv.code.map((c) => c.lang), ['abap', 'js']));
+  check('a code item: lines, name from the file: line, title', adv.code[0].lines === 9 && adv.code[0].name === 'zcl_order_check.clas.abap' && adv.code[0].title === 'zcl_order_check.clas.abap');
+  check('codeBlocks skips an unclosed fence (streaming)', V.codeBlocks('```abap\nWRITE 1.\n').length === 0 && V.codeBlocks('```\nx\n```').length === 1);
+  const many = { id: 'c2', access: 'advanced', messages: [{ id: 'a', role: 'assistant', content: Array.from({ length: 60 }, (_, i) => `\`\`\`sql\nSELECT ${i};\n\`\`\``).join('\n\n'), parts: [] }] };
+  const capped = V.viewerItems(many).code;
+  check('the latest 50 code items', capped.length === V.MAX_ITEMS && capped[0].code === 'SELECT 10;' && capped[49].code === 'SELECT 59;');
+
+  // download names
+  check('download name: "* file:" line', V.codeDownloadName(abap, 'abap', 1) === 'zcl_order_check.clas.abap');
+  check('download name: "// file:", "# file:", "-- file:" lines, path stripped', V.codeDownloadName('// file: webapp/controller/Main.controller.ts\nx', 'ts', 1) === 'Main.controller.ts' && V.codeDownloadName('# file: probe.py\n', 'python', 1) === 'probe.py' && V.codeDownloadName('-- file: q.sql\nSELECT 1', 'sql', 1) === 'q.sql');
+  check('download name fallback snippet-<n>.<ext> by language', V.codeDownloadName('x', 'abap', 3) === 'snippet-3.abap' && V.codeDownloadName('x', 'javascript', 2) === 'snippet-2.js' && V.codeDownloadName('x', 'yml', 4) === 'snippet-4.yaml' && V.codeDownloadName('x', 'cobol', 5) === 'snippet-5.txt' && V.codeDownloadName('x', '', 6) === 'snippet-6.txt');
+  check('the second code item of the advanced conversation falls back', adv.code[1].name === 'snippet-2.js');
+
+  // auto-open decision
+  const c = conv('advanced');
+  check('auto-open: a generated file of the turn wins', V.autoOpenItem(c, c.messages[1])?.key === 'file:g1');
+  const noFile = { ...c, messages: [c.messages[0], { ...c.messages[1], parts: [{ type: 'text', text: answer }] }] };
+  check('auto-open: advanced without a file -> the last code block of >= 5 lines', V.autoOpenItem(noFile, noFile.messages[1])?.name === 'zcl_order_check.clas.abap');
+  const basicNoFile = { ...noFile, access: 'basic' };
+  check('auto-open: basic without a file -> nothing', V.autoOpenItem(basicNoFile, basicNoFile.messages[1]) === null);
+  const shortOnly = { id: 'c3', access: 'advanced', messages: [{ id: 'a', role: 'assistant', content: '```js\nconst a = 1;\n```', parts: [] }] };
+  check('auto-open: a short block (< 5 lines) does not open', V.autoOpenItem(shortOnly, shortOnly.messages[0]) === null);
+
+  // the panel: open, close, the closed flag
+  const calls = [];
+  const toggles = [];
+  const fakeApi = {
+    fileUrl: (id, inline) => `/chat/api/files/${id}${inline ? '?inline=1' : ''}`,
+    fetchFileBlob: async () => null,
+    filePreview: async (id) => {
+      calls.push(id);
+      if (id === 'g1') return { kind: 'sheets', name: 'report.xlsx', truncated: false, sheets: [
+        { name: 'Entitlements', columns: ['A', 'B', 'C'], rows: [['Subaccount', 'Service', 'Spare'], ['b-fdn-dev', '<b>x</b>', 3], [null, null, null]], row_count: 3, truncated: false },
+        { name: 'Summary', columns: ['A', 'B'], rows: [['Checked', '2026-10-31']], row_count: 1, truncated: false }] };
+      if (id === 'd1') return { kind: 'document', name: 'r.docx', truncated: false, blocks: [{ type: 'heading', level: 1, text: 'Review' }, { type: 'paragraph', text: '<img src=x onerror=alert(1)>' }, { type: 'list', ordered: true, items: ['one', 'two'] }, { type: 'table', rows: [['h1', 'h2'], ['a', 'b']] }] };
+      throw Object.assign(new Error('415'), { status: 415, detail: 'No preview for this file type' });
+    },
+  };
+  const v = V.createViewer({ api: fakeApi, onToggle: (o) => toggles.push(o) });
+  document.body.appendChild(v.el);
+  check('the panel is a labelled region, hidden at first', v.el.getAttribute('role') === 'region' && v.el.getAttribute('aria-label') === 'Viewer' && v.el.hidden && !v.isOpen());
+  v.setConversation(conv('advanced'));
+  v.open('file:g1');
+  await new Promise((r) => setTimeout(r, 0));
+  check('open a file: the panel shows, onToggle(true), one preview call', v.isOpen() && eq(toggles, [true]) && eq(calls, ['g1']));
+  const sel = v.el.querySelector('select');
+  check('the select is grouped Files / Code', eq([...sel.querySelectorAll('optgroup')].map((g) => g.label), ['Files', 'Code']) && sel.value === 'file:g1');
+  const ths = [...v.el.querySelectorAll('.viewer-grid thead th')].map((t) => t.textContent);
+  check('sheets: column letters as the header, numbered data rows, tabs', eq(ths, ['', 'A', 'B', 'C']) && v.el.querySelectorAll('.viewer-grid tbody tr').length === 3 && v.el.querySelector('.viewer-grid tbody tr th').textContent === '1' && v.el.querySelectorAll('[role="tab"]').length === 2);
+  check('sheet cells are text nodes', v.el.querySelector('.viewer-body b') === null && v.el.querySelector('.viewer-body').textContent.includes('<b>x</b>'));
+  v.el.querySelectorAll('[role="tab"]')[1].click();
+  check('a tab click shows that sheet', v.el.querySelector('[role="tab"][aria-selected="true"]').textContent === 'Summary' && v.el.querySelector('.viewer-grid tbody').textContent.includes('Checked'));
+  check('a file shows Download (the file route), not Copy', !v.el.querySelector('.viewer-download').hidden && v.el.querySelector('.viewer-download').getAttribute('href') === '/chat/api/files/g1' && v.el.querySelector('.viewer-copy').hidden);
+
+  v.open('file:up1');
+  await new Promise((r) => setTimeout(r, 0));
+  check('a refused preview (415): the fixed text and a Download link', v.el.querySelector('.viewer-error').textContent.includes(V.TEXT_NO_PREVIEW) && v.el.querySelector('.viewer-error a').getAttribute('href') === '/chat/api/files/up1');
+
+  v.open({ key: 'file:d1', type: 'file', id: 'd1', name: 'r.docx' });
+  await new Promise((r) => setTimeout(r, 0));
+  check('document: heading, paragraph as text, ordered list, table', v.el.querySelector('.viewer-doc h1').textContent === 'Review' && v.el.querySelector('.viewer-doc img') === null && v.el.querySelectorAll('.viewer-doc ol li').length === 2 && v.el.querySelector('.viewer-doc table th').textContent === 'h1');
+
+  const code = v.items().code[0];
+  v.open(code);
+  // the vendored highlight.js has no ABAP grammar: ABAP stays plain text, a known language is coloured
+  check('code: <pre><code> (plain for a language highlight.js lacks), header with language and line count, Copy and Download', v.el.querySelector('.viewer-code code') !== null && v.el.querySelector('.viewer-code code').textContent === abap && v.el.querySelector('.viewer-meta').textContent === 'abap · 9 lines' && !v.el.querySelector('.viewer-copy').hidden && !v.el.querySelector('.viewer-download-code').hidden && v.el.querySelector('.viewer-download').hidden);
+  v.open(v.items().code[1]);
+  check('a known language (js) is highlighted', v.el.querySelector('.viewer-code code.hljs') !== null && v.el.querySelector('.viewer-meta').textContent === 'js · 1 line');
+  check('open from a code block button ({code, lang}) finds the listed item', v.open({ code: `${abap}\n`, lang: 'abap' }) && v.current().key === code.key);
+
+  v.close(true);
+  check('close by the user: hidden, onToggle(false), flag set', !v.isOpen() && toggles[toggles.length - 1] === false && v.isClosedByUser());
+  const c2 = conv('advanced');
+  v.setConversation(c2);
+  check('auto-open is blocked while closed by the user', v.autoOpen(c2.messages[1]) === false && !v.isOpen());
+  v.noteSend();
+  check('sending resets the flag; auto-open opens the turn\'s file', !v.isClosedByUser() && v.autoOpen(c2.messages[1]) === true && v.current().key === 'file:g1');
+  v.el.dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  check('Escape inside the panel closes it (as the user)', !v.isOpen() && v.isClosedByUser());
+  v.noteSend();
+  v.open('file:g1');
+  v.setConversation({ id: 'other', access: 'basic', messages: [] });
+  check('another conversation closes the panel without the flag', !v.isOpen() && !v.isClosedByUser());
+  const nf = { id: 'c9', access: 'advanced', messages: [{ id: 'a', role: 'assistant', content: answer, parts: [{ type: 'text', text: answer }], status: 'done' }] };
+  v.setConversation(nf);
+  check('auto-open in advanced with a long code block and no file', v.autoOpen(nf.messages[0]) === true && v.current().name === 'zcl_order_check.clas.abap');
+  v.close(false);
+  check('parseCsv: a table, null when ragged', eq(V.parseCsv('a,b\n1,"x, y"\n'), [['a', 'b'], ['1', 'x, y']]) && V.parseCsv('a,b\n1\n') === null);
+  v.el.remove();
+
+  // the "Open" button: markdown option, and the message list passes it only in advanced
+  const md = document.createElement('div');
+  const opened = [];
+  renderMarkdown(md, '```abap\nWRITE 1.\n```\n\n```mermaid\ngraph TD; A-->B\n```', { final: false, onOpenCode: (code, lang) => opened.push([code, lang]) });
+  const openBtns = md.querySelectorAll('.codeblock-open');
+  check('renderMarkdown with onOpenCode: one Open button per code block (not mermaid)', openBtns.length === 1);
+  openBtns[0].click();
+  check('the Open button hands over code and language', opened.length === 1 && opened[0][1] === 'abap' && opened[0][0].includes('WRITE 1.'));
+  const md2 = document.createElement('div');
+  renderMarkdown(md2, '```abap\nWRITE 1.\n```');
+  check('without the option: no Open button', md2.querySelector('.codeblock-open') === null && md2.querySelector('.codeblock-copy') !== null);
+
+  const log = document.createElement('section'); log.className = 'log';
+  const col = document.createElement('div'); log.appendChild(col); document.body.appendChild(log);
+  const files = [];
+  const codes = [];
+  const list = createMessageList(col, { onOpenFile: (f) => files.push(f.id), onOpenCode: (code, lang) => codes.push(lang) });
+  list.render(conv('basic'), {});
+  check('message list, basic: no Open button on code', col.querySelector('.codeblock-open') === null && col.querySelector('.codeblock') !== null);
+  list.render(conv('advanced'), {});
+  const advBtns = col.querySelectorAll('.codeblock-open');
+  check('message list, advanced: an Open button per code block', advBtns.length === 2);
+  advBtns[0].click();
+  check('it calls onOpenCode', eq(codes, ['abap']));
+  const card = col.querySelector('.msg.assistant .file-card.openable');
+  card.querySelector('.file-name').click();
+  card.querySelector('.file-tile').click();
+  col.querySelector('.msg.user .file-card .file-name').dispatchEvent(new dom.window.KeyboardEvent('keydown', { key: 'Enter' }));
+  check('file card name / icon (and Enter) open the file; the Download link is unchanged', eq(files, ['g1', 'g1', 'up1']) && card.querySelector('.file-download').getAttribute('href') === '/chat/api/files/g1');
+  log.remove();
+}
+
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

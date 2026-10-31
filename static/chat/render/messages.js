@@ -58,14 +58,14 @@ function buildUser(message) {
 
 // The user's file cards: rebuilt when the files or their "in context" state
 // change (the context drawer's switch, addendum e), not on every render.
-function updateUser(el, message, excludedIds) {
+function updateUser(el, message, excludedIds, onOpenFile = null) {
   const files = message.files || [];
   const sig = files.map((f) => `${f.id || f.file_id || f.name}:${excludedIds.has(String(f.id || f.file_id || '')) ? 'x' : ''}`).join(',');
   if (el._fsig === sig) return;
   el._fsig = sig;
   const prev = el.querySelector(':scope > .file-row');
   if (prev) prev.remove();
-  if (files.length) el.appendChild(fileCards(files, { excludedIds }));
+  if (files.length) el.appendChild(fileCards(files, { excludedIds, onOpen: onOpenFile || undefined }));
 }
 
 function buildAssistant() {
@@ -129,7 +129,7 @@ export function usageLine(usage) {
   return el;
 }
 
-function updateAssistant(el, message, live, agentName = 'Agents') {
+function updateAssistant(el, message, live, agentName = 'Agents', { onOpenFile = null, onOpenCode = null } = {}) {
   el.dataset.id = message.id;
   const running = message.status === 'running';
   el.classList.toggle('running', running);
@@ -150,11 +150,11 @@ function updateAssistant(el, message, live, agentName = 'Agents') {
   }
 
   const text = textOf(message);
-  const bsig = `${message.status}|${text.length}|${text.slice(-64)}`;
+  const bsig = `${message.status}|${text.length}|${text.slice(-64)}|${onOpenCode ? 'open' : ''}`;
   const body = el.querySelector('.body');
   if (el._bsig !== bsig) {
     el._bsig = bsig;
-    if (text) renderMarkdown(body, text, { final: !running });
+    if (text) renderMarkdown(body, text, { final: !running, onOpenCode: onOpenCode || null });
     else body.replaceChildren();
     body.classList.toggle('streaming', running && !!text);
     body.hidden = !text;
@@ -165,7 +165,7 @@ function updateAssistant(el, message, live, agentName = 'Agents') {
   if (el._fsig !== fsig) {
     el._fsig = fsig;
     const slot = el.querySelector('.files-slot');
-    slot.replaceChildren(...(files.length ? [fileCards(files)] : []));
+    slot.replaceChildren(...(files.length ? [fileCards(files, { onOpen: onOpenFile || undefined })] : []));
   }
 
   const esig = JSON.stringify([message.status, message.error]);
@@ -201,7 +201,12 @@ function updateAssistant(el, message, live, agentName = 'Agents') {
   }
 }
 
-export function createMessageList(container) {
+/**
+ * `onOpenFile(file)` opens a file card in the viewer (addendum f);
+ * `onOpenCode(code, lang)` adds an "Open" button to code blocks, and is
+ * passed to the markdown only while the conversation is advanced.
+ */
+export function createMessageList(container, { onOpenFile = null, onOpenCode = null } = {}) {
   const nodes = new Map();
   // Follow the stream while the user is at the bottom; stop following when
   // they scroll up. Scroll anchoring moves scrollTop *down* when content
@@ -230,6 +235,7 @@ export function createMessageList(container) {
   function render(conversation, { live = false, agentName = 'Agents', excludedIds = NO_IDS } = {}) {
     const messages = conversation?.messages || [];
     const excluded = excludedIds instanceof Set ? excludedIds : NO_IDS;
+    const openCode = conversation?.access === 'advanced' && typeof onOpenCode === 'function' ? onOpenCode : null;
     if (container.classList.contains('empty-state')) {
       // the empty state gives way to the first message
       container.classList.remove('empty-state');
@@ -245,8 +251,8 @@ export function createMessageList(container) {
         el = m.role === 'user' ? buildUser(m) : buildAssistant();
         nodes.set(m.id, el);
       }
-      if (m.role === 'assistant') updateAssistant(el, m, live, agentName || 'Agents');
-      else updateUser(el, m, excluded);
+      if (m.role === 'assistant') updateAssistant(el, m, live, agentName || 'Agents', { onOpenFile, onOpenCode: openCode });
+      else updateUser(el, m, excluded, onOpenFile);
       const next = cursor ? cursor.nextSibling : container.firstChild;
       if (next !== el) container.insertBefore(el, next);
       cursor = el;

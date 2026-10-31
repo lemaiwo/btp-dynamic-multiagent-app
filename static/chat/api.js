@@ -138,6 +138,13 @@ export function importBundle(file, onConflict = 'rename') {
 export const fileUrl = (id, inline = false) =>
   `${BASE}/files/${encodeURIComponent(id)}${inline ? '?inline=1' : ''}`;
 
+/**
+ * GET /files/{id}/preview (addendum f): {kind: sheets|document|text|inline, ...}.
+ * A 415 (no preview for the type) or 422 (unreadable) throws ApiError with
+ * `status` and `detail`, like every other call.
+ */
+export const filePreview = (id) => request(`/files/${encodeURIComponent(id)}/preview`);
+
 /** Fetch a file as a Blob (for image thumbnails). */
 export async function fetchFileBlob(id) {
   const res = await fetchImpl(fileUrl(id, true), { headers: baseHeaders(), credentials: 'same-origin' });

@@ -1735,6 +1735,34 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     file that is not an upload of this conversation or whose turn stored no
     history; `excluded` is derived from the history, no column.
     `tests/test_webchat_context.py`
+  - **The viewer** (`preview.py`, design addendum f): a panel beside the
+    messages that shows a file of the conversation or, in an advanced
+    conversation, a code block the model wrote. `GET /files/{fid}/preview`
+    (owner-scoped, 404 otherwise) answers JSON by `kind`, `Cache-Control:
+    private, no-store`, parsed in a worker thread from the STORED media type,
+    never the name: `.xlsx` → `sheets` (openpyxl read-only through the guarded
+    archive `extract_xlsx` uses, cached values only; 10 sheets, 200 rows × 50
+    columns, `columns` are the column LETTERS, `row_count`, `truncated`; dates
+    ISO, `=` strings stay strings), `.docx` → `document` blocks (heading
+    1..6 from `Title`/`Heading n`, paragraph, list with `ordered` only for a
+    known `w:numFmt`, table 100 × 20 with nested tables flattened; 2,000
+    blocks / 200,000 chars; defusedxml, reusing `check_office_archive` and
+    `_paragraph_text`), text/markdown/csv/json → `text` (200,000 chars), PNG /
+    JPEG / PDF → `inline` with the `?inline=1` URL; any other type 415 `No
+    preview for this file type`, unreadable bytes 422 `The file could not be
+    read`. Nothing of a preview is stored. The front end (`viewer.js`) derives
+    the items from the conversation it holds (generated `file` parts, the
+    user's uploads, and in `access === "advanced"` every closed backtick code
+    block of an assistant message except `mermaid`; latest 50 of each), opens
+    on a file card's name/icon or the "Open" button of a code block header
+    (advanced only), opens itself at `done` for a generated file or (advanced,
+    no file) a code block of ≥ 5 lines unless the user closed it since the last
+    send, and is a two-column grid from 1100 px (`main.with-viewer`), an
+    overlay below. A code item downloads as the `file:` line's name or
+    `snippet-<n>.<ext>`. `tests/test_webchat_preview.py`, the viewer section
+    of `tests/test_webchat_ui.mjs`. The vendored highlight.js has no ABAP
+    grammar: ABAP shows uncoloured (a third-party grammar would be a vendored
+    file; not added)
 - `static/chat/` + `templates/webchat.html` — the web chat front end: vanilla
   ES modules, no build step, nothing from a CDN (`static/vendor/`: marked,
   DOMPurify, mermaid, highlight.js 11.12.0 with two GitHub themes). `api.js`
@@ -2183,7 +2211,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   view's measured size) were 0 (`SAPAICoreModel` reads them directly now and
   asks a stream for its usage chunk; `AICORE_STREAM_USAGE=0` strips
   `stream_options` again, not in the descriptor), and streamed text parts
-  around a tool call are shown as separate paragraphs
+  around a tool call are shown as separate paragraphs; 2.30.0 adds the web
+  chat's viewer (`agents/webchat/preview.py`, `static/chat/render/viewer.js`):
+  no new resource, variable, table or column
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

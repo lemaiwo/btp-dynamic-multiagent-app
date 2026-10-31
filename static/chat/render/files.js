@@ -39,9 +39,11 @@ export const NOT_IN_CONTEXT = 'not in context';
 /**
  * One card. `file` = {id|file_id, name, media_type, size}. An upload the
  * user excluded from the model's context (`excluded`, or its id in
- * `excludedIds`) is struck through and says so (addendum e).
+ * `excludedIds`) is struck through and says so (addendum e). `onOpen(file)`,
+ * when given, makes the icon and the name open the file in the viewer
+ * (addendum f); the Download link is unchanged.
  */
-export function fileCard(file, { excludedIds } = {}) {
+export function fileCard(file, { excludedIds, onOpen } = {}) {
   const id = file.id || file.file_id;
   const kind = fileKind(file.media_type, file.name);
   const excluded = file.excluded === true || (!!id && excludedIds instanceof Set && excludedIds.has(String(id)));
@@ -72,6 +74,18 @@ export function fileCard(file, { excludedIds } = {}) {
   if (excluded) card.setAttribute('aria-label', `${file.name || 'file'}, ${NOT_IN_CONTEXT}`);
   meta.append(name, sub);
   card.append(tile, meta);
+  if (id && typeof onOpen === 'function') {
+    card.classList.add('openable');
+    name.setAttribute('role', 'button');
+    name.tabIndex = 0;
+    name.setAttribute('aria-label', `Open ${file.name || 'file'} in the viewer`);
+    const go = () => onOpen({ ...file, id });
+    tile.addEventListener('click', go);
+    name.addEventListener('click', go);
+    name.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+    });
+  }
   if (id) {
     const a = document.createElement('a');
     a.className = 'file-download';

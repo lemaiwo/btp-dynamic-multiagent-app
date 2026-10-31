@@ -179,6 +179,98 @@ MIME = {
     ".png": "image/png", ".svg": "image/svg+xml", ".json": "application/json",
 }
 
+ABAP_ANSWER_MD = """The read on `mt_rules` in `VALIDATE` lost its `sy-subrc` check in transport **DEVK912345**.
+This is the corrected method; it raises the class's own exception instead of dumping:
+
+```abap
+* file: zcl_order_check.clas.abap
+METHOD validate.
+  DATA ls_rule TYPE ty_rule.
+
+  LOOP AT it_items INTO DATA(ls_item).
+    READ TABLE mt_rules INTO ls_rule
+         WITH KEY rule_id = ls_item-rule_id.
+    IF sy-subrc <> 0.
+      RAISE EXCEPTION NEW zcx_order_check(
+        textid  = zcx_order_check=>rule_missing
+        rule_id = ls_item-rule_id ).
+    ENDIF.
+    IF ls_item-quantity > ls_rule-max_quantity.
+      APPEND VALUE #( item = ls_item-item_no msg = 'Quantity above limit' ) TO rt_findings.
+    ENDIF.
+  ENDLOOP.
+ENDMETHOD.
+```
+
+Run the ABAP Unit tests of `ZCL_ORDER_CHECK` after the change; the test `missing_rule_raises` covers the new branch.
+"""
+
+
+def letters(n: int) -> list[str]:
+    """Spreadsheet column letters A, B, ... AA, AB for the first n columns."""
+    out = []
+    for i in range(n):
+        s, k = "", i + 1
+        while k:
+            k, r = divmod(k - 1, 26)
+            s = chr(65 + r) + s
+        out.append(s)
+    return out
+
+
+def preview_of(f: dict) -> tuple[int, dict]:
+    """The scripted GET /files/{id}/preview answer (addendum f) by the dummy file's type."""
+    mt, name = f["media_type"], f["name"]
+    if mt in ("image/png", "image/jpeg", "application/pdf"):
+        return 200, {"kind": "inline", "name": name, "media_type": mt, "url": f"/chat/api/files/{f['id']}?inline=1"}
+    if mt == MEDIA_TYPES[8]:
+        ent = [["Subaccount", "Service", "Plan", "Assigned", "Used", "Spare"],
+               ["b-fdn-dev", "hana-cloud", "hana", 2, 1, 1],
+               ["b-fdn-dev", "xsuaa", "application", 20, 11, 9],
+               ["b-fdn-dev", "destination", "lite", 20, 8, 12],
+               ["b-fdn-dev", "jobscheduler", "standard", 5, 3, 2],
+               ["b-fdn-dev", "connectivity", "lite", 1, 1, 0],
+               ["b-int-dev", "integrationsuite", "enterprise_agreement", 1, 0, 1],
+               ["b-int-dev", "destination", "lite", 10, 4, 6],
+               ["b-int-dev", "xsuaa", "application", 10, 3, 7],
+               ["b-ui-dev", "html5-apps-repo", "app-runtime", 3, 3, 0],
+               ["b-ui-dev", "html5-apps-repo", "app-host", 2, 2, 0],
+               ["b-ui-dev", "workzone", "standard", 1, 1, 0],
+               ["b-ui-dev", "xsuaa", "application", 10, 6, 4],
+               [None, None, None, None, None, None],
+               ["Total", None, None, 85, 43, 42]]
+        summary = [["Checked on", "2026-10-31"], ["Subaccounts", 3], ["Services with spare quota", 8],
+                   ["Billable spare quota", "hana-cloud (1)"]]
+        return 200, {"kind": "sheets", "name": name, "truncated": False, "sheets": [
+            {"name": "Entitlements", "columns": letters(6), "rows": ent, "row_count": len(ent), "truncated": False},
+            {"name": "Summary", "columns": letters(2), "rows": summary, "row_count": len(summary), "truncated": False}]}
+    if mt == MEDIA_TYPES[7]:
+        return 200, {"kind": "document", "name": name, "truncated": False, "blocks": [
+            {"type": "heading", "level": 1, "text": "Platform review: dev subaccounts"},
+            {"type": "paragraph", "text": "This review covers the three subaccounts of the Infrabel-dev directory as of 31 October 2026. It lists the entitlements nobody uses and what to do with them."},
+            {"type": "heading", "level": 2, "text": "Findings"},
+            {"type": "list", "ordered": False, "items": [
+                "b-fdn-dev holds one spare hana-cloud unit, which bills every month.",
+                "integrationsuite on b-int-dev has no tenant since July.",
+                "xsuaa headroom on all three is free and can stay."]},
+            {"type": "heading", "level": 2, "text": "Entitlements with spare quota"},
+            {"type": "table", "rows": [["Subaccount", "Service", "Plan", "Spare"],
+                                       ["b-fdn-dev", "hana-cloud", "hana", "1"],
+                                       ["b-fdn-dev", "destination", "lite", "12"],
+                                       ["b-int-dev", "integrationsuite", "enterprise_agreement", "1"]]},
+            {"type": "heading", "level": 2, "text": "Actions"},
+            {"type": "list", "ordered": True, "items": [
+                "Release the spare hana-cloud unit on b-fdn-dev.",
+                "Ask the integration team whether the integrationsuite entitlement is still planned.",
+                "Repeat this check monthly from the pipeline."]},
+            {"type": "paragraph", "text": "Prepared by btp-admin and entitlement-analyst."}]}
+    lang = {"text/markdown": "markdown", "text/csv": "csv", "application/json": "json", "text/plain": "text"}.get(mt)
+    if lang:
+        text = f["data"].decode("utf-8", "replace")[:200000]
+        return 200, {"kind": "text", "name": name, "language": lang, "text": text, "truncated": False}
+    return 415, {"detail": "No preview for this file type"}
+
+
 ANSWER_MD = """## Unused entitlements in the dev subaccount
 
 I checked the three subaccounts of the **Infrabel-dev** directory. Two of them
@@ -346,6 +438,12 @@ class Store:
             m5["parts"] = [{"type": "text", "text": m5["content"]},
                            {"type": "usage", "input_tokens": 2210, "output_tokens": 140, "cache_read_tokens": 0, "total_tokens": 2350,
                             "requests": 2, "tool_calls": 2, "model": "gpt-5.6-terra", "duration_ms": 5400, "agents": []}]
+            # addendum (f): the fix as a fenced ABAP block, a viewer item in advanced access
+            self.add_message(c5["id"], "user", "Propose the fix.")
+            m6 = self.add_message(c5["id"], "assistant", ABAP_ANSWER_MD, status="done")
+            m6["parts"] = [{"type": "text", "text": ABAP_ANSWER_MD},
+                           {"type": "usage", "input_tokens": 2980, "output_tokens": 410, "cache_read_tokens": 0, "total_tokens": 3390,
+                            "requests": 2, "tool_calls": 1, "model": "gpt-5.6-terra", "duration_ms": 6100, "agents": []}]
 
     # ---- addendum (c): personal agents and skills ----
     def put_agent(self, aid: str | None, body: dict) -> dict:
@@ -899,6 +997,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.get_file(parts[1], query)
         if not self.ajax():
             return
+        if parts[:1] == ["files"] and len(parts) == 3 and parts[2] == "preview" and method == "GET":
+            with STORE.lock:
+                f = STORE.files.get(parts[1])
+            if f is None:
+                return self.detail(404, "not found")
+            status, payload = preview_of(f)
+            return self.send_json(status, payload, {"Cache-Control": "private, no-store"})
         if parts == ["me"] and method == "GET":
             return self.send_json(200, {"principal": PRINCIPAL, "models": MODELS, "app_name": APP_NAME,
                                         "developer": DEVELOPER, "access_default": "basic", "tiers": list(TIERS),
@@ -1302,7 +1407,7 @@ class Handler(BaseHTTPRequestHandler):
                            "files": [{"id": f["id"], "name": f["name"], "media_type": f["media_type"], "size": f["size"]} for f in file_rows]})
             nap(0.4)
             with STORE.lock:
-                ref_ok, _ = STORE.resolve_ref(conv.get("agent_ref"))
+                ref_ok, _ = STORE.resolve_ref(conv.get("agent_ref"), conv.get("access", "basic"))
             if not ref_ok:
                 emit("error", {"code": "agent_unavailable", "message": "The selected agent is no longer available."})
                 with STORE.lock:
@@ -1359,7 +1464,7 @@ class Handler(BaseHTTPRequestHandler):
             tool("t4", "create_workbook", "done", agent=None, agent_id=None, output="report.xlsx (9 KB)", duration_ms=int(400 * SLOW))
             nap(0.2)
             # text deltas: word-ish chunks so the markdown re-renders visibly
-            buf = ANSWER_MD
+            buf = ANSWER_MD + ("\n\n" + ABAP_ANSWER_MD if conv.get("access") == "advanced" else "")
             i = 0
             n = 0
             while i < len(buf):

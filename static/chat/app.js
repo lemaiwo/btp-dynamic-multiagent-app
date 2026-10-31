@@ -11,6 +11,7 @@ import { createComposer } from './composer.js';
 import { createAgentsPage } from './render/agents.js';
 import { createAgentEditor } from './render/agentEditor.js';
 import { createContextDrawer } from './render/contextDrawer.js';
+import { createViewer } from './render/viewer.js';
 import { pickerGroups, agentNameOf, refOffered, isAdvanced } from './myagents.js';
 import { initTheme, toggleTheme, onThemeChange } from './theme.js';
 import { titleFromText, formatTokens, formatPct, fillLevel, contextIndicatorText, normalizeAccess, rememberedAccess, rememberAccess } from './util.js';
@@ -164,8 +165,21 @@ const sidebar = createSidebar(sidebarEl, {
   },
 });
 
+// ---------- the viewer (addendum f): files and, in advanced access, code beside the log ----------
+const viewer = createViewer({
+  onToggle: (open) => mainEl.classList.toggle('with-viewer', open),
+  onClose: (byUser) => {
+    // focus was inside the panel that is now hidden: hand it to the composer
+    if (byUser && (!document.activeElement || document.activeElement === document.body || viewer.el.contains(document.activeElement))) composer.focus();
+  },
+});
+mainEl.insertBefore(viewer.el, pageEl);
+
 // ---------- messages + composer ----------
-const list = createMessageList(messagesEl);
+const list = createMessageList(messagesEl, {
+  onOpenFile: (f) => viewer.open({ key: `file:${f.id}`, type: 'file', id: String(f.id), name: f.name || 'file', media_type: f.media_type || '', size: f.size }, { focus: true }),
+  onOpenCode: (code, lang) => viewer.open({ code, lang }, { focus: true }),
+});
 const composer = createComposer($('#composer'), {
   getLimits: () => store.get().me?.limits || {},
   notify,
@@ -472,6 +486,7 @@ const agentsPage = createAgentsPage(pageEl, {
 function showView(view) {
   const agents = view === 'agents';
   store.set({ view });
+  if (agents) viewer.close(false);
   logEl.hidden = agents;
   composerWrap.hidden = agents;
   pageEl.hidden = !agents;
@@ -523,6 +538,7 @@ async function route() {
   const seq = ++routeSeq;
   if (!id) {
     store.set({ currentId: null, conversation: null, context: null, contextError: false });
+    viewer.setConversation(null);
     list.clear();
     renderDraftEmpty();
     composer.focus();
@@ -601,6 +617,7 @@ async function sendTurn(text, files) {
     composer.setText(text);
     return;
   }
+  viewer.noteSend(); // a closed panel may open itself again for this turn's output
   const user = newUserMessage(text, files.map((f) => ({ name: f.name, media_type: f.type, size: f.size })));
   const assistant = newAssistantMessage();
   const controller = new AbortController();
@@ -626,6 +643,14 @@ async function sendTurn(text, files) {
           }
           return patch;
         });
+        if (ev.type === 'done') {
+          // decision 3: the turn's last generated file, else (advanced) its last long code block
+          const st = store.get();
+          if (st.conversation?.id === conv.id) {
+            viewer.setConversation(st.conversation);
+            viewer.autoOpen(st.conversation.messages.find((m) => m.id === assistant.id));
+          }
+        }
         scheduleRender();
       },
     });
@@ -678,6 +703,7 @@ async function refreshList() {
 // ---------- rendering ----------
 function renderMessages() {
   const s = store.get();
+  viewer.setConversation(s.view === 'agents' ? null : s.conversation);
   if (!s.conversation) return;
   if (!s.run && !(s.conversation.messages || []).length) {
     renderEmptyFor(s.conversation.agent_ref || null, s.conversation.agent_name || '');
