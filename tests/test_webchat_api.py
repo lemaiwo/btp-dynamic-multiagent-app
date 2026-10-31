@@ -38,7 +38,7 @@ use_test_database()
 os.environ.pop("VCAP_SERVICES", None)
 os.environ.pop("VCAP_APPLICATION", None)
 
-from pydantic_ai import Agent  # noqa: E402
+from pydantic_ai import Agent, RunContext  # noqa: E402
 from pydantic_ai.messages import ModelRequest, ToolReturnPart, UserPromptPart  # noqa: E402
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel  # noqa: E402
 
@@ -51,7 +51,13 @@ from agents.db import (  # noqa: E402
     SessionLocal,
     init_db,
 )
-from agents.progress import report_tool_end, report_tool_start  # noqa: E402
+from agents.progress import (  # noqa: E402
+    current_delegation,
+    report_delegation_end,
+    report_delegation_start,
+    report_tool_end,
+    report_tool_start,
+)
 from agents.validation_errors import install_validation_handler  # noqa: E402
 from agents.webchat import routes, run, store, uploads  # noqa: E402
 
@@ -153,11 +159,41 @@ class Script:
         raise RuntimeError(f"backend refused https://user:{SECRET}@host.example/x?token={SECRET}")
         yield ""  # pragma: no cover
 
+    async def delegates(self, messages, info):
+        self.seen.append(list(messages))
+        if any(isinstance(p, ToolReturnPart) for p in messages[-1].parts):
+            yield "Three systems."
+            return
+        yield {0: DeltaToolCall(name="delegate_btp_admin",
+                                json_args=json.dumps({"query": f"list systems token={SECRET}"}),
+                                tool_call_id="deleg-1")}
+
     async def specialist_tool(self, messages, info):
         self.seen.append(list(messages))
         report_tool_start("btp-admin", "raw-1", "SAPQuery", {"q": "x"})
         report_tool_end("btp-admin", "raw-1", ok=True, output="3 rows")
         yield "done"
+
+
+SPEC_USAGE = {"input_tokens": 120, "output_tokens": 30, "cache_read_tokens": 7,
+              "requests": 2, "model": "spec-model"}
+
+
+async def delegate_btp_admin(ctx: RunContext, query: str) -> str:
+    """A delegation as ``agents.registry`` reports it: start with the query,
+    ``current_delegation`` bound around the specialist's work, end with ok,
+    output preview and the specialist's own usage."""
+    report_delegation_start("btp-admin", "Consulting the btp-admin specialist…",
+                            delegation_id=ctx.tool_call_id, query=query)
+    token = current_delegation.set(ctx.tool_call_id)
+    try:
+        report_tool_start("btp-admin", "raw-1", "SAPQuery", {"q": "x"})
+        report_tool_end("btp-admin", "raw-1", ok=True, output="3 rows")
+    finally:
+        current_delegation.reset(token)
+    report_delegation_end("btp-admin", delegation_id=ctx.tool_call_id, ok=True,
+                          output="3 systems", usage=dict(SPEC_USAGE), duration_ms=5)
+    return "3 systems"
 
 
 def use_model(monkeypatch, real_agents_and_mcp, stream) -> Agent:
@@ -315,21 +351,30 @@ async def test_a_turn_streams_its_events_and_is_stored(client, monkeypatch,
     assert r.headers["x-accel-buffering"] == "no"
     events = frames(r.text)
     names = [e for e, _ in events]
-    assert names == ["start", "tool", "tool", "file", "text", "text", "title", "done"]
+    assert names == ["start", "tool", "tool", "file", "text", "text", "usage", "title", "done"]
     start = events[0][1]
     assert set(start) == {"user_message_id", "assistant_message_id", "files"}
     assert [f["name"] for f in start["files"]] == ["chart.png", "notes.csv"]
     running, done = events[1][1], events[2][1]
     assert running["status"] == "running" and running["name"] == "create_excel_workbook"
     assert running["agent"] == "orchestrator" and "filename=../report" in running["args"]
+    assert running["agent_id"] is None  # the orchestrator's own tool
     assert done["status"] == "done" and done["id"] == running["id"]
+    assert done["agent_id"] is None and isinstance(done["duration_ms"], int)
     file_event = events[3][1]
     assert file_event["name"] == "report.xlsx"
     assert file_event["media_type"] == uploads.XLSX
     text = "".join(d["delta"] for e, d in events if e == "text")
     assert text == f"Here is [the workbook](/chat/api/files/{file_event['file_id']})."
-    assert events[6][1] == {"title": "Quarterly numbers"}
-    assert events[7][1] == {"message_id": start["assistant_message_id"], "status": "done"}
+    usage = events[6][1]
+    assert usage["model"] == "orchestrator-model" and usage["agents"] == []
+    assert usage["requests"] == 2 and usage["tool_calls"] == 1
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+    assert events[7][1] == {"title": "Quarterly numbers"}
+    done_event = events[8][1]
+    assert done_event == {"message_id": start["assistant_message_id"], "status": "done",
+                          "duration_ms": done_event["duration_ms"]}
+    assert isinstance(done_event["duration_ms"], int) and done_event["duration_ms"] >= 0
 
     # The model got the image as bytes and the CSV as a delimited block.
     first_request = script.seen[0][-1]
@@ -344,7 +389,11 @@ async def test_a_turn_streams_its_events_and_is_stored(client, monkeypatch,
     assert (user["role"], user["position"], assistant["position"]) == ("user", 1, 2)
     assert [f["kind"] for f in user["files"]] == ["upload", "upload"]
     assert assistant["status"] == "done" and assistant["content"] == text
-    assert [p["type"] for p in assistant["parts"]] == ["tool", "file", "text"]
+    assert [p["type"] for p in assistant["parts"]] == ["tool", "file", "text", "usage"]
+    assert detail["usage"] == {"input_tokens": usage["input_tokens"],
+                               "output_tokens": usage["output_tokens"],
+                               "total_tokens": usage["total_tokens"],
+                               "requests": 2, "turns": 1}
     assert assistant["files"][0]["kind"] == "generated"
 
     dl = await client.get(f"{API}/files/{file_event['file_id']}")
@@ -388,6 +437,81 @@ async def test_specialist_tools_become_cards(client, monkeypatch, real_agents_an
     assert [t["status"] for t in tools] == ["running", "done"]
     assert tools[0]["agent"] == "btp-admin" and tools[0]["name"] == "SAPQuery"
     assert tools[0]["id"].startswith("spec:") and tools[1]["output"] == "3 rows"
+
+
+async def test_a_delegation_streams_agent_tool_and_usage(client, monkeypatch,
+                                                          real_agents_and_mcp):
+    agent = use_model(monkeypatch, real_agents_and_mcp, Script().delegates)
+    agent.tool(name="delegate_btp_admin")(delegate_btp_admin)
+    cid = await new_conversation(client)
+    events = frames((await client.post(f"{API}/conversations/{cid}/messages",
+                                       **form(text="Which systems?"))).text)
+    flow = [(e, d.get("status")) for e, d in events
+            if e in ("agent", "tool", "usage", "done")]
+    assert flow == [("agent", "running"), ("tool", "running"), ("tool", "done"),
+                    ("agent", "done"), ("usage", None), ("done", "done")]
+    agent_run = next(d for e, d in events if e == "agent")
+    assert agent_run == {"id": "deleg-1", "agent": "btp-admin", "parent": None,
+                         "status": "running", "prompt": agent_run["prompt"]}
+    assert agent_run["prompt"].startswith("list systems") and SECRET not in agent_run["prompt"]
+    tools = [d for e, d in events if e == "tool"]
+    assert all(t["agent_id"] == "deleg-1" for t in tools)
+    assert tools[1]["output"] == "3 rows" and isinstance(tools[1]["duration_ms"], int)
+    agent_done = [d for e, d in events if e == "agent"][1]
+    assert set(agent_done) == {"id", "agent", "parent", "status", "output", "duration_ms",
+                               "usage"}
+    assert agent_done["output"] == "3 systems" and agent_done["usage"] == SPEC_USAGE
+    assert isinstance(agent_done["duration_ms"], int)
+    usage = next(d for e, d in events if e == "usage")
+    assert usage["agents"] == [{"id": "deleg-1", "agent": "btp-admin", "input_tokens": 120,
+                                "output_tokens": 30, "requests": 2, "model": "spec-model"}]
+    assert usage["model"] == "orchestrator-model" and usage["tool_calls"] == 1
+    assert usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+    assert isinstance(events[-1][1]["duration_ms"], int)
+
+    detail = (await client.get(f"{API}/conversations/{cid}")).json()
+    parts = detail["messages"][1]["parts"]
+    assert [p["type"] for p in parts] == ["agent", "tool", "text", "usage"]
+    stored_agent, stored_tool, _, stored_usage = parts
+    assert stored_agent == {"type": "agent", "id": "deleg-1", "agent": "btp-admin",
+                            "parent": None, "status": "done", "prompt": agent_run["prompt"],
+                            "output": "3 systems", "duration_ms": agent_done["duration_ms"],
+                            "usage": SPEC_USAGE}
+    assert stored_tool["agent_id"] == "deleg-1" and stored_tool["status"] == "done"
+    assert stored_usage == {"type": "usage", **usage}
+    assert detail["usage"] == {"input_tokens": usage["input_tokens"],
+                               "output_tokens": usage["output_tokens"],
+                               "total_tokens": usage["total_tokens"],
+                               "requests": usage["requests"], "turns": 1}
+
+
+async def test_an_open_delegation_is_closed_and_a_failed_turn_has_no_usage(
+        client, monkeypatch, real_agents_and_mcp):
+    async def starts_then_fails(messages, info):
+        report_delegation_start("btp-admin", "Consulting…", delegation_id="d-open",
+                                query="q")
+        token = current_delegation.set("d-open")
+        try:
+            report_tool_start("btp-admin", "raw-9", "SAPRead", {})
+        finally:
+            current_delegation.reset(token)
+        raise RuntimeError("boom")
+        yield ""  # pragma: no cover
+
+    use_model(monkeypatch, real_agents_and_mcp, starts_then_fails)
+    cid = await new_conversation(client)
+    events = frames((await client.post(f"{API}/conversations/{cid}/messages",
+                                       **form())).text)
+    assert "usage" not in [e for e, _ in events]
+    agent_frames = [d for e, d in events if e == "agent"]
+    assert [a["status"] for a in agent_frames] == ["running", "error"]
+    assert agent_frames[1]["output"] == "not finished" and agent_frames[1]["usage"] is None
+    detail = (await client.get(f"{API}/conversations/{cid}")).json()
+    parts = detail["messages"][1]["parts"]
+    assert [(p["type"], p["status"]) for p in parts] == [("agent", "error"), ("tool", "error")]
+    assert parts[1]["agent_id"] == "d-open"
+    assert detail["usage"] == {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                               "requests": 0, "turns": 0}
 
 
 async def test_a_failed_run_is_stored_masked(client, monkeypatch, real_agents_and_mcp):
@@ -624,3 +748,23 @@ def test_generated_docx_from_the_toolset_is_a_zip():
 
     data = docgen.build_docx("# x")
     assert zipfile.ZipFile(io.BytesIO(data)).testzip() is None
+
+
+# ---------------------------------------------------------------------------
+# A specialist's own delegate_* call is no tool card (the peer is an agent card)
+# ---------------------------------------------------------------------------
+def test_a_peer_delegation_of_a_specialist_is_not_a_tool_card():
+    from agents.progress import ProgressUpdate
+    from agents.webchat.run import Turn, TurnRecorder
+
+    turn = Turn(conversation_id="c", assistant_message_id="a", principal="local-dev")
+    rec = TurnRecorder(turn)
+    rec.sink(ProgressUpdate(agent="btp-admin", kind="tool_start", tool_call_id="t1",
+                            tool_name="delegate_cost_analyst", args={"query": "x"},
+                            delegation_id="d1"))
+    rec.sink(ProgressUpdate(agent="btp-admin", kind="tool_end", tool_call_id="t1", ok=True,
+                            output="done", delegation_id="d1"))
+    rec.sink(ProgressUpdate(agent="btp-admin", kind="tool_start", tool_call_id="t2",
+                            tool_name="SAPQuery", args={"q": "y"}, delegation_id="d1"))
+    kinds = [(p["type"], p.get("name")) for p in rec.parts]
+    assert kinds == [("tool", "SAPQuery")]

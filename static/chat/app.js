@@ -6,7 +6,7 @@ import { createSidebar } from './render/sidebar.js';
 import { createMessageList, renderEmpty } from './render/messages.js';
 import { createComposer } from './composer.js';
 import { initTheme, toggleTheme, onThemeChange } from './theme.js';
-import { titleFromText } from './util.js';
+import { titleFromText, formatTokens } from './util.js';
 
 const store = createStore(initialState);
 const root = document.getElementById('app');
@@ -23,6 +23,7 @@ root.innerHTML = `
       </button>
       <h1 class="title" id="title">SAP BTP Multi-Agent</h1>
       <div class="topbar-right">
+        <span class="usage-chip" id="usage-chip" hidden tabindex="0" role="status" aria-label="Conversation usage"></span>
         <label class="model-pick"><span class="sr-only">Model</span><select id="model" aria-label="Model"></select></label>
         <button type="button" class="icon-btn theme" id="theme" aria-label="Switch to dark theme" title="Theme">
           <svg class="sun" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
@@ -50,6 +51,7 @@ const scrim = $('.scrim');
 const hamburger = $('.hamburger');
 const titleEl = $('#title');
 const modelSel = $('#model');
+const usageChip = $('#usage-chip');
 const themeBtn = $('#theme');
 const bannerEl = $('#banner');
 const messagesEl = $('#messages');
@@ -210,6 +212,7 @@ async function route() {
 function normalizeConversation(conv) {
   return {
     ...conv,
+    usage: conv.usage && typeof conv.usage === 'object' ? conv.usage : null,
     messages: (conv.messages || []).map((m) => ({
       ...m,
       parts: Array.isArray(m.parts) ? m.parts : [],
@@ -339,8 +342,27 @@ store.subscribe((s) => {
     document.title = s.conversation?.title ? `${s.conversation.title} · ${s.me?.app_name || 'SAP BTP Multi-Agent'}` : (s.me?.app_name || 'SAP BTP Multi-Agent');
   }
   reflectModel();
+  reflectUsage(s.conversation?.usage);
   if (s.conversation && !s.run) renderMessages();
 });
+
+// The conversation total: "12.4k tokens", from the detail's `usage` and the
+// turn's usage part (applyStreamEvent adds it); hidden at zero.
+function reflectUsage(usage) {
+  const total = Number(usage?.total_tokens) || 0;
+  if (!total) {
+    usageChip.hidden = true;
+    usageChip.textContent = '';
+    usageChip.title = '';
+    return;
+  }
+  const text = `${formatTokens(total)} tokens`;
+  const turns = Number(usage.turns) || 0;
+  const title = `${formatTokens(usage.input_tokens || 0)} in / ${formatTokens(usage.output_tokens || 0)} out · ${Number(usage.requests) || 0} requests over ${turns === 1 ? '1 turn' : `${turns} turns`}`;
+  if (usageChip.textContent !== text) usageChip.textContent = text;
+  if (usageChip.title !== title) { usageChip.title = title; usageChip.setAttribute('aria-label', `Conversation usage: ${text}, ${title}`); }
+  usageChip.hidden = false;
+}
 
 // ---------- sign-in links (same-origin /oauth/login only), as the classic chat ----------
 function signinUrl(a) {

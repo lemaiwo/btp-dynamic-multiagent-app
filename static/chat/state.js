@@ -92,25 +92,58 @@ export function applyEvent(message, event) {
     }
     case 'tool': {
       const i = parts.findIndex((p) => p.type === 'tool' && p.id === data.id);
+      const prev = i >= 0 ? parts[i] : null;
       const card = {
         type: 'tool',
         id: data.id,
-        agent: data.agent ?? (i >= 0 ? parts[i].agent : undefined),
-        name: data.name ?? (i >= 0 ? parts[i].name : undefined),
+        agent: data.agent ?? prev?.agent,
+        name: data.name ?? prev?.name,
         status: data.status || 'running',
+        // the delegation the call ran under; null for the orchestrator's own
+        agent_id: data.agent_id !== undefined ? (data.agent_id ?? null) : (prev?.agent_id ?? null),
       };
-      if (i >= 0) {
-        const prev = parts[i];
+      if (prev) {
         parts[i] = {
           ...prev, ...card,
           args: data.args !== undefined ? data.args : prev.args,
           output: data.output !== undefined ? data.output : prev.output,
+          duration_ms: data.duration_ms != null ? Number(data.duration_ms) : prev.duration_ms,
         };
       } else {
         if (data.args !== undefined) card.args = data.args;
         if (data.output !== undefined) card.output = data.output;
+        if (data.duration_ms != null) card.duration_ms = Number(data.duration_ms);
         parts.push(card);
       }
+      return msg;
+    }
+    case 'agent': {
+      // One delegation: "running" carries the prompt, the closing frame the
+      // output, duration and usage. Merged by id into one part.
+      const i = parts.findIndex((p) => p.type === 'agent' && p.id === data.id);
+      const prev = i >= 0 ? parts[i] : null;
+      const part = {
+        type: 'agent',
+        id: data.id,
+        agent: data.agent ?? prev?.agent,
+        parent: data.parent !== undefined ? (data.parent ?? null) : (prev?.parent ?? null),
+        status: data.status || 'running',
+        prompt: data.prompt !== undefined ? data.prompt : prev?.prompt,
+        output: data.output !== undefined ? data.output : prev?.output,
+        duration_ms: data.duration_ms != null ? Number(data.duration_ms) : prev?.duration_ms,
+        usage: data.usage !== undefined ? data.usage : prev?.usage,
+      };
+      for (const k of ['prompt', 'output', 'duration_ms', 'usage']) if (part[k] === undefined) delete part[k];
+      if (prev) parts[i] = { ...prev, ...part };
+      else parts.push(part);
+      return msg;
+    }
+    case 'usage': {
+      // Once per turn, before `done`; a repeat replaces the first.
+      const part = { ...data, type: 'usage' };
+      const i = parts.findIndex((p) => p.type === 'usage');
+      if (i >= 0) parts[i] = part;
+      else parts.push(part);
       return msg;
     }
     case 'note': {
@@ -155,16 +188,126 @@ export function applyEvent(message, event) {
   }
 }
 
-/** Tool parts of a message, and how many are running / errored. */
-export function activitySummary(message) {
+/** The `usage` part of a message, or null. */
+export function usagePart(message) {
+  return (message?.parts || []).find((p) => p.type === 'usage') || null;
+}
+
+function tokensOf(usage) {
+  if (!usage) return 0;
+  const total = Number(usage.total_tokens);
+  if (Number.isFinite(total) && total > 0) return total;
+  return (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);
+}
+
+/**
+ * What the activity strip's headline says: agents, tools, how many are
+ * running / errored, the tokens (the usage part when there is one, else the
+ * sum over the agent parts) and the duration (live: now - started_at;
+ * stored: the usage part's duration_ms, else the message's).
+ */
+export function activitySummary(message, now = Date.now()) {
   const parts = message?.parts || [];
   const tools = parts.filter((p) => p.type === 'tool');
+  const agents = parts.filter((p) => p.type === 'agent');
+  const usage = usagePart(message);
+  const tokens = usage ? tokensOf(usage) : agents.reduce((n, a) => n + tokensOf(a.usage), 0);
+  let duration = null;
+  if (message?.status === 'running') duration = message.started_at ? Math.max(0, now - message.started_at) : null;
+  else if (usage && usage.duration_ms != null) duration = Number(usage.duration_ms);
+  else if (message?.duration_ms != null) duration = Number(message.duration_ms);
   return {
     tools: tools.length,
-    running: tools.filter((t) => t.status === 'running').length,
-    errors: tools.filter((t) => t.status === 'error').length,
+    agents: agents.length,
+    running: tools.filter((t) => t.status === 'running').length + agents.filter((a) => a.status === 'running').length,
+    errors: tools.filter((t) => t.status === 'error').length + agents.filter((a) => a.status === 'error').length,
     notes: parts.filter((p) => p.type === 'note').length,
-    hasActivity: tools.length > 0 || parts.some((p) => p.type === 'note' || p.type === 'message'),
+    tokens,
+    duration,
+    hasActivity: tools.length > 0 || agents.length > 0 || parts.some((p) => p.type === 'note' || p.type === 'message'),
+  };
+}
+
+/**
+ * The activity tree of a message, in order of first appearance:
+ * top-level nodes are the orchestrator's own tools (`agent_id` null), the
+ * delegations nobody delegated (`parent` null) and the notes / notices;
+ * an agent node's `children` are the tools with its id as `agent_id` and the
+ * delegations with its id as `parent`. A tool or delegation whose owner is
+ * not a known agent part is shown at the top level rather than lost.
+ * -> [{kind:'tool'|'agent'|'note'|'message', part, children?}]
+ */
+export function activityTree(message) {
+  const parts = message?.parts || [];
+  const agentIds = new Set(parts.filter((p) => p.type === 'agent' && p.id != null).map((p) => p.id));
+  const nodes = new Map(); // agent id -> node
+  const top = [];
+  const nodeOf = (part) => {
+    if (part.type === 'agent') {
+      const node = { kind: 'agent', part, children: [] };
+      if (part.id != null && !nodes.has(part.id)) nodes.set(part.id, node);
+      return node;
+    }
+    return { kind: part.type, part };
+  };
+  const pending = [];
+  for (const part of parts) {
+    if (part.type !== 'tool' && part.type !== 'agent' && part.type !== 'note' && part.type !== 'message') continue;
+    const node = nodeOf(part);
+    const owner = part.type === 'tool' ? part.agent_id : part.type === 'agent' ? part.parent : null;
+    if (owner != null && agentIds.has(owner) && owner !== part.id) pending.push([owner, node]);
+    else top.push(node);
+  }
+  // Attach children after every agent node exists (a tool frame can arrive
+  // before its delegation's part in a stored list that was reordered).
+  for (const [owner, node] of pending) {
+    const parent = nodes.get(owner);
+    if (parent && !isAncestor(node, parent)) parent.children.push(node);
+    else top.push(node);
+  }
+  return top;
+}
+
+function isAncestor(node, candidate) {
+  // true when `candidate` is inside `node` (guards a parent cycle)
+  if (node.kind !== 'agent') return false;
+  const stack = [...node.children];
+  while (stack.length) {
+    const n = stack.pop();
+    if (n === candidate) return true;
+    if (n.kind === 'agent') stack.push(...n.children);
+  }
+  return false;
+}
+
+function subtractUsage(total, usage) {
+  const t = total || {};
+  const u = usage || {};
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const own = Number(u.total_tokens);
+  return {
+    input_tokens: num(t.input_tokens) - num(u.input_tokens),
+    output_tokens: num(t.output_tokens) - num(u.output_tokens),
+    total_tokens: num(t.total_tokens) - (Number.isFinite(own) && own > 0 ? own : num(u.input_tokens) + num(u.output_tokens)),
+    requests: num(t.requests) - num(u.requests),
+    turns: Math.max(0, num(t.turns) - 1),
+  };
+}
+
+/** The conversation total after one more turn's usage part. */
+export function addUsage(total, usage) {
+  const t = total || {};
+  const u = usage || {};
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const input = num(t.input_tokens) + num(u.input_tokens);
+  const output = num(t.output_tokens) + num(u.output_tokens);
+  const own = Number(u.total_tokens);
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: num(t.total_tokens) + (Number.isFinite(own) && own > 0 ? own : num(u.input_tokens) + num(u.output_tokens)),
+    requests: num(t.requests) + num(u.requests),
+    turns: num(t.turns) + 1,
   };
 }
 
@@ -196,7 +339,15 @@ export function applyStreamEvent(conversation, userLocalId, assistantLocalId, ev
     return conv;
   }
   if (ai >= 0) {
+    const before = usagePart(conv.messages[ai]);
     conv.messages[ai] = applyEvent(conv.messages[ai], event);
+    if (event.type === 'usage') {
+      // the header chip: count this turn once, even when the event repeats
+      const after = usagePart(conv.messages[ai]);
+      let total = conv.usage || null;
+      if (before) total = subtractUsage(total, before);
+      conv.usage = addUsage(total, after);
+    }
     if (event.type === 'done' || event.type === 'error') conv.status = 'idle';
   }
   return conv;

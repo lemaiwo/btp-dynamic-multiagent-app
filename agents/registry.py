@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import reprlib
+import time
 import unicodedata
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -45,7 +46,7 @@ from agents.shared import (
 from agents.sharepoint_tools import activity_summary as sharepoint_activity_summary
 # --- deep agents ---
 from agents.deep import deep_toolset, scoped_deep_instructions
-from agents.errors import describe_exception
+from agents.errors import describe_exception, mask_text
 from agents.ide.readonly import ReadOnlyGuard
 
 logger = logging.getLogger(__name__)
@@ -993,6 +994,50 @@ async def build_orchestrator() -> BuildResult:
     )
 
 
+DELEGATION_PREVIEW_CHARS = 400
+
+
+def _delegation_preview(answer: str | None) -> str | None:
+    """What a delegation answered, for the progress side channel: masked like
+    an exception text (an error answer carries one) and cut to
+    ``DELEGATION_PREVIEW_CHARS``. ``None`` when nothing was answered
+    (cancelled)."""
+    if answer is None:
+        return None
+    text = mask_text(answer)
+    if len(text) > DELEGATION_PREVIEW_CHARS:
+        text = text[: DELEGATION_PREVIEW_CHARS - 1] + "…"
+    return text
+
+
+def specialist_usage(messages: list[Any]) -> dict[str, Any]:
+    """The token share of ONE specialist run: the sum of ``ModelResponse.usage``
+    over the messages of that run (``result.new_messages()``).
+
+    Not ``result.usage()``: the delegation passes ``usage=ctx.usage``, so that
+    object is shared with the orchestrator and every other delegation of the
+    turn and is cumulative. ``requests`` is the number of model responses,
+    ``model`` the model name of the last one. Numbers and the model name only.
+    """
+    from pydantic_ai.messages import ModelResponse
+
+    totals = {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0}
+    requests = 0
+    model: str | None = None
+    for message in messages:
+        if not isinstance(message, ModelResponse):
+            continue
+        requests += 1
+        usage = message.usage
+        for key in totals:
+            value = getattr(usage, key, 0)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] += value
+        if isinstance(message.model_name, str) and message.model_name:
+            model = message.model_name
+    return {**totals, "requests": requests, "model": model}
+
+
 def _attach_delegation_tool(
     orchestrator: Agent, specialist: Agent, row: AgentConfig,
     counter: RunCounter | None = None,
@@ -1004,10 +1049,10 @@ def _attach_delegation_tool(
     )
 
     async def _delegate(ctx: RunContext, query: str) -> str:
-        from agents.auth import current_principal
-        from agents.oauth2 import find_oauth_required, has_usable_token
+        from uuid import uuid4
+
         from agents.progress import (
-            is_interactive,
+            current_delegation,
             report_delegation_end,
             report_delegation_start,
         )
@@ -1030,125 +1075,162 @@ def _attach_delegation_tool(
         # up (MCP connect + first model call) before any tool card appears. The
         # paired end (in `finally`) lets the chat endpoint tell when *every*
         # specialist is done and the orchestrator is composing the reply.
-        report_delegation_start(row.name, f"Consulting the {row.name} specialist…")
+        # The delegation's id is this tool call's id: it ties the specialist's
+        # own tool calls (``current_delegation``) and a nested delegation's
+        # ``parent`` to it. ``outcome`` is filled by the paths below and
+        # reported once, in ``finally``.
+        delegation_id = getattr(ctx, "tool_call_id", None) or uuid4().hex
+        outcome: dict[str, Any] = {"ok": False, "usage": None}
+        answer: str | None = None
+        started = time.monotonic()
+        report_delegation_start(
+            row.name, f"Consulting the {row.name} specialist…",
+            delegation_id=delegation_id, query=query,
+        )
+        delegation_token = current_delegation.set(delegation_id)
         try:
-            # Fast path: if we already know an oauth2 MCP server has no usable
-            # credential for this user, prompt for sign-in *immediately* instead
-            # of paying the full model-call + MCP-connect + OAuth-discovery cost
-            # just to find out. Interactive runs only (A2A/no sink falls through
-            # to the run, which raises and returns the static link).
-            user_id = current_principal.get()
-            if user_id and is_interactive():
-                for server_key in _oauth2_server_keys(row):
-                    try:
-                        # A refreshable token still works without an interactive
-                        # sign-in (the run refreshes it silently), so only prompt
-                        # when there's no usable credential at all.
-                        if await has_usable_token(user_id, server_key):
-                            continue
-                        if not _build_login_link(row.name, server_key):
-                            break  # no app URL → let the run raise → static fallback
-                        logger.info("[delegate] %s -> sign-in needed (pre-check)", row.name)
-                        signed_in = await _await_signin(row.name, server_key, user_id)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:  # noqa: BLE001
-                        # Token lookup hiccup (e.g. transient DB error): don't
-                        # crash the turn — defer to the run, which has graceful
-                        # error handling and will re-prompt if auth is truly needed.
-                        logger.warning(
-                            "[delegate] %s pre-check failed; deferring to run",
-                            row.name, exc_info=True,
-                        )
-                        break
-                    if not signed_in:
-                        return _signin_timeout_message(row.name)
-
-            # Run the specialist; if its MCP server still needs the user to sign
-            # in (e.g. token expired mid-run), show a sign-in link, wait for them
-            # to authorize, then retry — so the user never has to message again.
-            for attempt in range(_MAX_AUTH_ROUNDS + 1):
-                try:
-                    result = await asyncio.wait_for(
-                        specialist.run(
-                            query,
-                            usage=ctx.usage,
-                            usage_limits=run_usage_limits(),
-                            event_stream_handler=_make_progress_handler(row.name),
-                        ),
-                        timeout=_SPECIALIST_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(
-                        "[delegate] %s TIMEOUT after %.0fs", row.name, _SPECIALIST_TIMEOUT
-                    )
-                    return (
-                        f"The {row.name} specialist timed out after "
-                        f"{int(_SPECIALIST_TIMEOUT)}s. The underlying system may be "
-                        "slow or the query too large; try a narrower request."
-                    )
-                except asyncio.CancelledError:
-                    # The request was cancelled (e.g. the chat client
-                    # disconnected). Let it unwind so the run actually stops,
-                    # instead of being caught below and reported as a normal
-                    # error (which would keep it running).
-                    raise
-                except BaseException as e:  # noqa: BLE001
-                    required = find_oauth_required(e)
-                    if required is None:
-                        logger.exception("Specialist %s failed", row.name)
-                        return f"Error from {row.name}: {_format_error(e)}"
-
-                    # Sign-in needed. Auto-continue (show link, wait, retry) only
-                    # makes sense with an interactive chat sink listening; for A2A
-                    # / background runs there's no popup and no one to stream the
-                    # link to, so return the sign-in link immediately instead of
-                    # holding the request polling for a sign-in that can't happen.
-                    user_id = current_principal.get()
-                    interactive = is_interactive()
-                    if not (
-                        user_id
-                        and interactive
-                        and _build_login_link(row.name, required.server_key)
-                    ):
-                        return await _authorization_prompt(row.name, e) or (
-                            f"Error from {row.name}: {_format_error(e)}"
-                        )
-                    if attempt >= _MAX_AUTH_ROUNDS:
-                        return (
-                            f"**{row.name}** still needs sign-in after several "
-                            "attempts. Use the sign-in link above, then send your "
-                            "request again."
-                        )
-                    logger.info("[delegate] %s -> awaiting user authorization", row.name)
-                    if await _await_signin(row.name, required.server_key, user_id):
-                        logger.info("[delegate] %s -> authorized; resuming", row.name)
-                        continue  # retry the run, now with a token
-                    logger.info("[delegate] %s -> sign-in not detected in time", row.name)
-                    return _signin_timeout_message(row.name)
-
-                out = "" if result.output is None else str(result.output)
-                logger.info(
-                    "[delegate] %s DONE | output=%d chars | %.300s",
-                    row.name, len(out), out.replace("\n", " "),
-                )
-                if not out.strip():
-                    return (
-                        f"The {row.name} specialist completed but returned no text. "
-                        "Please rephrase or try again."
-                    )
-                return out
-
-            # Defensive: loop exhausted without an explicit return.
-            return (
-                f"**{row.name}** could not complete sign-in. Use the sign-in link "
-                "above, then send your request again."
-            )
+            answer = await _work(ctx, query, outcome)
+            return answer
         finally:
+            current_delegation.reset(delegation_token)
             _delegation_stack.reset(stack_token)
             if counter is not None:
                 counter.value -= 1
-            report_delegation_end(row.name)
+            report_delegation_end(
+                row.name,
+                delegation_id=delegation_id,
+                ok=bool(outcome["ok"]),
+                output=_delegation_preview(answer),
+                usage=outcome["usage"] if outcome["ok"] else None,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+
+    async def _work(ctx: RunContext, query: str, outcome: dict[str, Any]) -> str:
+        """The delegated work; sets ``outcome`` ok/usage when the specialist
+        completed, leaves it ``ok=False`` for every refusal, timeout and
+        failure (each answers its fixed text)."""
+        from agents.auth import current_principal
+        from agents.oauth2 import find_oauth_required, has_usable_token
+        from agents.progress import is_interactive
+
+        # Fast path: if we already know an oauth2 MCP server has no usable
+        # credential for this user, prompt for sign-in *immediately* instead
+        # of paying the full model-call + MCP-connect + OAuth-discovery cost
+        # just to find out. Interactive runs only (A2A/no sink falls through
+        # to the run, which raises and returns the static link).
+        user_id = current_principal.get()
+        if user_id and is_interactive():
+            for server_key in _oauth2_server_keys(row):
+                try:
+                    # A refreshable token still works without an interactive
+                    # sign-in (the run refreshes it silently), so only prompt
+                    # when there's no usable credential at all.
+                    if await has_usable_token(user_id, server_key):
+                        continue
+                    if not _build_login_link(row.name, server_key):
+                        break  # no app URL → let the run raise → static fallback
+                    logger.info("[delegate] %s -> sign-in needed (pre-check)", row.name)
+                    signed_in = await _await_signin(row.name, server_key, user_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    # Token lookup hiccup (e.g. transient DB error): don't
+                    # crash the turn — defer to the run, which has graceful
+                    # error handling and will re-prompt if auth is truly needed.
+                    logger.warning(
+                        "[delegate] %s pre-check failed; deferring to run",
+                        row.name, exc_info=True,
+                    )
+                    break
+                if not signed_in:
+                    return _signin_timeout_message(row.name)
+
+        # Run the specialist; if its MCP server still needs the user to sign
+        # in (e.g. token expired mid-run), show a sign-in link, wait for them
+        # to authorize, then retry — so the user never has to message again.
+        for attempt in range(_MAX_AUTH_ROUNDS + 1):
+            try:
+                result = await asyncio.wait_for(
+                    specialist.run(
+                        query,
+                        usage=ctx.usage,
+                        usage_limits=run_usage_limits(),
+                        event_stream_handler=_make_progress_handler(row.name),
+                    ),
+                    timeout=_SPECIALIST_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[delegate] %s TIMEOUT after %.0fs", row.name, _SPECIALIST_TIMEOUT
+                )
+                return (
+                    f"The {row.name} specialist timed out after "
+                    f"{int(_SPECIALIST_TIMEOUT)}s. The underlying system may be "
+                    "slow or the query too large; try a narrower request."
+                )
+            except asyncio.CancelledError:
+                # The request was cancelled (e.g. the chat client
+                # disconnected). Let it unwind so the run actually stops,
+                # instead of being caught below and reported as a normal
+                # error (which would keep it running).
+                raise
+            except BaseException as e:  # noqa: BLE001
+                required = find_oauth_required(e)
+                if required is None:
+                    logger.exception("Specialist %s failed", row.name)
+                    return f"Error from {row.name}: {_format_error(e)}"
+
+                # Sign-in needed. Auto-continue (show link, wait, retry) only
+                # makes sense with an interactive chat sink listening; for A2A
+                # / background runs there's no popup and no one to stream the
+                # link to, so return the sign-in link immediately instead of
+                # holding the request polling for a sign-in that can't happen.
+                user_id = current_principal.get()
+                interactive = is_interactive()
+                if not (
+                    user_id
+                    and interactive
+                    and _build_login_link(row.name, required.server_key)
+                ):
+                    return await _authorization_prompt(row.name, e) or (
+                        f"Error from {row.name}: {_format_error(e)}"
+                    )
+                if attempt >= _MAX_AUTH_ROUNDS:
+                    return (
+                        f"**{row.name}** still needs sign-in after several "
+                        "attempts. Use the sign-in link above, then send your "
+                        "request again."
+                    )
+                logger.info("[delegate] %s -> awaiting user authorization", row.name)
+                if await _await_signin(row.name, required.server_key, user_id):
+                    logger.info("[delegate] %s -> authorized; resuming", row.name)
+                    continue  # retry the run, now with a token
+                logger.info("[delegate] %s -> sign-in not detected in time", row.name)
+                return _signin_timeout_message(row.name)
+
+            out = "" if result.output is None else str(result.output)
+            outcome["ok"] = True
+            try:
+                outcome["usage"] = specialist_usage(result.new_messages())
+            except Exception as exc:  # noqa: BLE001 - reporting never fails a delegation
+                logger.debug("[delegate] %s usage not readable (%s)", row.name,
+                             type(exc).__name__)
+            logger.info(
+                "[delegate] %s DONE | output=%d chars | %.300s",
+                row.name, len(out), out.replace("\n", " "),
+            )
+            if not out.strip():
+                return (
+                    f"The {row.name} specialist completed but returned no text. "
+                    "Please rephrase or try again."
+                )
+            return out
+
+        # Defensive: loop exhausted without an explicit return.
+        return (
+            f"**{row.name}** could not complete sign-in. Use the sign-in link "
+            "above, then send your request again."
+        )
 
     _delegate.__name__ = tool_name
     _delegate.__doc__ = description

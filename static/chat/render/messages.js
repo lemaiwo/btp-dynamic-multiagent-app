@@ -6,6 +6,8 @@
 import { renderMarkdown } from './markdown.js';
 import { fileCards } from './files.js';
 import { activityStrip } from './activity.js';
+import { usagePart } from '../state.js';
+import { formatElapsed, formatTokens } from '../util.js';
 
 function textOf(message) {
   if (message.content) return message.content;
@@ -62,15 +64,49 @@ function buildAssistant() {
   files.className = 'files-slot';
   const error = document.createElement('div');
   error.className = 'error-slot';
-  art.append(activity, body, files, error);
+  const usage = document.createElement('div');
+  usage.className = 'usage-slot';
+  art.append(activity, body, files, error, usage);
   return art;
 }
 
+function partSig(p) {
+  switch (p.type) {
+    case 'text': return 't';
+    case 'tool': return [p.id, p.status, !!p.output, p.duration_ms, p.agent_id];
+    case 'agent': return [p.id, p.status, !!p.output, p.duration_ms, p.usage?.total_tokens];
+    case 'usage': return ['usage', p.total_tokens, p.duration_ms];
+    default: return [p.type, p.text];
+  }
+}
+
 function activitySig(message) {
-  return JSON.stringify([
-    message.status, message.note, message.duration_ms,
-    (message.parts || []).map((p) => (p.type === 'tool' ? [p.id, p.status, !!p.output] : p.type === 'text' ? 't' : [p.type, p.text])),
-  ]);
+  return JSON.stringify([message.status, message.note, message.duration_ms, (message.parts || []).map(partSig)]);
+}
+
+/**
+ * "gpt-4o · 1,240 in / 380 out · 8.1 s" under an assistant message, with the
+ * per-agent split as the tooltip ("btp-admin 820 in / 120 out (2 requests)").
+ */
+export function usageLine(usage) {
+  if (!usage) return null;
+  const el = document.createElement('div');
+  el.className = 'usage-line';
+  const bits = [];
+  if (usage.model) bits.push(String(usage.model));
+  bits.push(`${formatTokens(usage.input_tokens || 0)} in / ${formatTokens(usage.output_tokens || 0)} out`);
+  if (usage.duration_ms != null) bits.push(formatElapsed(usage.duration_ms));
+  el.textContent = bits.join(' · ');
+  const agents = Array.isArray(usage.agents) ? usage.agents : [];
+  const lines = agents.map((a) => {
+    const n = Number(a.requests) || 0;
+    const req = n ? ` (${n === 1 ? '1 request' : `${n} requests`})` : '';
+    return `${a.agent || a.id || 'agent'} ${formatTokens(a.input_tokens || 0)} in / ${formatTokens(a.output_tokens || 0)} out${req}`;
+  });
+  const total = `Total ${formatTokens(usage.total_tokens || 0)} tokens` + (usage.requests ? ` · ${usage.requests} requests` : '') + (usage.cache_read_tokens ? ` · ${formatTokens(usage.cache_read_tokens)} cached` : '');
+  el.title = [...lines, total].join('\n');
+  el.setAttribute('aria-label', `Usage: ${el.textContent}. ${lines.join('; ')}`);
+  return el;
 }
 
 function updateAssistant(el, message, live) {
@@ -126,6 +162,16 @@ function updateAssistant(el, message, live) {
       }
       slot.appendChild(box);
     }
+  }
+
+  const usage = usagePart(message);
+  const usig = JSON.stringify(usage);
+  if (el._usig !== usig) {
+    el._usig = usig;
+    const slot = el.querySelector('.usage-slot');
+    const line = usageLine(usage);
+    slot.replaceChildren(...(line ? [line] : []));
+    slot.hidden = !line;
   }
 }
 

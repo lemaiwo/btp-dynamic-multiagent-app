@@ -287,7 +287,32 @@ async def conversation_detail(db: AsyncSession, conv: ChatConversation) -> dict[
         by_message.setdefault(row.message_id, []).append(file_out(row))
     out = conversation_out(conv)
     out["messages"] = [message_out(m, by_message.get(m.id, [])) for m in messages]
+    out["usage"] = conversation_usage(out["messages"])
     return out
+
+
+_USAGE_KEYS = ("input_tokens", "output_tokens", "total_tokens", "requests")
+
+
+def conversation_usage(messages: list[dict[str, Any]]) -> dict[str, int]:
+    """The conversation's token total: the sum over the ``usage`` parts of its
+    assistant messages (one per completed turn; ``turns`` counts them).
+    Summed in Python from the parts already read: ``parts_json`` is a
+    ``Text`` column, which HANA cannot aggregate. Non-integer values count 0."""
+    total = dict.fromkeys(_USAGE_KEYS, 0)
+    turns = 0
+    for msg in messages:
+        if msg["role"] != "assistant":
+            continue
+        for part in msg["parts"]:
+            if not isinstance(part, dict) or part.get("type") != "usage":
+                continue
+            turns += 1
+            for key in _USAGE_KEYS:
+                value = part.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    total[key] += value
+    return {**total, "turns": turns}
 
 
 async def message_count(db: AsyncSession, cid: str) -> int:

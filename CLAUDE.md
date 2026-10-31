@@ -1600,6 +1600,29 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     caps 10 MiB, 10 per run, 500,000 cells; every refusal is `{"error": ...}`
   - `store.py` — owner-scoped persistence, `CHAT_RETENTION_DAYS` (180, `0`
     keeps) purge in the app's daily retention pass, `MAX_MESSAGES` 500
+  - **Usage and agent detail** (no table or column: parts and events only).
+    Every delegation is an `agent` part/event `{id` (the delegation's
+    `tool_call_id`)`, agent, parent` (the delegation it ran inside, `null` at
+    the top)`, status, prompt, output` (previews ≤ 400 chars, masked)`,
+    duration_ms, usage}`; a `tool` part carries `agent_id` (the delegation it
+    ran under, `null` for the orchestrator's own tools) and `duration_ms`;
+    a specialist's own `delegate_*` call is no tool card (the peer's `agent`
+    card is). One `usage` part/event per finished turn, before `done`:
+    `input_tokens, output_tokens, cache_read_tokens, total_tokens, requests,
+    tool_calls, model, duration_ms, agents[]`; totals are the whole run tree
+    (`result.usage()`), a specialist's share is the sum of
+    `ModelResponse.usage` over ITS run's `new_messages()`
+    (`registry.specialist_usage`), never `result.usage()`, which is the
+    shared cumulative object (`usage=ctx.usage`). `done` carries
+    `duration_ms`; the conversation detail answers `usage` summed over the
+    stored usage parts. The plumbing is in `agents/progress.py`:
+    `current_delegation` (a contextvar the delegation tool sets around
+    `specialist.run`, so every tool update carries `delegation_id` without a
+    change to the specialists' handlers), `delegation_start` with `prompt`
+    and `parent`, `delegation_end` with `ok`, `output`, `usage`,
+    `duration_ms`; all keyword arguments with defaults, so
+    `agents/run_activity.py` and `agents/chat_app.py` are unchanged.
+    `tests/test_delegation_usage.py`
   - CSRF: the middleware's Origin check (`app.py`) covers `/chat/api` as well
     as `/admin`; the client sends `X-Requested-With: XMLHttpRequest` on every
     call. Tests: `tests/test_webchat_api.py`, `tests/test_webchat_docgen.py`,
@@ -1611,7 +1634,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `fetch` POST body, 401 → "Session expired" banner), `state.js` (parts
   reducer), `render/*` (sidebar grouped Today/Yesterday/Previous 7 days/Older,
   markdown through DOMPurify with copy buttons and mermaid, the collapsible
-  activity strip, file cards, image thumbnails), `composer.js` (Enter sends,
+  activity strip as a tree of agent cards (prompt, nested tool rows, answer,
+  duration, tokens) and the orchestrator's own tool rows, a usage line under
+  each answer and a conversation token total in the header, file cards, image
+  thumbnails), `composer.js` (Enter sends,
   attach / drag-and-drop / paste, chips, Stop), `theme.js`. Same-origin
   `/oauth/login` popup handling as `templates/chat.html`. Tests:
   `node tests/test_webchat_ui.mjs` (jsdom); `tests/e2e/webchat_fake_server.py`

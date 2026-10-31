@@ -28,6 +28,16 @@ specialists' tool calls reach us through the progress side channel
 phases are ``note``; a sign-in notice is ``message``. A heartbeat ``note``
 ("Working…") is sent after ``HEARTBEAT_QUIET_SECONDS`` of silence.
 
+Each delegation is an ``agent`` event (a ``running`` frame with the prompt,
+a closing frame with status, output, duration and the specialist's own
+tokens) and an ``agent`` part; a ``tool`` card names the delegation it ran
+under (``agent_id``, ``None`` for the orchestrator's own tools) and its
+closing frame its ``duration_ms``. Once per turn, before ``done``, a
+``usage`` event and part carry the run tree's tokens (the orchestrator
+run's ``result.usage()``) and the per-delegation shares; ``done`` carries
+the turn's ``duration_ms``. Durations are measured here (monotonic), and
+only numbers and the model id go into ``usage``.
+
 Exception text reaches the stream and the row only through
 ``agents.errors.describe_exception``. The turns are per process (one app
 instance, like the other runners); the run lock is the database row.
@@ -190,6 +200,10 @@ class Turn:
     task: asyncio.Task | None = None
     finalized: bool = False
     closed: bool = False
+    started: float = field(default_factory=time.monotonic)
+
+    def elapsed_ms(self) -> int:
+        return int((time.monotonic() - self.started) * 1000)
 
     def publish(self, event: str, data: dict[str, Any]) -> None:
         if self.closed:
@@ -274,6 +288,26 @@ def _preview_output(text: str | None) -> str:
     return _clip(mask_text(text or ""), OUTPUT_CHARS) if text else ""
 
 
+def _ms(since: float) -> int:
+    return int((time.monotonic() - since) * 1000)
+
+
+def _count(value: Any) -> int:
+    """A token count as an int; anything else is 0 (usage holds numbers only)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _usage_numbers(usage: Any) -> dict[str, int] | None:
+    """The numbers of a delegation's ``usage`` dict, ``None`` without one."""
+    if not isinstance(usage, dict):
+        return None
+    out = {k: _count(usage.get(k)) for k in
+           ("input_tokens", "output_tokens", "cache_read_tokens", "requests")}
+    model = usage.get("model")
+    out["model"] = model if isinstance(model, str) else None
+    return out
+
+
 def _docgen_output(content: Any) -> str:
     if isinstance(content, dict):
         if isinstance(content.get("error"), dict):
@@ -294,6 +328,9 @@ class TurnRecorder:
         self.turn = turn
         self.parts: list[dict[str, Any]] = []
         self._tools: dict[str, dict[str, Any]] = {}
+        self._tool_started: dict[str, float] = {}
+        self._agents: dict[str, dict[str, Any]] = {}
+        self._agent_started: dict[str, float] = {}
         self._card_ids: dict[str, str] = {}
         self._suppressed: set[str] = set()
         self.note = WORKING
@@ -318,12 +355,16 @@ class TurnRecorder:
         self.turn.publish("text", {"delta": delta})
         self._touch()
 
-    def tool_start(self, card_id: str, agent: str, name: str, args: Any) -> None:
-        part = {"type": "tool", "id": card_id, "agent": agent, "name": name,
-                "status": "running", "args": _preview_args(args), "output": ""}
+    def tool_start(self, card_id: str, agent: str, name: str, args: Any,
+                   agent_id: str | None = None) -> None:
+        part = {"type": "tool", "id": card_id, "agent": agent, "agent_id": agent_id,
+                "name": name, "status": "running", "args": _preview_args(args),
+                "output": "", "duration_ms": None}
         self.parts.append(part)
         self._tools[card_id] = part
-        self.turn.publish("tool", {k: part[k] for k in ("id", "agent", "name", "status", "args")})
+        self._tool_started[card_id] = time.monotonic()
+        self.turn.publish("tool", {k: part[k] for k in ("id", "agent", "agent_id", "name",
+                                                         "status", "args")})
         self._touch()
 
     def tool_end(self, card_id: str, ok: bool, output: str) -> None:
@@ -332,9 +373,62 @@ class TurnRecorder:
             return
         part["status"] = "done" if ok else "error"
         part["output"] = output
-        self.turn.publish("tool", {k: part[k] for k in ("id", "agent", "name", "status",
-                                                         "output")})
+        part["duration_ms"] = _ms(self._tool_started.pop(card_id, time.monotonic()))
+        self.turn.publish("tool", {k: part[k] for k in ("id", "agent", "agent_id", "name",
+                                                         "status", "output", "duration_ms")})
         self._touch()
+
+    def agent_start(self, delegation_id: str, agent: str, parent: str | None,
+                    prompt: str | None) -> None:
+        if delegation_id in self._agents:
+            return
+        part = {"type": "agent", "id": delegation_id, "agent": agent, "parent": parent,
+                "status": "running", "prompt": _preview_output(prompt), "output": "",
+                "duration_ms": None, "usage": None}
+        self.parts.append(part)
+        self._agents[delegation_id] = part
+        self._agent_started[delegation_id] = time.monotonic()
+        self.turn.publish("agent", {k: part[k] for k in ("id", "agent", "parent", "status",
+                                                          "prompt")})
+        self._touch()
+
+    def agent_end(self, delegation_id: str, ok: bool, output: str | None,
+                  usage: Any) -> None:
+        part = self._agents.pop(delegation_id, None)
+        if part is None:
+            return
+        part["status"] = "done" if ok else "error"
+        part["output"] = _preview_output(output)
+        part["duration_ms"] = _ms(self._agent_started.pop(delegation_id, time.monotonic()))
+        part["usage"] = _usage_numbers(usage) if ok else None
+        self.turn.publish("agent", {k: part[k] for k in ("id", "agent", "parent", "status",
+                                                          "output", "duration_ms", "usage")})
+        self._touch()
+
+    def usage(self, run_usage: Any, model: str | None) -> None:
+        """The turn's ``usage`` part and event (once, before ``done``)."""
+        input_tokens = _count(getattr(run_usage, "input_tokens", 0))
+        output_tokens = _count(getattr(run_usage, "output_tokens", 0))
+        agents = [
+            {"id": p["id"], "agent": p["agent"],
+             "input_tokens": p["usage"]["input_tokens"],
+             "output_tokens": p["usage"]["output_tokens"],
+             "requests": p["usage"]["requests"], "model": p["usage"]["model"]}
+            for p in self.parts if p["type"] == "agent" and p.get("usage")
+        ]
+        data = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": _count(getattr(run_usage, "cache_read_tokens", 0)),
+            "total_tokens": input_tokens + output_tokens,
+            "requests": _count(getattr(run_usage, "requests", 0)),
+            "tool_calls": _count(getattr(run_usage, "tool_calls", 0)),
+            "model": model,
+            "duration_ms": self.turn.elapsed_ms(),
+            "agents": agents,
+        }
+        self.parts.append({"type": "usage", **data})
+        self.turn.publish("usage", data)
 
     def file(self, info: dict[str, Any]) -> None:
         data = {k: info.get(k) for k in ("file_id", "name", "media_type", "size")}
@@ -353,8 +447,12 @@ class TurnRecorder:
         self._touch()
 
     def close_open_tools(self) -> None:
+        """Close what is still running: tool cards, then delegations (both
+        ``error``, output "not finished"). Idempotent."""
         for card_id in list(self._tools):
             self.tool_end(card_id, False, "not finished")
+        for delegation_id in reversed(list(self._agents)):
+            self.agent_end(delegation_id, False, "not finished", None)
 
     @property
     def text_so_far(self) -> str:
@@ -370,17 +468,28 @@ class TurnRecorder:
                 self.message(update.text)
         elif update.kind == "delegation_start":
             self.delegations += 1
+            if update.delegation_id:
+                self.agent_start(update.delegation_id, update.agent, update.parent,
+                                 update.prompt)
             if update.text:
                 self.set_note(update.text)
         elif update.kind == "delegation_end":
             self.delegations = max(0, self.delegations - 1)
+            if update.delegation_id:
+                self.agent_end(update.delegation_id, update.ok, update.output, update.usage)
             if self.delegations == 0:
                 self.set_note(COMPOSING)
         elif update.kind == "tool_start":
+            # A specialist consulting a peer: its own `delegate_*` call is an
+            # `agent` card already (the peer's delegation_start), as the
+            # orchestrator's delegate calls are suppressed in `handler`.
+            if (update.tool_name or "").startswith(DELEGATE_PREFIX):
+                return
             raw = update.tool_call_id or uuid4().hex
             card_id = f"spec:{uuid4().hex}"
             self._card_ids[raw] = card_id
-            self.tool_start(card_id, update.agent, update.tool_name or "tool", update.args)
+            self.tool_start(card_id, update.agent, update.tool_name or "tool", update.args,
+                            agent_id=update.delegation_id)
         elif update.kind == "tool_end":
             raw = update.tool_call_id or ""
             card_id = self._card_ids.pop(raw, None)
@@ -548,7 +657,8 @@ async def _finish(turn: Turn, rec: TurnRecorder | None, *, status: str,
 def _end(turn: Turn, status: str, title: str | None) -> None:
     if title:
         turn.publish("title", {"title": title})
-    turn.publish("done", {"message_id": turn.assistant_message_id, "status": status})
+    turn.publish("done", {"message_id": turn.assistant_message_id, "status": status,
+                          "duration_ms": turn.elapsed_ms()})
     turn.close()
     if _turns.get(turn.conversation_id) is turn:
         _turns.pop(turn.conversation_id, None)
@@ -581,6 +691,10 @@ async def _run(turn: Turn, data: TurnInput) -> None:
             content = output if isinstance(output, str) else str(output)
             model_json = result.new_messages_json().decode("utf-8")
             status = "done"
+            # Whatever is still open is closed first, so the usage part is
+            # the last part and its event comes after every agent frame.
+            rec.close_open_tools()
+            rec.usage(result.usage(), data.model_name or catalog.default_name())
         except asyncio.CancelledError:
             rec.finished = True
             turn.publish("error", {"code": "canceled", "message": MSG_CANCELED})

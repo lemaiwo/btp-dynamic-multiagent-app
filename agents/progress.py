@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Literal
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,17 @@ class ProgressUpdate:
       flips to "Completed" (``ok``) or "Error". ``output`` is a short preview.
     - ``note`` — a free-text phase hint (e.g. "Composing the answer…") used as
       the label of the live "working…" heartbeat; emits no card of its own.
+    - ``delegation_start`` / ``delegation_end`` — a delegation tool began or
+      finished consulting ``agent``. ``delegation_id`` names it (the
+      delegation tool call's id); the start carries ``parent`` (the delegation
+      it runs inside, ``None`` at the top) and ``prompt`` (the query, raw: a
+      sink previews and masks it), the end ``ok``, ``output`` (a masked
+      preview), ``usage`` (the specialist run's own tokens, ``None`` when it
+      did not complete) and ``duration_ms``.
+
+    Every update that sets no ``delegation_id`` gets it from
+    :data:`current_delegation`, so a specialist's tool calls say which
+    delegation they ran under without any change to its handler.
 
     The type is deliberately UI-protocol agnostic so this module does not depend
     on the Vercel/AG-UI chunk types.
@@ -62,6 +73,11 @@ class ProgressUpdate:
     args: Any | None = None
     output: str | None = None
     ok: bool = True
+    delegation_id: str | None = None
+    parent: str | None = None
+    prompt: str | None = None
+    usage: dict[str, Any] | None = None
+    duration_ms: int | None = None
 
 
 # Set by the chat endpoint per request; read indirectly via the report_* helpers.
@@ -70,6 +86,13 @@ class ProgressUpdate:
 current_progress: ContextVar[Callable[[ProgressUpdate], None] | None] = ContextVar(
     "current_progress", default=None
 )
+
+
+# The delegation the current code runs inside: set by the delegation tool
+# (``agents.registry``) around the specialist's whole run and reset in the same
+# task, so the specialist's progress updates carry it (contextvars are copied
+# into the tasks the run creates). ``None`` outside any delegation.
+current_delegation: ContextVar[str | None] = ContextVar("current_delegation", default=None)
 
 
 def is_interactive() -> bool:
@@ -94,6 +117,10 @@ def _emit(update: ProgressUpdate) -> None:
     sink = current_progress.get()
     if sink is None:
         return
+    if update.delegation_id is None:
+        delegation = current_delegation.get()
+        if delegation is not None:
+            update = replace(update, delegation_id=delegation)
     try:
         sink(update)
     except Exception:  # noqa: BLE001 — progress must never break a run
@@ -135,10 +162,19 @@ def report_note(agent: str, text: str) -> None:
     _emit(ProgressUpdate(agent=agent, kind="note", text=text))
 
 
-def report_delegation_start(agent: str, label: str) -> None:
+def report_delegation_start(
+    agent: str, label: str, *, delegation_id: str | None = None, query: str | None = None
+) -> None:
     """A specialist delegation became active; ``label`` is the heartbeat phase
-    hint to show while it spins up. Paired with :func:`report_delegation_end`."""
-    _emit(ProgressUpdate(agent=agent, kind="delegation_start", text=label))
+    hint to show while it spins up. Paired with :func:`report_delegation_end`.
+
+    Call it BEFORE binding :data:`current_delegation` to ``delegation_id``:
+    the value bound at this moment is the delegation this one runs inside
+    (``parent``)."""
+    _emit(ProgressUpdate(
+        agent=agent, kind="delegation_start", text=label, delegation_id=delegation_id,
+        parent=current_delegation.get(), prompt=query,
+    ))
 
 
 def report_message(agent: str, text: str) -> None:
@@ -151,14 +187,27 @@ def report_message(agent: str, text: str) -> None:
     _emit(ProgressUpdate(agent=agent, kind="message", text=text))
 
 
-def report_delegation_end(agent: str) -> None:
+def report_delegation_end(
+    agent: str,
+    *,
+    delegation_id: str | None = None,
+    ok: bool = True,
+    output: str | None = None,
+    usage: dict[str, Any] | None = None,
+    duration_ms: int | None = None,
+) -> None:
     """A specialist delegation finished (success, error, timeout, or cancel).
 
     The chat endpoint tracks how many are still in flight so the "composing the
     answer" phase is only shown once *all* of them are done — otherwise a fast
     specialist finishing would mislabel a turn where another is still working.
+    ``usage`` is the specialist run's own share (numbers and the model name
+    only), ``None`` for a delegation that did not complete.
     """
-    _emit(ProgressUpdate(agent=agent, kind="delegation_end"))
+    _emit(ProgressUpdate(
+        agent=agent, kind="delegation_end", delegation_id=delegation_id, ok=ok,
+        output=output, usage=usage, duration_ms=duration_ms,
+    ))
 
 
 def report_progress(agent: str, text: str) -> None:

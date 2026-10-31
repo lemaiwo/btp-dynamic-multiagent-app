@@ -24,7 +24,7 @@ globalThis.DOMPurify = require('../static/vendor/purify.min.js')(dom.window);
 globalThis.hljs = require('../static/vendor/highlight.min.js');
 
 const { createSSEParser } = await import('../static/chat/api.js');
-const { applyEvent, applyStreamEvent, newAssistantMessage, activitySummary } = await import('../static/chat/state.js');
+const { applyEvent, applyStreamEvent, newAssistantMessage, activitySummary, activityTree, usagePart, addUsage } = await import('../static/chat/state.js');
 const util = await import('../static/chat/util.js');
 const { toSafeHtml, renderMarkdown } = await import('../static/chat/render/markdown.js');
 
@@ -79,6 +79,7 @@ console.log('\n== parts reducer ==');
   m = applyEvent(m, { type: 'message', data: { text: 'Sign in [here](/oauth/login?x=1)' } });
   check('message notice stored as a part', m.parts.some((p) => p.type === 'message'));
   check('activity summary counts', eq([activitySummary(m).tools, activitySummary(m).running, activitySummary(m).hasActivity], [1, 0, true]));
+  check('tool without agent_id is the orchestrator\'s own (null)', tool.agent_id === null);
   const unknown = applyEvent(m, { type: 'whatever', data: {} });
   check('unknown event is ignored', unknown === m);
   const done = applyEvent(m, { type: 'done', data: { message_id: 'srv-1', status: 'done' } });
@@ -103,6 +104,77 @@ console.log('\n== parts reducer ==');
   check('done ends the run at conversation level', c.status === 'idle' && c.messages[1].status === 'done' && c.messages[1].content === 'ok');
   check('original conversation untouched', conv.title === 'New chat' && conv.messages[1].content === '');
 }
+
+// ---------------------------------------------------------------- agents, usage, tree
+console.log('\n== agent parts, usage part, activity tree ==');
+{
+  let m = newAssistantMessage();
+  m.started_at = 1_000;
+  m = applyEvent(m, { type: 'agent', data: { id: 'a1', agent: 'btp-admin', parent: null, status: 'running', prompt: 'List the subaccounts' } });
+  m = applyEvent(m, { type: 'tool', data: { id: 't1', agent: 'btp-admin', agent_id: 'a1', name: 'list', status: 'running', args: 'x' } });
+  m = applyEvent(m, { type: 'agent', data: { id: 'a2', agent: 'peer', parent: 'a1', status: 'running', prompt: 'rank them' } });
+  m = applyEvent(m, { type: 'tool', data: { id: 't2', agent: 'peer', agent_id: 'a2', name: 'rank', status: 'running' } });
+  m = applyEvent(m, { type: 'tool', data: { id: 't0', agent: null, agent_id: null, name: 'own', status: 'running' } });
+  let s = activitySummary(m, 5_000);
+  check('live summary: agents, tools, running, duration from started_at', eq([s.agents, s.tools, s.running, s.duration, s.tokens], [2, 3, 5, 4_000, 0]));
+  m = applyEvent(m, { type: 'tool', data: { id: 't2', status: 'done', output: 'ok', duration_ms: 300 } });
+  m = applyEvent(m, { type: 'agent', data: { id: 'a2', status: 'done', output: '2 flagged', duration_ms: 900, usage: { input_tokens: 600, output_tokens: 100, requests: 1 } } });
+  m = applyEvent(m, { type: 'tool', data: { id: 't1', status: 'done', output: '3', duration_ms: 1200 } });
+  m = applyEvent(m, { type: 'agent', data: { id: 'a1', status: 'error', output: 'timed out', duration_ms: 5000, usage: { input_tokens: 1000, output_tokens: 200, requests: 2 } } });
+  m = applyEvent(m, { type: 'tool', data: { id: 't0', status: 'done', duration_ms: 50 } });
+  const a1 = m.parts.find((p) => p.type === 'agent' && p.id === 'a1');
+  const a2 = m.parts.find((p) => p.type === 'agent' && p.id === 'a2');
+  const t1 = m.parts.find((p) => p.type === 'tool' && p.id === 't1');
+  check('agent frames merge by id, keeping prompt and parent', a1.status === 'error' && a1.prompt === 'List the subaccounts' && a1.parent === null && a1.output === 'timed out' && a1.duration_ms === 5000 && a1.usage.input_tokens === 1000);
+  check('nested agent keeps its parent through the closing frame', a2.parent === 'a1' && a2.status === 'done' && a2.prompt === 'rank them');
+  check('tool keeps agent_id and gets duration_ms', t1.agent_id === 'a1' && t1.duration_ms === 1200 && t1.args === 'x' && t1.output === '3');
+  check('one agent part per id', m.parts.filter((p) => p.type === 'agent').length === 2);
+  // tokens from the agent parts while there is no usage part
+  m.status = 'done';
+  m.duration_ms = 7000;
+  s = activitySummary(m);
+  check('stored summary sums agent usage without a usage part, duration from the message', eq([s.tokens, s.duration, s.errors, s.running], [1900, 7000, 1, 0]));
+  // the tree
+  const tree = activityTree(m);
+  check('top level: own tool and the top agent, in order of first appearance', eq(tree.map((n) => [n.kind, n.part.id]), [['agent', 'a1'], ['tool', 't0']]));
+  const a1n = tree[0];
+  check('children of a1: its tool then the nested agent', eq(a1n.children.map((n) => [n.kind, n.part.id]), [['tool', 't1'], ['agent', 'a2']]));
+  check('nested agent holds its own tool', eq(a1n.children[1].children.map((n) => n.part.id), ['t2']));
+  // usage part
+  const usage = { input_tokens: 1240, output_tokens: 380, cache_read_tokens: 0, total_tokens: 1620, requests: 4, tool_calls: 3, model: 'gpt-4o', duration_ms: 8100, agents: [{ id: 'a1', agent: 'btp-admin', input_tokens: 820, output_tokens: 120, requests: 2, model: 'gpt-4o' }] };
+  m = applyEvent(m, { type: 'usage', data: usage });
+  m = applyEvent(m, { type: 'usage', data: { ...usage, total_tokens: 1621 } });
+  check('usage part stored once, a repeat replaces it', m.parts.filter((p) => p.type === 'usage').length === 1 && usagePart(m).total_tokens === 1621 && usagePart(m).model === 'gpt-4o');
+  s = activitySummary(m);
+  check('summary prefers the usage part for tokens and duration', s.tokens === 1621 && s.duration === 8100);
+  m = applyEvent(m, { type: 'done', data: { message_id: 'A', status: 'done', duration_ms: 8200 } });
+  check('done.duration_ms is kept on the message', m.duration_ms === 8200);
+  check('usage is not a tree node', !activityTree(m).some((n) => n.kind === 'usage'));
+  // orphan ownership falls back to the top level
+  const orphan = { parts: [{ type: 'tool', id: 'x', agent_id: 'nobody', name: 'n', status: 'done' }] };
+  check('a tool whose owner is unknown stays visible at the top', activityTree(orphan).length === 1);
+  const cyc = { parts: [{ type: 'agent', id: 'p', parent: 'q', status: 'done' }, { type: 'agent', id: 'q', parent: 'p', status: 'done' }] };
+  check('a parent cycle does not loop', activityTree(cyc).length >= 1);
+}
+{
+  const conv = { id: 'c', title: 't', status: 'running', usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110, requests: 1, turns: 1 }, messages: [{ id: 'u', role: 'user', content: 'x' }, newAssistantMessage()] };
+  const aid = conv.messages[1].id;
+  let c = applyStreamEvent(conv, 'u', aid, { type: 'usage', data: { input_tokens: 1240, output_tokens: 380, total_tokens: 1620, requests: 4 } });
+  check('usage event adds the turn to the conversation total', eq(c.usage, { input_tokens: 1340, output_tokens: 390, total_tokens: 1730, requests: 5, turns: 2 }));
+  c = applyStreamEvent(c, 'u', aid, { type: 'usage', data: { input_tokens: 1250, output_tokens: 380, total_tokens: 1630, requests: 4 } });
+  check('a repeated usage event counts the turn once', eq(c.usage, { input_tokens: 1350, output_tokens: 390, total_tokens: 1740, requests: 5, turns: 2 }));
+  check('addUsage from nothing', eq(addUsage(null, { input_tokens: 5, output_tokens: 1, requests: 1 }), { input_tokens: 5, output_tokens: 1, total_tokens: 6, requests: 1, turns: 1 }));
+}
+
+// ---------------------------------------------------------------- number formatters
+console.log('\n== token and elapsed formatters ==');
+check('tokens exact below 10,000 with separators', util.formatTokens(1240) === '1,240' && util.formatTokens(380) === '380' && util.formatTokens(9999) === '9,999');
+check('tokens in k from 10,000', util.formatTokens(12_400) === '12.4k' && util.formatTokens(10_000) === '10k' && util.formatTokens(999_950) === '1000k');
+check('tokens in M', util.formatTokens(1_250_000) === '1.3M' && util.formatTokens(2_000_000) === '2M');
+check('tokens garbage', util.formatTokens('x') === '' && util.formatTokens(-5) === '' && util.formatTokens(0) === '0');
+check('elapsed one decimal under 10 s', util.formatElapsed(8_100) === '8.1 s' && util.formatElapsed(0) === '0.0 s');
+check('elapsed whole seconds under a minute', util.formatElapsed(12_400) === '12 s');
+check('elapsed minutes', util.formatElapsed(65_000) === '1m 05s');
 
 // ---------------------------------------------------------------- dates
 console.log('\n== date grouping ==');

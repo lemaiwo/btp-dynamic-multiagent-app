@@ -24,16 +24,20 @@ What it serves:
 - ``GET  /chat/api/conversations?q=``  ``POST /chat/api/conversations``
 - ``GET|PATCH|DELETE /chat/api/conversations/{id}``
 - ``POST /chat/api/conversations/{id}/messages`` -> a scripted SSE turn
-  (start, note, text deltas, two ``tool`` events of agent ``btp-admin``,
-  two ``file`` events, ``title`` on the first turn, ``done``), with small
-  sleeps so streaming is visible; 409 while a turn runs
+  (start, note, an ``agent`` delegation to ``btp-admin`` with two ``tool``
+  calls under it, a nested peer delegation (``parent`` = the first one) with
+  one tool, the closing ``agent`` frames with ``usage``, text deltas, two
+  ``file`` events, ``title`` on the first turn, ``usage``, ``done`` with
+  ``duration_ms``; addendum (b) of the design), with small sleeps so
+  streaming is visible; 409 while a turn runs
 - ``POST /chat/api/conversations/{id}/cancel`` -> the running turn ends with
   ``error canceled`` + ``done canceled``
 - ``GET  /chat/api/conversations/{id}/stream`` -> 409 ``not_running``
 - ``GET  /chat/api/files/{id}[?inline=1]``   -> dummy bytes, the real headers
 
 Three conversations are seeded (today, yesterday, older) so the sidebar
-groups show; the first one holds a stored turn with parts and files.
+groups show; the first one holds a stored turn with agent, tool, usage and
+file parts, and the detail answers ``usage`` summed over the usage parts.
 A request without ``X-Requested-With: XMLHttpRequest`` on ``/chat/api`` is
 answered 400, so a missing header is noticed during development.
 """
@@ -184,17 +188,38 @@ class Store:
         d = self.add_file(c1["id"], am["id"], "generated", "platform-review.docx", MEDIA_TYPES[7], b"PK\x03\x04" + b"\0" * 18200)
         am["parts"] = [
             {"type": "note", "text": "Reading the screenshot"},
-            {"type": "tool", "id": "t1", "agent": "btp-admin", "name": "list_subaccounts", "status": "done",
-             "args": "directory=Infrabel-dev", "output": "3 subaccounts"},
-            {"type": "tool", "id": "t2", "agent": "btp-admin", "name": "list_entitlements", "status": "done",
-             "args": "subaccount=b-fdn-dev", "output": "12 services, 2 with spare quota"},
+            {"type": "agent", "id": "a1", "agent": "btp-admin", "parent": None, "status": "done",
+             "prompt": "Which subaccounts of the Infrabel-dev directory have entitlements with spare quota? The screenshot shows the directory.",
+             "output": "3 subaccounts; b-fdn-dev has 2 services with unused quota (Destination 8 of 20, Job Scheduling 3 of 5).",
+             "duration_ms": 6420, "usage": {"input_tokens": 1820, "output_tokens": 260, "requests": 3, "model": "gpt-5.6-terra"}},
+            {"type": "tool", "id": "t1", "agent": "btp-admin", "agent_id": "a1", "name": "list_subaccounts", "status": "done",
+             "args": "directory=Infrabel-dev", "output": "3 subaccounts", "duration_ms": 1380},
+            {"type": "tool", "id": "t2", "agent": "btp-admin", "agent_id": "a1", "name": "list_entitlements", "status": "done",
+             "args": "subaccount=b-fdn-dev", "output": "12 services, 2 with spare quota", "duration_ms": 2240},
+            {"type": "agent", "id": "a2", "agent": "entitlement-analyst", "parent": "a1", "status": "done",
+             "prompt": "Rank these 12 entitlements by unused quota and flag the ones nobody used in 90 days.",
+             "output": "2 flagged: Destination (8/20, no instance since July), Job Scheduling (3/5).",
+             "duration_ms": 1810, "usage": {"input_tokens": 640, "output_tokens": 95, "requests": 1, "model": "gpt-5.6-terra"}},
+            {"type": "tool", "id": "t3", "agent": "entitlement-analyst", "agent_id": "a2", "name": "usage_history", "status": "done",
+             "args": "subaccount=b-fdn-dev days=90", "output": "2 services without usage", "duration_ms": 910},
+            {"type": "tool", "id": "t4", "agent": None, "agent_id": None, "name": "create_workbook", "status": "done",
+             "args": "title=entitlements rows=12", "output": "entitlements.xlsx (6 KB)", "duration_ms": 420},
             {"type": "text", "text": ANSWER_MD},
             {"type": "file", "file_id": x["id"], "name": x["name"], "media_type": x["media_type"], "size": x["size"]},
             {"type": "file", "file_id": d["id"], "name": d["name"], "media_type": d["media_type"], "size": d["size"]},
+            {"type": "usage", "input_tokens": 3410, "output_tokens": 812, "cache_read_tokens": 1024, "total_tokens": 4222,
+             "requests": 6, "tool_calls": 4, "model": "gpt-5.6-terra", "duration_ms": 9870,
+             "agents": [{"id": "a1", "agent": "btp-admin", "input_tokens": 1820, "output_tokens": 260, "requests": 3, "model": "gpt-5.6-terra"},
+                        {"id": "a2", "agent": "entitlement-analyst", "input_tokens": 640, "output_tokens": 95, "requests": 1, "model": "gpt-5.6-terra"}]},
         ]
         c2 = self.new_conversation("Destinations of the sandbox", "gpt-5.6-terra", t - timedelta(days=1, hours=2))
         self.add_message(c2["id"], "user", "List the destinations of the sandbox subaccount.")
-        self.add_message(c2["id"], "assistant", "There are **4** destinations: `S4H_DEV`, `JIRA`, `SHAREPOINT`, `BITBUCKET`.", status="done")
+        a2m = self.add_message(c2["id"], "assistant", "There are **4** destinations: `S4H_DEV`, `JIRA`, `SHAREPOINT`, `BITBUCKET`.", status="done")
+        a2m["parts"] = [
+            {"type": "text", "text": a2m["content"]},
+            {"type": "usage", "input_tokens": 980, "output_tokens": 64, "cache_read_tokens": 0, "total_tokens": 1044,
+             "requests": 1, "tool_calls": 0, "model": "gpt-5.6-terra", "duration_ms": 2150, "agents": []},
+        ]
         c3 = self.new_conversation("Role collections for the invoke API", "anthropic--claude-4.5-sonnet", t - timedelta(days=4))
         self.add_message(c3["id"], "user", "Who has the Agent Invoker role collection?")
         self.add_message(c3["id"], "assistant", "", status="failed", error="RuntimeError: the destination service answered 503")
@@ -231,9 +256,21 @@ class Store:
         return {"id": c["id"], "title": c["title"], "updated_at": utc(c["updated_at"]),
                 "created_at": utc(c["created_at"]), "status": c["status"]}
 
+    def conv_usage(self, cid: str) -> dict:
+        total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 0, "turns": 0}
+        for m in self.messages[cid]:
+            for p in m["parts"]:
+                if p.get("type") != "usage":
+                    continue
+                total["turns"] += 1
+                for k in ("input_tokens", "output_tokens", "total_tokens", "requests"):
+                    total[k] += int(p.get(k) or 0)
+        return total
+
     def conv_detail(self, c: dict) -> dict:
         out = {"id": c["id"], "title": c["title"], "model": c["model_name"], "status": c["status"],
-               "created_at": utc(c["created_at"]), "updated_at": utc(c["updated_at"]), "messages": []}
+               "created_at": utc(c["created_at"]), "updated_at": utc(c["updated_at"]),
+               "usage": self.conv_usage(c["id"]), "messages": []}
         for m in self.messages[c["id"]]:
             files = [self.files[fid] for fid in m["file_ids"] if fid in self.files]
             files += [f for f in self.files.values() if f["message_id"] == m["id"] and f["id"] not in m["file_ids"]]
@@ -542,19 +579,32 @@ class Handler(BaseHTTPRequestHandler):
                 parts.append({"type": "text", "text": delta})
             emit("text", {"delta": delta})
 
-        def tool(tid: str, name: str, status: str, **extra) -> None:
-            card = {"type": "tool", "id": tid, "agent": "btp-admin", "name": name, "status": status, **extra}
+        def merge(kind: str, pid: str, frame: dict) -> None:
             for i, p in enumerate(parts):
-                if p["type"] == "tool" and p["id"] == tid:
-                    parts[i] = {**p, **card}
+                if p["type"] == kind and p["id"] == pid:
+                    parts[i] = {**p, **frame}
                     break
             else:
-                parts.append(card)
-            emit("tool", {"id": tid, "agent": "btp-admin", "name": name, "status": status, **extra})
+                parts.append({"type": kind, **frame})
+
+        def tool(tid: str, name: str, status: str, *, agent: str | None, agent_id: str | None, **extra) -> None:
+            frame = {"id": tid, "agent": agent, "agent_id": agent_id, "name": name, "status": status, **extra}
+            merge("tool", tid, frame)
+            emit("tool", frame)
+
+        def agent(aid: str, name: str, status: str, *, parent: str | None, **extra) -> None:
+            frame = {"id": aid, "agent": name, "parent": parent, "status": status, **extra}
+            merge("agent", aid, frame)
+            emit("agent", frame)
 
         def note(t: str) -> None:
             parts.append({"type": "note", "text": t})
             emit("note", {"text": t})
+
+        started = time.monotonic()
+
+        def elapsed_ms() -> int:
+            return int((time.monotonic() - started) * 1000)
 
         def finish(status: str) -> None:
             with STORE.lock:
@@ -565,7 +615,7 @@ class Handler(BaseHTTPRequestHandler):
                 conv["updated_at"] = now()
                 if status == "canceled":
                     am["error"] = "canceled"
-            emit("done", {"message_id": am["id"], "status": status})
+            emit("done", {"message_id": am["id"], "status": status, "duration_ms": elapsed_ms()})
 
         def canceled() -> bool:
             if cancel.is_set():
@@ -582,20 +632,51 @@ class Handler(BaseHTTPRequestHandler):
             nap(0.9)
             if canceled():
                 return
-            tool("t1", "list_subaccounts", "running", args="directory=Infrabel-dev")
+            a1_start = time.monotonic()
+            agent("a1", "btp-admin", "running", parent=None,
+                  prompt="Which subaccounts of the Infrabel-dev directory have entitlements with spare quota? " + text[:200])
+            note("Asking btp-admin")
+            nap(0.5)
+            tool("t1", "list_subaccounts", "running", agent="btp-admin", agent_id="a1", args="directory=Infrabel-dev")
             note("btp-admin is listing the subaccounts")
             nap(1.4)
             if canceled():
                 return
-            tool("t1", "list_subaccounts", "done", output="3 subaccounts")
-            tool("t2", "list_entitlements", "running", args="subaccount=b-fdn-dev")
+            tool("t1", "list_subaccounts", "done", agent="btp-admin", agent_id="a1", output="3 subaccounts", duration_ms=int(1400 * SLOW))
+            tool("t2", "list_entitlements", "running", agent="btp-admin", agent_id="a1", args="subaccount=b-fdn-dev")
             note("btp-admin is reading the entitlements")
             nap(1.4)
             if canceled():
                 return
-            tool("t2", "list_entitlements", "done", output="12 services, 2 with spare quota")
-            note("Composing the answer")
+            tool("t2", "list_entitlements", "done", agent="btp-admin", agent_id="a1", output="12 services, 2 with spare quota", duration_ms=int(1400 * SLOW))
+            # a nested delegation: btp-admin consults a peer
+            a2_start = time.monotonic()
+            agent("a2", "entitlement-analyst", "running", parent="a1",
+                  prompt="Rank these 12 entitlements by unused quota and flag the ones nobody used in 90 days.")
+            note("btp-admin is asking entitlement-analyst")
+            nap(0.4)
+            tool("t3", "usage_history", "running", agent="entitlement-analyst", agent_id="a2", args="subaccount=b-fdn-dev days=90")
+            nap(1.2)
+            if canceled():
+                return
+            tool("t3", "usage_history", "done", agent="entitlement-analyst", agent_id="a2", output="2 services without usage", duration_ms=int(1200 * SLOW))
             nap(0.3)
+            agent("a2", "entitlement-analyst", "done", parent="a1",
+                  output="2 flagged: Destination (8/20, no instance since July), Job Scheduling (3/5).",
+                  duration_ms=int((time.monotonic() - a2_start) * 1000),
+                  usage={"input_tokens": 640, "output_tokens": 95, "requests": 1, "model": conv["model_name"] or "gpt-5.6-terra"})
+            nap(0.4)
+            if canceled():
+                return
+            agent("a1", "btp-admin", "done", parent=None,
+                  output="3 subaccounts; b-fdn-dev has 2 services with unused quota (Destination 8 of 20, Job Scheduling 3 of 5).",
+                  duration_ms=int((time.monotonic() - a1_start) * 1000),
+                  usage={"input_tokens": 1820, "output_tokens": 260, "requests": 3, "model": conv["model_name"] or "gpt-5.6-terra"})
+            tool("t4", "create_workbook", "running", agent=None, agent_id=None, args="title=entitlements rows=12")
+            note("Composing the answer")
+            nap(0.4)
+            tool("t4", "create_workbook", "done", agent=None, agent_id=None, output="report.xlsx (9 KB)", duration_ms=int(400 * SLOW))
+            nap(0.2)
             # text deltas: word-ish chunks so the markdown re-renders visibly
             buf = ANSWER_MD
             i = 0
@@ -627,6 +708,13 @@ class Handler(BaseHTTPRequestHandler):
                 with STORE.lock:
                     conv["title"] = title
                 emit("title", {"title": title})
+            model = conv["model_name"] or "gpt-5.6-terra"
+            usage = {"input_tokens": 3410, "output_tokens": 812, "cache_read_tokens": 1024, "total_tokens": 4222,
+                     "requests": 6, "tool_calls": 4, "model": model, "duration_ms": elapsed_ms(),
+                     "agents": [{"id": "a1", "agent": "btp-admin", "input_tokens": 1820, "output_tokens": 260, "requests": 3, "model": model},
+                                {"id": "a2", "agent": "entitlement-analyst", "input_tokens": 640, "output_tokens": 95, "requests": 1, "model": model}]}
+            parts.append({"type": "usage", **usage})
+            emit("usage", usage)
             finish("done")
         except (BrokenPipeError, ConnectionResetError):
             # client went away: the turn still finishes and is stored

@@ -24,6 +24,29 @@ export function formatDuration(ms) {
   return `${m}m ${String(rest).padStart(2, '0')}s`;
 }
 
+/**
+ * "8.1 s" under 10 s, "24 s" under a minute, "1m 05s" from there. The
+ * activity headline and the usage line; `formatDuration` stays for the
+ * sidebar and tests that want whole seconds.
+ */
+export function formatElapsed(ms) {
+  const n = Number(ms);
+  if (!Number.isFinite(n) || n < 0) return '';
+  if (n < 10_000) return `${(n / 1000).toFixed(1)} s`;
+  if (n < 60_000) return `${Math.round(n / 1000)} s`;
+  return formatDuration(n);
+}
+
+/** 1240 -> "1,240"; 12400 -> "12.4k"; 1_250_000 -> "1.3M"; garbage -> "". */
+export function formatTokens(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return '';
+  const whole = Math.round(v);
+  if (whole < 10_000) return String(whole).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  if (whole < 1_000_000) return `${(whole / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${(whole / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+}
+
 export const DATE_GROUPS = ['Today', 'Yesterday', 'Previous 7 days', 'Older'];
 
 function startOfDay(d) {
