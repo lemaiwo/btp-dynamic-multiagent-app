@@ -66,7 +66,9 @@ DOCUMENTS_SECTION = (
     "## Documents\n"
     "When the user asks for a document, a spreadsheet or a PDF, create it with "
     "create_word_document, create_pdf_document or create_excel_workbook and link "
-    "it in your answer with the download_url the tool returns.\n"
+    "it in your answer with the download_url the tool returns. When the user asks "
+    "for a dashboard, charts or KPIs, use create_dashboard with data from the "
+    "conversation only.\n"
     "If a specialist's response contains a sign-in or authorization link, relay "
     "that response to the user verbatim, including the full link."
 )

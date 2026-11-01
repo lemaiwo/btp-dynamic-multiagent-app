@@ -351,6 +351,7 @@ async def test_the_context_of_a_personal_agent(client, monkeypatch, real_agents_
         {"kind": "document", "name": "create_word_document"},
         {"kind": "document", "name": "create_pdf_document"},
         {"kind": "document", "name": "create_excel_workbook"},
+        {"kind": "document", "name": "create_dashboard"},
     ]
     assert out["usage"]["turns"] == 1 and out["usage"]["requests"] == 1
     assert set(out["usage"]) == {"input_tokens", "output_tokens", "total_tokens",

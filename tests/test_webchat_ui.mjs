@@ -715,5 +715,171 @@ console.log('\n== tool sources (addendum g) ==');
   host.remove();
 }
 
+// ---------------------------------------------------------------- dashboards (addendum i)
+console.log('\n== dashboards (addendum i) ==');
+{
+  const C = await import('../static/chat/render/charts.js');
+  const D = await import('../static/chat/render/dashboard.js');
+  const months = ['2026-05', '2026-06', '2026-07', '2026-08', '2026-09', '2026-10'];
+  const bar = { type: 'bar', title: 'Spend by service', x: 'Month', y: ['HANA', 'Integration', 'Runtime'], format: 'currency', unit: '€',
+    data: { columns: ['Month', 'HANA', 'Integration', 'Runtime'], rows: months.map((m, i) => [m, 100 + i * 10, 50 + i, i === 2 ? null : 20]) } };
+
+  // scales and ticks
+  check('niceTicks: clean steps covering the domain', eq(C.niceTicks(0, 87), [0, 20, 40, 60, 80, 100]) && eq(C.niceTicks(0, 1), [0, 0.2, 0.4, 0.6, 0.8, 1]) && eq(C.niceTicks(-12, 30), [-20, -10, 0, 10, 20, 30]));
+  check('niceTicks: a flat domain still gets an axis', C.niceTicks(5, 5).length >= 2 && C.niceTicks(0, 0).length >= 2);
+  const s = C.scaleLinear([0, 100], [200, 0]);
+  check('scaleLinear maps and inverts', s(0) === 200 && s(50) === 100 && s(100) === 0 && s.invert(100) === 50);
+  check('formatValue by format and unit', C.formatValue(1234) === '1,234' && C.formatValue(12.5, 'percent') === '12.5%' && C.formatValue(1234, 'currency', '€') === '€ 1,234' && C.formatValue(1234, 'number', 'GB') === '1,234 GB' && C.formatValue(12900, 'number', '', { compact: true }) === '12.9K' && C.formatValue(null) === '–');
+
+  // bar counts, grouped gaps, labels
+  const gsvg = C.chartSvg(bar, { theme: 'light', width: 600 });
+  const bars = [...gsvg.querySelectorAll('path.bar')];
+  check('grouped bar: one bar per non-null value (6 x 3 - 1)', bars.length === 17, String(bars.length));
+  check('bar colours: the light palette in fixed order', eq([0, 1, 2].map((j) => gsvg.querySelector(`path.bar[data-series="${j}"]`).getAttribute('fill')), C.CHART_PALETTE.light.slice(0, 3)));
+  const dsvg = C.chartSvg(bar, { theme: 'dark', width: 600 });
+  check('dark theme: the dark palette', dsvg.querySelector('path.bar[data-series="0"]').getAttribute('fill') === C.CHART_PALETTE.dark[0]);
+  const xStart = (p) => Number(p.getAttribute('d').match(/^M([\d.]+),/)[1]);
+  const first3 = bars.slice(0, 3).map(xStart);
+  const w = Number(bars[0].getAttribute('d').match(/H([\d.]+)/)[1]) + 4 - xStart(bars[0]); // H runs to x + w - r
+  check('grouped bars: a 2 px surface gap between neighbours, bars <= 24 px', Math.abs(first3[1] - first3[0] - (w + 2)) < 0.05 && w <= 24, `${first3} w=${w}`);
+  check('more than 12 bars: no label on every bar', gsvg.querySelectorAll('.data-label').length === 0);
+  const small = { ...bar, y: ['HANA'], data: { columns: bar.data.columns, rows: bar.data.rows } };
+  check('<= 12 bars: a value label on every bar', C.chartSvg(small, { width: 600 }).querySelectorAll('.data-label').length === 6);
+  check('aria-label summary', gsvg.getAttribute('role') === 'img' && gsvg.getAttribute('aria-label') === 'Bar chart: Spend by service, 6 categories, series HANA, Integration, Runtime');
+
+  // stacked sums
+  const stacked = { ...bar, stacked: true };
+  const ssvg = C.chartSvg(stacked, { width: 600 });
+  const segments = [...ssvg.querySelectorAll('path.bar')];
+  const ends = segments.map((p) => Number(p.getAttribute('data-end')));
+  const wanted = bar.data.rows.map((r) => r.slice(1).reduce((a, v) => a + (v || 0), 0));
+  check('stacked: the last segment of each stack ends at the row sum', eq(wanted, [170, 181, 172, 203, 214, 225]) && wanted.every((t) => ends.includes(t)) && segments.length === 17);
+  const yTicks = [...ssvg.querySelectorAll('.axis-y .tick')].map((t) => t.textContent);
+  check('stacked: the y axis reaches the largest sum', yTicks[yTicks.length - 1] === '€ 250', yTicks.join('|'));
+
+  // legend only for >= 2 series; the 9th series folds into Other
+  check('legend for >= 2 series', C.chartView(bar).querySelectorAll('.chart-legend .legend-item').length === 3);
+  check('no legend for one series', C.chartView(small).querySelector('.chart-legend') === null);
+  const nine = Array.from({ length: 10 }, (_, i) => ({ name: `s${i}`, values: [i, null] }));
+  const folded = C.foldSeries(nine);
+  check('foldSeries: 8 kept, the rest summed into "Other"', folded.length === 9 && folded[8].name === 'Other' && folded[8].other === true && eq(folded[8].values, [17, null]) && eq(C.foldSeries(nine.slice(0, 8)).map((x) => x.name), nine.slice(0, 8).map((x) => x.name)));
+  const wide = { type: 'line', title: 'Many', x: 'd', y: nine.slice(0, 9).map((x) => x.name), data: { columns: ['d', ...nine.slice(0, 9).map((x) => x.name)], rows: [['a', ...Array(9).fill(1)], ['b', ...Array(9).fill(2)]] } };
+  const wv = C.chartView(wide);
+  const names = [...wv.querySelectorAll('.legend-name')].map((n) => n.textContent);
+  check('a chart with 9 series: legend ends with "Other" in the de-emphasis hue', names.length === 9 && names[8] === 'Other' && wv.querySelectorAll('.legend-item .swatch')[8].style.background !== '' && wv.querySelectorAll('path.line').length === 9);
+
+  // donut slice labels >= 5%
+  const pie = { type: 'pie', title: 'Share', x: 'k', y: ['v'], data: { columns: ['k', 'v'], rows: [['a', 50], ['b', 30], ['c', 15], ['d', 3], ['e', 2]] } };
+  const psvg = C.chartSvg(pie, { width: 500 });
+  check('donut: 5 slices, labels only on slices >= 5%', psvg.querySelectorAll('path.slice').length === 5 && eq([...psvg.querySelectorAll('.slice-label')].map((t) => t.textContent), ['50%', '30%', '15%']));
+  check('donut: the total in the centre, aria-label', psvg.querySelector('.donut-total').textContent === '100' && psvg.getAttribute('aria-label') === 'Donut chart: Share, 5 slices');
+  const manyPie = { ...pie, data: { columns: ['k', 'v'], rows: Array.from({ length: 11 }, (_, i) => [`k${i}`, 10]) } };
+  check('donut: at most 8 slices, the rest is "Other"', C.slicesOf(manyPie).length === 8 && C.slicesOf(manyPie)[7].name === 'Other' && C.slicesOf(manyPie)[7].value === 40);
+
+  // line/area/scatter
+  const area = { type: 'area', title: 'Calls', x: 'Day', y: ['A', 'B'], stacked: true, data: { columns: ['Day', 'A', 'B'], rows: [['2026-10-03', 3, 4], ['2026-10-01', 1, 2], ['2026-10-02', 2, 3]] } };
+  const asvg = C.chartSvg(area, { width: 600 });
+  check('area: ISO dates sorted on a time axis, labelled YYYY-MM-DD', eq([...asvg.querySelectorAll('.axis-x .tick')].map((t) => t.textContent), ['2026-10-01', '2026-10-02', '2026-10-03']));
+  check('area: fills and 2 px lines per series, end labels for <= 4 series', asvg.querySelectorAll('path.area-fill').length === 2 && asvg.querySelectorAll('path.line[stroke-width="2"]').length === 2 && asvg.querySelectorAll('.end-label').length >= 1);
+  const sc = { type: 'scatter', title: 'Size vs cost', x: 'GB', y: ['Cost'], data: { columns: ['App', 'GB', 'Cost'], rows: [['a', 1, 10], ['b', 2, 18], ['c', 4, 33]] } };
+  const scsvg = C.chartSvg(sc, { width: 500 });
+  check('scatter: 8 px markers with a surface ring, 24 px hit areas', scsvg.querySelectorAll('circle.marker.ring[r="4"]').length === 3 && scsvg.querySelectorAll('circle.hit[r="12"]').length === 3);
+
+  // tooltip content on hover, focusable marks
+  const view = C.chartView(bar, { width: 600 });
+  document.body.appendChild(view);
+  const hit = view.querySelector('.hit[data-tip="1"]');
+  hit.dispatchEvent(new window.Event('pointerover', { bubbles: true }));
+  const tip = view.querySelector('.chart-tip');
+  const rows = [...tip.querySelectorAll('.chart-tip-row')].map((r) => [r.querySelector('.chart-tip-value').textContent, r.querySelector('.chart-tip-name').textContent]);
+  check('bar hover: one tooltip with the category and every series, the hovered one marked', !tip.hidden && tip.querySelector('.chart-tip-title').textContent === '2026-05' && eq(rows, [['€ 100', 'HANA'], ['€ 50', 'Integration'], ['€ 20', 'Runtime']]) && tip.querySelector('.chart-tip-row.current .chart-tip-name').textContent === 'Integration');
+  check('the hovered bar lifts', view.querySelectorAll('path.bar.active').length === 1);
+  check('one tooltip element per chart, inside the card', view.querySelectorAll('.chart-tip').length === 1 && tip.parentElement.classList.contains('chart-plot'));
+  view.querySelector('svg').dispatchEvent(new window.Event('pointerleave'));
+  check('pointer leaves: the tooltip hides', tip.hidden && view.querySelectorAll('path.bar.active').length === 0);
+  const hit0 = view.querySelector('.hit[data-tip="0"]');
+  check('marks are focusable with an accessible name', hit0.getAttribute('tabindex') === '0' && hit0.getAttribute('aria-label').startsWith('2026-05, HANA: € 100'));
+  hit0.focus();
+  check('focus shows the same tooltip', !tip.hidden && tip.querySelector('.chart-tip-row.current .chart-tip-name').textContent === 'HANA');
+  hit0.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+  check('arrow keys step to the next mark', document.activeElement === view.querySelector('.hit[data-tip="1"]'));
+  view.remove();
+  const lv = C.chartView({ ...area, type: 'line', stacked: false }, { width: 600 });
+  document.body.appendChild(lv);
+  lv.querySelector('.hit[data-tip="2"]').dispatchEvent(new window.Event('pointerover', { bubbles: true }));
+  const cross = lv.querySelector('.crosshair');
+  check('line hover: crosshair shown at the point, tooltip lists every series', cross.getAttribute('visibility') === 'visible' && lv.querySelector('.chart-tip-title').textContent === '2026-10-03' && lv.querySelectorAll('.chart-tip-row').length === 2);
+  lv.remove();
+
+  // KPI tile
+  const up = C.kpiTile({ type: 'kpi', title: 'Spend', value: 12900, unit: '€', delta: 4.2, delta_label: 'vs September', trend: [1, 3, 2, 5] });
+  check('KPI: hero value compact with the unit, delta up/good with the ▲ glyph and label', up.querySelector('.kpi-number').textContent === '12.9K' && up.querySelector('.kpi-unit').textContent === '€' && up.querySelector('.kpi-delta').classList.contains('up') && up.querySelector('.kpi-delta').classList.contains('good') && up.querySelector('.kpi-arrow').textContent === '▲' && up.querySelector('.kpi-delta-value').textContent === '+4.2' && up.querySelector('.kpi-delta-label').textContent === 'vs September');
+  check('KPI: a sparkline, one 2 px line', up.querySelectorAll('.kpi-spark path[stroke-width="2"]').length === 1);
+  const down = C.kpiTile({ type: 'kpi', title: 'Errors', value: '3 open', delta: -2, unit: '%' });
+  check('KPI: delta down/critical with ▼, value as given, no sparkline', down.querySelector('.kpi-delta').classList.contains('down') && down.querySelector('.kpi-delta').classList.contains('critical') && down.querySelector('.kpi-arrow').textContent === '▼' && down.querySelector('.kpi-delta-value').textContent === '−2%' && down.querySelector('.kpi-number').textContent === '3 open' && !down.querySelector('.kpi-spark'));
+
+  // dashboard body from a preview, table toggle
+  const spec = { title: 'BTP spend <b>2026</b>', description: 'Six months.', widgets: [
+    { type: 'kpi', title: 'Spend', value: 1234, unit: '€', delta: 3 },
+    { ...bar, size: 2, note: 'Runtime has no data for July.' },
+    pie,
+    { type: 'table', title: 'Raw', data: { columns: ['a', 'b'], rows: [['<img src=x>', 1]] } },
+  ] };
+  const body = D.dashboardBody({ kind: 'dashboard', name: 'spend.dashboard.json', dashboard: spec }, { theme: 'light' });
+  document.body.appendChild(body);
+  check('dashboard body: title as text, description, one card per widget', body.querySelector('.dash-title').textContent === 'BTP spend <b>2026</b>' && !body.querySelector('.dash-title b') && body.querySelector('.dash-desc').textContent === 'Six months.' && body.querySelectorAll('.dash-card').length === 4);
+  check('dashboard body: size 2 spans, KPI tile, chart, table widget, note', body.querySelector('.dash-card.size-2 svg.chart-svg') !== null && body.querySelector('.dash-kpi .kpi') !== null && body.querySelector('.dash-table td').textContent === '<img src=x>' && !body.querySelector('.dash-card img') && body.querySelector('.dash-note').textContent === 'Runtime has no data for July.');
+  const card = body.querySelector('.dash-card.size-2');
+  const toggle = card.querySelector('.dash-toggle');
+  check('table toggle: only on chart cards', body.querySelectorAll('.dash-toggle').length === 2 && toggle.getAttribute('aria-pressed') === 'false');
+  toggle.click();
+  check('table toggle: swaps the chart for the data table', !card.querySelector('svg.chart-svg') && card.querySelectorAll('.dash-table tbody tr').length === 6 && card.querySelector('.dash-table td.num').textContent === '€ 100' && toggle.getAttribute('aria-pressed') === 'true' && toggle.textContent === 'Chart');
+  toggle.click();
+  check('table toggle: and back to the chart', card.querySelector('svg.chart-svg') !== null && toggle.textContent === 'Table');
+  body.setTheme('dark');
+  check('setTheme re-renders in the dark palette', card.querySelector('path.bar[data-series="0"]').getAttribute('fill') === C.CHART_PALETTE.dark[0]);
+  body.remove();
+
+  // the HTML export
+  const html = D.dashboardHtml(spec);
+  check('export: a standalone page with inline SVG and the tables, no <script>', html.startsWith('<!doctype html>') && html.includes('<svg') && html.includes('<table') && !/<script/i.test(html) && html.includes('<style>'));
+  check('export: model text escaped, light palette', html.includes('<title>BTP spend &lt;b&gt;2026&lt;/b&gt;</title>') && !html.includes('<b>2026</b>') && !html.includes('<img src=x>') && html.includes(C.CHART_PALETTE.light[0]) && !html.includes(C.CHART_PALETTE.dark[0]));
+  check('export: a file name from the title', D.dashboardFilename(spec) === 'BTP spend b 2026 b.html' && D.dashboardFilename({}) === 'dashboard.html');
+
+  // the card label
+  const dcard = fileCard({ id: 'd9', name: 'btp-spend.dashboard.json', media_type: D.DASHBOARD_MEDIA_TYPE, size: 2048, title: 'BTP spend <i>x</i>', widgets: 6 });
+  check('file card: chart icon and "Dashboard · <title> · n widgets" as text', dcard.classList.contains('kind-chart') && dcard.querySelector('.file-name').textContent === 'Dashboard · BTP spend <i>x</i> · 6 widgets' && !dcard.querySelector('.file-name i') && dcard.querySelector('.file-sub').textContent === '2 KB' && dcard.querySelector('.file-download').getAttribute('download') === 'btp-spend.dashboard.json');
+  const bare = fileCard({ id: 'd8', name: 'q3.dashboard.json', media_type: D.DASHBOARD_MEDIA_TYPE, size: 10, widgets: 1 });
+  check('file card: without a title, the name without .dashboard.json', bare.querySelector('.file-name').textContent === 'Dashboard · q3 · 1 widget');
+
+  let fm = newAssistantMessage();
+  fm = applyEvent(fm, { type: 'file', data: { file_id: 'd9', name: 'btp-spend.dashboard.json', media_type: D.DASHBOARD_MEDIA_TYPE, size: 2048, title: 'BTP spend', widgets: 6 } });
+  check('reducer: a dashboard file event keeps title and widgets', fm.parts[0].title === 'BTP spend' && fm.parts[0].widgets === 6);
+  // the viewer: dashboard body, actions, title
+  const V = await import('../static/chat/render/viewer.js');
+  const api = { fileUrl: (id) => `/chat/api/files/${id}`, fetchFileBlob: async () => null, filePreview: async () => ({ kind: 'dashboard', name: 'btp-spend.dashboard.json', dashboard: spec }) };
+  const v = V.createViewer({ api });
+  document.body.appendChild(v.el);
+  v.setConversation({ id: 'cd', access: 'basic', messages: [{ id: 'a', role: 'assistant', content: '', parts: [{ type: 'file', file_id: 'd9', name: 'btp-spend.dashboard.json', media_type: D.DASHBOARD_MEDIA_TYPE, size: 2048 }] }] });
+  v.open('file:d9');
+  await new Promise((r) => setTimeout(r, 0));
+  const dl = v.el.querySelector('.viewer-download');
+  const dh = v.el.querySelector('.viewer-download-html');
+  check('viewer: the dashboard body', v.el.querySelector('.viewer-body .dash .dash-grid') !== null);
+  check('viewer: title is the dashboard title, meta counts widgets', v.el.querySelector('.viewer-title').textContent === spec.title && v.el.querySelector('.viewer-meta').textContent.startsWith('Dashboard · 4 widgets'));
+  check('viewer: "Download HTML" and "Download data" (the stored file)', !dh.hidden && !dh.disabled && dl.textContent === 'Download data' && dl.getAttribute('href') === '/chat/api/files/d9');
+  let made = null;
+  const origCreate = URL.createObjectURL;
+  URL.createObjectURL = (b) => { made = b; return 'blob:x'; };
+  let clicked = null;
+  const origClick = window.HTMLAnchorElement.prototype.click;
+  window.HTMLAnchorElement.prototype.click = function () { clicked = this.download; };
+  dh.click();
+  window.HTMLAnchorElement.prototype.click = origClick;
+  URL.createObjectURL = origCreate;
+  check('viewer: Download HTML saves <title>.html as text/html', clicked === 'BTP spend b 2026 b.html' && made && made.type.startsWith('text/html'));
+  v.el.remove();
+}
+
 console.log(failed ? `\n${failed} FAILED` : '\nall passed');
 process.exit(failed ? 1 : 0);

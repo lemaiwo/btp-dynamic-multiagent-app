@@ -24,7 +24,7 @@ function generatedFiles(message) {
   for (const p of message.parts || []) {
     if (p.type === 'file' && !seen.has(p.file_id)) {
       seen.add(p.file_id);
-      out.push({ id: p.file_id, name: p.name, media_type: p.media_type, size: p.size });
+      out.push({ id: p.file_id, name: p.name, media_type: p.media_type, size: p.size, title: p.title, widgets: p.widgets });
     }
   }
   for (const f of message.files || []) {

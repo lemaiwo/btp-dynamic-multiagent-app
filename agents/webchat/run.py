@@ -450,6 +450,8 @@ class TurnRecorder:
 
     def file(self, info: dict[str, Any]) -> None:
         data = {k: info.get(k) for k in ("file_id", "name", "media_type", "size")}
+        # A dashboard's card reads "Dashboard · <title> · n widgets".
+        data.update({k: info[k] for k in ("title", "widgets") if k in info})
         self.parts.append({"type": "file", **data})
         self.turn.publish("file", data)
         self._touch()

@@ -1,6 +1,6 @@
-"""The document tools of a web chat run: Word, PDF and Excel files.
+"""The document tools of a web chat run: Word, PDF, Excel and dashboards.
 
-Three tools, attached per run with ``toolsets=`` on the orchestrator
+Four tools, attached per run with ``toolsets=`` on the orchestrator
 (``agents/webchat/run.py``), never in the registry build: only a web chat
 run has a conversation to put a file in.
 
@@ -17,6 +17,11 @@ run has a conversation to put a file in.
 * ``create_excel_workbook(filename, sheets)`` -- an ``.xlsx`` through
   openpyxl (write-only). A text cell that starts with ``=`` is stored as
   text, never as a formula, and nothing is calculated.
+* ``create_dashboard(filename, title, widgets, description?)`` -- charts,
+  KPI tiles and tables for the viewer (design addendum (i)). The stored
+  file is the checked spec as JSON (``agents/webchat/dashboard.py``), media
+  type ``DASHBOARD_MEDIA_TYPE``, named ``<filename>.dashboard.json``; the
+  front end draws it. Its answer adds ``title`` and ``widgets`` (the count).
 
 The markdown is the subset of ``agents/webchat/md.py``. Where a file goes
 is never the model's choice: the tools write through the
@@ -51,6 +56,13 @@ from pydantic import BaseModel, Field
 from pydantic_ai.toolsets import FunctionToolset
 
 from agents.webchat import md
+from agents.webchat.dashboard import (
+    DASHBOARD_EXTENSION,
+    DASHBOARD_MEDIA_TYPE,
+    DashboardError,
+    build_dashboard,
+    validate_spec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +85,8 @@ MAX_CELL_CHARS = 32_767  # Excel's own limit for a cell
 MAX_NAME_CHARS = 100
 MAX_COLUMN_WIDTH = 60
 
-TOOL_NAMES = ("create_word_document", "create_pdf_document", "create_excel_workbook")
+TOOL_NAMES = ("create_word_document", "create_pdf_document", "create_excel_workbook",
+              "create_dashboard")
 
 # Characters XML 1.0 cannot hold (and so neither docx, xlsx nor reportlab's
 # paragraph markup): C0 controls other than tab / LF / CR, lone surrogates,
@@ -598,6 +611,9 @@ async def _store(ctx: ChatRunContext, name: str, media_type: str,
     except SheetError as exc:
         ctx.created -= 1
         return _error("invalid_argument", str(exc))
+    except DashboardError as exc:
+        ctx.created -= 1
+        return _error(exc.code, str(exc))
     except Exception as exc:  # noqa: BLE001 - the model gets a fixed text
         ctx.created -= 1
         logger.warning("webchat: building %s failed (%s)", media_type, type(exc).__name__)
@@ -676,12 +692,60 @@ async def create_excel_workbook(filename: str, sheets: list[SheetSpec]) -> dict[
     return await _store(ctx, name, XLSX, lambda: build_xlsx(sheets))
 
 
+_DASHBOARD_HINT = (
+    " After it returns, the dashboard opens beside the chat by itself: say in "
+    "your answer what it shows; do not repeat its data as a table."
+)
+_DASHBOARD_SUFFIX = re.compile(r"(\.dashboard)?\.json\s*$", re.IGNORECASE)
+
+
+async def create_dashboard(filename: str, title: str, widgets: list[dict[str, Any]],
+                           description: str | None = None) -> dict[str, Any]:
+    """Create a dashboard that opens in the chat's viewer: charts, KPI tiles
+    and tables on one page. Use it when the user asks for a dashboard,
+    charts, graphs or KPIs. The data must come from this conversation
+    (uploaded files, tool results, figures the user gave): never invent or
+    estimate numbers. At most 12 widgets. Widget shapes: chart {type:
+    bar|line|area|pie|scatter, title, data: {columns: [names], rows: [[cells]]},
+    x: column, y: [columns] (1-8 series; pie and scatter exactly 1, scatter
+    needs a numeric x), stacked (bar/area), unit, format:
+    number|percent|currency, size: 1|2, note}; kpi {type: kpi, title, value
+    (number or short text), unit, delta (number), delta_label, trend:
+    [numbers], size}; table {type: table, title, data, size}. Cells are
+    numbers, texts or null; y columns hold numbers or null only; one measure
+    per axis (never two units on one chart); dates as ISO strings
+    (YYYY-MM-DD)."""
+    ctx = current_chat_run.get()
+    if ctx is None:
+        return ERR_NO_CONTEXT
+    raw_name = _DASHBOARD_SUFFIX.sub("", filename) if isinstance(filename, str) else filename
+    name = clean_filename(raw_name, DASHBOARD_EXTENSION)
+    if name is None:
+        return ERR_NAME
+    raw: dict[str, Any] = {"title": title, "widgets": widgets}
+    if description is not None:
+        raw["description"] = description
+    checked: dict[str, Any] = {}
+
+    def build() -> bytes:
+        spec = validate_spec(raw)
+        checked.update(title=spec.title, widgets=len(spec.widgets))
+        return build_dashboard(spec)
+
+    info = await _store(ctx, name, DASHBOARD_MEDIA_TYPE, build)
+    if "error" in info:
+        return info
+    return {**info, **checked}
+
+
 def docgen_toolset() -> FunctionToolset:
-    """The three document tools, for one run's ``toolsets=``."""
+    """The four document tools, for one run's ``toolsets=``."""
     toolset: FunctionToolset = FunctionToolset()
-    for func in (create_word_document, create_pdf_document, create_excel_workbook):
+    for func in (create_word_document, create_pdf_document, create_excel_workbook,
+                 create_dashboard):
+        hint = _DASHBOARD_HINT if func is create_dashboard else _DOC_HINT
         toolset.add_function(
             func, takes_ctx=False, name=func.__name__,
-            description=" ".join((func.__doc__ or "").split()) + _DOC_HINT,
+            description=" ".join((func.__doc__ or "").split()) + hint,
         )
     return toolset

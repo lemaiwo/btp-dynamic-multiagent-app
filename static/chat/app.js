@@ -177,7 +177,7 @@ mainEl.insertBefore(viewer.el, pageEl);
 
 // ---------- messages + composer ----------
 const list = createMessageList(messagesEl, {
-  onOpenFile: (f) => viewer.open({ key: `file:${f.id}`, type: 'file', id: String(f.id), name: f.name || 'file', media_type: f.media_type || '', size: f.size }, { focus: true }),
+  onOpenFile: (f) => viewer.open({ key: `file:${f.id}`, type: 'file', id: String(f.id), name: f.name || 'file', media_type: f.media_type || '', size: f.size, ...(f.title ? { title: f.title } : {}) }, { focus: true }),
   onOpenCode: (code, lang) => viewer.open({ code, lang }, { focus: true }),
 });
 const composer = createComposer($('#composer'), {

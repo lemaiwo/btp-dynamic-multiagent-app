@@ -1641,8 +1641,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `CHAT_MAX_FILES_PER_MESSAGE` (5), text 64 KiB; refusals are fixed texts
     (413/415/422). The multipart reader is `agents/multipart_form.py`, shared
     with the invoke API
-  - `docgen.py` + `md.py` — the three tools attached **per run** (never in the
-    registry build): `create_word_document`, `create_pdf_document`
+  - `docgen.py` + `md.py` — the document tools attached **per run** (never in the
+    registry build): `create_word_document`, `create_pdf_document`, `create_dashboard`
+    (see Dashboards below)
     (markdown subset of `md.py`: headings, paragraphs with bold/italic/code,
     lists, pipe tables, fenced code, hr) and `create_excel_workbook(sheets=
     [{name, columns, rows}])` (bold frozen header, auto-filter, a cell starting
@@ -1815,6 +1816,26 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     "Tools from admin agents" multi-select (advanced sources disabled for a
     basic user), the lists a tools badge and a "Shares tools" tag.
     `tests/test_webchat_tools.py`
+  - **Dashboards** (`dashboard.py`, design addendum i): the fourth document tool,
+    `create_dashboard(filename, title, widgets, description=None)`, stores a
+    validated spec (pydantic, `extra="forbid"`: 1..12 widgets of `bar | line |
+    area | pie | scatter` with `data {columns ≤ 20, rows ≤ 2,000}`, `x`, `y`
+    1..8 series (pie and scatter exactly one), `stacked` (bar/area only), `unit`,
+    `format number|percent|currency`, `size 1|2`, `note`; `kpi` with `value`,
+    `delta`, `delta_label`, `trend ≤ 60`; `table`; 200,000 chars of JSON, 1 MiB
+    stored; refusals `{"error": {code, message}}` with a 0-based place such as
+    `widgets[3].y: not a column of data`) as a `chat_files` row of media type
+    `application/vnd.sap-btp-agent.dashboard+json`, name `<filename>.dashboard.json`;
+    the answer carries `title` and `widgets` (count) next to the usual keys, and so
+    do the `file` part and event. The preview answers `kind: "dashboard"` with the
+    spec (defaults filled in), never `inline`. The web chat draws it itself
+    (`static/chat/render/charts.js` SVG, `render/dashboard.js`): no chart library,
+    fixed categorical palette in both themes (validated with the hub's `dataviz`
+    skill), one y axis, legend for ≥ 2 series, direct labels, hover tooltips, a
+    "Table" toggle behind every chart, "Download HTML" (standalone, no script) and
+    "Download data". The model never receives the SVG.
+    `tests/test_webchat_dashboard.py`, the dashboard section of
+    `tests/test_webchat_ui.mjs`
   - **The viewer** (`preview.py`, design addendum f): a panel beside the
     messages that shows a file of the conversation or, in an advanced
     conversation, a code block the model wrote. `GET /files/{fid}/preview`
@@ -2300,7 +2321,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   viewer header), no descriptor change besides the version; 2.32.0 is the
   `builtin:git` release (`agents/git_tools.py`): no new resource, environment
   variable, table or column (HANA schema generation unchanged); the credential of
-  a remote is a BTP destination created per landscape
+  a remote is a BTP destination created per landscape; 2.33.0 adds dashboards
+  (`create_dashboard`, `agents/webchat/dashboard.py`, drawn by the web chat's own
+  SVG renderer): no new resource, variable, table or column
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

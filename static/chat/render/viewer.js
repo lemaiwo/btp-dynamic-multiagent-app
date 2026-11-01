@@ -21,11 +21,15 @@
 //   `onToggle(open)` is called on every open/close; `onClose()` after a close.
 // Pure helpers (exported for the tests): viewerItems, codeBlocks,
 // codeDownloadName, autoOpenItem, parseCsv, sheetTable, codeBody, MAX_ITEMS,
-// the fixed texts.
+// the fixed texts. A dashboard (addendum i) is rendered by ./dashboard.js; its
+// header has "Download HTML" (the standalone page, built here) and "Download
+// data" (the stored JSON), and its title is the dashboard's once loaded.
 
 import * as defaultApi from '../api.js';
 import { renderMarkdown, libs } from './markdown.js';
 import { formatSize } from '../util.js';
+import { dashboardBody, dashboardHtml, dashboardFilename, isDashboardFile } from './dashboard.js';
+import { onThemeChange } from '../theme.js';
 
 export const MAX_ITEMS = 50;
 export const AUTO_OPEN_MIN_LINES = 5;
@@ -86,7 +90,9 @@ function lineCount(code) {
 
 function fileItem(f, messageId) {
   const id = String(f.id || f.file_id || '');
-  return { key: `file:${id}`, type: 'file', id, name: f.name || 'file', media_type: f.media_type || '', size: f.size, messageId };
+  const it = { key: `file:${id}`, type: 'file', id, name: f.name || 'file', media_type: f.media_type || '', size: f.size, messageId };
+  if (typeof f.title === 'string' && f.title && isDashboardFile(it)) it.title = f.title; // a dashboard part carries its title (addendum i)
+  return it;
 }
 
 /**
@@ -385,12 +391,15 @@ export function createViewer({ api = defaultApi, onToggle, onClose } = {}) {
   downloadCode.type = 'button';
   const copy = el('button', 'btn small viewer-copy', 'Copy');
   copy.type = 'button';
+  const downloadHtml = el('button', 'btn small viewer-download-html', 'Download HTML');
+  downloadHtml.type = 'button';
+  downloadHtml.hidden = true;
   const closeBtn = el('button', 'icon-btn viewer-close');
   closeBtn.type = 'button';
   closeBtn.setAttribute('aria-label', 'Close viewer');
   closeBtn.title = 'Close';
   closeBtn.appendChild(svgIcon('M6 6l12 12M18 6L6 18'));
-  actions.append(copy, downloadCode, download, closeBtn);
+  actions.append(copy, downloadCode, downloadHtml, download, closeBtn);
   const top = el('div', 'viewer-top');
   top.append(titleBox, actions);
   head.append(top, pickLabel);
@@ -406,6 +415,8 @@ export function createViewer({ api = defaultApi, onToggle, onClose } = {}) {
   let objectUrl = null;
   const closedByUser = new Set(); // conversation ids
   const previews = new Map(); // file id -> preview answer (successes only)
+  let dashSpec = null; // the spec of the dashboard shown, for "Download HTML"
+  const theme = () => (document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light');
 
   function all() { return [...items.files, ...items.code]; }
 
@@ -425,7 +436,7 @@ export function createViewer({ api = defaultApi, onToggle, onClose } = {}) {
         }
         select.appendChild(og);
       };
-      group('Files', items.files, (f) => f.name);
+      group('Files', items.files, (f) => f.title || f.name);
       group('Code', items.code, (c) => `${c.title} (${c.lines === 1 ? '1 line' : `${c.lines} lines`})`);
       if (currentItem && !all().some((i) => i.key === currentItem.key)) {
         // an item no longer listed (an ad hoc block, a streaming one): keep it selectable
@@ -485,23 +496,41 @@ export function createViewer({ api = defaultApi, onToggle, onClose } = {}) {
     return wrap;
   }
 
+  function dashboardPreview(preview, item) {
+    const spec = preview.dashboard && typeof preview.dashboard === 'object' ? preview.dashboard : {};
+    dashSpec = spec;
+    const n = Array.isArray(spec.widgets) ? spec.widgets.length : 0;
+    if (spec.title) { title.textContent = String(spec.title); title.title = title.textContent; }
+    meta.textContent = ['Dashboard', n === 1 ? '1 widget' : `${n} widgets`, item.size != null ? formatSize(item.size) : ''].filter(Boolean).join(' · ');
+    downloadHtml.hidden = false;
+    downloadHtml.disabled = false;
+    download.textContent = 'Download data';
+    return dashboardBody(preview, { theme: theme() });
+  }
+
   function previewBody(preview, item) {
     switch (preview?.kind) {
       case 'sheets': return sheetsBody(preview);
       case 'document': return documentBody(preview);
       case 'text': return textBody(preview);
       case 'inline': return inlineBody(preview, item);
+      case 'dashboard': return dashboardPreview(preview, item);
       default: return errorState(415, item);
     }
   }
 
   function header(item) {
-    title.textContent = item.type === 'code' ? item.title : item.name;
+    title.textContent = item.title || item.name;
     title.title = title.textContent;
     const isCode = item.type === 'code';
     download.hidden = isCode;
     downloadCode.hidden = !isCode;
     copy.hidden = !isCode;
+    const dash = !isCode && isDashboardFile(item);
+    dashSpec = null;
+    downloadHtml.hidden = !dash;
+    downloadHtml.disabled = true; // until the preview is loaded
+    download.textContent = dash ? 'Download data' : 'Download';
     if (isCode) {
       meta.textContent = `${item.lang} · ${item.lines === 1 ? '1 line' : `${item.lines} lines`}`;
       downloadCode.setAttribute('aria-label', `Download ${item.name}`);
@@ -616,6 +645,22 @@ export function createViewer({ api = defaultApi, onToggle, onClose } = {}) {
       copy.textContent = 'Copied';
     } catch { copy.textContent = 'Copy failed'; }
     setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+  });
+  downloadHtml.addEventListener('click', () => {
+    if (!dashSpec) return;
+    const blob = new Blob([dashboardHtml(dashSpec)], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = el('a');
+    a.href = url;
+    a.download = dashboardFilename(dashSpec);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => { try { URL.revokeObjectURL(url); } catch { /* jsdom */ } }, 1000);
+  });
+  onThemeChange((t) => {
+    const dash = body.querySelector('.dash');
+    if (dash && typeof dash.setTheme === 'function') dash.setTheme(t);
   });
   downloadCode.addEventListener('click', () => {
     if (currentItem?.type !== 'code') return;

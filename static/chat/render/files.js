@@ -4,6 +4,7 @@
 
 import { fileUrl, fetchFileBlob } from '../api.js';
 import { formatSize, fileKind, isImageType } from '../util.js';
+import { isDashboardFile, dashboardStem } from './dashboard.js';
 
 const ICONS = {
   image: 'M4 5h16v14H4zM6 7v8l4-4 3 3 2-2 3 3V7z',
@@ -12,6 +13,7 @@ const ICONS = {
   doc: 'M6 2h8l4 4v16H6zM14 2v4h4M8 12h8M8 16h8M8 8h3',
   code: 'M8 9l-4 3 4 3M16 9l4 3-4 3M13 6l-2 12',
   text: 'M5 4h14M5 9h14M5 14h10M5 19h8',
+  chart: 'M4 20h16M7 17v-5M12 17V7M17 17v-8',
   file: 'M6 2h8l4 4v16H6zM14 2v4h4',
 };
 
@@ -36,6 +38,13 @@ function thumbnail(id) {
 
 export const NOT_IN_CONTEXT = 'not in context';
 
+/** The card label of a dashboard file: "Dashboard · <title> · n widgets" (the name without .dashboard.json when no title). */
+export function dashboardLabel(file) {
+  const title = typeof file?.title === 'string' && file.title.trim() ? file.title.trim() : dashboardStem(file?.name);
+  const n = Number.isInteger(file?.widgets) ? ` · ${file.widgets === 1 ? '1 widget' : `${file.widgets} widgets`}` : '';
+  return `Dashboard · ${title}${n}`;
+}
+
 /**
  * One card. `file` = {id|file_id, name, media_type, size}. An upload the
  * user excluded from the model's context (`excluded`, or its id in
@@ -45,7 +54,8 @@ export const NOT_IN_CONTEXT = 'not in context';
  */
 export function fileCard(file, { excludedIds, onOpen } = {}) {
   const id = file.id || file.file_id;
-  const kind = fileKind(file.media_type, file.name);
+  const dashboard = isDashboardFile(file);
+  const kind = dashboard ? 'chart' : fileKind(file.media_type, file.name);
   const excluded = file.excluded === true || (!!id && excludedIds instanceof Set && excludedIds.has(String(id)));
   const card = document.createElement('div');
   card.className = `file-card kind-${kind}${excluded ? ' excluded' : ''}`;
@@ -66,11 +76,13 @@ export function fileCard(file, { excludedIds, onOpen } = {}) {
   meta.className = 'file-meta';
   const name = document.createElement('div');
   name.className = 'file-name';
-  name.textContent = file.name || 'file';
+  // a dashboard (addendum i): "Dashboard · <title> · n widgets"
+  name.textContent = dashboard ? dashboardLabel(file) : (file.name || 'file');
   name.title = file.name || '';
   const sub = document.createElement('div');
   sub.className = 'file-sub';
-  sub.textContent = excluded ? `${formatSize(file.size)} · ${NOT_IN_CONTEXT}` : formatSize(file.size);
+  const size = formatSize(file.size);
+  sub.textContent = excluded ? `${size} · ${NOT_IN_CONTEXT}` : size;
   if (excluded) card.setAttribute('aria-label', `${file.name || 'file'}, ${NOT_IN_CONTEXT}`);
   meta.append(name, sub);
   card.append(tile, meta);

@@ -122,6 +122,49 @@ MEDIA_TYPES = [
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 ]
+DASHBOARD_TYPE = "application/vnd.sap-btp-agent.dashboard+json"
+MONTHS = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09", "2026-10"]
+
+
+def dashboard_spec(title: str = "BTP spend, dev landscape") -> dict:
+    """A dashboard as create_dashboard stores it (addendum i), chart defaults filled in."""
+    spend = [[m, h, i, r] for m, h, i, r in zip(MONTHS, [1180, 1210, 1260, 1240, 1310, 1385],
+                                                 [640, 655, 702, 698, 731, 760], [410, 395, 420, 455, 470, 492])]
+    calls = [[f"2026-10-{d:02d}", 1200 + 40 * d + (d % 3) * 90, 800 + 25 * d, 300 + (d % 5) * 40] for d in range(1, 15)]
+    return {
+        "title": title,
+        "description": "Monthly spend of the three dev subaccounts from the entitlement export, May to October 2026.",
+        "widgets": [
+            {"type": "kpi", "title": "Spend in October", "value": 2637, "unit": "€", "delta": 4.6, "delta_label": "vs September",
+             "trend": [2230, 2260, 2382, 2393, 2511, 2637], "size": 1},
+            {"type": "kpi", "title": "Unused entitlements", "value": 8, "unit": "", "delta": -3, "delta_label": "vs September",
+             "trend": [14, 13, 12, 11, 11, 8], "size": 1},
+            {"type": "bar", "title": "Spend by service family", "data": {"columns": ["Month", "HANA Cloud", "Integration Suite", "Runtime"], "rows": spend},
+             "x": "Month", "y": ["HANA Cloud", "Integration Suite", "Runtime"], "stacked": False, "unit": "€", "format": "currency", "size": 2,
+             "note": "Runtime covers CF memory and the HTML5 repository."},
+            {"type": "area", "title": "API calls per day", "data": {"columns": ["Day", "Approuter", "Backend", "A2A"], "rows": calls},
+             "x": "Day", "y": ["Approuter", "Backend", "A2A"], "stacked": True, "unit": "", "format": "number", "size": 1},
+            {"type": "pie", "title": "October spend by subaccount", "data": {"columns": ["Subaccount", "Spend"],
+             "rows": [["b-fdn-dev", 1120], ["b-int-dev", 760], ["b-ui-dev", 420], ["b-sbx", 210], ["b-ai-dev", 127]]},
+             "x": "Subaccount", "y": ["Spend"], "stacked": False, "unit": "€", "format": "currency", "size": 1},
+            {"type": "scatter", "title": "Memory against monthly cost per app", "data": {"columns": ["App", "Memory GB", "Cost"],
+             "rows": [["agent-app", 2, 96], ["approuter", 0.5, 22], ["mcp-btp", 1, 48], ["mcp-arc1", 1.5, 70], ["cap-orders", 1, 51],
+                      ["ui5-host", 0.25, 12], ["jobs", 0.5, 27], ["ide-api", 2.5, 118]]},
+             "x": "Memory GB", "y": ["Cost"], "stacked": False, "unit": "€", "format": "currency", "size": 1},
+            {"type": "table", "title": "Top entitlements by spend", "data": {"columns": ["Subaccount", "Service", "Plan", "Spend"],
+             "rows": [["b-fdn-dev", "hana-cloud", "hana", 980], ["b-int-dev", "integrationsuite", "enterprise_agreement", 640],
+                      ["b-ui-dev", "workzone", "standard", 210], ["b-fdn-dev", "destination", "lite", 0]]}, "size": 1},
+        ],
+    }
+
+
+def dashboard_part(f: dict) -> dict:
+    """A dashboard's file part / SSE file event: the usual keys plus title and widgets."""
+    spec = json.loads(f["data"])
+    return {"file_id": f["id"], "name": f["name"], "media_type": f["media_type"], "size": f["size"],
+            "title": spec["title"], "widgets": len(spec["widgets"])}
+
+
 MODELS = [
     {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra", "default": True},
     {"id": "anthropic--claude-4.5-sonnet", "label": "Claude 4.5 Sonnet", "default": False},
@@ -245,6 +288,8 @@ def letters(n: int) -> list[str]:
 def preview_of(f: dict) -> tuple[int, dict]:
     """The scripted GET /files/{id}/preview answer (addendum f) by the dummy file's type."""
     mt, name = f["media_type"], f["name"]
+    if mt == DASHBOARD_TYPE:
+        return 200, {"kind": "dashboard", "name": name, "dashboard": json.loads(f["data"])}
     if mt in ("image/png", "image/jpeg", "application/pdf"):
         return 200, {"kind": "inline", "name": name, "media_type": mt, "url": f"/chat/api/files/{f['id']}?inline=1"}
     if mt == MEDIA_TYPES[8]:
@@ -423,6 +468,17 @@ class Store:
              "requests": 6, "tool_calls": 4, "model": "gpt-5.6-terra", "duration_ms": 9870,
              "agents": [{"id": "a1", "agent": "btp-admin", "input_tokens": 1820, "output_tokens": 260, "requests": 3, "model": "gpt-5.6-terra"},
                         {"id": "a2", "agent": "entitlement-analyst", "input_tokens": 640, "output_tokens": 95, "requests": 1, "model": "gpt-5.6-terra"}]},
+        ]
+        c5 = self.new_conversation("BTP spend dashboard", "gpt-5.6-terra", t - timedelta(hours=1))
+        self.add_message(c5["id"], "user", "Make a dashboard of our BTP spend from the entitlement export.")
+        dm = self.add_message(c5["id"], "assistant", "Here is the dashboard: spend rose 4.6% in October, mostly HANA Cloud.", status="done")
+        db = self.add_file(c5["id"], dm["id"], "generated", "btp-spend.dashboard.json", DASHBOARD_TYPE,
+                           json.dumps(dashboard_spec()).encode())
+        dm["parts"] = [
+            {"type": "tool", "id": "t1", "agent": None, "agent_id": None, "name": "create_dashboard", "status": "done",
+             "args": "filename=btp-spend widgets=7", "output": "btp-spend.dashboard.json", "duration_ms": 120},
+            {"type": "text", "text": dm["content"]},
+            {"type": "file", **dashboard_part(db)},
         ]
         c2 = self.new_conversation("Destinations of the sandbox", "gpt-5.6-terra", t - timedelta(days=1, hours=2))
         self.add_message(c2["id"], "user", "List the destinations of the sandbox subaccount.")
@@ -1527,15 +1583,24 @@ class Handler(BaseHTTPRequestHandler):
             nap(0.4)
             if canceled():
                 return
-            with STORE.lock:
-                x = STORE.add_file(cid, am["id"], "generated", "report.xlsx", MEDIA_TYPES[8], b"PK\x03\x04" + b"\0" * 9100)
-            parts.append({"type": "file", "file_id": x["id"], "name": x["name"], "media_type": x["media_type"], "size": x["size"]})
-            emit("file", {"file_id": x["id"], "name": x["name"], "media_type": x["media_type"], "size": x["size"]})
-            nap(0.5)
-            with STORE.lock:
-                d = STORE.add_file(cid, am["id"], "generated", "summary.docx", MEDIA_TYPES[7], b"PK\x03\x04" + b"\0" * 22600)
-            parts.append({"type": "file", "file_id": d["id"], "name": d["name"], "media_type": d["media_type"], "size": d["size"]})
-            emit("file", {"file_id": d["id"], "name": d["name"], "media_type": d["media_type"], "size": d["size"]})
+            if "dashboard" in text.lower():
+                # a dashboard turn: one generated dashboard file, opened at done (auto-open)
+                with STORE.lock:
+                    db = STORE.add_file(cid, am["id"], "generated", "dev-spend.dashboard.json", DASHBOARD_TYPE,
+                                        json.dumps(dashboard_spec("Dev spend, last six months")).encode())
+                frame = dashboard_part(db)
+                parts.append({"type": "file", **frame})
+                emit("file", frame)
+            else:
+                with STORE.lock:
+                    x = STORE.add_file(cid, am["id"], "generated", "report.xlsx", MEDIA_TYPES[8], b"PK\x03\x04" + b"\0" * 9100)
+                parts.append({"type": "file", "file_id": x["id"], "name": x["name"], "media_type": x["media_type"], "size": x["size"]})
+                emit("file", {"file_id": x["id"], "name": x["name"], "media_type": x["media_type"], "size": x["size"]})
+                nap(0.5)
+                with STORE.lock:
+                    d = STORE.add_file(cid, am["id"], "generated", "summary.docx", MEDIA_TYPES[7], b"PK\x03\x04" + b"\0" * 22600)
+                parts.append({"type": "file", "file_id": d["id"], "name": d["name"], "media_type": d["media_type"], "size": d["size"]})
+                emit("file", {"file_id": d["id"], "name": d["name"], "media_type": d["media_type"], "size": d["size"]})
             nap(0.3)
             if first_turn or conv["title"] == "New chat":
                 title = text.splitlines()[0][:120]

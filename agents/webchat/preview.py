@@ -16,6 +16,9 @@ JSON the viewer renders, typed by ``kind`` (design addendum (f), decision 1):
   ``MAX_DOC_CHARS`` and ``MAX_TABLE_ROWS`` x ``MAX_TABLE_COLUMNS``.
 * text, markdown, CSV, JSON -> ``text``: UTF-8, cut at ``MAX_TEXT_CHARS``.
 * PNG, JPEG, PDF -> ``inline``: the existing inline download renders them.
+* a dashboard (``DASHBOARD_MEDIA_TYPE``, design addendum (i)) ->
+  ``dashboard``: the stored spec, checked again by ``parse_dashboard``. It
+  is never ``inline``: the front end draws it from this JSON.
 
 Anything else is :class:`PreviewError` 415, bytes that do not read as their
 type 422; both texts are fixed and name neither the file nor a value. The
@@ -40,6 +43,7 @@ from openpyxl.utils import get_column_letter
 
 from agents.multipart_form import FormRefused
 from agents.webchat import uploads
+from agents.webchat.dashboard import DASHBOARD_MEDIA_TYPE, parse_dashboard
 from agents.webchat.uploads import (
     CSV,
     DOCX,
@@ -404,9 +408,12 @@ def build_preview(media_type: str, name: str, data: bytes, fid: str) -> dict[str
     if media_type in INLINE_TYPES:
         return {"kind": "inline", "name": name, "media_type": media_type,
                 "url": f"/chat/api/files/{fid}?inline=1"}
-    if media_type not in (XLSX, DOCX) and media_type not in TEXT_LANGUAGES:
+    if (media_type not in (XLSX, DOCX, DASHBOARD_MEDIA_TYPE)
+            and media_type not in TEXT_LANGUAGES):
         raise PreviewError(415, MSG_NO_PREVIEW)
     try:
+        if media_type == DASHBOARD_MEDIA_TYPE:
+            return {"kind": "dashboard", "name": name, "dashboard": parse_dashboard(data)}
         if media_type == XLSX:
             return preview_xlsx(data, name)
         if media_type == DOCX:

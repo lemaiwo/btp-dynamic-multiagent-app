@@ -173,6 +173,9 @@ export function applyEvent(message, event) {
         name: data.name,
         media_type: data.media_type,
         size: data.size,
+        // a dashboard's file event carries its title and widget count (addendum i)
+        ...(typeof data.title === 'string' ? { title: data.title } : {}),
+        ...(Number.isInteger(data.widgets) ? { widgets: data.widgets } : {}),
       });
       return msg;
     }
