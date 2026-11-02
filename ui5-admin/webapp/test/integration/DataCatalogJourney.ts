@@ -1,0 +1,466 @@
+import opaTest from "sap/ui/test/opaQunit";
+import Opa5 from "sap/ui/test/Opa5";
+import Press from "sap/ui/test/actions/Press";
+import EnterText from "sap/ui/test/actions/EnterText";
+import HashChanger from "sap/ui/core/routing/HashChanger";
+import type Table from "sap/m/Table";
+import type ColumnListItem from "sap/m/ColumnListItem";
+import type ProgressIndicator from "sap/m/ProgressIndicator";
+import type ObjectIdentifier from "sap/m/ObjectIdentifier";
+import type Input from "sap/m/Input";
+import type List from "sap/m/List";
+import type Select from "sap/m/Select";
+import type MessageStrip from "sap/m/MessageStrip";
+import type Graph from "sap/suite/ui/commons/networkgraph/Graph";
+import type Node from "sap/suite/ui/commons/networkgraph/Node";
+import type Dialog from "sap/m/Dialog";
+import type Link from "sap/m/Link";
+import type UI5Element from "sap/ui/core/Element";
+import Common, { backend } from "./pages/Common";
+import { iSeeADialog } from "./pages/Dialogs";
+
+Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
+
+QUnit.module("Data catalogue journey");
+
+const LIST_VIEW = "DataCatalog";
+const DETAIL_VIEW = "DataCatalogDetail";
+const GRAPH_VIEW = "DataCatalogGraph";
+
+function rowsOf(table: UI5Element): ColumnListItem[] {
+    return (table as Table).getItems().filter((item) => item.isA("sap.m.ColumnListItem")) as ColumnListItem[];
+}
+
+/** The source name of a list row (the text of its identifier). */
+function nameOf(row: ColumnListItem): string {
+    return (row.getCells()[1] as ObjectIdentifier).getText();
+}
+
+function rowNamed(table: UI5Element, name: string): ColumnListItem | undefined {
+    return rowsOf(table).filter((row) => nameOf(row) === name)[0];
+}
+
+/** Picks `key` in a bound Select the way a user does: the selection, then its change event. */
+function choose(select: Select, key: string): void {
+    select.setSelectedKey(key);
+    select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+}
+
+opaTest("the list shows each source with its completeness", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog");
+
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 3,
+        success: function (table: UI5Element) {
+            Opa5.assert.deepEqual(rowsOf(table).map(nameOf), ["purchase-requisitions", "business-partners", "sales-orders"],
+                "every catalogue service is listed, the one never imported included");
+            const completeness = (name: string) => rowNamed(table, name)!.getCells()[8] as ProgressIndicator;
+            Opa5.assert.strictEqual(completeness("purchase-requisitions").getDisplayValue(), "72%");
+            Opa5.assert.strictEqual(completeness("purchase-requisitions").getState(), "Success");
+            Opa5.assert.strictEqual(completeness("business-partners").getDisplayValue(), "25%");
+            Opa5.assert.strictEqual(completeness("business-partners").getState(), "Warning",
+                "below half is a warning");
+            Opa5.assert.strictEqual(completeness("sales-orders").getDisplayValue(), "0%");
+            const lastImport = rowNamed(table, "sales-orders")!.getCells()[7] as unknown as { getText(): string };
+            Opa5.assert.strictEqual(lastImport.getText(), "Not imported yet");
+            Opa5.assert.ok(backend.requests.indexOf("GET data-catalog/sources") !== -1, "the list was read");
+        },
+        errorMessage: "The data catalogue list does not show the three sources"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("rebuild of the selected source sends that source", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog");
+
+    When.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 3,
+        success: function (table: UI5Element) {
+            const row = rowNamed(table, "business-partners")!;
+            (table as Table).setSelectedItem(row, true);
+            (table as Table).fireSelectionChange({ listItem: row, listItems: [row], selected: true });
+        }
+    });
+    When.waitFor({ id: "dcRebuildSelected", viewName: LIST_VIEW, actions: new Press() });
+
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: () => backend.requests.indexOf("POST data-catalog/rebuild") !== -1,
+        success: function () {
+            Opa5.assert.deepEqual(backend.bodies["POST data-catalog/rebuild"],
+                { source: { kind: "odata", name: "business-partners" } }, "the selected source is named");
+        },
+        errorMessage: "No rebuild was sent"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a row opens the source with its entities, fields and relations", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog");
+
+    When.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        matchers: (table: UI5Element) => rowNamed(table, "purchase-requisitions") ?? false,
+        actions: new Press(),
+        errorMessage: "No row for purchase-requisitions"
+    });
+
+    Then.waitFor({
+        id: "dcEntitiesTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 12,
+        success: function (table: UI5Element) {
+            Opa5.assert.strictEqual(HashChanger.getInstance().getHash(), "data-catalog/odata/purchase-requisitions");
+            const kinds = rowsOf(table).map((row) => (row.getBindingContext("src")!.getObject() as { kind: string }).kind);
+            Opa5.assert.deepEqual(kinds.filter((kind) => kind === "entity").length, 3, "three entities");
+            Opa5.assert.deepEqual(kinds.filter((kind) => kind === "field").length, 8, "their eight fields");
+            Opa5.assert.strictEqual(kinds[kinds.length - 1], "function", "the function comes last");
+        },
+        errorMessage: "The entities table does not show 3 entities, 8 fields and a function"
+    });
+    Then.waitFor({
+        id: "dcRelations",
+        viewName: DETAIL_VIEW,
+        check: (list: UI5Element) => (list as List).getItems().length === 3,
+        success: function (list: UI5Element) {
+            Opa5.assert.strictEqual((list as List).getItems()[0].getProperty("title"), "Requisition → Requisition item");
+        },
+        errorMessage: "The relations are not listed"
+    });
+    Then.waitFor({
+        id: "dcUsedBy",
+        viewName: DETAIL_VIEW,
+        check: (list: UI5Element) => (list as List).getItems().length === 1,
+        success: function (list: UI5Element) {
+            Opa5.assert.strictEqual((list as List).getItems()[0].getProperty("title"), "btp-agent");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a hint edit sends only what changed; an empty label is refused at the field", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/odata/purchase-requisitions");
+
+    When.waitFor({
+        id: "dcHintPurpose",
+        viewName: DETAIL_VIEW,
+        check: (input: UI5Element) => !!(input as Input).getValue(),
+        actions: new EnterText({ text: "Requests to buy goods", clearTextFirst: true })
+    });
+    When.waitFor({ id: "dcHintsSave", viewName: DETAIL_VIEW, actions: new Press() });
+
+    // Not the Save button: after a save there is nothing to save, and
+    // autoWait waits only on controls that can be used.
+    Then.waitFor({
+        id: "dcHintPurpose",
+        viewName: DETAIL_VIEW,
+        check: () => !!backend.bodies["PUT data-catalog/nodes/1/hints"],
+        success: function () {
+            Opa5.assert.deepEqual(backend.bodies["PUT data-catalog/nodes/1/hints"], { purpose: "Requests to buy goods" },
+                "the PUT body holds the changed field only");
+        },
+        errorMessage: "No hints PUT was sent"
+    });
+
+    When.waitFor({
+        id: "dcHintLabel",
+        viewName: DETAIL_VIEW,
+        success: function (input: UI5Element) {
+            (input as Input).setValue("");
+            (input as Input).fireLiveChange({ value: "" });
+        }
+    });
+    When.waitFor({ id: "dcHintsSave", viewName: DETAIL_VIEW, actions: new Press() });
+
+    Then.waitFor({
+        id: "dcHintLabel",
+        viewName: DETAIL_VIEW,
+        check: (input: UI5Element) => (input as Input).getValueState() === "Error",
+        success: function (input: UI5Element) {
+            Opa5.assert.deepEqual(backend.bodies["PUT data-catalog/nodes/1/hints"], { label: "" });
+            Opa5.assert.strictEqual((input as Input).getValueStateText(), "Value error, label: must not be empty",
+                "the server's message is shown at the label");
+        },
+        errorMessage: "The 422 is not shown at the label"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a test search lists the candidates for the chosen agent", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/odata/purchase-requisitions");
+
+    When.waitFor({
+        id: "dcSearchAgent",
+        viewName: DETAIL_VIEW,
+        // Set through the control's API: no need for it to be on screen,
+        // which a narrow test window may not give.
+        visible: false,
+        autoWait: false,
+        check: (select: UI5Element) => (select as Select).getItems().length === 3,
+        success: (select: UI5Element) => choose(select as Select, "btp-agent")
+    });
+    When.waitFor({
+        id: "dcSearchQuestion",
+        viewName: DETAIL_VIEW,
+        actions: new EnterText({ text: "Which supplier delivers this requisition item" })
+    });
+    When.waitFor({ id: "dcSearchRun", viewName: DETAIL_VIEW, actions: new Press() });
+
+    Then.waitFor({
+        id: "dcSearchResults",
+        viewName: DETAIL_VIEW,
+        check: (list: UI5Element) => (list as List).getItems().length > 0,
+        success: function (list: UI5Element) {
+            Opa5.assert.deepEqual(backend.bodies["POST data-catalog/search"],
+                { question: "Which supplier delivers this requisition item", agent: "btp-agent" });
+            const first = (list as List).getItems()[0].getBindingContext("search")!.getObject() as
+                { title: string; score: string; relations: string[] };
+            Opa5.assert.strictEqual(first.title, "Requisition item", "the best candidate comes first");
+            Opa5.assert.strictEqual(first.score, "0.50");
+            Opa5.assert.deepEqual(first.relations, ["association → Supplier (purchase-requisitions)"]);
+        },
+        errorMessage: "No candidates are listed"
+    });
+    Then.waitFor({
+        id: "dcSearchScope",
+        viewName: DETAIL_VIEW,
+        success: (strip: UI5Element) => {
+            Opa5.assert.strictEqual((strip as MessageStrip).getText(),
+                "Limited to the sources the chosen agent attaches.");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the graph shows every node and the agent filter reduces them", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/graph");
+
+    Then.waitFor({
+        id: "dcGraph",
+        viewName: GRAPH_VIEW,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 17,
+        success: function (graph: UI5Element) {
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 17, "17 nodes of two sources");
+            Opa5.assert.strictEqual((graph as Graph).getGroups().length, 2, "one group per source");
+        },
+        errorMessage: "The graph does not show 17 nodes"
+    });
+
+    When.waitFor({
+        id: "dcGraphAgent",
+        viewName: GRAPH_VIEW,
+        // Set through the control's API: no need for it to be on screen,
+        // which a narrow test window may not give.
+        visible: false,
+        autoWait: false,
+        check: (select: UI5Element) => (select as Select).getItems().length === 3,
+        success: (select: UI5Element) => choose(select as Select, "btp-agent")
+    });
+
+    Then.waitFor({
+        id: "dcGraph",
+        viewName: GRAPH_VIEW,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 13,
+        success: function (graph: UI5Element) {
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 13, "only btp-agent's source is left");
+            Opa5.assert.strictEqual((graph as Graph).getGroups().length, 1);
+            Opa5.assert.ok(backend.requests.indexOf("GET data-catalog/graph") !== -1);
+        },
+        errorMessage: "The agent filter did not reduce the graph to 13 nodes"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a source never imported says so instead of showing empty panels", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/odata/sales-orders");
+
+    Then.waitFor({
+        id: "dcNotImported",
+        viewName: DETAIL_VIEW,
+        success: function () {
+            Opa5.assert.ok(true, "the not-imported strip is shown");
+        },
+        errorMessage: "No not-imported strip"
+    });
+    Then.waitFor({
+        id: "dcHintsPanel",
+        viewName: DETAIL_VIEW,
+        visible: false,
+        check: (panel: UI5Element) => !(panel as unknown as { getVisible(): boolean }).getVisible(),
+        success: () => Opa5.assert.ok(true, "no hints to edit before an import")
+    });
+
+    When.waitFor({ id: "dcImportNow", viewName: DETAIL_VIEW, actions: new Press() });
+
+    Then.waitFor({
+        id: "dcNotImported",
+        viewName: DETAIL_VIEW,
+        visible: false,
+        check: () => !!backend.bodies["POST data-catalog/rebuild"],
+        success: function () {
+            Opa5.assert.deepEqual(backend.bodies["POST data-catalog/rebuild"],
+                { source: { kind: "odata", name: "sales-orders" } }, "Import now rebuilds that source");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a readable switch the catalogue refuses goes back", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/odata/purchase-requisitions");
+
+    When.waitFor({
+        id: "dcEntitiesTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 12,
+        success: function (table: UI5Element) {
+            const row = rowsOf(table).filter((item) =>
+                (item.getBindingContext("src")!.getObject() as { id: number }).id === 32)[0];
+            const toggle = row.getCells()[3] as unknown as { setState(v: boolean): void; fireChange(p: object): void };
+            toggle.setState(true);
+            toggle.fireChange({ state: true });
+        }
+    });
+
+    Then.waitFor({
+        id: "dcEntitiesTable",
+        viewName: DETAIL_VIEW,
+        // The refusal opens a message box over the page: wait without
+        // asking for an interactable table.
+        autoWait: false,
+        check: function (table: UI5Element) {
+            const row = rowsOf(table).filter((item) =>
+                (item.getBindingContext("src")!.getObject() as { id: number }).id === 32)[0];
+            return !!backend.bodies["PUT data-catalog/nodes/32/hints"]
+                && (row.getBindingContext("src")!.getObject() as { readable: boolean }).readable === false;
+        },
+        success: function () {
+            Opa5.assert.deepEqual(backend.bodies["PUT data-catalog/nodes/32/hints"], { readable: true });
+            Opa5.assert.ok(true, "the refused switch is off again");
+        },
+        errorMessage: "The refused readable switch did not go back"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the search filters the list and a used-by count opens the names", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog");
+
+    When.waitFor({ id: "dcSearch", viewName: LIST_VIEW, actions: new EnterText({ text: "partner" }) });
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 1,
+        success: (table: UI5Element) => Opa5.assert.deepEqual(rowsOf(table).map(nameOf), ["business-partners"]),
+        errorMessage: "The search did not leave one row"
+    });
+
+    When.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        matchers: (table: UI5Element) => rowsOf(table)[0].getCells()[5] as Link,
+        actions: new Press(),
+        errorMessage: "No used-by link"
+    });
+    Then.waitFor({
+        id: "dcUsedByList",
+        viewName: LIST_VIEW,
+        check: (list: UI5Element) => (list as List).getItems().length === 1,
+        success: (list: UI5Element) => Opa5.assert.strictEqual((list as List).getItems()[0].getProperty("title"), "gmail-agent"),
+        errorMessage: "The used-by popover does not name the agent"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("rebuild all sends no source; a rebuild that fails says so", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog");
+
+    When.waitFor({ id: "dcRebuildAll", viewName: LIST_VIEW, actions: new Press() });
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: () => backend.countRequests("POST data-catalog/rebuild") === 1,
+        success: () => Opa5.assert.deepEqual(backend.bodies["POST data-catalog/rebuild"], {}, "no source: all of them"),
+        errorMessage: "No rebuild was sent"
+    });
+    When.waitFor({
+        id: "dcRebuildAll",
+        viewName: LIST_VIEW,
+        success: function () {
+            backend.failNext = { path: "data-catalog/rebuild", status: 503, body: { detail: "Rebuild failed" } };
+        }
+    });
+    When.waitFor({ id: "dcRebuildAll", viewName: LIST_VIEW, actions: new Press() });
+    iSeeADialog(Then, (dialog: UI5Element) => {
+        Opa5.assert.strictEqual((dialog as Dialog).getType(), "Message");
+    }, "the 503 of a rebuild");
+
+    Then.iStopTheApp();
+});
+
+opaTest("a refusal in the route's string form is shown at its field", function (Given: Common, When: Common, Then: Common) {
+    const detail = "purpose: Value error, must be one line of text without control characters";
+    Given.iStartTheApp("data-catalog/odata/purchase-requisitions", {
+        path: "data-catalog/nodes/1/hints", status: 422, body: { detail }, method: "PUT"
+    });
+
+    When.waitFor({
+        id: "dcHintPurpose",
+        viewName: DETAIL_VIEW,
+        check: (input: UI5Element) => !!(input as Input).getValue(),
+        actions: new EnterText({ text: "Anything", clearTextFirst: true })
+    });
+    When.waitFor({ id: "dcHintsSave", viewName: DETAIL_VIEW, actions: new Press() });
+
+    Then.waitFor({
+        id: "dcHintPurpose",
+        viewName: DETAIL_VIEW,
+        check: (input: UI5Element) => (input as Input).getValueState() === "Error",
+        success: function (input: UI5Element) {
+            Opa5.assert.strictEqual((input as Input).getValueStateText(),
+                "must be one line of text without control characters");
+        },
+        errorMessage: "The string refusal is not shown at the purpose"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a graph node opens its source", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/graph");
+
+    When.waitFor({
+        id: "dcGraph",
+        viewName: GRAPH_VIEW,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 17,
+        success: function (graph: UI5Element) {
+            const node = (graph as Graph).getNodes().filter((one: Node) => one.getTitle() === "Business partners")[0];
+            node.firePress();
+        },
+        errorMessage: "The graph has no nodes to press"
+    });
+    Then.waitFor({
+        id: "dcEntitiesTable",
+        viewName: DETAIL_VIEW,
+        success: function () {
+            Opa5.assert.strictEqual(HashChanger.getInstance().getHash(), "data-catalog/odata/business-partners");
+        },
+        errorMessage: "The node did not open its source"
+    });
+
+    Then.iStopTheApp();
+});

@@ -204,7 +204,10 @@ export function kpiTile(widget, { theme = 'light' } = {}) {
   if (isNum(widget?.delta)) {
     const d = widget.delta;
     const dir = d > 0 ? 'up' : d < 0 ? 'down' : 'flat';
-    const status = dir === 'up' ? 'good' : dir === 'down' ? 'critical' : 'neutral';
+    // A verdict only when the spec says which way is good news: a rise in spend
+    // or errors must not read as good, and most figures carry no opinion at all.
+    const goodDir = widget.better === 'higher' ? 'up' : widget.better === 'lower' ? 'down' : null;
+    const status = !goodDir || dir === 'flat' ? 'neutral' : dir === goodDir ? 'good' : 'critical';
     const delta = el('div', `kpi-delta ${dir} ${status}`);
     const num = `${d > 0 ? '+' : d < 0 ? '−' : '±'}${formatValue(Math.abs(d))}${unit === '%' ? '%' : ''}`;
     const arrow = el('span', 'kpi-arrow', ARROW[dir]);

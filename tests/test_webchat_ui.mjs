@@ -813,10 +813,19 @@ console.log('\n== dashboards (addendum i) ==');
 
   // KPI tile
   const up = C.kpiTile({ type: 'kpi', title: 'Spend', value: 12900, unit: '€', delta: 4.2, delta_label: 'vs September', trend: [1, 3, 2, 5] });
-  check('KPI: hero value compact with the unit, delta up/good with the ▲ glyph and label', up.querySelector('.kpi-number').textContent === '12.9K' && up.querySelector('.kpi-unit').textContent === '€' && up.querySelector('.kpi-delta').classList.contains('up') && up.querySelector('.kpi-delta').classList.contains('good') && up.querySelector('.kpi-arrow').textContent === '▲' && up.querySelector('.kpi-delta-value').textContent === '+4.2' && up.querySelector('.kpi-delta-label').textContent === 'vs September');
+  check('KPI: hero value compact with the unit, delta up and neutral without `better`, with the ▲ glyph and label', up.querySelector('.kpi-number').textContent === '12.9K' && up.querySelector('.kpi-unit').textContent === '€' && up.querySelector('.kpi-delta').classList.contains('up') && up.querySelector('.kpi-delta').classList.contains('neutral') && !up.querySelector('.kpi-delta').classList.contains('good') && !up.querySelector('.kpi-delta-value').style.color && up.querySelector('.kpi-arrow').textContent === '▲' && up.querySelector('.kpi-delta-value').textContent === '+4.2' && up.querySelector('.kpi-delta-label').textContent === 'vs September');
   check('KPI: a sparkline, one 2 px line', up.querySelectorAll('.kpi-spark path[stroke-width="2"]').length === 1);
   const down = C.kpiTile({ type: 'kpi', title: 'Errors', value: '3 open', delta: -2, unit: '%' });
-  check('KPI: delta down/critical with ▼, value as given, no sparkline', down.querySelector('.kpi-delta').classList.contains('down') && down.querySelector('.kpi-delta').classList.contains('critical') && down.querySelector('.kpi-arrow').textContent === '▼' && down.querySelector('.kpi-delta-value').textContent === '−2%' && down.querySelector('.kpi-number').textContent === '3 open' && !down.querySelector('.kpi-spark'));
+  check('KPI: delta down and neutral without `better`, ▼, value as given, no sparkline', down.querySelector('.kpi-delta').classList.contains('down') && down.querySelector('.kpi-delta').classList.contains('neutral') && down.querySelector('.kpi-arrow').textContent === '▼' && down.querySelector('.kpi-delta-value').textContent === '−2%' && down.querySelector('.kpi-number').textContent === '3 open' && !down.querySelector('.kpi-spark'));
+
+  const statusOf = (delta, better) => {
+    const box = C.kpiTile({ type: 'kpi', title: 'T', value: 1, delta, better }).querySelector('.kpi-delta');
+    return ['good', 'critical', 'neutral'].filter((c) => box.classList.contains(c)).join();
+  };
+  check('KPI: higher is better, a rise is good and a fall critical', statusOf(5, 'higher') === 'good' && statusOf(-5, 'higher') === 'critical');
+  check('KPI: lower is better (spend, errors), a rise is critical and a fall good', statusOf(5, 'lower') === 'critical' && statusOf(-5, 'lower') === 'good');
+  check('KPI: no change is neutral whichever way is better', statusOf(0, 'higher') === 'neutral' && statusOf(0, 'lower') === 'neutral');
+  check('KPI: an unknown `better` is neutral', statusOf(5, 'sideways') === 'neutral');
 
   // dashboard body from a preview, table toggle
   const spec = { title: 'BTP spend <b>2026</b>', description: 'Six months.', widgets: [

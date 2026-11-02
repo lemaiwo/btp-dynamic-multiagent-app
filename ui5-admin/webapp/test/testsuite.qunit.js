@@ -20,6 +20,7 @@ sap.ui.define(function () {
             "unit/odataDestinations": { title: "Unit: odataDestinations" },
             "unit/odataImport": { title: "Unit: odataCatalog, import from $metadata" },
             "unit/oauthConfig": { title: "Unit: oauthConfig" },
+            "unit/dataCatalog": { title: "Unit: dataCatalog, the data catalogue pages" },
             "unit/odataEntry": { title: "Unit: odataEntry, the agent's OData services entry" },
             "unit/bitbucketEntry": { title: "Unit: bitbucketEntry" },
             "unit/gitEntry": { title: "Unit: gitEntry" },

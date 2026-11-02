@@ -242,6 +242,9 @@ class KpiWidget(_Strict):
     unit: Unit | None = None
     delta: Number | None = None
     delta_label: _text(MAX_DELTA_LABEL_CHARS) | None = None  # type: ignore[valid-type]
+    # Which way is good news. Absent means the data does not say: the delta is
+    # shown without a verdict (a rise in spend must not read as good).
+    better: Literal["higher", "lower"] | None = None
     trend: Annotated[list[Number], Len(0, MAX_TREND_POINTS)] | None = None
     size: Size = 1
 

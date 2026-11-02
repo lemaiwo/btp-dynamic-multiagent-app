@@ -1,0 +1,118 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.DataCatalogGraph"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core"
+    xmlns:ng="sap.suite.ui.commons.networkgraph"
+    xmlns:layout="sap.suite.ui.commons.networkgraph.layout">
+    <Page
+        id="dcGraphPage"
+        title="{i18n>dcGraphTitle}"
+        showNavButton="true"
+        enableScrolling="false"
+        navButtonPress=".onBack">
+        <subHeader>
+            <OverflowToolbar id="dcGraphToolbar">
+                <MultiComboBox
+                    id="dcGraphKinds"
+                    width="14rem"
+                    placeholder="{i18n>dcGraphKinds}"
+                    tooltip="{i18n>dcGraphKinds}"
+                    selectedKeys="{graphView>/kinds}"
+                    items="{ path: 'graphView>/kindOptions', templateShareable: false }"
+                    selectionFinish=".onFilterChange">
+                    <core:Item key="{graphView>key}" text="{graphView>text}" />
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" />
+                    </layoutData>
+                </MultiComboBox>
+                <Select
+                    id="dcGraphAgent"
+                    selectedKey="{graphView>/agent}"
+                    tooltip="{i18n>dcGraphAgent}"
+                    items="{ path: 'graphView>/agents', templateShareable: false }"
+                    change=".onFilterChange">
+                    <core:Item key="{graphView>key}" text="{graphView>text}" />
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" />
+                    </layoutData>
+                </Select>
+                <SearchField
+                    id="dcGraphSearch"
+                    width="16rem"
+                    value="{graphView>/q}"
+                    maxLength="200"
+                    placeholder="{i18n>dcGraphSearch}"
+                    search=".onFilterChange">
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" />
+                    </layoutData>
+                </SearchField>
+                <ToolbarSpacer />
+                <!-- The legend: one colour per source kind, the semantic colours
+                     the groups and nodes use (theme parameters, see statuses). -->
+                <HBox id="dcGraphLegend" alignItems="Center" renderType="Bare">
+                    <ObjectStatus icon="sap-icon://color-fill" state="Information" text="{i18n>dcKind_odata}" class="sapUiSmallMarginEnd" />
+                    <ObjectStatus icon="sap-icon://color-fill" state="Warning" text="{i18n>dcKind_ina}" class="sapUiSmallMarginEnd" />
+                    <ObjectStatus icon="sap-icon://color-fill" state="Success" text="{i18n>dcKind_generic}" />
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="Low" />
+                    </layoutData>
+                </HBox>
+            </OverflowToolbar>
+        </subHeader>
+        <content>
+            <MessageStrip
+                id="dcGraphCapped"
+                visible="{graph>/capped}"
+                type="Warning"
+                showIcon="true"
+                class="sapUiTinyMargin"
+                text="{i18n>dcGraphCapped}" />
+            <MessageStrip
+                id="dcGraphLoadFailed"
+                visible="{graphView>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiTinyMargin"
+                text="{graphView>/loadError}" />
+            <ng:Graph
+                id="dcGraph"
+                height="calc(100% - 1rem)"
+                width="100%"
+                enableWheelZoom="true"
+                orientation="LeftRight"
+                noDataText="{i18n>dcGraphNoData}"
+                graphReady=".onGraphReady"
+                nodes="{ path: 'graph>/nodes', templateShareable: false }"
+                lines="{ path: 'graph>/lines', templateShareable: false }"
+                groups="{ path: 'graph>/groups', templateShareable: false }">
+                <ng:statuses>
+                    <ng:Status key="dc-odata" title="{i18n>dcKind_odata}" backgroundColor="sapUiChartPaletteSequentialHue1Light3" borderColor="sapUiChartPaletteSequentialHue1" legendColor="sapUiChartPaletteSequentialHue1" headerContentColor="sapUiChartPaletteSequentialHue1Dark2" />
+                    <ng:Status key="dc-ina" title="{i18n>dcKind_ina}" backgroundColor="sapUiChartPaletteSemanticCriticalLight3" borderColor="sapUiChartPaletteSemanticCritical" legendColor="sapUiChartPaletteSemanticCritical" headerContentColor="sapUiChartPaletteSemanticCriticalDark2" />
+                    <ng:Status key="dc-generic" title="{i18n>dcKind_generic}" backgroundColor="sapUiChartPaletteSemanticGoodLight3" borderColor="sapUiChartPaletteSemanticGood" legendColor="sapUiChartPaletteSemanticGood" headerContentColor="sapUiChartPaletteSemanticGoodDark2" />
+                </ng:statuses>
+                <ng:layoutAlgorithm>
+                    <layout:LayeredLayout mergeEdges="true" nodePlacement="Simple" />
+                </ng:layoutAlgorithm>
+                <ng:nodes>
+                    <ng:Node
+                        key="{graph>key}"
+                        title="{graph>title}"
+                        description="{graph>description}"
+                        group="{graph>group}"
+                        status="{graph>status}"
+                        shape="{graph>shape}"
+                        maxWidth="220"
+                        press=".onNodePress" />
+                </ng:nodes>
+                <ng:lines>
+                    <ng:Line from="{graph>from}" to="{graph>to}" title="{graph>title}" description="{graph>description}" arrowOrientation="ParentOf" />
+                </ng:lines>
+                <ng:groups>
+                    <ng:Group key="{graph>key}" title="{graph>title}" status="{graph>status}" />
+                </ng:groups>
+            </ng:Graph>
+        </content>
+    </Page>
+</mvc:View>

@@ -6,6 +6,10 @@ import type {
     OrchestratorInfo, ReloadOutcome, ReloadResult, Skill, SkillInput, WhoAmI,
     Workflow, WorkflowDetail, WorkflowInput, WorkflowRun, WorkflowRunDetail
 } from "./types";
+import type {
+    DataGraph, DataHintsUpdate, DataNode, DataRebuildResult, DataSearchResult, DataSourceDetail, DataSourceKind,
+    DataSourceSummary
+} from "./dataCatalogTypes";
 
 /**
  * A non-2xx response from the admin API.
@@ -372,6 +376,48 @@ export default class AdminService {
     public testODataService(name: string): Promise<ODataTestResult> {
         return this.request<ODataTestResult>(`${AdminService.odataServicePath(name)}/test`, {
             method: "POST", ...AdminService.json({})
+        });
+    }
+
+    // --- data catalogue ---
+    // The catalogue graph of every data source agents reach
+    // (`/admin/api/data-catalog/...`). A source is addressed by its kind and
+    // name, a node by its id.
+
+    public listDataSources(): Promise<DataSourceSummary[]> {
+        return this.request<{ sources: DataSourceSummary[] }>("data-catalog/sources")
+            .then((answer) => answer.sources ?? []);
+    }
+
+    public getDataSource(kind: DataSourceKind | string, name: string): Promise<DataSourceDetail> {
+        return this.request<DataSourceDetail>(
+            `data-catalog/sources/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`);
+    }
+
+    /** Sends only the hints that change; answers the node as stored. A
+     *  refused value is a 422 whose `fieldErrors` name the field. */
+    public updateDataHints(id: number | string, body: DataHintsUpdate): Promise<DataNode> {
+        return this.request<DataNode>(`data-catalog/nodes/${encodeURIComponent(String(id))}/hints`, {
+            method: "PUT", ...AdminService.json(body)
+        });
+    }
+
+    /** The agents' retrieval for `question`, limited to `agent`'s sources when one is given. */
+    public searchDataCatalog(question: string, agent?: string): Promise<DataSearchResult> {
+        return this.request<DataSearchResult>("data-catalog/search", {
+            method: "POST", ...AdminService.json(agent ? { question, agent } : { question })
+        });
+    }
+
+    /** `query`: what `dataCatalog.graphQuery` builds ("" or "?agent=..."). */
+    public getDataGraph(query = ""): Promise<DataGraph> {
+        return this.request<DataGraph>(`data-catalog/graph${query}`);
+    }
+
+    /** Imports again every attached source, or the one named. */
+    public rebuildDataCatalog(source?: { kind: string; name: string }): Promise<DataRebuildResult> {
+        return this.request<DataRebuildResult>("data-catalog/rebuild", {
+            method: "POST", ...AdminService.json(source ? { source } : {})
         });
     }
 }

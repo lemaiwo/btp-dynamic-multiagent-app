@@ -4986,3 +4986,10 @@ def _clean_odata_entry(src: dict[str, Any]) -> dict[str, Any]:
     if src.get("allow_write") is True:
         cleaned["allow_write"] = True
     return cleaned
+
+
+# The data catalogue tables (agents/data_catalog/models.py) live in their own
+# package but must be on `Base.metadata` wherever the schema is used:
+# `create_all`, the HDI artifacts and the schema history script. Imported
+# last, once `Base` exists; that module imports nothing else of the app.
+import agents.data_catalog.models  # noqa: E402,F401

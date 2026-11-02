@@ -386,6 +386,16 @@ async def reload_after_catalogue_change(
     one app instance, or restart all instances after an edit that closes
     access: another instance keeps its build until it is reloaded.
     """
+    outcome = await _reload_if_in_use(names, referrers, what)
+    # The data catalogue graph follows the changed services (imported, or
+    # dropped when no enabled agent attaches them any more); never raises.
+    from agents.data_catalog.importer import rebuild_safely
+
+    await rebuild_safely([("odata", name) for name in names], what=what)
+    return outcome
+
+
+async def _reload_if_in_use(names: Any, referrers: dict[str, Any], what: str) -> dict[str, bool]:
     live = _live_registry()
     if live is None:
         return dict(NOT_RELOADED)

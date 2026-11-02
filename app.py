@@ -366,11 +366,17 @@ async def lifespan(app: FastAPI):
     if TOKEN_KEEPWARM_SECONDS > 0:
         keepwarm = asyncio.create_task(_token_keepwarm(TOKEN_KEEPWARM_SECONDS))
     ide_purge = asyncio.create_task(_ide_purge_loop(86400))
+    # The data catalogue graph follows the stored catalogue and agents
+    # (agents/data_catalog). In the background: embedding calls may take
+    # longer than a start is allowed to; rebuild_safely never raises.
+    from agents.data_catalog.importer import rebuild_safely
+
+    catalog_rebuild = asyncio.create_task(rebuild_safely(None, what="startup"))
     logger.info("Application startup complete")
     yield
     # Shutdown: cancel in-flight runs so each finalizes as `interrupted`
     # rather than being killed mid-await and leaving its row `running`.
-    for task in (heartbeat, keepwarm, ide_purge):
+    for task in (heartbeat, keepwarm, ide_purge, catalog_rebuild):
         if task is not None:
             task.cancel()
             with suppress(asyncio.CancelledError):

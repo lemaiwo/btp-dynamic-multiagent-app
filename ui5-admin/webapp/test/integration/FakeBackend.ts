@@ -4,6 +4,7 @@ import type {
     ODataServiceInput, ODataServiceSummary, ODataTestResult, ODataUsedBy, Skill, WorkflowDetail, WorkflowRunDetail
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
+import FakeDataCatalog from "./FakeDataCatalog";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
 export interface FailNext {
@@ -40,6 +41,8 @@ export default class FakeBackend {
      * definition on every answer, as the server does; `used_by` is kept on
      * the row, and a non-empty one refuses a delete. */
     public odataServices: ODataService[] = [];
+    /** The data catalogue routes (`data-catalog/...`), in a file of their own. */
+    public dataCatalog = new FakeDataCatalog();
     /** What POST odata/metadata answers, whatever the request names. */
     public metadataPreview!: ODataMetadataPreview;
     /** What POST odata/services/{name}/test answers. */
@@ -141,6 +144,7 @@ export default class FakeBackend {
         // that opens a fixture by a hardcoded id/hash, and `this.runs` below
         // already assumes btp-agent is id 100.
         this.nextId = 100;
+        this.dataCatalog.reset();
         this.requests = [];
         this.bodies = {};
         this.runNowCalls = [];
@@ -1646,6 +1650,11 @@ export default class FakeBackend {
             return this.json(failure.body, failure.status, failure.headers);
         }
 
+        const catalogue = this.dataCatalog.handle(path, method, body, query, (b, s) => this.json(b, s),
+            this.agents.map((agent) => agent.name));
+        if (catalogue) {
+            return catalogue;
+        }
         if (path === "whoami") {
             return this.json({ principal: "uuid-1234", label: "tester@example.com" });
         }

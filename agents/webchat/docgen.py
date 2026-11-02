@@ -710,11 +710,15 @@ async def create_dashboard(filename: str, title: str, widgets: list[dict[str, An
     x: column, y: [columns] (1-8 series; pie and scatter exactly 1, scatter
     needs a numeric x), stacked (bar/area), unit, format:
     number|percent|currency, size: 1|2, note}; kpi {type: kpi, title, value
-    (number or short text), unit, delta (number), delta_label, trend:
-    [numbers], size}; table {type: table, title, data, size}. Cells are
-    numbers, texts or null; y columns hold numbers or null only; one measure
-    per axis (never two units on one chart); dates as ISO strings
-    (YYYY-MM-DD)."""
+    (number or short text), unit, delta (number), delta_label, better:
+    higher|lower, trend: [numbers], size}; table {type: table, title, data,
+    size}. Cells are numbers, texts or null; y columns hold numbers or null
+    only; one measure per axis (never two units on one chart); dates as ISO
+    strings (YYYY-MM-DD). Do not assume: never add a currency or unit the data
+    or the user does not state (then use format number and no unit, in your
+    answer too), and set better only when it is clear which way is good news
+    (lower for spend, errors or backlog; higher for revenue or coverage); leave
+    it out otherwise."""
     ctx = current_chat_run.get()
     if ctx is None:
         return ERR_NO_CONTEXT

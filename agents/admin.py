@@ -1570,7 +1570,22 @@ async def _reload_for_changed_entry(before: Any, after: Any, what: str) -> dict[
     """
     if before == after:
         return dict(NOT_RELOADED)
-    return await reload_running_agents(f"{what} with a changed OData or Bitbucket entry")
+    outcome = await reload_running_agents(f"{what} with a changed OData or Bitbucket entry")
+    await _rebuild_data_catalog(before, after, what)
+    return outcome
+
+
+async def _rebuild_data_catalog(before: Any, after: Any, what: str) -> None:
+    """Bring the data catalogue graph up to date when an agent's
+    ``builtin:odata`` services changed (``agents.data_catalog``): the graph
+    holds only sources an enabled agent attaches. Never raises."""
+    odata_before = [s for s in before if s and isinstance(s[0], tuple)]
+    odata_after = [s for s in after if s and isinstance(s[0], tuple)]
+    if odata_before == odata_after:
+        return
+    from agents.data_catalog.importer import rebuild_safely
+
+    await rebuild_safely(None, what=what)
 
 
 def _entry_signatures(rows: Any) -> dict[str, Any]:
@@ -2878,6 +2893,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
                 "import with a changed OData or Bitbucket entry of an agent"
             )
 
+    # An import can attach, detach or change any source: the data catalogue
+    # graph is brought up to date as a whole (rare, and never raises).
+    from agents.data_catalog.importer import rebuild_safely
+
+    await rebuild_safely(None, what="import")
+
     return {
         **reload_outcome,
         "status": "imported",
@@ -3558,3 +3579,8 @@ router.include_router(_odata_router)
 from agents.notifications import router as _notifications_router  # noqa: E402
 
 router.include_router(_notifications_router)
+
+# The data catalogue graph (/admin/api/data-catalog), included the same way.
+from agents.data_catalog.routes import router as _data_catalog_router  # noqa: E402
+
+router.include_router(_data_catalog_router)

@@ -1063,6 +1063,46 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     `unknown_target`, `operation_disabled`, `no_destination_service`,
     `token_failed`, `list_failed`); a test that ran and failed is a 200 with
     `ok: false`
+- `agents/data_catalog/` — the **data catalogue graph** (design addendum j, part 1):
+  one graph of every data source attached to at least one enabled agent, built once
+  and scoped at query time, so an agent finds the right source without a prompt that
+  grows with the catalogue. Tables (HANA schema generation 8) `data_catalog_nodes`
+  (`kind` source|entity|field|function (|query|dimension|measure later), `source_kind`
+  odata (|ina|generic later), `source_name`, `name`, `label`, `purpose`, `not_for`,
+  `synonyms_json`, `examples_json`, `unit`, `readable`, `writable`, `is_key`,
+  `type_name`, `parent_id`, `updated_at`, `curated_at`), `data_catalog_edges` (`kind`
+  navigation|same_object|contains), `data_catalog_vectors` (float32 `LargeBinary` per
+  node and text hash; cosine in Python over the scoped set, no HANA vector type in v1).
+  `importer.py` turns an `odata_services` definition into nodes and edges (readable =
+  selectable, writable from the operations, `same_object` by entity type name) and is
+  incremental: an admin's hints (`curated_at` set) are never overwritten by a re-import,
+  `readable` can only be narrowed by a hint, never widened past the catalogue. Rebuilt
+  for the changed sources by `reload_after_catalogue_change`, by an agent save that
+  changes its OData services (`_reload_for_changed_entry`), after a bundle import, and
+  in the background at startup (`app.py`); failures are logged, never a 500 of the
+  save. `embeddings.py`: `AICORE_EMBEDDING_MODEL`, else `text-embedding-3-large` when
+  deployed, else the first deployed model named `*embedding*`, else none (lexical
+  ranking); through `gen_ai_hub`'s `AsyncOpenAI(proxy_client=...).embeddings`; only
+  names, labels, purpose, synonyms and examples are embedded, never data;
+  `DATA_CATALOG_EMBEDDINGS=0` switches it off (the test suite sets it). `search.py`
+  `find_sources(question, allowed_sources, tier, scope_tier, k=5)` filters to the
+  allowed sources BEFORE scoring (no leak of unattached sources through ranking or
+  empty results; an edge to a node outside the scope is dropped); `scope.py`: an
+  agent's scope is its own `builtin:odata` services. `tool.py`: the toolset
+  `data-catalog` with `find_data_source(question)` (≤ 5 candidates with hints, keys and
+  one-hop relations, or a fixed hint) and `list_data_sources()`, attached by
+  `registry.build_orchestrator` to every specialist with at least one usable source;
+  above 10 sources the `## OData services` instruction block becomes a `## Data
+  sources` heading naming the two tools. `routes.py` (`/admin/api/data-catalog`, each
+  route `require_admin`, raw JSON ≤ 64 KB, 422 `<field>: <rule>`): `GET /sources`,
+  `GET /sources/{kind}/{name}` (source, entities with fields, functions, edges with
+  their nodes, used_by), `PUT /nodes/{id}/hints` (label, purpose, not_for, synonyms ≤ 50,
+  examples ≤ 20, readable), `POST /search` ({question, agent?} → candidates, `scope`
+  agent|all), `GET /graph?agent=&kind=&q=` (≤ 2,000 nodes, `contains` edges, `truncated`),
+  `POST /rebuild` ({source?} → counts; 503 on failure). UI5 admin area "Data catalogue"
+  (list, detail with inline hints and test search, graph on
+  `sap.suite.ui.commons.networkgraph`). `tests/test_data_catalog.py`. Embeddings never
+  run against a real AI Core yet
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -1822,7 +1862,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     area | pie | scatter` with `data {columns ≤ 20, rows ≤ 2,000}`, `x`, `y`
     1..8 series (pie and scatter exactly one), `stacked` (bar/area only), `unit`,
     `format number|percent|currency`, `size 1|2`, `note`; `kpi` with `value`,
-    `delta`, `delta_label`, `trend ≤ 60`; `table`; 200,000 chars of JSON, 1 MiB
+    `delta`, `delta_label`, `better higher|lower` (absent: the delta carries no
+    good or bad colour), `trend ≤ 60`; `table`; 200,000 chars of JSON, 1 MiB
     stored; refusals `{"error": {code, message}}` with a 0-based place such as
     `widgets[3].y: not a column of data`) as a `chat_files` row of media type
     `application/vnd.sap-btp-agent.dashboard+json`, name `<filename>.dashboard.json`;
@@ -2323,7 +2364,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   variable, table or column (HANA schema generation unchanged); the credential of
   a remote is a BTP destination created per landscape; 2.33.0 adds dashboards
   (`create_dashboard`, `agents/webchat/dashboard.py`, drawn by the web chat's own
-  SVG renderer): no new resource, variable, table or column
+  SVG renderer): no new resource, variable, table or column; 2.34.0 adds the data
+  catalogue graph (`agents/data_catalog/`: three new tables, HANA schema generation 8,
+  optional `AICORE_EMBEDDING_MODEL` / `DATA_CATALOG_EMBEDDINGS`, not in the descriptor)
+  and the InA probe `scripts/probe_ina.py`
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

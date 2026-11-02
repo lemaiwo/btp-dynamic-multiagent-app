@@ -156,6 +156,8 @@ def test_a_good_spec_round_trips_as_compact_json_with_defaults():
      "widgets[1].trend[1]: must be a finite number"),
     (lambda s: s["widgets"][1].update(delta_label="d" * 61),
      "widgets[1].delta_label: at most 60 characters"),
+    (lambda s: s["widgets"][1].update(better="up"),
+     "widgets[1].better: must be one of higher or lower"),
     (lambda s: s["widgets"][1].update(size=True), "widgets[1].size: must be a number"),
     (lambda s: s["widgets"][1].update(data=DATA), "widgets[1].data: unknown key"),
     (lambda s: s["widgets"][2].update(x="month"), "widgets[2].x: unknown key"),
@@ -430,3 +432,22 @@ async def test_the_context_view_lists_the_tool_as_a_document_tool(client):
     assert r.status_code == 200, r.text
     documents = [t["name"] for t in r.json()["tools"] if t["kind"] == "document"]
     assert documents == list(docgen.TOOL_NAMES) and "create_dashboard" in documents
+
+
+def test_a_kpi_says_which_way_is_better_only_when_asked():
+    from agents.webchat.dashboard import parse_dashboard
+
+    base = {"type": "kpi", "title": "Spend", "value": 2620, "delta": 140}
+    plain = parse_dashboard(build_dashboard(validate_spec({"title": "T", "widgets": [base]})))
+    assert "better" not in plain["widgets"][0]
+    lower = {**base, "better": "lower"}
+    spec = parse_dashboard(build_dashboard(validate_spec({"title": "T", "widgets": [lower]})))
+    assert spec["widgets"][0]["better"] == "lower"
+
+
+def test_the_tool_tells_the_model_not_to_invent_a_currency_or_a_judgement():
+    from agents.webchat.docgen import create_dashboard
+
+    text = " ".join((create_dashboard.__doc__ or "").split())
+    assert "never add a currency or unit the data or the user does not state" in text
+    assert "better: higher|lower" in text

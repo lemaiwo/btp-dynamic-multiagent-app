@@ -135,9 +135,9 @@ def dashboard_spec(title: str = "BTP spend, dev landscape") -> dict:
         "title": title,
         "description": "Monthly spend of the three dev subaccounts from the entitlement export, May to October 2026.",
         "widgets": [
-            {"type": "kpi", "title": "Spend in October", "value": 2637, "unit": "€", "delta": 4.6, "delta_label": "vs September",
+            {"type": "kpi", "title": "Spend in October", "value": 2637, "unit": "€", "delta": 4.6, "delta_label": "vs September", "better": "lower",
              "trend": [2230, 2260, 2382, 2393, 2511, 2637], "size": 1},
-            {"type": "kpi", "title": "Unused entitlements", "value": 8, "unit": "", "delta": -3, "delta_label": "vs September",
+            {"type": "kpi", "title": "Unused entitlements", "value": 8, "unit": "", "delta": -3, "delta_label": "vs September", "better": "lower",
              "trend": [14, 13, 12, 11, 11, 8], "size": 1},
             {"type": "bar", "title": "Spend by service family", "data": {"columns": ["Month", "HANA Cloud", "Integration Suite", "Runtime"], "rows": spend},
              "x": "Month", "y": ["HANA Cloud", "Integration Suite", "Runtime"], "stacked": False, "unit": "€", "format": "currency", "size": 2,
