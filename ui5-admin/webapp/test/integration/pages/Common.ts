@@ -43,11 +43,14 @@ export default class Common extends Opa5 {
         // in the NEXT journey "not interactable" (OPA5's Interactable
         // matcher). destroy() (not close()) so no dialog's onClose handler
         // runs as a side effect of cleanup -- ErrorHandler's session-expired
-        // dialog reloads the page from onClose.
+        // dialog reloads the page from onClose. A Select's own picker (the
+        // Dialog it shows on a phone) is left alone: it belongs to the Select,
+        // goes with the component, and destroying it first makes the Select's
+        // next render throw ("valueStateText was destroyed").
         this.waitFor({
             success: function () {
                 Element.registry.filter(function (element) {
-                    return element.isA("sap.m.Dialog");
+                    return element.isA("sap.m.Dialog") && !element.getParent()?.isA("sap.m.Select");
                 }).forEach(function (element) {
                     (element as Dialog).destroy();
                 });

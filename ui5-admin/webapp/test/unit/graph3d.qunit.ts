@@ -1,5 +1,5 @@
 import graph3d, {
-    DASH, draw, drawList, hitTest, initialView, layout, project, rotate, step, zoomed
+    DASH, LABEL_FONT, THEME_COLOURS, draw, drawList, hitTest, initialView, layout, project, rotate, step, themeColours, zoomed
 } from "com/agent/admin/model/graph3d";
 import type { Canvas2d, Colours3d, DrawItem, Layout, Placed, Projected, View3d } from "com/agent/admin/model/graph3d";
 import { graphModel } from "com/agent/admin/model/dataCatalog";
@@ -128,6 +128,22 @@ QUnit.test("contains lines that loop do not lose a node", function (assert) {
     assert.ok(placed.points.every((p) => Number.isFinite(p.x + p.y + p.z)));
 });
 
+QUnit.test("one source: at the ring's first place, its entity around it, the field around that", function (assert) {
+    const placed = layout(graphModel({
+        nodes: [graphNode(1, "source", "pr"), graphNode(2, "entity", "pr"), graphNode(3, "field", "pr")],
+        edges: [contains(1, 2), contains(2, 3)]
+    }));
+    assert.strictEqual(placed.ring, 120, "one source: the floor");
+    const source = pointOf(placed, "1");
+    close(assert, source.x, 120, "x");
+    close(assert, source.y, 0, "y");
+    close(assert, source.z, 0, "z");
+    close(assert, distance(pointOf(placed, "2"), source), 45, "the entity on its source's ring");
+    close(assert, distance(pointOf(placed, "3"), pointOf(placed, "2")), 18, "the field on its entity's ring");
+    const shown = project(placed, initialView(800, 600));
+    assert.ok(shown.every((p) => [p.x, p.y, p.depth, p.radius].every(Number.isFinite)), "drawn at finite places");
+});
+
 QUnit.module("graph3d: the projection");
 
 function at(x: number, y: number, z: number, kind: DataNodeKind = "entity", key = "p"): Placed {
@@ -193,13 +209,23 @@ QUnit.test("a zoom that is no number is taken as 1", function (assert) {
     assert.deepEqual(project(placed, view({ zoom: 0 })), project(placed, view()));
 });
 
+QUnit.test("a yaw, pitch or zoom that is no finite number is taken as 0, 0 and 1", function (assert) {
+    const placed: Layout = { points: [at(100, 20, -30)], ring: 120 };
+    const plain = project(placed, view());
+    [NaN, Infinity, -Infinity].forEach((bad) => {
+        assert.deepEqual(project(placed, view({ yaw: bad })), plain, `yaw ${bad}`);
+        assert.deepEqual(project(placed, view({ pitch: bad })), plain, `pitch ${bad}`);
+        assert.deepEqual(project(placed, view({ zoom: bad })), plain, `zoom ${bad}`);
+    });
+});
+
 QUnit.module("graph3d: the hit test");
 
 function projected(key: string, x: number, y: number, radius: number, depth = 0): Projected {
     return { key, kind: "entity", x, y, radius, depth };
 }
 
-QUnit.test("the nearest centre within radius + 4 px wins", function (assert) {
+QUnit.test("at one depth the nearest centre within radius + 4 px wins", function (assert) {
     const list = [projected("a", 100, 100, 6), projected("b", 110, 100, 6)];
     assert.strictEqual(hitTest(list, 103, 100)?.key, "a");
     assert.strictEqual(hitTest(list, 108, 100)?.key, "b");
@@ -212,6 +238,16 @@ QUnit.test("at the same distance the nearer node, drawn on top, wins", function 
     const list = [projected("behind", 100, 100, 6, 40), projected("front", 100, 100, 6, -40)];
     assert.strictEqual(hitTest(list, 101, 100)?.key, "front");
     assert.strictEqual(hitTest(list.slice().reverse(), 101, 100)?.key, "front", "whatever the order");
+});
+
+QUnit.test("among the nodes under the pointer the front-most wins, even over a nearer centre", function (assert) {
+    // A big near node drawn over a small far one; the pointer is on the far one's centre.
+    const list = [projected("far", 106, 100, 3, 50), projected("near", 100, 100, 12, -50)];
+    assert.strictEqual(hitTest(list, 106, 100)?.key, "near", "the node drawn on top");
+    assert.strictEqual(hitTest(list.slice().reverse(), 106, 100)?.key, "near", "whatever the order");
+    assert.strictEqual(hitTest(list, 121, 100), null, "beyond both");
+    assert.strictEqual(hitTest([projected("far", 106, 100, 3, 50), projected("near", 80, 100, 6, -50)], 106, 100)?.key,
+        "far", "a near node the pointer is not on does not take the hit");
 });
 
 QUnit.module("graph3d: the draw list");
@@ -245,8 +281,24 @@ QUnit.test("far before near, nodes and lines alike", function (assert) {
     const list = drawList(catalogue(), view({ yaw: 0.9, pitch: 0.2 }), COLOURS);
     const nodeDepths = nodes(list).map((n) => n.depth);
     const lineDepths = lines(list).map((l) => l.depth);
+    assert.ok(new Set(nodeDepths).size > 1, "the nodes lie at several depths, so the order means something");
+    assert.ok(new Set(lineDepths).size > 1, "and so do the lines");
     assert.ok(nodeDepths.every((d, i) => i === 0 || d <= nodeDepths[i - 1]), "nodes far to near");
     assert.ok(lineDepths.every((d, i) => i === 0 || d <= lineDepths[i - 1]), "lines far to near");
+});
+
+QUnit.test("a layout computed once is drawn as given", function (assert) {
+    const model = catalogue();
+    const v = view({ yaw: 0.3, pitch: 0.4 });
+    const placed = layout(model);
+    assert.deepEqual(drawList(model, v, COLOURS, placed), drawList(model, v, COLOURS), "the same list as without it");
+    const moved: Layout = { ring: placed.ring, points: placed.points.map((p) => ({ ...p, x: p.x + 30 })) };
+    const expected = project(moved, v);
+    nodes(drawList(model, v, COLOURS, moved)).forEach((node) => {
+        const p = expected.filter((one) => one.key === node.key)[0];
+        close(assert, node.x, p.x, `node ${node.key} where the given layout puts it (x)`);
+        close(assert, node.y, p.y, `node ${node.key} (y)`);
+    });
 });
 
 QUnit.test("curated lines are dashed, contains lines faint", function (assert) {
@@ -286,11 +338,18 @@ QUnit.test("labels: every source, and the hovered node with its kind", function 
 
 QUnit.module("graph3d: drawing");
 
-interface Call { name: string; args: unknown[] }
+/** The context's state when a call was made. */
+interface Style { fillStyle: unknown; strokeStyle: unknown; globalAlpha: number; lineWidth: number; font: string }
+interface Call { name: string; args: unknown[]; style: Style }
 
 function recorder(): { ctx: Canvas2d; calls: Call[] } {
     const calls: Call[] = [];
-    const record = (name: string) => (...args: unknown[]) => { calls.push({ name, args }); };
+    const record = (name: string) => (...args: unknown[]) => {
+        calls.push({
+            name, args,
+            style: { fillStyle: ctx.fillStyle, strokeStyle: ctx.strokeStyle, globalAlpha: ctx.globalAlpha, lineWidth: ctx.lineWidth, font: ctx.font }
+        });
+    };
     const ctx: Canvas2d = {
         fillStyle: "", strokeStyle: "", globalAlpha: 1, lineWidth: 1, font: "", textAlign: "start", textBaseline: "alphabetic",
         save: record("save"), restore: record("restore"), beginPath: record("beginPath"), moveTo: record("moveTo"),
@@ -309,7 +368,8 @@ QUnit.test("a line, a node and a label are painted in that order", function (ass
         { type: "label", key: "1", text: "Purchase requisitions", x: 24, y: 20, colour: "#333" }
     ];
     draw(ctx, list);
-    const painting = calls.filter((c) => ["moveTo", "lineTo", "arc", "fillText", "setLineDash"].indexOf(c.name) !== -1);
+    const painting = calls.filter((c) => ["moveTo", "lineTo", "arc", "fillText", "setLineDash"].indexOf(c.name) !== -1)
+        .map(({ name, args }) => ({ name, args }));
     assert.deepEqual(painting, [
         { name: "moveTo", args: [1, 2] }, { name: "lineTo", args: [3, 4] }, { name: "setLineDash", args: [DASH] },
         { name: "moveTo", args: [5, 6] }, { name: "lineTo", args: [7, 8] }, { name: "setLineDash", args: [[]] },
@@ -322,6 +382,22 @@ QUnit.test("a line, a node and a label are painted in that order", function (ass
         "beginPath", "arc", "fill", "fillText", "restore"
     ], "each shape its own path, the context's state put back at the end");
     assert.ok(CONTEXT_FITS);
+});
+
+QUnit.test("each line, node and label is painted in its own style", function (assert) {
+    const { ctx, calls } = recorder();
+    draw(ctx, [
+        { type: "line", from: "1", to: "2", x1: 1, y1: 2, x2: 3, y2: 4, colour: "#111", alpha: 0.25, width: 1, dashed: true, depth: 5 },
+        { type: "node", key: "1", kind: "source", x: 10, y: 20, radius: 10, colour: "#222", depth: 0, hover: false, outline: "#333" },
+        { type: "label", key: "1", text: "Purchase requisitions", x: 24, y: 20, colour: "#444" }
+    ]);
+    const at = (name: string) => calls.filter((c) => c.name === name)[0].style;
+    assert.deepEqual(at("stroke"),
+        { fillStyle: "", strokeStyle: "#111", globalAlpha: 0.25, lineWidth: 1, font: LABEL_FONT }, "the line: its colour, alpha and width");
+    assert.deepEqual(at("fill"),
+        { fillStyle: "#222", strokeStyle: "#111", globalAlpha: 1, lineWidth: 1, font: LABEL_FONT }, "the node: its colour, at full alpha");
+    assert.deepEqual(at("fillText"),
+        { fillStyle: "#444", strokeStyle: "#111", globalAlpha: 1, lineWidth: 1, font: LABEL_FONT }, "the label: its colour and the label font");
 });
 
 QUnit.test("a hovered node gets a solid ring", function (assert) {
@@ -374,4 +450,21 @@ QUnit.test("the first view looks slightly from above and turns by itself", funct
     const v = initialView(640, 480);
     assert.deepEqual(v, { yaw: 0, pitch: 0.35, zoom: 1, width: 640, height: 480, touched: false, hover: null });
     assert.strictEqual(graph3d.layout, layout, "the default export carries the functions");
+});
+
+QUnit.module("graph3d: the theme colours");
+
+QUnit.test("the theme's values, Horizon's where the theme gives none", function (assert) {
+    const horizon: Colours3d = { odata: "#168eff", ina: "#e26300", generic: "#30914c", line: "#556b82", text: "#131e29" };
+    assert.deepEqual(themeColours(undefined), horizon, "no answer: Horizon's");
+    assert.deepEqual(themeColours("#000000"), horizon, "an answer that is no map");
+    assert.deepEqual(themeColours({
+        sapUiChartPaletteSequentialHue1: "#0a6ed1", sapUiChartPaletteSemanticCritical: " ", sapUiChartPaletteSemanticGood: 7,
+        sapUiContentLabelColor: "#6a6d70", sapUiBaseText: "#32363a"
+    }), { odata: "#0a6ed1", ina: "#e26300", generic: "#30914c", line: "#6a6d70", text: "#32363a" },
+    "a blank or non-text value keeps Horizon's");
+    assert.deepEqual(Object.keys(THEME_COLOURS).sort(), ["generic", "ina", "line", "odata", "text"], "one parameter per colour");
+    assert.strictEqual(THEME_COLOURS.odata[0], "sapUiChartPaletteSequentialHue1", "the 2D legend's colours");
+    assert.strictEqual(THEME_COLOURS.ina[0], "sapUiChartPaletteSemanticCritical");
+    assert.strictEqual(THEME_COLOURS.generic[0], "sapUiChartPaletteSemanticGood");
 });

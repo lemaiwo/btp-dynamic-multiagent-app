@@ -23,6 +23,7 @@ import "./ODataImportJourney";
 import "./ODataDestinationJourney";
 import "./InaJourney";
 import "./DataCatalogJourney";
+import "./DataCatalogGraph3dJourney";
 import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
 import "./ReloadJourney";

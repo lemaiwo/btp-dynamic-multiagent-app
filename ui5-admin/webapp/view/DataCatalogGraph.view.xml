@@ -48,6 +48,21 @@
                         <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" />
                     </layoutData>
                 </SearchField>
+                <!-- 2D (the network graph, the accessible view) or 3D (the
+                     canvas the controller draws with model/graph3d). -->
+                <SegmentedButton
+                    id="dcGraphMode"
+                    selectedKey="{graphView>/mode}"
+                    tooltip="{i18n>dcGraphMode}"
+                    selectionChange=".onModeChange">
+                    <items>
+                        <SegmentedButtonItem key="2d" text="{i18n>dcGraph2d}" />
+                        <SegmentedButtonItem key="3d" text="{i18n>dcGraph3d}" />
+                    </items>
+                    <layoutData>
+                        <OverflowToolbarLayoutData priority="NeverOverflow" />
+                    </layoutData>
+                </SegmentedButton>
                 <ToolbarSpacer />
                 <!-- The legend: one colour per source kind, the semantic colours
                      the groups and nodes use (theme parameters, see statuses). -->
@@ -78,6 +93,7 @@
                 text="{graphView>/loadError}" />
             <ng:Graph
                 id="dcGraph"
+                visible="{= ${graphView>/mode} === '2d'}"
                 height="calc(100% - 1rem)"
                 width="100%"
                 enableWheelZoom="true"
@@ -107,12 +123,20 @@
                         press=".onNodePress" />
                 </ng:nodes>
                 <ng:lines>
-                    <ng:Line from="{graph>from}" to="{graph>to}" title="{graph>title}" description="{graph>description}" arrowOrientation="ParentOf" />
+                    <ng:Line from="{graph>from}" to="{graph>to}" title="{graph>title}" description="{graph>description}" arrowOrientation="ParentOf"
+                        lineType="{= ${graph>curated} ? 'Dashed' : 'Solid'}" />
                 </ng:lines>
                 <ng:groups>
                     <ng:Group key="{graph>key}" title="{graph>title}" status="{graph>status}" />
                 </ng:groups>
             </ng:Graph>
+            <!-- The canvas is sized, wired and drawn by onCanvasRendered; its
+                 label says the 2D view holds the same nodes. -->
+            <core:HTML
+                id="dcGraph3d"
+                visible="{= ${graphView>/mode} === '3d'}"
+                content="&lt;canvas class=&quot;dcCanvas3d&quot; role=&quot;img&quot; aria-label=&quot;{i18n>dcGraph3dAria}&quot;&gt;&lt;/canvas&gt;"
+                afterRendering=".onCanvasRendered" />
         </content>
     </Page>
 </mvc:View>

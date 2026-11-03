@@ -262,3 +262,14 @@ html.sapUiTheme-sap_horizon .odataFieldConfirm.sapMFlexBox {
     font-size: 0.75rem;
     color: var(--sapContent_LabelColor);
 }
+
+/* The 3D overview of the data catalogue graph (DataCatalogGraph): the
+   canvas takes the network graph's place; the controller sizes its pixels
+   to this box. No touch scrolling on it: a drag turns the view. */
+.dcCanvas3d {
+    width: 100%;
+    height: calc(100% - 1rem);
+    display: block;
+    touch-action: none;
+    cursor: grab;
+}

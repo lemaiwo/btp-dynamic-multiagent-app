@@ -7,7 +7,8 @@ import type { DataNodeKind } from "../service/dataCatalogTypes";
  * pure; `draw` paints a draw list on anything shaped like a 2D canvas
  * context. No DOM and no UI5 here: the controller sizes the canvas, clears
  * it, feeds pointer events to `rotate` / `zoomed` / `hitTest` and calls
- * `draw(ctx, drawList(...))` per frame.
+ * `draw(ctx, drawList(...))` per frame, with the `layout` it made once per
+ * graph it was given.
  *
  * Layout: one place per source (per group, so the nodes of a source the
  * kind filter hides still circle that place) on a ring in the horizontal
@@ -90,6 +91,29 @@ export interface Colours3d {
     line: string;
     /** Labels and the ring around the hovered node. */
     text: string;
+}
+
+/** The theme parameter of each colour (the 2D legend's for the kinds), and Horizon's value of it. */
+export const THEME_COLOURS: Readonly<Record<keyof Colours3d, readonly [string, string]>> = {
+    odata: ["sapUiChartPaletteSequentialHue1", "#168eff"],
+    ina: ["sapUiChartPaletteSemanticCritical", "#e26300"],
+    generic: ["sapUiChartPaletteSemanticGood", "#30914c"],
+    line: ["sapUiContentLabelColor", "#556b82"],
+    text: ["sapUiBaseText", "#131e29"]
+};
+
+/** The colours from what the theme answered for the names of `THEME_COLOURS`
+ *  (a map by name); a missing, blank or non-text value keeps Horizon's. */
+export function themeColours(values: unknown): Colours3d {
+    const given = typeof values === "object" && values !== null ? values as Record<string, unknown> : {};
+    const pick = ([name, horizon]: readonly [string, string]): string => {
+        const value = given[name];
+        return typeof value === "string" && value.trim() !== "" ? value.trim() : horizon;
+    };
+    return {
+        odata: pick(THEME_COLOURS.odata), ina: pick(THEME_COLOURS.ina), generic: pick(THEME_COLOURS.generic),
+        line: pick(THEME_COLOURS.line), text: pick(THEME_COLOURS.text)
+    };
 }
 
 /** The part of `CanvasRenderingContext2D` that `draw` uses. */
@@ -288,14 +312,17 @@ function cutLoops(parent: Map<string, string>): void {
  * origin with focal length `FOCAL`. A radius is scaled by f / (f + z), z
  * the depth on the screen's scale (which is d / (d + depth) in world units),
  * so a node on the centre plane keeps its radius by kind; zoom scales all.
+ * A yaw, pitch or zoom that is no finite number counts as 0, 0 and 1.
  */
 export function project(placed: Layout, view: View3d): Projected[] {
     const camera = CAMERA_RINGS * placed.ring;
     const zoom = view.zoom > 0 && Number.isFinite(view.zoom) ? view.zoom : 1;
-    const cosYaw = Math.cos(view.yaw || 0);
-    const sinYaw = Math.sin(view.yaw || 0);
-    const cosPitch = Math.cos(view.pitch || 0);
-    const sinPitch = Math.sin(view.pitch || 0);
+    const yaw = Number.isFinite(view.yaw) ? view.yaw : 0;
+    const pitch = Number.isFinite(view.pitch) ? view.pitch : 0;
+    const cosYaw = Math.cos(yaw);
+    const sinYaw = Math.sin(yaw);
+    const cosPitch = Math.cos(pitch);
+    const sinPitch = Math.sin(pitch);
     const cx = view.width / 2;
     const cy = view.height / 2;
     return placed.points.map((p) => {
@@ -312,7 +339,11 @@ export function project(placed: Layout, view: View3d): Projected[] {
     });
 }
 
-/** The node under (x, y): the nearest centre within its radius plus `HIT_SLACK`; at equal distance the nearer node. */
+/**
+ * The node under (x, y): of the nodes whose radius plus `HIT_SLACK` reaches
+ * the point, the front-most (smallest depth: the one drawn on top); at equal
+ * depth the nearest centre.
+ */
 export function hitTest(projected: readonly Projected[], x: number, y: number): Projected | null {
     let best: Projected | null = null;
     let bestDistance = Infinity;
@@ -321,7 +352,7 @@ export function hitTest(projected: readonly Projected[], x: number, y: number): 
         if (distance > p.radius + HIT_SLACK) {
             continue;
         }
-        if (distance < bestDistance || (distance === bestDistance && best !== null && p.depth < best.depth)) {
+        if (best === null || p.depth < best.depth || (p.depth === best.depth && distance < bestDistance)) {
             best = p;
             bestDistance = distance;
         }
@@ -344,10 +375,11 @@ function farFirst(a: { depth: number }, b: { depth: number }): number {
  * What to paint, in order: the lines far to near (`contains` faint, the
  * others full, curated ones dashed), the nodes far to near in their source
  * kind's colour, then the labels: every source's name, and the hovered
- * node's name and kind last, so it is on top.
+ * node's name and kind last, so it is on top. `placed` is the model's
+ * layout, made once per model by a caller that draws it many times.
  */
-export function drawList(model: GraphModel, view: View3d, colours: Colours3d): DrawItem[] {
-    const projected = project(layout(model), view);
+export function drawList(model: GraphModel, view: View3d, colours: Colours3d, placed: Layout = layout(model)): DrawItem[] {
+    const projected = project(placed, view);
     const at = new Map<string, Projected>();
     projected.forEach((p) => at.set(p.key, p));
     const nodeOf = new Map<string, GraphModel["nodes"][number]>();
@@ -473,5 +505,5 @@ export function zoomed(view: View3d, deltaY: number): View3d {
 }
 
 export default {
-    layout, project, hitTest, drawList, draw, step, rotate, zoomed, initialView, radiusOf, ringRadius
+    layout, project, hitTest, drawList, draw, step, rotate, zoomed, initialView, radiusOf, ringRadius, themeColours
 };
