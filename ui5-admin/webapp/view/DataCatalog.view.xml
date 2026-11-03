@@ -1,7 +1,8 @@
 <mvc:View
     controllerName="com.agent.admin.controller.DataCatalog"
     xmlns="sap.m"
-    xmlns:mvc="sap.ui.core.mvc">
+    xmlns:mvc="sap.ui.core.mvc"
+    xmlns:core="sap.ui.core">
     <Page id="dataCatalogPage" title="{i18n>navDataCatalog}">
         <headerContent>
             <Button
@@ -35,7 +36,7 @@
                 popinLayout="GridSmall"
                 contextualWidth="Auto"
                 autoPopinMode="true"
-                noDataText="{ parts: ['view>/loadFailed', 'view>/query'], formatter: '.formatNoData' }">
+                noDataText="{ parts: ['view>/loadFailed', 'view>/query', 'view>/kind'], formatter: '.formatNoData' }">
                 <headerToolbar>
                     <OverflowToolbar>
                         <SearchField
@@ -47,6 +48,24 @@
                                 <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" maxWidth="18rem" />
                             </layoutData>
                         </SearchField>
+                        <!-- One kind of source, or all; applied together with the search.
+                             On a narrow screen it goes into the overflow before the
+                             rebuild buttons do. -->
+                        <Select
+                            id="dcKindFilter"
+                            selectedKey="{view>/kind}"
+                            tooltip="{i18n>dcKindFilter}"
+                            ariaLabelledBy="dcKindFilterText"
+                            change=".onKindFilter">
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="Low" />
+                            </layoutData>
+                            <core:Item key="" text="{i18n>dcKindAll}" />
+                            <core:Item key="odata" text="{i18n>dcKind_odata}" />
+                            <core:Item key="ina" text="{i18n>dcKind_ina}" />
+                            <core:Item key="generic" text="{i18n>dcKind_generic}" />
+                        </Select>
+                        <core:InvisibleText id="dcKindFilterText" text="{i18n>dcKindFilter}" />
                         <ToolbarSpacer />
                         <Button
                             id="dcRebuildSelected"
@@ -70,7 +89,8 @@
                          moves columns into the row by importance, keeping autoPopinWidth
                          (rem) free for it. Breakpoints by hand did not hold: they missed
                          at a narrower window. -->
-                    <Column width="5rem" importance="High"><Text text="{i18n>dcColKind}" /></Column>
+                    <!-- Wide enough for "InA query" on one line. -->
+                    <Column width="7rem" importance="High"><Text text="{i18n>dcColKind}" /></Column>
                     <Column autoPopinWidth="12" importance="High"><Text text="{i18n>dcColSource}" /></Column>
                     <Column width="9rem" importance="Medium"><Text text="{i18n>odataColDestination}" /></Column>
                     <Column width="8rem" importance="Medium"><Text text="{i18n>odataColRunsAs}" /></Column>

@@ -1,7 +1,7 @@
 import odataCatalog from "./odataCatalog";
 import type {
-    DataEdge, DataEdgeEnd, DataGraph, DataHintsUpdate, DataNode, DataNodeKind, DataSearchCandidate, DataSourceDetail,
-    DataSourceKind
+    DataEdge, DataEdgeEnd, DataGraph, DataHintsUpdate, DataLinkKind, DataNode, DataNodeKind, DataSearchCandidate,
+    DataSourceDetail, DataSourceKind
 } from "../service/dataCatalogTypes";
 
 /**
@@ -60,15 +60,33 @@ export function displayName(node: { label?: string | null; name: string }): stri
     return (node.label ?? "").trim() || node.name;
 }
 
-/** One line of the entity and field table of the detail page. */
+/** The icon of each node kind on the detail page and in the link search. */
+const NODE_ICONS: Record<string, string> = {
+    source: "sap-icon://database",
+    entity: "sap-icon://table-view",
+    field: "sap-icon://text-formatting",
+    query: "sap-icon://multiple-bar-chart",
+    dimension: "sap-icon://dimension",
+    measure: "sap-icon://measure",
+    function: "sap-icon://fx"
+};
+
+/** The icon of a node kind; a kind this page does not know gets a plain document. */
+export function nodeIcon(kind: DataNodeKind): string {
+    return Object.prototype.hasOwnProperty.call(NODE_ICONS, kind) ? NODE_ICONS[kind] : "sap-icon://document";
+}
+
+/** One line of the entity and field table of the detail page (for an InA
+ *  source: the query and its dimensions and measures). */
 export interface EntityRow {
     id: number | string;
-    /** 0 for an entity (or query), 1 for its fields. */
+    /** 0 for an entity (or query, or function), 1 for its fields (or the query's members). */
     depth: number;
     kind: DataNodeKind;
     name: string;
-    /** The entity a field belongs to, by name; the entity itself for an entity row. */
+    /** The entity (or query) a row belongs to, by name; its own name for a row at depth 0. */
     entity: string;
+    icon: string;
     label: string;
     /** The label as stored, to tell an edit from what is there. */
     savedLabel: string;
@@ -85,7 +103,7 @@ export interface EntityRow {
 
 function rowOf(node: DataNode, depth: number, entity: string): EntityRow {
     return {
-        id: node.id, depth, kind: node.kind, name: node.name, entity,
+        id: node.id, depth, kind: node.kind, name: node.name, entity, icon: nodeIcon(node.kind),
         label: node.label ?? "", savedLabel: node.label ?? "", purpose: node.purpose ?? "",
         unit: node.unit ?? "", readable: node.readable === true, writable: node.writable === true,
         isKey: node.is_key === true, typeName: node.type_name ?? "",
@@ -94,31 +112,55 @@ function rowOf(node: DataNode, depth: number, entity: string): EntityRow {
 }
 
 /** Each entity followed by its fields, in the order of the answer, then
- *  the source's functions (one level, like an entity without fields). */
-export function entityRows(detail: Pick<DataSourceDetail, "entities" | "functions">): EntityRow[] {
+ *  the source's functions (one level, like an entity without fields). An
+ *  InA source: its query, followed by its dimensions and then its measures. */
+export function entityRows(detail: Pick<DataSourceDetail, "entities" | "functions" | "query">): EntityRow[] {
     const rows: EntityRow[] = [];
     (detail.entities ?? []).forEach((entry) => {
         rows.push(rowOf(entry.node, 0, entry.node.name));
         (entry.fields ?? []).forEach((field) => rows.push(rowOf(field, 1, entry.node.name)));
     });
     (detail.functions ?? []).forEach((fn) => rows.push(rowOf(fn, 0, fn.name)));
+    if (detail.query) {
+        const query = detail.query.node;
+        rows.push(rowOf(query, 0, query.name));
+        (detail.query.dimensions ?? []).concat(detail.query.measures ?? [])
+            .forEach((member) => rows.push(rowOf(member, 1, query.name)));
+    }
     return rows;
 }
 
-/** One relation as the detail page lists it. */
+/** The edge kinds of the catalogue (`EDGE_KINDS` of agents/data_catalog/models.py). */
+const EDGE_KINDS: readonly string[] = ["navigation", "association", "foreign_key", "same_object", "aggregates"];
+
+/** The kinds of link an admin may draw (`CURATED_EDGE_KINDS`), in the order the Select offers them. */
+export const LINK_KINDS: readonly DataLinkKind[] = ["same_object", "aggregates"];
+
+/** The i18n key of a relation's kind; "" for a kind the catalogue does not name (shown as it is). */
+export function relationKindKey(kind: string): string {
+    return EDGE_KINDS.indexOf(kind) === -1 ? "" : `dcRelKind_${kind}`;
+}
+
+/** One relation as the Links table of the detail page lists it. */
 export interface RelationRow {
+    /** What `DELETE data-catalog/edges/{id}` takes. */
+    id: number | string;
     kind: string;
     label: string;
     from: string;
     to: string;
+    /** An admin drew it: only such a link can be removed (an import made the others). */
+    curated: boolean;
+    /** "Added by an admin" or "Imported"; the i18n key when no text function is given. */
+    origin: string;
 }
 
-/** The edges of a source with the names of both ends: the node the edge
- *  carries (`from_node` / `to_node`), else the node of the answer, else the
- *  id. An end in another source is named with that source. */
-export function relationRows(
-    detail: Pick<DataSourceDetail, "source" | "entities" | "edges" | "functions">
-): RelationRow[] {
+/** The text of the origin of a link. */
+export type TextOf = (key: string) => string;
+
+/** The nodes of the answer by id, with the names the detail page gives them:
+ *  a field (or a query's member) after its entity's (or query's) name. */
+function ownNames(detail: Pick<DataSourceDetail, "source" | "entities" | "functions" | "query">): Record<string, string> {
     const names: Record<string, string> = {};
     const note = (node: DataNode, prefix = ""): void => {
         names[String(node.id)] = prefix + displayName(node);
@@ -131,6 +173,24 @@ export function relationRows(
         (entry.fields ?? []).forEach((field) => note(field, `${displayName(entry.node)}.`));
     });
     (detail.functions ?? []).forEach((fn) => note(fn));
+    if (detail.query) {
+        const query = detail.query.node;
+        note(query);
+        (detail.query.dimensions ?? []).concat(detail.query.measures ?? [])
+            .forEach((member) => note(member, `${displayName(query)}.`));
+    }
+    return names;
+}
+
+/** The edges of a source with the names of both ends: the node of the
+ *  answer, else the node the edge carries (`from_node` / `to_node`), else
+ *  the id. An end in another source is named "source · node". `curated` only
+ *  for the boolean `true`: a remove is offered on nothing else. */
+export function relationRows(
+    detail: Pick<DataSourceDetail, "source" | "entities" | "edges" | "functions" | "query">,
+    text: TextOf = (key) => key
+): RelationRow[] {
+    const names = ownNames(detail);
     const own = detail.source ? detail.source.source_name : "";
     const end = (id: number | string, carried: DataEdgeEnd | null | undefined): string => {
         if (names[String(id)] !== undefined) {
@@ -138,16 +198,88 @@ export function relationRows(
         }
         if (carried) {
             const name = displayName(carried);
-            return carried.source_name && carried.source_name !== own ? `${name} (${carried.source_name})` : name;
+            return carried.source_name && carried.source_name !== own ? `${carried.source_name} · ${name}` : name;
         }
         return String(id);
     };
-    return (detail.edges ?? []).map((edge: DataEdge) => ({
-        kind: edge.kind,
-        label: edge.label ?? "",
-        from: end(edge.from, edge.from_node),
-        to: end(edge.to, edge.to_node)
-    }));
+    return (detail.edges ?? []).map((edge: DataEdge) => {
+        const curated = edge.curated === true;
+        return {
+            id: edge.id,
+            kind: edge.kind,
+            label: edge.label ?? "",
+            from: end(edge.from, edge.from_node),
+            to: end(edge.to, edge.to_node),
+            curated,
+            origin: text(curated ? "dcLinkOriginAdmin" : "dcLinkOriginImported")
+        };
+    });
+}
+
+/** The node kinds a link joins (`search.CANDIDATE_KINDS`), in the order the graph route is asked for them. */
+export const LINK_NODE_KINDS: readonly DataNodeKind[] = ["entity", "query", "function"];
+
+/** The two kinds of a catalogue service: one name is one row of the
+ *  catalogue, whatever its kind, so the server treats both as one source. */
+const CATALOGUE_KINDS: readonly string[] = ["odata", "generic"];
+
+/** Whether two nodes belong to one source, as `POST edges` decides it. */
+export function sameSource(
+    a: { source_kind: string; source_name: string }, b: { source_kind: string; source_name: string }
+): boolean {
+    return a.source_name === b.source_name && (a.source_kind === b.source_kind
+        || (CATALOGUE_KINDS.indexOf(a.source_kind) !== -1 && CATALOGUE_KINDS.indexOf(b.source_kind) !== -1));
+}
+
+/** A node of this source a link can start at, as the From select offers it. */
+export interface LinkStart {
+    key: string;
+    text: string;
+    kind: DataNodeKind;
+}
+
+/** The entities and functions of an OData or generic source, or the query
+ *  of an InA source: what may be linked (no field, no member). None for a
+ *  source that was never imported. */
+export function linkStarts(detail: Pick<DataSourceDetail, "source" | "entities" | "functions" | "query">): LinkStart[] {
+    if (!detail.source) {
+        return [];
+    }
+    const nodes: DataNode[] = (detail.entities ?? []).map((entry) => entry.node)
+        .concat(detail.functions ?? [])
+        .concat(detail.query ? [detail.query.node] : []);
+    return nodes.map((node) => ({ key: String(node.id), text: displayName(node), kind: node.kind }));
+}
+
+/** A node of another source the Add link dialog offers. */
+export interface LinkCandidate {
+    id: number | string;
+    title: string;
+    /** "agent-data · entity SCARRSet", as the test search names a candidate. */
+    subtitle: string;
+    kind: DataNodeKind;
+    icon: string;
+}
+
+/** The query of `GET graph` for the Add link search: the kinds a link
+ *  joins, and the typed text when there is one. */
+export function linkQuery(q: string): string {
+    return graphQuery({ kinds: LINK_NODE_KINDS, q });
+}
+
+/** The nodes of a graph answer a link from `source` may go to: entities,
+ *  queries and functions of OTHER sources, in the order of the answer. */
+export function linkCandidates(graph: DataGraph, source: { kind: string; name: string }): LinkCandidate[] {
+    const own = { source_kind: source.kind, source_name: source.name };
+    return (graph.nodes ?? [])
+        .filter((node) => LINK_NODE_KINDS.indexOf(node.kind) !== -1 && !sameSource(node, own))
+        .map((node) => ({
+            id: node.id,
+            title: displayName(node),
+            subtitle: `${node.source_name} · ${node.kind} ${node.name}`,
+            kind: node.kind,
+            icon: nodeIcon(node.kind)
+        }));
 }
 
 /** The hints of a node as the editor holds them. */
@@ -371,8 +503,9 @@ export function graphQuery(filters: { agent?: string; kinds?: readonly string[];
 }
 
 export default {
-    NODE_KINDS, DEFAULT_GRAPH_KINDS, SOURCE_KINDS, GRAPH_NODE_CAP, COMPLETENESS_WARNING,
-    completenessPercent, completenessText, completenessState, statusKey, displayName, entityRows,
-    relationRows, hintsOf, cleanList, hintsUpdate, hintErrors, hasChanges, scoreText, candidateRow, candidateRows,
+    NODE_KINDS, DEFAULT_GRAPH_KINDS, SOURCE_KINDS, GRAPH_NODE_CAP, COMPLETENESS_WARNING, LINK_KINDS, LINK_NODE_KINDS,
+    completenessPercent, completenessText, completenessState, statusKey, displayName, nodeIcon, entityRows,
+    relationKindKey, relationRows, sameSource, linkStarts, linkQuery, linkCandidates,
+    hintsOf, cleanList, hintsUpdate, hintErrors, hasChanges, scoreText, candidateRow, candidateRows,
     groupKey, graphModel, graphQuery, fitZoom
 };

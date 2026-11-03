@@ -475,7 +475,7 @@ export default class AdminService {
 
     /** Draws a link between two nodes of different sources (an entity, an
      *  InA query or a function at each end); answers the stored edge. A pair
-     *  that is linked already, by any kind, is a 409. */
+     *  that is linked already by the same kind, in either direction, is a 409. */
     public createDataEdge(body: DataEdgeInput): Promise<DataEdge> {
         return this.request<DataEdge>("data-catalog/edges", { method: "POST", ...AdminService.json(body) });
     }

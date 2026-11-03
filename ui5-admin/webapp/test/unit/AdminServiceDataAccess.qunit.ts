@@ -332,9 +332,12 @@ QUnit.test("an admin draws a link and removes it; an imported one stays", async 
     const listed = (await service.getDataSource("odata", "purchase-requisitions")).edges;
     assert.ok(listed.some((e) => e.id === edge.id && e.curated), "the detail lists it");
 
-    const again = await refusal(() => service.createDataEdge({ from_id: 210, to_id: 20, kind: "aggregates" }));
-    assert.strictEqual(again.status, 409, "the pair is linked, in either direction and by any kind");
+    const again = await refusal(() => service.createDataEdge({ from_id: 210, to_id: 20, kind: "same_object" }));
+    assert.strictEqual(again.status, 409, "the pair is linked by that kind, in either direction");
     assert.strictEqual(again.detail, "The two nodes are already linked");
+    const other = await service.createDataEdge({ from_id: 210, to_id: 20, kind: "aggregates" });
+    assert.strictEqual(other.kind, "aggregates", "a link of the other kind beside it is drawn (one per kind per pair)");
+    await service.deleteDataEdge(other.id);
 
     const imported = await refusal(() => service.deleteDataEdge(1));
     assert.strictEqual(imported.status, 409);

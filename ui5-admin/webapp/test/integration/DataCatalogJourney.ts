@@ -17,9 +17,15 @@ import type Graph from "sap/suite/ui/commons/networkgraph/Graph";
 import type Node from "sap/suite/ui/commons/networkgraph/Node";
 import type Dialog from "sap/m/Dialog";
 import type Link from "sap/m/Link";
+import type Button from "sap/m/Button";
+import type Panel from "sap/m/Panel";
+import type ObjectStatus from "sap/m/ObjectStatus";
+import type SearchField from "sap/m/SearchField";
+import type StandardListItem from "sap/m/StandardListItem";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
-import { iSeeADialog } from "./pages/Dialogs";
+import { iPressInDialog, iSeeADialog } from "./pages/Dialogs";
+import { messageOf } from "./pages/ODataList";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -63,6 +69,27 @@ function pickKinds(box: MultiComboBox, keys: string[]): void {
 function choose(select: Select, key: string): void {
     select.setSelectedKey(key);
     select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
+}
+
+/** A row of the Links table as the admin reads it: from, relation, to, origin, and whether it offers a remove. */
+function linkOf(row: ColumnListItem): { from: string; relation: string; to: string; origin: string; remove: boolean } {
+    const cells = row.getCells();
+    return {
+        from: (cells[0] as Text).getText(false),
+        relation: (cells[1] as ObjectIdentifier).getTitle(),
+        to: (cells[2] as Text).getText(false),
+        origin: (cells[3] as ObjectStatus).getText(),
+        remove: (cells[4] as Button).getVisible()
+    };
+}
+
+function linksOf(table: UI5Element): ReturnType<typeof linkOf>[] {
+    return rowsOf(table).map(linkOf);
+}
+
+/** The titles of the Add link dialog's candidates. */
+function candidatesOf(list: UI5Element): string[] {
+    return (list as List).getItems().map((item) => (item as StandardListItem).getTitle());
 }
 
 opaTest("the list shows each source with its completeness", function (Given: Common, When: Common, Then: Common) {
@@ -147,13 +174,17 @@ opaTest("a row opens the source with its entities, fields and relations", functi
         errorMessage: "The entities table does not show 3 entities, 8 fields and a function"
     });
     Then.waitFor({
-        id: "dcRelations",
+        id: "dcLinksTable",
         viewName: DETAIL_VIEW,
-        check: (list: UI5Element) => (list as List).getItems().length === 3,
-        success: function (list: UI5Element) {
-            Opa5.assert.strictEqual((list as List).getItems()[0].getProperty("title"), "Requisition → Requisition item");
+        check: (table: UI5Element) => rowsOf(table).length === 3,
+        success: function (table: UI5Element) {
+            Opa5.assert.deepEqual(linksOf(table)[0], {
+                from: "Requisition", relation: "Navigation", to: "Requisition item", origin: "Imported", remove: false
+            }, "a relation with its kind's text, its two ends and its origin");
+            Opa5.assert.ok(linksOf(table).every((link) => link.origin === "Imported" && !link.remove),
+                "an imported link has no remove");
         },
-        errorMessage: "The relations are not listed"
+        errorMessage: "The links are not listed"
     });
     Then.waitFor({
         id: "dcUsedBy",
@@ -162,6 +193,182 @@ opaTest("a row opens the source with its entities, fields and relations", functi
         success: function (list: UI5Element) {
             Opa5.assert.strictEqual((list as List).getItems()[0].getProperty("title"), "btp-agent");
         }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("an InA source shows its query, dimensions and measures and the link an admin drew", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/ina/flight-revenue");
+
+    Then.waitFor({
+        id: "dcEntitiesTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 4,
+        success: function (table: UI5Element) {
+            const rows = rowsOf(table).map((row) => row.getBindingContext("src")!.getObject() as
+                { depth: number; kind: string; name: string; label: string; unit: string });
+            Opa5.assert.deepEqual(rows.map((row) => `${row.depth}:${row.kind}:${row.name}`), [
+                "0:query:ZFLIGHT_REV_Q001", "1:dimension:0CALMONTH", "1:dimension:ZCARRID", "1:measure:ZREVENUE"
+            ], "the query, then its dimensions and its measure one level down");
+            const label = rowsOf(table)[1].getCells()[1] as Input;
+            Opa5.assert.strictEqual(label.getValue(), "Calendar month", "a dimension's label in the same inline input");
+            Opa5.assert.strictEqual(rows[3].unit, "EUR");
+        },
+        errorMessage: "The InA source does not list its query with two dimensions and a measure"
+    });
+    Then.waitFor({
+        id: "dcEntitiesPanel",
+        viewName: DETAIL_VIEW,
+        success: (panel: UI5Element) => Opa5.assert.strictEqual((panel as Panel).getHeaderText(),
+            "Query, dimensions and measures", "the panel is named for an InA source")
+    });
+    Then.waitFor({
+        id: "dcDetailKind",
+        viewName: DETAIL_VIEW,
+        success: (status: UI5Element) => Opa5.assert.strictEqual((status as ObjectStatus).getText(), "InA query",
+            "the header names the kind")
+    });
+    Then.waitFor({
+        id: "dcLinksTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 1,
+        success: (table: UI5Element) => Opa5.assert.deepEqual(linksOf(table), [{
+            from: "Flight revenue by month", relation: "Aggregates", to: "agent-data · Demo airlines",
+            origin: "Added by an admin", remove: true
+        }], "the other source's end as source · node; a drawn link offers a remove"),
+        errorMessage: "The drawn link is not listed"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("an admin links the query to the generic entity, then removes the link", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/ina/flight-revenue");
+
+    When.waitFor({ id: "dcAddLink", viewName: DETAIL_VIEW, actions: new Press() });
+    Then.waitFor({
+        id: "dcLinkCandidates",
+        viewName: DETAIL_VIEW,
+        searchOpenDialogs: true,
+        check: (list: UI5Element) => (list as List).getItems().length === 7,
+        success: function (list: UI5Element) {
+            Opa5.assert.deepEqual(candidatesOf(list), [
+                "Requisition", "Requisition item", "Supplier", "Release requisition", "A_BusinessPartner",
+                "Demo airlines", "Month names"
+            ], "entities and functions of the other sources: not the own query, no field, no source, no member");
+        },
+        errorMessage: "The dialog does not offer the seven nodes of the other sources"
+    });
+    When.waitFor({
+        id: "dcLinkSearch",
+        viewName: DETAIL_VIEW,
+        searchOpenDialogs: true,
+        success: function (field: UI5Element) {
+            (field as SearchField).setValue("airline");
+            (field as SearchField).fireSearch({ query: "airline" });
+        }
+    });
+    When.waitFor({
+        id: "dcLinkCandidates",
+        viewName: DETAIL_VIEW,
+        searchOpenDialogs: true,
+        // The airlines' field and the query's Airline dimension match too: neither is offered.
+        matchers: (list: UI5Element) => candidatesOf(list).join() === "Demo airlines" ? (list as List).getItems()[0] : false,
+        actions: new Press(),
+        errorMessage: "The search does not leave the demo airlines"
+    });
+    When.waitFor({ id: "dcLinkAdd", viewName: DETAIL_VIEW, searchOpenDialogs: true, actions: new Press() });
+
+    Then.waitFor({
+        id: "dcLinksTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 2,
+        success: function (table: UI5Element) {
+            Opa5.assert.deepEqual(backend.bodies["POST data-catalog/edges"], { from_id: 310, to_id: 210, kind: "same_object" },
+                "from the query, to the entity, by the kind picked first");
+            Opa5.assert.deepEqual(linksOf(table)[1], {
+                from: "Flight revenue by month", relation: "Same object", to: "agent-data · Demo airlines",
+                origin: "Added by an admin", remove: true
+            }, "the new link is listed at once, beside the aggregates link of the same pair");
+        },
+        errorMessage: "The added link is not listed"
+    });
+
+    When.waitFor({
+        id: "dcLinksTable",
+        viewName: DETAIL_VIEW,
+        matchers: (table: UI5Element) => rowsOf(table)[1].getCells()[4] as Button,
+        actions: new Press(),
+        errorMessage: "No remove on the added link"
+    });
+    iSeeADialog(Then, (dialog: UI5Element) => {
+        Opa5.assert.strictEqual(messageOf(dialog), "Remove the link Flight revenue by month \u2013 Same object \u2013 "
+            + "agent-data \u00b7 Demo airlines? An admin drew it, so no import brings it back.", "the question names the link");
+    }, "the question before a link is removed");
+    iPressInDialog(When, "OK");
+
+    Then.waitFor({
+        id: "dcLinksTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 1,
+        success: function (table: UI5Element) {
+            Opa5.assert.ok(backend.requests.indexOf("DELETE data-catalog/edges/5") !== -1, "the drawn link was removed");
+            Opa5.assert.strictEqual(linksOf(table)[0].relation, "Aggregates", "the other link stays");
+        },
+        errorMessage: "The removed link is still listed"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the kind filter keeps one kind of source", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog");
+
+    When.waitFor({
+        id: "dcKindFilter",
+        viewName: LIST_VIEW,
+        visible: false,
+        autoWait: false,
+        check: () => backend.requests.indexOf("GET data-catalog/sources") !== -1,
+        success: (select: UI5Element) => choose(select as Select, "ina")
+    });
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 1,
+        success: function (table: UI5Element) {
+            Opa5.assert.deepEqual(rowsOf(table).map(nameOf), ["flight-revenue"]);
+            Opa5.assert.strictEqual((rowsOf(table)[0].getCells()[0] as ObjectStatus).getText(), "InA query",
+                "the Kind column names it");
+        },
+        errorMessage: "The kind filter did not leave the InA query"
+    });
+    When.waitFor({
+        id: "dcKindFilter",
+        viewName: LIST_VIEW,
+        visible: false,
+        autoWait: false,
+        success: (select: UI5Element) => choose(select as Select, "generic")
+    });
+    When.waitFor({ id: "dcSearch", viewName: LIST_VIEW, actions: new EnterText({ text: "partner" }) });
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 0,
+        success: () => Opa5.assert.ok(true, "the kind and the search both hold: no generic source is a partner"),
+        errorMessage: "The kind filter and the search are not applied together"
+    });
+    When.waitFor({ id: "dcSearch", viewName: LIST_VIEW, actions: new EnterText({ text: "agent", clearTextFirst: true }) });
+    Then.waitFor({
+        id: "dcSourcesTable",
+        viewName: LIST_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 1,
+        success: function (table: UI5Element) {
+            Opa5.assert.deepEqual(rowsOf(table).map(nameOf), ["agent-data"]);
+            Opa5.assert.strictEqual((rowsOf(table)[0].getCells()[0] as ObjectStatus).getText(), "Generic");
+        },
+        errorMessage: "The generic source is not listed"
     });
 
     Then.iStopTheApp();

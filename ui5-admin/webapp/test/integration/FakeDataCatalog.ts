@@ -306,9 +306,10 @@ export default class FakeDataCatalog {
         if (sameSource) {
             return json({ detail: "to_id: same source as from_id" }, 422);
         }
-        const linked = this.edges.some((edge) =>
+        // One link per kind per pair, in either direction, imported or drawn.
+        const linked = this.edges.some((edge) => edge.kind === given.kind && (
             (String(edge.from) === String(start.id) && String(edge.to) === String(end.id))
-            || (String(edge.from) === String(end.id) && String(edge.to) === String(start.id)));
+            || (String(edge.from) === String(end.id) && String(edge.to) === String(start.id))));
         if (linked) {
             return json({ detail: ALREADY_LINKED }, 409);
         }

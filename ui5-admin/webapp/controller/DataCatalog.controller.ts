@@ -26,9 +26,9 @@ export default class DataCatalog extends BaseController {
     public onInit(): void {
         this.setModel(new JSONModel({ items: [] }), "dc");
         // selected: a row is picked, so "Rebuild selected" applies to it.
-        // busy: a rebuild is running.
+        // busy: a rebuild is running. kind: the kind filter, "" for all.
         this.setModel(new JSONModel({
-            loadFailed: false, loadError: "", query: "", selected: false, busy: false
+            loadFailed: false, loadError: "", query: "", kind: "", selected: false, busy: false
         }), "view");
         this.setModel(new JSONModel({ names: [] }), "usedBy");
         this.getRouter().getRoute("dataCatalog")?.attachPatternMatched(() => {
@@ -99,29 +99,46 @@ export default class DataCatalog extends BaseController {
         return dataCatalog.completenessState(value);
     }
 
-    public formatNoData(loadFailed: boolean | undefined, query: string | undefined): string {
+    public formatNoData(loadFailed: boolean | undefined, query: string | undefined, kind?: string): string {
         if (loadFailed) {
             return this.text("dcLoadFailedNoData");
         }
-        return this.text(query ? "dcNoMatches" : "dcNoSources");
+        return this.text(query || kind ? "dcNoMatches" : "dcNoSources");
     }
 
     // --- interaction --------------------------------------------------------
 
     public onSearch(event: Event): void {
-        const query = (event.getSource() as SearchField).getValue().trim();
-        const filters = query
-            ? [new Filter({
+        (this.getModel("view") as JSONModel).setProperty("/query", (event.getSource() as SearchField).getValue().trim());
+        this.applyFilters();
+    }
+
+    public onKindFilter(): void {
+        this.applyFilters();
+    }
+
+    /** The search text (title, name or destination) and the kind, together. */
+    private applyFilters(): void {
+        const view = this.getModel("view") as JSONModel;
+        const query = String(view.getProperty("/query") ?? "");
+        const kind = String(view.getProperty("/kind") ?? "");
+        const filters: Filter[] = [];
+        if (query) {
+            filters.push(new Filter({
                 filters: [
                     new Filter("title", FilterOperator.Contains, query),
                     new Filter("name", FilterOperator.Contains, query),
                     new Filter("destination", FilterOperator.Contains, query)
                 ],
                 and: false
-            })]
-            : [];
-        (this.getModel("view") as JSONModel).setProperty("/query", query);
-        ((this.byId("dcSourcesTable") as Table).getBinding("items") as ListBinding).filter(filters);
+            }));
+        }
+        if (kind) {
+            filters.push(new Filter("kind", FilterOperator.EQ, kind));
+        }
+        // Both must hold: said, not left to the binding's grouping by path.
+        ((this.byId("dcSourcesTable") as Table).getBinding("items") as ListBinding)
+            .filter(filters.length ? [new Filter({ filters, and: true })] : []);
     }
 
     public onSelectionChange(): void {

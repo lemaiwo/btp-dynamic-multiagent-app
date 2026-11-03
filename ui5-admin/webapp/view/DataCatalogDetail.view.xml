@@ -152,9 +152,14 @@
                 </VBox>
             </Panel>
 
-            <!-- Entities with their fields, one level deep. A label edit and
-                 the readable switch are saved when they change. -->
-            <Panel id="dcEntitiesPanel" headerText="{i18n>dcEntitiesPanel}" visible="{src>/imported}" class="sapUiSmallMarginTop">
+            <!-- Entities with their fields, one level deep; for an InA source
+                 its query with the dimensions and measures below it. A label
+                 edit and the readable switch are saved when they change. -->
+            <Panel
+                id="dcEntitiesPanel"
+                headerText="{= ${src>/kind} === 'ina' ? ${i18n>dcQueryPanel} : ${i18n>dcEntitiesPanel} }"
+                visible="{src>/imported}"
+                class="sapUiSmallMarginTop">
                 <Table
                     id="dcEntitiesTable"
                     items="{src>/rows}"
@@ -162,7 +167,7 @@
                     popinLayout="GridSmall"
                     contextualWidth="Auto"
                     autoPopinMode="true"
-                    noDataText="{i18n>dcNoEntities}">
+                    noDataText="{= ${src>/kind} === 'ina' ? ${i18n>dcNoQuery} : ${i18n>dcNoEntities} }">
                     <columns>
                         <!-- Wide enough for an entity set name on one line; a longer
                              name is cut with an ellipsis, never wrapped mid-word. -->
@@ -185,10 +190,10 @@
                                         <core:CustomData key="level" value="{= ${src>depth} === 0 ? 'entity' : 'field' }" writeToDom="true" />
                                     </customData>
                                     <core:Icon
-                                        src="{= ${src>kind} === 'function' ? 'sap-icon://fx' : ${src>depth} === 0 ? 'sap-icon://table-view' : 'sap-icon://text-formatting' }"
+                                        src="{src>icon}"
                                         class="sapUiTinyMarginEnd dcNameIcon"
-                                        tooltip="{src>kind}"
-                                        alt="{src>kind}"
+                                        tooltip="{ path: 'src>kind', formatter: '.formatNodeKind' }"
+                                        alt="{ path: 'src>kind', formatter: '.formatNodeKind' }"
                                         decorative="false" />
                                     <VBox renderType="Bare" class="dcNameText">
                                         <HBox alignItems="Center" renderType="Bare">
@@ -236,14 +241,62 @@
                 <core:InvisibleText id="dcLabelColumnText" text="{i18n>dcColLabel}" />
             </Panel>
 
-            <Panel id="dcRelationsPanel" headerText="{i18n>dcRelationsPanel}" visible="{src>/imported}" class="sapUiSmallMarginTop">
-                <List id="dcRelations" items="{src>/relations}" noDataText="{i18n>dcNoRelations}">
-                    <StandardListItem
-                        title="{src>from} → {src>to}"
-                        description="{src>label}"
-                        info="{src>kind}"
-                        icon="sap-icon://chain-link" />
-                </List>
+            <!-- The relations of the source's nodes, in either direction: what
+                 an import found and what an admin drew. Only a drawn link can
+                 be removed; Add link draws one to another source
+                 (fragment/DataCatalogLinkDialog). -->
+            <Panel id="dcLinksPanel" headerText="{i18n>dcLinksPanel}" visible="{src>/imported}" class="sapUiSmallMarginTop">
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <Title id="dcLinksTitle" text="{i18n>dcLinksPanel}" level="H2" />
+                        <ToolbarSpacer />
+                        <Button
+                            id="dcAddLink"
+                            icon="sap-icon://add"
+                            text="{i18n>dcAddLink}"
+                            tooltip="{i18n>dcAddLinkTooltip}"
+                            enabled="{= ${src>/linkStarts}.length > 0 }"
+                            press=".onAddLink" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <Table
+                    id="dcLinksTable"
+                    items="{src>/relations}"
+                    ariaLabelledBy="dcLinksTitle"
+                    popinLayout="GridSmall"
+                    contextualWidth="Auto"
+                    autoPopinMode="true"
+                    noDataText="{i18n>dcNoLinks}">
+                    <columns>
+                        <Column autoPopinWidth="12" importance="High"><Text text="{i18n>dcColFrom}" /></Column>
+                        <Column width="10rem" importance="High"><Text text="{i18n>dcColRelation}" /></Column>
+                        <Column autoPopinWidth="12" importance="High"><Text text="{i18n>dcColTo}" /></Column>
+                        <Column width="10rem" importance="Medium"><Text text="{i18n>dcColOrigin}" /></Column>
+                        <Column width="3.5rem" hAlign="End" importance="High">
+                            <core:InvisibleText text="{i18n>dcLinkRemove}" />
+                        </Column>
+                    </columns>
+                    <items>
+                        <ColumnListItem>
+                            <cells>
+                                <Text text="{src>from}" />
+                                <ObjectIdentifier
+                                    title="{ path: 'src>kind', formatter: '.formatRelationKind' }"
+                                    text="{src>label}" />
+                                <Text text="{src>to}" />
+                                <ObjectStatus
+                                    text="{src>origin}"
+                                    state="{= ${src>curated} ? 'Information' : 'None' }" />
+                                <Button
+                                    icon="sap-icon://delete"
+                                    type="Transparent"
+                                    tooltip="{i18n>dcLinkRemove}"
+                                    visible="{src>curated}"
+                                    press=".onRemoveLink" />
+                            </cells>
+                        </ColumnListItem>
+                    </items>
+                </Table>
             </Panel>
 
             <Panel id="dcUsedByPanel" headerText="{i18n>odataColUsedBy}" visible="{src>/loaded}" class="sapUiSmallMarginTop">

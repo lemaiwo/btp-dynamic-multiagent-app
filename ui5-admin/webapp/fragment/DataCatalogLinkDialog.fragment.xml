@@ -1,0 +1,97 @@
+<core:FragmentDefinition
+    xmlns="sap.m"
+    xmlns:core="sap.ui.core"
+    xmlns:f="sap.ui.layout.form">
+    <!-- Draws a link from a node of this source to an entity, InA query or
+         function of ANOTHER source (controller/dataCatalog/LinkDialog). The
+         search asks the graph route for those three kinds; the nodes of this
+         source are left out before they are listed
+         (model/dataCatalog.linkCandidates). Nothing is stored before Add. -->
+    <Dialog
+        id="dcLinkDialog"
+        title="{i18n>dcLinkDialogTitle}"
+        contentWidth="36rem">
+        <content>
+            <VBox class="sapUiSmallMarginBeginEnd sapUiSmallMarginTop">
+                <Text id="dcLinkHint" text="{i18n>dcLinkHint}" />
+                <!-- A refusal of the server (a pair already linked by this
+                     kind, a node gone since the search) or a failed search,
+                     in the server's fixed words. -->
+                <MessageStrip
+                    id="dcLinkError"
+                    visible="{= !!${link>/error} }"
+                    type="Error"
+                    showIcon="true"
+                    class="sapUiSmallMarginTop"
+                    text="{link>/error}" />
+            </VBox>
+            <f:SimpleForm
+                id="dcLinkForm"
+                editable="true"
+                layout="ResponsiveGridLayout"
+                labelSpanL="3" labelSpanM="3" columnsL="1" columnsM="1">
+                <Label text="{i18n>dcLinkFrom}" labelFor="dcLinkFrom" />
+                <Select
+                    id="dcLinkFrom"
+                    width="100%"
+                    selectedKey="{link>/from}"
+                    showSecondaryValues="true"
+                    items="{ path: 'link>/starts', templateShareable: false }">
+                    <core:ListItem key="{link>key}" text="{link>text}" additionalText="{link>kindText}" />
+                </Select>
+                <Label text="{i18n>dcLinkKind}" labelFor="dcLinkKind" />
+                <Select
+                    id="dcLinkKind"
+                    width="100%"
+                    selectedKey="{link>/kind}"
+                    items="{ path: 'link>/kinds', templateShareable: false }">
+                    <core:Item key="{link>key}" text="{link>text}" />
+                </Select>
+                <Label id="dcLinkToLabel" text="{i18n>dcLinkTo}" labelFor="dcLinkSearch" />
+                <!-- The graph route answers 422 above 200 characters. -->
+                <SearchField
+                    id="dcLinkSearch"
+                    value="{link>/q}"
+                    maxLength="200"
+                    placeholder="{i18n>dcLinkSearch}"
+                    search=".onSearch" />
+            </f:SimpleForm>
+            <MessageStrip
+                id="dcLinkCapped"
+                visible="{link>/capped}"
+                type="Information"
+                showIcon="true"
+                class="sapUiSmallMarginBeginEnd"
+                text="{i18n>dcLinkCapped}" />
+            <List
+                id="dcLinkCandidates"
+                mode="SingleSelectMaster"
+                items="{ path: 'link>/candidates', templateShareable: false }"
+                growing="true"
+                growingThreshold="50"
+                busy="{link>/searching}"
+                busyIndicatorDelay="0"
+                ariaLabelledBy="dcLinkToLabel"
+                noDataText="{= ${link>/searched} ? ${i18n>dcLinkNoCandidates} : ${i18n>dcLinkSearching} }"
+                selectionChange=".onCandidateSelect"
+                class="sapUiSmallMarginBottom">
+                <StandardListItem
+                    title="{link>title}"
+                    description="{link>subtitle}"
+                    icon="{link>icon}"
+                    iconInset="false" />
+            </List>
+        </content>
+        <beginButton>
+            <Button
+                id="dcLinkAdd"
+                text="{i18n>dcLinkAdd}"
+                type="Emphasized"
+                enabled="{= !!${link>/from} &amp;&amp; !!${link>/to} &amp;&amp; !${link>/busy} }"
+                press=".onAdd" />
+        </beginButton>
+        <endButton>
+            <Button id="dcLinkCancel" text="{i18n>cancel}" press=".onCancel" />
+        </endButton>
+    </Dialog>
+</core:FragmentDefinition>

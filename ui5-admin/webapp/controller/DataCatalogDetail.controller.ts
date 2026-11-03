@@ -1,16 +1,18 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
+import MessageBox from "sap/m/MessageBox";
 import MessageToast from "sap/m/MessageToast";
 import BaseController from "./BaseController";
+import LinkDialog from "./dataCatalog/LinkDialog";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
-import dataCatalog, { type EntityRow, type HintsForm } from "../model/dataCatalog";
+import dataCatalog, { type EntityRow, type HintsForm, type LinkStart, type RelationRow } from "../model/dataCatalog";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type MultiInput from "sap/m/MultiInput";
 import type { MultiInput$TokenUpdateEvent } from "sap/m/MultiInput";
 import type { ListBase$DeleteEvent } from "sap/m/ListBase";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
-import type { DataHintsUpdate, DataNode, DataSourceDetail } from "../service/dataCatalogTypes";
+import type { DataEdge, DataHintsUpdate, DataNode, DataSourceDetail } from "../service/dataCatalogTypes";
 
 /** The editor's copy of the source hints: examples as rows, so each one can be bound to an input. */
 interface HintsEditor {
@@ -23,7 +25,9 @@ interface HintsEditor {
 
 /**
  * One source of the data catalogue: its hints (edited inline), entities and
- * fields, relations, the agents that use it and a test of the retrieval.
+ * fields (for an InA source: its query, dimensions and measures), its links
+ * (Add link, and a remove on the ones an admin drew), the agents that use it
+ * and a test of the retrieval.
  *
  * @namespace com.agent.admin.controller
  */
@@ -31,6 +35,9 @@ export default class DataCatalogDetail extends BaseController {
 
     /** The source hints as stored, to tell what an edit changes. */
     private saved?: HintsForm;
+    /** The answer the page shows; a link that is added or removed changes its edges. */
+    private detail?: DataSourceDetail;
+    private linkDialog?: LinkDialog;
 
     public onInit(): void {
         this.setModel(new JSONModel(DataCatalogDetail.emptyState()), "src");
@@ -47,7 +54,7 @@ export default class DataCatalogDetail extends BaseController {
         return {
             loaded: false, imported: false, loadFailed: false, loadError: "", kind: "", name: "", source: {},
             hints: { label: "", purpose: "", not_for: "", synonyms: [], exampleRows: [] },
-            errors: {}, dirty: false, saving: false, rows: [], relations: [], usedBy: []
+            errors: {}, dirty: false, saving: false, rows: [], relations: [], linkStarts: [], usedBy: []
         };
     }
 
@@ -91,9 +98,11 @@ export default class DataCatalogDetail extends BaseController {
         if (!detail.source) {
             // In the catalogue, never imported: nothing to edit yet.
             this.saved = undefined;
+            this.detail = undefined;
             this.src().setProperty("/imported", false);
             return;
         }
+        this.detail = { ...detail, edges: (detail.edges ?? []).slice() };
         this.src().setProperty("/imported", true);
         this.saved = dataCatalog.hintsOf(detail.source);
         this.src().setProperty("/source", detail.source);
@@ -101,7 +110,13 @@ export default class DataCatalogDetail extends BaseController {
         this.src().setProperty("/errors", {});
         this.src().setProperty("/dirty", false);
         this.src().setProperty("/rows", dataCatalog.entityRows(detail));
-        this.src().setProperty("/relations", dataCatalog.relationRows(detail));
+        this.src().setProperty("/linkStarts", dataCatalog.linkStarts(detail));
+        this.showRelations();
+    }
+
+    private showRelations(): void {
+        this.src().setProperty("/relations", this.detail
+            ? dataCatalog.relationRows(this.detail, (key) => this.text(key)) : []);
     }
 
     /** Imports a source that was never imported, then reads it again. */
@@ -164,6 +179,16 @@ export default class DataCatalogDetail extends BaseController {
 
     public formatKind(kind: string): string {
         return kind ? this.text(`dcKind_${kind}`) : "";
+    }
+
+    public formatNodeKind(kind: string): string {
+        return (dataCatalog.NODE_KINDS as readonly string[]).indexOf(kind) === -1 ? kind ?? "" : this.text(`dcNodeKind_${kind}`);
+    }
+
+    /** "Same object"; a kind the catalogue does not name is shown as it is. */
+    public formatRelationKind(kind: string): string {
+        const key = dataCatalog.relationKindKey(kind);
+        return key ? this.text(key) : kind ?? "";
     }
 
     // --- source hints -------------------------------------------------------
@@ -316,6 +341,78 @@ export default class DataCatalogDetail extends BaseController {
             }
             return false;
         }
+    }
+
+    // --- links ----------------------------------------------------------------
+
+    public onAddLink(): void {
+        void this.addLink();
+    }
+
+    /** Opens Add link; a link it stored is listed at once. Resolves whether one was. */
+    public async addLink(): Promise<boolean> {
+        const shown = this.detail;
+        if (!shown) {
+            return false;
+        }
+        if (!this.linkDialog) {
+            this.linkDialog = new LinkDialog();
+        }
+        const edge = await this.linkDialog.open(this.getView()!, {
+            source: { kind: this.src().getProperty("/kind") as string, name: this.src().getProperty("/name") as string },
+            starts: this.src().getProperty("/linkStarts") as LinkStart[],
+            service: this.getAdminService(),
+            text: (key, args) => this.text(key, args)
+        });
+        if (!edge) {
+            return false;
+        }
+        MessageToast.show(this.text("dcLinkAdded"));
+        // The page shows another source by now: its next read lists the link.
+        if (this.detail === shown) {
+            shown.edges = shown.edges.concat([edge]);
+            this.showRelations();
+        }
+        return true;
+    }
+
+    /** Asks before a link an admin drew is removed: no import brings it back. */
+    public onRemoveLink(event: Event): void {
+        const row = (event.getSource() as Control).getBindingContext("src")?.getObject() as RelationRow | undefined;
+        if (!row || !row.curated) {
+            return;
+        }
+        MessageBox.confirm(this.text("dcLinkRemoveConfirm", [row.from, this.formatRelationKind(row.kind), row.to]), {
+            title: this.text("dcLinkRemoveTitle"),
+            emphasizedAction: MessageBox.Action.OK,
+            onClose: (action: string) => {
+                if (action === MessageBox.Action.OK) {
+                    void this.removeLink(row.id);
+                }
+            }
+        });
+    }
+
+    /** Removes a drawn link; resolves whether it is gone. One already gone
+     *  (404) leaves the list too; an imported one is refused by the server. */
+    public async removeLink(id: number | string): Promise<boolean> {
+        const shown = this.detail;
+        let key = "dcLinkRemoved";
+        try {
+            await this.withBusy(() => this.getAdminService().deleteDataEdge(id));
+        } catch (error) {
+            if (!(error instanceof AdminError && error.status === 404)) {
+                ErrorHandler.handle(error, this.text("dcLinkRemoveFailed"));
+                return false;
+            }
+            key = "dcLinkAlreadyRemoved";
+        }
+        MessageToast.show(this.text(key));
+        if (shown && this.detail === shown) {
+            shown.edges = shown.edges.filter((edge: DataEdge) => String(edge.id) !== String(id));
+            this.showRelations();
+        }
+        return true;
     }
 
     // --- test search --------------------------------------------------------

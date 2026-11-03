@@ -1,9 +1,12 @@
+import ResourceBundle from "sap/base/i18n/ResourceBundle";
 import dataCatalog, {
-    DEFAULT_GRAPH_KINDS, GRAPH_NODE_CAP, NODE_KINDS, candidateRows, cleanList, completenessPercent, completenessState, completenessText, entityRows, fitZoom,
-    graphModel, graphQuery, hasChanges, hintErrors, hintsOf, hintsUpdate, relationRows, scoreText, statusKey
+    DEFAULT_GRAPH_KINDS, GRAPH_NODE_CAP, LINK_KINDS, LINK_NODE_KINDS, NODE_KINDS, candidateRows, cleanList,
+    completenessPercent, completenessState, completenessText, entityRows, fitZoom, graphModel, graphQuery, hasChanges,
+    hintErrors, hintsOf, hintsUpdate, linkCandidates, linkQuery, linkStarts, nodeIcon, relationKindKey, relationRows,
+    sameSource, scoreText, statusKey
 } from "com/agent/admin/model/dataCatalog";
 import type {
-    DataGraphNode, DataNode, DataNodeKind, DataSearchCandidate, DataSourceDetail
+    DataGraph, DataGraphNode, DataNode, DataNodeKind, DataSearchCandidate, DataSourceDetail, DataSourceKind
 } from "com/agent/admin/service/dataCatalogTypes";
 
 function node(id: number, kind: DataNodeKind, name: string, extra: Partial<DataNode> = {}): DataNode {
@@ -70,8 +73,8 @@ QUnit.test("entities come first, each followed by its fields", function (assert)
 
 QUnit.test("relations name both ends; an end outside the answer keeps its id", function (assert) {
     assert.deepEqual(relationRows(DETAIL), [
-        { kind: "navigation", label: "to_Item", from: "Requisition", to: "A_Item" },
-        { kind: "foreign_key", label: "", from: "A_Item.Supplier", to: "999" }
+        { id: 1, kind: "navigation", label: "to_Item", from: "Requisition", to: "A_Item", curated: false, origin: "dcLinkOriginImported" },
+        { id: 2, kind: "foreign_key", label: "", from: "A_Item.Supplier", to: "999", curated: false, origin: "dcLinkOriginImported" }
     ]);
 });
 
@@ -92,8 +95,173 @@ QUnit.test("an end in another source is named from the node the edge carries", f
         source: DETAIL.source, entities: DETAIL.entities, functions: [],
         edges: [{ id: 3, from: 22, to: 900, kind: "same_object", label: "", curated: false, from_node: null, to_node: other }]
     });
-    assert.deepEqual(rows, [{ kind: "same_object", label: "", from: "A_Item.Supplier", to: "Supplier (business-partners)" }]);
+    assert.deepEqual(rows, [{
+        id: 3, kind: "same_object", label: "", from: "A_Item.Supplier", to: "business-partners · Supplier",
+        curated: false, origin: "dcLinkOriginImported"
+    }], "source · node, as the Links table's To column shows it");
     assert.deepEqual(relationRows({ source: null, entities: [], edges: [] }), [], "a source never imported has none");
+});
+
+QUnit.module("dataCatalog: an InA source and the links");
+
+function ina(id: number, kind: DataNodeKind, name: string, extra: Partial<DataNode> = {}): DataNode {
+    return node(id, kind, name, { source_kind: "ina", source_name: "flight-revenue", ...extra });
+}
+
+const INA_DETAIL: DataSourceDetail = {
+    source: ina(300, "source", "flight-revenue", { label: "Flight revenue" }),
+    query: {
+        node: ina(310, "query", "ZFLIGHT_REV_Q001", { label: "Flight revenue by month", parent_id: 300 }),
+        dimensions: [
+            ina(311, "dimension", "0CALMONTH", { label: "Calendar month", parent_id: 310 }),
+            ina(312, "dimension", "ZCARRID", { parent_id: 310 })
+        ],
+        measures: [ina(313, "measure", "ZREVENUE", { label: "Revenue", unit: "EUR", parent_id: 310 })]
+    },
+    edges: [
+        {
+            id: 4, from: 310, to: 210, kind: "aggregates", label: "", curated: true,
+            from_node: { id: 310, kind: "query", source_kind: "ina", source_name: "flight-revenue", name: "ZFLIGHT_REV_Q001", label: "Flight revenue by month" },
+            to_node: { id: 210, kind: "entity", source_kind: "generic", source_name: "agent-data", name: "SCARRSet", label: "Demo airlines" }
+        },
+        {
+            id: 7, from: 210, to: 310, kind: "same_object", label: "", curated: false,
+            from_node: { id: 210, kind: "entity", source_kind: "generic", source_name: "agent-data", name: "SCARRSet", label: "SCARRSet" },
+            to_node: null
+        }
+    ],
+    used_by: ["gmail-agent"]
+};
+
+QUnit.test("an InA source lists its query, then its dimensions and measures one level down", function (assert) {
+    const rows = entityRows(INA_DETAIL);
+    assert.deepEqual(rows.map((row) => `${row.depth}:${row.kind}:${row.name}`), [
+        "0:query:ZFLIGHT_REV_Q001", "1:dimension:0CALMONTH", "1:dimension:ZCARRID", "1:measure:ZREVENUE"
+    ]);
+    assert.deepEqual(rows.map((row) => row.entity), ["ZFLIGHT_REV_Q001", "ZFLIGHT_REV_Q001", "ZFLIGHT_REV_Q001", "ZFLIGHT_REV_Q001"],
+        "a member knows its query");
+    assert.strictEqual(rows[1].label, "Calendar month", "the hint controls edit the label as for a field");
+    assert.strictEqual(rows[1].savedLabel, "Calendar month");
+    assert.strictEqual(rows[3].unit, "EUR", "a measure's unit is carried");
+    assert.deepEqual(rows.map((row) => row.icon), [
+        "sap-icon://multiple-bar-chart", "sap-icon://dimension", "sap-icon://dimension", "sap-icon://measure"
+    ]);
+    assert.deepEqual(entityRows({ query: null }), [], "a query never imported has no rows");
+    assert.deepEqual(entityRows({}), [], "an answer without entities, functions or query");
+});
+
+QUnit.test("each row carries the icon of its kind", function (assert) {
+    assert.deepEqual(entityRows(DETAIL).map((row) => row.icon), [
+        "sap-icon://table-view", "sap-icon://text-formatting", "sap-icon://table-view", "sap-icon://text-formatting",
+        "sap-icon://text-formatting"
+    ]);
+    assert.strictEqual(nodeIcon("function"), "sap-icon://fx");
+    assert.strictEqual(nodeIcon("source"), "sap-icon://database");
+    assert.strictEqual(nodeIcon("other" as DataNodeKind), "sap-icon://document", "an unknown kind");
+});
+
+QUnit.test("a link says where it comes from; an InA query names its own end", function (assert) {
+    const texts: Record<string, string> = { dcLinkOriginAdmin: "Added by an admin", dcLinkOriginImported: "Imported" };
+    const rows = relationRows(INA_DETAIL, (key) => texts[key]);
+    assert.deepEqual(rows, [
+        {
+            id: 4, kind: "aggregates", label: "", from: "Flight revenue by month", to: "agent-data · Demo airlines",
+            curated: true, origin: "Added by an admin"
+        },
+        {
+            id: 7, kind: "same_object", label: "", from: "agent-data · SCARRSet", to: "Flight revenue by month",
+            curated: false, origin: "Imported"
+        }
+    ], "the own end by its label, the other source's end as source · node, either way round");
+    assert.deepEqual(relationRows(INA_DETAIL).map((row) => row.origin), ["dcLinkOriginAdmin", "dcLinkOriginImported"],
+        "without a text function: the i18n keys");
+    const flag = relationRows({
+        ...INA_DETAIL, edges: [{ ...INA_DETAIL.edges[0], curated: "true" as unknown as boolean }]
+    });
+    assert.strictEqual(flag[0].curated, false, "drawn by an admin only for the boolean true: no remove on anything else");
+});
+
+QUnit.test("the relation kinds have a text; an unknown kind has none", function (assert) {
+    assert.strictEqual(relationKindKey("same_object"), "dcRelKind_same_object");
+    assert.strictEqual(relationKindKey("foreign_key"), "dcRelKind_foreign_key");
+    assert.strictEqual(relationKindKey("contains"), "", "not a relation of the detail");
+    assert.strictEqual(relationKindKey("toString"), "", "no key from the prototype");
+    assert.deepEqual(LINK_KINDS.slice(), ["same_object", "aggregates"], "what an admin may draw, in the Select's order");
+});
+
+function graphOf(nodes: [number, DataNodeKind, DataSourceKind, string, string][]): DataGraph {
+    return {
+        nodes: nodes.map(([id, kind, sourceKind, sourceName, label]) => ({
+            id, kind, source_kind: sourceKind, source_name: sourceName, name: `N${id}`, label, group: ""
+        })),
+        edges: []
+    };
+}
+
+QUnit.test("link candidates leave out the own source, fields and every kind that cannot be linked", function (assert) {
+    const graph = graphOf([
+        [300, "source", "ina", "flight-revenue", "Flight revenue"],
+        [310, "query", "ina", "flight-revenue", "Flight revenue by month"],
+        [311, "dimension", "ina", "flight-revenue", ""],
+        [200, "source", "generic", "agent-data", ""],
+        [210, "entity", "generic", "agent-data", "Demo airlines"],
+        [211, "field", "generic", "agent-data", "Airline"],
+        [220, "function", "generic", "agent-data", ""],
+        [410, "query", "ina", "cost-centres", "Cost centres"],
+        [413, "measure", "ina", "cost-centres", "Amount"]
+    ]);
+    const rows = linkCandidates(graph, { kind: "ina", name: "flight-revenue" });
+    assert.deepEqual(rows.map((row) => row.id), [210, 220, 410], "entities, queries and functions of other sources, in the answer's order");
+    assert.deepEqual(rows[0], {
+        id: 210, title: "Demo airlines", subtitle: "agent-data · entity N210", kind: "entity", icon: "sap-icon://table-view"
+    });
+    assert.strictEqual(rows[1].title, "N220", "no label: the name");
+    assert.deepEqual(linkCandidates({ nodes: [], edges: [] }, { kind: "ina", name: "flight-revenue" }), []);
+});
+
+QUnit.test("an OData and a generic service of one name are one source", function (assert) {
+    const graph = graphOf([
+        [210, "entity", "generic", "agent-data", ""],
+        [10, "entity", "odata", "agent-data", ""],
+        [510, "query", "ina", "agent-data", ""],
+        [20, "entity", "odata", "business-partners", ""]
+    ]);
+    assert.deepEqual(linkCandidates(graph, { kind: "odata", name: "agent-data" }).map((row) => row.id), [510, 20],
+        "one name is one row of the catalogue services, whatever its kind; an InA query of that name is another source");
+    assert.ok(sameSource({ source_kind: "odata", source_name: "x" }, { source_kind: "generic", source_name: "x" }));
+    assert.notOk(sameSource({ source_kind: "ina", source_name: "x" }, { source_kind: "odata", source_name: "x" }));
+    assert.notOk(sameSource({ source_kind: "odata", source_name: "x" }, { source_kind: "odata", source_name: "y" }));
+});
+
+QUnit.test("the candidates are asked of the graph route by kind and search text", function (assert) {
+    assert.deepEqual(LINK_NODE_KINDS.slice(), ["entity", "query", "function"]);
+    assert.strictEqual(linkQuery(""), "?kind=entity,query,function");
+    assert.strictEqual(linkQuery("  demo airline "), "?kind=entity,query,function&q=demo%20airline");
+});
+
+QUnit.test("a link starts at an entity or function of the source, or at its InA query", function (assert) {
+    assert.deepEqual(linkStarts({
+        ...DETAIL, functions: [node(40, "function", "Release", { label: "Release requisition" })]
+    }), [
+        { key: "10", text: "Requisition", kind: "entity" },
+        { key: "20", text: "A_Item", kind: "entity" },
+        { key: "40", text: "Release requisition", kind: "function" }
+    ], "no field");
+    assert.deepEqual(linkStarts(INA_DETAIL), [{ key: "310", text: "Flight revenue by month", kind: "query" }]);
+    assert.deepEqual(linkStarts({ source: null, entities: [], functions: [] }), [], "never imported: nothing to link");
+    assert.deepEqual(linkStarts({ ...INA_DETAIL, source: null }), [], "no source node, no start");
+});
+
+QUnit.test("every text the detail's model names is in the bundle", async function (assert) {
+    const bundle = await ResourceBundle.create({
+        url: sap.ui.require.toUrl("com/agent/admin/i18n/i18n.properties"), async: true
+    }) as ResourceBundle;
+    const keys = ["dcLinkOriginAdmin", "dcLinkOriginImported"]
+        .concat(["navigation", "association", "foreign_key", "same_object", "aggregates"].map(relationKindKey))
+        .concat(NODE_KINDS.map((kind) => `dcNodeKind_${kind}`));
+    keys.forEach((key) => assert.ok(key && bundle.hasText(key), key));
+    assert.strictEqual(bundle.getText("dcLinkOriginAdmin"), "Added by an admin");
+    assert.strictEqual(bundle.getText("dcLinkOriginImported"), "Imported");
 });
 
 QUnit.module("dataCatalog: what a hint edit sends");
