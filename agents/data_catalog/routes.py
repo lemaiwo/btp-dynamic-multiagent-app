@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import unicodedata
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -53,8 +52,8 @@ from agents.db import (
     list_odata_services,
     odata_service_referrers,
 )
+from agents.loc_fields import one_line_text, refusal_text
 from agents.odata.admin_routes import _bounded_body
-from agents.odata.models import loc_path
 
 logger = logging.getLogger(__name__)
 
@@ -76,9 +75,9 @@ _NOT_READABLE = "readable: the catalogue does not let agents read this node"
 
 
 def _one_line(value: str) -> str:
-    if any(unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") for ch in value):
-        raise ValueError("must be one line of text without control characters")
-    return value.strip()
+    # A hint is shown as one line in the admin's tables and the model's tool
+    # answer; it is refused with invisible format characters too.
+    return one_line_text(value, refuse_format=True).strip()
 
 
 class _Strict(BaseModel):
@@ -148,9 +147,7 @@ class RebuildBody(_Strict):
 
 
 def _refusal(exc: ValidationError) -> HTTPException:
-    errors = exc.errors(include_url=False, include_context=False, include_input=False)
-    lines = [f"{loc_path(e['loc'], 'body')}: {e['msg']}" for e in errors[:20]]
-    return HTTPException(status_code=422, detail="; ".join(lines))
+    return HTTPException(status_code=422, detail=refusal_text(exc, "body"))
 
 
 async def _json_body(request: Request, model: type[BaseModel], *, empty_ok: bool = False) -> Any:

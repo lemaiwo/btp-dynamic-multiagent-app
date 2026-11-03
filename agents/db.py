@@ -969,9 +969,12 @@ class ODataService(Base):
         has_write = any(
             op in _ODATA_WRITE_OPS for e in sets for op in e.get("operations") or []
         ) or any(
-            # The models' own rule: a missing flag and every POST are writes.
+            # The models' own rule: a missing flag and every POST are writes;
+            # a GET function import of a generic service is a read.
             bool(o.get("enabled"))
-            and _odata_operation_is_write(o.get("changes_data"), o.get("http_method"))
+            and _odata_operation_is_write(
+                o.get("changes_data"), o.get("http_method"), self.kind or "odata", o.get("kind")
+            )
             for o in ops
         )
         return {"entity_sets": len(sets), "operations": len(ops)}, has_write

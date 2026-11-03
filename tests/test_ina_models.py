@@ -27,6 +27,9 @@ from agents.ina.models import (  # noqa: E402
 )
 
 SECRET = "hunter2-pasted-by-mistake"
+# The rule of a member's name, label and unit, and of the query name: one
+# line, and no invisible format character either.
+MEMBER_RULE = "must be one line of text without control or format characters"
 
 GOOD: dict[str, Any] = {
     "name": "sales-by-region",
@@ -129,7 +132,7 @@ def test_defaults():
 
 
 @pytest.mark.parametrize(
-    "name", ["sales-by-region", "q1", "0abc", "a", "a" * 64, "sales-", "9-9-9"]
+    "name", ["sales-by-region", "q1", "0abc", "a", "a" * 64, "9-9-9", "a-b"]
 )
 def test_name_accepts_a_slug(name):
     assert validate_ina_query({**good(), "name": name}).name == name
@@ -137,7 +140,10 @@ def test_name_accepts_a_slug(name):
 
 @pytest.mark.parametrize(
     "name",
-    ["", "-sales", "Sales", "a" * 65, "sales_region", "sales region", "sales\n", "sälès", "a/b"],
+    [
+        "", "-sales", "sales-", "a-", "Sales", "a" * 65, "sales_region", "sales region",
+        "sales\n", "sälès", "a/b",
+    ],
 )
 def test_name_refuses_anything_else(name):
     text = refusal({**good(), "name": name})
@@ -150,7 +156,7 @@ def test_query_accepts_1_to_128_characters(query):
 
 
 @pytest.mark.parametrize(
-    "query", ["", "Q" * 129, "ZQ\n", "Z\x00Q", "Z\tQ", "ZQ\x7f", "Z\x85Q", "Z Q", "Z\x1bQ"]
+    "query", ["", "Q" * 129, "ZQ\n", "Z\x00Q", "Z\tQ", "ZQ\x7f", "Z\x85Q", "Z\u2028Q", "Z\x1bQ"]
 )
 def test_query_refuses_empty_long_or_control_characters(query):
     assert refusal({**good(), "query": query}).startswith("query: ")
@@ -181,7 +187,7 @@ def test_texts_have_their_length_cap(field, limit):
 
 @pytest.mark.parametrize("field", ["title", "purpose", "not_for"])
 @pytest.mark.parametrize(
-    "char", ["\n", "\r", "\t", "\x00", "\x1b", "\x7f", "\x85", " ", " "]
+    "char", ["\n", "\r", "\t", "\x00", "\x1b", "\x7f", "\x85", "\u2028", "\u2029"]
 )
 def test_texts_are_one_line(field, char):
     text = refusal({**good(), field: f"{SECRET}{char}second line"})
@@ -243,7 +249,7 @@ def test_metadata_fetched_at_is_a_timestamp():
     "where", ["dimensions", "measures", "variables"]
 )
 def test_member_names_are_1_to_128_characters_without_control_characters(where):
-    for name in ("", "N" * 129, "N\n", "N\x00", "N "):
+    for name in ("", "N" * 129, "N\n", "N\x00", "N\u2028"):
         data = good()
         data["definition"][where][0]["name"] = name
         assert refusal(data).startswith(f"definition.{where}.0.name: ")
@@ -256,8 +262,7 @@ def test_key_field_is_a_name_too():
     data = good()
     data["definition"]["dimensions"][0]["key_field"] = "K\nx"
     assert refusal(data) == (
-        "definition.dimensions.0.key_field: Value error, "
-        "key_field must be one line of text without control characters"
+        f"definition.dimensions.0.key_field: Value error, key_field {MEMBER_RULE}"
     )
     data["definition"]["dimensions"][0]["key_field"] = ""
     assert refusal(data).startswith("definition.dimensions.0.key_field: ")
@@ -272,17 +277,55 @@ def test_member_labels_are_one_line_of_at_most_120(where):
     )
     data["definition"][where][0]["label"] = "Net\nsales"
     assert refusal(data) == (
-        f"definition.{where}.0.label: Value error, "
-        "label must be one line of text without control characters"
+        f"definition.{where}.0.label: Value error, label {MEMBER_RULE}"
     )
 
 
 def test_variable_label_is_one_line_of_at_most_120():
     data = good()
     data["definition"]["variables"][0]["label"] = "L" * 121
-    assert refusal(data).startswith("definition.variables.0.label: ")
-    data["definition"]["variables"][0]["label"] = "Fiscal year"
-    assert refusal(data).startswith("definition.variables.0.label: ")
+    assert refusal(data) == (
+        "definition.variables.0.label: String should have at most 120 characters"
+    )
+    data["definition"]["variables"][0]["label"] = "Fiscal\u2029year"
+    assert refusal(data) == (
+        "definition.variables.0.label: Value error, "
+        f"label {MEMBER_RULE}"
+    )
+
+
+@pytest.mark.parametrize("where", ["dimensions", "measures", "variables"])
+@pytest.mark.parametrize("field", ["name", "label"])
+@pytest.mark.parametrize("char", ["\u202e", "\u202a", "\u2066", "\u2069", "\u200b", "\ufeff"])
+def test_member_names_and_labels_refuse_invisible_format_characters(where, field, char):
+    # A bidi override reorders how the line reads in the admin table and in
+    # the model's tool answer; a zero-width character hides a difference.
+    data = good()
+    data["definition"][where][0][field] = f"Fiscal{char}year"
+    assert refusal(data) == (
+        f"definition.{where}.0.{field}: Value error, {field} {MEMBER_RULE}"
+    )
+
+
+def test_units_key_fields_and_the_query_name_refuse_them_too():
+    data = good()
+    data["definition"]["measures"][0]["unit"] = "E\u202eUR"
+    assert refusal(data) == (
+        f"definition.measures.0.unit: Value error, unit {MEMBER_RULE}"
+    )
+    data = good()
+    data["definition"]["dimensions"][0]["key_field"] = "K\u200bEY"
+    assert refusal(data) == (
+        f"definition.dimensions.0.key_field: Value error, key_field {MEMBER_RULE}"
+    )
+    assert refusal({**good(), "query": "2CZQ\u202eX"}) == f"query: Value error, query {MEMBER_RULE}"
+
+
+def test_the_record_texts_keep_the_plain_one_line_rule():
+    # Title, purpose and "not for" are the admin's own text, as on the OData
+    # page: a format character there is not refused.
+    p = validate_ina_query({**good(), "title": "Sales\u200b by region"})
+    assert p.title == "Sales\u200b by region"
 
 
 def test_measure_unit_is_optional_and_at_most_32():
@@ -414,7 +457,7 @@ def test_a_refusal_never_echoes_an_input_value():
         "metadata_fetched_at": SECRET,
     }
     data["definition"]["dimensions"][0].update(name=f"{SECRET}\n", label=SECRET * 10)
-    data["definition"]["dimensions"][1]["key_field"] = f"{SECRET} "
+    data["definition"]["dimensions"][1]["key_field"] = f"{SECRET}\u2028"
     data["definition"]["measures"][0].update(unit=SECRET * 2, label=f"{SECRET}\r")
     data["definition"]["variables"][0].update(type=SECRET, mandatory=SECRET)
     data["definition"]["variables"][1]["label"] = SECRET * 10

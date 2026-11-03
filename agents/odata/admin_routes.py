@@ -59,13 +59,13 @@ from agents.db import (
     update_odata_service,
     validate_odata_service,
 )
+from agents.loc_fields import loc_path, refusal_text
 from agents.odata import destinations, preview, testcall
 from agents.odata.models import (
     DESTINATION_NAME_RE,
     EDM_NAME_RE,
     MAX_DEFINITION_BYTES,
     SERVICE_NAME_RE,
-    loc_path,
 )
 from agents.odata.urls import confine_service_path
 
@@ -78,7 +78,6 @@ router = APIRouter(prefix="/api/odata", tags=["odata"])
 _NOT_FOUND = "Service not found"
 _TITLE_MAX = 120  # ODataServicePayload.title
 _COPY_SUFFIX = " (copy)"
-_MAX_REPORTED_ERRORS = 20
 # The largest definition the gate accepts plus room for the other fields.
 # Checked before anything is parsed: without it an admin token could make the
 # worker buffer and parse a body of any size.
@@ -240,10 +239,8 @@ def _model_body(model: type[_Body], data: dict[str, Any]) -> _Body:
     try:
         return model.model_validate(data)
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        lines = [f"{_body_loc(err['loc'])}: {err['msg']}" for err in errors[:_MAX_REPORTED_ERRORS]]
         # `from None`: the ValidationError carries the input in its repr.
-        raise _refuse("; ".join(lines)) from None
+        raise _refuse(refusal_text(exc, "body")) from None
 
 
 def _duplicate_body(data: dict[str, Any]) -> DuplicateBody:

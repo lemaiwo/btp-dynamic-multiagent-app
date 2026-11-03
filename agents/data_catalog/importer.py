@@ -94,6 +94,9 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
     from agents.odata.models import ServiceDefinition
 
     definition = ServiceDefinition.model_validate(service.definition)
+    # The service's kind decides which calls are writes (a GET function import
+    # of a `generic` service is a read: `operation_is_write`).
+    kind = getattr(service, "kind", None) or "odata"
     readable_sets = [e for e in definition.entity_sets if {"list", "get"} & set(e.operations)]
     enabled_ops = [o for o in definition.operations if o.enabled]
     source = _Planned(
@@ -104,8 +107,10 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
             "label": _cut(service.title, LABEL_MAX),
             "purpose": _cut(service.purpose, PURPOSE_MAX),
             "not_for": _cut(service.not_for, NOT_FOR_MAX),
-            "readable": int(bool(readable_sets) or any(not o.is_write() for o in enabled_ops)),
-            "writable": int(definition.has_write()),
+            "readable": int(
+                bool(readable_sets) or any(not o.is_write(kind) for o in enabled_ops)
+            ),
+            "writable": int(definition.has_write(kind)),
             "is_key": 0,
             "type_name": None,
             "synonyms_json": None,
@@ -168,8 +173,8 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
                     "label": _cut(op.title, LABEL_MAX),
                     "purpose": _cut(op.description, PURPOSE_MAX),
                     "not_for": "",
-                    "readable": int(not op.is_write()),
-                    "writable": int(op.is_write()),
+                    "readable": int(not op.is_write(kind)),
+                    "writable": int(op.is_write(kind)),
                     "is_key": 0,
                     "type_name": None,
                     "synonyms_json": None,

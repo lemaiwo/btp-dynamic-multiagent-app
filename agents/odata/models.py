@@ -19,7 +19,6 @@ all of them already matched ``EDM_NAME_RE``), never a free-text value:
 from __future__ import annotations
 
 import re
-import unicodedata
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
@@ -30,12 +29,14 @@ from pydantic import (
     StrictBool,
     StringConstraints,
     ValidationError,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
-from agents.loc_fields import loc_field
+# `one_line` and `loc_path` are re-exported: the names other modules and
+# the tests have used from here.
+from agents.loc_fields import loc_path, one_line, refusal_text
 
 from .urls import confine_service_path
 
@@ -57,9 +58,6 @@ MAX_DEFINITION_BYTES = 2_000_000
 # URL allows: no '/', '?', '#', '%', whitespace or parentheses.
 # Used with `fullmatch`: Python's `$` would also accept a trailing "\n".
 _ENTITY_PATH_RE = re.compile(r"[A-Za-z0-9_.-]{1,128}")
-# How many problems one refusal lists. (How a `loc` part is shown -- it can
-# be an unknown key, i.e. text the caller typed -- is `agents.loc_fields`.)
-_MAX_REPORTED_ERRORS = 20
 
 EdmName = Annotated[str, StringConstraints(pattern=EDM_NAME_RE)]
 EdmType = Annotated[str, StringConstraints(min_length=1, max_length=200)]
@@ -75,22 +73,9 @@ def _first_duplicate(names: list[str]) -> str | None:
     return None
 
 
-def one_line(value: str, info: ValidationInfo) -> str:
-    """Refuse a control character or a line separator in a one-line text.
-
-    These texts are printed as one line each -- the service's ``purpose`` in
-    an agent's instructions, titles, labels and value meanings in the search
-    tool's answer -- so a line break in one of them would start a line of its
-    own there, which reads as something the catalogue did not say. The
-    message names the field, never the text.
-    """
-    if any(unicodedata.category(ch) in ("Cc", "Zl", "Zp") for ch in value):
-        raise ValueError(f"{info.field_name} must be one line of text without control characters")
-    return value
-
-
-# The earlier, private name; `one_line` is public because the InA gate
-# (agents/ina/models.py) applies the same rule.
+# The one-line rule of the catalogue's texts is `agents.loc_fields.one_line`
+# (no control character, no line separator; the message names the field).
+# `_one_line` is the earlier, private name.
 _one_line = one_line
 
 
@@ -234,7 +219,9 @@ class ParamDef(_Model):
     required: StrictBool = True
 
 
-def operation_is_write(changes_data: Any, http_method: Any) -> bool:
+def operation_is_write(
+    changes_data: Any, http_method: Any, kind: Any = "odata", operation_kind: Any = None
+) -> bool:
     """Whether calling an operation is a write. THE rule, said once.
 
     A read is only what the catalogue marks ``changes_data: false`` (exactly
@@ -243,10 +230,22 @@ def operation_is_write(changes_data: Any, http_method: Any) -> bool:
     ``POST`` whatever its flag says -- the catalogue can store ``POST`` with
     ``changes_data: false``, and that combination is not run as a read.
 
-    Takes the two stored values, so that the model (``OperationDef.is_write``),
+    On a service of kind ``generic`` (the ZAGENT_DATA registration of SAP's
+    own allow-list) a ``function_import`` sent with ``GET`` is a read
+    whatever ``changes_data`` says: the allow-list owner vouches that a
+    listed module only reads, and the ABAP side calls it without a commit.
+    Only exactly that: ``kind`` exactly ``"generic"`` (the service's kind),
+    ``operation_kind`` exactly ``"function_import"`` (the operation's own
+    ``kind``; not given means not known, and the rule above applies) and
+    exactly ``GET``. A ``POST`` and every entity write of a generic service
+    are writes as on any other.
+
+    Takes the stored values, so that the model (``OperationDef.is_write``),
     the code that reads a stored dict without validating it (the service
     list in ``agents.db``, the search tool) and the client decide alike.
     """
+    if kind == "generic" and operation_kind == "function_import" and http_method == "GET":
+        return False
     return not (changes_data is False and http_method == "GET")
 
 
@@ -286,9 +285,10 @@ class OperationDef(_Model):
 
     _one_line = field_validator("title")(one_line)
 
-    def is_write(self) -> bool:
-        """Whether a call of this operation is a write (``operation_is_write``)."""
-        return operation_is_write(self.changes_data, self.http_method)
+    def is_write(self, kind: Any = "odata") -> bool:
+        """Whether a call of this operation is a write on a service of
+        ``kind`` (``operation_is_write``)."""
+        return operation_is_write(self.changes_data, self.http_method, kind, self.kind)
 
     @field_validator("qualified_name")
     @classmethod
@@ -344,15 +344,17 @@ class ServiceDefinition(_Model):
     def operation(self, name: str) -> OperationDef | None:
         return next((o for o in self.operations if o.name == name), None)
 
-    def has_write(self) -> bool:
-        """Whether anything in here can change data in SAP.
+    def has_write(self, kind: Any = "odata") -> bool:
+        """Whether anything in here can change data in SAP, on a service of
+        ``kind``.
 
         An entity set with create, update or delete, or an ENABLED operation
         that is run as a write (``OperationDef.is_write``: also a ``POST``
-        stored as ``changes_data: false``).
+        stored as ``changes_data: false``; not a ``GET`` function import of a
+        generic service).
         """
         return any(e.has_write() for e in self.entity_sets) or any(
-            o.enabled and o.is_write() for o in self.operations
+            o.enabled and o.is_write(kind) for o in self.operations
         )
 
 
@@ -360,8 +362,9 @@ class ODataServicePayload(_Model):
     """One catalogue service, as the admin API takes it and export writes it."""
 
     name: Annotated[str, StringConstraints(pattern=SERVICE_NAME_RE)]
-    # `generic` is the ZAGENT_DATA registration of addendum (k), part 3 (the
-    # rules that differ for it are applied where the kind is read).
+    # `generic` is the ZAGENT_DATA registration of addendum (k), part 3: an
+    # OData V2 service (`_kinds_match_version`) whose GET function imports
+    # are reads (`operation_is_write`).
     kind: Literal["odata", "generic"] = "odata"
     # Stripped before the length check, so a blank title or purpose is
     # refused: the model picks a service by these two lines.
@@ -388,6 +391,20 @@ class ODataServicePayload(_Model):
 
     @model_validator(mode="after")
     def _kinds_match_version(self) -> ODataServicePayload:
+        if self.kind == "generic" and self.odata_version != "v2":
+            # Named at `kind`, not at the whole service: raised as a
+            # ValidationError, pydantic keeps this error's own `loc`. Before
+            # the operations, whose kinds would otherwise be the reason given.
+            raise ValidationError.from_exception_data(
+                type(self).__name__,
+                [
+                    InitErrorDetails(
+                        type=PydanticCustomError("generic_is_v2", "a generic service is OData V2"),
+                        loc=("kind",),
+                        input=self.kind,
+                    )
+                ],
+            )
         for op in self.definition.operations:
             who = f"operation {op.name!r}"
             if self.odata_version == "v2":
@@ -411,20 +428,7 @@ class ODataServicePayload(_Model):
         return self
 
     def has_write(self) -> bool:
-        return self.definition.has_write()
-
-
-def loc_path(parts: tuple[Any, ...], root: str) -> str:
-    """Where a problem is, as ``a.0.b``; ``root`` when it is the whole input.
-
-    A list index is repeated as it is, a key only when it has the form of a
-    field name (``agents.loc_fields``: the one rule of every gate).
-    """
-    shown = [
-        str(part) if isinstance(part, int) and not isinstance(part, bool) else loc_field(part)
-        for part in parts
-    ]
-    return ".".join(shown) or root
+        return self.definition.has_write(self.kind)
 
 
 def _loc(parts: tuple[Any, ...]) -> str:
@@ -452,10 +456,6 @@ def validate_odata_service(data: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = ODataServicePayload.model_validate(data)
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        lines = [f"{_loc(err['loc'])}: {err['msg']}" for err in errors[:_MAX_REPORTED_ERRORS]]
-        if len(errors) > _MAX_REPORTED_ERRORS:
-            lines.append(f"and {len(errors) - _MAX_REPORTED_ERRORS} more")
         # `from None`: the ValidationError carries the input in its repr.
-        raise ValueError("; ".join(lines)) from None
+        raise ValueError(refusal_text(exc, "service")) from None
     return payload.model_dump(mode="json")

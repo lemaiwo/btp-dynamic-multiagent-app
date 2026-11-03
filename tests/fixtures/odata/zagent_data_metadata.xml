@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-written EDMX 1.0 in the shape SAP Gateway generates for the generic
+     allow-list service of addendum (k), part 3 (ZAGENT_DATA_SRV): two
+     allow-listed tables as read-only entity sets and one allow-listed
+     function module as a GET function import with a complex return type.
+     The two sets and the function import carry the allow-list's PURPOSE as
+     sap:label; the entity type SCARR has a label of its own, which the set's
+     label must win over. Standard SAP demo tables only, generic texts; not
+     a copy of any system's $metadata. -->
+<edmx:Edmx Version="1.0"
+    xmlns:edmx="http://schemas.microsoft.com/ado/2007/06/edmx"
+    xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
+    xmlns:sap="http://www.sap.com/Protocols/SAPData">
+  <edmx:DataServices m:DataServiceVersion="2.0">
+    <Schema Namespace="ZAGENT_DATA_SRV" xml:lang="en" sap:schema-version="1"
+        xmlns="http://schemas.microsoft.com/ado/2008/09/edm">
+      <EntityType Name="SCARR" sap:label="Airline" sap:content-version="1">
+        <Key>
+          <PropertyRef Name="CARRID"/>
+        </Key>
+        <Property Name="CARRID" Type="Edm.String" Nullable="false" MaxLength="3" sap:label="Airline" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="CARRNAME" Type="Edm.String" MaxLength="20" sap:label="Airline name" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="CURRCODE" Type="Edm.String" MaxLength="5" sap:label="Airline currency" sap:creatable="false" sap:updatable="false" sap:semantics="currency-code"/>
+      </EntityType>
+      <EntityType Name="T000" sap:content-version="1">
+        <Key>
+          <PropertyRef Name="MANDT"/>
+        </Key>
+        <Property Name="MANDT" Type="Edm.String" Nullable="false" MaxLength="3" sap:label="Client" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="MTEXT" Type="Edm.String" MaxLength="25" sap:label="Name" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="ORT01" Type="Edm.String" MaxLength="25" sap:label="City" sap:creatable="false" sap:updatable="false"/>
+        <Property Name="CCCATEGORY" Type="Edm.String" MaxLength="1" sap:label="Client role" sap:creatable="false" sap:updatable="false"/>
+      </EntityType>
+      <ComplexType Name="MONTH_NAMES_GET_RESULT">
+        <Property Name="SPRAS" Type="Edm.String" MaxLength="2" sap:label="Language"/>
+        <Property Name="MNR" Type="Edm.String" MaxLength="2" sap:label="Month"/>
+        <Property Name="KTX" Type="Edm.String" MaxLength="3" sap:label="Short text"/>
+        <Property Name="LTX" Type="Edm.String" MaxLength="10" sap:label="Long text"/>
+      </ComplexType>
+      <EntityContainer Name="ZAGENT_DATA_SRV_Entities" m:IsDefaultEntityContainer="true" sap:supported-formats="atom json xlsx">
+        <EntitySet Name="SCARRSet" EntityType="ZAGENT_DATA_SRV.SCARR" sap:label="Demo airlines (smoke test)" sap:creatable="false" sap:updatable="false" sap:deletable="false" sap:pageable="false" sap:content-version="1"/>
+        <EntitySet Name="T000Set" EntityType="ZAGENT_DATA_SRV.T000" sap:label="Clients of the system (smoke test)" sap:creatable="false" sap:updatable="false" sap:deletable="false" sap:pageable="false" sap:content-version="1"/>
+        <FunctionImport Name="MONTH_NAMES_GET" ReturnType="Collection(ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT)" m:HttpMethod="GET" sap:label="Month names (smoke test)">
+          <Parameter Name="LANGUAGE" Type="Edm.String" Mode="In" MaxLength="2" Nullable="false"/>
+        </FunctionImport>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

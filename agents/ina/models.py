@@ -16,9 +16,14 @@ never a value: unlike the OData catalogue's EDM names, an InA name may hold
 almost any character, so even a duplicate is named by its position.
 ``validate_ina_query`` builds its message from ``loc`` and ``msg`` only.
 
-The one-line rule, the destination name rule and the ``loc`` spelling are
-the OData catalogue's (``agents.odata.models``), so a text is refused alike
-on both registration pages. Never imports ``agents.db``.
+The one-line rule and the refusal text are those of every gate
+(``agents.loc_fields``) and the destination name rule is the OData
+catalogue's (``agents.odata.models``), so a text is refused alike on both
+registration pages. What SAP described -- a member's name and label, a
+unit, the query's name -- is held to the stricter form of the one-line rule
+(``one_line_strict``: no invisible format character either); the record's
+own texts (title, purpose, "not for", package) to the plain one, as on the
+OData page. Never imports ``agents.db``.
 """
 
 from __future__ import annotations
@@ -38,27 +43,28 @@ from pydantic import (
     field_validator,
 )
 
-# `one_line` is imported rather than restated: one rule for both pages.
-from agents.odata.models import DESTINATION_NAME_RE, loc_path, one_line
+# Imported rather than restated: one rule for every gate.
+from agents.loc_fields import one_line, one_line_strict, refusal_text
+from agents.odata.models import DESTINATION_NAME_RE
 
-QUERY_NAME_RE = r"^[a-z0-9][a-z0-9-]{0,63}$"  # the slug agents and server entries use
+# The slug agents and server entries use; no hyphen at either end, as
+# `SERVICE_NAME_RE` of the OData catalogue.
+QUERY_NAME_RE = r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$"
 
 MAX_DIMENSIONS = 100
 MAX_MEASURES = 100
 MAX_VARIABLES = 50
-# How many problems one refusal lists (as the OData gate).
-_MAX_REPORTED_ERRORS = 20
 
 
 # A technical name SAP uses (the query's object name, a dimension, measure,
 # variable or key field). Deliberately lax about which characters: InA names
 # are not EDM identifiers (`0CALMONTH`, `[ZREGION].[KEY]`, `!V0001`); only
-# what would break a line is refused.
+# what would break a line, or hide or reorder a part of it, is refused.
 InaName = Annotated[
-    StrictStr, StringConstraints(min_length=1, max_length=128), AfterValidator(one_line)
+    StrictStr, StringConstraints(min_length=1, max_length=128), AfterValidator(one_line_strict)
 ]
-Label = Annotated[StrictStr, StringConstraints(max_length=120), AfterValidator(one_line)]
-Unit = Annotated[StrictStr, StringConstraints(max_length=32), AfterValidator(one_line)]
+Label = Annotated[StrictStr, StringConstraints(max_length=120), AfterValidator(one_line_strict)]
+Unit = Annotated[StrictStr, StringConstraints(max_length=32), AfterValidator(one_line_strict)]
 
 
 def _first_repeat(names: list[str]) -> int | None:
@@ -153,12 +159,5 @@ def validate_ina_query(data: Any) -> InaQueryPayload:
     try:
         return InaQueryPayload.model_validate(data)
     except ValidationError as exc:
-        errors = exc.errors(include_url=False, include_context=False, include_input=False)
-        lines = [
-            f"{loc_path(err['loc'], 'ina_query')}: {err['msg']}"
-            for err in errors[:_MAX_REPORTED_ERRORS]
-        ]
-        if len(errors) > _MAX_REPORTED_ERRORS:
-            lines.append(f"and {len(errors) - _MAX_REPORTED_ERRORS} more")
         # `from None`: the ValidationError carries the input in its repr.
-        raise ValueError("; ".join(lines)) from None
+        raise ValueError(refusal_text(exc, "ina_query")) from None

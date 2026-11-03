@@ -75,17 +75,19 @@ their own gate, ``check_call``. In SAP the real business steps -- release,
 approve, post, cancel -- are function imports and actions, so a call is a
 WRITE unless the catalogue says otherwise in so many words: only an
 operation marked ``changes_data: false`` that is also a ``GET`` is sent as a
-read (``call_changes_data``); a V4 action is a ``POST`` and therefore always
-a write. Every other call, a ``GET`` included, goes out exactly like an
-entity write: the caller's own CSRF session, one repeat after a 403
-``Required``, never a repeat after a failure, success recognised
-positively. How a call is addressed is the dialect's (``call_request``): V2
-sends the parameters and the key of a bound entity in the query string, V4
-puts the key in the path, a function's parameters behind its name and an
-action's parameters in a JSON body. What comes back is shown only when
-it can be tied to a catalogue entity set -- the one the operation's
-``returns`` names, else the one it is ``bound_to`` -- so that the field
-allowlist applies; otherwise the answer is a confirmation and nothing else
+read (``call_changes_data``), and on a service of kind ``generic`` (SAP's
+own allow-list) a ``GET`` function import whatever its flag says; a V4
+action is a ``POST`` and therefore always a write. Every other call, a
+``GET`` included, goes out exactly like an entity write: the caller's own
+CSRF session, one repeat after a 403 ``Required``, never a repeat after a
+failure, success recognised positively. How a call is addressed is the
+dialect's (``call_request``): V2 sends the parameters and the key of a
+bound entity in the query string, V4 puts the key in the path, a
+function's parameters behind its name and an action's parameters in a JSON
+body. What comes back is shown only when it can be tied to a catalogue
+entity set -- the one the operation's ``returns`` names, else the one it is
+``bound_to`` -- so that the field allowlist applies; otherwise the answer
+is a confirmation and nothing else
 (``ODataClient.call``, ``_returned``).
 """
 
@@ -201,6 +203,7 @@ def call_refusal(
     *,
     allow_write: bool = True,
     bound_key_types: Sequence[str] | None = None,
+    kind: Any = "odata",
 ) -> str | None:
     """Why ``operation`` cannot be called, or ``None`` when it can. No I/O.
 
@@ -214,8 +217,10 @@ def call_refusal(
     an operation that is not bound; empty when the set has no key, which a
     set with only list or create may -- a call bound to it could name no
     entity). ``dialect`` is the dialect of the
-    service's OData version (``None``: none). First match of
-    ``CALL_REFUSALS``, in that order.
+    service's OData version (``None``: none), ``kind`` the service's kind,
+    which the write rule depends on (``models.operation_is_write``: a
+    ``GET`` function import of a ``generic`` service needs no
+    ``allow_write``). First match of ``CALL_REFUSALS``, in that order.
 
     The dialect says what it can call: ``supports_call`` exactly ``True``,
     and the operation kinds it sends (``call_kinds``; function imports when
@@ -251,7 +256,7 @@ def call_refusal(
         or operation.kind not in kinds
     ):
         return "calls_not_available"
-    if not allow_write and operation.is_write():
+    if not allow_write and operation.is_write(kind):
         return "write_not_allowed"
     always: set[str] = set()
     sends = getattr(dialect, "sends_type", None)
@@ -277,11 +282,12 @@ def call_refusal(
     return None
 
 
-def call_changes_data(operation: OperationDef) -> bool:
-    """Whether calling ``operation`` is a write: the model's own rule
-    (``OperationDef.is_write`` / ``models.operation_is_write``), which is
-    also what ``has_write`` and the search tool go by."""
-    return operation.is_write()
+def call_changes_data(operation: OperationDef, kind: Any = "odata") -> bool:
+    """Whether calling ``operation`` of a service of ``kind`` is a write: the
+    model's own rule (``OperationDef.is_write`` /
+    ``models.operation_is_write``), which is also what ``has_write`` and the
+    search tool go by."""
+    return operation.is_write(kind)
 
 
 # Raised before a connection exists: nothing left this app.
@@ -563,6 +569,10 @@ class ODataClient:
         # settings, never an argument of a call.
         self._destination = service.get("destination")
         self._user_context = service.get("user_context")
+        # Which write rule applies (`models.operation_is_write`): the stored
+        # kind as it is; anything but exactly "generic" keeps the rule of
+        # `odata`.
+        self._kind = service.get("kind", "odata")
         # For log lines only: the catalogue name, when it has the form of one.
         name = service.get("name")
         self._name = name if isinstance(name, str) and _LOG_NAME.fullmatch(name) else "?"
@@ -1100,6 +1110,7 @@ class ODataClient:
             bound_keys,
             self._dialect,
             bound_key_types=None if bound is None else [k.type for k in bound.keys],
+            kind=self._kind,
         )
         if reason is not None:
             raise self._not_callable(operation, reason, bound_keys or [])
@@ -1140,7 +1151,7 @@ class ODataClient:
                 "invalid_argument",
                 f"operation {operation.name!r} is not bound to an entity; it takes no key",
             )
-        changes = call_changes_data(operation)
+        changes = call_changes_data(operation, self._kind)
         if etag is not None:
             if bound is None or not changes:
                 raise ODataError(
