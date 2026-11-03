@@ -383,6 +383,20 @@ async def test_list_models_keeps_embedding_models_with_their_versions():
     assert request.url.path == "/v2/lm/scenarios/foundation-models/models"
 
 
+async def test_a_model_whose_name_says_embed_is_an_embedding_model():
+    # Bedrock's and NVIDIA's names say "embed", not "embedding"
+    server = FakeAICore()
+    server.models = [_model("gpt-4o"), _model("amazon--titan-embed-text", ("2",), "aws-bedrock")]
+    server.deployments = [_deployment("gpt-4o", "RUNNING", "d00000000g1"),
+                          _deployment("amazon--titan-embed-text", "RUNNING", "d00000000t1")]
+    client = _client(server)
+    assert await client.list_models() == [
+        {"model": "amazon--titan-embed-text", "versions": ["2"]}]
+    assert await client.list_deployments() == [
+        {"model": "amazon--titan-embed-text", "status": "RUNNING",
+         "deployment_id": "d00000000t1"}]
+
+
 @pytest.mark.parametrize("failure", [
     403, 500, 302,
     lambda request: httpx.Response(200, text=f"<html>{BODY_MARKER}</html>"),

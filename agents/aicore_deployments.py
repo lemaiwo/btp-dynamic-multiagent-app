@@ -203,7 +203,9 @@ def _is_name(value: Any) -> bool:
 
 
 def _is_embedding(value: Any) -> bool:
-    return _is_name(value) and "embedding" in value.lower()
+    # ``embed``, not ``embedding``: Bedrock and NVIDIA name theirs
+    # ``amazon--titan-embed-text``, ``nvidia--...-nv-embedqa-...``.
+    return _is_name(value) and "embed" in value.lower()
 
 
 def _deployed_model(entry: dict) -> Any:
@@ -429,7 +431,7 @@ class AICoreDeployments:
 
     async def list_models(self) -> list[dict[str, Any]]:
         """``[{model, versions}]``: the scenario's embedding models (the name
-        holds ``embedding``), by name."""
+        holds ``embed``, in any case), by name."""
         creds = self._resolved()
         async with self._http() as http:
             offered = await self._offered(http, creds)
