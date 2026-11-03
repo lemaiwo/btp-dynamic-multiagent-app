@@ -414,6 +414,20 @@ async def test_duplicate_copies_the_definition_under_a_new_identity(client, crea
     assert original["destination"] == "S4_ODATA_USER" and original["user_context"] is True
 
 
+async def test_duplicate_of_a_generic_service_is_generic(client):
+    """``kind`` is part of the copied definition: a copy of the ZAGENT_DATA
+    registration keeps its rules, and the copy of a plain one stays plain."""
+    r = await client.post(BASE, json=good(name="zagent-data", kind="generic"))
+    assert r.status_code == 201, r.text
+    r = await client.post(f"{BASE}/zagent-data/duplicate", json={"name": "zagent-data-jobs"})
+    assert r.status_code == 201, r.text
+    assert r.json()["kind"] == "generic"
+    assert (await client.get(f"{BASE}/zagent-data-jobs")).json()["kind"] == "generic"
+    assert (await client.post(BASE, json=good(name="plain"))).status_code == 201
+    r = await client.post(f"{BASE}/plain/duplicate", json={"name": "plain-copy"})
+    assert r.status_code == 201 and r.json()["kind"] == "odata"
+
+
 async def test_duplicate_keeps_identity_fields_it_is_not_given(client, created):
     r = await client.post(f"{ONE}/duplicate", json={"name": "pr-copy", "title": "  Mine  "})
     assert r.status_code == 201

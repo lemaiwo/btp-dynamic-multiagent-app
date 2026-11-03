@@ -39,6 +39,7 @@ import agents.ide.models  # noqa: E402,F401
 from agents.db import (  # noqa: E402
     AgentConfig,
     Base,
+    InaQuery,
     JobRun,
     McpOAuthClient,
     McpOAuthState,
@@ -49,8 +50,10 @@ from agents.db import (  # noqa: E402
     Workflow,
     WorkflowBranch,
     WorkflowStep,
+    create_ina_query,
 )
 from agents.ide.models import IdeAuditLog, IdeConventions  # noqa: E402
+from agents.ina.models import validate_ina_query  # noqa: E402
 from tests import pg  # noqa: E402
 from tests.registry_rows import (  # noqa: E402
     MARKER_AGENT,
@@ -147,6 +150,7 @@ async def test_the_default_is_a_dry_run_that_names_and_counts(dbs, capsys, caplo
         "  workflows: insert 1 (mail-triage), replace 0, unchanged 0, "
         "only in target 3 (local-wf-0, local-wf-1, local-wf-2)",
         "  odata_services: insert 1 (stock), replace 0, unchanged 0, only in target 0",
+        "  ina_queries: insert 0, replace 0, unchanged 0, only in target 0",
         "  ide_conventions: insert 1 (DEV), replace 0, unchanged 0, only in target 0, "
         "audited 1 (DEV)",
         "  mcp_oauth_clients: insert 1, replace 0, unchanged 0, only in target 0",
@@ -165,8 +169,8 @@ async def test_the_default_is_a_dry_run_that_names_and_counts(dbs, capsys, caplo
 def test_what_is_copied_and_what_is_not():
     assert set(copy_script.COPIED) == {
         "agent_configs", "skill_configs", "orchestrator_config", "workflows",
-        "workflow_branches", "workflow_steps", "odata_services", "ide_conventions",
-        "mcp_oauth_clients", "mcp_oauth_tokens",
+        "workflow_branches", "workflow_steps", "odata_services", "ina_queries",
+        "ide_conventions", "mcp_oauth_clients", "mcp_oauth_tokens",
     }
     assert set(copy_script.NOT_COPIED) == set(Base.metadata.tables) - set(copy_script.COPIED)
     for name in ("job_runs", "workflow_runs", "workflow_item_runs", "workflow_step_runs",
@@ -224,6 +228,32 @@ async def test_apply_copies_the_configuration_with_its_secrets(dbs, capsys, capl
     assert await target.count(JobRun) == 0 and await target.count(McpOAuthState) == 0
 
 
+async def test_a_registered_ina_query_goes_with_a_database_switch(dbs, capsys):
+    """``ina_queries`` is configuration (addendum (k)): the query, its
+    identity and what ``Describe`` read arrive as they were, matched by
+    name; a second run changes nothing."""
+    source, target = dbs
+    payload = validate_ina_query({
+        "name": "sales-by-region", "title": "Sales by region",
+        "purpose": "Net sales per region and month", "destination": "S4_INA_USER",
+        "user_context": True, "query": "2CZQ_SALES", "package": "ZANALYTICS",
+        "definition": {"dimensions": [{"name": "ZREGION", "label": "Region"}]},
+        "metadata_fetched_at": "2026-11-03T08:30:00Z",
+    })
+    async with source.sessions() as s:
+        await create_ina_query(s, payload)
+    code, out, _ = await run(capsys)
+    assert code == 0
+    assert ("  ina_queries: insert 1 (sales-by-region), replace 0, unchanged 0, "
+            "only in target 0") in out.splitlines()
+    assert (await run(capsys, "--apply"))[0] == 0
+    (copied,) = await target.all(InaQuery)
+    (original,) = await source.all(InaQuery)
+    assert copied.to_export() == original.to_export()
+    assert copied.to_export()["definition"] == payload.definition.model_dump(mode="json")
+    assert (await run(capsys))[1].count("ina_queries: insert 0, replace 0, unchanged 1") == 1
+
+
 async def test_ids_are_the_targets_and_children_follow_their_workflow(dbs, capsys):
     source, target = dbs
     assert (await run(capsys, "--apply"))[0] == 0
@@ -252,7 +282,7 @@ async def test_a_second_run_changes_nothing(dbs, capsys):
         code, out, _ = await run(capsys, *extra)
         assert code == 0
         lines = [line for line in out.splitlines() if ": insert " in line]
-        assert len(lines) == 10
+        assert len(lines) == len(copy_script.SPECS) + len(copy_script.CHILDREN) == 11
         assert all("insert 0, replace 0" in line for line in lines), out
     assert {a.name: a.updated_at for a in await target.all(AgentConfig)} == stamps
 

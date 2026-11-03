@@ -3842,20 +3842,27 @@ async def delete_odata_service(
     return True
 
 
-def odata_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The ``builtin:odata`` config blocks of a server list, in order.
+def _builtin_entries(servers: list[dict[str, Any]], builtin: str) -> list[dict[str, Any]]:
+    """The config blocks of the ``builtin`` entries of a server list, in order.
 
-    An entry without a block, or with one that is not an object, has no
-    services and is left out.
+    The URL is compared in the spelling storage and the gate accept (edge
+    whitespace, a trailing ``/`` and the case do not count). An entry
+    without a block, or with one that is not an object, is left out.
     """
     blocks: list[dict[str, Any]] = []
     for server in servers or []:
         if not isinstance(server, dict):
             continue
         url = str(server.get("url") or "").strip().rstrip("/").lower()
-        if url == BUILTIN_ODATA_URL and isinstance(server.get("oauth"), dict):
+        if url == builtin and isinstance(server.get("oauth"), dict):
             blocks.append(server["oauth"])
     return blocks
+
+
+def odata_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The ``builtin:odata`` config blocks of a server list, in order (an
+    entry without an object block has no services and is left out)."""
+    return _builtin_entries(servers, BUILTIN_ODATA_URL)
 
 
 async def odata_service_referrers(
@@ -3897,9 +3904,9 @@ async def odata_service_referrers(
 # The refusals of the CRUD: the field and the rule, never a value.
 INA_NAME_TAKEN = "name: already exists"
 INA_NAME_FIXED = "name: cannot be changed; register the query under the new name instead"
-# The payload fields a ``Describe`` writes rather than an admin types, and
-# their columns: an update that leaves such a key out keeps the stored value.
-_INA_DESCRIBED = {"definition": "definition_json", "metadata_fetched_at": "metadata_fetched_at"}
+# The columns a ``Describe`` writes rather than an admin types; one pair,
+# kept by an update whose payload has no ``definition`` key.
+_INA_DESCRIBED = ("definition_json", "metadata_fetched_at")
 
 
 class StaleRow(Exception):
@@ -3926,8 +3933,14 @@ def ina_query_columns(payload: InaQueryPayload) -> dict[str, Any]:
 
     The definition is stored as the model's own ``model_dump_json()``, so
     `InaQuery.to_export` reads back exactly what the gate produced; no
-    description yet is NULL.
+    description yet is NULL. ``definition`` and ``metadata_fetched_at`` are
+    one pair, the stamp saying when that definition was read: without a
+    definition there is no stamp (a stamp sent with ``null`` is dropped),
+    and a definition sent without a stamp is stamped now.
     """
+    described_at = None
+    if payload.definition is not None:
+        described_at = _odata_utc(payload.metadata_fetched_at) or _odata_now()
     return {
         "title": payload.title,
         "purpose": payload.purpose,
@@ -3939,7 +3952,7 @@ def ina_query_columns(payload: InaQueryPayload) -> dict[str, Any]:
         "definition_json": (
             None if payload.definition is None else payload.definition.model_dump_json()
         ),
-        "metadata_fetched_at": _odata_utc(payload.metadata_fetched_at),
+        "metadata_fetched_at": described_at,
         "enabled": 1 if payload.enabled is True else 0,
     }
 
@@ -3990,12 +4003,15 @@ async def create_ina_query(
     return row
 
 
-def _stamp_moved(stored: datetime | None, expected: datetime | None) -> bool:
-    """Whether the row's ``updated_at`` is no longer ``expected``.
+def stamp_moved(stored: datetime | None, expected: datetime | None) -> bool:
+    """Whether a row's ``updated_at`` (``stored``) is no longer ``expected``.
 
-    Instants are compared, not texts (SQLite hands the column back naive,
-    Postgres aware; a client may send either). ``expected`` None asks for no
-    check; a row without a stamp is always moved.
+    The one comparison of every ``expected_updated_at`` check (the OData
+    update route, `update_ina_query`). Instants are compared, not texts: the
+    same moment is written with an offset by Postgres and without one by
+    SQLite (naive means UTC), and a client may hand back either.
+    ``expected`` None asks for no check; a row without a stamp is always
+    moved. Only meaningful on a row read under the lock the write then keeps.
     """
     if expected is None:
         return False
@@ -4005,8 +4021,19 @@ def _stamp_moved(stored: datetime | None, expected: datetime | None) -> bool:
 
 def _locked_ina_query(name: str) -> Any:
     """The query row with an exclusive row lock (Postgres, HANA; SQLAlchemy
-    leaves ``FOR UPDATE`` out on SQLite)."""
-    return select(InaQuery).where(InaQuery.name == name).with_for_update()
+    leaves ``FOR UPDATE`` out on SQLite).
+
+    ``populate_existing``: the session may already hold this row from an
+    earlier read, and SQLAlchemy hands back such an instance as it is, so
+    the comparison would be made on the stamp of that read, not on the row
+    the lock waited for.
+    """
+    return (
+        select(InaQuery)
+        .where(InaQuery.name == name)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
 
 
 async def update_ina_query(
@@ -4019,38 +4046,40 @@ async def update_ina_query(
 ) -> InaQuery | None:
     """Replace everything but the name of query ``name`` with ``data``.
 
-    Lock, compare, write in the caller's transaction, as the OData update
-    route does: the row is read ``FOR UPDATE``, and with
-    ``expected_updated_at`` it is replaced only while its ``updated_at`` is
-    still that instant, else `StaleRow` and nothing changes. Of two saves
-    that loaded the same stamp the second waits at the locked read and then
-    compares against the first one's new stamp. SQLite has no row locks: on
-    a session that has not started yet the transaction is made a writer
-    first (`begin_exclusive_write`); a caller whose transaction is already
-    open there takes that lock itself, before its first statement. Without
-    ``expected_updated_at`` the replace is unconditional (scripts, imports).
+    Serialise, lock, compare, write in the caller's transaction, as the
+    OData update route does: `begin_exclusive_write` (SQLite has no row
+    locks; it makes the transaction a writer, and logs a WARNING when the
+    caller's transaction is already open), then the row read ``FOR UPDATE``
+    and re-read into the session (`_locked_ina_query`), and with
+    ``expected_updated_at`` the row is replaced only while its
+    ``updated_at`` is still that instant (`stamp_moved`), else `StaleRow`
+    and nothing changes. Of two saves that loaded the same stamp the second
+    waits at the locked read and then compares against the first one's new
+    stamp. Without ``expected_updated_at`` the replace is unconditional
+    (scripts, imports).
 
     Answers None for an unknown name; a different name in ``data`` is
     ``ValueError(INA_NAME_FIXED)``: agents name a query, so a rename would
-    detach them silently. ``definition`` and ``metadata_fetched_at`` are
-    what ``Describe`` read from SAP: a payload that leaves such a key out
-    (an edit form) keeps the stored value, an explicit ``null`` clears it.
-    ``updated_at`` moves forward on every call (`_next_odata_stamp`), also
-    when no field changed.
+    detach them silently. The description is a pair that follows
+    ``definition`` (`ina_query_columns`): a payload without the
+    ``definition`` key (an edit form, which never holds what ``Describe``
+    read) keeps the stored definition AND its ``metadata_fetched_at``,
+    whatever stamp it sends; ``definition: null`` clears both. ``updated_at``
+    moves forward on every call (`_next_odata_stamp`), also when no field
+    changed.
     """
     payload = _ina_payload(data)
-    if not session.in_transaction():
-        await begin_exclusive_write(session)
+    await begin_exclusive_write(session)
     row = (await session.execute(_locked_ina_query(name))).scalar_one_or_none()
     if row is None:
         return None
     if payload.name != row.name:
         raise ValueError(INA_NAME_FIXED)
-    if _stamp_moved(row.updated_at, expected_updated_at):
+    if stamp_moved(row.updated_at, expected_updated_at):
         raise StaleRow()
     columns = ina_query_columns(payload)
-    for field_name, column in _INA_DESCRIBED.items():
-        if field_name not in payload.model_fields_set:
+    if "definition" not in payload.model_fields_set:
+        for column in _INA_DESCRIBED:
             del columns[column]
     for column, value in columns.items():
         setattr(row, column, value)
@@ -4078,15 +4107,8 @@ async def delete_ina_query(
 
 def ina_entries(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """The ``builtin:ina`` config blocks of a server list, in order (the
-    `odata_entries` rule: a block that is not an object is left out)."""
-    blocks: list[dict[str, Any]] = []
-    for server in servers or []:
-        if not isinstance(server, dict):
-            continue
-        url = str(server.get("url") or "").strip().rstrip("/").lower()
-        if url == BUILTIN_INA_URL and isinstance(server.get("oauth"), dict):
-            blocks.append(server["oauth"])
-    return blocks
+    `odata_entries` rule)."""
+    return _builtin_entries(servers, BUILTIN_INA_URL)
 
 
 async def ina_query_referrers(

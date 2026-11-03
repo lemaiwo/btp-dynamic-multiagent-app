@@ -45,6 +45,7 @@ from agents.db import (  # noqa: E402
     ina_query_referrers,
     init_db,
     list_ina_queries,
+    stamp_moved,
     update_ina_query,
 )
 from agents.ina import BUILTIN_INA_URL  # noqa: E402
@@ -384,6 +385,45 @@ async def test_the_same_instant_matches_however_it_is_written():
         assert (await get_ina_query(s, "sales-by-region")).title == "Two"
 
 
+async def test_a_row_the_session_already_holds_is_compared_as_the_database_has_it():
+    """The session read the row before another writer committed: the
+    compare must use the row the lock waited for, not the instance the
+    session still holds (SQLAlchemy returns an identity-map instance as it
+    is unless the locked read populates it again)."""
+    await _created()
+    async with SessionLocal() as a:
+        held = await get_ina_query(a, "sales-by-region")
+        stamp = held.updated_at
+        async with SessionLocal() as b:
+            await update_ina_query(
+                b, "sales-by-region", validate_ina_query(good(title="Other tab")),
+                expected_updated_at=stamp,
+            )
+        assert held.title == "Sales by region"  # what this session still holds
+        with pytest.raises(StaleRow):
+            await update_ina_query(
+                a, "sales-by-region", validate_ina_query(good(title="This tab")),
+                expected_updated_at=stamp,
+            )
+        assert held.title == "Other tab"  # the locked read refreshed it
+    async with SessionLocal() as s:
+        assert (await get_ina_query(s, "sales-by-region")).title == "Other tab"
+
+
+def test_stamp_moved_compares_instants_and_is_the_odata_routes_rule():
+    from agents.odata import admin_routes
+
+    moment = datetime(2026, 11, 3, 8, 30, 0, 123456, tzinfo=timezone.utc)
+    assert stamp_moved(moment, None) is False  # no check asked for
+    assert stamp_moved(None, moment) is True  # a row without a stamp
+    assert stamp_moved(moment.replace(tzinfo=None), moment) is False  # SQLite's naive UTC
+    assert stamp_moved(moment, moment.astimezone(timezone(timedelta(hours=1)))) is False
+    assert stamp_moved(moment, moment + timedelta(microseconds=1)) is True
+    row = InaQuery(name="x", updated_at=moment)
+    for expected in (None, moment, moment + timedelta(seconds=1)):
+        assert admin_routes._is_stale(row, expected) is stamp_moved(moment, expected)
+
+
 async def test_without_a_stamp_the_update_replaces_unconditionally():
     await _created()
     async with SessionLocal() as s:
@@ -470,25 +510,48 @@ async def test_an_update_refuses_another_name_and_answers_none_for_an_unknown_on
 
 async def test_an_update_without_the_description_keeps_the_described_one():
     """``definition`` and ``metadata_fetched_at`` are what ``Describe`` read
-    from SAP, not what an admin types: a save that leaves the keys out (the
-    edit form) keeps them; an explicit ``null`` clears them."""
+    from SAP, not what an admin types, and one pair: a save without the
+    ``definition`` key (the edit form) keeps both, whatever stamp it sends;
+    ``definition: null`` clears both."""
     await _created()
     typed = {k: v for k, v in good(title="Edited").items()
              if k not in ("definition", "metadata_fetched_at")}
     async with SessionLocal() as s:
         await update_ina_query(s, "sales-by-region", validate_ina_query(typed))
     async with SessionLocal() as s:
+        await update_ina_query(
+            s, "sales-by-region",
+            validate_ina_query({**typed, "metadata_fetched_at": "2030-01-01T00:00:00Z"}),
+        )
+    async with SessionLocal() as s:
         row = await get_ina_query(s, "sales-by-region")
         assert row.title == "Edited"
         assert row.to_dict()["definition"]["dimensions"][0]["name"] == "0CALMONTH"
         assert row.to_dict()["metadata_fetched_at"] == "2026-11-03T08:30:00Z"
         await update_ina_query(
-            s, "sales-by-region",
-            validate_ina_query({**typed, "definition": None, "metadata_fetched_at": None}),
+            s, "sales-by-region", validate_ina_query({**typed, "definition": None})
         )
     async with SessionLocal() as s:
         row = await get_ina_query(s, "sales-by-region")
         assert row.definition_json is None and row.metadata_fetched_at is None
+
+
+async def test_a_definition_without_a_stamp_is_stamped_now_and_no_definition_has_none(
+    monkeypatch,
+):
+    """The stamp says when the stored definition was read, so it never
+    stands without one, and a definition never stands without it."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(agents_db, "_odata_now", lambda: now)
+    row = await _created(metadata_fetched_at=None)
+    assert row.to_export()["metadata_fetched_at"] == "2026-11-04T12:00:00Z"
+    bare = await _created(name="not-described", definition=None)  # a stamp, no definition
+    assert bare.metadata_fetched_at is None and bare.to_export()["definition"] is None
+    async with SessionLocal() as s:
+        await update_ina_query(s, "not-described", validate_ina_query(
+            good(name="not-described", metadata_fetched_at=None)))
+        described = await get_ina_query(s, "not-described")
+    assert described.to_export()["metadata_fetched_at"] == "2026-11-04T12:00:00Z"
 
 
 async def test_update_without_commit_flushes_and_moves_the_stamp():

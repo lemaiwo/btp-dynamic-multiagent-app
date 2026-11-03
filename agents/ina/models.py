@@ -137,8 +137,8 @@ class InaQueryPayload(_Model):
     query: InaName  # the InA `DataSource.ObjectName`
     package: Annotated[StrictStr, StringConstraints(max_length=64)] = ""  # InA `PackageName`
     # None = not described yet: a query is registered first, then `Describe`
-    # reads its members from SAP. (A route that takes a partial update must
-    # decide itself whether an absent key keeps the stored description.)
+    # reads its members from SAP. Storage decides what an absent key means on
+    # an update: `agents.db.update_ina_query` keeps the stored description.
     definition: InaDefinition | None = None
     metadata_fetched_at: datetime | None = None
     enabled: StrictBool = True

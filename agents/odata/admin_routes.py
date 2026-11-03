@@ -56,6 +56,7 @@ from agents.db import (
     list_odata_audit,
     list_odata_services,
     odata_service_referrers,
+    stamp_moved,
     update_odata_service,
     validate_odata_service,
 )
@@ -280,21 +281,9 @@ def _expected_updated_at(value: Any) -> datetime | None:
 
 
 def _is_stale(row: ODataService, expected: datetime | None) -> bool:
-    """Whether ``row`` moved on since the client loaded it.
-
-    Instants are compared, not texts: the same moment is written with an
-    offset by Postgres and without one by SQLite, and a client may hand back
-    either. ``expected`` None means the client did not ask for the check.
-    Only meaningful on a row read under the lock that the write then keeps.
-    """
-    if expected is None:
-        return False
-    stored = row.updated_at
-    if stored is None:
-        return True
-    if stored.tzinfo is None:
-        stored = stored.replace(tzinfo=timezone.utc)
-    return stored.astimezone(timezone.utc) != expected
+    """Whether ``row`` moved on since the client loaded it (`stamp_moved`:
+    instants, not texts; ``expected`` None asks for no check)."""
+    return stamp_moved(row.updated_at, expected)
 
 
 def _locked_service_query(name: str) -> Select[tuple[ODataService]]:

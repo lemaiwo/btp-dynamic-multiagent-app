@@ -205,6 +205,25 @@ async def test_export_wipe_import_export_is_byte_stable(client):
     assert json.dumps(third, sort_keys=True) == json.dumps(first, sort_keys=True)
 
 
+async def test_the_kind_of_a_service_goes_with_the_bundle(client):
+    """A generic source stays generic through export, wipe and import, and a
+    bundle that changes only the kind updates the service."""
+    await create(client, svc("zagent-data", kind="generic"), svc())
+    first = (await client.get(EXPORT)).json()
+    kinds = {s["name"]: s["kind"] for s in first["odata_services"]}
+    assert kinds == {"zagent-data": "generic", "purchase-requisitions": "odata"}
+
+    await wipe()
+    r = await client.post(IMPORT, json=first)
+    assert r.status_code == 200, r.text
+    assert {n: s["kind"] for n, s in (await catalogue()).items()} == kinds
+
+    r = await client.post(IMPORT, json={"odata_services": [svc(kind="generic")]})
+    assert r.status_code == 200, r.text
+    assert (r.json()["created_odata_services"], r.json()["updated_odata_services"]) == (0, 1)
+    assert (await catalogue())["purchase-requisitions"]["kind"] == "generic"
+
+
 async def test_a_bundle_carries_the_service_its_agent_attaches(client):
     """Order matters: the agent's existence check must see the bundle's
     service, so the catalogue goes in first."""
