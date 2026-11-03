@@ -1407,15 +1407,22 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   row and the discovered deployments, 10 minutes each (an empty or failed discovery
   60 s, `EMPTY_CACHE_SECONDS`), reset by a save (`reset_caches`; an epoch keeps a read
   that a save overtook out of the cache); another app instance sees a save after its
-  own 10 minutes, and a deploy resets neither, so Automatic takes up a new RUNNING
-  deployment after at most 10 minutes or at the next save. Embedding goes through
+  own 10 minutes. Every fresh AI Core deployment list (the status, the `PUT`, the
+  run) goes to `note_running`, which drops a cached discovery that disagrees about
+  the RUNNING embedding models, so a deployment that reached RUNNING is the model in
+  effect at once for Automatic. Embedding goes through
   `gen_ai_hub`'s `AsyncOpenAI(proxy_client=...).embeddings`; only names, labels,
   purpose, synonyms and examples of `EMBEDDED_KINDS` (source, entity, function, query)
   are embedded, never data and never fields. `refresh_vectors(db, scope=, model=,
-  on_progress=, strict=)` embeds what is stale (`_changed`: no vector of the model or
-  an old text hash) in batches of 64 and writes in one transaction at the end (a run
-  that fails at batch n keeps nothing of it); a refresh of ALL nodes that did not
-  fail also deletes the vectors of every other model (the startup rebuild too).
+  on_progress=, commit_batches=)` embeds what is stale (`_changed`: no vector of the
+  model or an old text hash) in batches of 64; the import and startup path holds one
+  transaction and does not commit (a failure writes nothing), the admin's run passes
+  `commit_batches` (each batch committed once embedded: a failure at batch n keeps
+  the batches before it, the next run sends only what is still stale) and re-resolves
+  the model before each write and before the drop (a save that changed it ends the
+  run as `ModelChanged`, nothing more written or dropped); a refresh of ALL nodes that
+  did not fail also deletes the vectors of every other model (the startup rebuild
+  too).
   **`embedding_routes.py`** (`/admin/api/data-catalog/embeddings`, included by
   `agents/admin.py` after the catalogue router, every route `require_admin`, raw JSON
   <= 4 KB through `routes._json_body`, registered on the bare prefix: no trailing
@@ -1425,12 +1432,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `available` (offered models without a RUNNING, PENDING or UNKNOWN deployment),
   `nodes`, `vectors` (of the effective model), `stale`, `running`, `progress`,
   `last_run`, plus `resource_group` and `aicore_error` (a code: AI Core unreadable
-  still answers 200 with both lists empty); the two AI Core lists are cached 10 s, and
-  only an answer of both); `PUT` `{enabled, model}` (both required, `enabled` strictly
+  still answers 200 with both lists empty, so no deploy is offered for a model whose
+  live state is unknown); the lists are read before the model is resolved and
+  cached 10 s, a failed read as well); `PUT` `{enabled, model}` (both required, `enabled` strictly
   boolean, `model` 1..128 characters or `null`; a model must be in `list_deployments()`,
   read fresh, any status, else 422 `model: not a deployed embedding model`; AI Core
-  unreachable with a model: 502) answers the status; `POST /run` (no body or `{}`) 202
-  `{running: true}`, 409 while a run is in flight or when no model is in effect;
+  unreachable with a model: 502) answers the status; `POST /run` (no body or `{}`,
+  reads the lists too) 202 `{running: true}`, 409 while a run is in flight or when no
+  model is in effect (then with `X-Embeddings-Error: no_model`);
   `POST /deploy` `{model}`: the name is checked (`EMBEDDING_MODEL_RE`) and must be
   offered by `list_models()` (else 422 `model: not an embedding model AI Core offers`,
   nothing logged), then ONE WARNING `AI Core deployment of <model> requested by
@@ -1439,12 +1448,15 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   that goes away does not cancel it); 202 `{deployment_id, status, created}`,
   idempotent (a live deployment of the model is answered, nothing created);
   `model_unknown` is a 422, every other failure a 502 with a fixed text and the code
-  (`aicore_unavailable`, `token_failed`, `deploy_failed`) in `X-Embeddings-Error`; the
-  lists cache is dropped after every deploy. No undeploy route (an ops step in AI
-  Core). **`embedding_run.py`**: one run per process (`start` is a synchronous
-  check-and-set; the task is created in the request context), `progress` `{done,
-  total}` per batch and `last_run` `{started_at, finished_at, model, embedded,
-  error_class}` in memory (gone at a restart, not shared between instances), cancelled
+  (`aicore_unavailable`, `token_failed`, `deploy_failed`) in `X-Embeddings-Error`;
+  one INFO line with the answer; the lists cache is dropped after every deploy; the
+  lifespan waits at most 15 s for deploys in flight (`drain_deploys`, never cancels
+  them: a create may already be with AI Core; one WARNING for what still runs). No
+  undeploy route (an ops step in AI Core). **`embedding_run.py`**: one run per
+  process (`start` is a synchronous check-and-set; the task is created in the request
+  context), `progress` `{done, total}` and `last_run` `{started_at, finished_at,
+  model, embedded` (the committed batches)`, error_class}` in memory (gone at a
+  restart, not shared between instances; the vectors are rows and survive), cancelled
   at shutdown (`cancel_all` in the lifespan: `finished_at` null, `error_class`
   `CancelledError`). `search.py`
   `find_sources(question, allowed_sources, tier, scope_tier, k=5)` filters to the
@@ -1531,16 +1543,26 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   variable); an x509 binding and the SDK's config-file profiles are not read. On CF
   only the binding is there (`mta.yaml` sets no `AICORE_*` credential). Token by
   client credentials, cached until `expires_in` minus 60 s, fetched once at a time; a
-  token AI Core answered 401 to is not handed out again. **Lists are paged and fail
-  closed**: `/lm/deployments` and `/lm/configurations` are read in pages of
-  `$top=100` / `$skip=n`, at most `MAX_PAGES` (100); a `count` that is missing or no
-  integer, a `count` that moves, an id twice, more entries than the count, an empty
-  page before it or too many pages is `aicore_unavailable`, and nothing is created.
-  **Unverified**: the names of the paging parameters (`ai_api_client_sdk` sends
-  `top` / `skip` for these endpoints, `ai_core_sdk` `$top` / `$skip`; an AI Core that
-  ignores ours answers its default page, read as complete only when it holds `count`
-  entries, refused otherwise; check on the first landscape with more than 100
-  deployments); `$count=true` is not sent. **`deploy` is idempotent**, under a
+  token AI Core answered 401 to is not handed out again. **Lists are paged**
+  (`_list_all`): `/lm/deployments` and `/lm/configurations` are read in pages of
+  `$top=100` / `$skip=n`, and the read ENDS ON A PAGE SHORTER THAN `$top` (an empty
+  page included), never on `count`: if `count` were the page length, page one would
+  say 100 of 100 and a RUNNING deployment on page two would stay unseen (and be
+  deployed, and billed, again). `count` is only a consistency check, valid whether it
+  is the page length or the total: when present it must be a non-negative integer of
+  at least its page's entries, and at the end the entries received must be at least
+  the largest `count` seen; an absent `count` is accepted; an id on two pages (the
+  server ignored `$skip`, or the list moved) and more than `MAX_PAGES` (100) pages
+  refuse. A refusal is `aicore_unavailable`. A deployment list that cannot be read
+  stops `deploy` before anything is created; a CONFIGURATION list that cannot be read
+  is logged by code and falls through to a new configuration (it costs nothing: the
+  deployment list, read in full before it, is the barrier against billing twice).
+  **The residual**: a server that answers fewer than `$top` entries while more exist
+  (a page cap below 100, or `$top` ignored with a small default page) with `count`
+  absent or the page length is read as complete; task 7 of the plan probes `$top=1`
+  on acc. **Unverified**: the names of the paging parameters against a live AI Core
+  (`ai_api_client_sdk` sends `top` / `skip` for these endpoints, `ai_core_sdk`
+  `$top` / `$skip`); `$count=true` is not sent. **`deploy` is idempotent**, under a
   per-process lock (two deploys take turns; ONE app instance assumed): a RUNNING,
   PENDING or UNKNOWN deployment of the model is answered (`created: false`, RUNNING
   preferred); a model that is not offered is `model_unknown` before anything is
@@ -1564,8 +1586,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   names the AI API host, is held back by `app.py` raising the `httpx` logger to
   WARNING). `default_client()` is the per-process client that holds the token (a
   FastAPI `Depends`), `reset()` is for tests. Never run against a real AI Core
-  (`tests/test_aicore_deployments.py`, on `httpx.MockTransport`). 676 lines: the
-  credential resolution is the split candidate (`agents/aicore_credentials.py`)
+  (`tests/test_aicore_deployments.py` on `httpx.MockTransport`; the scripted AI Core,
+  which answers `count` as the total, as the page length or not at all, is
+  `tests/aicore_helpers.py`). 693 lines: the credential resolution is the split
+  candidate (`agents/aicore_credentials.py`)
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
