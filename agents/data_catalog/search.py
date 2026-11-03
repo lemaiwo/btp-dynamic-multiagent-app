@@ -146,6 +146,12 @@ async def _vectors(
     return out
 
 
+# How a search ranked (``find_sources_detail``): ``vector`` when the
+# question was embedded and at least one candidate had a vector of the
+# effective model (the others are still ranked by words), else ``lexical``.
+VECTOR, LEXICAL = "vector", "lexical"
+
+
 async def find_sources(
     db: AsyncSession,
     question: str,
@@ -161,11 +167,31 @@ async def find_sources(
     ``tier`` is the turn's tier and ``scope_tier`` the tier of the agent
     whose scope this is: an advanced agent's scope is empty in a basic turn.
     """
+    candidates, _ = await find_sources_detail(
+        db, question, allowed_sources=allowed_sources, tier=tier, k=k,
+        scope_tier=scope_tier, use_vectors=use_vectors,
+    )
+    return candidates
+
+
+async def find_sources_detail(
+    db: AsyncSession,
+    question: str,
+    *,
+    allowed_sources: set[Source],
+    tier: str,
+    k: int = 5,
+    scope_tier: str = BASIC,
+    use_vectors: bool = True,
+) -> tuple[list[dict[str, Any]], str]:
+    """``(candidates, mode)``: what :func:`find_sources` answers, and
+    whether vectors ranked it (:data:`VECTOR`, :data:`LEXICAL`), for the
+    admin's test search. The agents' tool answers the candidates only."""
     if not agent_allowed(scope_tier, tier):
-        return []
+        return [], LEXICAL
     allowed = {(str(a), str(b)) for a, b in allowed_sources}
     if not allowed:
-        return []
+        return [], LEXICAL
     k = max(1, min(int(k), MAX_K))
     nodes = await scoped_nodes(db, allowed)
     by_id = {n.id: n for n in nodes}
@@ -175,7 +201,7 @@ async def find_sources(
             fields_of.setdefault(n.parent_id, []).append(n)
     candidates = [n for n in nodes if n.kind in CANDIDATE_KINDS and _visible(n)]
     if not candidates:
-        return []
+        return [], LEXICAL
 
     tokens = question_tokens(question)
     lexical = {
@@ -201,7 +227,9 @@ async def find_sources(
     ranked = sorted(scores, key=lambda nid: (-scores[nid], by_id[nid].source_name, by_id[nid].name))
     top = ranked[:k]
     relations = await _relations(db, top, by_id)
-    return [_out(by_id[nid], by_id, fields_of, relations.get(nid, []), scores[nid]) for nid in top]
+    mode = VECTOR if question_vector is not None and vectors else LEXICAL
+    found = [_out(by_id[nid], by_id, fields_of, relations.get(nid, []), scores[nid]) for nid in top]
+    return found, mode
 
 
 async def _relations(

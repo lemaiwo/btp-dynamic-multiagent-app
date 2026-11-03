@@ -5,6 +5,9 @@ carries ``require_admin`` itself (as ``agents/odata/admin_routes.py`` does).
 Bodies are read as raw JSON and validated here: a refusal is a 422 whose
 ``detail`` is ``<field>: <rule>``, never a value the client sent.
 
+The embeddings of the catalogue have routes of their own,
+``agents/data_catalog/embedding_routes.py`` (included next to this router).
+
 Routes: ``GET /sources`` (catalogue services of either kind and InA
 queries), ``GET /sources/{kind}/{name}`` (the OData shape for ``odata`` and
 ``generic``, the query with its dimensions and measures for ``ina``), ``PUT
@@ -55,7 +58,7 @@ from agents.data_catalog.scope import allowed_sources_of, node_sources
 from agents.data_catalog.search import (
     CANDIDATE_KINDS,
     QUESTION_MAX,
-    find_sources,
+    find_sources_detail,
     scoped_nodes,
 )
 from agents.db import (
@@ -195,14 +198,17 @@ def _refusal(exc: ValidationError) -> HTTPException:
     return HTTPException(status_code=422, detail=refusal_text(exc, "body"))
 
 
-async def _json_body(request: Request, model: type[BaseModel], *, empty_ok: bool = False) -> Any:
-    raw = await _bounded_body(request, BODY_BYTES)
+async def _json_body(
+    request: Request, model: type[BaseModel], *, empty_ok: bool = False, limit: int = BODY_BYTES
+) -> Any:
+    raw = await _bounded_body(request, limit)
     if not raw.strip() and empty_ok:
         data: Any = {}
     else:
         try:
             data = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
+        # RecursionError: a body nested deeper than the parser goes.
+        except (ValueError, UnicodeDecodeError, RecursionError):
             raise HTTPException(status_code=422, detail=_BODY_NOT_OBJECT) from None
     if not isinstance(data, dict):
         raise HTTPException(status_code=422, detail=_BODY_NOT_OBJECT)
@@ -473,10 +479,11 @@ async def api_search(request: Request) -> dict[str, Any]:
         if allowed is None:
             allowed = await importer.stored_sources(db)
             scope = "all"
-        candidates = await find_sources(
+        candidates, mode = await find_sources_detail(
             db, body.question, allowed_sources=allowed, tier=ADVANCED, scope_tier=scope_tier
         )
-    return {"candidates": candidates, "scope": scope}
+    # ``mode``: whether vectors ranked it, so the admin sees what embeddings do.
+    return {"candidates": candidates, "scope": scope, "mode": mode}
 
 
 @router.get("/graph", dependencies=[Depends(require_admin)])

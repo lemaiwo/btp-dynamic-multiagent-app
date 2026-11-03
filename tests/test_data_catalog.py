@@ -760,7 +760,7 @@ async def test_search_route_scoped_unscoped_and_unknown_agent(client, two_servic
     assert r.json()["candidates"][0]["source_name"] == "billing"
     r = await client.post(f"{API}/search",
                           json={"question": "invoice amount", "agent": "sales"})
-    assert r.json() == {"candidates": [], "scope": "agent"}
+    assert r.json() == {"candidates": [], "scope": "agent", "mode": "lexical"}
     r = await client.post(f"{API}/search", json={"question": "order", "agent": "nobody"})
     assert r.status_code == 404 and r.json()["detail"] == "Agent not found"
     for body in ({"question": ""}, {"question": "x" * 501}, {"question": 3},
@@ -900,4 +900,6 @@ def test_the_app_serves_the_routes_under_admin_api_data_catalog():
     assert served == {
         f"{API}/sources", f"{API}/sources/{{kind}}/{{name}}",
         f"{API}/nodes/{{node_id}}/hints", f"{API}/search", f"{API}/graph", f"{API}/rebuild",
-        f"{API}/edges", f"{API}/edges/{{edge_id}}"}
+        f"{API}/edges", f"{API}/edges/{{edge_id}}",
+        # The embeddings' own router (tests/test_data_catalog_embeddings.py).
+        f"{API}/embeddings", f"{API}/embeddings/run", f"{API}/embeddings/deploy"}

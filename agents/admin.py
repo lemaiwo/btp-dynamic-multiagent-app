@@ -3952,9 +3952,14 @@ from agents.notifications import router as _notifications_router  # noqa: E402
 router.include_router(_notifications_router)
 
 # The data catalogue graph (/admin/api/data-catalog), included the same way.
+from agents.data_catalog.embedding_routes import (  # noqa: E402
+    router as _data_catalog_embeddings_router,
+)
 from agents.data_catalog.routes import router as _data_catalog_router  # noqa: E402
 
 router.include_router(_data_catalog_router)
+# Its embeddings (/admin/api/data-catalog/embeddings, design addendum (l)).
+router.include_router(_data_catalog_embeddings_router)
 
 # The InA analytical queries (/admin/api/ina), included the same way.
 from agents.ina.admin_routes import reload_if_in_use as reload_ina_if_in_use  # noqa: E402
