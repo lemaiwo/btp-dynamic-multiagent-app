@@ -15,6 +15,11 @@ export const NODE_KINDS: readonly DataNodeKind[] = [
     "source", "entity", "field", "query", "dimension", "measure", "function"
 ];
 
+/** The node kinds the graph opens with: every kind but `field`. One service
+ *  of 4 entities and 53 fields would otherwise be drawn at 10% and nothing
+ *  could be read; fields are shown once the admin picks them. */
+export const DEFAULT_GRAPH_KINDS: readonly DataNodeKind[] = NODE_KINDS.filter((kind) => kind !== "field");
+
 /** The source kinds, in the order of the legend. */
 export const SOURCE_KINDS: readonly DataSourceKind[] = ["odata", "ina", "generic"];
 
@@ -344,15 +349,17 @@ export function fitZoom(
 }
 
 /** The query string of `GET graph`: only the filters that are set. The
- *  route takes one `kind`; with several picked none is sent and
- *  `graphModel` keeps the picked kinds on the client. */
+ *  picked kinds go comma-separated, so the route applies them before its
+ *  node cap; every kind picked is no filter. `graphModel` keeps the picked
+ *  kinds on the client as well. */
 export function graphQuery(filters: { agent?: string; kinds?: readonly string[]; q?: string }): string {
     const params: string[] = [];
     if (filters.agent) {
         params.push(`agent=${encodeURIComponent(filters.agent)}`);
     }
-    if (filters.kinds && filters.kinds.length === 1) {
-        params.push(`kind=${encodeURIComponent(filters.kinds[0])}`);
+    const kinds = filters.kinds ?? [];
+    if (kinds.length && NODE_KINDS.some((kind) => kinds.indexOf(kind) === -1)) {
+        params.push(`kind=${kinds.map((kind) => encodeURIComponent(kind)).join(",")}`);
     }
     const q = (filters.q ?? "").trim();
     if (q) {
@@ -362,7 +369,7 @@ export function graphQuery(filters: { agent?: string; kinds?: readonly string[];
 }
 
 export default {
-    NODE_KINDS, SOURCE_KINDS, GRAPH_NODE_CAP, COMPLETENESS_WARNING,
+    NODE_KINDS, DEFAULT_GRAPH_KINDS, SOURCE_KINDS, GRAPH_NODE_CAP, COMPLETENESS_WARNING,
     completenessPercent, completenessText, completenessState, statusKey, displayName, entityRows,
     relationRows, hintsOf, cleanList, hintsUpdate, hintErrors, hasChanges, scoreText, candidateRow, candidateRows,
     groupKey, graphModel, graphQuery, fitZoom

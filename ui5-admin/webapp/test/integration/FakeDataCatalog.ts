@@ -56,7 +56,7 @@ export default class FakeDataCatalog {
             }),
             pr(10, "entity", "A_PurchaseRequisitionHeader", 1, {
                 label: "Requisition", purpose: "One purchase requisition with its description",
-                synonyms: ["PR header"]
+                synonyms: ["PR header"], type_name: "API_PURCHASEREQ_PROCESS_SRV.A_PurchaseRequisitionHeaderType"
             }),
             pr(11, "field", "PurchaseRequisition", 10, { label: "Requisition number", is_key: true, type_name: "Edm.String" }),
             pr(12, "field", "PurReqnDescription", 10, { label: "Description" }),

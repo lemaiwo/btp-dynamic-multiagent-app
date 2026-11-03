@@ -411,6 +411,17 @@ console.log('\n== the drawer view model ==');
   check('attachments with size text and the excluded flag', vm.history.attachments.length === 2 && vm.history.attachments[0].sizeText === '2 KB' && vm.history.attachments[0].excluded === false && vm.history.attachments[1].excluded === true && vm.history.attachments[1].sizeText === '1 MB');
   check('tools grouped by kind in a fixed order, the delegate target named', eq(vm.tools.map((g) => g.kind), ['document', 'deep', 'delegate']) && vm.tools[0].items.length === 2 && vm.tools[2].items[0].label === 'delegate_to_btp_admin → btp-admin' && vm.tools[2].items[0].agent === 'btp-admin');
   check('usage: total and detail', vm.usage.totalText === '5,266 tokens' && vm.usage.detail === '4,390 in / 876 out · 7 requests over 2 turns');
+  const own = contextViewModel({ ...SAMPLE_CONTEXT, agent: { kind: 'admin', name: 'sap-data' }, tools: [
+    { kind: 'document', name: 'create_word_document' },
+    { kind: 'data_catalog', name: 'find_data_source', agent: 'sap-data' },
+    { kind: 'connector', name: 'builtin:odata', agent: 'sap-data' },
+    { kind: 'data_catalog', name: 'list_data_sources', agent: 'sap-data' },
+  ] });
+  check('an admin agent: its connectors and the data catalogue tools get groups of their own, not "Document tools"', eq(own.tools.map((g) => [g.kind, g.label, g.items.map((t) => t.name)]), [
+    ['document', 'Document tools', ['create_word_document']],
+    ['connector', 'Connectors', ['builtin:odata']],
+    ['data_catalog', 'Data catalogue', ['find_data_source', 'list_data_sources']],
+  ]) && own.tools[1].items[0].agent === 'sap-data');
   const hidden = contextViewModel({ ...SAMPLE_CONTEXT, agent: { kind: 'orchestrator', name: 'Orchestrator' }, instructions: { visible: false, text: null, chars: 1234, skills: [] }, model: { id: 'm', context_window: null }, history: { ...SAMPLE_CONTEXT.history, measured_tokens: null } });
   check('hidden instructions: "1,234 characters · shown to admins only"; no window: tokens without a percentage; no measure: estimated', hidden.instructions.hiddenText === '1,234 characters · shown to admins only' && hidden.who.kind === 'Orchestrator' && hidden.who.window === null && hidden.who.pctText === '' && hidden.who.fillText === '~12.4k tokens · window unknown' && hidden.who.fillSource === 'estimated' && hidden.history.measuredText === 'not measured yet');
   check('an empty or odd answer is a usable model', contextViewModel(null).who.agent === 'Agent' && contextViewModel({ tools: 'x', history: { attachments: [null, { name: 'no id' }] } }).history.attachments.length === 0 && contextViewModel({}).tools.length === 0);

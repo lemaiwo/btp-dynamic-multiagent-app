@@ -53,6 +53,7 @@ from agents.db import (  # noqa: E402
     ChatMessage,
     ChatUserAgent,
     ChatUserSkill,
+    ODataService,
     SessionLocal,
     SkillConfig,
     init_db,
@@ -126,7 +127,7 @@ async def client():
 async def wipe() -> None:
     async with SessionLocal() as s:
         for model in (ChatFile, ChatMessage, ChatConversation, ChatUserAgent, ChatUserSkill,
-                      AgentConfig, SkillConfig):
+                      AgentConfig, SkillConfig, ODataService):
             await s.execute(delete(model))
         await s.commit()
 
@@ -404,6 +405,54 @@ async def test_tools_name_the_delegation_targets_the_access_allows(client, roles
     spec = await conversation(client, agent_ref="admin:btp-admin")
     assert delegates(await get_context(client, spec)) == [
         ("delegate_abap_dev", "abap-dev"), ("delegate_hidden", "hidden")]
+
+
+async def test_an_admin_agent_lists_its_connectors_and_the_data_catalogue(client):
+    # Run straight (`admin:<name>`), an admin agent has its own servers: one
+    # `connector` entry per label (built-in canonical URL or MCP host; never a
+    # path, query, credential or destination name), plus the data catalogue's
+    # two tools once one of its OData services exists and is enabled.
+    odata = {"url": "builtin:odata", "auth_mode": "destination",
+             "oauth": {"services": ["sales-orders", "gone"]}}
+    jira = {"url": "builtin:jira", "auth_mode": "destination",
+            "oauth": {"destination": "JIRA_SECRET_DEST", "project": "P"}}
+    async with SessionLocal() as s:
+        s.add(AgentConfig(name="sap-data", description="d", instructions="x",
+                          mcp_url="https://mcp.example.com/sse/path?token=abc",
+                          auth_mode="jwt", enabled=1, expose_chat=1,
+                          extra_servers_json=json.dumps([odata, jira])))
+        s.add(ODataService(name="sales-orders", title="Sales orders", purpose="p",
+                           destination="S4_ODATA_USER", user_context=1, odata_version="v2",
+                           service_path="/sap/opu/odata/sap/API_SALES_ORDER_SRV",
+                           definition_json="{}", enabled=1))
+        await s.commit()
+    cid = await conversation(client, agent_ref="admin:sap-data")
+
+    def of(out, kind):
+        return [t for t in out["tools"] if t["kind"] == kind]
+
+    out = await get_context(client, cid)
+    assert of(out, "connector") == [
+        {"kind": "connector", "name": "mcp.example.com", "agent": "sap-data"},
+        {"kind": "connector", "name": "builtin:odata", "agent": "sap-data"},
+        {"kind": "connector", "name": "builtin:jira", "agent": "sap-data"},
+    ]
+    assert of(out, "data_catalog") == [
+        {"kind": "data_catalog", "name": "find_data_source", "agent": "sap-data"},
+        {"kind": "data_catalog", "name": "list_data_sources", "agent": "sap-data"},
+    ]
+    text = json.dumps(out["tools"])
+    for secret in ("token=abc", "/sse/path", "JIRA_SECRET_DEST", "S4_ODATA_USER"):
+        assert secret not in text, secret
+    # No enabled service behind the entry: the catalogue tools are not attached.
+    async with SessionLocal() as s:
+        await s.execute(update(ODataService).values(enabled=0))
+        await s.commit()
+    out = await get_context(client, cid)
+    assert of(out, "data_catalog") == [] and len(of(out, "connector")) == 3
+    # The orchestrator lists no connector of its own.
+    orch = await conversation(client)
+    assert of(await get_context(client, orch), "connector") == []
 
 
 async def test_a_deep_personal_agent_lists_its_deep_tools_and_consults(client):

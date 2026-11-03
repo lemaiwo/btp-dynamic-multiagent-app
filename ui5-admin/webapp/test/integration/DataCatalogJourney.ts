@@ -8,8 +8,10 @@ import type ColumnListItem from "sap/m/ColumnListItem";
 import type ProgressIndicator from "sap/m/ProgressIndicator";
 import type ObjectIdentifier from "sap/m/ObjectIdentifier";
 import type Input from "sap/m/Input";
+import type Text from "sap/m/Text";
 import type List from "sap/m/List";
 import type Select from "sap/m/Select";
+import type MultiComboBox from "sap/m/MultiComboBox";
 import type MessageStrip from "sap/m/MessageStrip";
 import type Graph from "sap/suite/ui/commons/networkgraph/Graph";
 import type Node from "sap/suite/ui/commons/networkgraph/Node";
@@ -38,6 +40,23 @@ function nameOf(row: ColumnListItem): string {
 
 function rowNamed(table: UI5Element, name: string): ColumnListItem | undefined {
     return rowsOf(table).filter((row) => nameOf(row) === name)[0];
+}
+
+/** The kind of a drawn graph node, from the row it is bound to. */
+function kindOf(node: Node): string {
+    return (node.getBindingContext("graph")!.getObject() as { kind: string }).kind;
+}
+
+/** The graph's nodes of `kind`. */
+function nodesOfKind(graph: UI5Element, kind: string): Node[] {
+    return (graph as Graph).getNodes().filter((node: Node) => kindOf(node) === kind);
+}
+
+/** Picks `keys` in the bound kinds filter the way a user ends a pick: the
+ *  selection, then the control's `selectionFinish`. */
+function pickKinds(box: MultiComboBox, keys: string[]): void {
+    box.setSelectedKeys(keys);
+    box.fireSelectionFinish({ selectedItems: box.getSelectedItems() });
 }
 
 /** Picks `key` in a bound Select the way a user does: the selection, then its change event. */
@@ -147,6 +166,37 @@ opaTest("a row opens the source with its entities, fields and relations", functi
     Then.iStopTheApp();
 });
 
+opaTest("a name stays on one line with its type below it, cut with a tooltip", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/odata/purchase-requisitions");
+
+    Then.waitFor({
+        id: "dcEntitiesTable",
+        viewName: DETAIL_VIEW,
+        check: (table: UI5Element) => rowsOf(table).length === 12,
+        success: function (table: UI5Element) {
+            const cellOf = (id: number) => rowsOf(table).filter((item) =>
+                (item.getBindingContext("src")!.getObject() as { id: number }).id === id)[0].getCells()[0];
+            const texts = (id: number) => (cellOf(id).findAggregatedObjects(true,
+                (control) => control.isA("sap.m.Text")) as unknown as Text[]).filter((text) => text.getVisible());
+            const type = "API_PURCHASEREQ_PROCESS_SRV.A_PurchaseRequisitionHeaderType";
+            const entity = texts(10);
+            Opa5.assert.deepEqual(entity.map((text) => text.getText(false)), ["A_PurchaseRequisitionHeader", type],
+                "the entity's name, then its type name");
+            Opa5.assert.ok(entity.every((text) => !text.getWrapping()), "neither wraps: both are cut with an ellipsis");
+            Opa5.assert.strictEqual(entity[1].getTooltip(), type, "the tooltip carries the whole type name");
+            Opa5.assert.ok(entity[1].getDomRef()!.getBoundingClientRect().top
+                > entity[0].getDomRef()!.getBoundingClientRect().top, "the type name sits below the name");
+            const field = texts(23);
+            Opa5.assert.deepEqual(field.map((text) => text.getText(false)), ["RequestedQuantity (EA)"],
+                "a field without a type: its name (and unit) alone");
+            Opa5.assert.strictEqual(texts(11)[1].getText(false), "Edm.String", "a key field's type below its name");
+        },
+        errorMessage: "The name cell does not show the name on one line with its type below it"
+    });
+
+    Then.iStopTheApp();
+});
+
 opaTest("a hint edit sends only what changed; an empty label is refused at the field", function (Given: Common, When: Common, Then: Common) {
     Given.iStartTheApp("data-catalog/odata/purchase-requisitions");
 
@@ -243,18 +293,29 @@ opaTest("a test search lists the candidates for the chosen agent", function (Giv
     Then.iStopTheApp();
 });
 
-opaTest("the graph shows every node and the agent filter reduces them", function (Given: Common, When: Common, Then: Common) {
+opaTest("the graph opens with every kind but fields and the agent filter reduces it", function (Given: Common, When: Common, Then: Common) {
     Given.iStartTheApp("data-catalog/graph");
 
     Then.waitFor({
+        id: "dcGraphKinds",
+        viewName: GRAPH_VIEW,
+        visible: false,
+        success: function (box: UI5Element) {
+            Opa5.assert.deepEqual((box as MultiComboBox).getSelectedKeys(),
+                ["source", "entity", "query", "dimension", "measure", "function"], "every kind but Field is picked");
+        }
+    });
+    Then.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 17,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 7,
         success: function (graph: UI5Element) {
-            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 17, "17 nodes of two sources");
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 7,
+                "2 sources, 4 entities and a function: the 10 fields are left out");
+            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 0, "no field node by default");
             Opa5.assert.strictEqual((graph as Graph).getGroups().length, 2, "one group per source");
         },
-        errorMessage: "The graph does not show 17 nodes"
+        errorMessage: "The graph does not open with the 7 nodes that are not fields"
     });
 
     When.waitFor({
@@ -271,13 +332,65 @@ opaTest("the graph shows every node and the agent filter reduces them", function
     Then.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 13,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 5,
         success: function (graph: UI5Element) {
-            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 13, "only btp-agent's source is left");
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 5, "only btp-agent's source is left");
             Opa5.assert.strictEqual((graph as Graph).getGroups().length, 1);
             Opa5.assert.ok(backend.requests.indexOf("GET data-catalog/graph") !== -1);
         },
-        errorMessage: "The agent filter did not reduce the graph to 13 nodes"
+        errorMessage: "The agent filter did not reduce the graph to 5 nodes"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("fields are drawn once the admin picks Field", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/graph");
+
+    Then.waitFor({
+        id: "dcGraph",
+        viewName: GRAPH_VIEW,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 7,
+        success: function (graph: UI5Element) {
+            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 0, "no field before the pick");
+        },
+        errorMessage: "The graph does not open without fields"
+    });
+    When.waitFor({
+        id: "dcGraphKinds",
+        viewName: GRAPH_VIEW,
+        // Set through the control's API, as the agent Select above.
+        visible: false,
+        autoWait: false,
+        check: (box: UI5Element) => (box as MultiComboBox).getItems().length === 7,
+        success: (box: UI5Element) => pickKinds(box as MultiComboBox,
+            ["source", "entity", "field", "query", "dimension", "measure", "function"])
+    });
+    Then.waitFor({
+        id: "dcGraph",
+        viewName: GRAPH_VIEW,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 17,
+        success: function (graph: UI5Element) {
+            Opa5.assert.strictEqual((graph as Graph).getNodes().length, 17, "17 nodes of two sources");
+            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 10, "the 10 fields are drawn");
+        },
+        errorMessage: "Picking Field did not draw the fields"
+    });
+    When.waitFor({
+        id: "dcGraphKinds",
+        viewName: GRAPH_VIEW,
+        visible: false,
+        autoWait: false,
+        success: (box: UI5Element) => pickKinds(box as MultiComboBox, ["field"])
+    });
+    Then.waitFor({
+        id: "dcGraph",
+        viewName: GRAPH_VIEW,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 10,
+        success: function (graph: UI5Element) {
+            Opa5.assert.strictEqual(nodesOfKind(graph, "field").length, 10, "Field alone: only fields");
+        },
+        errorMessage: "Field alone did not leave only the fields"
     });
 
     Then.iStopTheApp();
@@ -446,7 +559,7 @@ opaTest("a graph node opens its source", function (Given: Common, When: Common, 
     When.waitFor({
         id: "dcGraph",
         viewName: GRAPH_VIEW,
-        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 17,
+        check: (graph: UI5Element) => (graph as Graph).getNodes().length === 7,
         success: function (graph: UI5Element) {
             const node = (graph as Graph).getNodes().filter((one: Node) => one.getTitle() === "Business partners")[0];
             node.firePress();

@@ -1094,15 +1094,19 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `registry.build_orchestrator` to every specialist with at least one usable source;
   above 10 sources the `## OData services` instruction block becomes a `## Data
   sources` heading naming the two tools. `routes.py` (`/admin/api/data-catalog`, each
-  route `require_admin`, raw JSON ≤ 64 KB, 422 `<field>: <rule>`): `GET /sources`,
+  route `require_admin`, raw JSON ≤ 64 KB, 422 `<field>: <rule>`): `GET /sources`
+  (`hint_completeness` 0..1 = the share of the source node, its entities and functions
+  (not fields) an admin saved hints for, `curated_at` set; imported labels do not count),
   `GET /sources/{kind}/{name}` (source, entities with fields, functions, edges with
   their nodes, used_by), `PUT /nodes/{id}/hints` (label, purpose, not_for, synonyms ≤ 50,
   examples ≤ 20, readable), `POST /search` ({question, agent?} → candidates, `scope`
-  agent|all), `GET /graph?agent=&kind=&q=` (≤ 2,000 nodes, `contains` edges, `truncated`),
+  agent|all), `GET /graph?agent=&kind=&q=` (`kind` one node kind or several
+  comma-separated, applied before the cap; ≤ 2,000 nodes, `contains` edges, `truncated`),
   `POST /rebuild` ({source?} → counts; 503 on failure). UI5 admin area "Data catalogue"
   (list, detail with inline hints and test search, graph on
-  `sap.suite.ui.commons.networkgraph`). `tests/test_data_catalog.py`. Embeddings never
-  run against a real AI Core yet
+  `sap.suite.ui.commons.networkgraph`, opening with every node kind but `field`:
+  `DEFAULT_GRAPH_KINDS` in `model/dataCatalog.ts`). `tests/test_data_catalog.py`.
+  Embeddings never run against a real AI Core yet
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side
   from pinned `project`/`status` and a `lookback` ceiling; issues this
@@ -1810,7 +1814,9 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     fixed figure per binary, `measured_tokens` = the `input_tokens` of the
     last `ModelResponse` of the last stored turn, `attachments` of the
     history with `excluded`), `tools` (document, deep, delegate targets the
-    tier allows) and `usage`. Every upload enters the prompt as
+    tier allows; for an admin agent run straight also its own servers as
+    `connector` entries and, with at least one enabled OData service,
+    `find_data_source` / `list_data_sources` as `data_catalog`) and `usage`. Every upload enters the prompt as
     `BinaryContent(identifier=<file_id>)` (the identifier survives
     `ModelMessagesTypeAdapter`; it is never sent to the model in a user
     prompt) or as an `<attachment id="<file_id>" …>` text block, so `POST
@@ -2367,7 +2373,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   SVG renderer): no new resource, variable, table or column; 2.34.0 adds the data
   catalogue graph (`agents/data_catalog/`: three new tables, HANA schema generation 8,
   optional `AICORE_EMBEDDING_MODEL` / `DATA_CATALOG_EMBEDDINGS`, not in the descriptor)
-  and the InA probe `scripts/probe_ina.py`
+  and the InA probe `scripts/probe_ina.py`; 2.34.1 is the fix of the first signed-in look at
+  the catalogue on acc/AI (hint completeness counts only admin-written hints, the graph opens
+  without fields, the detail Name column, the context view lists an admin agent's own tools):
+  no descriptor change besides the version
 - `scripts/copy_registry_config.py` — copies the registry's configuration
   from one database to the other (a landscape that switches from PostgreSQL
   to HANA, or back). **It is the only supported way to carry stored secrets

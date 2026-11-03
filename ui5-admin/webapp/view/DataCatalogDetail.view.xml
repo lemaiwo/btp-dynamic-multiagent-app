@@ -164,7 +164,9 @@
                     autoPopinMode="true"
                     noDataText="{i18n>dcNoEntities}">
                     <columns>
-                        <Column autoPopinWidth="16" importance="High"><Text text="{i18n>dcColName}" /></Column>
+                        <!-- Wide enough for an entity set name on one line; a longer
+                             name is cut with an ellipsis, never wrapped mid-word. -->
+                        <Column width="20rem" importance="High"><Text text="{i18n>dcColName}" /></Column>
                         <Column width="14rem" importance="High"><Text text="{i18n>dcColLabel}" /></Column>
                         <Column autoPopinWidth="14" importance="Low"><Text text="{i18n>dcHintPurpose}" /></Column>
                         <Column width="5rem" hAlign="Center" importance="High"><Text text="{i18n>dcColReadable}" /></Column>
@@ -173,29 +175,41 @@
                     <items>
                         <ColumnListItem highlight="{= ${src>depth} === 0 ? 'Information' : 'None' }">
                             <cells>
-                                <HBox alignItems="Center">
+                                <!-- The name on one line, the type name below it; both
+                                     are cut with an ellipsis (the whole text is the
+                                     tooltip), so nothing runs under the Label column.
+                                     `data-level` indents a field and sets an entity's
+                                     name in bold (css/style.css, .dcNameCell). -->
+                                <HBox alignItems="Start" renderType="Bare" class="dcNameCell">
+                                    <customData>
+                                        <core:CustomData key="level" value="{= ${src>depth} === 0 ? 'entity' : 'field' }" writeToDom="true" />
+                                    </customData>
                                     <core:Icon
                                         src="{= ${src>kind} === 'function' ? 'sap-icon://fx' : ${src>depth} === 0 ? 'sap-icon://table-view' : 'sap-icon://text-formatting' }"
-                                        class="sapUiTinyMarginEnd"
+                                        class="sapUiTinyMarginEnd dcNameIcon"
                                         tooltip="{src>kind}"
-                                        visible="true" />
-                                    <ObjectIdentifier
-                                        title="{src>name}"
-                                        text="{src>kind}"
-                                        visible="{= ${src>depth} === 0 }" />
-                                    <Text
-                                        text="{= ${src>unit} ? ${src>name} + ' (' + ${src>unit} + ')' : ${src>name} }"
-                                        visible="{= ${src>depth} === 1 }"
-                                        class="sapUiSmallMarginBegin" />
-                                    <core:Icon
-                                        src="sap-icon://key"
-                                        visible="{src>isKey}"
-                                        tooltip="{i18n>dcKeyField}"
-                                        class="sapUiTinyMarginBegin" />
-                                    <Text
-                                        text="{src>typeName}"
-                                        visible="{= !!${src>typeName} }"
-                                        class="sapUiTinyMarginBegin" />
+                                        alt="{src>kind}"
+                                        decorative="false" />
+                                    <VBox renderType="Bare" class="dcNameText">
+                                        <HBox alignItems="Center" renderType="Bare">
+                                            <Text
+                                                text="{= ${src>unit} ? ${src>name} + ' (' + ${src>unit} + ')' : ${src>name} }"
+                                                tooltip="{= ${src>unit} ? ${src>name} + ' (' + ${src>unit} + ')' : ${src>name} }"
+                                                wrapping="false"
+                                                class="dcNodeName" />
+                                            <core:Icon
+                                                src="sap-icon://key"
+                                                visible="{src>isKey}"
+                                                tooltip="{i18n>dcKeyField}"
+                                                class="sapUiTinyMarginBegin dcNameIcon" />
+                                        </HBox>
+                                        <Text
+                                            text="{src>typeName}"
+                                            tooltip="{src>typeName}"
+                                            wrapping="false"
+                                            visible="{= !!${src>typeName} }"
+                                            class="dcNodeType" />
+                                    </VBox>
                                 </HBox>
                                 <Input
                                     value="{src>label}"

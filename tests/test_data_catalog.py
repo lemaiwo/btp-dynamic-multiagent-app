@@ -648,7 +648,7 @@ async def test_sources_list_and_detail(client, two_services):
         "kind": "odata", "title": "Sales orders", "destination": "S4_ODATA_USER",
         "user_context": True, "enabled": True, "used_by": ["sales"]}
     assert sales["nodes"] == 11 and sales["last_import"]
-    assert 0 < sales["hint_completeness"] <= 1
+    assert sales["hint_completeness"] == 0, "imported labels are no admin's hints"
     assert by_name["unused"]["nodes"] == 0 and by_name["unused"]["last_import"] is None
 
     r = await client.get(f"{API}/sources/odata/sales-orders")
@@ -667,6 +667,35 @@ async def test_sources_list_and_detail(client, two_services):
         assert r.status_code == 404, path
     r = await client.get(f"{API}/sources/odata/unused")
     assert r.status_code == 200 and r.json()["source"] is None
+
+
+async def test_hint_completeness_counts_what_an_admin_curated(client, two_services):
+    # Source, entities and functions count; fields do not (they would drown the
+    # entities); a node counts once an admin saved hints for it (curated_at).
+    await rebuild()
+
+    async def completeness() -> float:
+        r = await client.get(f"{API}/sources")
+        assert r.status_code == 200
+        return {s["name"]: s for s in r.json()["sources"]}["sales-orders"]["hint_completeness"]
+
+    assert await completeness() == 0
+    field = await node("sales-orders", "field", "SoldToParty")
+    r = await client.put(f"{API}/nodes/{field.id}/hints", json={"synonyms": ["buyer"]})
+    assert r.status_code == 200, r.text
+    assert await completeness() == 0, "a field adds nothing"
+    order = await node("sales-orders", "entity", "A_SalesOrder")
+    r = await client.put(f"{API}/nodes/{order.id}/hints", json={"purpose": "Order heads"})
+    assert r.status_code == 200, r.text
+    # source, A_SalesOrder, A_SalesOrderItem, ReleaseOrder: 1 of 4
+    assert await completeness() == 0.25
+    for kind, name in (("source", "sales-orders"), ("entity", "A_SalesOrderItem")):
+        target = await node("sales-orders", kind, name)
+        r = await client.put(f"{API}/nodes/{target.id}/hints", json={"synonyms": ["x"]})
+        assert r.status_code == 200, r.text
+    assert await completeness() == 0.75
+    billing = {s["name"]: s for s in (await client.get(f"{API}/sources")).json()["sources"]}
+    assert billing["billing"]["hint_completeness"] == 0
 
 
 @pytest.mark.parametrize("body, field", [
@@ -734,6 +763,15 @@ async def test_graph_route_filters_and_the_cap(client, two_services, monkeypatch
     assert {n["source_name"] for n in r.json()["nodes"]} == {"billing"}
     r = await client.get(f"{API}/graph", params={"kind": "entity"})
     assert {n["kind"] for n in r.json()["nodes"]} == {"entity"}
+    # Several kinds, comma-separated: the graph page's default (every kind
+    # but field) is applied before the cap, not after it.
+    r = await client.get(f"{API}/graph", params={"kind": "source,entity,function"})
+    assert {n["kind"] for n in r.json()["nodes"]} == {"source", "entity", "function"}
+    for bad in ("entity,bogus", "entity,", ",", "entity,entity,entity,entity,entity,entity,"
+                "entity,entity"):
+        r = await client.get(f"{API}/graph", params={"kind": bad})
+        assert r.status_code == 422, bad
+        assert r.json()["detail"] == "kind: unknown node kind" and "bogus" not in r.text
     r = await client.get(f"{API}/graph", params={"q": "material"})
     assert [n["name"] for n in r.json()["nodes"]] == ["Material"]
     assert (await client.get(f"{API}/graph", params={"kind": "bogus"})).status_code == 422
@@ -748,6 +786,9 @@ async def test_graph_route_filters_and_the_cap(client, two_services, monkeypatch
     r = await client.get(f"{API}/graph")
     assert len(r.json()["nodes"]) == dc_routes.GRAPH_MAX_NODES == 2000
     assert r.json()["truncated"] is True
+    r = await client.get(f"{API}/graph", params={"kind": "source,entity,function"})
+    assert r.json()["truncated"] is False
+    assert {n["kind"] for n in r.json()["nodes"]} == {"source", "entity", "function"}
 
 
 async def test_rebuild_route(client, two_services):

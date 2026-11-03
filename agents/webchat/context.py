@@ -61,12 +61,15 @@ from pydantic_ai.messages import (
 from sqlalchemy import select, update
 
 from agents.access import BASIC, agent_allowed, is_admin, tier_of
+from agents.data_catalog.scope import allowed_sources_of
+from agents.data_catalog.tool import TOOL_NAMES as DATA_CATALOG_TOOL_NAMES
 from agents.db import (
     AgentConfig,
     ChatConversation,
     ChatFile,
     ChatMessage,
     ChatUserSkill,
+    ODataService,
     SessionLocal,
     SkillConfig,
     delegation_tool_name,
@@ -386,6 +389,19 @@ async def describe(conv: ChatConversation, principal: str,
             enabled = {r.name: r for r in rows if r.enabled and not _approves(r.mcp_servers)}
             tools += [{"kind": "delegate", "name": delegation_tool_name(p), "agent": p}
                       for p in row.peers if p != row.name and p in enabled]
+            # Its own servers, labelled as a personal agent's tool sources are.
+            tools += [{"kind": "connector", "name": label, "agent": row.name}
+                      for label in user_agents.connector_labels(row)]
+            # The registry attaches the data catalogue's tools when one of the
+            # agent's OData services exists and is enabled (attached_services).
+            services = sorted(n for k, n in allowed_sources_of(row) if k == "odata")
+            if services and (await db.execute(
+                select(ODataService.name)
+                .where(ODataService.name.in_(services), ODataService.enabled == 1)
+                .limit(1)
+            )).first() is not None:
+                tools += [{"kind": "data_catalog", "name": n, "agent": row.name}
+                          for n in DATA_CATALOG_TOOL_NAMES]
         else:
             mine = target.user_row
             sources = {r.name: r for r in rows if user_agents.shares_tools(r)}

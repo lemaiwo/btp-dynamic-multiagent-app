@@ -1,7 +1,7 @@
 import JSONModel from "sap/ui/model/json/JSONModel";
 import BaseController from "./BaseController";
 import ErrorHandler from "../service/ErrorHandler";
-import dataCatalog, { NODE_KINDS, type GraphModel } from "../model/dataCatalog";
+import dataCatalog, { DEFAULT_GRAPH_KINDS, NODE_KINDS, type GraphModel } from "../model/dataCatalog";
 import type Event from "sap/ui/base/Event";
 import type Graph from "sap/suite/ui/commons/networkgraph/Graph";
 import type Node from "sap/suite/ui/commons/networkgraph/Node";
@@ -24,7 +24,8 @@ export default class DataCatalogGraph extends BaseController {
     public onInit(): void {
         this.setModel(new JSONModel({ groups: [], nodes: [], lines: [], capped: false }), "graph");
         this.setModel(new JSONModel({
-            kinds: [], agent: "", q: "", agents: [], loadFailed: false, loadError: "",
+            // Every kind but fields: they would shrink a real service to 10%.
+            kinds: DEFAULT_GRAPH_KINDS.slice(), agent: "", q: "", agents: [], loadFailed: false, loadError: "",
             kindOptions: NODE_KINDS.map((kind) => ({ key: kind, text: this.text(`dcNodeKind_${kind}`) }))
         }), "graphView");
         this.getRouter().getRoute("dataCatalogGraph")?.attachPatternMatched(() => {

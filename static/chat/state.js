@@ -370,7 +370,10 @@ const TOOL_GROUPS = [
   ['document', 'Document tools'],
   ['deep', 'Deep agent tools'],
   ['delegate', 'Delegation'],
-  ['connector', 'Connectors (shared by admin agents)'],
+  // An admin agent's own servers, or the ones an admin agent shares with a
+  // personal agent; each item names the agent ("· from <agent>").
+  ['connector', 'Connectors'],
+  ['data_catalog', 'Data catalogue'],
 ];
 
 const str = (v, fallback = '') => (typeof v === 'string' ? v : fallback);

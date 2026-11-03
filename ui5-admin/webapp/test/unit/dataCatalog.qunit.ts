@@ -1,5 +1,5 @@
 import dataCatalog, {
-    GRAPH_NODE_CAP, candidateRows, cleanList, completenessPercent, completenessState, completenessText, entityRows, fitZoom,
+    DEFAULT_GRAPH_KINDS, GRAPH_NODE_CAP, NODE_KINDS, candidateRows, cleanList, completenessPercent, completenessState, completenessText, entityRows, fitZoom,
     graphModel, graphQuery, hasChanges, hintErrors, hintsOf, hintsUpdate, relationRows, scoreText, statusKey
 } from "com/agent/admin/model/dataCatalog";
 import type {
@@ -239,8 +239,22 @@ QUnit.test("the query carries only the filters that are set", function (assert) 
     assert.strictEqual(graphQuery({ agent: "", kinds: [], q: "  " }), "");
     assert.strictEqual(graphQuery({ agent: "btp-agent", kinds: ["entity"], q: "supplier name" }),
         "?agent=btp-agent&kind=entity&q=supplier%20name");
-    assert.strictEqual(graphQuery({ kinds: ["entity", "field"] }), "",
-        "the route takes one kind: several are filtered on the client");
+    assert.strictEqual(graphQuery({ kinds: ["entity", "field"] }), "?kind=entity,field",
+        "several kinds go to the route comma-separated, so they apply before its node cap");
+    assert.strictEqual(graphQuery({ kinds: NODE_KINDS.slice() }), "", "every kind is no filter");
+});
+
+QUnit.test("the graph opens with every kind but fields", function (assert) {
+    assert.deepEqual(DEFAULT_GRAPH_KINDS.slice(), ["source", "entity", "query", "dimension", "measure", "function"],
+        "53 fields of one service would shrink the graph to 10%: fields only when picked");
+    assert.strictEqual(DEFAULT_GRAPH_KINDS.indexOf("field"), -1);
+    assert.strictEqual(graphQuery({ kinds: DEFAULT_GRAPH_KINDS }),
+        "?kind=source,entity,query,dimension,measure,function");
+    const model = graphModel({
+        nodes: [graphNode(1, "source", "pr"), graphNode(2, "entity", "pr"), graphNode(3, "field", "pr")],
+        edges: [{ from: 1, to: 2, kind: "contains", label: "" }, { from: 2, to: 3, kind: "contains", label: "" }]
+    }, DEFAULT_GRAPH_KINDS);
+    assert.deepEqual(model.nodes.map((n) => n.key), ["1", "2"], "no field node by default");
 });
 
 QUnit.test("an unknown source kind is coloured as generic", function (assert) {

@@ -6,7 +6,8 @@ Bodies are read as raw JSON and validated here: a refusal is a 422 whose
 ``detail`` is ``<field>: <rule>``, never a value the client sent.
 
 Routes: ``GET /sources``, ``GET /sources/{kind}/{name}``, ``PUT
-/nodes/{id}/hints``, ``POST /search``, ``GET /graph``, ``POST /rebuild``.
+/nodes/{id}/hints``, ``POST /search``, ``GET /graph`` (``kind`` is one node
+kind or several, comma-separated), ``POST /rebuild``.
 """
 
 from __future__ import annotations
@@ -179,17 +180,21 @@ def _stamp(value: Any) -> str | None:
     return value.astimezone(timezone.utc).isoformat()
 
 
+# Kinds that count towards a source's hint completeness: the source itself and
+# what an agent picks among (entities, functions; queries once a later source
+# kind has them). Fields, dimensions and measures do not: 53 fields would drown
+# 4 entities.
+_COMPLETENESS_KINDS = frozenset({"source", "entity", "function", "query"})
+
+
 def _completeness(nodes: list[DataCatalogNode]) -> float:
-    """Share of the nodes an agent sees that carry a label and, for a source,
-    an entity or a function, a purpose."""
-    counted = [
-        n for n in nodes if n.kind != "field" or n.readable
-    ]
+    """Share of the source node, its entities and functions that carry hints
+    an admin wrote (``curated_at`` set). Labels and purposes the import took
+    from the OData catalogue are not hints."""
+    counted = [n for n in nodes if n.kind in _COMPLETENESS_KINDS]
     if not counted:
         return 0.0
-    complete = sum(
-        1 for n in counted if (n.label or "").strip() and (n.kind == "field" or n.purpose)
-    )
+    complete = sum(1 for n in counted if n.curated_at is not None)
     return round(complete / len(counted), 2)
 
 
@@ -381,7 +386,12 @@ async def api_search(request: Request) -> dict[str, Any]:
 async def api_graph(
     agent: str | None = None, kind: str | None = None, q: str | None = None
 ) -> dict[str, Any]:
-    if kind is not None and kind not in NODE_KINDS:
+    # One kind or several, comma-separated (at most one per known kind), so a
+    # filter that leaves out the fields is applied before the node cap.
+    kinds = None if kind is None else kind.split(",")
+    if kinds is not None and (
+        len(kinds) > len(NODE_KINDS) or any(k not in NODE_KINDS for k in kinds)
+    ):
         raise HTTPException(status_code=422, detail="kind: unknown node kind")
     if q is not None and len(q) > GRAPH_QUERY_MAX:
         raise HTTPException(
@@ -393,8 +403,8 @@ async def api_graph(
             nodes = list((await db.execute(select(DataCatalogNode))).scalars())
         else:
             nodes = await scoped_nodes(db, allowed)
-        if kind is not None:
-            nodes = [n for n in nodes if n.kind == kind]
+        if kinds is not None:
+            nodes = [n for n in nodes if n.kind in kinds]
         needle = (q or "").strip().casefold()
         if needle:
             nodes = [
