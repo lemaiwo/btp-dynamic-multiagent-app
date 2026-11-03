@@ -3,7 +3,7 @@ import Fragment from "sap/ui/core/Fragment";
 import Device from "sap/ui/Device";
 import ErrorHandler from "../../service/ErrorHandler";
 import { AdminError } from "../../service/AdminService";
-import dataCatalog, { LINK_KINDS, type LinkCandidate, type LinkStart } from "../../model/dataCatalog";
+import dataCatalogLinks, { LINK_KINDS, type LinkCandidate, type LinkStart } from "../../model/dataCatalogLinks";
 import type AdminService from "../../service/AdminService";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
@@ -18,7 +18,7 @@ import type { DataEdge, DataLinkKind } from "../../service/dataCatalogTypes";
 export interface LinkDialogContext {
     /** The source the page shows: its nodes are no candidate. */
     source: { kind: string; name: string };
-    /** The nodes of that source a link can start at (`dataCatalog.linkStarts`). */
+    /** The nodes of that source a link can start at (`dataCatalogLinks.linkStarts`). */
     starts: LinkStart[];
     service: AdminService;
     text: (key: string, args?: (string | number)[]) => string;
@@ -31,7 +31,9 @@ export interface LinkDialogContext {
  * `POST data-catalog/edges`; `open` answers the stored edge, or nothing when
  * the dialog was closed without one (Cancel, Escape, a navigation). A refusal
  * of the server (the pair is already linked by that kind, a node is gone
- * since the search) is said in the dialog, which stays open.
+ * since the search) is said in the dialog, which stays open. While Add is
+ * on its way, Cancel and Escape wait; a navigation that closes the dialog
+ * meanwhile does not lose the answer: `open` answers once the server has.
  *
  * A plain class, not a controller: it is the controller object of its
  * fragment only.
@@ -47,6 +49,11 @@ export default class LinkDialog {
     private result?: DataEdge;
     /** Counts the searches: the answer of an earlier one is dropped. */
     private searches = 0;
+    /** Add is waiting for the server. */
+    private sending = false;
+    /** The answer of an `open` whose dialog closed while Add was waiting
+     *  (a navigation): that Add gives it, whatever the dialog shows by then. */
+    private pending?: (edge: DataEdge | undefined) => void;
 
     public async open(view: View, context: LinkDialogContext): Promise<DataEdge | undefined> {
         this.view = view;
@@ -56,13 +63,20 @@ export default class LinkDialog {
                 id: view.getId(), name: "com.agent.admin.fragment.DataCatalogLinkDialog", controller: this
             }) as Dialog;
             this.dialog.setModel(this.model, "link");
-            // Answered when the dialog has closed, whoever closed it.
+            // Escape is Cancel, which waits while Add is on its way.
+            this.dialog.setEscapeHandler((escape) => {
+                (escape.reject as () => void)();
+                this.onCancel();
+            });
+            // Answered when the dialog has closed, whoever closed it; closed
+            // under a pending Add (a navigation), that Add answers instead.
             this.dialog.attachAfterClose(() => {
-                const resolve = this.resolve;
-                const result = this.result;
-                this.resolve = undefined;
-                this.result = undefined;
-                resolve?.(result);
+                if (this.sending) {
+                    this.pending = this.resolve;
+                    this.resolve = undefined;
+                } else {
+                    this.settle();
+                }
             });
             // A dependent of the view: destroyed with it.
             view.addDependent(this.dialog);
@@ -74,9 +88,10 @@ export default class LinkDialog {
                 ...start, kindText: text(`dcNodeKind_${start.kind}`)
             })),
             from: context.starts.length ? context.starts[0].key : "",
-            kinds: LINK_KINDS.map((kind) => ({ key: kind, text: text(dataCatalog.relationKindKey(kind)) })),
+            kinds: LINK_KINDS.map((kind) => ({ key: kind, text: text(dataCatalogLinks.relationKindKey(kind)) })),
             kind: LINK_KINDS[0],
-            q: "", candidates: [], to: "", searching: false, searched: false, capped: false, error: "", busy: false
+            // Opened again while an earlier Add is on its way: it waits for that one.
+            q: "", candidates: [], to: "", searching: false, searched: false, capped: false, error: "", busy: this.sending
         });
         this.candidateList().removeSelections(true);
         this.dialog.setStretch(Device.system.phone === true);
@@ -87,6 +102,15 @@ export default class LinkDialog {
         return new Promise((resolve) => {
             this.resolve = resolve;
         });
+    }
+
+    /** Answers `open` with what the dialog stored, once. */
+    private settle(): void {
+        const resolve = this.resolve;
+        const result = this.result;
+        this.resolve = undefined;
+        this.result = undefined;
+        resolve?.(result);
     }
 
     private candidateList(): List {
@@ -102,8 +126,8 @@ export default class LinkDialog {
         let candidates: LinkCandidate[] = [];
         let capped = false;
         try {
-            const graph = await this.context.service.getDataGraph(dataCatalog.linkQuery(q));
-            candidates = dataCatalog.linkCandidates(graph, this.context.source);
+            const graph = await this.context.service.getDataGraph(dataCatalogLinks.linkQuery(q));
+            candidates = dataCatalogLinks.linkCandidates(graph, this.context.source);
             capped = graph.truncated === true;
         } catch (error) {
             if (mine !== this.searches) {
@@ -149,31 +173,47 @@ export default class LinkDialog {
         const from = Number(this.model.getProperty("/from"));
         const to = Number(this.model.getProperty("/to"));
         const kind = this.model.getProperty("/kind") as DataLinkKind;
-        if (this.model.getProperty("/busy") === true || !this.dialog?.isOpen() || !from || !to) {
+        const dialog = this.dialog;
+        if (this.sending || !dialog?.isOpen() || !from || !to) {
             return false;
         }
+        this.sending = true;
         this.model.setProperty("/busy", true);
         this.model.setProperty("/error", "");
+        let edge: DataEdge | undefined;
         try {
-            const edge = await this.context.service.createDataEdge({ from_id: from, to_id: to, kind });
-            this.result = edge;
-            this.dialog.close();
-            return true;
+            edge = await this.context.service.createDataEdge({ from_id: from, to_id: to, kind });
         } catch (error) {
             // The route's refusals are fixed texts that name the field and
-            // the rule, never a value: shown as they are.
+            // the rule, never a value: shown as they are, in the dialog they
+            // were made in (not in one opened since).
             if (error instanceof AdminError && (error.status === 409 || error.status === 422) && error.detail) {
-                this.model.setProperty("/error", this.context.text("dcLinkRefused", [error.detail]));
+                if (!this.pending) {
+                    this.model.setProperty("/error", this.context.text("dcLinkRefused", [error.detail]));
+                }
             } else {
                 ErrorHandler.handle(error, this.context.text("dcLinkAddFailed"));
             }
-            return false;
         } finally {
+            this.sending = false;
             this.model.setProperty("/busy", false);
         }
+        const pending = this.pending;
+        if (pending) {
+            // Closed while the server was asked: what it stored is answered all the same.
+            this.pending = undefined;
+            pending(edge);
+        } else if (edge) {
+            this.result = edge;
+            dialog.close();
+        }
+        return edge !== undefined;
     }
 
+    /** Closes without a link; not while Add is on its way (its link would be stored unseen). */
     public onCancel(): void {
-        this.dialog?.close();
+        if (!this.sending) {
+            this.dialog?.close();
+        }
     }
 }

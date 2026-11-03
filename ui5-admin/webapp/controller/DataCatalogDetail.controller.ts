@@ -5,7 +5,8 @@ import BaseController from "./BaseController";
 import LinkDialog from "./dataCatalog/LinkDialog";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
-import dataCatalog, { type EntityRow, type HintsForm, type LinkStart, type RelationRow } from "../model/dataCatalog";
+import dataCatalog, { type EntityRow, type HintsForm } from "../model/dataCatalog";
+import dataCatalogLinks, { type LinkStart, type RelationRow } from "../model/dataCatalogLinks";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
 import type MultiInput from "sap/m/MultiInput";
@@ -110,13 +111,13 @@ export default class DataCatalogDetail extends BaseController {
         this.src().setProperty("/errors", {});
         this.src().setProperty("/dirty", false);
         this.src().setProperty("/rows", dataCatalog.entityRows(detail));
-        this.src().setProperty("/linkStarts", dataCatalog.linkStarts(detail));
+        this.src().setProperty("/linkStarts", dataCatalogLinks.linkStarts(detail));
         this.showRelations();
     }
 
     private showRelations(): void {
         this.src().setProperty("/relations", this.detail
-            ? dataCatalog.relationRows(this.detail, (key) => this.text(key)) : []);
+            ? dataCatalogLinks.relationRows(this.detail, (key) => this.text(key)) : []);
     }
 
     /** Imports a source that was never imported, then reads it again. */
@@ -187,7 +188,7 @@ export default class DataCatalogDetail extends BaseController {
 
     /** "Same object"; a kind the catalogue does not name is shown as it is. */
     public formatRelationKind(kind: string): string {
-        const key = dataCatalog.relationKindKey(kind);
+        const key = dataCatalogLinks.relationKindKey(kind);
         return key ? this.text(key) : kind ?? "";
     }
 
@@ -351,15 +352,15 @@ export default class DataCatalogDetail extends BaseController {
 
     /** Opens Add link; a link it stored is listed at once. Resolves whether one was. */
     public async addLink(): Promise<boolean> {
-        const shown = this.detail;
-        if (!shown) {
+        if (!this.detail) {
             return false;
         }
         if (!this.linkDialog) {
             this.linkDialog = new LinkDialog();
         }
+        const source = { kind: this.src().getProperty("/kind") as string, name: this.src().getProperty("/name") as string };
         const edge = await this.linkDialog.open(this.getView()!, {
-            source: { kind: this.src().getProperty("/kind") as string, name: this.src().getProperty("/name") as string },
+            source,
             starts: this.src().getProperty("/linkStarts") as LinkStart[],
             service: this.getAdminService(),
             text: (key, args) => this.text(key, args)
@@ -368,8 +369,11 @@ export default class DataCatalogDetail extends BaseController {
             return false;
         }
         MessageToast.show(this.text("dcLinkAdded"));
-        // The page shows another source by now: its next read lists the link.
-        if (this.detail === shown) {
+        // The page may show another source by now (its next read lists the
+        // link), or this one read again since: with the link or without it.
+        const shown = this.detail;
+        if (shown && this.src().getProperty("/kind") === source.kind && this.src().getProperty("/name") === source.name
+            && !shown.edges.some((known) => String(known.id) === String(edge.id))) {
             shown.edges = shown.edges.concat([edge]);
             this.showRelations();
         }

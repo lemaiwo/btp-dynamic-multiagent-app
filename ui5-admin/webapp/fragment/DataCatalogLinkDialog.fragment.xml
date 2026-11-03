@@ -6,7 +6,7 @@
          function of ANOTHER source (controller/dataCatalog/LinkDialog). The
          search asks the graph route for those three kinds; the nodes of this
          source are left out before they are listed
-         (model/dataCatalog.linkCandidates). Nothing is stored before Add. -->
+         (model/dataCatalogLinks.linkCandidates). Nothing is stored before Add. -->
     <Dialog
         id="dcLinkDialog"
         title="{i18n>dcLinkDialogTitle}"
@@ -91,7 +91,8 @@
                 press=".onAdd" />
         </beginButton>
         <endButton>
-            <Button id="dcLinkCancel" text="{i18n>cancel}" press=".onCancel" />
+            <!-- Off while Add is on its way: a link stored then would go unseen. -->
+            <Button id="dcLinkCancel" text="{i18n>cancel}" enabled="{= !${link>/busy} }" press=".onCancel" />
         </endButton>
     </Dialog>
 </core:FragmentDefinition>

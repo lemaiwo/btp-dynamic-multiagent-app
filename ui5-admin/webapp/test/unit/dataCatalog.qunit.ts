@@ -1,10 +1,12 @@
 import ResourceBundle from "sap/base/i18n/ResourceBundle";
 import dataCatalog, {
-    DEFAULT_GRAPH_KINDS, GRAPH_NODE_CAP, LINK_KINDS, LINK_NODE_KINDS, NODE_KINDS, candidateRows, cleanList,
+    DEFAULT_GRAPH_KINDS, GRAPH_NODE_CAP, NODE_KINDS, candidateRows, cleanList,
     completenessPercent, completenessState, completenessText, entityRows, fitZoom, graphModel, graphQuery, hasChanges,
-    hintErrors, hintsOf, hintsUpdate, linkCandidates, linkQuery, linkStarts, nodeIcon, relationKindKey, relationRows,
-    sameSource, scoreText, statusKey
+    hintErrors, hintsOf, hintsUpdate, nodeIcon, scoreText, statusKey
 } from "com/agent/admin/model/dataCatalog";
+import dataCatalogLinks, {
+    LINK_KINDS, LINK_NODE_KINDS, linkCandidates, linkQuery, linkStarts, relationKindKey, relationRows, sameSource
+} from "com/agent/admin/model/dataCatalogLinks";
 import type {
     DataGraph, DataGraphNode, DataNode, DataNodeKind, DataSearchCandidate, DataSourceDetail, DataSourceKind
 } from "com/agent/admin/service/dataCatalogTypes";
@@ -262,6 +264,15 @@ QUnit.test("every text the detail's model names is in the bundle", async functio
     keys.forEach((key) => assert.ok(key && bundle.hasText(key), key));
     assert.strictEqual(bundle.getText("dcLinkOriginAdmin"), "Added by an admin");
     assert.strictEqual(bundle.getText("dcLinkOriginImported"), "Imported");
+});
+
+QUnit.test("the links module's default export holds what the detail page and the Add link dialog call", function (assert) {
+    assert.deepEqual(Object.keys(dataCatalogLinks).sort(), [
+        "LINK_KINDS", "LINK_NODE_KINDS", "linkCandidates", "linkQuery", "linkStarts", "relationKindKey", "relationRows",
+        "sameSource"
+    ]);
+    assert.strictEqual(dataCatalogLinks.relationRows, relationRows);
+    assert.notOk("relationRows" in dataCatalog, "the catalogue model no longer carries the link block");
 });
 
 QUnit.module("dataCatalog: what a hint edit sends");

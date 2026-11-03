@@ -261,7 +261,6 @@ export default class FakeIna {
         }
         if (this.describeMoves) {
             this.describeMoves = false;
-        this.busy = false;
             stored.updated_at = this.nextStamp();
             return json({ detail: FakeIna.describedMoved(stored.name) }, 409);
         }

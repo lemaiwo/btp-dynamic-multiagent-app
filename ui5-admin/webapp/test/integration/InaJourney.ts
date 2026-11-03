@@ -663,6 +663,36 @@ opaTest("leaving with unsaved changes asks; Cancel stays with the input, Discard
     Then.iStopTheApp();
 });
 
+/** Types `hash` into the address bar: the router cannot refuse it. */
+function iEditTheAddress(When: Common, hashTo: string): void {
+    When.waitFor({ success: function () { HashChanger.getInstance().setHash(hashTo); } });
+}
+
+opaTest("an address edited with unsaved changes is put back and asks; Cancel stays, Discard goes there", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+
+    iType(When, ID.title, "Flight revenue (EUR)");
+    iEditTheAddress(When, "ina-queries");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), "You have unsaved changes to this query. Discard them?");
+        Opa5.assert.strictEqual(hash(), FLIGHT, "the address is the query's again while it asks");
+    }, "the question");
+    iPressInDialog(When, "Cancel");
+    iSeeTheForm(Then, "Cancel keeps the page and the input", (form) => form.title === "Flight revenue (EUR)", function () {
+        Opa5.assert.strictEqual(hash(), FLIGHT, "still on the query");
+    });
+
+    iEditTheAddress(When, "ina-queries");
+    iPressInDialog(When, "Discard");
+    iSeeTheRows(Then, ALL, "Discard goes where the address said", function () {
+        Opa5.assert.strictEqual(hash(), "ina-queries", "the list route");
+        Opa5.assert.strictEqual(backend.countRequests(PUT_FLIGHT), 0, "nothing was saved");
+    });
+
+    Then.iStopTheApp();
+});
+
 opaTest("a Describe over a query saved meanwhile stores nothing, says so and reloads the query", function (Given: Common, When: Common, Then: Common) {
     Given.iStartTheApp(FLIGHT);
     iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
@@ -827,6 +857,27 @@ opaTest("Delete asks; a query in use is refused with the server's text, an unuse
     iSeeTheRows(Then, ["flight-revenue"], "back on the list, without it", function () {
         Opa5.assert.strictEqual(hash(), "ina-queries", "the list route");
         Opa5.assert.strictEqual(backend.ina.queries.length, 1, "deleted");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("Delete with unsaved changes goes to the list and asks nothing about them", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(COST);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "cost-centre-actuals");
+
+    iType(When, ID.title, "Cost centre actuals (edited)");
+    iPress(When, ID.remove);
+    iPressInDialog(When, "Delete");
+    iSeeTheRows(Then, ["flight-revenue"], "back on the list, without it", function () {
+        Opa5.assert.strictEqual(backend.ina.queries.length, 1, "deleted");
+    });
+    // The question would come a tick after the list (`LeaveGuard.askLater`).
+    Then.waitFor({
+        success: function () {
+            iSeeNoOpenDialog();
+            Opa5.assert.strictEqual(hash(), "ina-queries", "the list route: the deleted query's page is not put back");
+        }
     });
 
     Then.iStopTheApp();

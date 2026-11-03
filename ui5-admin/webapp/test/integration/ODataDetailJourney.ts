@@ -4151,3 +4151,29 @@ opaTest("a generic service says its function imports are reads and asks nothing 
     });
     Then.iStopTheApp();
 });
+
+opaTest("a 422 at the kind lands above the form: the Kind is no field of the form", function (Given: Common, When: Common, Then: Common) {
+    // The route's literal check (`kind: Literal["odata", "generic"]`).
+    const DETAIL = "kind: Input should be 'odata' or 'generic'";
+
+    Given.iStartTheApp(`odata-services/${JOBS}`);
+    iSeeTheService(Then, JOBS, "the service is loaded", function () {
+        backend.failNext = { path: `odata/services/${JOBS}`, method: "PUT", status: 422, body: { detail: DETAIL } };
+    });
+    iEnter(When, "odataTitle", "Edited");
+    iPress(When, "odataSaveButton");
+
+    iSee(Then, "the refusal above the form", function (page: UI5Element) {
+        return stripOf(page, "odataSaveError").visible;
+    }, function (page: UI5Element) {
+        Opa5.assert.deepEqual(stripOf(page, "odataSaveError"), {
+            visible: true, text: `The service was not saved. The server answered: ${DETAIL}`
+        }, "in the save strip, as the server's own text");
+        ["odataTitle", "odataName", "odataPurpose", "odataNotFor", "odataDestination", "odataServicePath"].forEach((id) => {
+            Opa5.assert.strictEqual(stateOf(page, id).state, "None", `${id} is not marked`);
+        });
+        Opa5.assert.strictEqual(formOf(page).title, "Edited", "the form keeps the edit");
+    });
+
+    Then.iStopTheApp();
+});

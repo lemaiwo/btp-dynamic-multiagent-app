@@ -186,3 +186,58 @@ opaTest("on the canvas a drag stops the turning, a hover points and a click open
 
     Then.iStopTheApp();
 });
+
+/** The animation frame the graph page has asked for, or null when nothing turns. */
+function pendingFrame(html: UI5Element): number | null {
+    return (viewOf(html).getController() as unknown as { frame: number | null }).frame;
+}
+
+opaTest("an address that matches no page stops the turning behind the not-found page", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp("data-catalog/graph");
+
+    When.waitFor({
+        id: "dcGraphMode",
+        viewName: GRAPH_VIEW,
+        success: (segmented: UI5Element) => pressSegment(segmented, "3d")
+    });
+    let canvas: UI5Element | undefined;
+    When.waitFor({
+        id: "dcGraph3d",
+        viewName: GRAPH_VIEW,
+        // Turning: no auto wait (see the first test).
+        autoWait: false,
+        check: (html: UI5Element) => paintedPixels(canvasOf(html)) > 0,
+        success: function (html: UI5Element) {
+            canvas = html;
+            Opa5.assert.notStrictEqual(pendingFrame(html), null, "the view turns");
+            HashChanger.getInstance().setHash("no-such-page");
+        },
+        errorMessage: "3D did not draw the catalogue on the canvas"
+    });
+    let seen: Projected[] = [];
+    let seenAt = 0;
+    Then.waitFor({
+        controlType: "sap.m.MessagePage",
+        viewName: "NotFound",
+        autoWait: false,
+        success: function () {
+            const html = canvas as UI5Element;
+            Opa5.assert.strictEqual(pendingFrame(html), null, "no frame is asked for behind the not-found page");
+            seen = nodesOnScreen(html);
+            seenAt = Date.now();
+        },
+        errorMessage: "The not-found page did not open"
+    });
+    Then.waitFor({
+        autoWait: false,
+        // Half a second later (30 frames, had the loop gone on), nothing has moved.
+        check: () => Date.now() - seenAt > 500
+            && JSON.stringify(nodesOnScreen(canvas as UI5Element)) === JSON.stringify(seen),
+        success: function () {
+            Opa5.assert.ok(seen.length > 0, "the view stands still");
+        },
+        errorMessage: "The 3D view went on turning behind the not-found page"
+    });
+
+    Then.iStopTheApp();
+});

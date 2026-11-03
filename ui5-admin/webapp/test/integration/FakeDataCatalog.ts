@@ -41,9 +41,20 @@ export default class FakeDataCatalog {
     public edges: DataEdge[] = [];
     /** Nodes the OData catalogue does not let agents read: `readable: true` is refused. */
     public catalogueHidden: (number | string)[] = [];
+    /** `true`: the next `POST edges` is not answered (nor stored) until
+     *  `releaseEdges()`: an Add on its way while something else happens. */
+    public holdNextEdge = false;
+    private heldEdges: (() => void)[] = [];
     private nextEdgeId = 1;
 
+    /** Answers the `POST edges` that `holdNextEdge` held. */
+    public releaseEdges(): void {
+        this.heldEdges.splice(0).forEach((release) => release());
+    }
+
     public reset(): void {
+        this.holdNextEdge = false;
+        this.heldEdges = [];
         this.sources = [
             {
                 kind: "odata", name: "purchase-requisitions", title: "Purchase requisitions",
@@ -206,6 +217,11 @@ export default class FakeDataCatalog {
             return this.graph(query, json);
         }
         if (sub === "edges" && method === "POST") {
+            if (this.holdNextEdge) {
+                this.holdNextEdge = false;
+                return new Promise<void>((resolve) => { this.heldEdges.push(resolve); })
+                    .then(() => this.createEdge(body, json));
+            }
             return this.createEdge(body, json);
         }
         const edge = /^edges\/([^/]+)$/.exec(sub);

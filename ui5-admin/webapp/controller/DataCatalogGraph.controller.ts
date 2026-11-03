@@ -80,20 +80,29 @@ export default class DataCatalogGraph extends BaseController {
             this.startTurning();
         });
         this.getRouter().attachRouteMatched(this.onAnyRouteMatched, this);
+        // `routeMatched` does not fire for an address that matches no route
+        // (the not-found page, see App.controller.ts).
+        this.getRouter().attachBypassed(this.onLeft, this);
     }
 
     public onExit(): void {
         this.stopTurning();
         this.unwire();
         this.getRouter().detachRouteMatched(this.onAnyRouteMatched, this);
+        this.getRouter().detachBypassed(this.onLeft, this);
     }
 
     /** Leaving by any route stops the auto-rotation. */
     private onAnyRouteMatched(event: Router$RouteMatchedEvent): void {
         if (event.getParameter("name") !== ROUTE) {
-            this.onRoute = false;
-            this.stopTurning();
+            this.onLeft();
         }
+    }
+
+    /** Another page is shown: nothing turns behind it. */
+    private onLeft(): void {
+        this.onRoute = false;
+        this.stopTurning();
     }
 
     /** A method, not a getter: UI5's extend reads getters before there is a view. */

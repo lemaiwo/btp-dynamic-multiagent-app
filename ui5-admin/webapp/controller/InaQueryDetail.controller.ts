@@ -85,7 +85,12 @@ export default class InaQueryDetail extends BaseController {
             service: () => this.getAdminService(),
             busy: (work) => this.callBusy(work),
             warnIfNotLive: (outcome, leadKey) => this.warnIfNotLive(outcome, leadKey),
-            done: () => this.getRouter().navTo("inaQueries")
+            done: () => {
+                // Nothing left to lose: the form goes with the query, so the
+                // guard has no unsaved changes to keep the page for.
+                this.qry().setData(blankDetail());
+                this.getRouter().navTo("inaQueries");
+            }
         });
         this.leaveGuard = new LeaveGuard(this.getOwnerComponentTyped(), this.getRouter(), ROUTE, {
             isDirty: () => this.qry().getProperty("/exists") === true && this.isDirty(),

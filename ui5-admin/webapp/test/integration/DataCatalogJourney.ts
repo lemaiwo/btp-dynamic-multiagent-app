@@ -17,27 +17,16 @@ import type Graph from "sap/suite/ui/commons/networkgraph/Graph";
 import type Node from "sap/suite/ui/commons/networkgraph/Node";
 import type Dialog from "sap/m/Dialog";
 import type Link from "sap/m/Link";
-import type Button from "sap/m/Button";
 import type Panel from "sap/m/Panel";
 import type ObjectStatus from "sap/m/ObjectStatus";
-import type SearchField from "sap/m/SearchField";
-import type StandardListItem from "sap/m/StandardListItem";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
-import { iPressInDialog, iSeeADialog } from "./pages/Dialogs";
-import { messageOf } from "./pages/ODataList";
+import { iSeeADialog } from "./pages/Dialogs";
+import { DETAIL_VIEW, GRAPH_VIEW, LIST_VIEW, choose, linksOf, rowsOf } from "./pages/DataCatalog";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
 QUnit.module("Data catalogue journey");
-
-const LIST_VIEW = "DataCatalog";
-const DETAIL_VIEW = "DataCatalogDetail";
-const GRAPH_VIEW = "DataCatalogGraph";
-
-function rowsOf(table: UI5Element): ColumnListItem[] {
-    return (table as Table).getItems().filter((item) => item.isA("sap.m.ColumnListItem")) as ColumnListItem[];
-}
 
 /** The source name of a list row (the text of its identifier). */
 function nameOf(row: ColumnListItem): string {
@@ -63,33 +52,6 @@ function nodesOfKind(graph: UI5Element, kind: string): Node[] {
 function pickKinds(box: MultiComboBox, keys: string[]): void {
     box.setSelectedKeys(keys);
     box.fireSelectionFinish({ selectedItems: box.getSelectedItems() });
-}
-
-/** Picks `key` in a bound Select the way a user does: the selection, then its change event. */
-function choose(select: Select, key: string): void {
-    select.setSelectedKey(key);
-    select.fireChange({ selectedItem: select.getSelectedItem() ?? undefined });
-}
-
-/** A row of the Links table as the admin reads it: from, relation, to, origin, and whether it offers a remove. */
-function linkOf(row: ColumnListItem): { from: string; relation: string; to: string; origin: string; remove: boolean } {
-    const cells = row.getCells();
-    return {
-        from: (cells[0] as Text).getText(false),
-        relation: (cells[1] as ObjectIdentifier).getTitle(),
-        to: (cells[2] as Text).getText(false),
-        origin: (cells[3] as ObjectStatus).getText(),
-        remove: (cells[4] as Button).getVisible()
-    };
-}
-
-function linksOf(table: UI5Element): ReturnType<typeof linkOf>[] {
-    return rowsOf(table).map(linkOf);
-}
-
-/** The titles of the Add link dialog's candidates. */
-function candidatesOf(list: UI5Element): string[] {
-    return (list as List).getItems().map((item) => (item as StandardListItem).getTitle());
 }
 
 opaTest("the list shows each source with its completeness", function (Given: Common, When: Common, Then: Common) {
@@ -238,85 +200,6 @@ opaTest("an InA source shows its query, dimensions and measures and the link an 
             origin: "Added by an admin", remove: true
         }], "the other source's end as source · node; a drawn link offers a remove"),
         errorMessage: "The drawn link is not listed"
-    });
-
-    Then.iStopTheApp();
-});
-
-opaTest("an admin links the query to the generic entity, then removes the link", function (Given: Common, When: Common, Then: Common) {
-    Given.iStartTheApp("data-catalog/ina/flight-revenue");
-
-    When.waitFor({ id: "dcAddLink", viewName: DETAIL_VIEW, actions: new Press() });
-    Then.waitFor({
-        id: "dcLinkCandidates",
-        viewName: DETAIL_VIEW,
-        searchOpenDialogs: true,
-        check: (list: UI5Element) => (list as List).getItems().length === 7,
-        success: function (list: UI5Element) {
-            Opa5.assert.deepEqual(candidatesOf(list), [
-                "Requisition", "Requisition item", "Supplier", "Release requisition", "A_BusinessPartner",
-                "Demo airlines", "Month names"
-            ], "entities and functions of the other sources: not the own query, no field, no source, no member");
-        },
-        errorMessage: "The dialog does not offer the seven nodes of the other sources"
-    });
-    When.waitFor({
-        id: "dcLinkSearch",
-        viewName: DETAIL_VIEW,
-        searchOpenDialogs: true,
-        success: function (field: UI5Element) {
-            (field as SearchField).setValue("airline");
-            (field as SearchField).fireSearch({ query: "airline" });
-        }
-    });
-    When.waitFor({
-        id: "dcLinkCandidates",
-        viewName: DETAIL_VIEW,
-        searchOpenDialogs: true,
-        // The airlines' field and the query's Airline dimension match too: neither is offered.
-        matchers: (list: UI5Element) => candidatesOf(list).join() === "Demo airlines" ? (list as List).getItems()[0] : false,
-        actions: new Press(),
-        errorMessage: "The search does not leave the demo airlines"
-    });
-    When.waitFor({ id: "dcLinkAdd", viewName: DETAIL_VIEW, searchOpenDialogs: true, actions: new Press() });
-
-    Then.waitFor({
-        id: "dcLinksTable",
-        viewName: DETAIL_VIEW,
-        check: (table: UI5Element) => rowsOf(table).length === 2,
-        success: function (table: UI5Element) {
-            Opa5.assert.deepEqual(backend.bodies["POST data-catalog/edges"], { from_id: 310, to_id: 210, kind: "same_object" },
-                "from the query, to the entity, by the kind picked first");
-            Opa5.assert.deepEqual(linksOf(table)[1], {
-                from: "Flight revenue by month", relation: "Same object", to: "agent-data · Demo airlines",
-                origin: "Added by an admin", remove: true
-            }, "the new link is listed at once, beside the aggregates link of the same pair");
-        },
-        errorMessage: "The added link is not listed"
-    });
-
-    When.waitFor({
-        id: "dcLinksTable",
-        viewName: DETAIL_VIEW,
-        matchers: (table: UI5Element) => rowsOf(table)[1].getCells()[4] as Button,
-        actions: new Press(),
-        errorMessage: "No remove on the added link"
-    });
-    iSeeADialog(Then, (dialog: UI5Element) => {
-        Opa5.assert.strictEqual(messageOf(dialog), "Remove the link Flight revenue by month \u2013 Same object \u2013 "
-            + "agent-data \u00b7 Demo airlines? An admin drew it, so no import brings it back.", "the question names the link");
-    }, "the question before a link is removed");
-    iPressInDialog(When, "OK");
-
-    Then.waitFor({
-        id: "dcLinksTable",
-        viewName: DETAIL_VIEW,
-        check: (table: UI5Element) => rowsOf(table).length === 1,
-        success: function (table: UI5Element) {
-            Opa5.assert.ok(backend.requests.indexOf("DELETE data-catalog/edges/5") !== -1, "the drawn link was removed");
-            Opa5.assert.strictEqual(linksOf(table)[0].relation, "Aggregates", "the other link stays");
-        },
-        errorMessage: "The removed link is still listed"
     });
 
     Then.iStopTheApp();
