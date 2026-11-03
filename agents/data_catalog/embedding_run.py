@@ -4,21 +4,28 @@ Design addendum (l), point 2: ``POST /admin/api/data-catalog/embeddings/run``
 starts it (``agents/data_catalog/embedding_routes.py``), and it embeds every
 embeddable node whose text changed (``embeddings.refresh_vectors`` with no
 scope and ``commit_batches``: batches of ``embeddings.BATCH_SIZE``, each
-committed when it is embedded), with the model the route resolved when it
-started it; a run of all nodes also drops the vectors of every other model.
-A save that changes the model in effect meanwhile ends the run as
-``ModelChanged`` before its next write: nothing more is written or dropped.
+committed when it is embedded and replacing vectors of its own model only),
+with the model the route resolved when it started it; a run of all nodes
+also drops the vectors of every other model at its end, unless the model in
+effect cannot be told then (they are kept for a run that can tell). A save
+that changes the model in effect meanwhile ends the run as ``ModelChanged``
+before its next write: nothing more is written or dropped.
 
 **One at a time per process**: :func:`start` checks and sets in one step
-(no ``await`` between the two, so two requests cannot both start one). The
-progress (``{done, total}``, done counted in texts sent) and the last run's
-outcome (``{started_at, finished_at, model, embedded, error_class}``) are
-kept in memory: another app instance knows nothing of them, and a restart
-forgets them; the vectors themselves are rows and survive.
+(no ``await`` between the two, so two requests cannot both start one). A
+catalogue or hint save, or the startup rebuild, that embeds meanwhile takes
+turns with the run's batches (the lock of ``embeddings.refresh_vectors``):
+what it embedded is not sent again by the run. The progress (``{done,
+total}``, done counted in nodes dealt with: sent, or found current by then)
+and the last run's outcome (``{started_at, finished_at, model, embedded,
+error_class}``) are kept in memory: another app instance knows nothing of
+them, and a restart forgets them; the vectors themselves are rows and
+survive.
 
 A failure is the run's ``error_class`` (the exception class, never its
-text: an httpx error names the URL); ``embedded`` counts the batches that
-were committed before it, and the next run sends only what is still stale.
+text: an httpx error names the URL); ``embedded`` counts the vectors the run
+wrote (after a failure: the nodes of the batches committed before it), and
+the next run sends only what is still stale.
 The lifespan cancels a run at shutdown (:func:`cancel_all`); a cancelled
 run's ``finished_at`` stays ``null``. Nothing needs a shielded save: the
 batch in flight is lost at worst and sent again by the next run.

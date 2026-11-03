@@ -33,7 +33,9 @@ while its list is empty: a deployment that reaches RUNNING later is not in
 it, and resetting our caches does not change that. AI Core's own list
 (``agents.aicore_deployments``, read by the admin's status, PUT and run)
 does show it: :func:`note_running` compares, and when the two disagree the
-next discovery makes the proxy client read its deployments again.
+next discovery makes the proxy client read its deployments again
+(``refresh=True``); a refresh that fails is no answer, so the one after it
+asks again.
 
 The call goes through the same ``gen_ai_hub`` proxy client as the chat
 models (``AsyncOpenAI(proxy_client=...).embeddings.create``). Every failure
@@ -43,6 +45,15 @@ vectors", logged by exception class only.
 Only catalogue text is embedded (names, labels, purpose, synonyms,
 examples), never a row of data. A vector is stored with the SHA-256 of the
 text it was made from, so an unchanged node is never sent again.
+
+**One embed-and-write at a time per process** (:func:`refresh_vectors`): a
+catalogue or hint save, the startup rebuild and the admin's run take one
+lock around reading what is stale, embedding it and committing the vectors,
+so two of them never send the same nodes (two bills) nor write the same
+vectors from two transactions. The admin's run takes it per batch and reads
+the batch's nodes again under it (what a save embedded meanwhile is not sent
+again), so a save waits for one batch, not for the run. Another app instance
+is not covered (ONE instance assumed, as by the startup sweep).
 """
 
 from __future__ import annotations
@@ -95,6 +106,9 @@ _cache_epoch = 0
 # kept; not by reset_caches (a save makes the proxy client no fresher).
 _refresh_next = False
 _question_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
+# The lock of refresh_vectors (see the module docstring), one per event loop:
+# the app has one, the test suite one per test.
+_write_lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
 
 
 def enabled() -> bool:
@@ -107,6 +121,14 @@ def reset_caches() -> None:
     _deployed_cache = None
     _cache_epoch += 1
     _question_cache.clear()
+
+
+def _writing() -> asyncio.Lock:
+    global _write_lock
+    loop = asyncio.get_running_loop()
+    if _write_lock is None or _write_lock[0] is not loop:
+        _write_lock = (loop, asyncio.Lock())
+    return _write_lock[1]
 
 
 def _pick(deployed: list[str]) -> str | None:
@@ -139,12 +161,13 @@ async def _deployed() -> list[str]:
     """The model names AI Core lists with a RUNNING deployment, cached for
     10 minutes; an empty list, a failed discovery included, for one minute
     (no discovery call per search either way). After :func:`note_running`
-    asked for it, discovery reads AI Core again first. Never raises."""
+    asked for it, discovery reads AI Core again first, until such a refresh
+    has answered. Never raises."""
     global _deployed_cache, _refresh_next
     now, epoch = _clock(), _cache_epoch
     if _deployed_cache is not None and now - _deployed_cache[0] < _deployed_cache[1]:
         return _deployed_cache[2]
-    refresh = _refresh_next
+    refresh, answered = _refresh_next, False
     try:
         from agents.shared import _discover_deployed_models
 
@@ -153,13 +176,15 @@ async def _deployed() -> list[str]:
             _discover_deployed_models)
         found = await asyncio.wait_for(asyncio.to_thread(call), DISCOVERY_TIMEOUT_SECONDS)
         deployed = [m for m in (found or []) if isinstance(m, str)]
+        # ``None`` is a refresh that failed (``agents.shared`` logged it).
+        answered = found is not None
     except Exception as exc:  # noqa: BLE001 - no vectors, see the module docstring
         logger.warning("data catalogue: model discovery failed (%s)", type(exc).__name__)
         deployed = []
-    else:
-        # A note that landed meanwhile asked for a refresh after this one.
-        if refresh and epoch == _cache_epoch:
-            _refresh_next = False
+    # A refresh that failed is asked again, and so is one that a note
+    # overtook (it asked for a refresh after this one).
+    if refresh and answered and epoch == _cache_epoch:
+        _refresh_next = False
     if epoch == _cache_epoch:
         ttl = MODEL_CACHE_SECONDS if deployed else EMPTY_CACHE_SECONDS
         _deployed_cache = (now, ttl, deployed)
@@ -364,14 +389,26 @@ class ModelChanged(Exception):
 
 
 async def _write(
-    db: AsyncSession, todo: list[tuple[int, str, str]], vectors: list[list[float]], model: str
+    db: AsyncSession,
+    todo: list[tuple[int, str, str]],
+    vectors: list[list[float]],
+    model: str,
+    *,
+    every_model: bool,
 ) -> None:
-    """The new vectors of ``todo``; every older vector of those nodes, of any
-    model, goes."""
+    """The new vectors of ``todo``, in place of the nodes' older vector of
+    ``model``; with ``every_model`` (the import path, one transaction) their
+    vectors of other models go too. The admin's run commits batch by batch
+    and leaves the other models' vectors to the drop at its end: a run that
+    fails or stops keeps every node the vector of the model it had (it may be
+    the one in effect again, after a save switched back)."""
     from agents.data_catalog.importer import batched
 
     for chunk in batched([nid for nid, _, _ in todo]):
-        await db.execute(delete(DataCatalogVector).where(DataCatalogVector.node_id.in_(chunk)))
+        query = delete(DataCatalogVector).where(DataCatalogVector.node_id.in_(chunk))
+        if not every_model:
+            query = query.where(DataCatalogVector.model == model)
+        await db.execute(query)
     for (nid, _, digest), vector in zip(todo, vectors):
         db.add(DataCatalogVector(node_id=nid, model=model, text_hash=digest, vector=pack(vector)))
 
@@ -395,20 +432,78 @@ async def _in_effect(model: str) -> bool | None:
     return None if picked is None else picked == model
 
 
-async def _still_in_effect(model: str) -> None:
-    """Raise :class:`ModelChanged` when a save changed the model or switched
+async def _still_in_effect(model: str) -> bool:
+    """``True`` while ``model`` is the one in effect; raises
+    :class:`ModelChanged` when a save changed the model or switched
     embeddings off. A check that cannot tell is made once more; still not
-    told, the run goes on with its model: what it writes is of that model
-    either way, and a run of a model no longer in effect is dropped by the
-    next one."""
+    told, ``False``: the run goes on with its model (what it writes is of
+    that model either way, and a run of a model no longer in effect is
+    dropped by the next one), but it drops no other model's vectors (one of
+    them may be the model in effect)."""
     for _ in range(2):
         verdict = await _in_effect(model)
         if verdict is False:
             raise ModelChanged()
         if verdict:
-            return
+            return True
     logger.warning(
         "data catalogue: the model in effect could not be read; the run goes on with %s", model)
+    return False
+
+
+async def _nodes(db: AsyncSession, ids: list[int]) -> list[DataCatalogNode]:
+    """The nodes of ``ids`` (at most a batch) as stored now: the session's
+    copies of an earlier read are refreshed, so a text a save changed
+    counts, and a node a save removed is gone."""
+    query = (
+        select(DataCatalogNode)
+        .where(DataCatalogNode.id.in_(ids))
+        .order_by(DataCatalogNode.id)
+        .execution_options(populate_existing=True)
+    )
+    return list((await db.execute(query)).scalars())
+
+
+async def _drop_other_models(db: AsyncSession, model: str) -> None:
+    # The search reads the vectors of the effective model only: those of a
+    # model switched away from are dead weight.
+    await db.execute(delete(DataCatalogVector).where(DataCatalogVector.model != model))
+
+
+async def _refresh_in_batches(
+    db: AsyncSession,
+    scope: tuple[str, str] | None,
+    model: str,
+    on_progress: Callable[[int, int], None] | None,
+) -> int:
+    """The admin's run of :func:`refresh_vectors` (``commit_batches``)."""
+    nodes = await _embeddable(db, scope)
+    todo = _changed(nodes, await _stored_hashes(db, [n.id for n in nodes], model))
+    if on_progress is not None:
+        on_progress(0, len(todo))
+    written = 0
+    for start in range(0, len(todo), BATCH_SIZE):
+        ids = [nid for nid, _, _ in todo[start : start + BATCH_SIZE]]
+        async with _writing():
+            # Read again under the lock: a save may have embedded a node of
+            # this batch, changed its text or removed it since the run began.
+            chunk = _changed(await _nodes(db, ids), await _stored_hashes(db, ids, model))
+            if chunk:
+                vectors = await _embed_batches([t for _, t, _ in chunk], model)
+                await _still_in_effect(model)
+                await _write(db, chunk, vectors, model, every_model=False)
+                await db.commit()
+                written += len(chunk)
+        if on_progress is not None:
+            on_progress(start + len(ids), len(todo))
+    if scope is None:
+        async with _writing():
+            if await _still_in_effect(model):
+                await _drop_other_models(db, model)
+                await db.commit()
+            else:
+                logger.info("data catalogue: the vectors of other models are kept")
+    return written
 
 
 async def refresh_vectors(
@@ -421,50 +516,45 @@ async def refresh_vectors(
 ) -> int:
     """Embed every embeddable node (of ``scope``, or all) whose text changed
     since its vector was made; drop vectors of another model (a node's, when
-    it is sent again; every one, after a refresh of all nodes that did not
-    fail). Returns how many vectors were written; 0 without a model.
+    the import path sends it again; every one, after a refresh of all nodes
+    that did not fail). Returns how many vectors were written; 0 without a
+    model. Under the lock of the module docstring.
 
-    The import and startup path (the default) holds one transaction and does
-    not commit; an embedding failure writes nothing and answers 0.
+    The import and startup path (the default) writes in one transaction,
+    which it commits before it lets the lock go (a refresh that waited for
+    the lock reads what this one wrote); an embedding failure writes nothing
+    and answers 0.
 
     The admin's run (``agents.data_catalog.embedding_run``) passes ``model``
     (resolved once, named in its ``last_run``), ``on_progress(done, total)``
-    (called once the nodes to send are known and after each committed batch)
+    (called once the nodes to send are known and after each batch: ``done``
+    counts the nodes dealt with, sent by the run or found current by then)
     and ``commit_batches``: each batch is written and COMMITTED as soon as it
     is embedded, so a failure at batch 70 of 80 keeps the 69 that were paid
-    for and the next run sends only what is still stale. An embedding failure
-    is raised (the run reports its class). Before each write and before the
-    drop of other models the model is checked again (:func:`_still_in_effect`):
-    when a save changed it, :class:`ModelChanged` is raised and nothing more
-    is written or dropped; a check that cannot tell is no change. The caller
-    commits the drop at the end.
+    for and the next run sends only what is still stale; a batch replaces
+    vectors of the run's model only. An embedding failure is raised (the run
+    reports its class). Before each write and before the drop of other models
+    the model is checked again (:func:`_still_in_effect`): when a save changed
+    it, :class:`ModelChanged` is raised and nothing more is written or
+    dropped; a check that cannot tell is no change for the writes, and the
+    drop is then skipped (the next run that can tell makes it).
     """
     model = model or await resolve_model()
     if not model:
         return 0
-    nodes = await _embeddable(db, scope)
-    todo = _changed(nodes, await _stored_hashes(db, [n.id for n in nodes], model))
-    if on_progress is not None:
-        on_progress(0, len(todo))
     if commit_batches:
-        for start in range(0, len(todo), BATCH_SIZE):
-            chunk = todo[start : start + BATCH_SIZE]
-            vectors = await _embed_batches([t for _, t, _ in chunk], model)
-            await _still_in_effect(model)
-            await _write(db, chunk, vectors, model)
-            await db.commit()
-            if on_progress is not None:
-                on_progress(start + len(chunk), len(todo))
-    elif todo:
-        found = await embed_texts([t for _, t, _ in todo], model)
-        if found is None:
-            return 0
-        await _write(db, todo, found, model)
-    if scope is None:
-        if commit_batches:
-            await _still_in_effect(model)
-        # The search reads the vectors of the effective model only: those of
-        # a model switched away from are dead weight.
-        await db.execute(delete(DataCatalogVector).where(DataCatalogVector.model != model))
-    await db.flush()
+        return await _refresh_in_batches(db, scope, model, on_progress)
+    async with _writing():
+        nodes = await _embeddable(db, scope)
+        todo = _changed(nodes, await _stored_hashes(db, [n.id for n in nodes], model))
+        if on_progress is not None:
+            on_progress(0, len(todo))
+        if todo:
+            found = await embed_texts([t for _, t, _ in todo], model)
+            if found is None:
+                return 0
+            await _write(db, todo, found, model, every_model=True)
+        if scope is None:
+            await _drop_other_models(db, model)
+        await db.commit()
     return len(todo)

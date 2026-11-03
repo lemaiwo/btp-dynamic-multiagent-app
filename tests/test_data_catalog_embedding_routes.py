@@ -430,6 +430,54 @@ async def test_put_of_automatic_needs_no_ai_core(client, aicore, discovery):
     assert await stored() == (0, None)
 
 
+async def test_switching_off_needs_no_deployment_of_the_saved_model(client, aicore, discovery):
+    """The saved model's deployment was deleted in AI Core meanwhile: the
+    admin can still switch embeddings off (an "off" never depends on a
+    remote check)."""
+    await store(1, SMALL)
+    embeddings.reset_caches()
+    r = await client.put(BASE, json={"enabled": False, "model": SMALL})
+    assert r.status_code == 200
+    assert r.json()["setting"] == {"enabled": False, "model": SMALL}
+    assert await stored() == (0, SMALL)
+
+
+@pytest.mark.parametrize(("saved", "sent"), [
+    ((1, ADA), {"enabled": False, "model": ADA}),
+    ((1, ADA), {"enabled": False, "model": SMALL}),
+    ((1, ADA), {"enabled": True, "model": ADA}),
+    ((0, LARGE), {"enabled": True, "model": LARGE}),
+], ids=["off, the saved model", "off, another model", "on, the saved model",
+        "on again, the saved model"])
+async def test_switching_off_or_keeping_the_saved_model_asks_ai_core_nothing(
+    client, aicore, discovery, saved, sent
+):
+    """AI Core unreachable: the PUT stores what needs no check (the lists of
+    the status it answers are the ones a status read cached)."""
+    await store(*saved)
+    embeddings.reset_caches()
+    aicore.fail = {"list_deployments": "aicore_unavailable", "list_models": "aicore_unavailable"}
+    assert (await client.get(BASE)).json()["aicore_error"] == "aicore_unavailable"
+    aicore.calls.clear()
+    r = await client.put(BASE, json=sent)
+    assert r.status_code == 200 and r.json()["aicore_error"] == "aicore_unavailable"
+    assert await stored() == (int(sent["enabled"]), sent["model"])
+    assert aicore.calls == []
+
+
+@pytest.mark.parametrize("saved", [(0, LARGE), (1, LARGE), (0, None)])
+async def test_switching_on_with_another_model_is_still_checked(client, aicore, discovery, saved):
+    await store(*saved)
+    embeddings.reset_caches()
+    r = await client.put(BASE, json={"enabled": True, "model": SMALL})
+    assert r.status_code == 422
+    assert r.json() == {"detail": "model: not a deployed embedding model"}
+    aicore.fail = {"list_deployments": "aicore_unavailable"}
+    r = await client.put(BASE, json={"enabled": True, "model": SMALL})
+    assert r.status_code == 502
+    assert await stored() == saved
+
+
 # --- the run --------------------------------------------------------------------------------
 
 
@@ -593,16 +641,20 @@ async def test_a_run_whose_check_cannot_tell_goes_on_with_its_model(
     monkeypatch, client, aicore, discovery, catalogue, embedder, cause
 ):
     """A database blip or a discovery that answers nothing during a run is
-    no change of the model: the run writes every batch and drops the other
-    model's vectors at its end, as it would have."""
+    no change of the model: the run writes every batch. It keeps the other
+    model's vectors at its end (whether its model is still the one in effect
+    is not known); the next run that can tell drops them."""
     monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
     await add_vector(catalogue["Release"], SMALL)
     embedder.hold = 1
     assert (await client.post(f"{BASE}/run")).status_code == 202
     await asyncio.wait_for(embedder.reached.wait(), 5)
+    real, broken = embeddings.get_embedding_setting, True
 
     async def unreadable(session):
-        raise RuntimeError("connection reset")
+        if broken:
+            raise RuntimeError("connection reset")
+        return await real(session)
 
     if cause == "setting unreadable":
         monkeypatch.setattr(embeddings, "get_embedding_setting", unreadable)
@@ -613,7 +665,91 @@ async def test_a_run_whose_check_cannot_tell_goes_on_with_its_model(
     await finished()
     last = embedding_run.last_run()
     assert (last["model"], last["embedded"], last["error_class"]) == (LARGE, 4, None)
-    assert {m for _, m in await vectors_stored()} == {LARGE}
+    every = {(catalogue[n], LARGE) for n in ("sales", "Order", "Item", "Release")}
+    assert await vectors_stored() == every | {(catalogue["Release"], SMALL)}
+    broken, discovery.models = False, list(DEPLOYED)
+    embeddings.reset_caches()
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await finished()
+    assert await vectors_stored() == every
+
+
+@pytest.mark.parametrize("stop", ["failure", "model changed"])
+async def test_a_run_that_stops_keeps_the_previous_models_vectors(
+    monkeypatch, client, aicore, discovery, catalogue, embedder, stop
+):
+    """The batches a run committed replace only vectors of its own model: a
+    run that fails or whose model was changed back meanwhile leaves every
+    node its vector of the previous model (else those nodes rank by words,
+    and are paid for again, until a run of that model)."""
+    monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
+    names = ("sales", "Order", "Item", "Release")
+    for name in names:
+        await add_vector(catalogue[name], SMALL)
+    aicore.deployments.append({"model": SMALL, "status": "RUNNING", "deployment_id": "d-2"})
+    if stop == "failure":
+        embedder.boom, embedder.boom_at = RuntimeError("batch 2 failed"), 1
+    else:
+        embedder.hold = 1
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    if stop == "model changed":
+        await asyncio.wait_for(embedder.reached.wait(), 5)
+        assert (await client.put(BASE, json={"enabled": True, "model": SMALL})).status_code == 200
+        embedder.release.set()
+    await finished()
+    last = embedding_run.last_run()
+    assert (last["embedded"], last["error_class"]) == (
+        2, "RuntimeError" if stop == "failure" else "ModelChanged")
+    assert await vectors_stored() == {(catalogue[n], SMALL) for n in names} | {
+        (catalogue["sales"], LARGE), (catalogue["Order"], LARGE)}
+
+
+async def _save(scope: tuple[str, str] = ("odata", "sales")) -> int:
+    """What a catalogue or hint save does after its commit."""
+    async with SessionLocal() as s:
+        written = await embeddings.refresh_vectors(s, scope=scope)
+        await s.commit()
+    return written
+
+
+def _sent(embedder: Embedder) -> list[str]:
+    return sorted(t.split(" | ")[0] for batch in embedder.batches for t in batch)
+
+
+async def test_a_save_while_a_run_embeds_waits_and_nothing_is_sent_twice(
+    monkeypatch, client, aicore, discovery, catalogue, embedder
+):
+    """One embed-and-write at a time per process: the save waits for the
+    run's batch, then embeds what is still stale; the run's next batch finds
+    it current and sends nothing (no second bill, no clash on a vector)."""
+    monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
+    embedder.hold = 0
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await asyncio.wait_for(embedder.reached.wait(), 5)
+    saving = asyncio.create_task(_save())
+    await asyncio.sleep(0.1)
+    assert len(embedder.batches) == 1 and not saving.done()
+    embedder.release.set()
+    assert await asyncio.wait_for(saving, 5) == 2
+    await finished()
+    last = embedding_run.last_run()
+    assert (last["embedded"], last["error_class"]) == (2, None)
+    assert _sent(embedder) == ["Item", "Order", "Release", "sales"]
+    assert await vectors_stored() == {
+        (catalogue[n], LARGE) for n in ("sales", "Order", "Item", "Release")}
+
+
+async def test_two_saves_at_once_embed_each_node_once(discovery, catalogue, embedder):
+    embedder.hold = 0
+    first = asyncio.create_task(_save())
+    await asyncio.wait_for(embedder.reached.wait(), 5)
+    second = asyncio.create_task(_save())
+    await asyncio.sleep(0.1)
+    assert len(embedder.batches) == 1 and not second.done()
+    embedder.release.set()
+    assert await asyncio.wait_for(asyncio.gather(first, second), 5) == [4, 0]
+    assert _sent(embedder) == ["Item", "Order", "Release", "sales"]
+    assert len(await vectors_stored()) == 4
 
 
 async def test_the_run_is_cancelled_at_shutdown_and_keeps_its_committed_batches(

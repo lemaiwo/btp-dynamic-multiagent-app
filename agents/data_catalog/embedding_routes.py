@@ -16,8 +16,13 @@ whose body reader it shares, capped at 4 KB here). Every route carries
   rest of the status is answered all the same; ``available`` is then empty,
   so no deploy is offered for a model whose live state is unknown).
 * ``PUT ""`` ``{enabled, model}`` -- both keys required; ``model`` ``null``
-  (automatic) or a model AI Core lists a deployment of, in any status (the
-  status then says whether it embeds). Answers the status.
+  (automatic) or a model name. AI Core is asked only when the PUT switches
+  embeddings on with a model other than the stored one: that model must have
+  a deployment there, in any status (the status then says whether it
+  embeds). Switching off, or keeping the stored model, never waits for AI
+  Core and is never refused by it: an admin whose saved model's deployment
+  was deleted, or whose AI Core is unreachable, can still switch off.
+  Answers the status.
 * ``POST /run`` -- 202 ``{running: true}``; 409 while a run is in flight,
   or when no model is in effect (then with ``X-Embeddings-Error: no_model``,
   so the panel can tell the two apart). AI Core's lists are read only when
@@ -32,8 +37,8 @@ whose body reader it shares, capped at 4 KB here). Every route carries
   one INFO line (deployment id, status, whether it was created). Idempotent in
   ``agents.aicore_deployments.deploy``: a live deployment is answered and
   nothing is made. The deploy runs in a task of its own that the request
-  only waits for (at most :data:`DEPLOY_WAIT_SECONDS`): a client that goes
-  away must not cancel it between the create AI Core may already have
+  only waits for (at most :data:`DEPLOY_WAIT_SECONDS`, 300 s): a client that
+  goes away must not cancel it between the create AI Core may already have
   received and the release of the module's deploy lock. A wait that runs out
   is ``deploy_failed`` (the deployment may still appear in the list). The
   lifespan waits for a deploy in flight at shutdown, bounded and without
@@ -79,8 +84,12 @@ BODY_BYTES = 4 * 1024
 LISTS_CACHE_SECONDS = 10.0
 # How long the shutdown waits for a deploy in flight.
 DEPLOY_DRAIN_SECONDS = 15.0
-# Above the module's own bounds: four calls of at most 30 s each.
-DEPLOY_WAIT_SECONDS = 150.0
+# Above the module's own bounds: a deploy makes at least six AI API calls of
+# at most 30 s each (model list, deployment list, executables, configuration
+# list, configuration create, deployment create), plus a token request, the
+# further pages of the two lists and, after an unconfirmed create, a re-read
+# of the deployments.
+DEPLOY_WAIT_SECONDS = 300.0
 ERROR_HEADER = "X-Embeddings-Error"
 MODEL_NOT_DEPLOYED = "model: not a deployed embedding model"
 MODEL_NOT_OFFERED = "model: not an embedding model AI Core offers"
@@ -220,7 +229,11 @@ async def api_status() -> dict[str, Any]:
 @router.put("", dependencies=[Depends(require_admin)])
 async def api_put_setting(request: Request) -> dict[str, Any]:
     body, _ = await _json_body(request, SettingBody, limit=BODY_BYTES)
-    if body.model is not None:
+    async with agents_db.SessionLocal() as db:
+        saved = await agents_db.get_embedding_setting(db)
+    # Only a model that the PUT puts in effect anew is checked: an "off", or
+    # the stored model kept, must not depend on a remote call.
+    if body.enabled and body.model is not None and body.model != saved["model"]:
         from agents import aicore_deployments as aicore
 
         deployed = await _aicore(aicore.list_deployments)

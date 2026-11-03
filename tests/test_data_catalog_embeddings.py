@@ -21,6 +21,7 @@ to ``1`` here only where a rung needs it.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import subprocess
@@ -75,17 +76,21 @@ class ProxyClient:
     ``test_the_proxy_client_is_one_instance_that_keeps_its_list``): ONE
     instance per process, whose ``deployments`` are read from AI Core
     (``live``: the models with a RUNNING deployment there) only while its
-    list is empty; ``update_deployments()`` reads them again. ``install``
-    makes ``get_proxy_client`` answer it, so the real
+    list is empty; ``update_deployments()`` reads them again (``fail``: that
+    read raises, the list stays what it was). ``install`` makes
+    ``get_proxy_client`` answer it, so the real
     ``agents.shared._discover_deployed_models`` runs."""
 
     def __init__(self, live: Callable[[], list[str]]) -> None:
         self._live = live
         self._deployments: list[SimpleNamespace] = []
         self.updates = 0
+        self.fail: Exception | None = None
 
     def update_deployments(self) -> list[SimpleNamespace]:
         self.updates += 1
+        if self.fail is not None:
+            raise self.fail
         self._deployments = [SimpleNamespace(model_name=m) for m in self._live()]
         return self._deployments
 
@@ -616,6 +621,40 @@ async def test_a_refresh_that_a_note_overtook_is_asked_again(monkeypatch):
     assert found.refreshes == 2
 
 
+def test_a_failed_refresh_answers_none_and_names_the_class_only(monkeypatch, caplog):
+    """A refresh that fails is no list (``None``: the data catalogue asks
+    again), and gen_ai_hub's traceback, which names the AI API host and what
+    it answered, stays out of the log. The chat's call is unchanged: ``[]``."""
+    proxy = ProxyClient(lambda: ["gpt-4o"]).install(monkeypatch)
+    proxy.fail = RuntimeError(f"https://{SECRET}.aicore.example/v2/lm/deployments refused")
+    with caplog.at_level(logging.WARNING, logger=shared.logger.name):
+        assert shared._discover_deployed_models(refresh=True) is None
+    (record,) = [r for r in caplog.records if r.name == shared.logger.name]
+    assert record.exc_info is None and "RuntimeError" in record.getMessage()
+    assert SECRET not in caplog.text
+    assert shared._discover_deployed_models() == []
+
+
+async def test_a_refresh_that_fails_is_asked_again(monkeypatch):
+    """A failed refresh is no answer: the flag stays, so the next discovery
+    (after the minute a failed one is cached) reads AI Core again instead of
+    the proxy client's old list."""
+    clock = Clock()
+    monkeypatch.setattr(embeddings, "_clock", clock)
+    live = ["gpt-4o"]
+    proxy = ProxyClient(lambda: list(live)).install(monkeypatch)
+    proxy.update_deployments()  # the chat read it long ago
+    live.append(SMALL_MODEL)
+    embeddings.note_running([SMALL_MODEL])
+    proxy.fail = RuntimeError("AI Core unreachable")
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    assert embeddings._refresh_next is True
+    proxy.fail = None
+    clock.now += embeddings.EMPTY_CACHE_SECONDS + 1
+    assert await embeddings.resolve_model_detail() == (SMALL_MODEL, "discovery")
+    assert embeddings._refresh_next is False
+
+
 # --- a run's check of the model in effect ---------------------------------------------------
 
 
@@ -639,10 +678,10 @@ async def test_a_definite_change_of_the_model_stops_the_run(monkeypatch, discove
 
 
 async def test_the_run_goes_on_while_its_model_is_in_effect(discovery):
-    await embeddings._still_in_effect(LARGE_MODEL)
+    assert await embeddings._still_in_effect(LARGE_MODEL) is True
     await store(1, LARGE_MODEL)
     embeddings.reset_caches()
-    await embeddings._still_in_effect(LARGE_MODEL)
+    assert await embeddings._still_in_effect(LARGE_MODEL) is True
 
 
 @pytest.mark.parametrize("cause", ["setting unreadable", "discovery empty",
@@ -651,7 +690,8 @@ async def test_a_check_that_cannot_tell_is_tried_again_once_then_the_run_goes_on
     monkeypatch, discovery, caplog, cause
 ):
     """A failed read is no change: the run keeps its model (what it writes is
-    of that model either way), after one more try."""
+    of that model either way), after one more try; ``False`` says it was not
+    told (the run then keeps the other models' vectors)."""
     reads = 0
 
     async def unreadable(session):
@@ -667,7 +707,9 @@ async def test_a_check_that_cannot_tell_is_tried_again_once_then_the_run_goes_on
         await store(1, LARGE_MODEL)
         discovery.models = ["gpt-4o"]
     embeddings.reset_caches()
-    await embeddings._still_in_effect(LARGE_MODEL)
+    # The admin's model is compared by name: that one is told, and in effect.
+    told = cause == "admin model no longer listed"
+    assert await embeddings._still_in_effect(LARGE_MODEL) is told
     if cause == "setting unreadable":
         assert reads == 2
     assert SECRET not in caplog.text

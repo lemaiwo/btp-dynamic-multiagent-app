@@ -572,11 +572,13 @@ DEFAULT_AVAILABLE_MODELS = (
 )
 
 
-def _discover_deployed_models(refresh: bool = False) -> list[str]:
+def _discover_deployed_models(refresh: bool = False) -> list[str] | None:
     """Query SAP AI Core for the model names that are actually deployed.
 
     Returns an empty list if discovery fails (no credentials, network error,
-    etc.) so the caller can fall back to the static default list.
+    etc.) so the caller can fall back to the static default list; a refresh
+    that fails returns ``None`` instead, so the data catalogue can tell "no
+    answer" from "no deployments" and asks again.
 
     ``get_proxy_client("gen-ai-hub")`` is ONE instance per process
     (gen_ai_hub caches it by its arguments), and its ``deployments`` are read
@@ -594,7 +596,13 @@ def _discover_deployed_models(refresh: bool = False) -> list[str]:
         deployments = client.update_deployments() if refresh else client.deployments
         names = {d.model_name for d in deployments if d.model_name}
         return sorted(names)
-    except Exception:
+    except Exception as exc:
+        if refresh:
+            # The class only: gen_ai_hub's traceback names the AI API host
+            # and quotes what it answered.
+            logger.warning("Could not refresh the deployed models from AI Core (%s)",
+                           type(exc).__name__)
+            return None
         logger.warning("Could not discover deployed models from AI Core", exc_info=True)
         return []
 
