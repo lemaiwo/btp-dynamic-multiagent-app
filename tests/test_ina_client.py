@@ -9,9 +9,8 @@ service, the connectivity tokens and SAP behind them are doubles
 capabilities, a query description, a result grid, and the message of an
 unknown query.
 
-Covered: the CSRF token is fetched once per (destination, user) with the
-``GetServerInfo`` call and sent with every ``GetResponse``; a 403 re-fetches it
-once; ``describe`` maps SAP's description onto the save-time gate's
+Covered (the CSRF token and the SAP session per destination and user are
+``tests/test_ina_sessions.py``): ``describe`` maps SAP's description onto the save-time gate's
 ``InaDefinition``; ``run`` sends the ``Analytics`` request exactly as pinned
 and reads rows and units from the grid; every cap and every argument check
 refuses before anything is sent; and every failure is one code of the closed
@@ -186,12 +185,13 @@ def make(
     sap: Sap,
     *,
     user_context: bool = False,
+    destination: str = DESTINATION,
     resolver: Any = None,
     store: InaSessionStore | None = None,
     known: InaDefinition | None = None,
     package: str = "",
 ) -> InaClient:
-    resolver = resolver or FakeResolver(url=SIA_URL, name=DESTINATION)
+    resolver = resolver or FakeResolver(url=SIA_URL, name=destination)
     http = destination_http_client(
         resolver,
         user_context=user_context,
@@ -203,7 +203,7 @@ def make(
     return InaClient(
         http,
         store if store is not None else InaSessionStore(),
-        destination=DESTINATION,
+        destination=destination,
         user_context=user_context,
         query=QUERY,
         package=package,
@@ -277,125 +277,6 @@ def test_the_caps_are_the_designs():
         30,
         2000,
     )
-
-
-# --------------------------------------------------------------- CSRF and session
-
-
-async def test_server_info_is_fetched_once_per_destination_and_user_and_its_token_reused():
-    sap = Sap()
-    sap.answers = [fixture("describe_ok.json"), fixture("run_ok.json")]
-    store = InaSessionStore()
-    await make(sap, store=store).describe()
-    await make(sap, store=store, known=definition()).run(**RUN)
-    (get,) = sap.gets
-    assert get.url.path == INFO_PATH and get.headers["X-CSRF-Token"] == "Fetch"
-    assert "cookie" not in get.headers
-    assert len(sap.posts) == 2
-    for post in sap.posts:
-        assert post.url.path == RESPONSE_PATH
-        assert post.headers["X-CSRF-Token"] == "csrf-1"
-        assert post.headers["Cookie"] == "SAP_SESSIONID_XYZ_100=sess-1"
-        assert post.headers["Content-Type"] == "application/json"
-        # The destination's credential travels as for any destination request.
-        assert post.headers["Authorization"] == "Bearer dest-token"
-        assert post.url.host == "sia.example.test"
-
-
-async def test_each_signed_in_user_has_a_session_of_their_own():
-    sap = Sap()
-    sap.answers = [fixture("run_ok.json")]
-    store = InaSessionStore()
-    with signed_in(ALICE):
-        await make(sap, user_context=True, store=store, known=definition()).run(**RUN)
-        await make(sap, user_context=True, store=store, known=definition()).run(**RUN)
-    with signed_in(BOB):
-        await make(sap, user_context=True, store=store, known=definition()).run(**RUN)
-    assert len(sap.gets) == 2
-    tokens = [p.headers["X-CSRF-Token"] for p in sap.posts]
-    assert tokens == ["csrf-1", "csrf-1", "csrf-2"]
-    assert [p.headers["Authorization"] for p in sap.posts] == [
-        f"Bearer user-token-of-{ALICE}",
-        f"Bearer user-token-of-{ALICE}",
-        f"Bearer user-token-of-{BOB}",
-    ]
-
-
-async def test_the_shared_http_client_keeps_no_cookie():
-    sap = Sap()
-    sap.answers = [fixture("describe_ok.json")]
-    client = make(sap)
-    await client.describe()
-    assert len(client._http.cookies.jar) == 0
-
-
-async def test_a_403_on_the_post_fetches_the_token_again_once():
-    sap = Sap()
-    sap.answers = [
-        httpx.Response(403, headers={"x-csrf-token": "Required"}, text="CSRF validation failed"),
-        fixture("run_ok.json"),
-    ]
-    out = await make(sap, known=definition()).run(**RUN)
-    assert out["row_count"] == 3
-    assert [r.method for r in sap.requests] == ["GET", "POST", "GET", "POST"]
-    assert [p.headers["X-CSRF-Token"] for p in sap.posts] == ["csrf-1", "csrf-2"]
-
-
-async def test_a_second_403_is_csrf_failed():
-    sap = Sap()
-    sap.answers = [httpx.Response(403, headers={"x-csrf-token": "Required"})]
-    error = await refused(make(sap, known=definition()).run(**RUN))
-    assert error.code == "csrf_failed"
-    assert [r.method for r in sap.requests] == ["GET", "POST", "GET", "POST"]
-
-
-async def test_a_403_that_is_no_csrf_refusal_is_forbidden_after_the_one_retry():
-    sap = Sap()
-    sap.answers = [httpx.Response(403, text="<html>no authorisation</html>")]
-    error = await refused(make(sap, known=definition()).run(**RUN))
-    assert error.code == "forbidden"
-    assert "html" not in error.message and "authorisation" not in error.message
-    assert len(sap.posts) == 2
-
-
-async def test_server_info_without_a_token_is_csrf_failed():
-    sap = Sap()
-    sap.info_answer = lambda request: httpx.Response(200, json=fixture("server_info.json"))
-    error = await refused(make(sap).describe())
-    assert error.code == "csrf_failed"
-    assert sap.posts == []
-
-
-async def test_server_info_without_the_analytics_service_is_sap_error():
-    sap = Sap()
-    sap.server_info = {"Services": [{"Service": "Catalog", "Capabilities": []}]}
-    error = await refused(make(sap).describe())
-    assert error.code == "sap_error"
-    assert sap.posts == []
-
-
-@pytest.mark.parametrize(
-    ("status", "code"),
-    [(401, "unauthorized"), (403, "forbidden"), (404, "sap_error"), (500, "sap_error")],
-)
-async def test_a_refused_server_info_maps_to_its_code(status, code):
-    sap = Sap()
-    sap.info_answer = lambda request: httpx.Response(status, text="<html>secret page</html>")
-    error = await refused(make(sap).describe())
-    assert error.code == code
-    assert "secret" not in error.message
-    assert sap.posts == []
-
-
-async def test_a_redirect_is_not_followed():
-    sap = Sap()
-    sap.info_answer = lambda request: httpx.Response(
-        302, headers={"location": "https://idp.example.test/login?token=abc"}
-    )
-    error = await refused(make(sap).describe())
-    assert error.code == "sap_error"
-    assert len(sap.requests) == 1
-    assert "idp" not in error.message and "abc" not in error.message
 
 
 # ---------------------------------------------------------------------- describe
@@ -584,10 +465,11 @@ async def test_run_sends_the_analytics_request_exactly():
                 "ResultSetFeatureRequest": {
                     "ResultFormat": "Version2",
                     "ResultEncoding": "None",
-                    "MaxResultRecords": 50,
+                    # One row more than top: it tells "there is more" from "that is all".
+                    "MaxResultRecords": 51,
                     "SubSetDescription": {
                         "RowFrom": 0,
-                        "RowTo": 50,
+                        "RowTo": 51,
                         "ColumnFrom": 0,
                         "ColumnTo": -1,
                     },
@@ -607,7 +489,7 @@ async def test_run_without_filters_order_or_variables_sends_none_of_them():
     await make(sap, known=known).run(measures=["0AMOUNT", "0QUANTITY"], group_by=["0CALMONTH"])
     request = sap.body()["Analytics"]["Definition"]
     assert "Filter" not in request and "Sort" not in request and "Variables" not in request
-    assert request["ResultSetFeatureRequest"]["MaxResultRecords"] == 100
+    assert request["ResultSetFeatureRequest"]["MaxResultRecords"] == 101
 
 
 async def test_run_reads_rows_and_units_from_the_grid():
@@ -910,6 +792,45 @@ async def test_a_destination_failure_is_destination_error_with_a_fixed_text():
     assert error.code == "destination_error"
     assert "s3" not in error.message and "dest.example" not in error.message
     assert sap.requests == []
+
+
+async def test_a_refused_destination_keeps_its_admin_text_out_of_the_answer():
+    from agents.destination_auth import DestinationRefused
+
+    class Refusing(FakeResolver):
+        async def resolve(self, **kwargs: Any) -> Any:
+            raise DestinationRefused(
+                "refused at https://dest.example.test/?x=1",
+                admin_text="destination 'SIA_INA' is not usable as configured",
+            )
+
+    sap = Sap()
+    error = await refused(make(sap, resolver=Refusing(url=SIA_URL, name=DESTINATION)).describe())
+    assert error.code == "destination_error"
+    assert error.admin_text == "destination 'SIA_INA' is not usable as configured"
+    assert "admin_text" not in error.to_dict() and "usable" not in json.dumps(error.to_dict())
+
+
+async def test_another_destination_failure_has_no_admin_text():
+    class Broken(FakeResolver):
+        async def resolve(self, **kwargs: Any) -> Any:
+            raise DestinationError("boom")
+
+    error = await refused(make(Sap(), resolver=Broken(url=SIA_URL, name=DESTINATION)).describe())
+    assert error.code == "destination_error" and error.admin_text is None
+
+
+def test_the_repr_of_an_answer_holds_neither_headers_nor_body():
+    from agents.ina.client import _Answer
+
+    answer = _Answer(
+        status=200,
+        headers=httpx.Headers({"x-csrf-token": "secret-token"}),
+        body=b"secret-body",
+        cookies={"SAP_SESSIONID": "secret-cookie"},
+        proxied=False,
+    )
+    assert "secret" not in repr(answer) and "200" in repr(answer)
 
 
 async def test_the_repr_of_the_client_holds_no_credential():

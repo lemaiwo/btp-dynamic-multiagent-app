@@ -66,6 +66,7 @@ from pydantic import ValidationError
 from agents.destination import DestinationError
 from agents.destination_auth import (
     PROXY_REFUSED_TEXT,
+    DestinationRefused,
     DestinationUserRequired,
     went_through_proxy,
 )
@@ -165,13 +166,21 @@ class InaSessionStore(CsrfSessionStore):
 # -- the client ------------------------------------------------------------
 
 
-@dataclass
+@dataclass(repr=False)
 class _Answer:
+    """One answer as ``_exchange`` read it. Headers, body and cookies hold
+    SAP's session and data, so the repr shows the status only."""
+
     status: int
     headers: httpx.Headers
     body: bytes
     cookies: dict[str, str]
     proxied: bool
+
+    def __repr__(self) -> str:
+        return f"_Answer(status={self.status!r}, proxied={self.proxied!r})"
+
+    __str__ = __repr__
 
 
 def _csrf_required(headers: httpx.Headers) -> bool:
@@ -322,6 +331,9 @@ class InaClient:
                 "the destination of this query could not be used",
                 hint="an administrator has to check the destination and the connectivity "
                 "setup; " + TELL_THE_USER,
+                # A fixed text naming the destination and the rule, for the
+                # admin routes; the model gets the message above.
+                admin_text=exc.admin_text if isinstance(exc, DestinationRefused) else None,
             ) from None
         except httpx.TimeoutException as exc:
             logger.warning("ina: %s %s timed out (%s)", method, path, type(exc).__name__)
@@ -507,7 +519,9 @@ class InaClient:
         variables: Any = None,
     ) -> dict[str, Any]:
         """One ``Analytics`` read: ``{columns, rows, units, row_count,
-        truncated: false}``. Checked in full before anything is sent."""
+        truncated}``, ``truncated`` true when SAP had more than ``top`` rows
+        (the rows beyond are not returned). Checked in full before anything
+        is sent."""
         definition = self._definition
         if definition is None:
             # What fails without the description is refused before it is read.

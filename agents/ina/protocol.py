@@ -65,6 +65,9 @@ MAX_MESSAGE_CHARS = 500
 _MAX_SCANNED = 2000
 _MAX_CAPABILITIES = 1000
 _MAX_MESSAGES = 50
+# What a grid may hold before it is parsed at all: `top + 1` rows of every
+# measure a run may name.
+_MAX_RAW_CELLS = (MAX_TOP + 1) * MAX_MEASURES
 
 # The structure of the measures (key figures) on the Columns axis.
 MEASURES_DIMENSION = "Measures"
@@ -90,10 +93,12 @@ _ORDER_KEYS = frozenset({"by", "direction"})
 _CAPABILITY = re.compile(r"[A-Za-z0-9_.\-]{1,128}")
 # SAP's text for a query it does not know, in the two languages seen so far
 # ("Query X ist unbekannt" on SIA).
+# The name is one token (an InA query name has no white space); anything
+# between it and the phrase ("Query X, variable Y not found") is another message.
 _UNKNOWN_QUERY = re.compile(
-    r"^(?:query|abfrage)\s+.{1,130}?\s+(?:ist unbekannt|is unknown|does not exist"
+    r"^(?:query|abfrage)\s+[^\s,;:]{1,130}\s+(?:ist unbekannt|is unknown|does not exist"
     r"|existiert nicht|not found)\.?$",
-    re.IGNORECASE | re.DOTALL,
+    re.IGNORECASE,
 )
 # Control, format, surrogate, private-use and line/paragraph separators.
 _DROPPED = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
@@ -224,6 +229,16 @@ def _variable_type(raw: dict[str, Any]) -> str:
     return "single"
 
 
+def _is_mandatory(value: object) -> bool:
+    """InA says "mandatory" as a JSON boolean, ``1`` or ABAP's ``"X"``;
+    anything else (``"false"``, ``2``, ``None``) is optional."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 1
+    return isinstance(value, str) and value.strip().lower() in ("x", "true")
+
+
 def _is_measure_structure(raw: dict[str, Any]) -> bool:
     kind = raw.get("DimensionType")
     return (
@@ -240,7 +255,9 @@ def read_description(cube: object) -> InaDescription:
     to 120 characters and units to 32 with dropped characters removed; an
     entry whose name does not pass the gate's rule, or repeats an earlier
     name, is left out and listed in ``skipped``; beyond 100 dimensions, 100
-    measures or 50 variables ``truncated`` is set.
+    measures or 50 variables ``truncated`` is set. A description without a
+    measure structure is refused (``sap_error``): it is not one this reader
+    knows, and a query read as "no measures" could never be run.
     """
     if not isinstance(cube, dict) or not isinstance(cube.get("Dimensions"), list):
         raise InaError("sap_error", UNREADABLE)
@@ -258,10 +275,12 @@ def read_description(cube: object) -> InaDescription:
             return
         bucket.append(kind(name=name, **values))
 
+    structures = 0
     for raw in cube["Dimensions"][:_MAX_SCANNED]:
         if not isinstance(raw, dict):
             continue
         if _is_measure_structure(raw):
+            structures += 1
             structure = raw.get("Name") if isinstance(raw.get("Name"), str) else ""
             for member in raw["Members"][:_MAX_SCANNED]:
                 if not isinstance(member, dict):
@@ -300,6 +319,8 @@ def read_description(cube: object) -> InaDescription:
             label=_label(raw.get("Description"), 120),
             key_field=key_field if fits_name(key_field) else None,
         )
+    if not structures:
+        raise InaError("sap_error", UNREADABLE)
     raw_variables = cube.get("Variables")
     for raw in raw_variables[:_MAX_SCANNED] if isinstance(raw_variables, list) else []:
         if not isinstance(raw, dict):
@@ -310,7 +331,7 @@ def read_description(cube: object) -> InaDescription:
             MAX_DESCRIBED_VARIABLES,
             raw.get("Name"),
             label=_label(raw.get("Description") or raw.get("Text"), 120),
-            mandatory=raw.get("Mandatory") is True,
+            mandatory=_is_mandatory(raw.get("Mandatory")),
             type=_variable_type(raw),
         )
     out.definition = InaDefinition(dimensions=dimensions, measures=measures, variables=variables)
@@ -343,17 +364,22 @@ def _wire_value(value: object, where: str) -> str:
     if isinstance(value, bool) or value is None:
         raise _refuse(where, "a string or a number")
     if isinstance(value, str):
-        if len(value) > MAX_VALUE_CHARS:
-            raise _refuse(where, f"at most {MAX_VALUE_CHARS} characters")
-        return value
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        text = plain_float(value)
-        if text is None:
+        text = value
+    elif isinstance(value, int):
+        try:
+            text = str(value)
+        except ValueError:  # more digits than Python converts (sys.int_info)
+            raise _refuse(where, f"at most {MAX_VALUE_CHARS} characters") from None
+    elif isinstance(value, float):
+        float_text = plain_float(value)
+        if float_text is None:
             raise _refuse(where, "a number with at most 15 significant digits, as plain digits")
-        return text
-    raise _refuse(where, "a string or a number")
+        text = float_text
+    else:
+        raise _refuse(where, "a string or a number")
+    if len(text) > MAX_VALUE_CHARS:
+        raise _refuse(where, f"at most {MAX_VALUE_CHARS} characters")
+    return text
 
 
 def check_caps(
@@ -580,10 +606,12 @@ def analytics_request(
         "ResultSetFeatureRequest": {
             "ResultFormat": "Version2",
             "ResultEncoding": "None",
-            "MaxResultRecords": plan.top,
+            # One row more than top: the extra row is how "there is more" is
+            # told from "that is all"; it is never returned.
+            "MaxResultRecords": plan.top + 1,
             "SubSetDescription": {
                 "RowFrom": 0,
-                "RowTo": plan.top,
+                "RowTo": plan.top + 1,
                 "ColumnFrom": 0,
                 "ColumnTo": -1,
             },
@@ -676,8 +704,10 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
     ``<name>.text`` when SAP sent a text that differs from the key) and
     measures (each followed by ``<name>.unit`` when its unit is not the same
     in every row; otherwise the unit is in ``units``). Columns of anything
-    that was not asked for are dropped. A grid of more than
-    :data:`MAX_CELLS` cells, or with more rows than ``top``, is refused.
+    that was not asked for are dropped. The request asks for ``top + 1``
+    rows: when that extra row came, ``top`` rows are returned and
+    ``truncated`` is true. More than :data:`MAX_CELLS` cells in what would
+    be returned, or more than ``top + 1`` rows, is refused, never cut.
     """
     grids = payload.get("Grids") if isinstance(payload, dict) else None
     if not isinstance(grids, list) or not grids or not isinstance(grids[0], dict):
@@ -686,12 +716,10 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
     axes, cells = grid.get("Axes"), grid.get("Cells")
     if not isinstance(axes, list) or not isinstance(cells, list):
         raise InaError("sap_error", UNREADABLE)
-    if len(cells) > MAX_CELLS:
-        raise InaError(
-            "result_too_large",
-            f"the answer has more than {MAX_CELLS} cells",
-            hint="group by fewer dimensions, ask for fewer measures, filter, or lower top",
-        )
+    # A bound on the work before anything is parsed; the cap is applied to
+    # what would be returned, below.
+    if len(cells) > _MAX_RAW_CELLS:
+        raise _too_many_cells()
     columns_axis = _axis(axes, "Columns", 2)
     rows_axis = _axis(axes, "Rows", 1)
     if columns_axis is None or _axis_dimensions(columns_axis) != [MEASURES_DIMENSION]:
@@ -718,12 +746,16 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
     width = len(column_measures)
     if len(row_tuples) * width != len(cells):
         raise InaError("sap_error", UNREADABLE)
-    if len(row_tuples) > plan.top:
+    if len(row_tuples) > plan.top + 1:
         raise InaError(
             "result_too_large",
-            "SAP answered with more rows than top asked for",
+            "SAP answered with more rows than were asked for",
             hint="filter, or group by fewer dimensions",
         )
+    truncated = len(row_tuples) > plan.top
+    row_tuples = row_tuples[: plan.top]
+    if len(row_tuples) * len(plan.measures) > MAX_CELLS:
+        raise _too_many_cells()
     position = {}
     for index, name in enumerate(column_measures):
         if name in plan.measures:
@@ -739,7 +771,9 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
         row: dict[str, tuple[Any, str | None]] = {}
         for name, column in position.items():
             cell = cells[row_index * width + column]
-            if not isinstance(cell, dict):
+            # Only a `Value` that is there and null is null; a cell without
+            # one is not a cell this reader knows.
+            if not isinstance(cell, dict) or "Value" not in cell:
                 raise InaError("sap_error", UNREADABLE)
             unit = cell.get("Unit") if isinstance(cell.get("Unit"), str) else cell.get("Currency")
             row[name] = (_cells_value(cell.get("Value")), _label(unit, 32) or None)
@@ -778,8 +812,16 @@ def read_grid(payload: object, plan: RunPlan) -> dict[str, Any]:
         "rows": rows,
         "units": units,
         "row_count": len(rows),
-        "truncated": False,
+        "truncated": truncated,
     }
+
+
+def _too_many_cells() -> InaError:
+    return InaError(
+        "result_too_large",
+        f"the answer has more than {MAX_CELLS} cells",
+        hint="group by fewer dimensions, ask for fewer measures, filter, or lower top",
+    )
 
 
 def _columns(plan: RunPlan, with_text: set[str], mixed: set[str]) -> list[str]:

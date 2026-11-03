@@ -37,7 +37,11 @@ class InaError(Exception):
     """A refusal or a failed InA call, in the shape the tools hand to the model.
 
     ``status`` is the HTTP status when there was one (for the log and the
-    admin test call), never part of :meth:`to_dict`.
+    admin test call), and ``admin_text`` the fixed text of a destination
+    that was refused as configured (``destination_auth.DestinationRefused``:
+    it names the destination and the rule, for the admin Describe and Test
+    answers). Neither is part of :meth:`to_dict`, so neither reaches the
+    model.
     """
 
     def __init__(
@@ -47,6 +51,7 @@ class InaError(Exception):
         *,
         hint: str | None = None,
         status: int | None = None,
+        admin_text: str | None = None,
     ) -> None:
         if code not in ERROR_CODES:
             # The code only: it is a constant of this package, never input.
@@ -56,6 +61,7 @@ class InaError(Exception):
         self.message = message
         self.hint = hint
         self.status = status
+        self.admin_text = admin_text
 
     def to_dict(self) -> dict[str, str]:
         out = {"code": self.code, "message": self.message}

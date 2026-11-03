@@ -37,6 +37,7 @@ from agents.ina.protocol import (  # noqa: E402
     plan_run,
     read_description,
     read_grid,
+    sap_message_error,
 )
 from tests.test_ina_client import definition, fixture, grid  # noqa: E402
 
@@ -108,6 +109,8 @@ def one(operator: str, value: Any, dimension: str = "D0") -> dict[str, Any]:
         (one("=", float("nan")), "invalid_filter"),
         (one("=", 1e20), "invalid_filter"),
         (one("=", "x" * 256), "invalid_filter"),
+        (one("=", 10**300), "invalid_filter"),
+        (one("=", 10**5000), "invalid_filter"),
         (one("between", ["1"]), "invalid_filter"),
         (one("between", "1"), "invalid_filter"),
         (one("in", []), "invalid_filter"),
@@ -199,7 +202,7 @@ def test_a_value_is_a_json_string_never_part_of_a_name():
 def test_describe_cleans_cuts_skips_and_caps_what_sap_names():
     cube = fixture("describe_ok.json")["Cube"]
     month, region, measures = cube["Dimensions"]
-    month["Description"] = "Month of\x00the‮year " + "x" * 200
+    month["Description"] = "Month\u2028of\x00the\u202eyear " + "x" * 200
     measures["Members"][0]["Unit"] = "EUR-" + "u" * 60
     region["Name"] = "R" * 200  # does not fit the gate's name rule
     extra = [{"Name": f"ZDIM{i}", "Description": f"D{i}"} for i in range(120)]
@@ -232,6 +235,63 @@ def test_a_key_field_that_does_not_fit_is_left_out_not_the_dimension():
     described = read_description(cube)
     assert described.definition.dimensions[0].key_field is None
     assert described.skipped == []
+
+
+def test_a_description_without_a_measure_structure_is_sap_error():
+    cube = fixture("describe_ok.json")["Cube"]
+    cube["Dimensions"] = [d for d in cube["Dimensions"] if d["Name"] != "Measures"]
+    with pytest.raises(InaError) as info:
+        read_description(cube)
+    assert info.value.code == "sap_error"
+
+
+def test_a_measure_structure_without_members_is_read_as_no_measures():
+    cube = fixture("describe_ok.json")["Cube"]
+    cube["Dimensions"][-1]["Members"] = []
+    assert read_description(cube).definition.measures == []
+
+
+@pytest.mark.parametrize(
+    ("value", "mandatory"),
+    [
+        (True, True),
+        (1, True),
+        ("X", True),
+        ("x", True),
+        ("true", True),
+        ("TRUE", True),
+        (False, False),
+        (0, False),
+        (2, False),
+        ("", False),
+        ("false", False),
+        ("yes", False),
+        (None, False),
+    ],
+)
+def test_the_spellings_of_mandatory(value, mandatory):
+    cube = fixture("describe_ok.json")["Cube"]
+    cube["Variables"][0]["Mandatory"] = value
+    assert read_description(cube).definition.variables[0].mandatory is mandatory
+
+
+@pytest.mark.parametrize(
+    ("text", "code"),
+    [
+        ("Query ZQ_SALES_01 ist unbekannt", "query_unknown"),
+        ("Query ZQ_SALES_01 is unknown.", "query_unknown"),
+        ("query 2CZVIEW does not exist", "query_unknown"),
+        ("Abfrage ZQ_SALES_01 existiert nicht", "query_unknown"),
+        ("Query ZQ_SALES_01 not found", "query_unknown"),
+        ("Query ZQ_SALES_01, variable ZV_REGION not found", "sap_error"),
+        ("Query ZQ_SALES_01 variable ZV_REGION not found", "sap_error"),
+        ("Query ZQ_SALES_01: value 4711 is unknown", "sap_error"),
+        ("Unknown Key Field: Analytics/MetadataCatalog//DataSource", "sap_error"),
+    ],
+)
+def test_only_the_unknown_query_message_is_query_unknown(text, code):
+    error = sap_message_error({"Messages": [{"Type": 2, "Text": text}]})
+    assert error is not None and error.code == code
 
 
 @pytest.mark.parametrize("cube", [None, [], {"Dimensions": "x"}, {"Variables": []}])
@@ -280,7 +340,7 @@ def test_what_sap_returns_beyond_what_was_asked_is_not_passed_on():
     grid is cleaned and cut."""
     payload = grid(
         ["ZREGION"],
-        [["NORTH‮\x07"]],
+        [["NORTH\u202e\x07"]],
         ["0AMOUNT", "0SECRET"],
         [{"Value": 5, "Unit": "EUR"}, {"Value": 99, "Unit": "EUR"}],
     )
@@ -291,7 +351,7 @@ def test_what_sap_returns_beyond_what_was_asked_is_not_passed_on():
 
 
 def test_a_long_text_value_is_cut_and_cleaned():
-    payload = grid(["ZREGION"], [["N"]], ["0AMOUNT"], [{"Value": "v " + "w" * 400}])
+    payload = grid(["ZREGION"], [["N"]], ["0AMOUNT"], [{"Value": "v\u2029" + "w" * 400}])
     out = read_grid(payload, run_plan(["0AMOUNT"], ["ZREGION"]))
     (row,) = out["rows"]
     assert row[1] == ("v" + "w" * 400)[:255]
@@ -322,6 +382,8 @@ def test_without_group_by_the_one_row_is_the_total():
         lambda g: g["Grids"][0]["Cells"].pop(),
         lambda g: g["Grids"][0]["Cells"].__setitem__(0, {"Value": {"nested": 1}}),
         lambda g: g["Grids"][0]["Cells"].__setitem__(0, {"Value": True}),
+        lambda g: g["Grids"][0]["Cells"].__setitem__(0, {"Foo": 1}),
+        lambda g: g["Grids"][0]["Cells"].__setitem__(0, {}),
         lambda g: g["Grids"][0]["Cells"].__setitem__(0, "1200.5"),
         lambda g: g["Grids"][0]["Axes"][0]["Dimensions"].__setitem__(0, {"Name": "ZOTHER"}),
         lambda g: g["Grids"][0]["Axes"][0]["Tuples"][0]["Members"].append({"Name": "X"}),
@@ -342,11 +404,13 @@ def test_a_grid_this_reader_does_not_know_is_sap_error(mangle):
 
 
 def test_a_grid_of_more_than_max_cells_is_result_too_large_never_cut():
-    rows = [[f"R{i}"] for i in range(MAX_CELLS // 2 + 1)]
-    cells = [{"Value": i} for i in range(len(rows) * 2)]
-    payload = grid(["ZREGION"], rows, ["0AMOUNT", "0QUANTITY"], cells)
-    error = unreadable(payload, ["0AMOUNT", "0QUANTITY"], ["ZREGION"], top=MAX_TOP)
-    assert error.code == "result_too_large"
+    measures = [f"M{i}" for i in range(3)]
+    rows = [[f"R{i}"] for i in range(MAX_CELLS // 3 + 1)]
+    cells = [{"Value": i} for i in range(len(rows) * 3)]
+    payload = grid(["D0"], rows, measures, cells)
+    with pytest.raises(InaError) as info:
+        read_grid(payload, plan(measures=measures, top=MAX_TOP))
+    assert info.value.code == "result_too_large"
 
 
 def test_a_grid_of_exactly_max_cells_is_read():
@@ -358,6 +422,31 @@ def test_a_grid_of_exactly_max_cells_is_read():
     assert out["row_count"] == MAX_CELLS // 5 and out["truncated"] is False
 
 
-def test_more_rows_than_top_is_result_too_large():
-    error = unreadable(fixture("run_ok.json"), ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=2)
+def test_the_row_beyond_top_says_truncated_and_is_not_returned():
+    out = read_grid(
+        fixture("run_ok.json"), run_plan(["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=2)
+    )
+    assert out["truncated"] is True and out["row_count"] == 2
+    assert [row[0] for row in out["rows"]] == ["202601", "202602"]
+
+
+def test_exactly_top_rows_is_not_truncated():
+    out = read_grid(
+        fixture("run_ok.json"), run_plan(["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=3)
+    )
+    assert out["truncated"] is False and out["row_count"] == 3
+
+
+def test_the_cell_cap_counts_what_is_returned_not_the_extra_row():
+    measures = [f"M{i}" for i in range(5)]
+    top = MAX_CELLS // 5
+    rows = [[f"R{i}"] for i in range(top + 1)]
+    cells = [{"Value": i} for i in range(len(rows) * 5)]
+    payload = grid(["D0"], rows, measures, cells)
+    out = read_grid(payload, plan(measures=measures, top=top))
+    assert out["row_count"] == top and out["truncated"] is True
+
+
+def test_more_rows_than_top_plus_one_is_result_too_large():
+    error = unreadable(fixture("run_ok.json"), ["0AMOUNT", "0QUANTITY"], ["0CALMONTH"], top=1)
     assert error.code == "result_too_large"
