@@ -9,14 +9,16 @@ score, an order or a relation. Then:
   the score is the cosine similarity;
 * otherwise (no model, no vector for a node) the score is lexical: the
   question's words against the node's name, label and synonyms (weight 3),
-  purpose and examples (2), its readable fields' names, labels and synonyms
+  purpose and examples (2), its readable children's names, labels and
+  synonyms -- an entity's fields, an InA query's dimensions and measures --
   (1 each, at most 5: the field-of-source boost) and its source's label,
   purpose and synonyms (1), normalised to 0..1.
 
-Candidates are entities and functions an agent can read or change. A field
-that is not readable adds nothing and is never named; a relation to a node
-outside the scope is dropped. Hints inherit: an entity or function without
-a purpose or "not for" shows its source's; a node without a label shows its
+Candidates are entities, functions and InA queries an agent can read or
+change. A child that is not readable adds nothing and is never named; a
+candidate's ``keys`` are its readable children marked ``is_key``; a relation
+to a node outside the scope is dropped. Hints inherit: a candidate without a
+purpose or "not for" shows its source's; a node without a label shows its
 name.
 """
 
@@ -32,11 +34,14 @@ from agents.access import BASIC, agent_allowed
 from agents.data_catalog.embeddings import cosine, embed_question, resolve_model, unpack
 from agents.data_catalog.importer import batched
 from agents.data_catalog.models import DataCatalogEdge, DataCatalogNode, DataCatalogVector
+from agents.data_catalog.scope import node_sources
 from agents.odata.search import _hits
 
 Source = tuple[str, str]
 
 CANDIDATE_KINDS = ("entity", "function", "query")
+# The children whose names and labels boost their parent candidate.
+CHILD_KINDS = ("field", "dimension", "measure")
 QUESTION_MAX = 500
 MAX_K = 25
 MIN_COSINE = 0.2
@@ -68,7 +73,9 @@ def question_tokens(question: str) -> list[str]:
 
 
 async def scoped_nodes(db: AsyncSession, allowed: set[Source]) -> list[DataCatalogNode]:
-    """Every node of the allowed sources, and only those."""
+    """Every node of the allowed sources, and only those (a catalogue
+    service's under the kind it is stored as: `node_sources`)."""
+    allowed = node_sources(allowed)
     pairs = sorted(allowed)
     nodes: list[DataCatalogNode] = []
     for chunk in batched(pairs, _PAIRS_PER_STATEMENT):
@@ -145,7 +152,7 @@ async def find_sources(
     by_id = {n.id: n for n in nodes}
     fields_of: dict[int, list[DataCatalogNode]] = {}
     for n in nodes:
-        if n.kind == "field" and n.readable and n.parent_id is not None:
+        if n.kind in CHILD_KINDS and n.readable and n.parent_id is not None:
             fields_of.setdefault(n.parent_id, []).append(n)
     candidates = [n for n in nodes if n.kind in CANDIDATE_KINDS and _visible(n)]
     if not candidates:

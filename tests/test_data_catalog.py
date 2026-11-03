@@ -7,6 +7,10 @@ lexical fallback and the vector path, the tier rule, the incremental
 rebuild, every admin route, the agent tools and their attachment in the
 registry. No network: embedding calls are patched or switched off
 (``DATA_CATALOG_EMBEDDINGS=0`` from ``tests/conftest.py``).
+
+The other kinds of addendum (k) (``generic``, InA, cross-kind links, curated
+edges) are in ``tests/test_data_catalog_kinds.py``, which reuses the helpers
+and fixtures here (``_clean`` empties ``ina_queries`` for it).
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ from agents.data_catalog.scope import allowed_sources_of  # noqa: E402
 from agents.data_catalog.tool import NO_MATCH_HINT, data_catalog_toolset  # noqa: E402
 from agents.db import (  # noqa: E402
     AgentConfig,
+    InaQuery,
     ODataService,
     SessionLocal,
     create_odata_service,
@@ -214,7 +219,7 @@ async def _clean(monkeypatch):
     await init_db()
     async with SessionLocal() as s:
         for model in (DataCatalogEdge, DataCatalogVector, DataCatalogNode, ODataService,
-                      AgentConfig):
+                      InaQuery, AgentConfig):
             await s.execute(delete(model))
         await s.commit()
     embeddings.reset_caches()

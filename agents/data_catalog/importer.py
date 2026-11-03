@@ -1,13 +1,31 @@
-"""Build the data catalogue graph from the OData catalogue, incrementally.
+"""Build the data catalogue graph from the registrations, incrementally.
 
 ``import_odata_service`` turns one ``odata_services`` row into nodes and
-edges: the ``source``, an ``entity`` per entity set, a ``field`` per field
-(``readable`` = selectable, ``writable`` = writable on an entity set that can
-create or update, ``is_key`` for a key), a ``function`` per ENABLED operation
-(``readable`` for a read, ``writable`` for a write, by the one write rule of
-``agents.odata.models``), ``navigation`` edges inside the source and
-``same_object`` edges between entity sets of different sources that share an
-entity type name.
+edges, under the row's kind as ``source_kind`` (``odata``, or ``generic`` for
+a ZAGENT_DATA registration): the ``source``, an ``entity`` per entity set, a
+``field`` per field (``readable`` = selectable, ``writable`` = writable on an
+entity set that can create or update, ``is_key`` for a key), a ``function``
+per ENABLED operation (``readable`` for a read, ``writable`` for a write, by
+the one write rule of ``agents.odata.models`` for the service's kind) and
+``navigation`` edges inside the source.
+
+``import_ina_query`` does the same for one ``ina_queries`` row (addendum
+(k), part 2): the ``source``, one ``query`` node (the InA object name; its
+label is the registration's title) and a ``dimension`` and ``measure`` per
+member ``Describe`` stored (``unit`` on a measure); everything readable,
+nothing writable (InA only reads). A query not described yet is the source
+and the query alone. Variables are no nodes.
+
+``same_object`` edges join nodes of different sources by NAME, never by
+data (``_link_same_objects``): entity sets that share an entity type name,
+and across kinds the names SAP gives one repository object (an InA query
+``2C<view>``, a ``generic`` table or view ``<view>``, an ``odata`` entity
+type ``<view>`` / ``<view>Type``).
+
+Edges an admin drew (``curated_at`` set) are never deleted by an import, and
+an import does not add a ``same_object`` edge beside one for the same pair:
+the admin already said how the two relate. A node that disappears takes its
+curated edges with it.
 
 Incremental, because the admin's hints are worth more than the import:
 
@@ -22,18 +40,20 @@ Incremental, because the admin's hints are worth more than the import:
   vectors.
 
 Only sources attached to at least one ENABLED agent through an enabled
-catalogue service are kept (``rebuild``): the graph is what agents can reach,
-not a copy of everything an admin ever imported. The source node's
+catalogue service or InA query are kept (``rebuild``): the graph is what
+agents can reach, not a copy of everything an admin ever imported. The source node's
 ``updated_at`` is stamped by every import: it is the source's "last import".
 
-Nothing here raises for a broken stored definition: the service is skipped
-with one WARNING naming it, and its old nodes stay until it is repaired.
+Nothing here raises for a broken stored definition: the service or query is
+skipped with one WARNING naming it, and its old nodes stay until it is
+repaired.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,6 +75,19 @@ from agents.data_catalog.models import (
 logger = logging.getLogger(__name__)
 
 ODATA = "odata"
+GENERIC = "generic"
+INA = "ina"
+# The kinds whose sources are ``odata_services`` rows. A service name is
+# unique in that table whatever the kind, so ``("odata", name)`` -- what the
+# catalogue routes and the registry say -- and ``("generic", name)`` name the
+# same row; its nodes are stored under the row's kind (`service_kind`).
+CATALOGUE_KINDS = (ODATA, GENERIC)
+# Node kinds an import links with ``navigation`` / ``same_object`` edges.
+_LINKED_KINDS = ("entity", "query")
+_IMPORTED_EDGE_KINDS = ("navigation", "same_object")
+# The InA prefix of a query generated from a CDS view: ``2C<view>``.
+_CDS_QUERY_PREFIX = "2C"
+_UNIT_MAX = 32
 # Statement parameter lists are cut into batches of this size: SQLite allows
 # 999 bound parameters per statement, and very long IN lists are slow
 # everywhere.
@@ -88,6 +121,14 @@ def _type_local_name(entity_type: str) -> str:
     return entity_type.rsplit(".", 1)[-1] if entity_type else ""
 
 
+def service_kind(row: Any) -> str:
+    """``generic`` for a ZAGENT_DATA registration, ``odata`` for every other
+    catalogue row (also one without the column): the ``source_kind`` of its
+    nodes and the kind `operation_is_write` decides its writes by, which is
+    exactly ``"generic"`` or not."""
+    return GENERIC if getattr(row, "kind", None) == GENERIC else ODATA
+
+
 def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str]]]:
     """The nodes a service definition makes, in parent-first order, and its
     navigation edges as ``(from entity, to entity, label)``."""
@@ -96,7 +137,7 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
     definition = ServiceDefinition.model_validate(service.definition)
     # The service's kind decides which calls are writes (a GET function import
     # of a `generic` service is a read: `operation_is_write`).
-    kind = getattr(service, "kind", None) or "odata"
+    kind = service_kind(service)
     readable_sets = [e for e in definition.entity_sets if {"list", "get"} & set(e.operations)]
     enabled_ops = [o for o in definition.operations if o.enabled]
     source = _Planned(
@@ -187,6 +228,62 @@ def plan_service(service: Any) -> tuple[list[_Planned], list[tuple[str, str, str
     return planned, navigations
 
 
+def _ina_attrs(
+    label: Any, *, purpose: Any = "", not_for: Any = "", unit: Any = None, type_name: Any = None
+) -> dict[str, Any]:
+    """The columns of an InA node: readable, never writable (InA only reads)."""
+    return {
+        "label": _cut(label, LABEL_MAX),
+        "purpose": _cut(purpose, PURPOSE_MAX),
+        "not_for": _cut(not_for, NOT_FOR_MAX),
+        "readable": 1,
+        "writable": 0,
+        "is_key": 0,
+        "type_name": _cut(type_name, 200) or None,
+        "unit": _cut(unit, _UNIT_MAX) or None,
+        "synonyms_json": None,
+        "examples_json": None,
+    }
+
+
+def plan_ina_query(row: Any) -> list[_Planned]:
+    """The nodes an InA query registration makes, in parent-first order.
+
+    The query node carries the InA object name as name and ``type_name``
+    (the cross-kind join reads it) and the registration's title as label;
+    its purpose and "not for" stay empty, so the search shows the source's
+    (one place for the admin to write them). A stored description that does
+    not validate raises (``ValueError`` / ``ValidationError``).
+    """
+    from agents.ina.models import InaDefinition
+
+    raw = row.definition_json
+    definition = (
+        InaDefinition() if raw is None else InaDefinition.model_validate(json.loads(raw))
+    )
+    query_name = str(row.query)[:NAME_MAX]
+    planned = [
+        _Planned(
+            "source",
+            row.name,
+            None,
+            _ina_attrs(row.title, purpose=row.purpose, not_for=row.not_for),
+        ),
+        _Planned(
+            "query", query_name, ("source", row.name), _ina_attrs(row.title, type_name=row.query)
+        ),
+    ]
+    query_ref = ("query", query_name)
+    for dim in definition.dimensions:
+        planned.append(_Planned("dimension", dim.name, query_ref, _ina_attrs(dim.label)))
+    for measure in definition.measures:
+        attrs = _ina_attrs(measure.label, unit=measure.unit)
+        planned.append(_Planned("measure", measure.name, query_ref, attrs))
+    for p in planned:
+        p.name = p.name[:NAME_MAX]
+    return planned
+
+
 @dataclass
 class ImportResult:
     imported: int = 0  # nodes created or changed
@@ -232,12 +329,12 @@ async def remove_source(db: AsyncSession, source_kind: str, source_name: str) ->
 
 
 async def import_odata_service(db: AsyncSession, service_row: Any) -> ImportResult:
-    """Bring the nodes and edges of one catalogue service up to date.
+    """Bring the nodes and edges of one catalogue service up to date, under
+    the service's kind (`service_kind`).
 
     Does not commit: the caller owns the transaction. A definition that does
     not validate leaves the stored nodes alone (one WARNING).
     """
-    result = ImportResult()
     try:
         planned, navigations = plan_service(service_row)
     except (ValidationError, TypeError, ValueError):
@@ -246,8 +343,44 @@ async def import_odata_service(db: AsyncSession, service_row: Any) -> ImportResu
             "its nodes are left as they are",
             service_row.name,
         )
-        return result
-    existing = await _source_nodes(db, ODATA, service_row.name)
+        return ImportResult()
+    source = (service_kind(service_row), service_row.name)
+    result, kept = await _import_planned(db, source, planned)
+    await _replace_imported_edges(db, source, kept, navigations)
+    await db.flush()
+    return result
+
+
+async def import_ina_query(db: AsyncSession, query_row: Any) -> ImportResult:
+    """Bring the nodes and edges of one InA query up to date, as
+    `import_odata_service` does for a catalogue service (same keep, update
+    and delete rules; no navigations). Does not commit."""
+    try:
+        planned = plan_ina_query(query_row)
+    except (ValidationError, TypeError, ValueError):
+        logger.warning(
+            "data catalogue: InA query %s has a stored description that does not validate; "
+            "its nodes are left as they are",
+            query_row.name,
+        )
+        return ImportResult()
+    source = (INA, query_row.name)
+    result, kept = await _import_planned(db, source, planned)
+    await _replace_imported_edges(db, source, kept, [])
+    await db.flush()
+    return result
+
+
+async def _import_planned(
+    db: AsyncSession, source: tuple[str, str], planned: list[_Planned]
+) -> tuple[ImportResult, dict[tuple[str, str], DataCatalogNode]]:
+    """Match ``planned`` against the stored nodes of ``source``: create the
+    new ones, update the changed ones (never an admin's hints, ``readable``
+    never wider than the plan), delete the ones the plan no longer has.
+    Answers the counts and the kept nodes by ``(kind, name)``."""
+    source_kind, source_name = source
+    result = ImportResult()
+    existing = await _source_nodes(db, source_kind, source_name)
     by_id = {n.id: n for n in existing}
 
     def ref_of(node: DataCatalogNode) -> tuple[str, str] | None:
@@ -265,8 +398,8 @@ async def import_odata_service(db: AsyncSession, service_row: Any) -> ImportResu
         if node is None:
             node = DataCatalogNode(
                 kind=item.kind,
-                source_kind=ODATA,
-                source_name=service_row.name,
+                source_kind=source_kind,
+                source_name=source_name,
                 name=item.name,
                 updated_at=now,
                 **attrs,
@@ -294,12 +427,25 @@ async def import_odata_service(db: AsyncSession, service_row: Any) -> ImportResu
     gone = [n.id for n in existing if n.id not in seen_ids]
     await delete_nodes(db, gone)
     result.removed += len(gone)
+    return result, kept
 
-    entity_ids = [n.id for (kind, _), n in kept.items() if kind == "entity"]
-    for chunk in batched(entity_ids):
+
+async def _replace_imported_edges(
+    db: AsyncSession,
+    source: tuple[str, str],
+    kept: dict[tuple[str, str], DataCatalogNode],
+    navigations: list[tuple[str, str, str]],
+) -> None:
+    """Drop the imported ``navigation`` and ``same_object`` edges of the
+    source's entities and queries and make them again; a curated edge stays
+    (``curated_at`` set: an admin drew it)."""
+    linked = [n for (kind, _), n in kept.items() if kind in _LINKED_KINDS]
+    ids = [n.id for n in linked]
+    for chunk in batched(ids):
         await db.execute(
             delete(DataCatalogEdge).where(
-                DataCatalogEdge.kind.in_(("navigation", "same_object")),
+                DataCatalogEdge.kind.in_(_IMPORTED_EDGE_KINDS),
+                DataCatalogEdge.curated_at.is_(None),
                 or_(DataCatalogEdge.from_id.in_(chunk), DataCatalogEdge.to_id.in_(chunk)),
             )
         )
@@ -307,57 +453,190 @@ async def import_odata_service(db: AsyncSession, service_row: Any) -> ImportResu
         a, b = kept.get(("entity", src)), kept.get(("entity", target))
         if a is not None and b is not None:
             db.add(DataCatalogEdge(from_id=a.id, to_id=b.id, kind="navigation", label=label))
-    await _link_same_objects(db, service_row.name, [kept[k] for k in kept if k[0] == "entity"])
-    await db.flush()
-    return result
+    await _link_same_objects(db, source, linked, await _curated_pairs(db, ids))
+
+
+async def _curated_pairs(db: AsyncSession, ids: list[int]) -> set[frozenset[int]]:
+    """The node pairs an admin linked, of the edges that touch ``ids``."""
+    pairs: set[frozenset[int]] = set()
+    for chunk in batched(ids):
+        rows = await db.execute(
+            select(DataCatalogEdge.from_id, DataCatalogEdge.to_id).where(
+                DataCatalogEdge.curated_at.is_not(None),
+                or_(DataCatalogEdge.from_id.in_(chunk), DataCatalogEdge.to_id.in_(chunk)),
+            )
+        )
+        pairs.update(frozenset(row) for row in rows.all())
+    return pairs
+
+
+def _cds_view_of(node: DataCatalogNode) -> str:
+    """``2CZC_ONCALL`` -> ``ZC_ONCALL`` for an InA query generated from a CDS
+    view; ``""`` for any other node."""
+    name = node.name.upper() if node.source_kind == INA and node.kind == "query" else ""
+    if name.startswith(_CDS_QUERY_PREFIX) and len(name) > len(_CDS_QUERY_PREFIX):
+        return name[len(_CDS_QUERY_PREFIX) :]
+    return ""
+
+
+def _upper_type_local(node: DataCatalogNode) -> str:
+    return _type_local_name(node.type_name or "").upper()
+
+
+def _join_names(node: DataCatalogNode) -> set[str]:
+    """The upper-cased names a node may share with a node of another kind
+    (the index of the cross-kind pass; `_same_by_name` decides)."""
+    if node.kind == "query":
+        view = _cds_view_of(node)
+        return {view} if view else set()
+    if node.kind != "entity":
+        return set()
+    if node.source_kind == GENERIC:
+        return {node.name.upper()}
+    if node.source_kind == ODATA:
+        local = _upper_type_local(node)
+        if not local:
+            return set()
+        if local.endswith("TYPE") and len(local) > len("TYPE"):
+            return {local, local[: -len("TYPE")]}
+        return {local}
+    return set()
+
+
+def _same_by_name(a: DataCatalogNode, b: DataCatalogNode) -> str:
+    """The name under which ``a`` and ``b``, of two different source kinds,
+    are one SAP object, or ``""`` (addendum (k), "Cross-kind links" 1):
+
+    * an InA query ``2C<view>`` and a ``generic`` entity ``<view>`` (a CDS
+      view on SAP's allow-list);
+    * an InA query ``2C<view>`` and an ``odata`` entity whose entity type's
+      local name is ``<view>`` or ``<view>Type``;
+    * a ``generic`` entity (a table or view name) and an ``odata`` entity
+      whose entity type's local name is exactly that name.
+
+    Compared upper-cased: names in SAP's repository are case-insensitive
+    (DDIC keeps them upper case, while the OData type of a CDS entity keeps
+    its camel case, ``ZC_OnCallType``)."""
+    ends = {a.source_kind: a, b.source_kind: b}
+    if len(ends) != 2:
+        return ""
+    query, generic, odata = ends.get(INA), ends.get(GENERIC), ends.get(ODATA)
+    view = _cds_view_of(query) if query is not None else ""
+    if generic is not None and generic.kind != "entity":
+        return ""
+    if odata is not None and odata.kind != "entity":
+        return ""
+    if view and generic is not None:
+        return view if generic.name.upper() == view else ""
+    if view and odata is not None:
+        return view if _upper_type_local(odata) in (view, view + "TYPE") else ""
+    if generic is not None and odata is not None:
+        name = generic.name.upper()
+        return name if name and _upper_type_local(odata) == name else ""
+    return ""
 
 
 async def _link_same_objects(
-    db: AsyncSession, source_name: str, entities: list[DataCatalogNode]
+    db: AsyncSession,
+    source: tuple[str, str],
+    mine: list[DataCatalogNode],
+    taken: set[frozenset[int]],
 ) -> None:
-    """``same_object`` edges from this source's entities to the entities of
-    OTHER sources with the same entity type name (local part)."""
-    mine = {}
-    for node in entities:
-        local = _type_local_name(node.type_name or "")
+    """``same_object`` edges from this source's entities and queries to the
+    nodes of OTHER sources that are the same object: entities with the same
+    entity type name (local part, exactly), then the cross-kind names of
+    `_same_by_name`. One edge per pair: a pair in ``taken`` (an admin's
+    edge, or one this pass made) gets none."""
+    by_type: dict[str, list[DataCatalogNode]] = {}
+    by_name: dict[str, list[DataCatalogNode]] = {}
+    for node in mine:
+        local = _type_local_name(node.type_name or "") if node.kind == "entity" else ""
         if local:
-            mine.setdefault(local, []).append(node)
-    if not mine:
+            by_type.setdefault(local, []).append(node)
+        for name in _join_names(node):
+            by_name.setdefault(name, []).append(node)
+    if not by_type and not by_name:
         return
     others = await db.execute(
-        select(DataCatalogNode).where(
-            DataCatalogNode.kind == "entity",
-            DataCatalogNode.type_name.is_not(None),
-            DataCatalogNode.source_name != source_name,
+        select(DataCatalogNode)
+        .where(
+            DataCatalogNode.kind.in_(_LINKED_KINDS),
+            or_(
+                DataCatalogNode.source_kind != source[0],
+                DataCatalogNode.source_name != source[1],
+            ),
         )
+        .order_by(DataCatalogNode.id)
     )
     for other in others.scalars():
-        for node in mine.get(_type_local_name(other.type_name or ""), []):
+        found: list[tuple[DataCatalogNode, str]] = []
+        if other.kind == "entity":
+            local = _type_local_name(other.type_name or "")
+            found.extend((node, node.type_name or "") for node in by_type.get(local, []))
+        for name in _join_names(other):
+            for node in by_name.get(name, []):
+                shared = _same_by_name(node, other)
+                if shared:
+                    found.append((node, shared))
+        for node, label in found:
+            pair = frozenset((node.id, other.id))
+            if pair in taken:
+                continue
+            taken.add(pair)
             db.add(
                 DataCatalogEdge(
-                    from_id=node.id, to_id=other.id, kind="same_object", label=node.type_name
+                    from_id=node.id,
+                    to_id=other.id,
+                    kind="same_object",
+                    label=_cut(label, LABEL_MAX),
                 )
             )
 
 
-async def wanted_odata_services(db: AsyncSession) -> dict[str, Any]:
-    """``{name: row}`` of the enabled catalogue services that an ENABLED
-    agent attaches: the only ones the graph holds."""
-    from agents.db import list_agents, list_odata_services, odata_entries
+async def _names_enabled_agents_attach(
+    db: AsyncSession, entries: Callable[[list[dict[str, Any]]], list[dict[str, Any]]], key: str
+) -> set[str]:
+    """The names listed under ``key`` in the ``entries`` blocks of every
+    ENABLED agent (a name that is not a string is ignored)."""
+    from agents.db import list_agents
 
     names: set[str] = set()
     for agent in await list_agents(db):
         if not agent.enabled:
             continue
-        for block in odata_entries(agent.mcp_servers):
-            services = block.get("services")
-            if isinstance(services, list):
-                names.update(n for n in services if isinstance(n, str))
+        for block in entries(agent.mcp_servers):
+            listed = block.get(key)
+            if isinstance(listed, list):
+                names.update(n for n in listed if isinstance(n, str))
+    return names
+
+
+async def wanted_odata_services(db: AsyncSession) -> dict[str, Any]:
+    """``{name: row}`` of the enabled catalogue services (either kind) that
+    an ENABLED agent attaches: the only ones the graph holds."""
+    from agents.db import list_odata_services, odata_entries
+
+    names = await _names_enabled_agents_attach(db, odata_entries, "services")
     if not names:
         return {}
     return {
         row.name: row
         for row in await list_odata_services(db)
+        if row.name in names and row.enabled
+    }
+
+
+async def wanted_ina_queries(db: AsyncSession) -> dict[str, Any]:
+    """``{name: row}`` of the enabled InA queries that an ENABLED agent names
+    in a ``builtin:ina`` entry: the only ones the graph holds."""
+    from agents.db import ina_entries, list_ina_queries
+
+    names = await _names_enabled_agents_attach(db, ina_entries, "queries")
+    if not names:
+        return {}
+    return {
+        row.name: row
+        for row in await list_ina_queries(db)
         if row.name in names and row.enabled
     }
 
@@ -375,26 +654,50 @@ async def rebuild(
     db: AsyncSession, source: tuple[str, str] | None = None, *, embed: bool = True
 ) -> dict[str, int]:
     """Import the wanted sources (all, or the one named) and drop the rest:
-    ``{imported, removed, vectors}``. Commits."""
+    ``{imported, removed, vectors}``. Commits.
+
+    A catalogue source is named ``("odata", name)`` or ``("generic", name)``
+    alike (`CATALOGUE_KINDS`): the row's own kind decides, and nodes of that
+    name under the other kind (a service whose kind changed) are dropped.
+    What goes is dropped before anything is imported, so a stale node is
+    never linked.
+    """
     from agents.data_catalog.embeddings import refresh_vectors
 
     total = ImportResult()
-    wanted = await wanted_odata_services(db)
+    scope = source
     if source is None:
-        for name in sorted(wanted):
-            total.add(await import_odata_service(db, wanted[name]))
+        services = await wanted_odata_services(db)
+        queries = await wanted_ina_queries(db)
         for kind, name in sorted(await stored_sources(db)):
-            if kind == ODATA and name not in wanted:
+            if kind in CATALOGUE_KINDS:
+                stale = name not in services or service_kind(services[name]) != kind
+            else:
+                stale = kind == INA and name not in queries
+            if stale:
                 total.removed += await remove_source(db, kind, name)
-    elif source[0] == ODATA:
-        if source[1] in wanted:
-            total.add(await import_odata_service(db, wanted[source[1]]))
+        for name in sorted(services):
+            total.add(await import_odata_service(db, services[name]))
+        for name in sorted(queries):
+            total.add(await import_ina_query(db, queries[name]))
+    elif source[0] in CATALOGUE_KINDS:
+        row = (await wanted_odata_services(db)).get(source[1])
+        for kind in CATALOGUE_KINDS:
+            if row is None or service_kind(row) != kind:
+                total.removed += await remove_source(db, kind, source[1])
+        if row is not None:
+            total.add(await import_odata_service(db, row))
+            scope = (service_kind(row), row.name)
+    elif source[0] == INA:
+        row = (await wanted_ina_queries(db)).get(source[1])
+        if row is not None:
+            total.add(await import_ina_query(db, row))
         else:
             total.removed += await remove_source(db, *source)
     await db.commit()
     vectors = 0
     if embed:
-        vectors = await refresh_vectors(db, scope=source)
+        vectors = await refresh_vectors(db, scope=scope)
         await db.commit()
     return {"imported": total.imported, "removed": total.removed, "vectors": vectors}
 
