@@ -1,7 +1,7 @@
 import ResourceBundle from "sap/base/i18n/ResourceBundle";
 import inaQueries, {
     MAX_NOT_FOR, MAX_PACKAGE, MAX_PURPOSE, MAX_QUERY, MAX_TITLE, describedText, emptyForm, formOf, identityChange,
-    rowsOf, sameForm, toInput, toUpdate, usedByNames, validateInput
+    identityTexts, rowsOf, sameForm, toInput, toUpdate, usedByNames, validateInput
 } from "com/agent/admin/model/inaQueries";
 import type { InaQueryForm } from "com/agent/admin/model/inaQueries";
 import type { InaQuery, InaQuerySummary } from "com/agent/admin/service/inaTypes";
@@ -65,20 +65,16 @@ QUnit.test("the flags are strict: only the boolean true counts", function (asser
     assert.strictEqual(row.described, false);
 });
 
-QUnit.test("without a described key, the stamp of the last Describe says it", function (assert) {
-    const { described, ...older } = summary("x", { metadata_fetched_at: "2026-11-02T09:00:00+00:00" });
-    void described;
-    assert.strictEqual(rowsOf([older as InaQuerySummary])[0].described, true, "definition and stamp are a pair");
-    const { described: unused, ...never } = summary("y");
-    void unused;
-    assert.strictEqual(rowsOf([never as InaQuerySummary])[0].described, false);
+QUnit.test("described is the server's flag, never guessed from the stamp", function (assert) {
+    assert.strictEqual(rowsOf([summary("x", { metadata_fetched_at: "2026-11-02T09:00:00+00:00" })])[0].described, false,
+        "a stamp without the flag is not a description");
+    assert.strictEqual(rowsOf([summary("y", { described: true })])[0].described, true);
 });
 
-QUnit.test("the agents of used_by are read as objects or as names, each once", function (assert) {
-    assert.deepEqual(usedByNames([
-        { agent_id: 1, agent: "a", enabled: true, expose_api: false, api_slug: null }, "b", "a",
-        { agent: 42 } as never, null as never
-    ]), ["a", "b"], "a repeat and what names no agent are left out");
+QUnit.test("the agents of used_by are read by name, each once", function (assert) {
+    const used = (agent: unknown) => ({ agent_id: 1, agent, enabled: true, expose_api: false, api_slug: null }) as never;
+    assert.deepEqual(usedByNames([used("a"), used("b"), used("a"), used(42), null as never]), ["a", "b"],
+        "a repeat and what names no agent are left out");
     assert.deepEqual(usedByNames(undefined), []);
 });
 
@@ -267,4 +263,19 @@ QUnit.test("sameForm compares every field of the form", function (assert) {
         const other = { ...form(), [field]: typeof form()[field] === "boolean" ? !form()[field] : `${String(form()[field])}x` };
         assert.notOk(sameForm(form(), other as InaQueryForm), `${field} differs`);
     });
+});
+
+QUnit.test("identityTexts asks only for a query in use whose identity changes, in the page's order", function (assert) {
+    const change = identityChange(form(), form({ user_context: false, destination: "S4_ODATA_TECH", query: "ZOTHER_Q" }));
+    assert.deepEqual(identityTexts(change, []), [], "nobody uses the query: no question");
+    assert.deepEqual(identityTexts({}, ["a"]), [], "nothing of the identity changes: no question");
+    assert.deepEqual(identityTexts(change, ["a"]), [
+        { key: "inaIdentityAgentsOne", args: ["a"] },
+        { key: "inaIdentityToTechnical" },
+        { key: "inaIdentityDestination", args: ["S4_ODATA_USER", "S4_ODATA_TECH"] },
+        { key: "inaIdentityQuery", args: ["ZFLIGHT_REV_Q001", "ZOTHER_Q"] }
+    ], "the agent, then Runs as (no arguments: the text has an apostrophe), destination and InA name");
+    assert.deepEqual(identityTexts({ runsAs: "user" }, ["a", "b"]), [
+        { key: "inaIdentityAgentsMany", args: ["a, b"] }, { key: "inaIdentityToUser" }
+    ], "several agents");
 });

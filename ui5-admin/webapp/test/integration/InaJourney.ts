@@ -3,7 +3,6 @@ import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
 import HashChanger from "sap/ui/core/routing/HashChanger";
-import ElementRegistry from "sap/ui/core/ElementRegistry";
 import type Input from "sap/m/Input";
 import type Page from "sap/m/Page";
 import type Table from "sap/m/Table";
@@ -19,8 +18,10 @@ import { buttonsOf, messageOf } from "./pages/ODataList";
 import {
     CREATE, DETAIL_VIEW, TABLE, VIEW, isOpen, itemOf, itemsOf, namesIn, rowTexts, type InaRowTexts
 } from "./pages/InaQueries";
-import { ID, PAGE, detailOf, stripText, tableRows, type DetailTexts } from "./pages/InaQueryDetail";
 import FakeIna, { UNKNOWN_IN_SAP, VARIABLE_REQUIRED } from "./FakeIna";
+import {
+    BUSY_TEXT_SHOWN, ID, PAGE, detailOf, iSeeNoOpenDialog, stripText, tableRows, type DetailTexts
+} from "./pages/InaQueryDetail";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -586,12 +587,77 @@ opaTest("a query with a mandatory variable cannot be tested: the reason is the o
             Opa5.assert.strictEqual(stripText(strip), `Test not run: ${VARIABLE_REQUIRED}`, "the server's fixed text");
             Opa5.assert.strictEqual((strip as MessageStrip).getType(), "Information", "as information");
             Opa5.assert.strictEqual(backend.countRequests("POST ina/queries/cost-centre-actuals/test"), 1, "one test");
-            const open = ElementRegistry.filter((element) => (
-                element.isA("sap.m.Dialog") && (element as unknown as { isOpen(): boolean }).isOpen()
-            ));
-            Opa5.assert.strictEqual(open.length, 0, "no error dialog");
+            iSeeNoOpenDialog();
         },
         errorMessage: "The variable_required outcome is not shown"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a Describe while every call slot is taken says so as a warning, without a dialog", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+    meanwhile(Given, () => { backend.ina.busy = true; });
+
+    iPress(When, ID.describe);
+    Then.waitFor({
+        id: ID.resultStrip,
+        viewName: DETAIL_VIEW,
+        check: function (strip: UI5Element) { return stripText(strip) !== ""; },
+        success: function (strip: UI5Element) {
+            Opa5.assert.strictEqual(stripText(strip), BUSY_TEXT_SHOWN, "the fixed text");
+            Opa5.assert.strictEqual((strip as MessageStrip).getType(), "Warning", "as a warning");
+            iSeeNoOpenDialog();
+        },
+        errorMessage: "The busy Describe is not said"
+    });
+    iSeeTheTable(Then, ID.measures, [["ZREVENUE", "Revenue", "EUR"]], "the stored description stays");
+
+    Then.iStopTheApp();
+});
+
+opaTest("a Test while every call slot is taken says so as a warning, not as an error", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+    meanwhile(Given, () => { backend.ina.busy = true; });
+
+    iPress(When, ID.test);
+    Then.waitFor({
+        id: ID.resultStrip,
+        viewName: DETAIL_VIEW,
+        check: function (strip: UI5Element) { return stripText(strip) !== ""; },
+        success: function (strip: UI5Element) {
+            Opa5.assert.strictEqual(stripText(strip), BUSY_TEXT_SHOWN, "the fixed text, not the server's");
+            Opa5.assert.strictEqual((strip as MessageStrip).getType(), "Warning", "as a warning");
+            iSeeNoOpenDialog();
+        },
+        errorMessage: "The busy Test is not said"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("leaving with unsaved changes asks; Cancel stays with the input, Discard goes", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+
+    iType(When, ID.title, "Flight revenue (EUR)");
+    When.waitFor({ id: `${PAGE}-navButton`, viewName: DETAIL_VIEW, actions: new Press() });
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), "You have unsaved changes to this query. Discard them?");
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Discard", "Cancel"]);
+    }, "the question");
+    iPressInDialog(When, "Cancel");
+    iSeeTheForm(Then, "Cancel keeps the page and the input", (form) => form.title === "Flight revenue (EUR)", function () {
+        Opa5.assert.strictEqual(hash(), FLIGHT, "still on the query");
+    });
+
+    When.waitFor({ id: `${PAGE}-navButton`, viewName: DETAIL_VIEW, actions: new Press() });
+    iPressInDialog(When, "Discard");
+    iSeeTheRows(Then, ALL, "Discard goes back to the list", function () {
+        Opa5.assert.strictEqual(hash(), "ina-queries", "the list route");
+        Opa5.assert.strictEqual(backend.countRequests(PUT_FLIGHT), 0, "nothing was saved");
     });
 
     Then.iStopTheApp();

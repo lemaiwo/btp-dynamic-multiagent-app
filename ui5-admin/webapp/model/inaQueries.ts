@@ -96,12 +96,12 @@ function textOf(value: unknown): string {
     return typeof value === "string" ? value : "";
 }
 
-/** The agent names of `used_by`, each once: objects of the record's
- *  `to_dict` or plain names; anything else names no agent. */
-export function usedByNames(usedBy: readonly (InaUsedBy | string)[] | null | undefined): string[] {
+/** The agent names of `used_by`, each once; an entry without a name
+ *  names no agent. */
+export function usedByNames(usedBy: readonly InaUsedBy[] | null | undefined): string[] {
     const names: string[] = [];
     (usedBy ?? []).forEach((entry) => {
-        const name = typeof entry === "string" ? entry : entry && typeof entry.agent === "string" ? entry.agent : "";
+        const name = entry && typeof entry.agent === "string" ? entry.agent : "";
         if (name && names.indexOf(name) === -1) {
             names.push(name);
         }
@@ -110,8 +110,7 @@ export function usedByNames(usedBy: readonly (InaUsedBy | string)[] | null | und
 }
 
 /** The list rows, in the order of the answer. The flags count only as the
- *  boolean `true`; without a `described` key, the stamp of the last
- *  `Describe` says it (the definition and its stamp are a pair). */
+ *  boolean `true`. */
 export function rowsOf(summaries: readonly InaQuerySummary[] | null | undefined): InaQueryRow[] {
     return (summaries ?? []).map((summary) => {
         const describedAt = typeof summary.metadata_fetched_at === "string" ? summary.metadata_fetched_at : null;
@@ -123,7 +122,7 @@ export function rowsOf(summaries: readonly InaQuerySummary[] | null | undefined)
             destination: textOf(summary.destination),
             userContext: summary.user_context === true,
             usedBy: usedByNames(summary.used_by),
-            described: "described" in summary ? summary.described === true : describedAt !== null,
+            described: summary.described === true,
             describedAt,
             enabled: summary.enabled === true
         };
@@ -261,11 +260,37 @@ export function identityChange(stored: InaQueryForm, form: InaQueryForm): InaIde
     return change;
 }
 
+/**
+ * What to ask before a save that changes `change` of a query the agents
+ * `usedBy` use, as i18n texts in their order; none when nobody uses the
+ * query or nothing of its identity changes. The words are the OData
+ * service page's.
+ */
+export function identityTexts(change: InaIdentityChange, usedBy: readonly string[]): InaText[] {
+    if (!usedBy.length || (!change.runsAs && !change.destination && !change.query)) {
+        return [];
+    }
+    const texts: InaText[] = [usedBy.length === 1
+        ? { key: "inaIdentityAgentsOne", args: [usedBy[0]] }
+        : { key: "inaIdentityAgentsMany", args: [usedBy.join(", ")] }];
+    if (change.runsAs) {
+        // No arguments: these two texts carry an apostrophe.
+        texts.push({ key: change.runsAs === "technical" ? "inaIdentityToTechnical" : "inaIdentityToUser" });
+    }
+    if (change.destination) {
+        texts.push({ key: "inaIdentityDestination", args: [change.destination.from, change.destination.to] });
+    }
+    if (change.query) {
+        texts.push({ key: "inaIdentityQuery", args: [change.query.from, change.query.to] });
+    }
+    return texts;
+}
+
 /** Whether two forms hold the same values, field by field. */
 export function sameForm(a: InaQueryForm, b: InaQueryForm): boolean {
     return (Object.keys(emptyForm()) as InaField[]).every((field) => a[field] === b[field]);
 }
 
 export default {
-    rowsOf, usedByNames, describedText, emptyForm, formOf, validateInput, toInput, toUpdate, identityChange, sameForm
+    rowsOf, usedByNames, describedText, emptyForm, formOf, validateInput, toInput, toUpdate, identityChange, identityTexts, sameForm
 };

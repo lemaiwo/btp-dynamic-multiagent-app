@@ -5,10 +5,14 @@ import MessageToast from "sap/m/MessageToast";
 import { InvisibleMessageMode, ValueState } from "sap/ui/core/library";
 import BaseController from "./BaseController";
 import DestinationField from "./DestinationField";
+import LeaveGuard from "./LeaveGuard";
+import DescribeTest from "./ina/DescribeTest";
+import QueryDelete from "./ina/QueryDelete";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
 import inaQueries, { DESTINATION_TEXTS, type InaField, type InaQueryForm } from "../model/inaQueries";
+import { FORM_FIELDS, VARIABLE_TYPES, blankDetail } from "../model/inaDetail";
 import odataCatalog from "../model/odataCatalog";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
@@ -16,56 +20,10 @@ import type Input from "sap/m/Input";
 import type Page from "sap/m/Page";
 import type SegmentedButton from "sap/m/SegmentedButton";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
-import type { InaDefinition, InaDescribeResult, InaQuery, InaTestResult } from "../service/inaTypes";
+import type { InaQuery } from "../service/inaTypes";
+import type { ResultType } from "../model/inaDetail";
 
 const ROUTE = "inaQueryDetail";
-
-/** The fields of the form that a refusal can name, in its order, with their ids. */
-const FORM_FIELDS: readonly { field: InaField; id: string }[] = [
-    { field: "title", id: "inaDetailTitle" },
-    { field: "purpose", id: "inaDetailPurpose" },
-    { field: "not_for", id: "inaDetailNotFor" },
-    { field: "destination", id: "inaDetailDestination" },
-    { field: "query", id: "inaDetailQuery" },
-    { field: "package", id: "inaDetailPackage" }
-];
-
-/** The words of a variable's type (`InaVariableType`). */
-const VARIABLE_TYPES: Record<string, string> = {
-    single: "inaVariableSingle", interval: "inaVariableInterval", multiple: "inaVariableMultiple"
-};
-
-type ResultType = "Success" | "Information" | "Warning" | "Error";
-
-/** The model of the page (`qry`). */
-interface DetailState {
-    loaded: boolean;
-    /** A stored query is shown (false while loading and after a failed load). */
-    exists: boolean;
-    /** A save, describe, test or delete is on its way. */
-    busy: boolean;
-    /** A question is open: nothing is saved or sent until it is answered. */
-    asking: boolean;
-    title: string;
-    /** What the form holds. */
-    data: InaQueryForm;
-    /** The query as it was loaded: the tags, the dirty check, the identity question. */
-    stored: InaQueryForm;
-    /** What a save sends back as `expected_updated_at`. */
-    updated_at: string | null;
-    usedBy: string[];
-    definition: InaDefinition;
-    describedAt: string | null;
-    describedText: string;
-    errors: Partial<Record<InaField, string>>;
-    saveError: string;
-    loadFailed: boolean;
-    loadError: string;
-    changedElsewhere: boolean;
-    deletedElsewhere: boolean;
-    /** The strip under the toolbar: what Test answered, or what Describe or Test has to say. */
-    test: { type: ResultType; text: string } | null;
-}
 
 /**
  * One analytical query (InA): its identity (destination, "Runs as"), the
@@ -75,7 +33,8 @@ interface DetailState {
  * Mirrors the OData service page (`ODataServiceDetail`): a save is a GET
  * and a PUT with `expected_updated_at`, so a query saved elsewhere is never
  * overwritten; a change of whom or what the agents of a query in use call
- * is asked about first.
+ * is asked about first, and unsaved changes are asked about before the
+ * page is left (`LeaveGuard`). Describe and Test are `DescribeTest`.
  *
  * @namespace com.agent.admin.controller
  */
@@ -89,9 +48,12 @@ export default class InaQueryDetail extends BaseController {
     /** Counts the loads, so that a late answer for another query is dropped. */
     private loadCount = 0;
     private destinationField!: DestinationField;
+    private leaveGuard!: LeaveGuard;
+    private describeTest!: DescribeTest;
+    private queryDelete!: QueryDelete;
 
     public onInit(): void {
-        this.setModel(new JSONModel(InaQueryDetail.blank()), "qry");
+        this.setModel(new JSONModel(blankDetail()), "qry");
         // `items` and `hint` of the destination field; `page`: what the list
         // knows about the name in it.
         const dest = new JSONModel({ items: [], hint: "", page: { notice: "", noticeText: "" } });
@@ -108,21 +70,55 @@ export default class InaQueryDetail extends BaseController {
             hasError: () => !!this.qry().getProperty("/errors/destination"),
             edited: () => this.clearError("destination")
         });
+        this.describeTest = new DescribeTest({
+            text: (key, args) => this.text(key, args),
+            service: () => this.getAdminService(),
+            busy: (work) => this.callBusy(work),
+            reload: (name) => this.load(name, true),
+            warnIfNotLive: (outcome, leadKey) => this.warnIfNotLive(outcome, leadKey),
+            showResult: (type, text) => this.showResult(type, text),
+            deletedElsewhere: () => this.qry().setProperty("/deletedElsewhere", true),
+            shownName: () => this.queryName
+        });
+        this.queryDelete = new QueryDelete({
+            text: (key, args) => this.text(key, args),
+            service: () => this.getAdminService(),
+            busy: (work) => this.callBusy(work),
+            warnIfNotLive: (outcome, leadKey) => this.warnIfNotLive(outcome, leadKey),
+            done: () => this.getRouter().navTo("inaQueries")
+        });
+        this.leaveGuard = new LeaveGuard(this.getOwnerComponentTyped(), this.getRouter(), ROUTE, {
+            isDirty: () => this.qry().getProperty("/exists") === true && this.isDirty(),
+            askDiscard: () => this.askDiscard(),
+            left: () => {
+                // Whatever the page held is not a form any more.
+                this.loadCount++;
+                this.queryName = undefined;
+                this.qry().setData(blankDetail());
+            }
+        });
         this.getRouter().getRoute(ROUTE)?.attachPatternMatched((event: Route$PatternMatchedEvent) => {
+            if (!this.leaveGuard.matched()) {
+                return;
+            }
             const name = (event.getParameter("arguments") as { name: string }).name;
             void this.destinationField.load();
             void this.load(name);
         });
     }
 
-    private static blank(): DetailState {
-        return {
-            loaded: false, exists: false, busy: false, asking: false, title: "",
-            data: inaQueries.emptyForm(), stored: inaQueries.emptyForm(), updated_at: null, usedBy: [],
-            definition: { dimensions: [], measures: [], variables: [] }, describedAt: null, describedText: "",
-            errors: {}, saveError: "", loadFailed: false, loadError: "", changedElsewhere: false,
-            deletedElsewhere: false, test: null
-        };
+    public onExit(): void {
+        this.leaveGuard.destroy();
+    }
+
+    /** Runs `work` with the page busy: the indicator and the buttons. */
+    private async callBusy<T>(work: () => Promise<T>): Promise<T> {
+        this.setBusy(true);
+        try {
+            return await this.withBusy(work);
+        } finally {
+            this.setBusy(false);
+        }
     }
 
     private qry(): JSONModel {
@@ -157,7 +153,7 @@ export default class InaQueryDetail extends BaseController {
         const count = ++this.loadCount;
         this.queryName = name;
         if (!keep) {
-            this.qry().setData(InaQueryDetail.blank());
+            this.qry().setData(blankDetail());
         }
         let query: InaQuery;
         try {
@@ -168,7 +164,7 @@ export default class InaQueryDetail extends BaseController {
             }
             const reason = ErrorHandler.messageFor(error, "");
             this.qry().setData({
-                ...InaQueryDetail.blank(), loadFailed: true,
+                ...blankDetail(), loadFailed: true,
                 loadError: reason ? this.text("inaDetailLoadFailedReason", [name, reason])
                     : this.text("inaDetailLoadFailed", [name])
             });
@@ -188,7 +184,7 @@ export default class InaQueryDetail extends BaseController {
         const form = inaQueries.formOf(query);
         const described = inaQueries.describedText(query.definition);
         this.qry().setData({
-            ...InaQueryDetail.blank(), loaded: true, exists: true, title: query.title,
+            ...blankDetail(), loaded: true, exists: true, title: query.title,
             data: form, stored: { ...form }, updated_at: query.updated_at ?? null,
             usedBy: inaQueries.usedByNames(query.used_by),
             definition: query.definition ?? { dimensions: [], measures: [], variables: [] },
@@ -211,8 +207,33 @@ export default class InaQueryDetail extends BaseController {
         }
     }
 
-    public onBack(): void {
-        this.getRouter().navTo("inaQueries");
+    public async onBack(): Promise<void> {
+        if (await this.leaveGuard.confirm()) {
+            this.getRouter().navTo("inaQueries");
+        }
+    }
+
+    /** "Discard" puts the stored query back in the form, so nothing asks
+     *  a second time on the way out; Cancel is the default. */
+    private askDiscard(): Promise<boolean> {
+        const discard = this.text("odataDiscard");
+        return new Promise<boolean>((resolve) => {
+            MessageBox.warning(this.text("inaUnsavedLeave"), {
+                title: this.text("odataUnsavedTitle"),
+                actions: [discard, MessageBox.Action.CANCEL],
+                emphasizedAction: discard,
+                initialFocus: MessageBox.Action.CANCEL,
+                onClose: (action: string | null) => {
+                    if (action === discard) {
+                        const model = this.qry();
+                        model.setProperty("/data", { ...(model.getProperty("/stored") as InaQueryForm) });
+                        model.setProperty("/errors", {});
+                        model.setProperty("/saveError", "");
+                    }
+                    resolve(action === discard);
+                }
+            });
+        });
     }
 
     // --- formatters ---------------------------------------------------------
@@ -348,30 +369,13 @@ export default class InaQueryDetail extends BaseController {
         return fresh;
     }
 
-    /**
-     * What to ask before the save, or undefined: only when agents use the
-     * query and the save changes "Runs as", the destination or the InA
-     * name, in the words of the OData service page.
-     */
+    /** What to ask before the save, or undefined (`inaQueries.identityTexts`). */
     private identityQuestion(stored: InaQueryForm, usedBy: string[]): { title: string; text: string } | undefined {
-        const change = inaQueries.identityChange(stored, this.data());
-        if (!usedBy.length || (!change.runsAs && !change.destination && !change.query)) {
-            return undefined;
-        }
-        const parts = [usedBy.length === 1
-            ? this.text("inaIdentityAgentsOne", [usedBy[0]])
-            : this.text("inaIdentityAgentsMany", [usedBy.join(", ")])];
-        if (change.runsAs) {
-            // No arguments: these two texts carry an apostrophe.
-            parts.push(this.text(change.runsAs === "technical" ? "inaIdentityToTechnical" : "inaIdentityToUser"));
-        }
-        if (change.destination) {
-            parts.push(this.text("inaIdentityDestination", [change.destination.from, change.destination.to]));
-        }
-        if (change.query) {
-            parts.push(this.text("inaIdentityQuery", [change.query.from, change.query.to]));
-        }
-        return { title: this.text("inaIdentityConfirmTitle"), text: parts.join("\n\n") };
+        const texts = inaQueries.identityTexts(inaQueries.identityChange(stored, this.data()), usedBy);
+        return texts.length ? {
+            title: this.text("inaIdentityConfirmTitle"),
+            text: texts.map((part) => this.text(part.key, part.args)).join("\n\n")
+        } : undefined;
     }
 
     /** Saves, after asking `question` when there is one (Cancel is the default). */
@@ -472,91 +476,17 @@ export default class InaQueryDetail extends BaseController {
         return true;
     }
 
-    /**
-     * Reads the description from SAP and stores it, then reads the query
-     * again: a Describe moves its `updated_at`. A 409 is a save in between
-     * (nothing was stored); every other refusal is the code's text from
-     * the server, through the central handler.
-     */
     public async onDescribe(): Promise<void> {
-        if (!this.canCall()) {
-            return;
-        }
-        const name = this.queryName as string;
-        this.clearResult();
-        this.setBusy(true);
-        let result: InaDescribeResult;
-        try {
-            result = await this.withBusy(() => this.getAdminService().describeInaQuery(name));
-        } catch (error) {
-            this.setBusy(false);
-            if (error instanceof AdminError && error.status === 404) {
-                this.qry().setProperty("/deletedElsewhere", true);
-            } else if (error instanceof AdminError && error.status === 409) {
-                await this.load(name, true);
-                this.showResult("Warning", this.text("inaDescribeMoved"));
-            } else {
-                ErrorHandler.handle(error, this.text("inaDescribeFailed"));
-            }
-            return;
-        }
-        this.setBusy(false);
-        await this.load(name, true);
-        if (result.truncated === true) {
-            this.showResult("Warning", this.text("inaDescribeTruncated"));
-        }
-        if (!this.warnIfNotLive(result, "inaReloadFailedDescribed")) {
-            MessageToast.show(this.text("inaDescribedToast", [result.dimensions, result.measures, result.variables]));
+        if (this.canCall()) {
+            this.clearResult();
+            await this.describeTest.describe(this.queryName as string);
         }
     }
 
-    /** One read of the first measure: outcome, status, duration and the
-     *  column names in the strip. A refusal is the outcome too, never a
-     *  dialog, except for a lapsed session or a missing scope. */
     public async onTest(): Promise<void> {
-        if (!this.canCall()) {
-            return;
+        if (this.canCall()) {
+            await this.describeTest.test(this.queryName as string);
         }
-        const name = this.queryName as string;
-        this.setBusy(true);
-        let result: InaTestResult;
-        try {
-            result = await this.withBusy(() => this.getAdminService().testInaQuery(name));
-        } catch (error) {
-            this.setBusy(false);
-            this.showTestRefusal(error);
-            return;
-        }
-        this.setBusy(false);
-        if (name !== this.queryName) {
-            return;
-        }
-        const status = typeof result.status === "number" ? String(result.status) : "-";
-        const duration = String(result.duration_ms ?? 0);
-        if (result.ok === true) {
-            const columns = (Array.isArray(result.columns) ? result.columns : []).join(", ");
-            this.showResult("Success", this.text("inaTestOk", [status, duration, columns || this.text("inaTestNoColumns")]));
-        } else {
-            this.showResult("Error", this.text("inaTestFailed", [status, duration]));
-        }
-    }
-
-    private showTestRefusal(error: unknown): void {
-        if (error instanceof AdminError && error.status === 404) {
-            this.qry().setProperty("/deletedElsewhere", true);
-            return;
-        }
-        const kind = ErrorHandler.classify(error);
-        if (kind === "session" || kind === "forbidden") {
-            ErrorHandler.handle(error);
-            return;
-        }
-        const reason = ErrorHandler.messageFor(error, "");
-        // By the code of `X-Ina-Error`: a mandatory variable is how the
-        // query is, not a failure (Describe is its check).
-        const code = error instanceof AdminError ? error.code : "";
-        this.showResult(code === "variable_required" ? "Information" : "Error",
-            reason ? this.text("inaTestNotRun", [reason]) : this.text("inaTestNotRunPlain"));
     }
 
     /** Shows the strip under the toolbar, brings it into view and says it. */
@@ -574,47 +504,13 @@ export default class InaQueryDetail extends BaseController {
 
     // --- delete -------------------------------------------------------------
 
-    /** Asks, naming title and technical name, then deletes and goes back to the list. */
+    /** Asks, naming title and technical name, then deletes (`QueryDelete`). */
     public onDelete(): void {
         const model = this.qry();
         if (model.getProperty("/busy") === true || model.getProperty("/exists") !== true || !this.queryName) {
             return;
         }
         const stored = model.getProperty("/stored") as InaQueryForm;
-        const remove = this.text("delete");
-        MessageBox.warning(this.text("inaDeleteConfirm", [stored.title, stored.name]), {
-            title: remove,
-            actions: [remove, MessageBox.Action.CANCEL],
-            emphasizedAction: remove,
-            initialFocus: MessageBox.Action.CANCEL,
-            onClose: (action: string | null) => {
-                if (action === remove) {
-                    void this.deleteQuery(stored.name, stored.title);
-                }
-            }
-        });
-    }
-
-    private async deleteQuery(name: string, title: string): Promise<void> {
-        this.setBusy(true);
-        let answer;
-        try {
-            answer = await this.withBusy(() => this.getAdminService().deleteInaQuery(name));
-        } catch (error) {
-            this.setBusy(false);
-            if (error instanceof AdminError && ErrorHandler.classify(error) === "conflict") {
-                // Still used: the server's text names the agents to detach it
-                // from, so it stays on screen as it came.
-                MessageBox.error(error.detail || this.text("inaDeleteFailed", [title]));
-            } else {
-                ErrorHandler.handle(error, this.text("inaDeleteFailed", [title]));
-            }
-            return;
-        }
-        this.setBusy(false);
-        if (!this.warnIfNotLive(answer, "inaReloadFailedDeleted")) {
-            MessageToast.show(this.text("inaDeleted"));
-        }
-        this.getRouter().navTo("inaQueries");
+        this.queryDelete.ask(stored.name, stored.title);
     }
 }

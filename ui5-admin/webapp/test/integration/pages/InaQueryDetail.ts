@@ -8,6 +8,8 @@ import type Switch from "sap/m/Switch";
 import type View from "sap/ui/core/mvc/View";
 import type UI5Element from "sap/ui/core/Element";
 import type ManagedObject from "sap/ui/base/ManagedObject";
+import Opa5 from "sap/ui/test/Opa5";
+import ElementRegistry from "sap/ui/core/ElementRegistry";
 
 /**
  * What the analytical query detail journey reads off the page: the
@@ -103,4 +105,16 @@ export function tableRows(table: UI5Element): string[][] {
 export function stripText(strip: UI5Element): string {
     const control = strip as MessageStrip;
     return control.getVisible() ? control.getText() : "";
+}
+
+/** What the page says when every Describe or Test slot is taken (`inaBusy`). */
+export const BUSY_TEXT_SHOWN = "Not run: other Describe or Test calls are running. Try again in a moment.";
+
+/** Asserts, inside a `success`, that no dialog is open. (A `waitFor` on
+ *  `sap.m.Dialog` would wait forever when there is none.) */
+export function iSeeNoOpenDialog(): void {
+    const open = ElementRegistry.filter((element) => (
+        element.isA("sap.m.Dialog") && (element as unknown as { isOpen(): boolean }).isOpen()
+    ));
+    Opa5.assert.strictEqual(open.length, 0, "no dialog is open");
 }

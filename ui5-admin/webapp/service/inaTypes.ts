@@ -13,7 +13,9 @@ import type { ReloadOutcome } from "./types";
 export type InaErrorCode =
     | "destination_error" | "proxy_refused" | "user_token_required" | "unauthorized" | "forbidden"
     | "csrf_failed" | "query_unknown" | "variable_required" | "invalid_filter" | "result_too_large"
-    | "sap_error" | "unreachable" | "timeout" | "not_json";
+    | "sap_error" | "unreachable" | "timeout" | "not_json"
+    /** 429: the admin calls' slots are all taken (agents/ina/admin_routes.py `_busy`). */
+    | "busy";
 
 export interface InaDimension {
     /** SAP's technical name (`0CALMONTH`); case sensitive. */
@@ -104,10 +106,9 @@ export interface InaQuerySummary {
     created_at?: string | null;
     /** What a client sends back as `expected_updated_at`. */
     updated_at: string | null;
-    /** The agents that name the query, enabled or not: objects as the
-     *  record's `to_dict` gives them; a plain agent name is read as well
-     *  (`inaQueries.usedByNames`). */
-    used_by: (InaUsedBy | string)[];
+    /** The agents that name the query, enabled or not, as the record's
+     *  `to_dict` gives them (`ina_query_referrers`). */
+    used_by: InaUsedBy[];
 }
 
 /** `GET ina/queries/{name}`. The answer of a `PUT` also carries the

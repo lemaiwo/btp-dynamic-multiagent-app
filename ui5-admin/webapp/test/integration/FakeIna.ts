@@ -28,6 +28,8 @@ export const NOT_FOUND = "Query not found";
 export const NAME_TAKEN = "name: already exists";
 export const NAME_FIXED = "name: cannot be changed; register the query under the new name instead";
 export const UNKNOWN_IN_SAP = "SAP does not know the InA query of this registration";
+/** `BUSY_TEXT` of agents/ina/admin_calls.py, with its 2 slots. */
+export const BUSY = "2 Describe or Test calls are running already; try again in a moment";
 /** `VARIABLE_REQUIRED_TEXT` of agents/ina/admin_calls.py. */
 export const VARIABLE_REQUIRED = "the query has a mandatory variable, which a test cannot fill; Describe checks "
     + "the destination, the identity and the query";
@@ -54,6 +56,8 @@ export default class FakeIna {
     /** True: the next Describe finds the row changed while SAP was asked
      *  (somebody saved it meanwhile): 409, nothing stored. */
     public describeMoves = false;
+    /** True: every call slot is taken, Describe and Test answer 429 `busy`. */
+    public busy = false;
     private stamp = 0;
     private nextId = 1;
 
@@ -61,6 +65,7 @@ export default class FakeIna {
         this.stamp = Date.parse("2026-11-01T08:00:00Z");
         this.nextId = 1;
         this.describeMoves = false;
+        this.busy = false;
         this.sap = {
             ZFLIGHT_REV_Q001: {
                 dimensions: [
@@ -156,7 +161,7 @@ export default class FakeIna {
         }
         if (action === "" && method === "DELETE") {
             if (stored.used_by.length) {
-                const agents = stored.used_by.map((u) => `'${typeof u === "string" ? u : u.agent}'`).join(", ");
+                const agents = stored.used_by.map((u) => `'${u.agent}'`).join(", ");
                 return json({ detail: `Query '${name}' is used by agent(s) ${agents}` }, 409);
             }
             this.queries.splice(this.queries.indexOf(stored), 1);
@@ -172,6 +177,9 @@ export default class FakeIna {
             const extra = isObject(body) ? Object.keys(body)[0] : undefined;
             if (extra !== undefined) {
                 return json({ detail: `${FakeIna.loc(extra)}: Extra inputs are not permitted` }, 422);
+            }
+            if (this.busy) {
+                return json({ detail: BUSY }, 429, { "X-Ina-Error": "busy" });
             }
             return action === "/describe" ? this.describe(stored, json, reload) : this.test(stored, json);
         }
@@ -253,6 +261,7 @@ export default class FakeIna {
         }
         if (this.describeMoves) {
             this.describeMoves = false;
+        this.busy = false;
             stored.updated_at = this.nextStamp();
             return json({ detail: FakeIna.describedMoved(stored.name) }, 409);
         }
