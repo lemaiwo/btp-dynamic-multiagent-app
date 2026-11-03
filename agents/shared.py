@@ -572,17 +572,27 @@ DEFAULT_AVAILABLE_MODELS = (
 )
 
 
-def _discover_deployed_models() -> list[str]:
+def _discover_deployed_models(refresh: bool = False) -> list[str]:
     """Query SAP AI Core for the model names that are actually deployed.
 
     Returns an empty list if discovery fails (no credentials, network error,
     etc.) so the caller can fall back to the static default list.
+
+    ``get_proxy_client("gen-ai-hub")`` is ONE instance per process
+    (gen_ai_hub caches it by its arguments), and its ``deployments`` are read
+    from AI Core only while its list is empty: a deployment that reaches
+    RUNNING later is not in it. ``refresh`` reads the list again first
+    (``update_deployments()``); the data catalogue asks for it when AI Core's
+    own list names a RUNNING embedding model this list does not
+    (``agents/data_catalog/embeddings.py``). The chat's model list keeps the
+    default.
     """
     try:
         from gen_ai_hub.proxy import get_proxy_client
 
         client = get_proxy_client("gen-ai-hub")
-        names = {d.model_name for d in client.deployments if d.model_name}
+        deployments = client.update_deployments() if refresh else client.deployments
+        names = {d.model_name for d in deployments if d.model_name}
         return sorted(names)
     except Exception:
         logger.warning("Could not discover deployed models from AI Core", exc_info=True)

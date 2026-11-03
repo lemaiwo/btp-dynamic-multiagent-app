@@ -27,6 +27,14 @@ caches are per process: another app instance sees a save after its own 10
 minutes. A setting that cannot be read means none, and is read again on the
 next call (fail closed: an admin who switched embeddings off gets no call).
 
+Discovery (``agents.shared._discover_deployed_models``) reads the list of
+gen_ai_hub's proxy client, ONE instance per process that reads AI Core only
+while its list is empty: a deployment that reaches RUNNING later is not in
+it, and resetting our caches does not change that. AI Core's own list
+(``agents.aicore_deployments``, read by the admin's status, PUT and run)
+does show it: :func:`note_running` compares, and when the two disagree the
+next discovery makes the proxy client read its deployments again.
+
 The call goes through the same ``gen_ai_hub`` proxy client as the chat
 models (``AsyncOpenAI(proxy_client=...).embeddings.create``). Every failure
 (no credentials, no deployment, a refused call, a timeout) means "no
@@ -48,6 +56,7 @@ import time
 from array import array
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from functools import partial
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -81,6 +90,10 @@ _deployed_cache: tuple[float, float, list[str]] | None = None
 # Raised by every reset: a read that began before a reset is not cached,
 # so a save that lands while a resolve awaits the row is seen next time.
 _cache_epoch = 0
+# Set by note_running: the proxy client's list is stale or unknown, so the
+# next discovery reads AI Core again. Cleared once a refresh's answer is
+# kept; not by reset_caches (a save makes the proxy client no fresher).
+_refresh_next = False
 _question_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
 
 
@@ -125,21 +138,28 @@ async def _setting() -> dict[str, Any] | None:
 async def _deployed() -> list[str]:
     """The model names AI Core lists with a RUNNING deployment, cached for
     10 minutes; an empty list, a failed discovery included, for one minute
-    (no discovery call per search either way). Never raises."""
-    global _deployed_cache
+    (no discovery call per search either way). After :func:`note_running`
+    asked for it, discovery reads AI Core again first. Never raises."""
+    global _deployed_cache, _refresh_next
     now, epoch = _clock(), _cache_epoch
     if _deployed_cache is not None and now - _deployed_cache[0] < _deployed_cache[1]:
         return _deployed_cache[2]
+    refresh = _refresh_next
     try:
         from agents.shared import _discover_deployed_models
 
-        found = await asyncio.wait_for(
-            asyncio.to_thread(_discover_deployed_models), DISCOVERY_TIMEOUT_SECONDS
-        )
+        # Only a refresh passes the argument: the chat's call is unchanged.
+        call = partial(_discover_deployed_models, refresh=True) if refresh else (
+            _discover_deployed_models)
+        found = await asyncio.wait_for(asyncio.to_thread(call), DISCOVERY_TIMEOUT_SECONDS)
         deployed = [m for m in (found or []) if isinstance(m, str)]
     except Exception as exc:  # noqa: BLE001 - no vectors, see the module docstring
         logger.warning("data catalogue: model discovery failed (%s)", type(exc).__name__)
         deployed = []
+    else:
+        # A note that landed meanwhile asked for a refresh after this one.
+        if refresh and epoch == _cache_epoch:
+            _refresh_next = False
     if epoch == _cache_epoch:
         ttl = MODEL_CACHE_SECONDS if deployed else EMPTY_CACHE_SECONDS
         _deployed_cache = (now, ttl, deployed)
@@ -149,18 +169,39 @@ async def _deployed() -> list[str]:
 def note_running(running: Iterable[str]) -> None:
     """AI Core's own list of deployments (``agents.aicore_deployments``, read
     by the admin's status, PUT and run) names these embedding models
-    RUNNING. When the cached discovery list disagrees about the embedding
-    models (one reached RUNNING after a deploy, or one stopped), it is
-    dropped: the admin who sees RUNNING must not get "no model in effect"
-    for the next ten minutes. Discovery itself creates its client per call,
-    so its next answer is fresh."""
-    global _deployed_cache, _cache_epoch
-    if _deployed_cache is None:
+    RUNNING. When discovery's last answer disagrees about the embedding
+    models (one reached RUNNING after a deploy, or one stopped), or there is
+    none since the last reset, that answer is dropped and the next discovery
+    makes gen_ai_hub's proxy client read AI Core again (see the module
+    docstring): the admin who sees RUNNING must not get "no model in effect"
+    for as long as the process lives. While the two agree nothing is read
+    again."""
+    global _deployed_cache, _cache_epoch, _refresh_next
+    named = {m for m in running if isinstance(m, str)}
+    if _deployed_cache is not None and named == {
+        m for m in _deployed_cache[2] if "embed" in m.casefold()
+    }:
         return
-    cached = {m for m in _deployed_cache[2] if "embed" in m.casefold()}
-    if cached != {m for m in running if isinstance(m, str)}:
-        _deployed_cache = None
-        _cache_epoch += 1
+    _deployed_cache = None
+    _cache_epoch += 1
+    _refresh_next = True
+
+
+async def _rung() -> tuple[str, str | None] | None:
+    """The rung of the module docstring that decides, before AI Core is
+    asked: ``("off", None)``, ``("setting", model)``, ``("env", model)`` or
+    ``("discovery", None)``; ``None`` when the setting cannot be read."""
+    if not enabled():
+        return "off", None
+    setting = await _setting()
+    if setting is None:
+        return None
+    if not setting["enabled"]:
+        return "off", None
+    if setting["model"]:
+        return "setting", setting["model"]
+    configured = (os.environ.get(MODEL_ENV) or "").strip()
+    return ("env", configured) if configured else ("discovery", None)
 
 
 async def resolve_model_detail() -> tuple[str | None, str]:
@@ -168,18 +209,15 @@ async def resolve_model_detail() -> tuple[str | None, str]:
     where it came from, one of :data:`SOURCES`, in the order of the module
     docstring. ``setting`` with ``None`` is an admin's model that AI Core
     does not list as deployed; switched off (by the environment or the
-    admin) and nothing found are ``none``."""
-    if not enabled():
+    admin), an unreadable setting and nothing found are ``none``."""
+    rung = await _rung()
+    if rung is None or rung[0] == "off":
         return None, "none"
-    setting = await _setting()
-    if setting is None or not setting["enabled"]:
-        return None, "none"
-    chosen = setting["model"]
-    if chosen:
-        return (chosen if chosen in await _deployed() else None), "setting"
-    configured = (os.environ.get(MODEL_ENV) or "").strip()
-    if configured:
-        return configured, "env"
+    kind, named = rung
+    if kind == "setting":
+        return (named if named in await _deployed() else None), "setting"
+    if kind == "env":
+        return named, "env"
     model = _pick(await _deployed())
     return model, ("discovery" if model else "none")
 
@@ -338,9 +376,39 @@ async def _write(
         db.add(DataCatalogVector(node_id=nid, model=model, text_hash=digest, vector=pack(vector)))
 
 
+async def _in_effect(model: str) -> bool | None:
+    """Whether ``model`` is still the one in effect: ``False`` only for a
+    definite change (switched off, or another model named or picked),
+    ``None`` when it cannot be told (the setting unreadable, discovery
+    empty). The admin's or the environment's model is compared by name:
+    whether AI Core still lists it is not the run's question (its next call
+    fails if it is gone)."""
+    rung = await _rung()
+    if rung is None:
+        return None
+    kind, named = rung
+    if kind == "off":
+        return False
+    if kind != "discovery":
+        return named == model
+    picked = _pick(await _deployed())
+    return None if picked is None else picked == model
+
+
 async def _still_in_effect(model: str) -> None:
-    if await resolve_model() != model:
-        raise ModelChanged()
+    """Raise :class:`ModelChanged` when a save changed the model or switched
+    embeddings off. A check that cannot tell is made once more; still not
+    told, the run goes on with its model: what it writes is of that model
+    either way, and a run of a model no longer in effect is dropped by the
+    next one."""
+    for _ in range(2):
+        verdict = await _in_effect(model)
+        if verdict is False:
+            raise ModelChanged()
+        if verdict:
+            return
+    logger.warning(
+        "data catalogue: the model in effect could not be read; the run goes on with %s", model)
 
 
 async def refresh_vectors(
@@ -366,9 +434,10 @@ async def refresh_vectors(
     is embedded, so a failure at batch 70 of 80 keeps the 69 that were paid
     for and the next run sends only what is still stale. An embedding failure
     is raised (the run reports its class). Before each write and before the
-    drop of other models the model is resolved again: when a save changed
-    it, :class:`ModelChanged` is raised and nothing more is written or
-    dropped. The caller commits the drop at the end.
+    drop of other models the model is checked again (:func:`_still_in_effect`):
+    when a save changed it, :class:`ModelChanged` is raised and nothing more
+    is written or dropped; a check that cannot tell is no change. The caller
+    commits the drop at the end.
     """
     model = model or await resolve_model()
     if not model:

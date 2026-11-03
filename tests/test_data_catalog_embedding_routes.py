@@ -9,9 +9,10 @@ the one WARNING, 502 with the code in ``X-Embeddings-Error``, a task of its
 own that a cancelled request does not cancel) and the ``mode`` of the
 admin's test search.
 
-No network: discovery is patched (``discovery``; the autouse ``_defaults``
-of ``tests/test_data_catalog_embeddings.py`` puts the setting back around
-every test), so are the three calls of
+No network: discovery is patched (``discovery``, or gen_ai_hub's proxy
+client where its list of deployments matters: ``ProxyClient``; the autouse
+``_defaults`` of ``tests/test_data_catalog_embeddings.py`` puts the setting
+back around every test), so are the three calls of
 ``agents.aicore_deployments`` (``FakeAICore``) and the embedding call
 (``embeddings._create``, ``Embedder``).
 """
@@ -50,6 +51,7 @@ from tests.test_data_catalog_embeddings import (  # noqa: E402
     SECRET,
     Clock,
     Discovery,
+    ProxyClient,
     _defaults,  # noqa: F401
     store,
     stored,
@@ -308,42 +310,35 @@ async def test_the_ai_core_lists_are_cached_briefly_between_polls(
     assert aicore.calls.count("list_deployments") == 2
 
 
-async def test_a_deployment_that_reaches_running_is_used_at_the_next_status(
-    monkeypatch, client, aicore, catalogue, embedder
+@pytest.mark.parametrize("first", ["status", "run"])
+@pytest.mark.parametrize("chosen", [None, SMALL], ids=["automatic", "admin model"])
+async def test_a_deployment_that_reaches_running_is_in_effect_at_the_next_read(
+    monkeypatch, client, aicore, catalogue, embedder, chosen, first
 ):
-    """AI Core's own list says RUNNING: the discovery the model is resolved
-    with must not answer from its ten-minute cache, or "Compute" is refused
-    with "no model" until a save resets it."""
-    found = Discovery(["gpt-4o"])
-    monkeypatch.setattr(shared, "_discover_deployed_models", found)
+    """gen_ai_hub's proxy client is one per process and keeps the list of
+    deployments it read first (``ProxyClient``): a model deployed later is
+    not in it. Once AI Core's own list says RUNNING, ONE status read or ONE
+    "Compute" makes it the model in effect, or "Compute" would be refused
+    with "no model" for as long as the process lives."""
+    proxy = ProxyClient(lambda: ["gpt-4o"] + [
+        d["model"] for d in aicore.deployments if d["status"] == "RUNNING"]).install(monkeypatch)
     aicore.deployments = []
-    body = (await client.get(BASE)).json()
-    assert (body["effective_model"], body["source"]) == (None, "none")
-    r = await client.post(f"{BASE}/deploy", json={"model": SMALL})
-    assert r.status_code == 202 and r.json()["status"] == "PENDING"
-    assert (await client.get(BASE)).json()["effective_model"] is None
+    proxy.update_deployments()  # the chat read it long ago
+    if chosen:
+        aicore.deployments = [{"model": SMALL, "status": "PENDING", "deployment_id": "d-9"}]
+        r = await client.put(BASE, json={"enabled": True, "model": SMALL})
+        assert (r.json()["effective_model"], r.json()["source"]) == (None, "setting")
+    else:
+        assert (await client.get(BASE)).json()["effective_model"] is None
+        r = await client.post(f"{BASE}/deploy", json={"model": SMALL})
+        assert r.status_code == 202 and r.json()["status"] == "PENDING"
+        assert (await client.get(BASE)).json()["effective_model"] is None
     aicore.deployments[0]["status"] = "RUNNING"  # minutes later
-    found.models = ["gpt-4o", SMALL]
     embedding_routes.reset_cache()  # the 10 s of the panel's cache are over
-    body = (await client.get(BASE)).json()
-    assert (body["effective_model"], body["source"]) == (SMALL, "discovery")
-    assert (await client.post(f"{BASE}/run")).status_code == 202
-    await finished()
-    assert embedding_run.last_run()["model"] == SMALL
-
-
-async def test_an_admin_model_that_reaches_running_is_used_at_the_next_run(
-    monkeypatch, client, aicore, catalogue, embedder
-):
-    found = Discovery(["gpt-4o"])
-    monkeypatch.setattr(shared, "_discover_deployed_models", found)
-    aicore.deployments = [{"model": SMALL, "status": "PENDING", "deployment_id": "d-9"}]
-    r = await client.put(BASE, json={"enabled": True, "model": SMALL})
-    assert (r.json()["effective_model"], r.json()["source"]) == (None, "setting")
-    aicore.deployments[0]["status"] = "RUNNING"
-    found.models = ["gpt-4o", SMALL]
-    embedding_routes.reset_cache()
-    # No status in between: the run reads AI Core's list itself.
+    if first == "status":
+        body = (await client.get(BASE)).json()
+        assert (body["effective_model"], body["source"]) == (
+            SMALL, "setting" if chosen else "discovery")
     assert (await client.post(f"{BASE}/run")).status_code == 202
     await finished()
     assert embedding_run.last_run()["model"] == SMALL
@@ -493,6 +488,17 @@ async def test_a_run_without_a_model_is_refused(client, aicore, catalogue, embed
     assert embedding_run._task is None and embedder.batches == []
 
 
+async def test_a_run_with_a_model_in_effect_does_not_wait_for_ai_core(
+    client, aicore, discovery, catalogue, embedder
+):
+    """The run needs no AI Core list: its lists are read only when no model
+    resolves (a deployment may have reached RUNNING since)."""
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await finished()
+    assert aicore.calls == []
+    assert embedding_run.last_run()["model"] == LARGE
+
+
 async def test_two_runs_started_at_once_make_one_run(client, aicore, discovery, catalogue,
                                                      embedder):
     first, second = await asyncio.gather(client.post(f"{BASE}/run"),
@@ -562,7 +568,8 @@ async def test_a_run_whose_model_was_changed_meanwhile_stops_and_drops_nothing(
     await finished()
     last = embedding_run.last_run()
     assert (last["model"], last["embedded"], last["error_class"]) == (LARGE, 2, "ModelChanged")
-    # Batch 1 is not written and the other model's vector is not dropped.
+    # Batch 1 is committed, batch 2 is not written, and the other model's
+    # vector is not dropped.
     assert await vectors_stored() == {(catalogue["sales"], LARGE), (catalogue["Order"], LARGE),
                                       (catalogue["Release"], SMALL)}
 
@@ -579,6 +586,34 @@ async def test_a_run_switched_off_meanwhile_drops_nothing_at_its_end(
     await finished()
     assert embedding_run.last_run()["error_class"] == "ModelChanged"
     assert await vectors_stored() == {(catalogue["Release"], SMALL)}
+
+
+@pytest.mark.parametrize("cause", ["setting unreadable", "discovery empty"])
+async def test_a_run_whose_check_cannot_tell_goes_on_with_its_model(
+    monkeypatch, client, aicore, discovery, catalogue, embedder, cause
+):
+    """A database blip or a discovery that answers nothing during a run is
+    no change of the model: the run writes every batch and drops the other
+    model's vectors at its end, as it would have."""
+    monkeypatch.setattr(embeddings, "BATCH_SIZE", 2)
+    await add_vector(catalogue["Release"], SMALL)
+    embedder.hold = 1
+    assert (await client.post(f"{BASE}/run")).status_code == 202
+    await asyncio.wait_for(embedder.reached.wait(), 5)
+
+    async def unreadable(session):
+        raise RuntimeError("connection reset")
+
+    if cause == "setting unreadable":
+        monkeypatch.setattr(embeddings, "get_embedding_setting", unreadable)
+    else:
+        discovery.models = []
+    embeddings.reset_caches()
+    embedder.release.set()
+    await finished()
+    last = embedding_run.last_run()
+    assert (last["model"], last["embedded"], last["error_class"]) == (LARGE, 4, None)
+    assert {m for _, m in await vectors_stored()} == {LARGE}
 
 
 async def test_the_run_is_cancelled_at_shutdown_and_keeps_its_committed_batches(

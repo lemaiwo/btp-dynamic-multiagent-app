@@ -13,7 +13,8 @@ resets it.
 The routes of point 2 are in ``tests/test_data_catalog_embedding_routes.py``,
 which reuses the fixtures here.
 
-No network: discovery is patched (``agents.shared._discover_deployed_models``)
+No network: discovery is patched (``agents.shared._discover_deployed_models``,
+or, where its refresh matters, gen_ai_hub's proxy client: ``ProxyClient``)
 and the suite's ``DATA_CATALOG_EMBEDDINGS=0`` (``tests/conftest.py``) is set
 to ``1`` here only where a rung needs it.
 """
@@ -24,7 +25,10 @@ import os
 import sqlite3
 import subprocess
 import sys
+import textwrap
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -51,15 +55,51 @@ DEPLOYED = ["gpt-4o", "text-embedding-3-small", "text-embedding-3-large"]
 
 
 class Discovery:
-    """Stands in for AI Core's list of RUNNING deployments; counts the calls."""
+    """Stands in for AI Core's list of RUNNING deployments; counts the calls
+    and those that asked for a refresh."""
 
     def __init__(self, models: list[str]) -> None:
         self.models = list(models)
         self.calls = 0
+        self.refreshes = 0
 
-    def __call__(self) -> list[str]:
+    def __call__(self, refresh: bool = False) -> list[str]:
         self.calls += 1
+        self.refreshes += refresh
         return list(self.models)
+
+
+class ProxyClient:
+    """Behaves like the client ``gen_ai_hub.proxy.get_proxy_client("gen-ai-hub")``
+    hands out (sap-ai-sdk-gen 6.6.0; pinned by
+    ``test_the_proxy_client_is_one_instance_that_keeps_its_list``): ONE
+    instance per process, whose ``deployments`` are read from AI Core
+    (``live``: the models with a RUNNING deployment there) only while its
+    list is empty; ``update_deployments()`` reads them again. ``install``
+    makes ``get_proxy_client`` answer it, so the real
+    ``agents.shared._discover_deployed_models`` runs."""
+
+    def __init__(self, live: Callable[[], list[str]]) -> None:
+        self._live = live
+        self._deployments: list[SimpleNamespace] = []
+        self.updates = 0
+
+    def update_deployments(self) -> list[SimpleNamespace]:
+        self.updates += 1
+        self._deployments = [SimpleNamespace(model_name=m) for m in self._live()]
+        return self._deployments
+
+    @property
+    def deployments(self) -> list[SimpleNamespace]:
+        if not self._deployments:
+            self.update_deployments()
+        return self._deployments
+
+    def install(self, monkeypatch) -> ProxyClient:
+        import gen_ai_hub.proxy
+
+        monkeypatch.setattr(gen_ai_hub.proxy, "get_proxy_client", lambda *a, **k: self)
+        return self
 
 
 async def store(enabled: int, model: str | None) -> None:
@@ -90,11 +130,15 @@ async def _defaults(monkeypatch):
     await init_db()
     await store(1, None)
     embeddings.reset_caches()
+    # Not part of the caches (a save does not make the proxy client's list
+    # fresh): set by note_running, cleared by a refresh; no test leaves it.
+    embeddings._refresh_next = False
     monkeypatch.setenv(embeddings.SWITCH_ENV, "1")
     monkeypatch.delenv(embeddings.MODEL_ENV, raising=False)
     yield
     await store(1, None)
     embeddings.reset_caches()
+    embeddings._refresh_next = False
 
 
 @pytest.fixture
@@ -456,6 +500,195 @@ async def test_resolving_never_raises_whatever_discovery_answers(monkeypatch):
     embeddings.reset_caches()
     monkeypatch.delattr(shared, "_discover_deployed_models")
     assert await embeddings.resolve_model_detail() == (None, "none")
+
+
+# --- the proxy client's list of deployments --------------------------------------------
+
+
+def test_the_proxy_client_is_one_instance_that_keeps_its_list(tmp_path):
+    """What ``ProxyClient`` copies from sap-ai-sdk-gen: ``get_proxy_client``
+    answers the same instance every time (``InstanceCacheMeta``), and its
+    ``deployments`` do not read AI Core again once they hold one;
+    ``update_deployments()`` does. In a child process with made-up
+    credentials and AI Core's list replaced: no network, and the instance
+    made here is not the suite's."""
+    code = textwrap.dedent("""
+        from types import SimpleNamespace
+        from gen_ai_hub.proxy import get_proxy_client
+        from gen_ai_hub.proxy.gen_ai_hub_proxy.client import GenAIHubProxyClient
+
+        live, reads = ["gpt-4o"], []
+
+        def scenario(self, info):
+            reads.append(1)
+            return {m: SimpleNamespace(model_name=m, created_at=i) for i, m in enumerate(live)}
+
+        GenAIHubProxyClient._get_scenario_deployments = scenario
+        first = get_proxy_client("gen-ai-hub")
+        print(first is get_proxy_client("gen-ai-hub"))
+        print(",".join(d.model_name for d in first.deployments), len(reads))
+        live.append("text-embedding-3-small")
+        print(",".join(d.model_name for d in get_proxy_client("gen-ai-hub").deployments),
+              len(reads))
+        print(",".join(sorted(d.model_name for d in first.update_deployments())), len(reads))
+    """)
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "AICORE_HOME": str(tmp_path),
+        "AICORE_CLIENT_ID": "test-client",
+        "AICORE_CLIENT_SECRET": "made-up",
+        "AICORE_AUTH_URL": "https://auth.invalid",
+        "AICORE_BASE_URL": "https://api.invalid/v2",
+        "AICORE_RESOURCE_GROUP": "default",
+    }
+    r = subprocess.run([sys.executable, "-I", "-c", code], cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.splitlines() == [
+        "True", "gpt-4o 1", "gpt-4o 1", "gpt-4o,text-embedding-3-small 2"]
+
+
+def test_discovery_reads_the_proxy_clients_list_and_a_refresh_reads_ai_core(monkeypatch):
+    """The chat's model list (the default) is what it was; ``refresh`` makes
+    the one instance read its deployments again."""
+    live = ["gpt-4o"]
+    proxy = ProxyClient(lambda: list(live)).install(monkeypatch)
+    assert shared._discover_deployed_models() == ["gpt-4o"]
+    live.append(SMALL_MODEL)  # deployed later, RUNNING now
+    assert shared._discover_deployed_models() == ["gpt-4o"]
+    assert proxy.updates == 1
+    assert shared._discover_deployed_models(refresh=True) == ["gpt-4o", SMALL_MODEL]
+    assert shared._discover_deployed_models() == ["gpt-4o", SMALL_MODEL]
+    assert proxy.updates == 2
+
+
+async def test_a_running_model_discovery_does_not_list_makes_it_read_ai_core_again(
+    monkeypatch,
+):
+    """A save resets our caches, not the proxy client's list: only AI Core's
+    own list (``note_running``) tells that a model reached RUNNING, and then
+    the next discovery reads the deployments again, once."""
+    live = ["gpt-4o"]
+    proxy = ProxyClient(lambda: list(live)).install(monkeypatch)
+    proxy.update_deployments()  # the chat read it long ago
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    live.append(SMALL_MODEL)
+    embeddings.reset_caches()
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    embeddings.note_running([SMALL_MODEL])
+    assert await embeddings.resolve_model_detail() == (SMALL_MODEL, "discovery")
+    updates = proxy.updates
+    embeddings.note_running([SMALL_MODEL])  # agrees: nothing is read again
+    assert await embeddings.resolve_model_detail() == (SMALL_MODEL, "discovery")
+    assert proxy.updates == updates == 2
+
+
+async def test_a_note_before_any_discovery_reads_ai_core_again(monkeypatch):
+    """No discovery since the last save: what the proxy client holds is
+    unknown, so a note that names RUNNING models makes the next one read."""
+    live = ["gpt-4o"]
+    proxy = ProxyClient(lambda: list(live)).install(monkeypatch)
+    proxy.update_deployments()
+    live.append(SMALL_MODEL)
+    await store(1, SMALL_MODEL)
+    embeddings.reset_caches()
+    embeddings.note_running([SMALL_MODEL])
+    assert await embeddings.resolve_model_detail() == (SMALL_MODEL, "setting")
+    assert proxy.updates == 2
+
+
+async def test_a_refresh_that_a_note_overtook_is_asked_again(monkeypatch):
+    """The refresh is done once its answer is kept: a note that lands while
+    it runs leaves the next discovery a refresh too."""
+    found = Discovery(["gpt-4o"])
+
+    def overtaken(refresh: bool = False) -> list[str]:
+        models = found(refresh)
+        embeddings.note_running([SMALL_MODEL])
+        return models
+
+    embeddings.note_running([SMALL_MODEL])
+    monkeypatch.setattr(shared, "_discover_deployed_models", overtaken)
+    assert await embeddings.resolve_model_detail() == (None, "none")
+    found.models = ["gpt-4o", SMALL_MODEL]
+    monkeypatch.setattr(shared, "_discover_deployed_models", found)
+    assert await embeddings.resolve_model_detail() == (SMALL_MODEL, "discovery")
+    assert found.refreshes == 2
+
+
+# --- a run's check of the model in effect ---------------------------------------------------
+
+
+LARGE_MODEL = "text-embedding-3-large"
+
+
+@pytest.mark.parametrize("change", ["another admin model", "admin switched off",
+                                    "environment switch off", "discovery picks another"])
+async def test_a_definite_change_of_the_model_stops_the_run(monkeypatch, discovery, change):
+    if change == "another admin model":
+        await store(1, SMALL_MODEL)
+    elif change == "admin switched off":
+        await store(0, None)
+    elif change == "environment switch off":
+        monkeypatch.setenv(embeddings.SWITCH_ENV, "0")
+    else:
+        discovery.models = ["gpt-4o", SMALL_MODEL]
+    embeddings.reset_caches()
+    with pytest.raises(embeddings.ModelChanged):
+        await embeddings._still_in_effect(LARGE_MODEL)
+
+
+async def test_the_run_goes_on_while_its_model_is_in_effect(discovery):
+    await embeddings._still_in_effect(LARGE_MODEL)
+    await store(1, LARGE_MODEL)
+    embeddings.reset_caches()
+    await embeddings._still_in_effect(LARGE_MODEL)
+
+
+@pytest.mark.parametrize("cause", ["setting unreadable", "discovery empty",
+                                   "admin model no longer listed"])
+async def test_a_check_that_cannot_tell_is_tried_again_once_then_the_run_goes_on(
+    monkeypatch, discovery, caplog, cause
+):
+    """A failed read is no change: the run keeps its model (what it writes is
+    of that model either way), after one more try."""
+    reads = 0
+
+    async def unreadable(session):
+        nonlocal reads
+        reads += 1
+        raise RuntimeError(f"postgresql://app:{SECRET}@db.internal/registry")
+
+    if cause == "setting unreadable":
+        monkeypatch.setattr(embeddings, "get_embedding_setting", unreadable)
+    elif cause == "discovery empty":
+        discovery.models = []
+    else:
+        await store(1, LARGE_MODEL)
+        discovery.models = ["gpt-4o"]
+    embeddings.reset_caches()
+    await embeddings._still_in_effect(LARGE_MODEL)
+    if cause == "setting unreadable":
+        assert reads == 2
+    assert SECRET not in caplog.text
+
+
+async def test_a_change_seen_by_the_second_try_stops_the_run(monkeypatch, discovery):
+    real, reads = embeddings.get_embedding_setting, 0
+
+    async def flaky(session):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            raise RuntimeError("connection reset")
+        return await real(session)
+
+    monkeypatch.setattr(embeddings, "get_embedding_setting", flaky)
+    await store(1, SMALL_MODEL)
+    embeddings.reset_caches()
+    with pytest.raises(embeddings.ModelChanged):
+        await embeddings._still_in_effect(LARGE_MODEL)
+    assert reads == 2
 
 
 def test_the_session_factory_is_looked_up_at_call_time():

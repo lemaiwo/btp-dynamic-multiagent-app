@@ -20,7 +20,10 @@ whose body reader it shares, capped at 4 KB here). Every route carries
   status then says whether it embeds). Answers the status.
 * ``POST /run`` -- 202 ``{running: true}``; 409 while a run is in flight,
   or when no model is in effect (then with ``X-Embeddings-Error: no_model``,
-  so the panel can tell the two apart).
+  so the panel can tell the two apart). AI Core's lists are read only when
+  no model resolves (a deployment may have reached RUNNING since), and the
+  model is resolved once more after them: a run with a model in effect
+  does not wait for them.
 * ``POST /deploy`` ``{model}`` -- 202 ``{deployment_id, status, created}``.
   It bills, so it is logged as ONE WARNING naming the model, the caller's
   principal and the resource group, written once AI Core has confirmed that
@@ -47,7 +50,8 @@ because the panel polls the status every 2 s while a run is in flight and a
 read may take its whole 30 s timeout; a deploy drops the cache, and the
 PUT's check reads the deployments fresh. Every fresh list of deployments is
 handed to ``embeddings.note_running``, so the model in effect follows what
-AI Core says is RUNNING instead of a discovery cached for ten minutes.
+AI Core says is RUNNING: not a discovery cached for ten minutes, nor the list
+gen_ai_hub's proxy client read once for the whole process.
 """
 
 from __future__ import annotations
@@ -236,8 +240,10 @@ async def api_run(request: Request) -> dict[str, bool]:
     await _json_body(request, RunBody, empty_ok=True, limit=BODY_BYTES)
     if embedding_run.running():
         raise HTTPException(status_code=409, detail=RUN_IN_FLIGHT)
-    await _lists()  # a deployment that reached RUNNING since counts now
     model = await embeddings.resolve_model()
+    if not model:
+        await _lists()  # a deployment that reached RUNNING since counts now
+        model = await embeddings.resolve_model()
     if not model:
         raise HTTPException(status_code=409, detail=NO_MODEL, headers={ERROR_HEADER: "no_model"})
     # Checked again in the one step that starts it: the resolve awaited.
