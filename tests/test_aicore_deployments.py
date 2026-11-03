@@ -23,7 +23,8 @@ CLIENT_ID = "client-id-for-tests"
 SECRET = "not-a-real-secret-123"
 BODY_MARKER = "BODY-MARKER-must-not-be-logged"
 ENV_NAMES = ("AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET", "AICORE_AUTH_URL",
-             "AICORE_BASE_URL", "AICORE_RESOURCE_GROUP", "VCAP_SERVICES")
+             "AICORE_BASE_URL", "AICORE_RESOURCE_GROUP", "AICORE_SERVICE_KEY",
+             "VCAP_SERVICES")
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +54,8 @@ def _model(name, versions=("1",), executable="azure-openai"):
 def _deployment(model, status="RUNNING", did="d0000000001", *, style="backend"):
     details = ({"resources": {"backend_details": {"model": {"name": model, "version": "1"}}}}
                if style == "backend" else {"modelName": model})
-    return {"id": did, "status": status, "details": details, "configurationId": "c1"}
+    return {"id": did, "status": status, "details": details, "configurationId": "c1",
+            "configurationName": "something-else"}
 
 
 class FakeAICore:
@@ -74,6 +76,7 @@ class FakeAICore:
             {"id": "aws-bedrock", "parameters": [{"name": "modelName", "type": "string"}]},
         ]
         self.deployments: list[dict] = []
+        self.configurations: list[dict] = []
         self.requests: list[httpx.Request] = []
         self.posted: list[tuple[str, dict]] = []
         self.fail: dict[str, object] = {}
@@ -115,20 +118,35 @@ class FakeAICore:
         if key == "GET /v2/lm/scenarios/foundation-models/executables":
             return httpx.Response(200, json={"resources": self.executables})
         if key == "GET /v2/lm/deployments":
-            return httpx.Response(200, json={"resources": self.deployments})
+            return self.page(self.deployments, request)
+        if key == "GET /v2/lm/configurations":
+            return self.page(self.configurations, request)
         if key == "POST /v2/lm/configurations":
             body = json.loads(request.content)
             self.posted.append((path, body))
-            return httpx.Response(201, json={"id": f"cfg-{len(self.posted)}", "message": "ok"})
+            self.configurations.append({**body, "id": f"cfg-{len(self.configurations) + 1}"})
+            return httpx.Response(201, json={"id": self.configurations[-1]["id"],
+                                             "message": "ok"})
         if key == "POST /v2/lm/deployments":
             body = json.loads(request.content)
             self.posted.append((path, body))
-            did = f"dnew{len(self.posted):08d}"
-            model = next(b["parameterBindings"][0]["value"] for p, b in self.posted
-                         if p.endswith("/configurations"))
-            self.deployments.append(_deployment(model, "PENDING", did))
-            return httpx.Response(202, json={"id": did, "status": "UNKNOWN", "message": "ok"})
+            return httpx.Response(202, json={**self.add_deployment(body), "message": "ok"})
         return httpx.Response(404, text=BODY_MARKER)
+
+    def add_deployment(self, body: dict) -> dict:
+        """What a create makes: a PENDING deployment whose details name no
+        model yet, only its configuration."""
+        config = next(c for c in self.configurations if c["id"] == body["configurationId"])
+        did = f"dnew{len(self.posted):08d}"
+        self.deployments.append({"id": did, "status": "PENDING", "configurationId": config["id"],
+                                 "configurationName": config["name"]})
+        return {"id": did, "status": "UNKNOWN"}
+
+    @staticmethod
+    def page(items: list, request: httpx.Request) -> httpx.Response:
+        top = int(request.url.params.get("$top", 10_000))
+        skip = int(request.url.params.get("$skip", 0))
+        return httpx.Response(200, json={"count": len(items), "resources": items[skip:skip + top]})
 
     def api_requests(self):
         return [r for r in self.requests if r.url.host == "api.example.test"]
@@ -232,6 +250,20 @@ def test_no_usable_credentials_is_aicore_unavailable(monkeypatch, caplog, vcap):
             aid.resolve_credentials()
     assert info.value.code == "aicore_unavailable"
     assert SECRET not in str(info.value) and "https://" not in str(info.value)
+    _assert_clean(_own_log(caplog))
+
+
+def test_a_service_key_variable_is_refused_with_a_hint(monkeypatch, caplog):
+    # the SDK reads AICORE_SERVICE_KEY before everything else: answering from
+    # the binding here would deploy into another tenant than the model calls use
+    monkeypatch.setenv("VCAP_SERVICES", _binding())
+    monkeypatch.setenv("AICORE_SERVICE_KEY", json.dumps({"clientid": CLIENT_ID,
+                                                         "clientsecret": SECRET}))
+    with caplog.at_level(logging.WARNING, logger=aid.__name__):
+        with pytest.raises(AICoreError) as info:
+            aid.resolve_credentials()
+    assert info.value.code == "aicore_unavailable"
+    assert "AICORE_SERVICE_KEY" in _own_log(caplog)
     _assert_clean(_own_log(caplog))
 
 
@@ -342,7 +374,8 @@ async def test_a_401_from_ai_core_fetches_a_new_token_once():
         seen.append(request.headers["Authorization"])
         if len(seen) == 1:
             return httpx.Response(401, text=BODY_MARKER)
-        return httpx.Response(200, json={"resources": [_deployment("text-embedding-3-large")]})
+        return httpx.Response(200, json={"count": 1,
+                                         "resources": [_deployment("text-embedding-3-large")]})
 
     server.fail["GET /v2/lm/deployments"] = once
     out = await _client(server).list_deployments()
@@ -487,6 +520,111 @@ async def test_list_deployments_answers_embedding_deployments_only():
     assert request.url.params["scenarioId"] == "foundation-models"
 
 
+async def test_a_fresh_deployment_without_details_counts_under_its_configuration_name():
+    server = FakeAICore()
+    server.deployments = [
+        {"id": "d000000fresh", "status": "PENDING",
+         "configurationName": "text-embedding-3-large-embeddings"},
+        # not a configuration this module named: no model to tell
+        {"id": "d000000other", "status": "PENDING", "configurationName": "gpt-4o-embeddings"},
+        {"id": "d000000plain", "status": "PENDING", "configurationName": "my-config"},
+        # a model the details name wins over the configuration's name
+        {**_deployment("gpt-4o", "RUNNING", "d00000000gpt"),
+         "configurationName": "text-embedding-3-large-embeddings"},
+    ]
+    client = _client(server)
+    assert await client.list_deployments() == [
+        {"model": "text-embedding-3-large", "status": "PENDING", "deployment_id": "d000000fresh"}]
+    out = await client.deploy("text-embedding-3-large")
+    assert out == {"deployment_id": "d000000fresh", "status": "PENDING", "created": False}
+    assert server.posted == []
+
+
+async def test_deployments_are_read_page_by_page_until_the_count():
+    # STOPPED and DEAD deployments pile up; the RUNNING one is on page two
+    server = FakeAICore()
+    server.deployments = [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
+                          for i in range(130)]
+    server.deployments.append(_deployment("text-embedding-3-large", "RUNNING", "d0000running"))
+    client = _client(server)
+    assert len(await client.list_deployments()) == 131
+    out = await client.deploy("text-embedding-3-large")
+    assert out == {"deployment_id": "d0000running", "status": "RUNNING", "created": False}
+    assert server.posted == []
+    pages = [r.url.params for r in server.api_requests() if r.url.path == "/v2/lm/deployments"]
+    assert [(p["$top"], p.get("$skip")) for p in pages] == [("100", None), ("100", "100")] * 2
+    assert all(p["scenarioId"] == "foundation-models" for p in pages)
+
+
+def _answer(count, resources):
+    return httpx.Response(200, json={"count": count, "resources": resources})
+
+
+def _pages_ignoring_skip(request):
+    return _answer(150, [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
+                         for i in range(100)])
+
+
+def _pages_that_overlap():
+    # adds up to the count, but page two repeats half of page one: an entry
+    # removed between the reads shifted the list, and one was never seen
+    calls = []
+
+    def answer(request):
+        calls.append(1)
+        ids = range(100) if len(calls) == 1 else range(50, 100)
+        return _answer(150, [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
+                             for i in ids])
+    return answer
+
+
+def _count_that_moves():
+    # a deployment created between the two reads: page two states 151 while
+    # the two pages hold 150, so one entry on them is not the list's
+    calls = []
+
+    def answer(request):
+        calls.append(1)
+        ids = range(100) if len(calls) == 1 else range(100, 150)
+        return _answer(150 if len(calls) == 1 else 151,
+                       [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
+                        for i in ids])
+    return answer
+
+
+@pytest.mark.parametrize("answer", [
+    _pages_ignoring_skip,
+    _pages_that_overlap(),
+    _count_that_moves(),
+    lambda request: httpx.Response(200, json={"resources": []}),
+    lambda request: _answer("3", []),
+    lambda request: _answer(True, []),
+    lambda request: _answer(5, []),  # an empty page before the count is reached
+    lambda request: _answer(0, [_deployment("text-embedding-3-large")]),
+], ids=["skip-ignored", "overlap", "count-moves", "no-count", "count-text", "count-bool",
+        "short", "more-than-count"])
+async def test_pages_that_do_not_add_up_are_aicore_unavailable_and_nothing_is_made(answer,
+                                                                                caplog):
+    server = FakeAICore()
+    server.fail["GET /v2/lm/deployments"] = answer
+    with caplog.at_level(logging.DEBUG, logger=aid.__name__):
+        err = await _refused(_client(server).deploy("text-embedding-3-large"))
+    assert err.code == "aicore_unavailable"
+    assert server.posted == []
+    assert "deployment list failed" in _own_log(caplog)
+    _assert_clean(_own_log(caplog))
+
+
+async def test_more_pages_than_the_limit_are_refused(monkeypatch):
+    monkeypatch.setattr(aid, "PAGE_SIZE", 2)
+    monkeypatch.setattr(aid, "MAX_PAGES", 3)
+    server = FakeAICore()
+    server.deployments = [_deployment("text-embedding-ada-002", "STOPPED", f"d{i:011d}")
+                          for i in range(7)]
+    err = await _refused(_client(server).list_deployments())
+    assert err.code == "aicore_unavailable"
+
+
 async def test_list_deployments_failure_is_aicore_unavailable(caplog):
     server = FakeAICore()
     server.fail["GET /v2/lm/deployments"] = 503
@@ -607,6 +745,155 @@ async def test_a_failed_deployment_create_is_deploy_failed_and_never_repeated(ca
                if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
     assert len(creates) == 1
     _assert_clean(_own_log(caplog) + str(err))
+
+
+async def test_a_retry_after_a_failed_deployment_create_reuses_the_configuration():
+    server = FakeAICore()
+    server.fail["POST /v2/lm/deployments"] = 500
+    client = _client(server)
+    assert (await _refused(client.deploy("text-embedding-3-large"))).code == "deploy_failed"
+    del server.fail["POST /v2/lm/deployments"]
+    out = await client.deploy("text-embedding-3-large")
+    assert out["created"] is True
+    configs = [b for p, b in server.posted if p.endswith("/configurations")]
+    assert len(configs) == 1
+    deployment_posts = [json.loads(r.content) for r in server.requests
+                        if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
+    assert deployment_posts == [{"configurationId": "cfg-1"}, {"configurationId": "cfg-1"}]
+    configuration_lists = [r for r in server.api_requests()
+                           if r.url.path == "/v2/lm/configurations" and r.method == "GET"]
+    assert configuration_lists[0].url.params["scenarioId"] == "foundation-models"
+    assert configuration_lists[0].url.params["$top"] == "100"
+
+
+@pytest.mark.parametrize("change", [
+    {"executableId": "aws-bedrock"},
+    {"parameterBindings": [{"key": "modelName", "value": "text-embedding-3-large"}]},
+    {"parameterBindings": [{"key": "modelName", "value": "text-embedding-3-large"},
+                           {"key": "modelVersion", "value": "1"}]},
+    {"name": "text-embedding-3-large-embeddings-2"},
+    {"inputArtifactBindings": [{"key": "x", "artifactId": "a1"}]},
+    {"scenarioId": "other"},
+])
+async def test_a_configuration_that_differs_is_not_reused(change):
+    server = FakeAICore()
+    server.configurations = [{
+        "id": "cfg-old", "name": "text-embedding-3-large-embeddings",
+        "executableId": "azure-openai", "scenarioId": "foundation-models",
+        "parameterBindings": [{"key": "modelVersion", "value": "latest"},
+                              {"key": "modelName", "value": "text-embedding-3-large"}],
+        "inputArtifactBindings": [], **change}]
+    await _client(server).deploy("text-embedding-3-large")
+    assert [p for p, _ in server.posted] == ["/v2/lm/configurations", "/v2/lm/deployments"]
+    assert server.posted[1][1] == {"configurationId": "cfg-2"}
+
+
+async def test_an_equal_configuration_is_reused_whatever_the_order_of_its_bindings():
+    server = FakeAICore()
+    server.configurations = [{
+        "id": "cfg-old", "name": "text-embedding-3-large-embeddings",
+        "executableId": "azure-openai", "scenarioId": "foundation-models",
+        "parameterBindings": [{"key": "modelVersion", "value": "latest"},
+                              {"key": "modelName", "value": "text-embedding-3-large"}],
+        "inputArtifactBindings": []}]
+    out = await _client(server).deploy("text-embedding-3-large")
+    assert out["created"] is True
+    assert server.posted == [("/v2/lm/deployments", {"configurationId": "cfg-old"})]
+
+
+@pytest.mark.parametrize("lost", ["timeout", "500", "no id"])
+async def test_an_unconfirmed_create_that_was_made_is_answered_from_the_list(lost, caplog):
+    server = FakeAICore()
+
+    def made_but_lost(request):
+        server.add_deployment(json.loads(request.content))
+        if lost == "timeout":
+            raise httpx.ReadTimeout("lost")
+        if lost == "500":
+            return httpx.Response(500, text=BODY_MARKER)
+        return httpx.Response(202, json={"message": "ok"})
+
+    server.fail["POST /v2/lm/deployments"] = made_but_lost
+    with caplog.at_level(logging.DEBUG, logger=aid.__name__):
+        out = await _client(server).deploy("text-embedding-3-large")
+    assert out["created"] is True and out["status"] == "PENDING"
+    assert out["deployment_id"] == server.deployments[-1]["id"]
+    creates = [r for r in server.requests
+               if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
+    assert len(creates) == 1
+    assert "unconfirmed" in _own_log(caplog)
+    _assert_clean(_own_log(caplog))
+
+
+async def test_an_unconfirmed_create_whose_list_fails_is_deploy_failed():
+    server = FakeAICore()
+    calls = []
+
+    def listing(request):
+        calls.append(1)
+        if len(calls) > 1:
+            return httpx.Response(503)
+        return FakeAICore.page(server.deployments, request)
+
+    server.fail["GET /v2/lm/deployments"] = listing
+    server.fail["POST /v2/lm/deployments"] = 500
+    err = await _refused(_client(server).deploy("text-embedding-3-large"))
+    assert err.code == "deploy_failed"
+
+
+async def test_a_401_on_the_deployment_create_is_repeated_once_with_a_new_token():
+    server = FakeAICore()
+    tokens = []
+
+    def refused_once(request):
+        tokens.append(request.headers["Authorization"])
+        if len(tokens) == 1:
+            return httpx.Response(401, text=BODY_MARKER)
+        return httpx.Response(202, json=server.add_deployment(json.loads(request.content)))
+
+    server.fail["POST /v2/lm/deployments"] = refused_once
+    out = await _client(server).deploy("text-embedding-3-large")
+    assert out["created"] is True
+    assert tokens == ["Bearer token-1", "Bearer token-2"]
+
+
+async def test_a_second_401_on_the_deployment_create_is_deploy_failed(caplog):
+    server = FakeAICore()
+    server.fail["POST /v2/lm/deployments"] = 401
+    with caplog.at_level(logging.DEBUG, logger=aid.__name__):
+        err = await _refused(_client(server).deploy("text-embedding-3-large"))
+    assert err.code == "deploy_failed"
+    creates = [r for r in server.requests
+               if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
+    assert [r.headers["Authorization"] for r in creates] == ["Bearer token-1", "Bearer token-2"]
+    assert "HTTP 401" in _own_log(caplog)
+
+
+async def test_a_deployment_create_over_the_total_deadline_is_deploy_failed_and_sent_once(
+        monkeypatch, caplog):
+    monkeypatch.setattr(aid, "REQUEST_TIMEOUT_SECONDS", 0.05)
+    server = FakeAICore()
+
+    async def slow(request):
+        await asyncio.sleep(1)
+        return httpx.Response(202, json={"id": "dlate0000001"})
+
+    inner = server.handler
+
+    async def handler(request):
+        if request.method == "POST" and request.url.path == "/v2/lm/deployments":
+            server.requests.append(request)
+            return await slow(request)
+        return await inner(request)
+
+    client = AICoreDeployments(credentials=_creds(), transport=httpx.MockTransport(handler))
+    with caplog.at_level(logging.DEBUG, logger=aid.__name__):
+        err = await _refused(client.deploy("text-embedding-3-large"))
+    assert err.code == "deploy_failed"
+    assert "deployment create failed (deadline" in _own_log(caplog)
+    creates = [r for r in server.requests
+               if r.method == "POST" and r.url.path == "/v2/lm/deployments"]
+    assert len(creates) == 1
 
 
 async def test_a_listing_failure_during_deploy_is_aicore_unavailable_and_creates_nothing():
