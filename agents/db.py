@@ -3802,6 +3802,27 @@ def _next_odata_stamp(previous: datetime | None) -> datetime:
     return stored + timedelta(microseconds=1)
 
 
+def _warn_generic_kind(name: str) -> None:
+    """One WARNING when a write sets a service's kind to ``generic``.
+
+    The kind relaxes the catalogue's rules on trust: whatever service is
+    registered as generic gets them (a GET function import is a read, so not
+    audited and callable without ``allow_write``; a complex result reaches
+    the model whole), so who did it should show in the log. The service name
+    and the caller's principal, nothing of the body. Every writer goes
+    through `create_odata_service` / `update_odata_service` (the catalogue
+    routes, Duplicate, the bundle import), so this is said in one place.
+    """
+    from agents.auth import current_principal
+
+    logger.warning(
+        "odata service '%s' set to kind generic (GET function imports are read "
+        "without audit, complex results reach the model whole) by %s",
+        name,
+        current_principal.get() or "unknown principal",
+    )
+
+
 async def create_odata_service(
     session: AsyncSession,
     data: dict[str, Any],
@@ -3831,6 +3852,8 @@ async def create_odata_service(
             await session.flush()
     except IntegrityError:
         raise ValueError(taken) from None
+    if row.kind == "generic":
+        _warn_generic_kind(name)
     if commit:
         await session.commit()
     await session.refresh(row)
@@ -3880,8 +3903,11 @@ async def update_odata_service(
     """
     if data["name"] != row.name:
         raise ValueError("name cannot be changed; duplicate the service instead")
+    was_generic = row.kind == "generic"
     for column, value in (columns or odata_service_columns(data)).items():
         setattr(row, column, value)
+    if row.kind == "generic" and not was_generic:
+        _warn_generic_kind(row.name)
     row.updated_at = _next_odata_stamp(row.updated_at)
     if commit:
         await session.commit()
