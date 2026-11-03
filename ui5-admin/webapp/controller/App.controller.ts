@@ -25,6 +25,8 @@ const NAV_KEY_BY_ROUTE: Record<string, string> = {
     skillDetail: "skills",
     odataServices: "odataServices",
     odataServiceDetail: "odataServices",
+    inaQueries: "inaQueries",
+    inaQueryDetail: "inaQueries",
     dataCatalog: "dataCatalog",
     dataCatalogGraph: "dataCatalog",
     dataCatalogDetail: "dataCatalog",

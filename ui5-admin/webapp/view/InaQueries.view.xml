@@ -1,0 +1,90 @@
+<mvc:View
+    controllerName="com.agent.admin.controller.InaQueries"
+    xmlns="sap.m"
+    xmlns:mvc="sap.ui.core.mvc">
+    <Page id="inaQueriesPage" title="{i18n>navInaQueries}">
+        <content>
+            <!-- A failed load is said here, with a retry, so that the empty
+                 table below it cannot be read as an empty list. -->
+            <MessageStrip
+                id="inaLoadFailed"
+                visible="{view>/loadFailed}"
+                type="Error"
+                showIcon="true"
+                class="sapUiSmallMargin"
+                text="{view>/loadError}">
+                <link>
+                    <Link id="inaRetry" text="{i18n>inaRetry}" press=".onRetry" />
+                </link>
+            </MessageStrip>
+            <Table
+                id="inaQueriesTable"
+                items="{ina>/items}"
+                growing="true"
+                growingThreshold="50"
+                sticky="ColumnHeaders"
+                popinLayout="GridSmall"
+                noDataText="{ parts: ['view>/loadFailed', 'view>/query'], formatter: '.formatNoData' }">
+                <!-- Search and Create sit in the table's toolbar, as on the
+                     OData services page: the page header has no overflow
+                     handling. -->
+                <headerToolbar>
+                    <OverflowToolbar>
+                        <SearchField
+                            id="inaSearch"
+                            placeholder="{i18n>inaSearch}"
+                            liveChange=".onSearch"
+                            search=".onSearch">
+                            <layoutData>
+                                <OverflowToolbarLayoutData priority="NeverOverflow" shrinkable="true" minWidth="8rem" maxWidth="18rem" />
+                            </layoutData>
+                        </SearchField>
+                        <ToolbarSpacer />
+                        <Button
+                            id="inaCreateButton"
+                            type="Emphasized"
+                            icon="sap-icon://add"
+                            text="{i18n>inaCreate}"
+                            press=".onCreate" />
+                    </OverflowToolbar>
+                </headerToolbar>
+                <columns>
+                    <Column><Text text="{i18n>inaColTitle}" /></Column>
+                    <Column width="12rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColQuery}" /></Column>
+                    <Column width="11rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColDestination}" /></Column>
+                    <Column width="9rem" minScreenWidth="Tablet" demandPopin="true"><Text text="{i18n>inaColRunsAs}" /></Column>
+                    <Column width="7rem" minScreenWidth="Desktop" demandPopin="true"><Text text="{i18n>inaColUsedBy}" /></Column>
+                    <Column width="7rem" minScreenWidth="Desktop" demandPopin="true"><Text text="{i18n>inaColDescribed}" /></Column>
+                    <Column width="5rem" minScreenWidth="Desktop" demandPopin="true"><Text text="{i18n>inaColEnabled}" /></Column>
+                </columns>
+                <items>
+                    <ColumnListItem type="Navigation" press=".onOpen">
+                        <cells>
+                            <ObjectIdentifier title="{ina>title}" text="{ina>name}" />
+                            <VBox>
+                                <Text text="{ina>query}" />
+                                <Text text="{ina>package}" visible="{= !!${ina>package} }" class="odataHint" />
+                            </VBox>
+                            <Text text="{ina>destination}" />
+                            <ObjectStatus
+                                text="{ path: 'ina>userContext', formatter: '.formatRunsAs' }"
+                                state="{= ${ina>userContext} ? 'Information' : 'None' }" />
+                            <Text
+                                text="{ path: 'ina>usedBy', formatter: '.formatUsedBy' }"
+                                tooltip="{ path: 'ina>usedBy', formatter: '.formatUsedByNames' }" />
+                            <Text
+                                text="{ parts: ['ina>described', 'ina>describedAt'], formatter: '.formatDescribed' }"
+                                tooltip="{ parts: ['ina>described', 'ina>describedAt'], formatter: '.formatDescribedAt' }" />
+                            <!-- No value state: "Success" would tell a screen reader
+                                 that the entry was validated, which is not what
+                                 this says. The words carry it; the icon only marks it. -->
+                            <ObjectStatus
+                                text="{= ${ina>enabled} ? ${i18n>inaEnabledYes} : ${i18n>inaEnabledNo} }"
+                                icon="{= ${ina>enabled} ? 'sap-icon://accept' : '' }" />
+                        </cells>
+                    </ColumnListItem>
+                </items>
+            </Table>
+        </content>
+    </Page>
+</mvc:View>

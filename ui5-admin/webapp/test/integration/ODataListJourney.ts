@@ -122,7 +122,7 @@ opaTest("the list shows each service with its texts, version, identity, counts a
 // The detail route maps to the same item (NAV_KEY_BY_ROUTE), but the router
 // fires routeMatched only once the route's target is displayed, so that half
 // is asserted by the detail journey, which comes with the detail view.
-opaTest("the side navigation item sits between Skills and Data catalogue and is selected on the list route", function (Given: Common, When: Common, Then: Common) {
+opaTest("the side navigation item sits between Skills and Analytical queries and is selected on the list route", function (Given: Common, When: Common, Then: Common) {
     Given.iStartTheApp("odata-services");
 
     Then.waitFor({
@@ -133,8 +133,9 @@ opaTest("the side navigation item sits between Skills and Data catalogue and is 
             const keys = (navigation.getItem() as NavigationList).getItems().map((item) => item.getKey());
             const index = keys.indexOf("odataServices");
             Opa5.assert.strictEqual(keys[index - 1], "skills", "it follows Skills");
-            Opa5.assert.strictEqual(keys[index + 1], "dataCatalog", "and precedes the data catalogue");
-            Opa5.assert.strictEqual(keys[index + 2], "runs", "which precedes Job Runs");
+            Opa5.assert.strictEqual(keys[index + 1], "inaQueries", "and precedes the analytical queries");
+            Opa5.assert.strictEqual(keys[index + 2], "dataCatalog", "which precede the data catalogue");
+            Opa5.assert.strictEqual(keys[index + 3], "runs", "which precedes Job Runs");
             Opa5.assert.strictEqual(navigation.getSelectedKey(), "odataServices", "it is the selected item");
         }
     });

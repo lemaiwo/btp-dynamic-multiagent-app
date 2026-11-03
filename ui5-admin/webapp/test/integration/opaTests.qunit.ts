@@ -21,6 +21,7 @@ import "./ODataDetailJourney";
 import "./ODataEntityJourney";
 import "./ODataImportJourney";
 import "./ODataDestinationJourney";
+import "./InaJourney";
 import "./DataCatalogJourney";
 import "./RunReportJourney";
 import "./RunAutoRefreshJourney";
