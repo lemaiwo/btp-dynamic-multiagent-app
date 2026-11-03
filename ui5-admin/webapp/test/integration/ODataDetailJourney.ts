@@ -9,6 +9,8 @@ import type Panel from "sap/m/Panel";
 import type MessageStrip from "sap/m/MessageStrip";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type SegmentedButton from "sap/m/SegmentedButton";
+import type Select from "sap/m/Select";
+import type Item from "sap/ui/core/Item";
 import type SideNavigation from "sap/tnt/SideNavigation";
 import type NavigationList from "sap/tnt/NavigationList";
 import type UI5Element from "sap/ui/core/Element";
@@ -4034,6 +4036,129 @@ opaTest("a test call that is refused because the destination does not sign in as
         Opa5.assert.strictEqual(strip.type, "Error", "a failure");
         Opa5.assert.strictEqual(strip.markup, false, "as text");
         Opa5.assert.ok(strip.text.indexOf(REFUSED) !== -1, `the server's fixed text is shown: ${strip.text}`);
+    });
+    Then.iStopTheApp();
+});
+
+// --- the generic kind (ZAGENT_DATA) ------------------------------------------
+
+/** The Kind select of the page. */
+function kindOf(page: UI5Element): { key: string; state: string } {
+    const select = viewOf(page).byId("odataKind") as Select;
+    return { key: select.getSelectedKey(), state: select.getValueState() };
+}
+
+/** Picks `text` in the Kind select as a user does: opens it and presses the item. */
+function iPickKind(When: Common, text: string): void {
+    When.waitFor({
+        id: "odataKind",
+        viewName: VIEW,
+        actions: new Press(),
+        success: function (select: UI5Element) {
+            When.waitFor({
+                controlType: "sap.ui.core.Item",
+                matchers: function (item: UI5Element) {
+                    return (select as Select).getItems().indexOf(item as Item) !== -1 && (item as Item).getText() === text;
+                },
+                searchOpenDialogs: true,
+                actions: new Press(),
+                errorMessage: `No item ${text} in the Kind select`
+            });
+        },
+        errorMessage: "No Kind select"
+    });
+}
+
+opaTest("a generic service says its function imports are reads and asks nothing about Allow writes for a GET import", function (Given: Common, When: Common, Then: Common) {
+    const GENERIC = "agent-data";
+    const PUT = `PUT odata/services/${GENERIC}`;
+    const MONTHS = "Month names";
+    const WEEKDAYS = "Weekday names";
+    const STRIP = "Function imports of a generic service are reads when they are sent with GET, as ZAGENT_DATA sends them: "
+        + "they run without \"Allow writes\" and are not recorded in the audit. A generic service is always OData V2.";
+    const NOT_OFFERED = "A function import of a generic service that is sent with GET is a read whatever this flag says; "
+        + "it cannot be ticked.";
+    const importOf = (name: string, title: string, enabled: boolean) => ({
+        name, qualified_name: "", title, kind: "function_import" as const, http_method: "GET" as const, bound_to: null,
+        parameters: [{ name: "LANGUAGE", type: "Edm.String", required: true }], description: "", enabled,
+        // What an import from $metadata stores for a GET function import:
+        // the document cannot say, so it counts as changing data.
+        changes_data: true
+    });
+
+    iOpenPrepared(Given, When, GENERIC, function () {
+        backend.odataServices.push({
+            ...stored(UNUSED), id: 98, name: GENERIC, kind: "generic", title: "Agent data",
+            purpose: "Allow-listed tables and function modules of the SAP system", destination: "AGENT_DATA_A4H",
+            user_context: false, odata_version: "v2", service_path: "/sap/opu/odata/sap/ZAGENT_DATA_SRV", enabled: true,
+            used_by: [], definition: {
+                entity_sets: [],
+                operations: [importOf("MONTH_NAMES_GET", MONTHS, true), importOf("WEEKDAYS_GET", WEEKDAYS, false)]
+            }
+        });
+    });
+    iSeeTheService(Then, GENERIC, "the generic service is loaded", function (page: UI5Element) {
+        Opa5.assert.deepEqual(kindOf(page), { key: "generic", state: "None" }, "the Kind select shows Generic");
+        Opa5.assert.deepEqual(stripOf(page, "odataGenericStrip"), { visible: true, text: STRIP }, "and the strip says what it means");
+        Opa5.assert.strictEqual(formOf(page).version, "v2", "a generic service is V2");
+        Opa5.assert.strictEqual((viewOf(page).byId("odataVersion") as SegmentedButton).getEnabled(), false, "and stays so");
+        Opa5.assert.deepEqual(tagsOf(page), ["V2", "Generic", "Technical user"], "no Write tag: its one enabled import reads");
+        Opa5.assert.deepEqual(operationRow(page, MONTHS), {
+            title: MONTHS, technical: "MONTH_NAMES_GET · GET", description: "", boundTo: "Unbound", parameters: "LANGUAGE",
+            changesData: false, enabled: true, enabledState: "None", uncallable: "", note: ""
+        }, "an enabled GET import does not stand out as a write, whatever its stored flag says");
+        const item = operationItem(page, MONTHS);
+        Opa5.assert.deepEqual(changesDataOf(item), { editable: false, tooltip: NOT_OFFERED }, "Changes data is shown, not offered");
+        Opa5.assert.strictEqual(String(operationBox(item, "enabled").getTooltip()), `Enabled: ${MONTHS}`,
+            "the Enabled box names no write operation");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").visible, false, "nothing is pending");
+    });
+
+    // Enabling the second import opens a read for every agent, not a write.
+    iTickOperation(When, WEEKDAYS, "enabled");
+    iSee(Then, "the enabled import", function (page: UI5Element) {
+        return operationRow(page, WEEKDAYS).enabled;
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, WEEKDAYS).enabledState, "None", "no warning on the box");
+        Opa5.assert.deepEqual(stripOf(page, "odataPendingWrites"), {
+            visible: true, text: `${pendingRead(`the operation "${WEEKDAYS}" (WEEKDAYS_GET)`)} No agent uses this service yet.`
+        }, "the strip next to Save says it is callable without Allow writes, and names no write");
+    });
+
+    // As an OData service the same imports are writes: the kind decides.
+    iPickKind(When, "OData service");
+    iSee(Then, "the kind changed", function (page: UI5Element) {
+        return kindOf(page).key === "odata";
+    }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(stripOf(page, "odataGenericStrip").visible, false, "the strip is gone");
+        Opa5.assert.strictEqual((viewOf(page).byId("odataVersion") as SegmentedButton).getEnabled(), true, "the version can be chosen");
+        Opa5.assert.deepEqual(
+            [operationRow(page, MONTHS).changesData, operationRow(page, MONTHS).enabledState], [true, "Warning"],
+            "an enabled import is a write again"
+        );
+        Opa5.assert.strictEqual(changesDataOf(operationItem(page, MONTHS)).editable, true, "whose flag can be changed");
+        Opa5.assert.strictEqual(stripOf(page, "odataPendingWrites").text,
+            `Not saved yet: the operation "${MONTHS}" (MONTH_NAMES_GET); the operation "${WEEKDAYS}" (WEEKDAYS_GET). `
+            + "After Save, agents whose server entry has \"Allow writes\" can run this in SAP. Every write call is audited.",
+            "and both are pending writes");
+    });
+
+    // Back to Generic, and saved: the PUT carries the kind.
+    iPickKind(When, "Generic (ZAGENT_DATA)");
+    iSee(Then, "generic again", function (page: UI5Element) { return kindOf(page).key === "generic"; }, function (page: UI5Element) {
+        Opa5.assert.strictEqual(operationRow(page, MONTHS).changesData, false, "a read again");
+    });
+    iPress(When, "odataSaveButton");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.ok(messageOf(dialog).indexOf(WEEKDAYS) !== -1, `the newly callable import is asked about: ${messageOf(dialog)}`);
+        Opa5.assert.strictEqual(messageOf(dialog).indexOf(MONTHS), -1, "the stored read is not");
+    }, "the question about the read");
+    iPressInDialog(When, "Save");
+    iSee(Then, "the save", function () { return backend.countRequests(PUT) === 1; }, function () {
+        Opa5.assert.strictEqual(backend.bodies[PUT]?.kind, "generic", "the PUT carries the kind");
+        Opa5.assert.deepEqual(stored(GENERIC).definition.operations.map((o) => [o.name, o.enabled]),
+            [["MONTH_NAMES_GET", true], ["WEEKDAYS_GET", true]], "and the enabled import is stored");
+        Opa5.assert.strictEqual(stored(GENERIC).kind, "generic");
     });
     Then.iStopTheApp();
 });

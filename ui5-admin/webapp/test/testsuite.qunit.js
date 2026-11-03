@@ -17,6 +17,7 @@ sap.ui.define(function () {
             "unit/validators": { title: "Unit: validators" },
             "unit/builtins": { title: "Unit: builtins catalog" },
             "unit/odataCatalog": { title: "Unit: odataCatalog" },
+            "unit/odataKind": { title: "Unit: odataCatalog, the service kind (generic)" },
             "unit/odataEntityDialog": { title: "Unit: odataCatalog, entity set dialog" },
             "unit/odataDestinations": { title: "Unit: odataDestinations" },
             "unit/odataImport": { title: "Unit: odataCatalog, import from $metadata" },

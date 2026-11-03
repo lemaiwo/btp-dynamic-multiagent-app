@@ -141,6 +141,10 @@ export interface ODataOperationRow {
     write: boolean;
     /** Sent with POST: "Changes data" cannot be unticked. */
     post: boolean;
+    /** A function import of a generic service sent with GET: a read
+     *  whatever its flag says (`readByKind`), so "Changes data" cannot be
+     *  ticked. */
+    readByKind: boolean;
     /** Why no agent can call it although it is enabled, as an i18n key; ""
      *  when it can be called, is not enabled, or was changed on the page
      *  (the reason is about the operation as it is stored). */
@@ -158,6 +162,14 @@ export interface ODataPending {
     /** Fields that become writable for agents: marked Write on an entity
      *  set that has (or gets) Create or Update. */
     fields: ODataNewFieldWrite[];
+}
+
+/** The service kinds a comparison of two definitions is worked out with:
+ *  the stored service's and the form's (they differ once the Kind is
+ *  changed). One left out is `odata`, whose rule makes no exception. */
+export interface ODataKinds {
+    stored?: unknown;
+    current?: unknown;
 }
 
 /** Which fields the entity set dialog lists: all; those agents may read;
@@ -222,7 +234,7 @@ export interface ODataWriters {
 /** The payload fields `validate` can report on. The first six have a text
  *  field in the form; the flags and the definition can only be wrong in a
  *  payload that did not come from the form (an imported file). */
-export type ODataErrorField = "name" | "title" | "purpose" | "not_for" | "destination" | "service_path"
+export type ODataErrorField = "name" | "kind" | "title" | "purpose" | "not_for" | "destination" | "service_path"
     | "user_context" | "enabled" | "definition";
 
 /** What a save changes about whose identity reaches SAP, and through which
@@ -239,7 +251,7 @@ export interface ODataIdentityChange {
 
 /** The payload fields, in the order of `ODataServicePayload`. */
 const PAYLOAD_FIELDS: readonly (keyof ODataServiceInput)[] = [
-    "name", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
+    "name", "kind", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
     "service_path", "enabled", "definition", "metadata_fetched_at"
 ];
 
@@ -330,22 +342,41 @@ function writeOpsOf(entitySet: ODataEntitySet): ODataEntityOp[] {
     return WRITE_OPS.filter((op) => enabled.indexOf(op) !== -1);
 }
 
+/** What `operationIsWrite` reads of an operation: its flag, its method and
+ *  its own kind (`function_import`, `action`, `function`). */
+type WriteRuleInput = Pick<ODataOperation, "changes_data" | "http_method"> & { kind?: unknown };
+
 /**
- * Whether calling `operation` is a write. THE rule, the server's
- * (`operation_is_write` in agents/odata/models.py): a read is only what is marked
- * `changes_data: false` (exactly) AND is sent with GET. A missing flag does
- * not read as "only reads", and a POST is a write whatever the flag says.
- * The Write tag, the pending strip, the Save question and the duplicate
- * dialog all go through here, so they cannot disagree.
+ * Whether `operation` is a read because of the kind of its service: a
+ * function import sent with GET on a service of kind `generic` (the
+ * ZAGENT_DATA registration: SAP's allow-list owner vouches that a listed
+ * module only reads). Exactly those three values; anything else, a value
+ * not given included, is not.
  */
-function operationIsWrite(operation: Pick<ODataOperation, "changes_data" | "http_method">): boolean {
-    return !(operation.changes_data === false && operation.http_method === "GET");
+function readByKind(operation: WriteRuleInput, serviceKind: unknown): boolean {
+    return serviceKind === "generic" && operation.kind === "function_import" && operation.http_method === "GET";
+}
+
+/**
+ * Whether calling `operation` on a service of `serviceKind` is a write. THE
+ * rule, the server's (`operation_is_write(changes_data, http_method, kind,
+ * operation_kind)` in agents/odata/models.py): a read is what is marked
+ * `changes_data: false` (exactly) AND is sent with GET, or a GET function
+ * import of a generic service (`readByKind`), whatever its flag says. A
+ * missing flag does not read as "only reads", a POST is a write whatever the
+ * flag says, and a kind not given is `odata`. The Write tag, the pending
+ * strip, the Save question, the duplicate dialog, the agent's "Allow writes"
+ * (`odataEntry.opens`) and a bundle import (`importBundle`) all go through
+ * here, so they cannot disagree.
+ */
+function operationIsWrite(operation: WriteRuleInput, serviceKind: unknown = "odata"): boolean {
+    return !readByKind(operation, serviceKind) && !(operation.changes_data === false && operation.http_method === "GET");
 }
 
 /** The operations of a definition an agent with `allow_write` can run as
  *  writes: enabled, and a write by `operationIsWrite`. */
-function writeOperations(definition: ODataDefinition | undefined | null): ODataOperation[] {
-    return (definition?.operations ?? []).filter((o) => o.enabled === true && operationIsWrite(o));
+function writeOperations(definition: ODataDefinition | undefined | null, kind?: unknown): ODataOperation[] {
+    return (definition?.operations ?? []).filter((o) => o.enabled === true && operationIsWrite(o, kind));
 }
 
 function operationTitle(operation: ODataOperation): string {
@@ -355,8 +386,8 @@ function operationTitle(operation: ODataOperation): string {
 /** The operations of a definition that every agent using the service can
  *  call, with or without `allow_write`, and whose calls are not recorded
  *  in the audit: enabled, and a read by `operationIsWrite`. */
-function readOperations(definition: ODataDefinition | undefined | null): ODataOperation[] {
-    return (definition?.operations ?? []).filter((o) => o.enabled === true && !operationIsWrite(o));
+function readOperations(definition: ODataDefinition | undefined | null, kind?: unknown): ODataOperation[] {
+    return (definition?.operations ?? []).filter((o) => o.enabled === true && !operationIsWrite(o, kind));
 }
 
 /**
@@ -367,13 +398,14 @@ function readOperations(definition: ODataDefinition | undefined | null): ODataOp
  * is no longer recorded, so this is a widening like a new write, and is
  * said and asked about like one. An operation `stored` already has enabled
  * as a read is no entry, and a POST never is one: it stays a write whatever
- * its flag says.
+ * its flag says. Each side is judged by its own service kind (`kinds`), so
+ * a service switched to `generic` lists its enabled GET function imports.
  */
 function newReadOperations(
-    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null, kinds: ODataKinds = {}
 ): ODataNewOperation[] {
-    const had = readOperations(stored).map((o) => o.name);
-    return readOperations(current)
+    const had = readOperations(stored, kinds.stored).map((o) => o.name);
+    return readOperations(current, kinds.current)
         .filter((o) => had.indexOf(o.name) === -1)
         .map((o) => ({ name: o.name, title: operationTitle(o) }));
 }
@@ -418,12 +450,13 @@ function newEntityWrites(
 }
 
 function newWriteOperations(
-    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null, switchedOn: boolean
+    stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null, switchedOn: boolean,
+    kinds: ODataKinds = {}
 ): ODataNewOperation[] {
     // What agents could already run as a write: by name, and nothing when
     // the stored service was switched off.
-    const had = switchedOn ? [] : writeOperations(stored).map((o) => o.name);
-    return writeOperations(current)
+    const had = switchedOn ? [] : writeOperations(stored, kinds.stored).map((o) => o.name);
+    return writeOperations(current, kinds.current)
         .filter((o) => had.indexOf(o.name) === -1)
         .map((o) => ({ name: o.name, title: operationTitle(o) }));
 }
@@ -455,11 +488,12 @@ function uncallableKey(reason: string | undefined | null): string {
  * that the admin has switched off again would describe nothing an agent
  * meets). `stored`: the definition that reason is about; an operation that
  * is not (or no longer) as it is there shows no reason, which would be
- * about another operation than the row shows.
+ * about another operation than the row shows. `kind`: the service's kind
+ * as the form holds it, which the write rule reads.
  */
 function operationRow(
     operation: ODataOperation, index: number, definition: ODataDefinition | undefined | null,
-    uncallable: Record<string, string> = {}, stored?: ODataDefinition | null
+    uncallable: Record<string, string> = {}, stored?: ODataDefinition | null, kind?: unknown
 ): ODataOperationRow {
     const title = operationTitle(operation);
     const bound = operation.bound_to === null || operation.bound_to === undefined ? "" : operation.bound_to;
@@ -478,8 +512,9 @@ function operationRow(
         parameters: (operation.parameters ?? [])
             .map((p) => (p.required === false ? `[${p.name}]` : p.name)).join(", "),
         enabled: operation.enabled === true,
-        write: operationIsWrite(operation),
+        write: operationIsWrite(operation, kind),
         post: operation.http_method !== "GET",
+        readByKind: readByKind(operation, kind),
         uncallable: operation.enabled === true ? uncallableKey(reason) : "",
         note: "",
         label: title === operation.name ? title : `${title} (${operation.name})`
@@ -1506,30 +1541,32 @@ export default {
     },
 
     /**
-     * Whether the definition lets an agent with `allow_write` change data:
-     * an entity set with create, update or delete, or an enabled operation
-     * that is a write (`operationIsWrite`): the rule the server runs calls
-     * by, and the one behind the `has_write` flag of its answers
-     * (`operation_is_write` in agents/odata/models.py).
+     * Whether the definition of a service of `kind` lets an agent with
+     * `allow_write` change data: an entity set with create, update or
+     * delete, or an enabled operation that is a write (`operationIsWrite`):
+     * the rule the server runs calls by, and the one behind the `has_write`
+     * flag of its answers (`operation_is_write` in agents/odata/models.py).
      */
-    hasWrite(definition: ODataDefinition | undefined | null): boolean {
+    hasWrite(definition: ODataDefinition | undefined | null, kind?: unknown): boolean {
         return (definition?.entity_sets ?? []).some((e) => writeOpsOf(e).length > 0)
-            || writeOperations(definition).length > 0;
+            || writeOperations(definition, kind).length > 0;
     },
 
     operationIsWrite,
+    readByKind,
 
     writeOperations,
 
     operationRow,
 
-    /** One table row per operation, in the definition's order. */
+    /** One table row per operation, in the definition's order, for a
+     *  service of `kind`. */
     operationRows(
         definition: ODataDefinition | undefined | null, uncallable: Record<string, string> = {},
-        stored?: ODataDefinition | null
+        stored?: ODataDefinition | null, kind?: unknown
     ): ODataOperationRow[] {
         return (definition?.operations ?? []).map((operation, index) => (
-            operationRow(operation, index, definition, uncallable, stored)
+            operationRow(operation, index, definition, uncallable, stored, kind)
         ));
     },
 
@@ -1568,13 +1605,13 @@ export default {
     /**
      * What `allow_write` opens, one entry per entity set with a write
      * operation -- "Item text (create, update)" -- followed by the enabled
-     * operations that are writes, by title.
+     * operations that are writes on a service of `kind`, by title.
      */
-    writeSummary(definition: ODataDefinition | undefined | null): string[] {
+    writeSummary(definition: ODataDefinition | undefined | null, kind?: unknown): string[] {
         const entitySets = (definition?.entity_sets ?? [])
             .filter((e) => writeOpsOf(e).length > 0)
             .map((e) => `${titleOf(e)} (${writeOpsOf(e).join(", ")})`);
-        return entitySets.concat(writeOperations(definition).map(operationTitle));
+        return entitySets.concat(writeOperations(definition, kind).map(operationTitle));
     },
 
     /** How many of an entity set's fields an agent can read, of how many. */
@@ -1620,15 +1657,17 @@ export default {
      * such in `stored` (matched by name: absent, not enabled, or a read
      * there), and the fields that become writable for agents
      * (`newWritableFields`). `switchedOn`: the save also switches the
-     * stored, disabled service on, which opens every write it has.
+     * stored, disabled service on, which opens every write it has. `kinds`:
+     * the service kind of each side; a GET function import of a generic
+     * service is no write there.
      */
     pendingWrites(
         stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
-        switchedOn = false
+        switchedOn = false, kinds: ODataKinds = {}
     ): ODataPending {
         return {
             entitySets: newEntityWrites(stored, current, switchedOn),
-            operations: newWriteOperations(stored, current, switchedOn),
+            operations: newWriteOperations(stored, current, switchedOn, kinds),
             fields: newWritableFields(stored, current)
         };
     },
@@ -1638,11 +1677,13 @@ export default {
      * that uses the service call, without `allow_write` and without a
      * record in the audit (`newReadOperations`). Beside `pendingWrites`,
      * not in it: who it reaches and what it means are other sentences.
+     * `kinds` as for `pendingWrites`.
      */
     pendingReads(
-        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null
+        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
+        kinds: ODataKinds = {}
     ): ODataNewOperation[] {
-        return newReadOperations(stored, current);
+        return newReadOperations(stored, current, kinds);
     },
 
     /** The operations of `list` that `other` does not name. */
@@ -1810,11 +1851,11 @@ export default {
         };
     },
 
-    /** A new service as the form starts with it: V2, enabled, technical
-     * user, nothing in the definition. */
+    /** A new service as the form starts with it: an OData service, V2,
+     * enabled, technical user, nothing in the definition. */
     emptyService(): ODataServiceInput {
         return {
-            name: "", title: "", purpose: "", not_for: "", destination: "", user_context: false,
+            name: "", kind: "odata", title: "", purpose: "", not_for: "", destination: "", user_context: false,
             odata_version: "v2", service_path: "", enabled: true,
             definition: { entity_sets: [], operations: [] }, metadata_fetched_at: null
         };
@@ -1840,6 +1881,14 @@ export default {
         };
 
         set("name", nameProblem(input.name ?? ""));
+        // `Literal["odata", "generic"]` with a default: left out is odata;
+        // there, anything else is refused. A generic service is OData V2
+        // (`_kinds_match_version`, said at `kind`).
+        if (input.kind !== undefined && input.kind !== "odata" && input.kind !== "generic") {
+            errors.kind = "odataErrKind";
+        } else if (input.kind === "generic" && input.odata_version !== "v2") {
+            errors.kind = "odataErrKindGenericV2";
+        }
         if (!title) {
             errors.title = "odataErrTitleRequired";
         } else if (title.length > MAX_TITLE) {
@@ -1917,7 +1966,9 @@ export default {
      * The payload fields of a service, as a deep copy and without anything
      * else: a stored service carries `id`, `counts`, `used_by` and more,
      * and the server refuses a payload with a key it does not know. The
-     * definition always goes along -- a save sends the whole service.
+     * definition always goes along -- a save sends the whole service -- and
+     * so does the kind: `odata` (the server's default) when the service does
+     * not say, otherwise as it is, for the server to judge.
      */
     payloadOf(service: ODataServiceInput): ODataServiceInput {
         const source = service as unknown as Record<string, unknown>;
@@ -1925,6 +1976,9 @@ export default {
         PAYLOAD_FIELDS.forEach((field) => {
             payload[field] = source[field];
         });
+        if (payload.kind === undefined) {
+            payload.kind = "odata";
+        }
         return JSON.parse(JSON.stringify(payload)) as ODataServiceInput;
     },
 

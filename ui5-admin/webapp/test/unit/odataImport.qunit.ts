@@ -357,3 +357,27 @@ QUnit.test("a document of 200 entity sets, one of them with 500 fields, is plann
     const over = odataCatalog.importSummary({ entity_sets: mine.entity_sets.concat([entitySet("Extra", [field("ID")])]), operations: [] }, doc, all);
     assert.deepEqual(over.blocked, [{ id: "", key: "odataImportTooManySets", args: [201, 200] }], "more than a service holds is said");
 });
+
+QUnit.test("a re-import keeps the admin's title of an entity set and an operation; a new one takes SAP's label", function (assert) {
+    // ZAGENT_DATA's shape: SAP sends the PURPOSE of an allow-listed object
+    // as the `sap:label` of its entity set and of its function import.
+    const carriers = entitySet("SCARRSet", [field("CARRID"), field("CARRNAME")], { title: "Airlines (mine)" });
+    const mine: ODataDefinition = {
+        entity_sets: [carriers],
+        operations: [operation("MONTH_NAMES_GET", { title: "Months (mine)", http_method: "GET" })]
+    };
+    const doc = preview([
+        offered(carriers, "Airline carriers"), offered(entitySet("T000Set", [field("MANDT")]), "Clients of the system")
+    ], [
+        FakeBackend.previewOperation({ name: "MONTH_NAMES_GET", kind: "function_import", http_method: "GET", label: "Month names" }),
+        FakeBackend.previewOperation({ name: "WEEKDAYS_GET", kind: "function_import", http_method: "GET", label: "Weekday names" })
+    ]);
+
+    const out = odataCatalog.mergeImport(mine, doc, ["labels", "set:T000Set", "op:MONTH_NAMES_GET", "op:WEEKDAYS_GET"]);
+    assert.deepEqual(out.entity_sets.map((e) => [e.name, e.title]), [
+        ["SCARRSet", "Airlines (mine)"], ["T000Set", "Clients of the system"]
+    ], "the admin's title stays, also when empty labels are filled; the new entity set is titled by SAP's label");
+    assert.deepEqual(out.operations.map((o) => [o.name, o.title]), [
+        ["MONTH_NAMES_GET", "Months (mine)"], ["WEEKDAYS_GET", "Weekday names"]
+    ], "the same for the operations");
+});

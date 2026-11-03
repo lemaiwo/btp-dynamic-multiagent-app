@@ -889,9 +889,20 @@ export interface ODataDefinition {
 }
 
 /** What POST/PUT /admin/api/odata/services accepts (`ODataServicePayload`). */
+/**
+ * What a catalogue service is (`ODataServicePayload.kind`): a service curated
+ * from its `$metadata` (`odata`), or the generic ZAGENT_DATA registration of
+ * an SAP system (`generic`): an OData V2 service whose function imports sent
+ * with GET are reads (`odataCatalog.operationIsWrite`).
+ */
+export type ODataServiceKind = "odata" | "generic";
+
 export interface ODataServiceInput {
     /** The slug agents and server entries use. Immutable once created. */
     name: string;
+    /** Absent reads as `odata`, the server's default; `odataCatalog.payloadOf`
+     *  always sends it. */
+    kind?: ODataServiceKind;
     title: string;
     purpose: string;
     not_for: string;

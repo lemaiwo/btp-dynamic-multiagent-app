@@ -9,7 +9,8 @@ import type { ImportResult, McpServer, ODataDefinition } from "../service/types"
  * in SAP, read from the bundle itself before anything is sent.
  *
  * Pure rules, no controls. The write rule is the catalogue's
- * (`odataCatalog.writeSummary`, which goes through `operationIsWrite`) and
+ * (`odataCatalog.writeSummary`, which goes through `operationIsWrite`, with
+ * the service's kind as the bundle gives it) and
  * the entry rule is the agent page's (`odataEntry.isODataUrl`, `allow_write`
  * only as the JSON boolean `true`): nothing is decided here a second time.
  * Every text of a bundle is untrusted: it is cut to one line
@@ -23,7 +24,7 @@ export interface BundleService {
     title: string;
     userContext: boolean;
     destination: string;
-    /** `odataCatalog.writeSummary` of its definition. */
+    /** `odataCatalog.writeSummary` of its definition, by its kind. */
     writes: string[];
 }
 
@@ -97,7 +98,10 @@ function serviceOf(raw: Record<string, unknown>): BundleService {
         title: label(raw.title) || label(raw.name),
         userContext: userContext === true,
         destination: label(raw.destination),
-        writes: odataCatalog.writeSummary(definitionOf(raw.definition)).map(label)
+        // The kind as the bundle has it: only exactly "generic" makes a GET
+        // function import a read, and the import's gate refuses any other
+        // value but "odata".
+        writes: odataCatalog.writeSummary(definitionOf(raw.definition), raw.kind).map(label)
     };
 }
 

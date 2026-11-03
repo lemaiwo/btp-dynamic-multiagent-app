@@ -46,6 +46,25 @@ QUnit.test("opens: each service with identity, destination and its writes by the
     });
 });
 
+QUnit.test("opens: a generic service's GET function imports are no writes; any other kind keeps the rule", function (assert) {
+    const imports = {
+        entity_sets: [],
+        operations: [
+            { name: "MONTHS", title: "Months", kind: "function_import", enabled: true, http_method: "GET", changes_data: true },
+            { name: "UNMARKED", title: "Unmarked", kind: "function_import", enabled: true, http_method: "GET" },
+            { name: "NO_KIND", title: "No kind", enabled: true, http_method: "GET" },
+            { name: "POSTED", title: "Posted", kind: "function_import", enabled: true, http_method: "POST" }
+        ]
+    };
+    const writes = (kind: unknown) => importBundle.opens({
+        odata_services: [service({ kind, definition: imports })]
+    })!.services[0].writes;
+    assert.deepEqual(writes("generic"), ["No kind", "Posted"], "only exactly a GET function import is a read there");
+    assert.deepEqual(writes("odata"), ["Months", "Unmarked", "No kind", "Posted"]);
+    assert.deepEqual(writes(undefined), ["Months", "Unmarked", "No kind", "Posted"], "no kind: odata");
+    assert.deepEqual(writes("Generic"), ["Months", "Unmarked", "No kind", "Posted"], "nor any other spelling");
+});
+
 QUnit.test("opens: the agents whose OData entry has Allow writes as the JSON boolean true", function (assert) {
     const entry = (allow: unknown, url = "builtin:odata") => ({ url, auth_mode: "destination", oauth: { services: ["a", "b"], allow_write: allow } });
     const found = importBundle.opens({

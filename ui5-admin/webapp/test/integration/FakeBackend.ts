@@ -548,23 +548,28 @@ export default class FakeBackend {
         input: ODataServiceInput, usedBy: ODataUsedBy[] = []
     ): ODataService {
         return {
-            ...input, id: this.nextId++, created_at: "2026-10-05T08:00:00+00:00",
+            ...input, kind: input.kind ?? "odata", id: this.nextId++, created_at: "2026-10-05T08:00:00+00:00",
             updated_at: "2026-10-05T08:00:00+00:00",
             counts: { entity_sets: 0, operations: 0 }, has_write: false, used_by: usedBy
         };
     }
 
-    /** `ODataService.to_dict()`: counts and has_write follow the definition. */
+    /** `ODataService.to_dict()`: counts and has_write follow the definition,
+     *  and `kind` is always there (`odata` for a row stored without one). */
     private static odataDict(service: ODataService): ODataService {
         const definition: ODataDefinition = service.definition;
         const writes: ODataEntityOp[] = ["create", "update", "delete"];
+        const kind = service.kind ?? "odata";
         return {
             ...service,
+            kind,
             counts: { entity_sets: definition.entity_sets.length, operations: definition.operations.length },
             has_write: definition.entity_sets.some((e) => e.operations.some((op) => writes.indexOf(op) !== -1))
                 // `operation_is_write` in agents/odata/models.py: a read is
-                // only `changes_data: false` (exactly) sent with GET.
+                // `changes_data: false` (exactly) sent with GET, or a GET
+                // function import of a generic service, whatever its flag.
                 || definition.operations.some((o) => o.enabled === true
+                    && !(kind === "generic" && o.kind === "function_import" && o.http_method === "GET")
                     && !(o.changes_data === false && o.http_method === "GET")),
             uncallable_operations: FakeBackend.odataUncallable(service)
         };
@@ -624,7 +629,7 @@ export default class FakeBackend {
     private static readonly ODATA_NAME_MSG = "String should match pattern '^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'";
     private static readonly ODATA_DESTINATION_MSG = "String should match pattern '^[A-Za-z0-9_.-]{1,200}$'";
     private static readonly ODATA_PAYLOAD_KEYS = [
-        "name", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
+        "name", "kind", "title", "purpose", "not_for", "destination", "user_context", "odata_version",
         "service_path", "enabled", "definition", "metadata_fetched_at"
     ];
     private static readonly ODATA_DUPLICATE_KEYS = ["name", "title", "destination", "user_context"];
@@ -956,6 +961,10 @@ export default class FakeBackend {
         FakeBackend.odataText(data, "name", true, (v) => (
             FakeBackend.ODATA_NAME_RE.test(v) ? "" : FakeBackend.ODATA_NAME_MSG
         ), problems);
+        // `Literal["odata", "generic"] = "odata"`: left out is odata.
+        if (data.kind !== undefined && data.kind !== "odata" && data.kind !== "generic") {
+            problems.push("kind: Input should be 'odata' or 'generic'");
+        }
         // Stripped, measured, and only then held to one line: what
         // surrounds a title or purpose is gone before `_one_line` runs.
         FakeBackend.odataText(data, "title", true, (v) => (
@@ -983,6 +992,11 @@ export default class FakeBackend {
         flag("enabled");
         FakeBackend.odataDefinitionProblems(data.definition).forEach((problem) => problems.push(problem));
         FakeBackend.odataExtras(data, FakeBackend.ODATA_PAYLOAD_KEYS, problems);
+        // `_kinds_match_version`, an after-validator: it runs only on a
+        // payload whose fields all passed, and says it at `kind`.
+        if (!problems.length && data.kind === "generic" && data.odata_version !== "v2") {
+            problems.push("kind: a generic service is OData V2");
+        }
         return problems;
     }
 
@@ -1021,7 +1035,8 @@ export default class FakeBackend {
     private static odataInput(body: Record<string, unknown> | undefined): ODataServiceInput {
         const input = (body ?? {}) as Partial<ODataServiceInput>;
         return {
-            name: String(input.name), title: FakeBackend.odataStrip(String(input.title)),
+            name: String(input.name), kind: input.kind === "generic" ? "generic" : "odata",
+            title: FakeBackend.odataStrip(String(input.title)),
             purpose: FakeBackend.odataStrip(String(input.purpose)), not_for: input.not_for ?? "",
             destination: String(input.destination), user_context: input.user_context === true,
             odata_version: input.odata_version === "v4" ? "v4" : "v2",

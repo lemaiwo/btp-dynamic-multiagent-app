@@ -34,12 +34,13 @@ import type Page from "sap/m/Page";
 import type Table from "sap/m/Table";
 import type SearchField from "sap/m/SearchField";
 import type SegmentedButton from "sap/m/SegmentedButton";
+import type Select from "sap/m/Select";
 import type ListBinding from "sap/ui/model/ListBinding";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
 import type {
     ODataDefinition, ODataEntityOp, ODataEntitySet, ODataMetadataRequest, ODataOperation, ODataService,
-    ODataServiceInput, ODataServiceUpdate, ODataTestResult, ODataUsedBy
+    ODataServiceInput, ODataServiceKind, ODataServiceUpdate, ODataTestResult, ODataUsedBy
 } from "../service/types";
 
 const ROUTE = "odataServiceDetail";
@@ -55,6 +56,7 @@ const FORM_FIELDS: readonly { field: ODataErrorField; id: string }[] = [
     { field: "purpose", id: "odataPurpose" },
     { field: "not_for", id: "odataNotFor" },
     { field: "destination", id: "odataDestination" },
+    { field: "kind", id: "odataKind" },
     { field: "service_path", id: "odataServicePath" }
 ];
 
@@ -63,6 +65,9 @@ interface DuplicateState {
     name: string;
     destination: string;
     user_context: boolean;
+    /** The source's kind, which the copy keeps (`DuplicateBody` cannot
+     *  change it): shown, and the writes are worked out by it. */
+    kind: ODataServiceKind;
     /** Field -> message. */
     errors: Record<string, string>;
     /** A refusal that names neither field. */
@@ -455,7 +460,8 @@ export default class ODataServiceDetail extends ODataController {
             // with every load and save.
             test: null,
             duplicate: {
-                name: "", destination: "", user_context: false, errors: {}, error: "", unsaved: false, writes: ""
+                name: "", destination: "", user_context: false, kind: "odata", errors: {}, error: "", unsaved: false,
+                writes: ""
             }
         };
     }
@@ -889,11 +895,13 @@ export default class ODataServiceDetail extends ODataController {
     /**
      * The Write tag: the stored service lets an agent with "Allow writes"
      * change data. By the rule the Save question goes by
-     * (`odataCatalog.hasWrite`), worked out from the definition the page
-     * holds as stored.
+     * (`odataCatalog.hasWrite`), worked out from the definition and the
+     * kind the page holds as stored.
      */
-    public formatWriteTag(exists: boolean | undefined, definition: ODataDefinition | undefined): boolean {
-        return exists === true && odataCatalog.hasWrite(definition);
+    public formatWriteTag(
+        exists: boolean | undefined, definition: ODataDefinition | undefined, kind: ODataServiceKind | undefined
+    ): boolean {
+        return exists === true && odataCatalog.hasWrite(definition, kind);
     }
 
     /** The copy button says when it copies write operations. */
@@ -1007,8 +1015,14 @@ export default class ODataServiceDetail extends ODataController {
     }
 
     /** What the Changes data box switches -- or, for an operation that is
-     *  sent with POST, why it cannot be switched. */
-    public formatChangesDataTooltip(label: string | undefined, title: string | undefined, post: boolean | undefined): string {
+     *  sent with POST or is a read by the service's kind, why it cannot be
+     *  switched. */
+    public formatChangesDataTooltip(
+        label: string | undefined, title: string | undefined, post: boolean | undefined, readByKind?: boolean
+    ): string {
+        if (readByKind === true) {
+            return this.text("odataChangesDataGeneric");
+        }
         return post === true ? this.text("odataChangesDataPost") : this.formatOperationOf(label, title);
     }
 
@@ -1062,7 +1076,12 @@ export default class ODataServiceDetail extends ODataController {
      * Update is on. Switching a stored, disabled service on opens all it has.
      */
     private newWrites(stored: ODataServiceInput): ODataPending {
-        return odataCatalog.pendingWrites(stored.definition, this.definition(), this.switchesOn(stored));
+        return odataCatalog.pendingWrites(stored.definition, this.definition(), this.switchesOn(stored), this.kinds(stored));
+    }
+
+    /** The kind of `stored` and the form's: the write rule of each side. */
+    private kinds(stored: ODataServiceInput): { stored: unknown; current: unknown } {
+        return { stored: stored.kind, current: this.data().kind };
     }
 
     /** Whether saving the form switches the stored, disabled service on. */
@@ -1144,7 +1163,7 @@ export default class ODataServiceDetail extends ODataController {
      * (`odataCatalog.pendingReads`).
      */
     private newReads(stored: ODataServiceInput): ODataNewOperation[] {
-        return odataCatalog.pendingReads(stored.definition, this.definition());
+        return odataCatalog.pendingReads(stored.definition, this.definition(), this.kinds(stored));
     }
 
     /**
@@ -1586,7 +1605,7 @@ export default class ODataServiceDetail extends ODataController {
         const rows = model.getProperty("/loaded") === true
             ? odataCatalog.operationRows(
                 this.definition(), model.getProperty("/uncallable") as Record<string, string>,
-                this.original().definition
+                this.original().definition, this.data().kind
             )
             : [];
         model.setProperty("/opRows", rows);
@@ -1622,7 +1641,7 @@ export default class ODataServiceDetail extends ODataController {
         model.setProperty(`/opRows/${index}`, {
             ...odataCatalog.operationRow(
                 operation, index, this.definition(), model.getProperty("/uncallable") as Record<string, string>,
-                this.original().definition
+                this.original().definition, this.data().kind
             ),
             note
         });
@@ -1778,6 +1797,15 @@ export default class ODataServiceDetail extends ODataController {
             return;
         }
         const model = this.svc();
+        if (odataCatalog.readByKind(operation, this.data().kind)) {
+            // A read by the kind of the service whatever its flag says: the
+            // box is shown, not offered (it would claim a write).
+            this.resetOperationBox(box);
+            const reason = this.text("odataChangesDataGeneric");
+            this.showOperation(operation, reason);
+            InvisibleMessage.getInstance().announce(reason, InvisibleMessageMode.Assertive);
+            return;
+        }
         if (tick) {
             operation.changes_data = true;
             this.showOperation(operation);
@@ -1996,6 +2024,25 @@ export default class ODataServiceDetail extends ODataController {
         this.clearTest();
         this.showUsedBy();
         this.checkDestination(true, undefined, true);
+    }
+
+    /**
+     * The Kind select: an OData service or the generic ZAGENT_DATA
+     * registration. A generic service is OData V2 (the server refuses it
+     * otherwise), so the version follows; and its GET function imports are
+     * reads, so the operations and what is pending are worked out again.
+     */
+    public onKindChange(event: Event): void {
+        const model = this.svc();
+        const kind: ODataServiceKind = (event.getSource() as Select).getSelectedKey() === "generic" ? "generic" : "odata";
+        model.setProperty("/data/kind", kind);
+        if (kind === "generic") {
+            model.setProperty("/data/odata_version", "v2");
+        }
+        model.setProperty("/errors/kind", "");
+        model.setProperty("/saveError", "");
+        this.showOperations();
+        this.showPendingWrites(true);
     }
 
     public onVersionChange(event: Event): void {
@@ -2432,10 +2479,13 @@ export default class ODataServiceDetail extends ODataController {
 
     /** Every write `definition` holds, as the duplicate dialog lists them:
      *  the server copies the definition whole, writes included. */
-    private copiedWrites(definition: ODataDefinition): string {
+    private copiedWrites(definition: ODataDefinition, kind: ODataServiceKind | undefined): string {
         // The operations, as the dialog's sentence says; which fields
-        // they can send is part of the definition that is copied.
-        return this.writeList({ ...odataCatalog.pendingWrites(undefined, definition), fields: [] });
+        // they can send is part of the definition that is copied. The copy
+        // keeps the kind, so its writes are judged by it.
+        return this.writeList({
+            ...odataCatalog.pendingWrites(undefined, definition, false, { current: kind }), fields: []
+        });
     }
 
     /**
@@ -2452,7 +2502,8 @@ export default class ODataServiceDetail extends ODataController {
         const stored = this.original();
         const state: DuplicateState = {
             name: "", destination: stored.destination, user_context: stored.user_context,
-            errors: {}, error: "", unsaved: this.isDirty(), writes: this.copiedWrites(stored.definition)
+            kind: stored.kind === "generic" ? "generic" : "odata",
+            errors: {}, error: "", unsaved: this.isDirty(), writes: this.copiedWrites(stored.definition, stored.kind)
         };
         model.setProperty("/duplicate", state);
 
@@ -2524,7 +2575,8 @@ export default class ODataServiceDetail extends ODataController {
         try {
             const name = this.serviceName;
             const fresh = await this.withBusy(() => this.getAdminService().getODataService(name));
-            const writes = this.copiedWrites(fresh.definition);
+            const writes = this.copiedWrites(fresh.definition, fresh.kind);
+            model.setProperty("/duplicate/kind", fresh.kind === "generic" ? "generic" : "odata");
             if (writes !== state.writes) {
                 this.setWorking(false);
                 // With no write left there is no list to point at.

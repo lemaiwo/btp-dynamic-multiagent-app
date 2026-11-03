@@ -26,6 +26,13 @@
                     tooltip="{i18n>odataTagSavedTooltip}"
                     visible="{svc>/exists}" />
                 <ObjectStatus
+                    id="odataTagKind"
+                    text="{i18n>odataTagGeneric}"
+                    state="Information"
+                    inverted="true"
+                    tooltip="{i18n>odataTagSavedTooltip}"
+                    visible="{= ${svc>/exists} &amp;&amp; ${svc>/original/kind} === 'generic' }" />
+                <ObjectStatus
                     id="odataTagRunsAs"
                     text="{ path: 'svc>/original/user_context', formatter: '.formatRunsAs' }"
                     state="{ path: 'svc>/original/user_context', formatter: '.formatRunsAsState' }"
@@ -37,7 +44,7 @@
                     text="{i18n>odataTagWrite}"
                     state="Warning"
                     inverted="true"
-                    visible="{ parts: ['svc>/exists', 'svc>/original/definition'], formatter: '.formatWriteTag' }" />
+                    visible="{ parts: ['svc>/exists', 'svc>/original/definition', 'svc>/original/kind'], formatter: '.formatWriteTag' }" />
                 <ObjectStatus
                     id="odataTagDisabled"
                     text="{i18n>odataTagDisabled}"
@@ -337,11 +344,41 @@
                             class="odataHint" />
                     </VBox>
 
+                    <!-- What the service is: one curated from its $metadata, or
+                         the generic ZAGENT_DATA registration of an SAP system,
+                         whose objects SAP's allow-list names. A generic service
+                         is OData V2, so the version below follows it, and its
+                         GET function imports are reads, which the strip says. -->
+                    <Label id="odataKindLabel" text="{i18n>odataKind}" labelFor="odataKind" />
+                    <VBox>
+                        <Select
+                            id="odataKind"
+                            selectedKey="{svc>/data/kind}"
+                            change=".onKindChange"
+                            valueState="{ path: 'svc>/errors/kind', formatter: '.formatErrorState' }"
+                            valueStateText="{svc>/errors/kind}"
+                            ariaLabelledBy="odataKindLabel">
+                            <items>
+                                <core:Item key="odata" text="{i18n>odataKindOData}" />
+                                <core:Item key="generic" text="{i18n>odataKindGeneric}" />
+                            </items>
+                        </Select>
+                        <MessageStrip
+                            id="odataGenericStrip"
+                            visible="{= ${svc>/data/kind} === 'generic' }"
+                            type="Information"
+                            showIcon="true"
+                            class="sapUiTinyMarginTop"
+                            text="{i18n>odataGenericStrip}" />
+                    </VBox>
+
                     <Label id="odataVersionLabel" text="{i18n>odataVersion}" labelFor="odataVersion" />
                     <SegmentedButton
                         id="odataVersion"
                         selectedKey="{svc>/data/odata_version}"
                         selectionChange=".onVersionChange"
+                        enabled="{= ${svc>/data/kind} !== 'generic' }"
+                        tooltip="{= ${svc>/data/kind} === 'generic' ? ${i18n>odataVersionGeneric} : '' }"
                         ariaLabelledBy="odataVersionLabel">
                         <items>
                             <SegmentedButtonItem key="v2" text="{i18n>odataVersionV2}" />
@@ -684,13 +721,14 @@
                                 <Text text="{ path: 'svc>boundTo', formatter: '.formatBoundTo' }" />
                                 <Text text="{svc>parameters}" class="odataFieldName" />
                                 <!-- Sent with POST it is a write whatever
-                                     the flag says: the box is shown, not
-                                     offered, and says why. -->
+                                     the flag says, and a GET function import
+                                     of a generic service a read: the box is
+                                     shown, not offered, and says why. -->
                                 <CheckBox
                                     selected="{ path: 'svc>write', mode: 'OneWay' }"
                                     enabled="{= !${svc>/busy} }"
-                                    editable="{= !${svc>post} }"
-                                    tooltip="{ parts: ['i18n>odataColChangesData', 'svc>title', 'svc>post'], formatter: '.formatChangesDataTooltip' }"
+                                    editable="{= !${svc>post} &amp;&amp; !${svc>readByKind} }"
+                                    tooltip="{ parts: ['i18n>odataColChangesData', 'svc>title', 'svc>post', 'svc>readByKind'], formatter: '.formatChangesDataTooltip' }"
                                     ariaLabelledBy="odataOpNameChanges odataOperationRowName"
                                     app:flag="changes_data"
                                     select=".onToggleChangesData" />
