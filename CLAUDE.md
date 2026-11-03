@@ -314,7 +314,14 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   deployments were not affected). `_get_stream_options` no longer strips
   `stream_options` (AI Core accepts `include_usage`, checked on the three
   deployed model families); `AICORE_STREAM_USAGE=0` strips it again for a
-  deployment that refuses it (`tests/test_model_usage.py`)
+  deployment that refuses it (`tests/test_model_usage.py`).
+  `_discover_deployed_models(refresh=False)` lists the deployed model names from
+  gen_ai_hub's proxy client (one per process, its list read from AI Core only while
+  empty): the chat's `available_models()` reads that list (`[]` on a failure, logged
+  with the traceback); `refresh=True` (the data catalogue, after `note_running`)
+  reads AI Core again through `client.update_deployments()` and answers `None` on a
+  failure, logged by exception class only (gen_ai_hub's traceback names the AI API
+  host)
 - `agents/oauth2.py` — per-user OAuth2 authorization_code for
   `auth_mode="oauth2"`: `PerUserOAuth2Auth` (httpx auth that attaches/
   refreshes the user's token, raises `OAuthAuthorizationRequired`),
@@ -1407,22 +1414,43 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   row and the discovered deployments, 10 minutes each (an empty or failed discovery
   60 s, `EMPTY_CACHE_SECONDS`), reset by a save (`reset_caches`; an epoch keeps a read
   that a save overtook out of the cache); another app instance sees a save after its
-  own 10 minutes. Every fresh AI Core deployment list (the status, the `PUT`, the
-  run) goes to `note_running`, which drops a cached discovery that disagrees about
-  the RUNNING embedding models, so a deployment that reached RUNNING is the model in
-  effect at once for Automatic. Embedding goes through
+  own 10 minutes. Discovery reads gen_ai_hub's proxy client, ONE instance per process
+  whose list of deployments is read from AI Core only while it is empty, so a
+  deployment that reaches RUNNING later is not in it and our cache reset does not
+  change that. Every fresh AI Core deployment list (the status, the `PUT`'s check,
+  the run when no model resolves) goes to `note_running`: when the cached discovery
+  disagrees about the RUNNING embedding models, or there is none since the last
+  reset, it drops the cache and sets `_refresh_next`, and the next discovery calls
+  `_discover_deployed_models(refresh=True)` (`client.update_deployments()`), so a
+  deployment that reached RUNNING is the model in effect at the next read, for the
+  admin's model as for Automatic. The flag is cleared only once such a refresh
+  answered and no note or reset overtook it: a refresh that fails (`None`) is asked
+  again (after the 60 s a failed discovery is cached); a save does not clear it.
+  Embedding goes through
   `gen_ai_hub`'s `AsyncOpenAI(proxy_client=...).embeddings`; only names, labels,
   purpose, synonyms and examples of `EMBEDDED_KINDS` (source, entity, function, query)
   are embedded, never data and never fields. `refresh_vectors(db, scope=, model=,
   on_progress=, commit_batches=)` embeds what is stale (`_changed`: no vector of the
-  model or an old text hash) in batches of 64; the import and startup path holds one
-  transaction and does not commit (a failure writes nothing), the admin's run passes
-  `commit_batches` (each batch committed once embedded: a failure at batch n keeps
-  the batches before it, the next run sends only what is still stale) and re-resolves
-  the model before each write and before the drop (a save that changed it ends the
-  run as `ModelChanged`, nothing more written or dropped); a refresh of ALL nodes that
-  did not fail also deletes the vectors of every other model (the startup rebuild
-  too).
+  model or an old text hash) in batches of 64. **One embed-and-write at a time per
+  process**: an `asyncio.Lock` (`_writing()`, one per event loop) covers reading what
+  is stale, the embedding calls and the commit, so a catalogue or hint save, the
+  startup rebuild and the admin's run never send the same nodes twice nor write the
+  same `(node_id, model)` from two transactions (another app instance is not
+  covered). The import and startup path writes in one transaction that it commits
+  before it releases the lock (a failure writes nothing) and replaces a re-sent
+  node's vectors of every model; the admin's run passes `commit_batches`
+  (`_refresh_in_batches`: the lock per batch, the batch's nodes and hashes read again
+  under it so what a save embedded meanwhile is not sent again; each batch committed
+  once embedded and replacing vectors of the run's model only, so a failure or a
+  `ModelChanged` at batch n keeps the batches before it AND every node's vector of
+  the previous model; the next run sends only what is still stale) and checks the
+  model before each write and before the drop (`_still_in_effect`: a save that
+  changed it ends the run as `ModelChanged`, nothing more written or dropped; a check
+  that cannot tell, an unreadable setting or an empty discovery, is tried once more
+  and the run goes on with its model, the admin's or the environment's model being
+  compared by name). A refresh of ALL nodes that did not fail also deletes the
+  vectors of every other model (the startup rebuild too); the admin's run skips that
+  drop when its last check could not tell.
   **`embedding_routes.py`** (`/admin/api/data-catalog/embeddings`, included by
   `agents/admin.py` after the catalogue router, every route `require_admin`, raw JSON
   <= 4 KB through `routes._json_body`, registered on the bare prefix: no trailing
@@ -1435,27 +1463,39 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   still answers 200 with both lists empty, so no deploy is offered for a model whose
   live state is unknown); the lists are read before the model is resolved and
   cached 10 s, a failed read as well); `PUT` `{enabled, model}` (both required, `enabled` strictly
-  boolean, `model` 1..128 characters or `null`; a model must be in `list_deployments()`,
-  read fresh, any status, else 422 `model: not a deployed embedding model`; AI Core
-  unreachable with a model: 502) answers the status; `POST /run` (no body or `{}`,
-  reads the lists too) 202 `{running: true}`, 409 while a run is in flight or when no
-  model is in effect (then with `X-Embeddings-Error: no_model`);
+  boolean, `model` 1..128 characters or `null`) answers the status; AI Core is asked
+  only when it switches on with a model other than the stored one: that model must be
+  in `list_deployments()`, read fresh, any status, else 422 `model: not a deployed
+  embedding model` (AI Core unreachable then: 502); switching off or keeping the
+  stored model never asks AI Core, so a deleted deployment or an unreachable AI Core
+  cannot keep an admin from switching off; `POST /run` (no body or `{}`) 202
+  `{running: true}`, 409 while a run is in flight or when no model is in effect (then
+  with `X-Embeddings-Error: no_model`); it reads the AI Core lists ONLY when no model
+  resolves (a deployment may have reached RUNNING since) and resolves once more after
+  them;
   `POST /deploy` `{model}`: the name is checked (`EMBEDDING_MODEL_RE`) and must be
   offered by `list_models()` (else 422 `model: not an embedding model AI Core offers`,
   nothing logged), then ONE WARNING `AI Core deployment of <model> requested by
   <principal> in resource group <rg>` (it bills), then `deploy(model)` in its own task,
-  awaited through `asyncio.shield` for at most 150 s (`DEPLOY_WAIT_SECONDS`; a client
-  that goes away does not cancel it); 202 `{deployment_id, status, created}`,
+  awaited through `asyncio.shield` for at most 300 s (`DEPLOY_WAIT_SECONDS`: a deploy
+  makes at least six AI API calls of up to 30 s each plus the token, the lists' further
+  pages and a re-read after an unconfirmed create; a client that goes away does not
+  cancel it); 202 `{deployment_id, status, created}`,
   idempotent (a live deployment of the model is answered, nothing created);
   `model_unknown` is a 422, every other failure a 502 with a fixed text and the code
   (`aicore_unavailable`, `token_failed`, `deploy_failed`) in `X-Embeddings-Error`;
   one INFO line with the answer; the lists cache is dropped after every deploy; the
   lifespan waits at most 15 s for deploys in flight (`drain_deploys`, never cancels
-  them: a create may already be with AI Core; one WARNING for what still runs). No
+  them: a create may already be with AI Core; one WARNING for what still runs), side
+  by side with the IDE approvals' drain (`asyncio.gather`: CF kills 10 s after
+  SIGTERM). No
   undeploy route (an ops step in AI Core). **`embedding_run.py`**: one run per
   process (`start` is a synchronous check-and-set; the task is created in the request
-  context), `progress` `{done, total}` and `last_run` `{started_at, finished_at,
-  model, embedded` (the committed batches)`, error_class}` in memory (gone at a
+  context; a save's or the startup rebuild's embedding takes turns with its batches
+  through the lock above), `progress` `{done, total}` (`done` counts nodes dealt
+  with) and `last_run` `{started_at, finished_at, model, embedded` (the vectors it
+  wrote; after a failure the nodes of the committed batches)`, error_class}` in
+  memory (gone at a
   restart, not shared between instances; the vectors are rows and survive), cancelled
   at shutdown (`cancel_all` in the lifespan: `finished_at` null, `error_class`
   `CancelledError`). `search.py`
@@ -1584,8 +1624,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `deploy_failed`. A log line names the step and the status or exception class,
   never a body, a URL, a token or a credential (httpx's own INFO request line, which
   names the AI API host, is held back by `app.py` raising the `httpx` logger to
-  WARNING). `default_client()` is the per-process client that holds the token (a
-  FastAPI `Depends`), `reset()` is for tests. Never run against a real AI Core
+  WARNING). `default_client()` is the per-process client that holds the token, built at
+  the first call of the module functions, `reset()` is for tests. Never run against a real AI Core
   (`tests/test_aicore_deployments.py` on `httpx.MockTransport`; the scripted AI Core,
   which answers `count` as the total, as the page length or not at all, is
   `tests/aicore_helpers.py`). 693 lines: the credential resolution is the split
