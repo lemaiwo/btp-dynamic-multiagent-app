@@ -114,8 +114,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   exactly `{"url": "builtin:ina", "auth_mode": "destination", "oauth":
   {"queries": [...]}}` (`_clean_ina_entry`, dispatched from
   `_clean_destination`: 1 to 50 slugs through `check_query_names`, repeats
-  dropped, every other key refused without its value; no destination and no
-  `user_context`: those belong to each registered query); `prepare_servers`
+  dropped, every other key DROPPED; the save-time gate `_validate_ina_entry`
+  in `agents/admin.py` is the one that refuses another key, without its
+  value; no destination and no `user_context`: those belong to each
+  registered query); `prepare_servers`
   stores the canonical URL, requires `destination` mode and refuses a second
   entry in any spelling (`INA_SINGLE_ENTRY_MESSAGE`); `check_ina_queries`
   (`upsert_agent` and the admin update route, next to
@@ -988,7 +990,13 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   refuses V4 at `kind`: `kind: a generic service is OData V2`); the catalogue
   imports it as `source_kind` `generic`. The service name is unique across
   both kinds, so `("odata", name)` and `("generic", name)` name one row
-  everywhere (registry, catalogue routes, rebuild). **Verified locally only**,
+  everywhere (registry, catalogue routes, rebuild). The relaxation trusts
+  whatever service is registered as generic: its GET function imports become
+  unaudited reads (callable without `allow_write`) and its complex results
+  reach the model whole, so every write that sets or changes a service's kind
+  to `generic` (create, update, Duplicate, the bundle import: the CRUD in
+  `agents/db.py`, `_warn_generic_kind`) is one WARNING naming the service and
+  the caller's principal, never the body. **Verified locally only**,
   against the recorded `$metadata` of A4H's `ZAGENT_DATA_SRV`
   (`tests/fixtures/odata/zagent_data_metadata.xml`): A4H is not reachable
   from BTP, and no landscape has the ABAP package yet. Tools are denied in
@@ -1130,7 +1138,10 @@ SAP AI Core's Generative AI Hub is the LLM provider.
     moved (lock, compare, write in one transaction); without it (absent or
     `null`) the `PUT` replaces unconditionally, as API clients and scripts
     may, and each such save is one WARNING line naming the service and the
-    caller's principal, never the body (both UIs always send it); `DELETE` answers 409 while
+    caller's principal, never the body (both UIs always send it); a `PUT`
+    is a whole replace, so one without `kind` resets it to `odata` (the
+    stricter direction: a UI that edits a generic service must send it);
+    `DELETE` answers 409 while
     any agent, enabled or not, attaches the service. After the commit, a
     `PUT` or `DELETE` of a service that is in use (an agent row attaches it,
     or the running build still holds a copy of it) rebuilds the registry and
@@ -1359,12 +1370,16 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   stays 0: no record says whose 0 it was). **A kind flip** odata ↔ generic re-keys the
   nodes in place (`_follow_kind`, one conditional `UPDATE` of `source_kind`), so ids,
   hints, vectors and drawn links survive it; `("odata", n)` and `("generic", n)` are
-  one handle for `rebuild`. **Cross-kind links** (`_link_same_objects`, pass 2, on
-  names, never on data): `same_object` between an InA query `2C<view>` and a generic
-  entity `<view>` or an odata entity type `<view>` / `<view>Type` (compared
-  upper-cased: repository names are case-insensitive, a CDS entity's OData type keeps
-  camel case), and between a generic entity (table name) and an odata entity type of
-  exactly that name (exact case, as pass 1); one edge per pair. **Curated edges**: a
+  one handle for `rebuild`. **Cross-kind links** (`links.py`, `link_same_objects`,
+  pass 2, on names, never on data; re-exported by `importer.py`): a generic entity is
+  the object its entity TYPE names, never its set (`ZCL_AGENT_DATA_MODEL` serves
+  `<OBJ>` as the set `<OBJ>Set` of `ZAGENT_DATA_SRV.<OBJ>`; a set without a type joins
+  nothing across kinds); `same_object` between an InA query `2C<view>` and a generic
+  entity of the object `<view>` or an odata entity type `<view>` / `<view>Type`
+  (compared upper-cased: repository names are case-insensitive, a CDS entity's OData
+  type keeps camel case), and between a generic entity and an odata entity type of
+  exactly its object's name (exact case, as pass 1, which under SAP's naming already
+  joins the two); one edge per pair. **Curated edges**: a
   re-import never deletes an edge with `curated_at` (a node that disappears takes its
   edges); one link per kind per pair, so a drawn `same_object` keeps the import's
   `same_object` of that pair out (`_curated_pairs`), a drawn `aggregates` leaves it.
@@ -1382,9 +1397,12 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   allowed sources BEFORE scoring (no leak of unattached sources through ranking or
   empty results; an edge to a node outside the scope is dropped; `CANDIDATE_KINDS`
   entity, function, query; `CHILD_KINDS` field, dimension, measure feed the boost and
-  `keys`); `scope.py`: an agent's scope is its own `builtin:odata` services and
-  `builtin:ina` queries (`allowed_sources_of`, `listed_names`), and `node_sources`
-  widens `("odata"|"generic", n)` to both catalogue kinds (the name is unique in
+  `keys`; an InA query is answered, as a candidate and as a relation's end, under its
+  registration's slug, never its InA object name: the slug is what `run_query` takes);
+  `scope.py`: an agent's scope is its own `builtin:odata` services and
+  `builtin:ina` queries (`allowed_sources_of`, `listed_names`; a row with more than
+  one `builtin:ina` entry has no InA source, as the registry builds none), and
+  `node_sources` widens `("odata"|"generic", n)` to both catalogue kinds (the name is unique in
   `odata_services`, so it names the one row; an InA query of the same slug stays
   apart). `tool.py`: the toolset `data-catalog` with `find_data_source(question)` (≤ 5
   candidates with hints, keys and one-hop relations, drawn links named like imported
@@ -1392,7 +1410,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   `registry.build_orchestrator` to every specialist with at least one usable OData
   service or InA query; above `DATA_CATALOG_INDEX_MAX` (10) sources of either kind the
   `## OData services` / `## Analytical queries` blocks become a `## Data sources`
-  heading naming the two tools and the OData tools, the InA tools or both
+  heading naming the two tools and the OData tools, the InA tools or both, and with
+  an InA entry the line "pass the returned name as `query` to `run_query`"
   (`_data_catalog_instructions(count, odata_prefixes, ina_prefixes)`). `routes.py`
   (`/admin/api/data-catalog`, each route `require_admin`, raw JSON ≤ 64 KB, 422
   `<field>: <rule>`; an id is `_row_id`: `[0-9]{1,10}` and ≤ 2^31-1, else 404):
@@ -1428,7 +1447,8 @@ SAP AI Core's Generative AI Hub is the LLM provider.
   but `field`: `DEFAULT_GRAPH_KINDS` in `model/dataCatalog.ts`; see `ui5-admin/`).
   `tests/test_data_catalog.py`, `tests/test_data_catalog_kinds.py` (generic and InA
   import, the routes per kind, the edge routes), `tests/test_data_catalog_links.py`
-  (kind flip, look-alike names, cross-kind scope, curated edges against re-imports).
+  (kind flip, look-alike names, SAP's generic naming for rules (a) and (b) against the
+  recorded `$metadata`, cross-kind scope, curated edges against re-imports).
   Embeddings never run against a real AI Core yet
 - `agents/jira_tools.py` — in-process Jira tools over REST v2
   (`builtin:jira`), reached through a destination. JQL is built server-side

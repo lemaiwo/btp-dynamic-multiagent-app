@@ -1661,8 +1661,9 @@ def _catalogue_part(signature: Any) -> list[Any]:
 
 
 def _entry_signatures(rows: Any) -> dict[str, Any]:
-    """``{agent name: _entry_signature}`` of the agents that have OData or
-    Bitbucket access at all: what an import compares before and after."""
+    """``{agent name: _entry_signature}`` of the agents that have OData,
+    InA, Bitbucket or Git access at all: what an import compares before and
+    after."""
     out: dict[str, Any] = {}
     for row in rows:
         signature = _entry_signature(row.mcp_servers, row.enabled)
