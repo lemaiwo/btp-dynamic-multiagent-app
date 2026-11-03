@@ -432,3 +432,39 @@ async def test_the_script_names_a_query_without_a_name_by_its_position(capsys):
     failed = await script.import_bundle({"ina_queries": [qry(name=f"Bad {SECRET}")]})
     out = capsys.readouterr().out
     assert failed == ["#1"] and "FAIL   ina query #1: name: " in out and SECRET not in out
+
+
+async def test_the_import_is_one_writer_from_its_first_statement(client, monkeypatch, caplog):
+    """On SQLite nothing locks a row: ``api_import`` takes the write lock at
+    its first statement, once, so the reads of every section are those the
+    writes act on, and no write in it asks again (no WARNING)."""
+    from tests.odata_helpers import service_payload
+
+    await create(client, qry(), qry(STOCK))
+    r = await client.post("/admin/api/odata/services", json=service_payload())
+    assert r.status_code == 201, r.text
+    order: list[str] = []
+    real_begin, real_list = admin.begin_exclusive_write, admin.list_agents
+
+    async def begin(session):
+        order.append("begin")
+        return await real_begin(session)
+
+    async def list_agents_spy(session):
+        order.append("list_agents")
+        return await real_list(session)
+
+    monkeypatch.setattr(admin, "begin_exclusive_write", begin)
+    monkeypatch.setattr(admin, "list_agents", list_agents_spy)
+    bundle = {
+        "skills": [{"name": "s1", "description": "d", "content": "c"}],
+        "odata_services": [service_payload(title="Changed")],
+        "ina_queries": [qry(title="A"), qry(STOCK, title="B"), qry("third")],
+        "agents": [agent(queries=[SALES, "third"])],
+    }
+    with caplog.at_level(logging.WARNING):
+        r = await client.post(IMPORT, json=bundle)
+    assert r.status_code == 200, r.text
+    assert r.json()["updated_ina_queries"] == 2 and r.json()["created_ina_queries"] == 1
+    assert order[:2] == ["begin", "list_agents"] and order.count("begin") == 1
+    assert "begin_exclusive_write" not in caplog.text

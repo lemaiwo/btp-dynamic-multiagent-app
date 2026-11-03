@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -382,11 +383,23 @@ async def reload_after_catalogue_change(
     return outcome
 
 
-async def _reload_if_in_use(names: Any, referrers: dict[str, Any], what: str) -> dict[str, bool]:
+def _holds_odata_service(live: Any, name: str) -> bool:
+    return live.holds_odata_service(name)
+
+
+async def _reload_if_in_use(
+    names: Any,
+    referrers: dict[str, Any],
+    what: str,
+    holds: Callable[[Any, str], bool] = _holds_odata_service,
+) -> dict[str, bool]:
+    """Rebuild when one of ``names`` is in use: an agent row names it
+    (``referrers``) or the running build holds a copy of it (``holds(live,
+    name)``; the InA queries' routes pass ``holds_ina_query``)."""
     live = _live_registry()
     if live is None:
         return dict(NOT_RELOADED)
-    if not any(referrers.get(name) or live.holds_odata_service(name) for name in names):
+    if not any(referrers.get(name) or holds(live, name) for name in names):
         return dict(NOT_RELOADED)
     return await reload_running_agents(what)
 

@@ -50,17 +50,15 @@ from pydantic import ValidationError
 from pydantic_ai.toolsets import FunctionToolset
 
 from agents.destination import DestinationError
-from agents.destination_auth import destination_http_client
 from agents.errors import mask_text
 from agents.odata.models import DESTINATION_NAME_RE
-from agents.odata.session import NoCookieJar
 
 # The OData toolset's closer and frame locator, not copies: one way to close a
 # toolset's clients and one way to say where an error was raised.
 from agents.odata.tools import _Clients, _origin
 
 from . import BUILTIN_INA_URL
-from .client import DEFAULT_TOP, MAX_TOP, InaClient, InaSessionStore
+from .client import DEFAULT_TOP, MAX_TOP, InaClient, InaSessionStore, build_ina_http_client
 from .errors import InaError
 from .models import InaDefinition
 from .protocol import fits_name, plan_run
@@ -313,17 +311,16 @@ def ina_toolset(
             from agents.destination import connectivity_from_environment
 
             shared["connectivity"] = connectivity or connectivity_from_environment()
-        http = destination_http_client(
+        # Shared by every user of the agent: the SAP session of each identity
+        # lives in `sessions`, never in the client's jar.
+        http = build_ina_http_client(
             resolver,
             user_context=user_context,
             server_key=key,
-            transport=transport,
             connectivity=shared["connectivity"],
+            transport=transport,
             proxy_transport=proxy_transport,
         )
-        # Shared by every user of the agent: the SAP session of each identity
-        # lives in `sessions`, never in the client's jar.
-        http.cookies = NoCookieJar()  # type: ignore[assignment]
         closer.clients.append(http)
         entry.client = InaClient(
             http,

@@ -68,6 +68,7 @@ from agents.destination_auth import (
     PROXY_REFUSED_TEXT,
     DestinationRefused,
     DestinationUserRequired,
+    destination_http_client,
     went_through_proxy,
 )
 from agents.odata.session import (
@@ -161,6 +162,42 @@ class InaSessionStore(CsrfSessionStore):
         if hit is not None:
             self._capabilities.move_to_end(digest)
         return hit
+
+
+# -- the HTTP client ---------------------------------------------------------
+
+
+def build_ina_http_client(
+    resolver: Any,
+    *,
+    user_context: bool,
+    server_key: str,
+    connectivity: Any,
+    transport: httpx.AsyncBaseTransport | None = None,
+    proxy_transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    """The HTTP client of a registered query's calls, for the agent tools
+    and the admin Describe and Test alike: one way to route a query's
+    credential.
+
+    Built for the connectivity route (``destination_http_client(...,
+    connectivity=...)``): an OnPremise destination goes through the proxy,
+    and ``connectivity`` None says "no binding", so such a destination is
+    refused with a text that names it. The cookie jar stores nothing: the
+    SAP session of each identity lives in an :class:`InaSessionStore`,
+    never in a client another identity may share. ``transport`` and
+    ``proxy_transport`` are the test seams of the two sides.
+    """
+    http = destination_http_client(
+        resolver,
+        user_context=user_context,
+        server_key=server_key,
+        transport=transport,
+        connectivity=connectivity,
+        proxy_transport=proxy_transport,
+    )
+    http.cookies = NoCookieJar()  # type: ignore[assignment]
+    return http
 
 
 # -- the client ------------------------------------------------------------
@@ -584,4 +621,5 @@ __all__ = [
     "InaClient",
     "InaDescription",
     "InaSessionStore",
+    "build_ina_http_client",
 ]

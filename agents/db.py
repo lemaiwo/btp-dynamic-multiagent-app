@@ -4142,11 +4142,13 @@ async def update_ina_query(
     moves forward on every call (`_next_odata_stamp`), also when no field
     changed.
 
-    ``write_locked``: the caller's transaction already serialises this write
-    and holds the row, so no `begin_exclusive_write` is asked for -- which
-    in an open transaction would take no lock and log a WARNING per call. A
-    bundle import, which read every query with ``list_ina_queries(lock=True)``
-    and writes without ``expected_updated_at``.
+    ``write_locked``: the caller has taken what serialises this write
+    already -- on SQLite `begin_exclusive_write` at its transaction's first
+    statement, on Postgres and HANA the row lock of a read such as
+    ``list_ina_queries(lock=True)`` -- so none is asked for here: in an open
+    transaction `begin_exclusive_write` takes no lock and logs a WARNING per
+    call. The bundle import (`agents.admin.api_import`), which writes
+    without ``expected_updated_at``.
     """
     payload = _ina_payload(data)
     if not write_locked:

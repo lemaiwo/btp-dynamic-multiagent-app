@@ -14,6 +14,8 @@ the OData catalogue's test route.
   theirs, ``agents.ina.tools``), InA client and session store, closed when
   it ends: nothing an agent later uses is warmed, and no SAP session of the
   admin outlives the call in this app.
+* **Two at a time.** ``MAX_CONCURRENT_CALLS`` per app instance; a third
+  is refused at once (:class:`Busy`), as the OData preview's ``busy`` is.
 * **One clock.** ``CALL_BUDGET_SECONDS`` for the whole call (GetServerInfo,
   GetResponse and the one repeat after a stale token), checked with
   ``expired()`` so a timeout of the client's own is not taken for it.
@@ -40,11 +42,10 @@ import httpx
 
 from agents.auth import current_jwt, current_principal
 from agents.destination import DestinationError, connectivity_from_environment
-from agents.destination_auth import DestinationRefused, destination_http_client, resolver_for
+from agents.destination_auth import DestinationRefused, resolver_for
 from agents.odata.preview import DESTINATION_TEXT, PREVIEW_BUDGET_SECONDS, plain
-from agents.odata.session import NoCookieJar
 
-from .client import InaClient, InaSessionStore
+from .client import InaClient, InaSessionStore, build_ina_http_client
 from .errors import InaError
 from .protocol import InaDescription
 
@@ -67,6 +68,18 @@ VARIABLE_REQUIRED_TEXT = (
     "the destination, the identity and the query"
 )
 _FAILED_TEXT = "the call could not be completed; the application log has the reason"
+# At most this many Describe and Test calls at a time per app instance: each
+# opens a stateful InA session in SAP that lives until SAP times it out.
+MAX_CONCURRENT_CALLS = 2
+BUSY_TEXT = (
+    f"{MAX_CONCURRENT_CALLS} Describe or Test calls are running already; try again in a moment"
+)
+_slots = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
+
+
+class Busy(Exception):
+    """Every call slot is taken: the route answers 429 with the code ``busy``,
+    which is the route's own and not one of the InA client's codes."""
 
 
 # --------------------------------------------------------------------- seams
@@ -104,21 +117,20 @@ class _Wire:
 
 
 def _http_client(stored: dict[str, Any], wire: _Wire) -> httpx.AsyncClient:
-    """A client through the stored query's destination, built as the tools
-    build theirs, plus a hook that notes the status of each answer."""
+    """A client through the stored query's destination, the tools' own
+    (`build_ina_http_client`), plus a hook that notes each answer's status."""
 
     async def arrived(response: httpx.Response) -> None:
         wire.status = response.status_code
 
-    http = destination_http_client(
+    http = build_ina_http_client(
         _resolver(stored["destination"]),
         user_context=stored["user_context"] is True,
         server_key=f"{SERVER_KEY}/{stored['name']}",
-        transport=_transport(),
         connectivity=_connectivity(),
+        transport=_transport(),
         proxy_transport=_proxy_transport(),
     )
-    http.cookies = NoCookieJar()  # type: ignore[assignment]
     hooks = http.event_hooks
     http.event_hooks = {
         "request": list(hooks.get("request", [])),
@@ -145,6 +157,28 @@ def _log(
     )
 
 
+def _open(stored: dict[str, Any], wire: _Wire, action: str) -> httpx.AsyncClient:
+    """`_http_client`, with a failure to build it -- the destination, the
+    resolver -- as ``destination_error``. Only here: an error of the same
+    classes from inside the InA client is not the destination's, and its
+    text may hold what was sent or answered."""
+    try:
+        return _http_client(stored, wire)
+    except (DestinationError, ValueError) as exc:
+        # ValueError: `resolver_for` on an empty name. The text can quote the
+        # destination service's answer: to the log only, URLs masked.
+        logger.warning(
+            "ina %s: destination '%s' of query '%s' could not be used (%s): %s",
+            action,
+            stored["destination"],
+            stored["name"],
+            type(exc).__name__,
+            plain(str(exc), 300),
+        )
+        text = exc.admin_text if isinstance(exc, DestinationRefused) else DESTINATION_TEXT
+        raise InaError("destination_error", text) from None
+
+
 async def _call(
     stored: dict[str, Any],
     action: str,
@@ -152,10 +186,24 @@ async def _call(
 ) -> tuple[_Result, int | None, int]:
     """Run ``work`` with an InA client of the stored query (``to_export``):
     ``(result, status, duration_ms)``, or the :class:`InaError` of the
-    refusal. ``test`` hands the client the stored definition; ``describe``
-    reads a new one."""
-    wire = _Wire()
+    refusal; :class:`Busy` when ``MAX_CONCURRENT_CALLS`` run already (no
+    ``await`` lies between the check and the take). ``test`` hands the
+    client the stored definition; ``describe`` reads a new one."""
     started = time.monotonic()
+    if _slots.locked():
+        _log(action, stored, "busy", None, started)
+        raise Busy(BUSY_TEXT)
+    async with _slots:
+        return await _call_in_slot(stored, action, work, started)
+
+
+async def _call_in_slot(
+    stored: dict[str, Any],
+    action: str,
+    work: Callable[[InaClient], Awaitable[_Result]],
+    started: float,
+) -> tuple[_Result, int | None, int]:
+    wire = _Wire()
     clock: asyncio.Timeout | None = None
     user_context = stored["user_context"] is True
     try:
@@ -163,7 +211,7 @@ async def _call(
             # Before anything is resolved: no call to the destination service
             # on behalf of nobody, and never a fall-back to its own credential.
             raise InaError("user_token_required", USER_REQUIRED_TEXT)
-        http = _http_client(stored, wire)
+        http = _open(stored, wire, action)
         try:
             client = InaClient(
                 http,
@@ -187,19 +235,6 @@ async def _call(
             )
         else:
             refusal = InaError("unreachable", "SAP could not be reached")
-    except (DestinationError, ValueError) as exc:
-        # ValueError: `resolver_for` on an empty name. The text can quote the
-        # destination service's answer: to the log only, URLs masked.
-        logger.warning(
-            "ina %s: destination '%s' of query '%s' could not be used (%s): %s",
-            action,
-            stored["destination"],
-            stored["name"],
-            type(exc).__name__,
-            plain(str(exc), 300),
-        )
-        text = exc.admin_text if isinstance(exc, DestinationRefused) else DESTINATION_TEXT
-        refusal = InaError("destination_error", text)
     except Exception as exc:  # noqa: BLE001 - a defect; its text may quote an answer
         logger.error("ina %s: query '%s' failed (%s)", action, stored["name"], type(exc).__name__)
         refusal = InaError("destination_error", _FAILED_TEXT)
@@ -248,7 +283,10 @@ async def run_test_read(stored: dict[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "BUSY_TEXT",
     "CALL_BUDGET_SECONDS",
+    "MAX_CONCURRENT_CALLS",
+    "Busy",
     "SERVER_KEY",
     "USER_REQUIRED_TEXT",
     "VARIABLE_REQUIRED_TEXT",

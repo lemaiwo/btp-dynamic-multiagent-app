@@ -57,7 +57,6 @@ from agents.odata.admin_routes import (
     _json_object,
     _model_body,
     _refuse,
-    reload_running_agents,
 )
 from agents.odata.preview import plain
 
@@ -154,25 +153,24 @@ async def _stored(name: str) -> tuple[dict[str, Any], Any]:
 # ---------------------------------------------------------------------- reload
 
 
+def _holds_ina_query(live: Any, name: str) -> bool:
+    return live.holds_ina_query(name)
+
+
 async def reload_if_in_use(names: Any, referrers: dict[str, Any], what: str) -> dict[str, bool]:
     """Rebuild the running agents after a COMMITTED change of the queries
     ``names`` when one of them is in use: ``{reloaded, reload_failed}``.
 
-    The OData catalogue's rule (`odata_routes.reload_after_catalogue_change`):
+    The OData catalogue's rule and code (`odata_routes._reload_if_in_use`):
     the registry hands every ``builtin:ina`` toolset a copy of its queries
     when it is built, so an edit that closes something (a query disabled,
     another identity, a new description) would otherwise wait for somebody
     to press Reload. "In use" is an agent row naming the query
     (``referrers``, enabled or not) or the running build holding a copy of
-    it. A rebuild that fails is ``reload_failed: true``, never raised
-    (`reload_running_agents`); it reaches only this app instance.
+    it. A rebuild that fails is ``reload_failed: true``, never raised; it
+    reaches only this app instance.
     """
-    live = odata_routes._live_registry()
-    if live is None:
-        return dict(NOT_RELOADED)
-    if not any(referrers.get(name) or live.holds_ina_query(name) for name in names):
-        return dict(NOT_RELOADED)
-    return await reload_running_agents(what)
+    return await odata_routes._reload_if_in_use(names, referrers, what, holds=_holds_ina_query)
 
 
 async def reload_after_query_change(
@@ -186,6 +184,16 @@ async def reload_after_query_change(
 
     await rebuild_safely([("ina", name) for name in names], what=what)
     return outcome
+
+
+def _busy() -> HTTPException:
+    """429 while ``admin_calls.MAX_CONCURRENT_CALLS`` Describe or Test calls
+    run: the code ``busy`` (the OData preview's), a fixed text."""
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=admin_calls.BUSY_TEXT,
+        headers={ERROR_HEADER: "busy"},
+    )
 
 
 def _refusal(exc: InaError) -> HTTPException:
@@ -336,14 +344,16 @@ async def api_describe_ina_query(name: str, request: Request) -> dict[str, Any]:
     holds), ``skipped`` (how many odd names were left out),
     ``metadata_fetched_at``, and ``reloaded`` / ``reload_failed``: a new
     description of a query in use rebuilds the running agents, whose tools
-    answer the stored one, and its data catalogue source.
+    answer the stored one, and its data catalogue source; one equal to the
+    stored description rebuilds nothing.
 
     The description is stored only over the row it was read for: when the
     query changed while SAP was asked (another destination, a save of the
     form) the answer is 409 and nothing is written; a query deleted
-    meanwhile is 404. Refusals (``X-Ina-Error``): 424
-    ``user_token_required``, 504 ``timeout``, 502 for every other code of
-    the client, and for a description the gate would not take (``sap_error``).
+    meanwhile is 404. Refusals (``X-Ina-Error``): 429 ``busy`` (two calls
+    run already), 424 ``user_token_required``, 504 ``timeout``, 502 for
+    every other code of the client, and for a description the gate would
+    not take (``sap_error``).
     """
     name = _query_name(name)
     stored, loaded_at = await _stored(name)
@@ -352,8 +362,11 @@ async def api_describe_ina_query(name: str, request: Request) -> dict[str, Any]:
         description = await admin_calls.read_description(stored)
     except InaError as exc:
         raise _refusal(exc) from None
+    except admin_calls.Busy:
+        raise _busy() from None
     definition = description.definition
-    payload = {**stored, "definition": definition.model_dump(mode="json")}
+    described = definition.model_dump(mode="json")
+    payload = {**stored, "definition": described}
     # No stamp: one is given now, the moment the definition is stored.
     payload["metadata_fetched_at"] = None
     async with SessionLocal() as session:
@@ -366,16 +379,26 @@ async def api_describe_ina_query(name: str, request: Request) -> dict[str, Any]:
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"Query '{name}' was changed while it was described; describe it again",
             ) from None
-        except ValueError:
-            # The gate's text names a position of SAP's answer: the log has it.
-            logger.warning("ina describe: the description of query '%s' was refused", name)
+        except ValueError as e:
+            # The gate names the field and the rule, never a value: the log
+            # gets its text, the admin a fixed one.
+            logger.warning(
+                "ina describe: the description of query '%s' was refused: %s", name, e
+            )
             raise _refusal(InaError("sap_error", _STORE_TEXT)) from None
         if row is None:
             raise HTTPException(status_code=404, detail=_NOT_FOUND)
         used_by = await ina_query_referrers(session, name)
         fetched_at = row.to_export()["metadata_fetched_at"]
         await session.commit()
-    outcome = await reload_after_query_change([name], used_by, f"InA query '{name}' described")
+    if described == stored["definition"]:
+        # SAP describes what the agents already hold: only the stamp moved,
+        # which neither the tools nor the data catalogue read.
+        outcome = dict(NOT_RELOADED)
+    else:
+        outcome = await reload_after_query_change(
+            [name], used_by, f"InA query '{name}' described"
+        )
     return {
         "dimensions": len(definition.dimensions),
         "measures": len(definition.measures),
@@ -407,7 +430,7 @@ async def api_test_ina_query(name: str, request: Request) -> dict[str, Any]:
     Answer, HTTP 200: ``{ok: true, status, duration_ms, columns}`` --
     ``status`` the HTTP status of SAP's last answer, ``columns`` the names
     of the result's columns. A test that failed is an error answer with the
-    client's code in ``X-Ina-Error``, as for Describe.
+    client's code in ``X-Ina-Error``, as for Describe (429 ``busy`` too).
     """
     name = _query_name(name)
     stored, _ = await _stored(name)
@@ -416,3 +439,5 @@ async def api_test_ina_query(name: str, request: Request) -> dict[str, Any]:
         return await admin_calls.run_test_read(stored)
     except InaError as exc:
         raise _refusal(exc) from None
+    except admin_calls.Busy:
+        raise _busy() from None

@@ -83,6 +83,7 @@ from agents.db import (
     SessionLocal,
     agent_referrers,
     agent_where_used,
+    begin_exclusive_write,
     bitbucket_approves,
     check_bitbucket_approver_reach,
     check_delegation_name_collision,
@@ -2744,9 +2745,13 @@ async def _import_ina_queries(
     (`agents.db.upsert_ina_query`). An entry without the ``definition`` key
     keeps the stored description.
 
-    Every query row is locked first, after the catalogue's (the same order
-    in every import), so a write in this transaction needs no write lock of
-    its own (``write_locked``).
+    Serialised like a route's write, in the two ways a database offers:
+    every query row is locked by the first read, after the catalogue's (the
+    same order in every import; Postgres, HANA), and ``api_import`` made the
+    whole transaction a writer at its first statement (SQLite,
+    `begin_exclusive_write`). So an update here asks for no write lock of
+    its own (``write_locked``), which in this open transaction could take
+    none.
     """
     result = _CatalogueImport()
     section = _bounded_section(
@@ -2924,6 +2929,12 @@ async def api_import(payload: ImportPayload = Body(...)) -> dict[str, Any]:
     ina_identity_changes: list[dict[str, Any]] = []
     async with SessionLocal() as session:
         try:
+            # On SQLite, which has no row locks, the whole import is one
+            # writer from its first statement: what it reads (the catalogue,
+            # the queries, the agents) cannot change before it writes. On
+            # Postgres and HANA this does nothing; the row locks of the
+            # sections' first reads serialise it there.
+            await begin_exclusive_write(session)
             existing_agents = {r.name: r for r in await list_agents(session)}
             # Taken now: the rows are changed in place by the loop below.
             odata_before = _entry_signatures(existing_agents.values())
