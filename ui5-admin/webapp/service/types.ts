@@ -888,7 +888,6 @@ export interface ODataDefinition {
     operations: ODataOperation[];
 }
 
-/** What POST/PUT /admin/api/odata/services accepts (`ODataServicePayload`). */
 /**
  * What a catalogue service is (`ODataServicePayload.kind`): a service curated
  * from its `$metadata` (`odata`), or the generic ZAGENT_DATA registration of
@@ -897,6 +896,7 @@ export interface ODataDefinition {
  */
 export type ODataServiceKind = "odata" | "generic";
 
+/** What POST/PUT /admin/api/odata/services accepts (`ODataServicePayload`). */
 export interface ODataServiceInput {
     /** The slug agents and server entries use. Immutable once created. */
     name: string;

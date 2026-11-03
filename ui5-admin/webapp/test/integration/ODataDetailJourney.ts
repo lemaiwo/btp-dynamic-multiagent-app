@@ -9,8 +9,6 @@ import type Panel from "sap/m/Panel";
 import type MessageStrip from "sap/m/MessageStrip";
 import type ObjectStatus from "sap/m/ObjectStatus";
 import type SegmentedButton from "sap/m/SegmentedButton";
-import type Select from "sap/m/Select";
-import type Item from "sap/ui/core/Item";
 import type SideNavigation from "sap/tnt/SideNavigation";
 import type NavigationList from "sap/tnt/NavigationList";
 import type UI5Element from "sap/ui/core/Element";
@@ -4042,31 +4040,10 @@ opaTest("a test call that is refused because the destination does not sign in as
 
 // --- the generic kind (ZAGENT_DATA) ------------------------------------------
 
-/** The Kind select of the page. */
-function kindOf(page: UI5Element): { key: string; state: string } {
-    const select = viewOf(page).byId("odataKind") as Select;
-    return { key: select.getSelectedKey(), state: select.getValueState() };
-}
-
-/** Picks `text` in the Kind select as a user does: opens it and presses the item. */
-function iPickKind(When: Common, text: string): void {
-    When.waitFor({
-        id: "odataKind",
-        viewName: VIEW,
-        actions: new Press(),
-        success: function (select: UI5Element) {
-            When.waitFor({
-                controlType: "sap.ui.core.Item",
-                matchers: function (item: UI5Element) {
-                    return (select as Select).getItems().indexOf(item as Item) !== -1 && (item as Item).getText() === text;
-                },
-                searchOpenDialogs: true,
-                actions: new Press(),
-                errorMessage: `No item ${text} in the Kind select`
-            });
-        },
-        errorMessage: "No Kind select"
-    });
+/** The Kind choice of the page and the texts it offers. */
+function kindOf(page: UI5Element): { key: string; items: string[] } {
+    const choice = viewOf(page).byId("odataKind") as SegmentedButton;
+    return { key: choice.getSelectedKey(), items: choice.getItems().map((item) => item.getText()) };
 }
 
 opaTest("a generic service says its function imports are reads and asks nothing about Allow writes for a GET import", function (Given: Common, When: Common, Then: Common) {
@@ -4098,7 +4075,9 @@ opaTest("a generic service says its function imports are reads and asks nothing 
         });
     });
     iSeeTheService(Then, GENERIC, "the generic service is loaded", function (page: UI5Element) {
-        Opa5.assert.deepEqual(kindOf(page), { key: "generic", state: "None" }, "the Kind select shows Generic");
+        Opa5.assert.deepEqual(kindOf(page), {
+            key: "generic", items: ["OData service", "Generic (ZAGENT_DATA)"]
+        }, "the Kind shows Generic");
         Opa5.assert.deepEqual(stripOf(page, "odataGenericStrip"), { visible: true, text: STRIP }, "and the strip says what it means");
         Opa5.assert.strictEqual(formOf(page).version, "v2", "a generic service is V2");
         Opa5.assert.strictEqual((viewOf(page).byId("odataVersion") as SegmentedButton).getEnabled(), false, "and stays so");
@@ -4121,12 +4100,18 @@ opaTest("a generic service says its function imports are reads and asks nothing 
     }, function (page: UI5Element) {
         Opa5.assert.strictEqual(operationRow(page, WEEKDAYS).enabledState, "None", "no warning on the box");
         Opa5.assert.deepEqual(stripOf(page, "odataPendingWrites"), {
-            visible: true, text: `${pendingRead(`the operation "${WEEKDAYS}" (WEEKDAYS_GET)`)} No agent uses this service yet.`
+            visible: true,
+            text: `Not saved yet, enabled as a read of this generic service: the operation "${WEEKDAYS}" (WEEKDAYS_GET). `
+                + "After Save, every agent that uses this service can call it, also without \"Allow writes\", and its calls "
+                + "are not recorded in the audit. No agent uses this service yet."
         }, "the strip next to Save says it is callable without Allow writes, and names no write");
+        Opa5.assert.strictEqual(announced(),
+            `the operation "${WEEKDAYS}" (WEEKDAYS_GET) will be enabled as a read by Save: callable without "Allow writes" `
+            + "and not recorded in the audit.", "and so does the announcement");
     });
 
     // As an OData service the same imports are writes: the kind decides.
-    iPickKind(When, "OData service");
+    iChoose(When, "odataKind", "odata");
     iSee(Then, "the kind changed", function (page: UI5Element) {
         return kindOf(page).key === "odata";
     }, function (page: UI5Element) {
@@ -4144,14 +4129,18 @@ opaTest("a generic service says its function imports are reads and asks nothing 
     });
 
     // Back to Generic, and saved: the PUT carries the kind.
-    iPickKind(When, "Generic (ZAGENT_DATA)");
+    iChoose(When, "odataKind", "generic");
     iSee(Then, "generic again", function (page: UI5Element) { return kindOf(page).key === "generic"; }, function (page: UI5Element) {
         Opa5.assert.strictEqual(operationRow(page, MONTHS).changesData, false, "a read again");
     });
     iPress(When, "odataSaveButton");
     iSeeADialog(Then, function (dialog: UI5Element) {
-        Opa5.assert.ok(messageOf(dialog).indexOf(WEEKDAYS) !== -1, `the newly callable import is asked about: ${messageOf(dialog)}`);
-        Opa5.assert.strictEqual(messageOf(dialog).indexOf(MONTHS), -1, "the stored read is not");
+        Opa5.assert.strictEqual(messageOf(dialog),
+            `Saving enables these function imports of the generic service as reads: the operation "${WEEKDAYS}" (WEEKDAYS_GET). `
+            + "Every agent that uses this service can then call them, also without \"Allow writes\", and their calls are "
+            + "not recorded in the audit.\n\nNo agent uses this service yet.",
+            "the newly callable import is asked about in its own words; the stored read is not");
+        Opa5.assert.strictEqual((dialog as unknown as { getTitle(): string }).getTitle(), "Save these reads?");
     }, "the question about the read");
     iPressInDialog(When, "Save");
     iSee(Then, "the save", function () { return backend.countRequests(PUT) === 1; }, function () {

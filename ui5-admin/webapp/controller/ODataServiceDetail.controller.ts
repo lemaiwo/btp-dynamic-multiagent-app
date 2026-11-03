@@ -34,7 +34,6 @@ import type Page from "sap/m/Page";
 import type Table from "sap/m/Table";
 import type SearchField from "sap/m/SearchField";
 import type SegmentedButton from "sap/m/SegmentedButton";
-import type Select from "sap/m/Select";
 import type ListBinding from "sap/ui/model/ListBinding";
 import type { Route$PatternMatchedEvent } from "sap/ui/core/routing/Route";
 import type { Router$RouteMatchedEvent } from "sap/ui/core/routing/Router";
@@ -56,7 +55,6 @@ const FORM_FIELDS: readonly { field: ODataErrorField; id: string }[] = [
     { field: "purpose", id: "odataPurpose" },
     { field: "not_for", id: "odataNotFor" },
     { field: "destination", id: "odataDestination" },
-    { field: "kind", id: "odataKind" },
     { field: "service_path", id: "odataServicePath" }
 ];
 
@@ -1114,15 +1112,23 @@ export default class ODataServiceDetail extends ODataController {
         const count = odataCatalog.pendingCount(pending);
         model.setProperty("/pending", pending);
         model.setProperty("/pendingReads", reads);
+        // Newly enabled imports of a generic service were never callable:
+        // nothing about them is "no longer" recorded, so they have a
+        // sentence of their own beside the operations marked as reading.
+        const enabled = loaded ? this.newEnabledReads(this.original()) : [];
+        const marked = odataCatalog.operationsMinus(reads, enabled);
         // The strip names a few and counts the rest: it stays over the page.
         model.setProperty("/pendingWrites", [
             count ? this.text("odataPendingWrites", [this.writeList(pending, STRIP_CAP)]) : "",
             reads.length ? [
-                this.text(reads.length === 1 ? "odataPendingReads" : "odataPendingReadsMany", [
-                    this.operationList(reads, STRIP_CAP)
-                ]),
+                marked.length ? this.text(marked.length === 1 ? "odataPendingReads" : "odataPendingReadsMany", [
+                    this.operationList(marked, STRIP_CAP)
+                ]) : "",
+                enabled.length ? this.text(enabled.length === 1 ? "odataPendingGenericRead" : "odataPendingGenericReadsMany", [
+                    this.operationList(enabled, STRIP_CAP)
+                ]) : "",
                 this.readAgents(model.getProperty("/used_by") as ODataUsedBy[], STRIP_CAP)
-            ].join(" ") : ""
+            ].filter(Boolean).join(" ") : ""
         ].filter(Boolean).join(" "));
         if (!announce) {
             return;
@@ -1144,8 +1150,12 @@ export default class ODataServiceDetail extends ODataController {
         // One announcement for both: a second one would replace the first.
         const readsAdded = odataCatalog.operationsMinus(reads, readsBefore);
         const readsRemoved = odataCatalog.operationsMinus(readsBefore, reads);
+        const enabledAdded = odataCatalog.operationsMinus(readsAdded, marked);
+        const markedAdded = odataCatalog.operationsMinus(readsAdded, enabled);
         const saidReads = [
-            readsAdded.length ? this.text("odataAnnounceReadAdded", [this.operationList(readsAdded, STRIP_CAP)]) : "",
+            markedAdded.length ? this.text("odataAnnounceReadAdded", [this.operationList(markedAdded, STRIP_CAP)]) : "",
+            enabledAdded.length
+                ? this.text("odataAnnounceGenericReadAdded", [this.operationList(enabledAdded, STRIP_CAP)]) : "",
             readsRemoved.length
                 ? this.text("odataAnnounceReadRemoved", [this.operationList(readsRemoved, STRIP_CAP, "odataWriteMoreShort")])
                 : ""
@@ -1164,6 +1174,12 @@ export default class ODataServiceDetail extends ODataController {
      */
     private newReads(stored: ODataServiceInput): ODataNewOperation[] {
         return odataCatalog.pendingReads(stored.definition, this.definition(), this.kinds(stored));
+    }
+
+    /** Of `newReads`, the newly enabled imports of a generic service
+     *  (`odataCatalog.enabledReadsByKind`). */
+    private newEnabledReads(stored: ODataServiceInput): ODataNewOperation[] {
+        return odataCatalog.enabledReadsByKind(stored.definition, this.definition(), this.kinds(stored));
     }
 
     /**
@@ -2027,19 +2043,19 @@ export default class ODataServiceDetail extends ODataController {
     }
 
     /**
-     * The Kind select: an OData service or the generic ZAGENT_DATA
+     * The Kind choice: an OData service or the generic ZAGENT_DATA
      * registration. A generic service is OData V2 (the server refuses it
      * otherwise), so the version follows; and its GET function imports are
      * reads, so the operations and what is pending are worked out again.
      */
     public onKindChange(event: Event): void {
         const model = this.svc();
-        const kind: ODataServiceKind = (event.getSource() as Select).getSelectedKey() === "generic" ? "generic" : "odata";
+        const key = (event.getSource() as SegmentedButton).getSelectedKey();
+        const kind: ODataServiceKind = key === "generic" ? "generic" : "odata";
         model.setProperty("/data/kind", kind);
         if (kind === "generic") {
             model.setProperty("/data/odata_version", "v2");
         }
-        model.setProperty("/errors/kind", "");
         model.setProperty("/saveError", "");
         this.showOperations();
         this.showPendingWrites(true);
@@ -2333,16 +2349,26 @@ export default class ODataServiceDetail extends ODataController {
             }
             parts.push(this.text("odataWriteAudited"));
         }
+        // A newly enabled import of a generic service is a read that was
+        // never callable: said in its own words.
+        const enabled = this.newEnabledReads(stored);
+        const marked = odataCatalog.operationsMinus(reads, enabled);
         if (anyRead) {
             // The other way a save opens something: a call that stops
             // being a write reaches the agents WITHOUT "Allow writes", and
             // nobody can look it up afterwards. Every operation is named.
-            parts.push(this.text("odataReadSaveIntro", [this.operationList(reads)]));
+            if (marked.length) {
+                parts.push(this.text("odataReadSaveIntro", [this.operationList(marked)]));
+            }
+            if (enabled.length) {
+                parts.push(this.text("odataGenericReadSaveIntro", [this.operationList(enabled)]));
+            }
             parts.push(this.readAgents(usedBy));
         }
         const kinds = [identity, anyWrite, anyRead].filter(Boolean).length;
+        const readTitle = marked.length ? "odataReadConfirmTitle" : "odataGenericReadConfirmTitle";
         const title = kinds > 1 ? "odataSaveConfirmTitle"
-            : identity ? "odataIdentityConfirmTitle" : anyWrite ? "odataWriteConfirmTitle" : "odataReadConfirmTitle";
+            : identity ? "odataIdentityConfirmTitle" : anyWrite ? "odataWriteConfirmTitle" : readTitle;
         return { title: this.text(title), text: parts.join("\n\n") };
     }
 

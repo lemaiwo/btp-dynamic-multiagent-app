@@ -1686,6 +1686,23 @@ export default {
         return newReadOperations(stored, current, kinds);
     },
 
+    /**
+     * Of what `pendingReads` lists, the function imports that become reads
+     * by the kind of a generic service (`readByKind` in `current`) and are
+     * newly ENABLED: absent or not enabled in `stored`. They were never
+     * callable, so nothing is "no longer" recorded about them: the page
+     * words them apart from operations marked as only reading.
+     */
+    enabledReadsByKind(
+        stored: ODataDefinition | undefined | null, current: ODataDefinition | undefined | null,
+        kinds: ODataKinds = {}
+    ): ODataNewOperation[] {
+        const had = (stored?.operations ?? []).filter((o) => o.enabled === true).map((o) => o.name);
+        return (current?.operations ?? [])
+            .filter((o) => o.enabled === true && readByKind(o, kinds.current) && had.indexOf(o.name) === -1)
+            .map((o) => ({ name: o.name, title: operationTitle(o) }));
+    },
+
     /** The operations of `list` that `other` does not name. */
     operationsMinus(list: readonly ODataNewOperation[], other: readonly ODataNewOperation[]): ODataNewOperation[] {
         const names = other.map((operation) => operation.name);

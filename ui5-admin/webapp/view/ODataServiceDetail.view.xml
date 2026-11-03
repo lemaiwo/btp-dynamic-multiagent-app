@@ -348,21 +348,24 @@
                          the generic ZAGENT_DATA registration of an SAP system,
                          whose objects SAP's allow-list names. A generic service
                          is OData V2, so the version below follows it, and its
-                         GET function imports are reads, which the strip says. -->
+                         GET function imports are reads, which the strip says.
+                         Two choices, so a segmented button like Runs as and the
+                         version (no picker popup: a sap.m.Select's picker is a
+                         Dialog on a phone, which the OPA teardown destroys
+                         while the Select lives on). A refusal of the server at
+                         `kind` is said in the save strip above the form. -->
                     <Label id="odataKindLabel" text="{i18n>odataKind}" labelFor="odataKind" />
                     <VBox>
-                        <Select
+                        <SegmentedButton
                             id="odataKind"
                             selectedKey="{svc>/data/kind}"
-                            change=".onKindChange"
-                            valueState="{ path: 'svc>/errors/kind', formatter: '.formatErrorState' }"
-                            valueStateText="{svc>/errors/kind}"
+                            selectionChange=".onKindChange"
                             ariaLabelledBy="odataKindLabel">
                             <items>
-                                <core:Item key="odata" text="{i18n>odataKindOData}" />
-                                <core:Item key="generic" text="{i18n>odataKindGeneric}" />
+                                <SegmentedButtonItem key="odata" text="{i18n>odataKindOData}" />
+                                <SegmentedButtonItem key="generic" text="{i18n>odataKindGeneric}" />
                             </items>
-                        </Select>
+                        </SegmentedButton>
                         <MessageStrip
                             id="odataGenericStrip"
                             visible="{= ${svc>/data/kind} === 'generic' }"

@@ -149,3 +149,23 @@ QUnit.test("validate: a kind the server takes, and a generic service is OData V2
         );
     });
 });
+
+QUnit.test("enabledReadsByKind: the pending reads that are newly enabled imports of a generic service", function (assert) {
+    const off = definition(months({ enabled: false }));
+    const on = definition(months());
+    const generic = { stored: "generic", current: "generic" };
+
+    assert.deepEqual(odataCatalog.enabledReadsByKind(off, on, generic), MONTHS, "enabled now, off as stored");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(definition(), on, generic), MONTHS, "not stored at all");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(undefined, on, { current: "generic" }), MONTHS, "a new service");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(on, on, generic), [], "enabled as stored: nothing pending");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(on, on, { stored: "odata", current: "generic" }), [],
+        "enabled as stored and made a read by the kind: marked as only reading, not newly enabled");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(off, on), [], "an odata service: none");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(off, definition(months({ changes_data: false })), { stored: "odata", current: "odata" }),
+        [], "a GET marked as reading on an odata service is no read by the kind");
+    assert.deepEqual(odataCatalog.enabledReadsByKind(off, definition(months({ http_method: "POST" })), generic), [], "a POST");
+    const reads = odataCatalog.pendingReads(off, on, generic);
+    assert.deepEqual(odataCatalog.operationsMinus(reads, odataCatalog.enabledReadsByKind(off, on, generic)), [],
+        "always a part of the pending reads");
+});
