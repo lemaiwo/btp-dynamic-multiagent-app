@@ -8,7 +8,7 @@ import type {
 } from "./types";
 import type {
     DataEdge, DataEdgeInput, DataGraph, DataHintsUpdate, DataNode, DataRebuildResult, DataSearchResult, DataSourceDetail,
-    DataSourceKind, DataSourceSummary
+    DataSourceKind, DataSourceSummary, EmbeddingDeployResult, EmbeddingSetting, EmbeddingsRunStarted, EmbeddingsStatus
 } from "./dataCatalogTypes";
 import type {
     InaDescribeResult, InaQuery, InaQueryInput, InaQuerySummary, InaQueryUpdate, InaTestResult
@@ -489,6 +489,41 @@ export default class AdminService {
     public rebuildDataCatalog(source?: { kind: string; name: string }): Promise<DataRebuildResult> {
         return this.request<DataRebuildResult>("data-catalog/rebuild", {
             method: "POST", ...AdminService.json(source ? { source } : {})
+        });
+    }
+
+    // --- data catalogue embeddings ---
+    // The setting, the vectors and the AI Core deployments of the embedding
+    // models (`/admin/api/data-catalog/embeddings`, design addendum (l)).
+
+    /** The setting, the model in effect and where it comes from, the counts and the run. */
+    public getEmbeddings(): Promise<EmbeddingsStatus> {
+        return this.request<EmbeddingsStatus>("data-catalog/embeddings");
+    }
+
+    /** Saves `{enabled, model}` (`model` null: automatic) and answers the
+     *  status. A model that is not a deployed embedding model is a 422
+     *  whose `detail` names the field. */
+    public setEmbeddings(setting: EmbeddingSetting): Promise<EmbeddingsStatus> {
+        return this.request<EmbeddingsStatus>("data-catalog/embeddings", {
+            method: "PUT", ...AdminService.json({ enabled: setting.enabled, model: setting.model })
+        });
+    }
+
+    /** Starts the background run (202); a 409 while one is in flight. The
+     *  status says how far it is (`running`, `progress`, `last_run`). */
+    public runEmbeddings(): Promise<EmbeddingsRunStarted> {
+        return this.request<EmbeddingsRunStarted>("data-catalog/embeddings/run", {
+            method: "POST", ...AdminService.json({})
+        });
+    }
+
+    /** Asks AI Core for a deployment of `model` (202; it bills). An existing
+     *  RUNNING or PENDING deployment of it is answered and nothing is made;
+     *  a model the scenario does not offer is a 422. */
+    public deployEmbeddingModel(model: string): Promise<EmbeddingDeployResult> {
+        return this.request<EmbeddingDeployResult>("data-catalog/embeddings/deploy", {
+            method: "POST", ...AdminService.json({ model })
         });
     }
 }

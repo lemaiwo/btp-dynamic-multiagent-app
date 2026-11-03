@@ -5,6 +5,7 @@ import type {
 } from "com/agent/admin/service/types";
 import { DEEP_DEFAULTS } from "com/agent/admin/service/types";
 import FakeDataCatalog from "./FakeDataCatalog";
+import FakeEmbeddings from "./FakeEmbeddings";
 import FakeIna from "./FakeIna";
 
 /** What `FakeBackend#failNext` accepts: the next call to `path` answers with `body`/`status` instead. */
@@ -44,6 +45,9 @@ export default class FakeBackend {
     public odataServices: ODataService[] = [];
     /** The data catalogue routes (`data-catalog/...`), in a file of their own. */
     public dataCatalog = new FakeDataCatalog();
+    /** The embeddings of the catalogue (`data-catalog/embeddings...`): the
+     *  setting, a scripted run and the AI Core deployments. */
+    public embeddings = new FakeEmbeddings();
     /** The `ina/...` routes: the analytical queries of `builtin:ina`. */
     public ina = new FakeIna();
     /** What POST odata/metadata answers, whatever the request names. */
@@ -148,6 +152,7 @@ export default class FakeBackend {
         // already assumes btp-agent is id 100.
         this.nextId = 100;
         this.dataCatalog.reset();
+        this.embeddings.reset();
         this.ina.reset();
         this.requests = [];
         this.bodies = {};
@@ -1669,6 +1674,11 @@ export default class FakeBackend {
             return this.json(failure.body, failure.status, failure.headers);
         }
 
+        // Before the catalogue, which answers every other `data-catalog/...` path.
+        const embeddings = this.embeddings.handle(path, method, body, (b, s, h) => this.json(b, s, h));
+        if (embeddings) {
+            return embeddings;
+        }
         const catalogue = this.dataCatalog.handle(path, method, body, query, (b, s) => this.json(b, s),
             this.agents.map((agent) => agent.name));
         if (catalogue) {

@@ -146,6 +146,9 @@ export interface DataSearchResult {
     candidates: DataSearchCandidate[];
     /** `agent`: limited to what the chosen agent attaches. */
     scope: "agent" | "all";
+    /** How the candidates were ranked: by their vectors, or by words (no
+     *  embedding model in effect). Absent from a server before 2.36.0. */
+    mode?: "vector" | "lexical";
 }
 
 export interface DataGraphNode {
@@ -172,4 +175,83 @@ export interface DataRebuildResult {
     imported: number;
     removed: number;
     vectors: number;
+}
+
+// --- embeddings (design addendum (l)) ---
+// `/admin/api/data-catalog/embeddings`: the setting, the vectors, the
+// background run and the AI Core deployment of an embedding model.
+
+/** Where the effective embedding model comes from: the setting saved here,
+ *  `AICORE_EMBEDDING_MODEL`, discovery among the deployments, or none. */
+export type EmbeddingSource = "setting" | "env" | "discovery" | "none";
+
+/** The stored setting, and the body of `PUT data-catalog/embeddings`.
+ *  `model` null: automatic (the landscape's variable, else discovery). */
+export interface EmbeddingSetting {
+    enabled: boolean;
+    model: string | null;
+}
+
+/** A deployment of an embedding model in the app's resource group. */
+export interface EmbeddingDeployment {
+    model: string;
+    /** AI Core's status: `RUNNING`, `PENDING`, `STOPPED`, `DEAD`, ... */
+    status: string;
+    deployment_id: string;
+}
+
+/** An embedding model the scenario offers that has no deployment yet. */
+export interface EmbeddingModelOffer {
+    model: string;
+    versions: string[];
+}
+
+/** The last background run, kept in memory by the app instance. */
+export interface EmbeddingRun {
+    started_at: string;
+    /** null: the run did not finish (the instance stopped meanwhile). */
+    finished_at: string | null;
+    model: string | null;
+    /** How many nodes it embedded. */
+    embedded: number;
+    /** The exception class of a failed run; null when it worked. */
+    error_class: string | null;
+}
+
+/** `GET data-catalog/embeddings`, also the answer of the `PUT`. */
+export interface EmbeddingsStatus {
+    setting: EmbeddingSetting;
+    /** The model vectors are made and searched with; null: none, agents rank by words. */
+    effective_model: string | null;
+    source: EmbeddingSource;
+    /** `AICORE_EMBEDDING_MODEL` is set on this landscape. */
+    env_override: boolean;
+    /** Embedding models only. */
+    deployed: EmbeddingDeployment[];
+    available: EmbeddingModelOffer[];
+    /** The nodes of the embeddable kinds. */
+    nodes: number;
+    /** The nodes with a vector of the effective model. */
+    vectors: number;
+    /** The nodes without a vector or with one of an older text. */
+    stale: number;
+    running: boolean;
+    progress: { done: number; total: number } | null;
+    last_run: EmbeddingRun | null;
+    /** The AI Core resource group a deployment is made in. Not in the
+     *  status shape of the design's point 2, which the deploy confirmation
+     *  needs; read when the server sends it. */
+    resource_group?: string;
+}
+
+/** `POST data-catalog/embeddings/run`: 202, or 409 while a run is in flight. */
+export interface EmbeddingsRunStarted {
+    running: boolean;
+}
+
+/** `POST data-catalog/embeddings/deploy`: 202 with the new deployment, or the
+ *  RUNNING / PENDING one that already exists (nothing is created then). */
+export interface EmbeddingDeployResult {
+    deployment_id: string;
+    status: string;
 }
