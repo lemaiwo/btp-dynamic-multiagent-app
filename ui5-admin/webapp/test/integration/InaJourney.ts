@@ -3,6 +3,7 @@ import Opa5 from "sap/ui/test/Opa5";
 import Press from "sap/ui/test/actions/Press";
 import EnterText from "sap/ui/test/actions/EnterText";
 import HashChanger from "sap/ui/core/routing/HashChanger";
+import ElementRegistry from "sap/ui/core/ElementRegistry";
 import type Input from "sap/m/Input";
 import type Page from "sap/m/Page";
 import type Table from "sap/m/Table";
@@ -12,10 +13,14 @@ import type SideNavigation from "sap/tnt/SideNavigation";
 import type NavigationList from "sap/tnt/NavigationList";
 import type UI5Element from "sap/ui/core/Element";
 import Common, { backend } from "./pages/Common";
+import { iPressInDialog, iSeeADialog } from "./pages/Dialogs";
 import { pressSegment } from "./pages/ODataDetail";
+import { buttonsOf, messageOf } from "./pages/ODataList";
 import {
     CREATE, DETAIL_VIEW, TABLE, VIEW, isOpen, itemOf, itemsOf, namesIn, rowTexts, type InaRowTexts
 } from "./pages/InaQueries";
+import { ID, PAGE, detailOf, stripText, tableRows, type DetailTexts } from "./pages/InaQueryDetail";
+import FakeIna, { UNKNOWN_IN_SAP, VARIABLE_REQUIRED } from "./FakeIna";
 
 Opa5.extendConfig({ viewNamespace: "com.agent.admin.view.", autoWait: true });
 
@@ -403,6 +408,359 @@ opaTest("a valid Create sends the form as typed and lands on the new query's det
         success: function (dialog: UI5Element) {
             Opa5.assert.notOk(isOpen(dialog), "the dialog is closed");
         }
+    });
+
+    Then.iStopTheApp();
+});
+
+// --- the detail page ---------------------------------------------------------
+
+QUnit.module("Analytical query detail journey");
+
+const FLIGHT = "ina-queries/flight-revenue";
+const COST = "ina-queries/cost-centre-actuals";
+const PUT_FLIGHT = "PUT ina/queries/flight-revenue";
+const DOT = " · ";
+
+function stored(name: string) {
+    return backend.ina.queries.filter((q) => q.name === name)[0];
+}
+
+/** Waits until the form shows what `check` wants, then runs `assert` on it. */
+function iSeeTheForm(Then: Common, what: string, check: (form: DetailTexts) => boolean, assert?: (form: DetailTexts) => void): void {
+    Then.waitFor({
+        id: PAGE,
+        viewName: DETAIL_VIEW,
+        check: function (page: UI5Element) { return check(detailOf(page)); },
+        success: function (page: UI5Element) {
+            Opa5.assert.ok(true, what);
+            if (assert) {
+                assert(detailOf(page));
+            }
+        },
+        errorMessage: `The form does not show: ${what}`
+    });
+}
+
+/** Waits until the table `id` shows `rows`. */
+function iSeeTheTable(Then: Common, id: string, rows: string[][], what: string): void {
+    Then.waitFor({
+        id,
+        viewName: DETAIL_VIEW,
+        check: function (table: UI5Element) { return JSON.stringify(tableRows(table)) === JSON.stringify(rows); },
+        success: function (table: UI5Element) { Opa5.assert.deepEqual(tableRows(table), rows, what); },
+        errorMessage: `The table ${id} does not show: ${what}`
+    });
+}
+
+/** Waits until the strip `id` shows a text for which `check` holds. */
+function iSeeTheStrip(Then: Common, id: string, check: (text: string) => boolean, what: string, assert?: (text: string) => void): void {
+    Then.waitFor({
+        id,
+        viewName: DETAIL_VIEW,
+        visible: false,
+        check: function (strip: UI5Element) { return check(stripText(strip)); },
+        success: function (strip: UI5Element) {
+            Opa5.assert.ok(true, what);
+            if (assert) {
+                assert(stripText(strip));
+            }
+        },
+        errorMessage: `The strip ${id} does not show: ${what}`
+    });
+}
+
+function iPress(When: Common, id: string): void {
+    When.waitFor({ id, viewName: DETAIL_VIEW, actions: new Press(), errorMessage: `No ${id}` });
+}
+
+function iType(When: Common, id: string, text: string): void {
+    When.waitFor({ id, viewName: DETAIL_VIEW, actions: new EnterText({ text, pressEnterKey: false }) });
+}
+
+function iChooseRunsAs(When: Common, key: string): void {
+    When.waitFor({
+        id: ID.runsAs,
+        viewName: DETAIL_VIEW,
+        actions: function (segmented: UI5Element | null) { pressSegment(segmented as UI5Element, key); }
+    });
+}
+
+/** Runs `step` in the OPA queue, after what was queued before it. */
+function meanwhile(Given: Common, step: () => void): void {
+    Given.waitFor({ success: step });
+}
+
+opaTest("the detail shows the identity, the texts and what Describe stored", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+
+    iSeeTheForm(Then, "flight-revenue is loaded", (form) => form.name === "flight-revenue", function (form) {
+        Opa5.assert.deepEqual(form, {
+            title: "Flight revenue", name: "flight-revenue", nameEditable: false,
+            purpose: "Revenue per airline and month", notFor: "Plan values", destination: "S4_ODATA_USER",
+            runsAs: "user", query: "ZFLIGHT_REV_Q001", package: "ZFLIGHT", enabled: true, usedBy: "gmail-agent",
+            described: `Dimensions: 2${DOT}Measures: 1${DOT}Variables: 0`
+        }, "every field as stored; the name cannot be changed");
+    });
+    iSeeTheTable(Then, ID.dimensions, [["0CALMONTH", "Calendar month", ""], ["ZCARRID", "Airline", "ZCARRID_KEY"]],
+        "the dimensions with their key field");
+    iSeeTheTable(Then, ID.measures, [["ZREVENUE", "Revenue", "EUR"]], "the measure with its unit");
+    iSeeTheTable(Then, ID.variables, [], "no variables");
+    Then.waitFor({
+        id: PAGE,
+        viewName: DETAIL_VIEW,
+        success: function (page: UI5Element) {
+            Opa5.assert.strictEqual((page as Page).getTitle(), "Flight revenue", "the page is titled by the query");
+        }
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("Describe reads SAP, says the counts and fills the tables", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(COST);
+
+    iSeeTheForm(Then, "not described yet", (form) => form.name === "cost-centre-actuals" && form.described === "Not described yet");
+    iSeeTheTable(Then, ID.dimensions, [], "no dimensions before Describe");
+    iPress(When, ID.describe);
+
+    iSeeTheTable(Then, ID.dimensions, [["0COSTCENTER", "Cost centre", ""], ["0CALMONTH", "Calendar month", ""]], "the dimensions SAP described");
+    iSeeTheTable(Then, ID.measures, [["0AMOUNT", "Amount", "EUR"], ["0QUANTITY", "Quantity", ""]], "the measures");
+    iSeeTheTable(Then, ID.variables, [["ZV_YEAR", "Fiscal year", "Yes", "Single value"]], "the variable, mandatory");
+    iSeeTheForm(Then, "the counts", (form) => form.described === `Dimensions: 2${DOT}Measures: 2${DOT}Variables: 1`, function () {
+        Opa5.assert.strictEqual(backend.countRequests("POST ina/queries/cost-centre-actuals/describe"), 1, "one describe");
+        Opa5.assert.deepEqual(backend.bodies["POST ina/queries/cost-centre-actuals/describe"], {}, "with an empty body");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a Describe SAP refuses shows the code's text and changes nothing", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+    meanwhile(Given, () => { backend.ina.sap = {}; });
+    iPress(When, ID.describe);
+
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.ok(messageOf(dialog).indexOf(UNKNOWN_IN_SAP) > -1, "the fixed text of query_unknown");
+    }, "the refusal");
+    iPressInDialog(When, "Close");
+    iSeeTheTable(Then, ID.measures, [["ZREVENUE", "Revenue", "EUR"]], "the stored description stays");
+
+    Then.iStopTheApp();
+});
+
+opaTest("Test shows status, duration and the column names; with unsaved changes it asks for a save first", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+
+    iType(When, ID.title, "Flight revenue (EUR)");
+    iPress(When, ID.test);
+    iSeeTheStrip(Then, ID.resultStrip, (text) => text.indexOf("Save") === 0, "a save comes first", function () {
+        Opa5.assert.strictEqual(backend.countRequests("POST ina/queries/flight-revenue/test"), 0, "nothing was sent");
+    });
+    iPress(When, ID.describe);
+    iSeeTheStrip(Then, ID.resultStrip, (text) => text.indexOf("Save") === 0, "Describe as well", function () {
+        Opa5.assert.strictEqual(backend.countRequests("POST ina/queries/flight-revenue/describe"), 0, "nothing was sent");
+    });
+
+    iType(When, ID.title, "Flight revenue");
+    iPress(When, ID.test);
+    iSeeTheStrip(Then, ID.resultStrip, (text) => text.indexOf("ZREVENUE") > -1, "the result", function (text) {
+        Opa5.assert.strictEqual(text, "Test read: HTTP 200 in 87 ms. Columns: ZREVENUE.", "outcome, status, duration, columns");
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a query with a mandatory variable cannot be tested: the reason is the outcome, not an error", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(COST);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "cost-centre-actuals");
+
+    iPress(When, ID.test);
+    Then.waitFor({
+        id: ID.resultStrip,
+        viewName: DETAIL_VIEW,
+        check: function (strip: UI5Element) { return stripText(strip) !== ""; },
+        success: function (strip: UI5Element) {
+            Opa5.assert.strictEqual(stripText(strip), `Test not run: ${VARIABLE_REQUIRED}`, "the server's fixed text");
+            Opa5.assert.strictEqual((strip as MessageStrip).getType(), "Information", "as information");
+            Opa5.assert.strictEqual(backend.countRequests("POST ina/queries/cost-centre-actuals/test"), 1, "one test");
+            const open = ElementRegistry.filter((element) => (
+                element.isA("sap.m.Dialog") && (element as unknown as { isOpen(): boolean }).isOpen()
+            ));
+            Opa5.assert.strictEqual(open.length, 0, "no error dialog");
+        },
+        errorMessage: "The variable_required outcome is not shown"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a Describe over a query saved meanwhile stores nothing, says so and reloads the query", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+    meanwhile(Given, () => { backend.ina.describeMoves = true; });
+
+    iPress(When, ID.describe);
+    iSeeTheStrip(Then, ID.resultStrip, (text) => text !== "", "the moved text", function (text) {
+        Opa5.assert.strictEqual(text, "The query was changed while SAP was asked, so nothing was stored. "
+            + "The page shows the current version now; press Describe again.");
+        Opa5.assert.strictEqual(backend.countRequests("GET ina/queries/flight-revenue"), 2, "the query was read again");
+    });
+    // The form carries the stamp the server has now: a save goes through.
+    iType(When, ID.title, "Flight revenue (EUR)");
+    iPress(When, ID.save);
+    Then.waitFor({
+        id: PAGE,
+        viewName: DETAIL_VIEW,
+        check: function () { return stored("flight-revenue").title === "Flight revenue (EUR)"; },
+        success: function () { Opa5.assert.ok(true, "saved over the version the reload showed"); },
+        errorMessage: "The save after the reload did not go through"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a query changed elsewhere is not overwritten, and a stale PUT shows the moved text", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+
+    iType(When, ID.title, "Flight revenue (EUR)");
+    meanwhile(Given, () => { stored("flight-revenue").updated_at = "2026-11-02T09:00:00+00:00"; });
+    iPress(When, ID.save);
+    iSeeTheStrip(Then, ID.changedElsewhere, (text) => text !== "", "the query moved since it was loaded", function (text) {
+        Opa5.assert.strictEqual(text,
+            "This query was changed elsewhere. Reload to see the current version; your changes are kept until you reload.");
+        Opa5.assert.strictEqual(backend.countRequests(PUT_FLIGHT), 0, "nothing was sent over it");
+    });
+    iSeeTheForm(Then, "the input stays", (form) => form.title === "Flight revenue (EUR)");
+
+    When.waitFor({ id: ID.reload, viewName: DETAIL_VIEW, actions: new Press() });
+    iSeeTheStrip(Then, ID.changedElsewhere, (text) => text === "", "the strip goes with the reload");
+    iSeeTheForm(Then, "the stored version is back", (form) => form.title === "Flight revenue");
+
+    iType(When, ID.title, "Flight revenue (EUR)");
+    meanwhile(Given, () => {
+        backend.failNext = {
+            path: "ina/queries/flight-revenue", method: "PUT", status: 409,
+            body: { detail: FakeIna.changedElsewhere("flight-revenue") }
+        };
+    });
+    iPress(When, ID.save);
+    iSeeTheStrip(Then, ID.saveError, (text) => text !== "", "the server's refusal", function (text) {
+        Opa5.assert.strictEqual(text, "The query was not saved. The server answered: "
+            + "Query 'flight-revenue' was changed since it was loaded; reload it and save again");
+        Opa5.assert.strictEqual(backend.countRequests(PUT_FLIGHT), 1, "one PUT was sent");
+        Opa5.assert.strictEqual(backend.bodies[PUT_FLIGHT]?.expected_updated_at, "2026-11-02T09:00:00+00:00",
+            "with the version the form was loaded from");
+    });
+    iSeeTheStrip(Then, ID.changedElsewhere, (text) => text !== "", "and the moved strip");
+
+    Then.iStopTheApp();
+});
+
+opaTest("changing destination and Runs as of a query in use asks first, naming the agents", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+
+    iType(When, ID.destination, "S4_ODATA_TECH");
+    iChooseRunsAs(When, "technical");
+    iPress(When, ID.save);
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        const text = messageOf(dialog);
+        Opa5.assert.ok(text.indexOf("The agent gmail-agent uses this query.") > -1, "the agent is named");
+        Opa5.assert.ok(text.indexOf("Runs as changes from \"Signed-in user\" to \"Technical user\".") > -1, "the identity change");
+        Opa5.assert.ok(text.indexOf("The destination changes from S4_ODATA_USER to S4_ODATA_TECH.") > -1, "the destination change");
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Save", "Cancel"], "Save or Cancel");
+        Opa5.assert.strictEqual(backend.countRequests(PUT_FLIGHT), 0, "nothing sent before the answer");
+    }, "the identity question");
+    iPressInDialog(When, "Cancel");
+    iSeeTheForm(Then, "Cancel keeps the input", (form) => form.destination === "S4_ODATA_TECH", function () {
+        Opa5.assert.strictEqual(backend.countRequests(PUT_FLIGHT), 0, "and sends nothing");
+    });
+
+    iPress(When, ID.save);
+    iPressInDialog(When, "Save");
+    Then.waitFor({
+        id: PAGE,
+        viewName: DETAIL_VIEW,
+        check: function () { return backend.countRequests(PUT_FLIGHT) === 1 && stored("flight-revenue").user_context === false; },
+        success: function () {
+            const body = backend.bodies[PUT_FLIGHT] as Record<string, unknown>;
+            Opa5.assert.strictEqual(body.destination, "S4_ODATA_TECH", "the new destination is saved");
+            Opa5.assert.strictEqual(body.user_context, false, "as the technical user");
+            Opa5.assert.notOk("definition" in body, "the description is not sent");
+        },
+        errorMessage: "The confirmed save was not sent"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("the same change of a query nobody uses is saved without a question", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(COST);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "cost-centre-actuals");
+
+    iType(When, ID.destination, "S4_ODATA_USER");
+    iChooseRunsAs(When, "user");
+    iPress(When, ID.save);
+    Then.waitFor({
+        id: PAGE,
+        viewName: DETAIL_VIEW,
+        check: function () { return stored("cost-centre-actuals").destination === "S4_ODATA_USER"; },
+        success: function () {
+            Opa5.assert.strictEqual(stored("cost-centre-actuals").user_context, true, "saved as the signed-in user");
+        },
+        errorMessage: "The save was not sent"
+    });
+
+    Then.iStopTheApp();
+});
+
+opaTest("a save the running agents did not take up says so in a box that stays", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+    meanwhile(Given, () => { backend.reloadOutcome = "failed"; });
+
+    iType(When, ID.title, "Flight revenue (EUR)");
+    iPress(When, ID.save);
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.ok(messageOf(dialog).indexOf("The query was saved, but the running agents could not be reloaded") === 0,
+            "the warning names what was stored");
+    }, "the not-live warning");
+    iPressInDialog(When, "OK");
+
+    Then.iStopTheApp();
+});
+
+opaTest("Delete asks; a query in use is refused with the server's text, an unused one is gone", function (Given: Common, When: Common, Then: Common) {
+    Given.iStartTheApp(FLIGHT);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "flight-revenue");
+
+    iPress(When, ID.remove);
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog),
+            "Delete the analytical query \"Flight revenue\" (flight-revenue)? This cannot be undone.", "title and name");
+        Opa5.assert.deepEqual(buttonsOf(dialog), ["Delete", "Cancel"]);
+    }, "the question");
+    iPressInDialog(When, "Delete");
+    iSeeADialog(Then, function (dialog: UI5Element) {
+        Opa5.assert.strictEqual(messageOf(dialog), "Query 'flight-revenue' is used by agent(s) 'gmail-agent'", "the 409 text");
+    }, "the refusal");
+    iPressInDialog(When, "Close");
+    iSeeTheForm(Then, "the page stays", (form) => form.name === "flight-revenue", function () {
+        Opa5.assert.strictEqual(hash(), FLIGHT, "still on the query");
+    });
+    Then.iStopTheApp();
+
+    Given.iStartTheApp(COST);
+    iSeeTheForm(Then, "loaded", (form) => form.name === "cost-centre-actuals");
+    iPress(When, ID.remove);
+    iPressInDialog(When, "Delete");
+    iSeeTheRows(Then, ["flight-revenue"], "back on the list, without it", function () {
+        Opa5.assert.strictEqual(hash(), "ina-queries", "the list route");
+        Opa5.assert.strictEqual(backend.ina.queries.length, 1, "deleted");
     });
 
     Then.iStopTheApp();

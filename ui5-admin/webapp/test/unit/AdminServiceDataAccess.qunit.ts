@@ -246,8 +246,8 @@ QUnit.test("describe stores what SAP describes and answers counts and names", as
     const result = await service.describeInaQuery("cost-centre-actuals");
     assert.deepEqual(result, {
         dimensions: 2, measures: 2, variables: 1, names: ["0COSTCENTER", "0CALMONTH", "0AMOUNT", "0QUANTITY", "ZV_YEAR"],
-        truncated: false, metadata_fetched_at: result.metadata_fetched_at
-    });
+        truncated: false, skipped: 0, metadata_fetched_at: result.metadata_fetched_at, reloaded: false, reload_failed: false
+    }, "the route's answer: counts, names, what was left out, the stamp and the reload outcome");
     assert.ok(result.metadata_fetched_at, "stamped");
     const stored = await service.getInaQuery("cost-centre-actuals");
     assert.strictEqual(stored.described, true);
@@ -273,6 +273,10 @@ QUnit.test("the test answers outcome and column names, never a value", async fun
     assert.strictEqual(result.status, 200);
     assert.deepEqual(result.columns, ["ZREVENUE"], "the first measure");
     assert.deepEqual(Object.keys(result).sort(), ["columns", "duration_ms", "ok", "status"]);
+    // A mandatory variable cannot be filled by a test: refused before anything is sent.
+    const required = await refusal(() => new AdminService().testInaQuery("cost-centre-actuals"));
+    assert.strictEqual(required.status, 422);
+    assert.strictEqual(required.code, "variable_required", "the code of the header");
 });
 
 QUnit.module("AdminService against the fake catalogue links", {

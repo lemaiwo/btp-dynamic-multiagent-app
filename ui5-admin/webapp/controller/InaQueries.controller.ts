@@ -8,7 +8,9 @@ import DestinationField from "./DestinationField";
 import ErrorHandler from "../service/ErrorHandler";
 import { AdminError } from "../service/AdminService";
 import formatter from "../model/formatter";
-import inaQueries, { type InaField, type InaQueryForm, type InaQueryRow } from "../model/inaQueries";
+import inaQueries, {
+    DESTINATION_TEXTS, type InaField, type InaQueryForm, type InaQueryRow
+} from "../model/inaQueries";
 import odataCatalog from "../model/odataCatalog";
 import type Event from "sap/ui/base/Event";
 import type Control from "sap/ui/core/Control";
@@ -30,17 +32,6 @@ const CREATE_FIELDS: readonly { field: InaField; id: string }[] = [
     { field: "package", id: "inaCreatePackage" },
     { field: "purpose", id: "inaCreatePurpose" }
 ];
-
-/** The destination texts that name OData, in the words of a query. The
- *  rest of the shared field's texts hold for both. */
-const DESTINATION_TEXTS: Record<string, string> = {
-    odataDestinationFixedAccount: "inaDestinationFixedAccount",
-    odataDestinationNeedsUser: "inaDestinationNeedsUser",
-    odataDestinationNotListed: "inaDestinationNotListed",
-    odataDestinationNotUsable: "inaDestinationNotUsable",
-    odataDestinationsUnusableOne: "inaDestinationsUnusableOne",
-    odataDestinationsUnusableMany: "inaDestinationsUnusableMany"
-};
 
 /** The model of the Create dialog. */
 interface CreateState {

@@ -75,6 +75,18 @@ export interface InaQueryRow {
     enabled: boolean;
 }
 
+/** The texts of the shared destination field (`DestinationField`) that
+ *  name OData, in the words of a query: OData key -> InA key. The rest of
+ *  that field's texts hold for both. */
+export const DESTINATION_TEXTS: Readonly<Record<string, string>> = {
+    odataDestinationFixedAccount: "inaDestinationFixedAccount",
+    odataDestinationNeedsUser: "inaDestinationNeedsUser",
+    odataDestinationNotListed: "inaDestinationNotListed",
+    odataDestinationNotUsable: "inaDestinationNotUsable",
+    odataDestinationsUnusableOne: "inaDestinationsUnusableOne",
+    odataDestinationsUnusableMany: "inaDestinationsUnusableMany"
+};
+
 /** Characters as the server counts them: code points, not UTF-16 units. */
 function length(value: string): number {
     return Array.from(value).length;
@@ -224,4 +236,36 @@ export function toUpdate(form: InaQueryForm, expected_updated_at: string | null)
     return { ...toInput(form), expected_updated_at };
 }
 
-export default { rowsOf, usedByNames, describedText, emptyForm, formOf, validateInput, toInput, toUpdate };
+/** What a save changes about whom the agents act as and what they call:
+ *  "Runs as", the destination and the InA name. Absent: unchanged. */
+export interface InaIdentityChange {
+    /** The identity after the save. */
+    runsAs?: "user" | "technical";
+    destination?: { from: string; to: string };
+    query?: { from: string; to: string };
+}
+
+/** The identity change from the stored query `stored` to `form`. Names are
+ *  compared as typed: destination names are case-sensitive. */
+export function identityChange(stored: InaQueryForm, form: InaQueryForm): InaIdentityChange {
+    const change: InaIdentityChange = {};
+    if ((stored.user_context === true) !== (form.user_context === true)) {
+        change.runsAs = form.user_context === true ? "user" : "technical";
+    }
+    if (stored.destination !== form.destination) {
+        change.destination = { from: stored.destination, to: form.destination };
+    }
+    if (stored.query !== form.query) {
+        change.query = { from: stored.query, to: form.query };
+    }
+    return change;
+}
+
+/** Whether two forms hold the same values, field by field. */
+export function sameForm(a: InaQueryForm, b: InaQueryForm): boolean {
+    return (Object.keys(emptyForm()) as InaField[]).every((field) => a[field] === b[field]);
+}
+
+export default {
+    rowsOf, usedByNames, describedText, emptyForm, formOf, validateInput, toInput, toUpdate, identityChange, sameForm
+};

@@ -117,8 +117,9 @@ export interface InaQuery extends InaQuerySummary, ReloadOutcome {
     definition: InaDefinition | null;
 }
 
-/** `POST ina/queries/{name}/describe`: what SAP described, now stored. */
-export interface InaDescribeResult {
+/** `POST ina/queries/{name}/describe`: what SAP described, now stored. The
+ *  `ReloadOutcome` keys say whether the running agents took it up. */
+export interface InaDescribeResult extends ReloadOutcome {
     dimensions: number;
     measures: number;
     variables: number;
@@ -126,6 +127,8 @@ export interface InaDescribeResult {
     names: string[];
     /** SAP described more members than a definition may hold. */
     truncated: boolean;
+    /** How many members with an odd name were left out. */
+    skipped?: number;
     metadata_fetched_at: string | null;
 }
 

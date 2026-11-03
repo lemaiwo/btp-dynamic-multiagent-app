@@ -28,6 +28,9 @@ export const NOT_FOUND = "Query not found";
 export const NAME_TAKEN = "name: already exists";
 export const NAME_FIXED = "name: cannot be changed; register the query under the new name instead";
 export const UNKNOWN_IN_SAP = "SAP does not know the InA query of this registration";
+/** `VARIABLE_REQUIRED_TEXT` of agents/ina/admin_calls.py. */
+export const VARIABLE_REQUIRED = "the query has a mandatory variable, which a test cannot fill; Describe checks "
+    + "the destination, the identity and the query";
 
 type Body = Record<string, unknown>;
 
@@ -48,12 +51,16 @@ export default class FakeIna {
     public queries: InaQuery[] = [];
     /** What `Describe` reads from SAP, by the query's InA name. */
     public sap: Record<string, InaDefinition> = {};
+    /** True: the next Describe finds the row changed while SAP was asked
+     *  (somebody saved it meanwhile): 409, nothing stored. */
+    public describeMoves = false;
     private stamp = 0;
     private nextId = 1;
 
     public reset(): void {
         this.stamp = Date.parse("2026-11-01T08:00:00Z");
         this.nextId = 1;
+        this.describeMoves = false;
         this.sap = {
             ZFLIGHT_REV_Q001: {
                 dimensions: [
@@ -166,7 +173,7 @@ export default class FakeIna {
             if (extra !== undefined) {
                 return json({ detail: `${FakeIna.loc(extra)}: Extra inputs are not permitted` }, 422);
             }
-            return action === "/describe" ? this.describe(stored, json) : this.test(stored, json);
+            return action === "/describe" ? this.describe(stored, json, reload) : this.test(stored, json);
         }
         return json({ detail: "Method Not Allowed" }, 405);
     }
@@ -228,11 +235,26 @@ export default class FakeIna {
         return json({ ...FakeIna.copy(stored), reloaded: reload.reloaded === true, reload_failed: reload.reload_failed === true });
     }
 
-    /** Reads SAP and stores what it describes; the stored row moves with it. */
-    private describe(stored: InaQuery, json: Json): Promise<Response> {
+    /** The answer of a Describe of `name` over a row that moved meanwhile. */
+    public static describedMoved(name: string): string {
+        return `Query '${name}' was changed while it was described; describe it again`;
+    }
+
+    /**
+     * Reads SAP and stores what it describes; the stored row moves with it,
+     * and the answer carries the reload outcome (agents/ina/admin_routes.py).
+     * Stored only over the row it was read for: `describeMoves` is a save
+     * in between, answered 409 with nothing stored.
+     */
+    private describe(stored: InaQuery, json: Json, reload: ReloadOutcome): Promise<Response> {
         const read = this.sap[stored.query];
         if (!read) {
             return json({ detail: UNKNOWN_IN_SAP }, 502, { "X-Ina-Error": "query_unknown" });
+        }
+        if (this.describeMoves) {
+            this.describeMoves = false;
+            stored.updated_at = this.nextStamp();
+            return json({ detail: FakeIna.describedMoved(stored.name) }, 409);
         }
         stored.definition = JSON.parse(JSON.stringify(read)) as InaDefinition;
         stored.described = true;
@@ -241,18 +263,25 @@ export default class FakeIna {
         const names = [...read.dimensions, ...read.measures, ...read.variables].map((member) => member.name);
         return json({
             dimensions: read.dimensions.length, measures: read.measures.length, variables: read.variables.length,
-            names, truncated: false, metadata_fetched_at: stored.metadata_fetched_at
+            names, truncated: false, skipped: 0, metadata_fetched_at: stored.metadata_fetched_at,
+            reloaded: reload.reloaded === true, reload_failed: reload.reload_failed === true
         });
     }
 
-    /** One read of the first measure: outcome and column names, never a value. */
+    /** One read of the first measure: exactly `{ok, status, duration_ms,
+     *  columns}`, never a value. A mandatory variable, which a test cannot
+     *  fill, is refused before anything is sent. */
     private test(stored: InaQuery, json: Json): Promise<Response> {
         // Not described yet, the run reads the description from SAP first.
         const read = this.sap[stored.query];
         if (!read) {
             return json({ detail: UNKNOWN_IN_SAP }, 502, { "X-Ina-Error": "query_unknown" });
         }
-        const first = (stored.definition ?? read).measures[0];
+        const definition = stored.definition ?? read;
+        if (definition.variables.some((variable) => variable.mandatory === true)) {
+            return json({ detail: VARIABLE_REQUIRED }, 422, { "X-Ina-Error": "variable_required" });
+        }
+        const first = definition.measures[0];
         return json({ ok: true, status: 200, duration_ms: 87, columns: first ? [first.name] : [] });
     }
 

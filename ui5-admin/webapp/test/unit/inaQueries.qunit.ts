@@ -1,7 +1,7 @@
 import ResourceBundle from "sap/base/i18n/ResourceBundle";
 import inaQueries, {
-    MAX_NOT_FOR, MAX_PACKAGE, MAX_PURPOSE, MAX_QUERY, MAX_TITLE, describedText, emptyForm, formOf, rowsOf, toInput,
-    toUpdate, usedByNames, validateInput
+    MAX_NOT_FOR, MAX_PACKAGE, MAX_PURPOSE, MAX_QUERY, MAX_TITLE, describedText, emptyForm, formOf, identityChange,
+    rowsOf, sameForm, toInput, toUpdate, usedByNames, validateInput
 } from "com/agent/admin/model/inaQueries";
 import type { InaQueryForm } from "com/agent/admin/model/inaQueries";
 import type { InaQuery, InaQuerySummary } from "com/agent/admin/service/inaTypes";
@@ -245,4 +245,26 @@ QUnit.test("every text key the model answers exists", async function (assert) {
     keys.forEach((key) => assert.ok(bundle.hasText(key), key));
     const counts = bundle.getText("inaDescribedCounts", ["12", "4", "2"]) || "";
     ["12", "4", "2"].forEach((count) => assert.ok(counts.indexOf(count) > -1, `the counts name ${count}`));
+});
+
+QUnit.test("identityChange names what decides whom and what the agents call", function (assert) {
+    assert.deepEqual(identityChange(form(), form()), {}, "nothing changed");
+    assert.deepEqual(identityChange(form(), form({ title: "Other", purpose: "Other", package: "ZOTHER", enabled: false })), {},
+        "texts, the package and the switch are no identity");
+    assert.deepEqual(identityChange(form(), form({ user_context: false })), { runsAs: "technical" }, "to the technical user");
+    assert.deepEqual(identityChange(form({ user_context: false }), form()), { runsAs: "user" }, "to the signed-in user");
+    assert.deepEqual(identityChange(form(), form({ destination: "S4_ODATA_TECH", query: "ZOTHER_Q" })), {
+        destination: { from: "S4_ODATA_USER", to: "S4_ODATA_TECH" },
+        query: { from: "ZFLIGHT_REV_Q001", to: "ZOTHER_Q" }
+    }, "the destination and the InA name, from and to, as typed");
+    assert.deepEqual(identityChange(form(), form({ destination: "s4_odata_user" })),
+        { destination: { from: "S4_ODATA_USER", to: "s4_odata_user" } }, "names are case-sensitive");
+});
+
+QUnit.test("sameForm compares every field of the form", function (assert) {
+    assert.ok(sameForm(form(), form()), "equal");
+    (Object.keys(form()) as (keyof InaQueryForm)[]).forEach((field) => {
+        const other = { ...form(), [field]: typeof form()[field] === "boolean" ? !form()[field] : `${String(form()[field])}x` };
+        assert.notOk(sameForm(form(), other as InaQueryForm), `${field} differs`);
+    });
 });
