@@ -747,7 +747,7 @@ async def test_hints_body_and_node_errors(client, two_services):
         r = await client.put(f"{API}/nodes/{order.id}/hints", content=raw,
                              headers={"content-type": "application/json"})
         assert r.status_code == 422 and r.json()["detail"] == "body: expected a JSON object"
-    for nid in ("999999", "abc", "99999999999", "-1"):
+    for nid in ("999999", "abc", "99999999999", "-1", "\u00b2"):
         r = await client.put(f"{API}/nodes/{nid}/hints", json={"label": "x"})
         assert r.status_code == 404, nid
 

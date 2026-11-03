@@ -5,8 +5,8 @@ nodes in place, so the admin's hints, a narrowed ``readable``, vectors and
 curated edges survive; the cross-kind ``same_object`` rules do not join
 names that only look alike (rule (b) is exact, ``2C<view>`` needs the view
 name whole); a relation to a source outside the caller's scope is dropped;
-a curated ``aggregates`` edge keeps the import from adding a ``same_object``
-beside it. The helpers and fixtures are those of
+one link per kind per pair: a curated ``same_object`` keeps the import from
+adding its own beside it, a curated ``aggregates`` does not. The helpers and fixtures are those of
 ``tests/test_data_catalog.py``: ``_clean`` (autouse) is imported so that
 pytest finds it here by name.
 """
@@ -180,7 +180,7 @@ async def test_a_relation_to_a_source_outside_the_scope_is_dropped():
     assert {r["to"]["source_name"] for r in together["Carriers"]} == {"agent-data"}
 
 
-async def test_a_curated_aggregates_edge_keeps_out_the_imported_same_object():
+async def test_a_curated_aggregates_edge_leaves_the_imported_same_object():
     await attach(DATA)
     await add_query("oncall", "2CZC_ONCALL")
     await rebuild()
@@ -193,4 +193,21 @@ async def test_a_curated_aggregates_edge_keeps_out_the_imported_same_object():
         await db.commit()
     for source in (("ina", "oncall"), ("odata", "agent-data"), None):
         await rebuild(source)
-        assert [e.kind for e in await pair(view, query)] == ["aggregates"]
+        assert sorted((e.kind, e.curated_at is not None) for e in await pair(view, query)) == [
+            ("aggregates", True), ("same_object", False)]
+
+
+async def test_a_curated_same_object_edge_keeps_out_the_imported_one():
+    await attach(DATA)
+    await add_query("oncall", "2CZC_ONCALL")
+    await rebuild()
+    view = await node("agent-data", "entity", "ZC_ONCALL")
+    query = await node("oncall", "query", "2CZC_ONCALL")
+    async with SessionLocal() as db:
+        db.add(DataCatalogEdge(from_id=query.id, to_id=view.id, kind="same_object",
+                               curated_at=utcnow()))
+        await db.commit()
+    for source in (("ina", "oncall"), ("odata", "agent-data"), None):
+        await rebuild(source)
+        assert [(e.kind, e.curated_at is not None) for e in await pair(view, query)] == [
+            ("same_object", True)]

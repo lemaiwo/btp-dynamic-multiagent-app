@@ -508,20 +508,29 @@ async def test_an_admin_draws_a_link_and_removes_it(client, ina_query, generic_s
             if {e["from"], e["to"]} == {query.id, view.id}] == [False]
     assert not any(e["curated"] for e in graph["edges"] if e["kind"] == "contains")
 
-    # A pair is linked once, in either direction and whatever the kind.
+    # One link per kind per pair, in either direction, imported or drawn.
     for body in ({"from_id": order.id, "to_id": query.id, "kind": "aggregates"},
-                 {"from_id": query.id, "to_id": order.id, "kind": "same_object"},
-                 {"from_id": view.id, "to_id": query.id, "kind": "aggregates"}):
+                 {"from_id": view.id, "to_id": query.id, "kind": "same_object"}):
         r = await client.post(f"{API}/edges", json=body)
         assert r.status_code == 409, body
     assert len(await edges()) == before + 1
+    r = await client.post(f"{API}/edges",  # over the imported same_object
+                          json={"from_id": view.id, "to_id": query.id, "kind": "aggregates"})
+    assert r.status_code == 201, r.text
+    assert sorted(e.kind for e in await edge_between(query, view)) == [
+        "aggregates", "same_object"]
+    r = await client.post(f"{API}/edges",
+                          json={"from_id": query.id, "to_id": order.id, "kind": "same_object"})
+    assert r.status_code == 201, r.text
+    assert len(await edges()) == before + 3
 
     r = await client.delete(f"{API}/edges/{imported.id}")
-    assert r.status_code == 409 and await edge_between(query, view)
+    assert r.status_code == 409 and imported.id in {e.id for e in await edges()}
     r = await client.delete(f"{API}/edges/{drawn['id']}")
-    assert r.status_code == 204 and await edge_between(query, order) == []
+    assert r.status_code == 204
+    assert [e.kind for e in await edge_between(query, order)] == ["same_object"]
     assert (await client.delete(f"{API}/edges/{drawn['id']}")).status_code == 404
-    for eid in ("abc", "99999999999", "-1", "0x1"):
+    for eid in ("abc", "99999999999", "-1", "0x1", "\u00b2"):
         assert (await client.delete(f"{API}/edges/{eid}")).status_code == 404, eid
 
 
@@ -652,3 +661,20 @@ async def test_a_generic_node_is_widened_back_up_to_the_definition_only(client):
     assert r.status_code == 200 and r.json()["readable"] is True
     r = await client.put(f"{API}/nodes/{internal.id}/hints", json={"readable": True})
     assert r.status_code == 422 and r.json()["detail"].startswith("readable:")
+
+
+def test_the_node_lock_compiles_for_hana_and_postgres():
+    """The suite runs on SQLite, where `api_create_edge` takes no row lock:
+    the statement of the other two databases is checked by compiling it."""
+    from sqlalchemy.dialects import postgresql
+
+    from agents.data_catalog import routes
+    from tests.hana_sql import hana_sql, refusals
+
+    stmt = routes._lock_nodes_stmt([7, 3])
+    assert refusals(stmt) == []
+    sql = hana_sql(stmt)
+    assert sql.startswith("SELECT data_catalog_nodes.id FROM data_catalog_nodes WHERE")
+    assert sql.endswith("ORDER BY data_catalog_nodes.id FOR UPDATE")
+    pg = " ".join(str(stmt.compile(dialect=postgresql.dialect())).split())
+    assert pg.endswith("ORDER BY data_catalog_nodes.id FOR UPDATE")

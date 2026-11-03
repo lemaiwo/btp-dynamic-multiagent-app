@@ -23,8 +23,9 @@ and across kinds the names SAP gives one repository object (an InA query
 type ``<view>`` / ``<view>Type``).
 
 Edges an admin drew (``curated_at`` set) are never deleted by an import, and
-an import does not add a ``same_object`` edge beside one for the same pair:
-the admin already said how the two relate. A node that disappears takes its
+an import does not add a ``same_object`` edge beside a drawn ``same_object``
+of the same pair (one link per kind per pair; a drawn ``aggregates`` leaves
+the imported ``same_object`` in place). A node that disappears takes its
 curated edges with it.
 
 Incremental, because the admin's hints are worth more than the import:
@@ -461,12 +462,15 @@ async def _replace_imported_edges(
 
 
 async def _curated_pairs(db: AsyncSession, ids: list[int]) -> set[frozenset[int]]:
-    """The node pairs an admin linked, of the edges that touch ``ids``."""
+    """The node pairs an admin linked as ``same_object``, of the edges that
+    touch ``ids``: one link per kind per pair, so a drawn ``aggregates`` does
+    not keep the import's ``same_object`` out."""
     pairs: set[frozenset[int]] = set()
     for chunk in batched(ids):
         rows = await db.execute(
             select(DataCatalogEdge.from_id, DataCatalogEdge.to_id).where(
                 DataCatalogEdge.curated_at.is_not(None),
+                DataCatalogEdge.kind == "same_object",
                 or_(DataCatalogEdge.from_id.in_(chunk), DataCatalogEdge.to_id.in_(chunk)),
             )
         )
@@ -552,8 +556,8 @@ async def _link_same_objects(
     """``same_object`` edges from this source's entities and queries to the
     nodes of OTHER sources that are the same object: entities with the same
     entity type name (local part, exactly), then the cross-kind names of
-    `_same_by_name`. One edge per pair: a pair in ``taken`` (an admin's
-    edge, or one this pass made) gets none."""
+    `_same_by_name`. One ``same_object`` per pair: a pair in ``taken`` (an
+    admin's ``same_object``, or one this pass made) gets none."""
     by_type: dict[str, list[DataCatalogNode]] = {}
     by_name: dict[str, list[DataCatalogNode]] = {}
     for node in mine:

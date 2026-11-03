@@ -52,7 +52,12 @@ from agents.data_catalog.models import (
     utcnow,
 )
 from agents.data_catalog.scope import allowed_sources_of, node_sources
-from agents.data_catalog.search import QUESTION_MAX, find_sources, scoped_nodes
+from agents.data_catalog.search import (
+    CANDIDATE_KINDS,
+    QUESTION_MAX,
+    find_sources,
+    scoped_nodes,
+)
 from agents.db import (
     SessionLocal,
     begin_exclusive_write,
@@ -79,6 +84,8 @@ SYNONYMS_MAX = 50
 EXAMPLES_MAX = 20
 _MAX_ID = 2_147_483_647
 _NAME_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
+# ASCII digits only: ``str.isdigit`` is true for "²", which ``int`` refuses.
+_ROW_ID_RE = re.compile(r"[0-9]{1,10}")
 _AGENT_RE = re.compile(r"[^\x00-\x1f\x7f]{1,64}")
 _SOURCE_NOT_FOUND = "Source not found"
 _NODE_NOT_FOUND = "Node not found"
@@ -88,9 +95,8 @@ _ALREADY_LINKED = "The two nodes are already linked"
 _NOT_LINKABLE = "not an entity, query or function"
 _NOT_A_NODE = "not a node of the catalogue"
 _SAME_SOURCE = "to_id: same source as from_id"
-# What an admin may link: the nodes an agent picks among (`search.CANDIDATE_KINDS`),
+# What an admin may link: the nodes an agent picks among (`CANDIDATE_KINDS`),
 # by the two kinds of addendum (k); `navigation` stays the import's.
-LINKABLE_KINDS = ("entity", "query", "function")
 CURATED_EDGE_KINDS = ("same_object", "aggregates")
 _AGENT_NOT_FOUND = "Agent not found"
 _BODY_NOT_OBJECT = "body: expected a JSON object"
@@ -383,8 +389,9 @@ def _edge_out(edge: DataCatalogEdge, nodes: dict[int, DataCatalogNode]) -> dict[
     }
 
 
-def _node_id(raw: str, not_found: str = _NODE_NOT_FOUND) -> int:
-    if not raw.isdigit() or len(raw) > 10 or int(raw) > _MAX_ID:
+def _row_id(raw: str, not_found: str = _NODE_NOT_FOUND) -> int:
+    """The id of a node or an edge in a path; anything else is a 404."""
+    if not _ROW_ID_RE.fullmatch(raw) or int(raw) > _MAX_ID:
         raise HTTPException(status_code=404, detail=not_found)
     return int(raw)
 
@@ -423,7 +430,7 @@ async def _catalogue_readable(db: Any, node: DataCatalogNode) -> bool:
 
 @router.put("/nodes/{node_id}/hints", dependencies=[Depends(require_admin)])
 async def api_put_hints(node_id: str, request: Request) -> dict[str, Any]:
-    nid = _node_id(node_id)
+    nid = _row_id(node_id)
     body, raw = await _json_body(request, HintsBody)
     async with SessionLocal() as db:
         node = await db.get(DataCatalogNode, nid)
@@ -556,41 +563,50 @@ def _same_source(a: DataCatalogNode, b: DataCatalogNode) -> bool:
     return (a.source_kind, a.source_name) in node_sources({(b.source_kind, b.source_name)})
 
 
+def _lock_nodes_stmt(ids: list[int]) -> Any:
+    """The row lock `api_create_edge` takes on Postgres and HANA, in id order
+    (two requests for one pair cannot wait for each other). The id column
+    alone: HANA locks no row through a LOB column. A function of its own so
+    a test can compile it; the SQLite suite never sends it."""
+    return (
+        select(DataCatalogNode.id)
+        .where(DataCatalogNode.id.in_(sorted(ids)))
+        .order_by(DataCatalogNode.id)
+        .with_for_update()
+    )
+
+
 @router.post(
     "/edges", status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_admin)]
 )
 async def api_create_edge(request: Request) -> dict[str, Any]:
     """Draw a link between two nodes of different sources (an entity, an
-    InA query or a function at each end) that are not linked yet, in either
-    direction and by any kind: ``same_object`` or ``aggregates``. The edge
-    carries ``curated_at``, so an import keeps it and adds no ``same_object``
-    of its own for the pair.
+    InA query or a function at each end): ``same_object`` or ``aggregates``.
+    One link per kind per pair: 409 when an edge of that kind joins the two
+    in either direction, imported or drawn; an ``aggregates`` over an
+    imported ``same_object`` is fine. The edge carries ``curated_at``, so an
+    import keeps it, and a drawn ``same_object`` keeps the import from adding
+    its own for the pair (`importer._curated_pairs`).
 
-    Check and insert in one transaction, behind a lock on both nodes (in id
-    order; ``BEGIN IMMEDIATE`` on SQLite), so two requests for one pair
-    cannot both pass the "already linked" check. An import that runs at the
-    same moment takes no such lock: it may add its own ``same_object`` beside
-    the new edge (the next import of either end drops it again), or delete a
-    node the edge then points at (the routes skip an end that is gone).
+    Check and insert in one transaction, behind a lock on both nodes
+    (`_lock_nodes_stmt`; ``BEGIN IMMEDIATE`` on SQLite), so two requests for
+    one pair cannot both pass the "already linked" check. An import that
+    runs at the same moment takes no such lock: it may add its own
+    ``same_object`` beside a new one (the next import of either end drops it
+    again), or delete a node the edge then points at (the routes skip an end
+    that is gone).
     """
     body, _ = await _json_body(request, EdgeBody)
     async with SessionLocal() as db:
         await begin_exclusive_write(db)
-        pair = sorted({body.from_id, body.to_id})
         if has_row_locks(db):
-            # The id column alone: HANA locks no row through a LOB column.
-            await db.execute(
-                select(DataCatalogNode.id)
-                .where(DataCatalogNode.id.in_(pair))
-                .order_by(DataCatalogNode.id)
-                .with_for_update()
-            )
+            await db.execute(_lock_nodes_stmt([body.from_id, body.to_id]))
         ends: dict[str, DataCatalogNode] = {}
         for field_name, nid in (("from_id", body.from_id), ("to_id", body.to_id)):
             node = await db.get(DataCatalogNode, nid)
             if node is None:
                 raise HTTPException(status_code=422, detail=f"{field_name}: {_NOT_A_NODE}")
-            if node.kind not in LINKABLE_KINDS:
+            if node.kind not in CANDIDATE_KINDS:
                 raise HTTPException(status_code=422, detail=f"{field_name}: {_NOT_LINKABLE}")
             ends[field_name] = node
         start, end = ends["from_id"], ends["to_id"]
@@ -598,6 +614,7 @@ async def api_create_edge(request: Request) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=_SAME_SOURCE)
         linked = await db.execute(
             select(DataCatalogEdge.id).where(
+                DataCatalogEdge.kind == body.kind,
                 or_(
                     and_(DataCatalogEdge.from_id == start.id, DataCatalogEdge.to_id == end.id),
                     and_(DataCatalogEdge.from_id == end.id, DataCatalogEdge.to_id == start.id),
@@ -622,7 +639,7 @@ async def api_create_edge(request: Request) -> dict[str, Any]:
 async def api_delete_edge(edge_id: str) -> Response:
     """Remove a link an admin drew. An imported edge answers 409: the next
     import would make it again, so removing it would only look done."""
-    eid = _node_id(edge_id, _EDGE_NOT_FOUND)
+    eid = _row_id(edge_id, _EDGE_NOT_FOUND)
     async with SessionLocal() as db:
         # Conditional on ``curated_at``, so the 409 never races a delete.
         result = await db.execute(
