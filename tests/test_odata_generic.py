@@ -1,12 +1,18 @@
 """The generic kind of a catalogue service (addendum (k), part 3, of the web chat design).
 
 A ``generic`` service is the ZAGENT_DATA registration: a V2 service whose
-objects come from SAP's own allow-list. Two things differ from ``odata``:
+objects come from SAP's own allow-list. Three things differ from ``odata``:
 
 * the write rule: a ``GET`` function import is a read whatever its stored
   ``changes_data`` says (the allow-list owner vouches that a listed module
   only reads), so it runs without ``allow_write`` and is not audited. Every
   other call, and every entity write, keeps the rule of ``odata``;
+* what such a read returns (point 4b): a complex answer -- one structure or
+  a collection of them -- reaches the model with every property, the
+  protocol's bookkeeping dropped, and is refused, never cut, over the size
+  cap. Anything that is not positively complex data (an entity, a
+  navigation, a type of a catalogue entity set, a list of plain values)
+  keeps the default-deny rule of ``odata``: withheld;
 * the gate: a generic service is OData V2, refused at ``kind`` otherwise.
 
 And one thing is the same for both, pinned here on a document of that
@@ -45,7 +51,13 @@ from agents.data_catalog.importer import plan_service  # noqa: E402
 from agents.db import ODataAuditLog, ODataService, SessionLocal, init_db  # noqa: E402
 from agents.odata.audit import StoredWriteRecorder  # noqa: E402
 from agents.odata.calls import stored_call_refusal  # noqa: E402
-from agents.odata.client import ODataClient, call_changes_data, call_refusal  # noqa: E402
+from agents.odata.client import (  # noqa: E402
+    MAX_STRUCTURE_DEPTH,
+    ODataClient,
+    call_changes_data,
+    call_refusal,
+    clip_result,
+)
 from agents.odata.metadata import ParsedReturn, parse_metadata  # noqa: E402
 from agents.odata.models import (  # noqa: E402
     ODataServicePayload,
@@ -56,11 +68,15 @@ from agents.odata.models import (  # noqa: E402
 )
 from agents.odata.preview import build_preview  # noqa: E402
 from agents.odata.search import operation_changes_data, search_catalogue  # noqa: E402
-from agents.odata.tools import odata_toolset  # noqa: E402
+from agents.odata.tools import MAX_RESULT_CHARS, odata_toolset  # noqa: E402
 from agents.odata.v2 import V2Dialect  # noqa: E402
 from tests.odata_helpers import FakeResolver  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "odata" / "zagent_data_metadata.xml"
+# What the service answers for MONTH_NAMES_GET (LANGUAGE 'E'): a
+# Collection(ComplexType) in the JSON verbose shape of SAP Gateway V2.
+MONTH_NAMES = ROOT / "tests" / "fixtures" / "odata" / "zagent_data_month_names.json"
+RESULT_TYPE = "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"
 SERVICE_PATH = "/sap/opu/odata/sap/ZAGENT_DATA_SRV"
 CTX = SimpleNamespace(run_id="run-1")
 MONTHS = "MONTH_NAMES_GET"
@@ -305,24 +321,21 @@ def test_a_generic_service_is_odata_v2():
 # -- through the toolset ----------------------------------------------------------
 
 
+def month_names() -> dict[str, Any]:
+    return json.loads(MONTH_NAMES.read_text(encoding="utf-8"))
+
+
+def plain(row: dict[str, Any]) -> dict[str, Any]:
+    """A row of the fixture as the model gets it: without ``__metadata``."""
+    return {k: v for k, v in row.items() if k != "__metadata"}
+
+
 class Sap:
     """SAP: answers the function import, and anything else with an error."""
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.answer: Any = {
-            "d": {
-                "results": [
-                    {
-                        "__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"},
-                        "SPRAS": "E",
-                        "MNR": "01",
-                        "KTX": "Jan",
-                        "LTX": "January",
-                    }
-                ]
-            }
-        }
+        self.answer: Any = month_names()
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -367,8 +380,11 @@ async def test_without_allow_write_a_generic_get_import_is_listed_and_runs_unrec
 
     out = await execute(tools, **CALL)
     assert out["ok"] is True and out["status"] == 200
-    # A complex type is not tied to a catalogue entity set: not passed on.
-    assert out["returned"] == "withheld" and out["result"] is None
+    # The module's table, whole: every property of every row (4b).
+    assert out["returned"] == "collection" and out["truncated"] is False
+    assert out["result"] == [plain(r) for r in month_names()["d"]["results"]]
+    assert out["result"][0] == {"SPRAS": "E", "MNR": "01", "KTX": "Jan", "LTX": "January"}
+    assert len(out["result"]) == 12
     (sent,) = sap.requests  # no CSRF token request: sent as a read
     assert sent.method == "GET" and sent.url.path == f"{SERVICE_PATH}/{MONTHS}"
     assert dict(sent.url.params) == {"LANGUAGE": "'E'", "$format": "json"}
@@ -402,6 +418,233 @@ def test_search_over_the_snapshot_lists_by_kind():
         return [m["target"] for m in out["matches"] if m["kind"] == "operation"]
 
     assert listed("generic") == [MONTHS] and listed("odata") == []
+
+
+# -- what a function import of a generic service returns (4b) ---------------------
+
+
+def _withheld() -> dict[str, Any]:
+    return {"ok": True, "status": 200, "returned": "withheld", "result": None,
+            "truncated": False}
+
+
+def _writes(services: list[str]) -> dict[str, Any]:
+    return {"services": services, "allow_write": True}
+
+
+def test_the_plan_says_when_a_complex_answer_is_passed_on_whole():
+    def whole(kind: str, op: dict[str, Any]) -> bool:
+        rules = ODataClient(None, service(kind, definition=_definition([op])), V2Dialect())  # type: ignore[arg-type]
+        operation = ServiceDefinition.model_validate(_definition([op])).operation(MONTHS)
+        return rules.check_call(operation, params={"LANGUAGE": "E"}).whole
+
+    assert whole("generic", _get_import()) is True
+    assert whole("generic", _get_import(changes_data=False)) is True
+    assert whole("odata", _get_import(changes_data=False)) is False  # a read, of `odata`
+    assert whole("odata", _get_import()) is False
+    # A write's answer is its confirmation, on every kind.
+    assert whole("generic", _get_import(http_method="POST", changes_data=False)) is False
+    # The catalogue says it returns entities of a set: that set's fields decide.
+    returns = {"entity_set": "SCARRSet", "collection": True}
+    assert whole("generic", _get_import(returns=returns)) is False
+
+
+@pytest.mark.parametrize(
+    "kind, operation, allow_write",
+    [
+        ("odata", _get_import(changes_data=False), False),  # a read of an `odata` service
+        ("odata", _get_import(), True),  # a write of an `odata` service
+        # A POST import of a generic service is a write: its answer is the confirmation.
+        ("generic", _get_import(http_method="POST", changes_data=False), True),
+    ],
+)
+async def test_the_same_answer_keeps_the_default_deny_rule_elsewhere(kind, operation, allow_write):
+    sap = Sap()
+    services = {"agent-data": service(kind, definition=_definition([operation]))}
+    tools = toolset(services, sap, _writes(list(services)) if allow_write else None)
+    out = await execute(tools, **CALL)
+    assert out == _withheld()
+    assert "January" not in json.dumps(out)
+    # The two writes went out and were recorded as done; the read was not.
+    assert [r.outcome for r in await all_rows()] == (["ok"] if allow_write else [])
+
+
+async def test_one_structure_is_returned_whole():
+    sap = Sap()
+    row = month_names()["d"]["results"][0]
+    for answer in ({"d": {MONTHS: row}}, {"d": row}):  # with Gateway's wrapper and without
+        sap.answer = answer
+        out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+        assert out == {"ok": True, "status": 200, "returned": "structure",
+                       "result": plain(row), "truncated": False}
+
+
+async def test_an_empty_table_is_an_empty_collection():
+    sap = Sap()
+    sap.answer = {"d": {"results": []}}
+    out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+    assert (out["returned"], out["result"]) == ("collection", [])
+
+
+async def test_nested_structures_come_whole_without_the_bookkeeping():
+    sap = Sap()
+    sap.answer = {
+        "d": {
+            "results": [
+                {
+                    "__metadata": {"type": RESULT_TYPE},
+                    "MNR": "01",
+                    "TEXTS": {
+                        "__metadata": {"type": "Collection(ZAGENT_DATA_SRV.TEXT)"},
+                        "results": [
+                            {"__metadata": {"type": "ZAGENT_DATA_SRV.TEXT"}, "SPRAS": "E",
+                             "LTX": "January"},
+                        ],
+                    },
+                    "HEAD": {"__metadata": {"type": "ZAGENT_DATA_SRV.HEAD"}, "LANG": "E",
+                             "LANG@odata.type": "Edm.String"},
+                    "LIST": [1, "two", None, True],
+                    "EMPTY": None,
+                }
+            ]
+        }
+    }
+    out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+    assert out["returned"] == "collection"
+    assert out["result"] == [
+        {
+            "MNR": "01",
+            "TEXTS": {"results": [{"SPRAS": "E", "LTX": "January"}]},
+            "HEAD": {"LANG": "E"},
+            "LIST": [1, "two", None, True],
+            "EMPTY": None,
+        }
+    ]
+
+
+def _nested(depth: int) -> dict[str, Any]:
+    """A row whose innermost value lies ``depth`` levels below it."""
+    value: Any = "deep"
+    for _ in range(depth):
+        value = {"__metadata": {"type": "ZAGENT_DATA_SRV.NODE"}, "NEXT": value}
+    return value
+
+
+ROW = {"__metadata": {"type": RESULT_TYPE}, "MNR": "01", "LTX": "January"}
+ENTITY_META = {"type": "ZAGENT_DATA_SRV.T000", "uri": "T000Set('001')"}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # Entities, of a set the catalogue does not hold: their V2 marks.
+        {"d": {"results": [{**ROW, "__metadata": ENTITY_META}]}},
+        {"d": {"results": [ROW, {**ROW, "__metadata": {"type": RESULT_TYPE, "id": "x"}}]}},
+        {"d": {MONTHS: {**ROW, "__metadata": {"type": RESULT_TYPE, "etag": "W/\"1\""}}}},
+        {"d": {"results": [{**ROW, "__metadata": {"type": RESULT_TYPE, "media_src": "x"}}]}},
+        # A navigation: only an entity has one.
+        {"d": {"results": [{**ROW, "TO_X": {"__deferred": {"uri": "x"}}}]}},
+        # An entity inline, deeper down.
+        {"d": {"results": [{**ROW, "ITEM": {"__metadata": ENTITY_META, "MANDT": "001"}}]}},
+        {"d": {"results": [{**ROW, "ITEMS": [{"__metadata": ENTITY_META, "MANDT": "001"}]}]}},
+        # The entity type of a catalogue entity set: that set's fields decide, not this rule.
+        {"d": {"results": [{**ROW, "__metadata": {"type": "ZAGENT_DATA_SRV.SCARR"}}]}},
+        {"d": {MONTHS: {**ROW, "__metadata": {"type": "ZAGENT_DATA_SRV.SCARR"}}}},
+        # Bookkeeping that is no complex type's.
+        {"d": {"results": [{**ROW, "__metadata": "x"}]}},
+        {"d": {"results": [{**ROW, "__metadata": {"type": ["x"]}}]}},
+        {"d": {"results": [{**ROW, "__count": "1"}]}},
+        # A list of plain values, or rows that are not all structures.
+        {"d": {"results": ["January", "February"]}},
+        {"d": {"results": [ROW, "February"]}},
+        {"d": {"results": [ROW, ["January"]]}},
+        # Nested deeper than a structure of a module may be.
+        {"d": {"results": [_nested(MAX_STRUCTURE_DEPTH + 1)]}},
+    ],
+)
+async def test_what_is_not_positively_complex_data_is_withheld(answer):
+    sap = Sap()
+    sap.answer = answer
+    out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+    assert out == _withheld()
+    text = json.dumps(out)
+    assert "January" not in text and "001" not in text and "deep" not in text
+
+
+async def test_a_structure_at_the_depth_bound_is_returned():
+    sap = Sap()
+    sap.answer = {"d": {"results": [_nested(MAX_STRUCTURE_DEPTH)]}}
+    out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+    assert out["returned"] == "collection" and "deep" in json.dumps(out["result"])
+
+
+async def test_entities_keep_the_catalogue_cut_on_a_generic_service():
+    """An import that says it returns a catalogue entity set: the read's rule."""
+    sap = Sap()
+    returns = {"entity_set": "SCARRSet", "collection": True}
+    tools = toolset({"agent-data": service(definition=_definition([_get_import(returns=returns)]))},
+                    sap)
+    sap.answer = {
+        "d": {
+            "results": [
+                {"__metadata": {"type": "ZAGENT_DATA_SRV.SCARR", "uri": "SCARRSet('LH')"},
+                 "CARRID": "LH", "CARRNAME": "Lufthansa", "CURRCODE": "EUR"}
+            ]
+        }
+    }
+    out = await execute(tools, **CALL)
+    # CURRCODE is no catalogue field of SCARRSet: cut, as a read would.
+    assert (out["returned"], out["result"]) == (
+        "entities", [{"CARRID": "LH", "CARRNAME": "Lufthansa"}]
+    )
+    sap.answer = month_names()  # something else than the declared entities
+    assert await execute(tools, **CALL) == _withheld()
+
+
+def _big(rows: int, text_chars: int) -> list[dict[str, Any]]:
+    return [{"__metadata": {"type": RESULT_TYPE}, "MNR": f"{i:02}", "LTX": "x" * text_chars}
+            for i in range(rows)]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"d": {"results": _big(12, MAX_RESULT_CHARS // 10)}},  # many rows, together too large
+        {"d": {"results": _big(1, MAX_RESULT_CHARS)}},  # one row too large
+        {"d": {MONTHS: _big(1, MAX_RESULT_CHARS)[0]}},  # one structure too large
+    ],
+)
+async def test_a_complex_answer_over_the_cap_is_refused_never_cut(answer):
+    sap = Sap()
+    sap.answer = answer
+    out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+    assert set(out) == {"error"} and code(out) == "result_too_large"
+    assert "xxxx" not in json.dumps(out)
+    assert len(sap.requests) == 1  # nothing is asked again
+
+
+async def test_a_complex_answer_under_the_cap_comes_whole():
+    sap = Sap()
+    rows = _big(10, MAX_RESULT_CHARS // 12)
+    sap.answer = {"d": {"results": rows}}
+    out = await execute(toolset({"agent-data": service()}, sap), **CALL)
+    assert out["returned"] == "collection" and out["truncated"] is False
+    assert out["result"] == [plain(r) for r in rows]
+    assert len(json.dumps(out)) <= MAX_RESULT_CHARS
+
+
+def test_the_cap_refuses_a_whole_result_and_still_cuts_entities():
+    rows = [{"MNR": f"{i:02}", "LTX": "x" * 100} for i in range(20)]
+    for returned in ("collection", "structure"):
+        result = rows if returned == "collection" else {"ROWS": rows}
+        out = clip_result({"ok": True, "status": 200, "returned": returned, "result": result}, 1000)
+        assert set(out) == {"error"} and out["error"]["code"] == "result_too_large"
+    # Unchanged for the default-deny rule's entities: trailing rows dropped, said so.
+    out = clip_result({"ok": True, "status": 200, "returned": "entities", "result": rows}, 1000)
+    assert out["truncated"] is True and 0 < len(out["result"]) < 20
+    # Under the cap a whole result is untouched.
+    small = {"ok": True, "status": 200, "returned": "collection", "result": rows[:2]}
+    assert clip_result(small, 1000) == {**small, "truncated": False}
 
 
 # -- the $metadata of a generic service -------------------------------------------

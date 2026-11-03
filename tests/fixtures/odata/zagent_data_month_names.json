@@ -1,0 +1,18 @@
+{
+  "d": {
+    "results": [
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "01", "KTX": "Jan", "LTX": "January"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "02", "KTX": "Feb", "LTX": "February"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "03", "KTX": "Mar", "LTX": "March"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "04", "KTX": "Apr", "LTX": "April"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "05", "KTX": "May", "LTX": "May"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "06", "KTX": "Jun", "LTX": "June"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "07", "KTX": "Jul", "LTX": "July"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "08", "KTX": "Aug", "LTX": "August"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "09", "KTX": "Sep", "LTX": "September"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "10", "KTX": "Oct", "LTX": "October"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "11", "KTX": "Nov", "LTX": "November"},
+      {"__metadata": {"type": "ZAGENT_DATA_SRV.MONTH_NAMES_GET_RESULT"}, "SPRAS": "E", "MNR": "12", "KTX": "Dec", "LTX": "December"}
+    ]
+  }
+}

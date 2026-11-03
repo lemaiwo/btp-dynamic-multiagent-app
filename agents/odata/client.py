@@ -88,7 +88,15 @@ body. What comes back is shown only when it can be tied to a catalogue
 entity set -- the one the operation's ``returns`` names, else the one it is
 ``bound_to`` -- so that the field allowlist applies; otherwise the answer
 is a confirmation and nothing else
-(``ODataClient.call``, ``_returned``).
+(``ODataClient.call``, ``_returned``). One exception, on a service of kind
+``generic`` only: the complex answer of a ``GET`` function import that the
+catalogue does not tie to an entity set -- one structure or a collection of
+them, the module's exporting and table parameters -- is shown with every
+property (``__metadata`` dropped). SAP's allow-list owner decides what a
+listed module exposes, and the app has no field catalogue for a complex type
+to cut by; what is not positively complex data (an entity, a navigation) is
+still withheld, and such an answer over the size cap is refused, never cut
+(``clip_result``).
 """
 
 from __future__ import annotations
@@ -167,6 +175,10 @@ MAX_CALL_PARAMS = 100
 MAX_CALL_VALUE_CHARS = 1000
 # How a serialised JSON or XML document starts, whatever its length.
 _STRUCTURED_STARTS = ("{", "[", "<")
+# How deep the complex answer of a generic service's function import may nest
+# (a value in a structure in a table in a structure ...) to be passed on
+# whole (`_is_structure`); a deeper one is withheld, not walked further.
+MAX_STRUCTURE_DEPTH = 10
 
 
 def _outcome_hint(operation: str) -> str:
@@ -458,7 +470,11 @@ class CallPlan:
     against and cut to -- the one the catalogue's ``returns`` names, else
     ``bound`` -- and ``many`` what ``returns`` declares (``True`` a
     collection, ``False`` one entity, ``None`` when the catalogue does not
-    say); ``etag`` the validated ``If-Match`` value or ``None``.
+    say); ``etag`` the validated ``If-Match`` value or ``None``;
+    ``whole`` whether a complex answer is passed on with every property
+    (``ODataClient._returned``): a call that only reads, of a function
+    import of a service of kind ``generic``, whose catalogue entry names no
+    entity set it returns.
     ``operation`` and ``body`` make it the plan of a modifying request for
     ``_write``. The ``repr`` shows names only: the path, the query and the
     body carry the parameter and key values.
@@ -477,6 +493,7 @@ class CallPlan:
     etag: str | None = field(default=None, repr=False)
     operation: str = "call"
     body: dict[str, Any] | None = field(default=None, repr=False)
+    whole: bool = False
 
     def __repr__(self) -> str:
         return (
@@ -541,6 +558,41 @@ def _value(value: Any) -> Any:
     if isinstance(value, list):
         return [v for v in (_value(item) for item in value) if v is not _DROP]
     return value
+
+
+def _is_structure(value: Any, entity_types: frozenset[str], depth: int = 0) -> bool:
+    """Whether ``value`` is positively complex-type data, nothing of an entity.
+
+    In V2 an entity carries ``__metadata`` with its ``uri`` (and ``id``,
+    ``etag``, media keys) and its navigations as ``__deferred``; a complex
+    value carries at most ``__metadata.type``. So an object passes only when
+    its ``__metadata``, if any, holds nothing but a ``type`` that is a text
+    and not the entity type of a catalogue entity set (that set's field
+    allowlist decides about such data), it has no other ``__`` key, and
+    every value passes in turn; a list when every item does; a scalar
+    always. A value nested deeper than ``MAX_STRUCTURE_DEPTH`` does not.
+    """
+    if depth > MAX_STRUCTURE_DEPTH:
+        return False
+    if isinstance(value, dict):
+        meta = value.get("__metadata", {})
+        if not isinstance(meta, dict) or set(meta) - {"type"}:
+            return False
+        kind = meta.get("type")
+        if kind is not None and (not isinstance(kind, str) or kind in entity_types):
+            return False
+        return all(
+            name == "__metadata"
+            or (
+                isinstance(name, str)
+                and not name.startswith("__")
+                and _is_structure(item, entity_types, depth + 1)
+            )
+            for name, item in value.items()
+        )
+    if isinstance(value, list):
+        return all(_is_structure(item, entity_types, depth + 1) for item in value)
+    return True
 
 
 class ODataClient:
@@ -1207,6 +1259,13 @@ class ODataClient:
             ),
             many=None if returns is None else returns.collection,
             etag=etag,
+            # The generic exception of `_returned`: exact kinds, a read only.
+            whole=(
+                self._kind == "generic"
+                and operation.kind == "function_import"
+                and not changes
+                and returns is None
+            ),
         )
 
     @staticmethod
@@ -2041,6 +2100,14 @@ class ODataClient:
         ``withheld``: the caller learns that the call worked, not what it
         returned.
 
+        Except, for a plan that says ``whole`` (a reading function import of
+        a ``generic`` service that names no entity set it returns): one
+        object, or a list of objects, that is positively complex-type data
+        (``_is_structure``) is ``structure`` / ``collection`` with every
+        property, the bookkeeping dropped as for a read (``_value``: no
+        ``__metadata``, no annotation). What fails that test falls to the
+        rule above, which withholds it.
+
         A single JSON scalar is passed on for a call that only reads (it is
         the whole point of such a function): a number or a boolean as it
         is, a text only when it is one printable line of at most
@@ -2065,6 +2132,16 @@ class ODataClient:
                 ):
                     return "withheld", None
             return "value", value
+        if plan.whole and shape in ("entity", "collection"):
+            rows = value if shape == "collection" else [value]
+            entity_types = frozenset(
+                e.entity_type for e in self._definition.entity_sets if e.entity_type
+            )
+            if isinstance(rows, list) and all(
+                isinstance(row, dict) and _is_structure(row, entity_types) for row in rows
+            ):
+                whole = [_value(row) for row in rows]
+                return ("collection", whole) if shape == "collection" else ("structure", whole[0])
         target = plan.result_set
         if shape not in ("entity", "collection") or target is None or not target.entity_type:
             return "withheld", None
@@ -2096,7 +2173,9 @@ class ODataClient:
 
         ``returned`` says what ``result`` is: ``entity`` / ``entities`` (cut
         to the selectable fields of the entity set the operation returns,
-        or is bound to), ``value`` (one scalar, read-type calls only), ``nothing`` (SAP
+        or is bound to), ``structure`` / ``collection`` (a ``generic``
+        service's reading function import: complex data with every
+        property), ``value`` (one scalar, read-type calls only), ``nothing`` (SAP
         sent no content) or ``withheld`` (SAP sent something that could not
         be tied to a catalogue entity set, so it is not passed on);
         ``result`` is ``None`` for the last two. See ``_returned``.
@@ -2127,6 +2206,10 @@ class ODataClient:
 
 
 # -- the size cap ---------------------------------------------------------------
+
+# What `ODataClient.call` passes on whole (a generic service's complex answer):
+# over the cap it is refused, never cut.
+WHOLE_RETURNS = ("structure", "collection")
 
 
 def _size(result: dict) -> int:
@@ -2191,12 +2274,25 @@ def clip_result(result: dict, max_chars: int, *, skip: int | None = None) -> dic
     page) the cut page gets one only if the caller passes the ``skip`` it
     asked with. When not even the first row of a page fits, the answer is a
     refusal (``{"error": {code: result_too_large, ...}}``) instead of an
-    empty page that would be asked for again. The input is not changed.
+    empty page that would be asked for again. A call result passed on whole
+    (``returned`` in ``WHOLE_RETURNS``) that does not fit is that refusal at
+    once: it has no field catalogue to cut by and no page to continue from,
+    so a list that ends early or a structure with halved texts would read as
+    SAP's whole answer. The input is not changed.
     """
     out = copy.deepcopy(result)
     out["truncated"] = bool(out.get("truncated", False))
     if _size(out) <= max_chars:
         return out
+    if out.get("returned") in WHOLE_RETURNS:
+        return {
+            "error": ODataError(
+                "result_too_large",
+                "the answer of this operation is larger than a tool result may be; "
+                "nothing of it was returned",
+                hint="call it with parameters that select less",
+            ).to_dict()
+        }
     out["truncated"] = True
     for key in ("items", "result"):
         if isinstance(out.get(key), list):
