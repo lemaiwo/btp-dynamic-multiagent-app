@@ -889,6 +889,15 @@ function addMcpServerRow(server) {
             + 'edit this server in the UI5 admin.';
     }
     modeSelect.value = storedMode;
+    // A stored builtin:ina entry (made in the UI5 admin; its destination mode
+    // is an option here, so the branch above does not see it). The block is
+    // kept on the row and sent back as loaded while the row stays an ina row
+    // on that mode; nothing on this page edits or creates one.
+    if (!isNewServer && storedMode === 'destination' && destinationBuiltinOf(row) === INA_BUILTIN) {
+        const keptIna = Object.assign({}, oauth);
+        delete keptIna.has_client_secret;
+        row.dataset.keptIna = JSON.stringify(keptIna);
+    }
     row.querySelector('.oauth-dcr').checked = !!oauth.dcr;
     row.querySelector('.oauth-uaa').value = oauth.uaa_url || '';
     row.querySelector('.oauth-client-id').value = oauth.client_id || '';
@@ -958,6 +967,11 @@ function collectMcpServers() {
             // A mode this page does not edit: the block as it was loaded.
             const kept = JSON.parse(r.dataset.keptOauth || '{}');
             if (Object.keys(kept).length) server.oauth = kept;
+        } else if (destinationBuiltinOf(r) === INA_BUILTIN) {
+            // The stored entry as loaded; any other builtin:ina row (typed by
+            // hand, or left on another mode) is refused before the save.
+            if (mode !== 'destination' || !r.dataset.keptIna) throw new Error(INA_REFUSAL);
+            server.oauth = JSON.parse(r.dataset.keptIna);
         } else if (mode === 'oauth2') {
             const scope = r.querySelector('.oauth-scope').value.trim();
             if (r.querySelector('.oauth-dcr').checked) {
@@ -2657,8 +2671,17 @@ const DESTINATION_FIELDS = {
     // service (`_validate_odata_entry` in agents/admin.py refuses any key but
     // these two). Collected by `collectODataConfig`, not the generic branch.
     'builtin:odata':         ['services', 'allow_write'],
+    // Analytical queries (InA). Made and edited in the UI5 admin only: this
+    // page knows the key so that a STORED row is kept, shown and posted back
+    // as it was loaded (`addMcpServerRow` / `collectMcpServers`). The entry
+    // is {queries: [...]} and nothing else, and no field here edits it.
+    'builtin:ina':           ['queries'],
 };
 const ODATA_BUILTIN = 'builtin:odata';
+const INA_BUILTIN = 'builtin:ina';
+const INA_NOTE = 'Edited in the UI5 admin (Analytical queries)';
+// Fixed text: a row typed by hand, or a kept row left on another auth mode.
+const INA_REFUSAL = 'builtin:ina is edited in the UI5 admin (Analytical queries); this page only keeps a stored entry.';
 const BITBUCKET_BUILTIN = 'builtin:bitbucket';
 const GIT_BUILTIN = 'builtin:git';
 // The toolset's name, as the UI5 admin's dropdown shows it.
@@ -2702,6 +2725,9 @@ function destinationFieldsHtml() {
                     <div class="dest-services" role="group" style="margin:4px 0;max-height:220px;overflow-y:auto"></div>
                     <div class="dest-services-note" style="color:var(--muted);font-size:12px"></div>
                     <div class="dest-odata-warning" role="status" style="color:var(--warn);font-size:12px"></div>
+                </div>
+                <div class="dest-field-queries" style="grid-column:1 / -1">
+                    <div class="dest-queries" style="font-weight:600"></div>
                 </div>
                 <div class="dest-field-allow_write" style="grid-column:1 / -1">
                     <label style="font-weight:600"><input type="checkbox" class="dest-allow_write"> Allow writes</label>
@@ -2873,6 +2899,11 @@ function fillDestinationFields(row, oauth) {
     row.dataset.odataServices = JSON.stringify(stored);
     wireODataFields(row);
     renderODataServiceChecks(row, stored);
+    // builtin:ina. A read-only line of the stored query names, as text (they
+    // are data); only an ina row shows what a block of another type holds.
+    const inaQueries = destinationBuiltinOf(row) === INA_BUILTIN && Array.isArray(oauth.queries)
+        ? oauth.queries.filter(n => typeof n === 'string') : [];
+    row.querySelector('.dest-queries').textContent = inaQueries.length ? 'Queries: ' + inaQueries.join(', ') : '';
     const theme = oauth.theme;
     row.querySelector('.dest-theme').value =
         theme && typeof theme === 'object' && Object.keys(theme).length ? JSON.stringify(theme, null, 2) : '';
@@ -2929,9 +2960,10 @@ function syncDestinationFields(row) {
     box.querySelectorAll('[class*="dest-field-"]').forEach(label => {
         const key = [...label.classList].find(c => c.startsWith('dest-field-')).slice('dest-field-'.length);
         let show = wanted.includes(key);
-        // Every type names its destination, except builtin:odata: there the
-        // destination belongs to each catalogue service.
-        if (key === 'destination') show = builtin !== ODATA_BUILTIN;
+        // Every type names its destination, except builtin:odata and
+        // builtin:ina: there the destination belongs to each catalogue
+        // service or registered query.
+        if (key === 'destination') show = builtin !== ODATA_BUILTIN && builtin !== INA_BUILTIN;
         // A destination resolved as the user reads /me: no mailbox to name.
         if (key === 'mailbox' && userContext) show = false;
         // Graph refuses application posts, so Teams posts only as the user.
@@ -2944,6 +2976,8 @@ function syncDestinationFields(row) {
             + 'builtin:teams, builtin:slack, builtin:jira, builtin:confluence, builtin:smtp, builtin:sharepoint, builtin:bitbucket, builtin:git, builtin:sapnotes, builtin:sapnotedetail, builtin:odata).';
     } else if (builtin === ODATA_BUILTIN) {
         hint = 'Destination and identity come from each catalogue service. Edit services in the UI5 admin (OData services).';
+    } else if (builtin === INA_BUILTIN) {
+        hint = INA_NOTE;
     } else if (isRemoteMcpUrl(builtin)) {
         hint = 'The destination names the MCP server\'s host and holds its credential; the URL above contributes only its path. '
             + (userContext

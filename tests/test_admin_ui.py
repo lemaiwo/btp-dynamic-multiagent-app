@@ -1743,6 +1743,18 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
         # made in the UI5 admin) is sent back as loaded, and the row says so.
         check("a server on a mode the page does not edit is kept as stored",
               "dataset.keptMode" in html and "It is saved as stored" in html)
+        # builtin:ina (analytical queries): the entry is made in the UI5 admin.
+        # This page knows the key so that a stored row is kept and marked, but
+        # it does not offer the toolset: the hint list of what a new row can
+        # be does not name it, and a row typed by hand is refused at save.
+        check("ina is a known destination built-in, kept as stored",
+              "'builtin:ina':" in html and "['queries']" in html
+              and "Edited in the UI5 admin (Analytical queries)" in html)
+        hint_line = next((ln for ln in js.splitlines()
+                          if "A destination works with an https MCP server" in ln), "")
+        check("a new row is not offered builtin:ina",
+              "builtin:odata)" in js and hint_line != "" and "builtin:ina" not in hint_line
+              and '<option value="builtin:ina"' not in html)
         check("api() call discovered: GET /admin/api/odata/services",
               ("GET", "/admin/api/odata/services") in discovered)
         for opener in ("openAgentModal", "editAgent"):
@@ -1758,6 +1770,8 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
 
         odata_agent_id = None
         odata_names = ["purchase-requisitions", "business-partners"]
+        ina_agent_id = None
+        ina_query_name = "ui-test-sales"
         try:
             # A stored entry, as GET /agents/{id} answers it, for the round trip
             # below: load it into the row, collect it, PUT it back unchanged.
@@ -1795,8 +1809,45 @@ main().catch(err => { console.error(err); process.exitCode = 1; });
                       and stored_odata[0]["oauth"].get("allow_write") is True,
                       str(stored_odata))
 
+            # builtin:ina: a registered query and an agent that names it, made
+            # as the UI5 admin would. Its stored entry, as GET answers it, is
+            # loaded into the row below and must come back unchanged.
+            from agents.db import SessionLocal, create_ina_query
+            async with SessionLocal() as s:
+                await create_ina_query(s, {
+                    "name": ina_query_name, "title": "UI test query", "purpose": "UI test query.",
+                    "not_for": "Nothing else", "destination": "SIA_INA", "user_context": False,
+                    "query": "ZQ_UI_TEST_01", "enabled": True,
+                    "definition": {
+                        "dimensions": [{"name": "0CALMONTH", "label": "Month",
+                                        "key_field": "0CALMONTH.KEY"}],
+                        "measures": [{"name": "0AMOUNT", "label": "Net amount", "unit": "EUR"}],
+                        "variables": []},
+                })
+            ina_entry = {"url": "builtin:ina", "auth_mode": "destination",
+                         "oauth": {"queries": [ina_query_name]}}
+            ina_agent = {
+                "name": "uiina", "description": "UI test agent with an analytical query.",
+                "instructions": "You are a UI test agent.", "enabled": True,
+                "mcp_servers": [ina_entry],
+            }
+            r = await client.post("/admin/api/agents", json=ina_agent)
+            check("fixture agent with a builtin:ina entry created",
+                  r.status_code == 201, r.text[:300])
+            ina_agent_id = r.json().get("id") if r.status_code == 201 else None
+            stored_ina = None
+            if ina_agent_id is not None:
+                r = await client.get(f"/admin/api/agents/{ina_agent_id}")
+                stored_ina = r.json()["mcp_servers"]
+                check("the stored entry is the url, the mode and the query names",
+                      len(stored_ina) == 1 and stored_ina[0]["url"] == "builtin:ina"
+                      and stored_ina[0]["auth_mode"] == "destination"
+                      and stored_ina[0]["oauth"].get("queries") == [ina_query_name],
+                      str(stored_ina))
+
             if shutil.which("node") is not None:
-                dest_harness = "const STORED_ODATA = " + json.dumps(stored_odata) + ";\n" + r"""
+                dest_harness = ("const STORED_ODATA = " + json.dumps(stored_odata) + ";\n"
+                                + "const STORED_INA = " + json.dumps(stored_ina) + ";\n") + r"""
 'use strict';
 const assert = require('node:assert');
 const { JSDOM } = require('jsdom');
@@ -2206,6 +2257,86 @@ assert.throws(() => collectMcpServers(), /Two builtin:git rows/);
 assert.deepStrictEqual(out.oauth, { destination: 'BITBUCKET', workspace: 'acme-ws' });
 assert.strictEqual(row.querySelector('.dest-allow_push').checked, false);
 assert.strictEqual(row.querySelector('.dest-base_branch').value, '');
+// 7f. builtin:ina (analytical queries) is edited in the UI5 admin. A stored
+//     row is shown with the destination option, its queries as a read-only
+//     line and a fixed note, and goes back as it was loaded; a NEW row cannot
+//     be made here.
+const INA_NOTE_TEXT = 'Edited in the UI5 admin (Analytical queries)';
+const INA_ENTRY = { url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month', 'stock-levels'] } };
+({ row, out } = addAndCollect(JSON.parse(JSON.stringify(INA_ENTRY))));
+assert.deepStrictEqual(out, INA_ENTRY, 'sent back exactly as loaded');
+assert.strictEqual(row.querySelector('.mcp-auth-mode').value, 'destination',
+    'the destination option, not a blank select');
+assert.strictEqual(row.querySelectorAll('.mcp-auth-mode option').length, 5, 'no option of its own');
+assert.strictEqual(row.querySelector('.mcp-destination').style.display, 'block');
+assert.strictEqual(row.querySelector('.dest-field-queries').style.display, '');
+assert.strictEqual(row.querySelector('.dest-queries').textContent,
+    'Queries: sales-by-month, stock-levels');
+assert.strictEqual(row.querySelector('.dest-hint').textContent, INA_NOTE_TEXT);
+// Read-only and nothing else of the form: no destination name (each query
+// names its own), no identity switch, none of another built-in's fields.
+assert.strictEqual(row.querySelector('.dest-field-queries input'), null,
+    'no input to edit the queries');
+assert.strictEqual(row.querySelector('.dest-field-queries textarea'), null);
+for (const k of ['destination', 'user_context', 'services', 'allow_write', 'project', 'workspace',
+                 'repositories', 'views', 'site', 'allow_send']) {
+    assert.strictEqual(row.querySelector('.dest-field-' + k).style.display, 'none',
+        k + ' is hidden');
+}
+console.log('INA:' + JSON.stringify(out));
+// Query names are data: the line is text, never markup.
+({ row, out } = addAndCollect({ url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['<img src=x onerror=alert(1)>'] } }));
+assert.strictEqual(row.querySelector('.dest-field-queries img'), null);
+assert.strictEqual(row.querySelector('.dest-queries').textContent,
+    'Queries: <img src=x onerror=alert(1)>');
+assert.deepStrictEqual(out.oauth, { queries: ['<img src=x onerror=alert(1)>'] });
+// The API's read-only marker is not part of the block and is not sent back.
+({ row, out } = addAndCollect({ url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'], has_client_secret: false } }));
+assert.deepStrictEqual(out, { url: 'builtin:ina', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'] } });
+// Another spelling of the url is the same entry; the url goes out as loaded.
+({ row, out } = addAndCollect({ url: 'Builtin:INA/', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'] } }));
+assert.deepStrictEqual(out, { url: 'Builtin:INA/', auth_mode: 'destination',
+    oauth: { queries: ['sales-by-month'] } });
+// A row that is made another built-in is an ordinary row: nothing of the
+// kept block rides along (a deliberate edit of the url).
+({ row } = addAndCollect(JSON.parse(JSON.stringify(INA_ENTRY))));
+row.querySelector('.mcp-url').value = 'builtin:jira';
+syncDestinationFields(row);
+row.querySelector('.dest-destination').value = 'JIRA';
+row.querySelector('.dest-project').value = 'ABC';
+assert.deepStrictEqual(collectMcpServers()[0], { url: 'builtin:jira', auth_mode: 'destination',
+    oauth: { destination: 'JIRA', project: 'ABC' } });
+// Another auth mode on the kept row is refused, not posted with the queries
+// of the stored mode.
+({ row } = addAndCollect(JSON.parse(JSON.stringify(INA_ENTRY))));
+row.querySelector('.mcp-auth-mode').value = 'jwt';
+assert.throws(() => collectMcpServers(), e => {
+    assert.ok(/builtin:ina is edited in the UI5 admin \(Analytical queries\)/.test(e.message));
+    return true;
+});
+// A new row cannot be made here: the dropdown has no such toolset and a url
+// typed by hand is refused before the save, with a fixed text.
+document.getElementById('agent-mcp-servers').innerHTML = '';
+addMcpServerRow();
+row = document.querySelector('.mcp-server-row');
+const optionText = [...row.querySelectorAll('option')].map(o => o.value + o.textContent).join();
+assert.ok(!/builtin:ina/i.test(optionText), 'no option of a new row names builtin:ina');
+row.querySelector('.mcp-url').value = 'builtin:ina';
+row.querySelector('.mcp-auth-mode').value = 'destination';
+toggleOauthFields(row.querySelector('.mcp-auth-mode'));
+assert.throws(() => collectMcpServers(), e => {
+    assert.strictEqual(e.message, 'builtin:ina is edited in the UI5 admin (Analytical queries); '
+        + 'this page only keeps a stored entry.');
+    return true;
+});
+// ... also with a stored row next to it: the typed one is not a stored one.
+addMcpServerRow(JSON.parse(JSON.stringify(INA_ENTRY)));
+assert.throws(() => collectMcpServers(), /builtin:ina is edited in the UI5 admin/);
 // 4b. Confluence keeps its space pin and api_base; nothing of Jira's, no user switch.
 ({ row, out } = addAndCollect({
     url: 'builtin:confluence', auth_mode: 'destination',
@@ -2798,6 +2929,17 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
     assert.deepStrictEqual(calls, [], 'no request for an entry without services');
     assert.strictEqual(toastEl.textContent, 'Select at least one OData service');
 
+    // 24b. saveAgent() with a kept builtin:ina row posts the entry as loaded.
+    document.getElementById('agent-mcp-servers').innerHTML = '';
+    renderMcpServers(JSON.parse(JSON.stringify([INA_ENTRY])));
+    calls = [];
+    answer = () => ({ ok: false, status: 422, statusText: 'Unprocessable Entity',
+                      json: async () => ({ detail: 'refused for the test' }) });
+    await saveAgent();
+    assert.deepStrictEqual(calls.map(c => c.slice(0, 2)), [['/admin/api/agents/7', 'PUT']]);
+    assert.deepStrictEqual(JSON.parse(calls[0][2]).mcp_servers, [INA_ENTRY],
+        'the posted entry is the loaded one');
+
     // 25. The entry as the live API stored it: load, collect, same entry. The
     //     catalogue here lists by name, the stored entry does not.
     if (STORED_ODATA) {
@@ -2809,6 +2951,14 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
         const again = collectMcpServers();
         assert.deepStrictEqual(Object.keys(again[0].oauth).sort(), ['allow_write', 'services']);
         console.log('ROUNDTRIP:' + JSON.stringify(again));
+    }
+    // 25b. The builtin:ina entry as the live API stored it: load, collect, same entry.
+    if (STORED_INA) {
+        document.getElementById('agent-mcp-servers').innerHTML = '';
+        renderMcpServers(STORED_INA);
+        const inaAgain = collectMcpServers();
+        assert.ok(!('has_client_secret' in inaAgain[0].oauth));
+        console.log('INAROUNDTRIP:' + JSON.stringify(inaAgain));
     }
     console.log('destination server round-trip scenarios passed');
 })().catch(e => { console.error(e && e.stack || e); process.exit(1); });
@@ -2950,6 +3100,25 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
                                       str(after)[:420])
                             finally:
                                 await client.delete(f"/admin/api/agents/{app_id}")
+                    # builtin:ina (kept as stored): what the form posts for the
+                    # untouched row is accepted and leaves the stored entry as it was.
+                    ina_collected = next((json.loads(line[len("INAROUNDTRIP:"):])
+                                          for line in result.stdout.splitlines()
+                                          if line.startswith("INAROUNDTRIP:")), None)
+                    check("the form collected the stored builtin:ina entry",
+                          ina_collected == [ina_entry], str(ina_collected))
+                    if ina_collected is not None and ina_agent_id is not None:
+                        before = (await client.get(f"/admin/api/agents/{ina_agent_id}")).json()
+                        r = await client.put(f"/admin/api/agents/{ina_agent_id}",
+                                             json={**ina_agent, "mcp_servers": ina_collected})
+                        check("saving the collected builtin:ina entry is accepted",
+                              r.status_code == 200, r.text[:300])
+                        after = (await client.get(f"/admin/api/agents/{ina_agent_id}")).json()
+                        check("load, save without changes: the same stored builtin:ina entry",
+                              after["mcp_servers"] == before["mcp_servers"]
+                              and after["mcp_servers"][0]["oauth"].get("queries")
+                              == [ina_query_name],
+                              str(after["mcp_servers"]))
                     if collected is not None and odata_agent_id is not None:
                         r = await client.put(f"/admin/api/agents/{odata_agent_id}",
                                              json={**odata_agent, "mcp_servers": collected})
@@ -2979,6 +3148,13 @@ assert.ok(errText({ detail: [{ loc: ['body', 'mcp_servers', 0], type: 'value_err
             # Whatever failed above, the fixtures do not outlive this section.
             if odata_agent_id is not None:
                 await client.delete(f"/admin/api/agents/{odata_agent_id}")
+            if ina_agent_id is not None:
+                await client.delete(f"/admin/api/agents/{ina_agent_id}")
+            from agents.db import SessionLocal, delete_ina_query, get_ina_query
+            async with SessionLocal() as s_ina:
+                ina_row = await get_ina_query(s_ina, ina_query_name)
+                if ina_row is not None:
+                    await delete_ina_query(s_ina, ina_row)
             for svc_name in odata_names:
                 r = await client.delete(f"/admin/api/odata/services/{svc_name}")
                 check(f"fixture OData service {svc_name} removed", r.status_code == 204,
